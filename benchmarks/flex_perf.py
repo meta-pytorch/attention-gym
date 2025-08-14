@@ -353,6 +353,7 @@ def run_single_experiment(
     config: ExperimentConfig,
     dynamic=False,
     max_autotune=False,
+    kernel_options_override: Optional[dict] = None,
 ) -> dict[str, ExperimentResults]:
     device = torch.device("cuda")
     batch_size, q_heads, q_seq_len, kv_heads, kv_seq_len, head_dim = config.shape
@@ -371,6 +372,37 @@ def run_single_experiment(
     score_mod = generate_score_mod(config.attn_type, config.shape)
     block_mask, mask_kwargs = generate_block_mask(config.attn_type, config.shape)
     kernel_options = get_kernel_options(config.attn_type, config.shape)
+
+    # Merge in overrides: supports either a flat dict (applies to all)
+    # or a mapping keyed by attention type, with optional "global" fallback.
+    if kernel_options_override:
+        selected_override = kernel_options_override
+        # Detect keyed-by-attn-type mapping
+        attn_keys = {
+            "noop",
+            "causal",
+            "rel",
+            "head_bias",
+            "alibi",
+            "sliding_window",
+            "document_mask",
+            "prefix_lm",
+            "softcap",
+            "global",
+        }
+        if isinstance(kernel_options_override, dict) and any(
+            k in attn_keys for k in kernel_options_override.keys()
+        ):
+            selected_override = kernel_options_override.get(
+                config.attn_type, kernel_options_override.get("global")
+            )
+        if selected_override is not None:
+            if kernel_options is None:
+                kernel_options = dict(selected_override)
+            else:
+                merged = dict(kernel_options)
+                merged.update(selected_override)
+                kernel_options = merged
 
     if max_autotune:
         compiled_sdpa = torch.compile(
@@ -1189,6 +1221,7 @@ def main(
     throughput: bool = True,
     show_speedups: bool = False,
     save_path: Optional[str] = None,
+    kernel_options: Optional[dict] = None,
 ) -> None:
     """Run sweep over sizes and score mods for flex attention.
 
@@ -1227,6 +1260,9 @@ def main(
         throughput: Calculate kernel memory bandwidth & computational throughput (always True)
         show_speedups: Show speedup calculations in output
         save_path: Path to save the results CSV file
+        kernel_options: Dict of overrides merged into defaults from get_kernel_options. Either a
+            flat dict applied to all types, or a dict keyed by attention type, with optional
+            "global" key as fallback.
     """
     # Convert dtype string to torch dtype
     import torch
@@ -1265,6 +1301,7 @@ def main(
                     exp_config,
                     dynamic=dynamic,
                     max_autotune=max_autotune,
+                    kernel_options_override=kernel_options,
                 ),
             )
         )
