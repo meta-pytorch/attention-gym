@@ -29,7 +29,7 @@ This repository aims to provide a playground for experimenting with various atte
 ### Installation
 
 ```bash
-git clone https://github.com/pytorch-labs/attention-gym.git
+git clone https://github.com/meta-pytorch/attention-gym.git
 cd attention-gym
 pip install .
 ```
