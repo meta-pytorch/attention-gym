@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 class NonPagedAttentionLayer(torch.nn.Module):
     """An attention layer without paged attention, ported from GPT-Fast:
-    https://github.com/pytorch-labs/gpt-fast/blob/main/model.py#L180-L227
+    https://github.com/meta-pytorch/gpt-fast/blob/main/model.py#L180-L227
     """
 
     def __init__(self, bsz, n_heads, max_seq_len, head_dim, dtype, block_size: int = 32768):
