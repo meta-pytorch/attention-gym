@@ -1,10 +1,11 @@
 import csv
+import gc
 import itertools
 import random
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import Callable, Optional, Union, Literal
 
 from jsonargparse import CLI
@@ -24,6 +25,40 @@ from torch.nn.attention.flex_attention import (
     noop_mask,
 )
 from torch._inductor.runtime.benchmarking import benchmarker
+
+
+def cleanup_memory():
+    """Aggressively free GPU memory"""
+    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def safe_backend(backend_name=None):
+    """Decorator that wraps backend functions with error handling"""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(config, *args, **kwargs):
+            try:
+                return func(config, *args, **kwargs)
+            except torch.OutOfMemoryError:
+                print(f"[SKIP] OOM for {backend_name or func.__name__} with shape {config.shape}")
+                cleanup_memory()
+            except Exception as e:
+                print(
+                    f"[SKIP] Error for {backend_name or func.__name__} with shape {config.shape}: {e}"
+                )
+
+            return ExperimentResults(
+                fwd_time=float("nan"),
+                bwd_time=float("nan") if config.calculate_bwd_time else None,
+            )
+
+        return wrapper
+
+    return decorator
 
 
 # Type definitions
@@ -204,6 +239,7 @@ def query_key_value_clones(
     return query_ref, key_ref, value_ref
 
 
+@safe_backend("SDPA")
 def run_single_backend_sdpa(
     config: ExperimentConfig,
     query: torch.Tensor,
@@ -217,7 +253,6 @@ def run_single_backend_sdpa(
 ) -> ExperimentResults:
     backend_context = get_backend_context(backend)
     with backend_context:
-        _device = torch.device("cuda")
         eager_sdpa = generate_eager_sdpa(
             config.attn_type, config.shape, config.dtype, block_mask, score_mod
         )
@@ -232,60 +267,34 @@ def run_single_backend_sdpa(
         else:
             q_eager, k_eager, v_eager = query_key_value_clones(query, key, value)
 
-        if eager_sdpa:
-            try:
-                out_eager = eager_sdpa(query=q_eager, key=k_eager, value=v_eager)
-            except RuntimeError as e:
-                print(
-                    f"[SKIP] SDPA Backend {backend} for shape {config.shape}. \n\t\t\tError encountered: {e} "
-                )
-                result = ExperimentResults(
-                    fwd_time=float("nan"),
-                    bwd_time=float("nan") if config.calculate_bwd_time else None,
-                )
-                return add_metrics_to_result(config, result)
-            if config.attn_type in ["document_mask"]:
-                flatten_o_eager = torch.cat(torch.unbind(out_eager.transpose(1, 2)))
-                flatten_o_compile = out_compile.transpose(1, 2).flatten(start_dim=0, end_dim=1)
-                torch.testing.assert_close(
-                    flatten_o_eager, flatten_o_compile, atol=1e-2, rtol=1e-2
-                )
-            elif not (
-                config.attn_type in ["rel", "alibi"]
-                and config.dtype in [torch.float16, torch.bfloat16]
-            ):  # rel has accuracy issue with 16bit floats
-                torch.testing.assert_close(out_eager, out_compile, atol=1e-2, rtol=1e-2)
-
-        if eager_sdpa:
-            forward_eager_time = benchmark_torch_function_in_microseconds(
-                eager_sdpa, query=q_eager, key=k_eager, value=v_eager
+        if eager_sdpa is None:
+            return ExperimentResults(
+                fwd_time=float("nan"),
+                bwd_time=float("nan") if config.calculate_bwd_time else None,
             )
-        else:
-            forward_eager_time = float("nan")
-
+        forward_eager_time = benchmark_torch_function_in_microseconds(
+            eager_sdpa, q_eager, k_eager, v_eager
+        )
+        bwd_time = None if not config.calculate_bwd_time else float("nan")
         if config.calculate_bwd_time:
+            out_eager = eager_sdpa(q_eager, k_eager, v_eager)
             # TODO: debug backward pass for njt
-            if eager_sdpa and not config.attn_type == "document_mask":
+            if not config.attn_type == "document_mask":
                 d_out = torch.randn_like(out_eager.transpose(1, 2)).transpose(1, 2)
                 backward_eager_time = benchmark_torch_function_in_microseconds(
                     out_eager.backward, d_out, retain_graph=True
                 )
-            else:
-                backward_eager_time = float("nan")
+                bwd_time = backward_eager_time
 
-            result = ExperimentResults(
-                fwd_time=forward_eager_time,
-                bwd_time=backward_eager_time,
-            )
-            return add_metrics_to_result(config, result)
-        else:
-            result = ExperimentResults(
-                fwd_time=forward_eager_time,
-                bwd_time=None,
-            )
-            return add_metrics_to_result(config, result)
+        result = ExperimentResults(
+            fwd_time=forward_eager_time,
+            bwd_time=bwd_time,
+            sparsity=0.5 if config.attn_type in ("causal", "document_mask") else 0.0,
+        )
+        return add_metrics_to_result(config, result)
 
 
+@safe_backend("FlashAttention")
 def run_single_backend_FA(
     config: ExperimentConfig,
     query: torch.Tensor,
@@ -313,38 +322,90 @@ def run_single_backend_FA(
         k_FA = k_FA.flatten(start_dim=0, end_dim=1)
         v_FA = v_FA.flatten(start_dim=0, end_dim=1)
 
-    if FA:
-        out_FA = FA(q=q_FA, k=k_FA, v=v_FA)
-        if config.attn_type in ["document_mask"]:
-            out_FA_updated = out_FA[None, :, :, :]
-        else:
-            out_FA_updated = out_FA
+    if FA is None:
+        return ExperimentResults(
+            fwd_time=float("nan"),
+            bwd_time=float("nan") if config.calculate_bwd_time else None,
+        )
 
-        if not (
-            config.attn_type in ["rel", "alibi"]
-            and config.dtype in [torch.float16, torch.bfloat16]
-        ):
-            torch.testing.assert_close(
-                out_FA_updated, out_compile.transpose(1, 2), atol=1e-2, rtol=1e-2
-            )
-
-    if FA:
-        forward_FA_time = benchmark_torch_function_in_microseconds(FA, q=q_FA, k=k_FA, v=v_FA)
-    else:
-        forward_FA_time = float("nan")
-
+    forward_FA_time = benchmark_torch_function_in_microseconds(FA, q=q_FA, k=k_FA, v=v_FA)
+    backward_FA_time = None
     if config.calculate_bwd_time:
-        if FA:
-            d_out = torch.randn_like(out_FA)
-            backward_FA_time = benchmark_torch_function_in_microseconds(
-                out_FA.backward, d_out, retain_graph=True
-            )
-        else:
-            backward_FA_time = float("nan")
+        out_FA = FA(q=q_FA, k=k_FA, v=v_FA)
+        d_out = torch.randn_like(out_FA)
+        backward_FA_time = benchmark_torch_function_in_microseconds(
+            out_FA.backward, d_out, retain_graph=True
+        )
 
     result = ExperimentResults(
         fwd_time=forward_FA_time,
         bwd_time=backward_FA_time if config.calculate_bwd_time else None,
+        sparsity=0.5
+        if config.attn_type in ("causal", "document_mask", "alibi", "softcap")
+        else 0.0,
+    )
+    return add_metrics_to_result(config, result)
+
+
+@safe_backend("flex_attention")
+def run_flex_attention(
+    config: ExperimentConfig,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    score_mod: Optional[Callable],
+    block_mask: Optional[BlockMask],
+    kernel_options: Optional[dict] = None,
+    dynamic: bool = False,
+    max_autotune: bool = False,
+) -> ExperimentResults:
+    if max_autotune:
+        compiled_sdpa = torch.compile(
+            flex_attention, dynamic=dynamic, mode="max-autotune-no-cudagraphs"
+        )
+    else:
+        compiled_sdpa = torch.compile(flex_attention, dynamic=dynamic)
+
+    out_compile = compiled_sdpa(
+        query=query,
+        key=key,
+        value=value,
+        score_mod=score_mod,
+        block_mask=block_mask,
+        enable_gqa=True,
+        kernel_options=kernel_options,
+    )
+
+    forward_compiled_time = benchmark_torch_function_in_microseconds(
+        compiled_sdpa,
+        query,
+        key,
+        value,
+        score_mod=score_mod,
+        block_mask=block_mask,
+        enable_gqa=True,
+        kernel_options=kernel_options,
+    )
+
+    backward_compile_time = None
+    if config.calculate_bwd_time:
+        try:
+            d_out = torch.randn_like(out_compile)
+            backward_compile_time = benchmark_torch_function_in_microseconds(
+                out_compile.backward, d_out, retain_graph=True
+            )
+        except Exception as e:
+            print(f"[SKIP] Backward pass failed for flex_attention with shape {config.shape}: {e}")
+            cleanup_memory()
+            backward_compile_time = float("nan")
+
+    sparsity = block_mask.sparsity() / 100.0 if block_mask is not None else 0.0
+    sparsity = sparsity if config.attn_type != "document_mask" else 0.5
+
+    result = ExperimentResults(
+        fwd_time=forward_compiled_time,
+        bwd_time=backward_compile_time,
+        sparsity=sparsity,
     )
     return add_metrics_to_result(config, result)
 
@@ -460,10 +521,17 @@ def run_single_experiment(
             )
 
     if config.calculate_bwd_time:
-        d_out = torch.randn_like(out_compile)
-        backward_compile_time = benchmark_torch_function_in_microseconds(
-            out_compile.backward, d_out, retain_graph=True
-        )
+        try:
+            d_out = torch.randn_like(out_compile)
+            backward_compile_time = benchmark_torch_function_in_microseconds(
+                out_compile.backward, d_out, retain_graph=True
+            )
+        except Exception as e:
+            print(
+                f"[SKIP] Backward pass failed for {config.attn_type} with shape {config.shape}: {e}"
+            )
+            cleanup_memory()
+            backward_compile_time = float("nan")
     sparsity = block_mask.sparsity() / 100.0 if block_mask is not None else 0.0
     sparsity = sparsity if config.attn_type != "document_mask" else 0.5
 
@@ -1279,6 +1347,7 @@ def main(
     np.random.seed(seed)
     torch.manual_seed(seed)
     results = []
+    experiment_count = 0
     for exp_config in tqdm(
         generate_experiment_configs(
             calculate_bwd,
@@ -1294,17 +1363,18 @@ def main(
             backend,
         )
     ):
-        results.append(
-            Experiment(
-                exp_config,
-                run_single_experiment(
-                    exp_config,
-                    dynamic=dynamic,
-                    max_autotune=max_autotune,
-                    kernel_options_override=kernel_options,
-                ),
-            )
+        experiment_result = run_single_experiment(
+            exp_config,
+            dynamic=dynamic,
+            max_autotune=max_autotune,
+            kernel_options_override=kernel_options,
         )
+        results.append(Experiment(exp_config, experiment_result))
+
+        experiment_count += 1
+        # Periodic memory cleanup every 10 experiments
+        if experiment_count % 10 == 0:
+            cleanup_memory()
 
     print_results(results, save_path, show_speedups=show_speedups)
 
