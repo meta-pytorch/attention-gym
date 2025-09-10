@@ -167,3 +167,4 @@ __pycache__
 
 # Local Claude development notes
 CLAUDE.local.md
+data/
