@@ -1,8 +1,12 @@
-import os
 import warnings
-from typing import Callable, Optional, Tuple
+from contextlib import nullcontext
 
 import torch
+from torch._dynamo import lookup_backend
+from torch._dynamo.aot_compile import aot_compile_module, ModelInput
+
+# from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
+from torch._dynamo.hooks import Hooks
 from torch.nn.attention import flex_attention as flex_attention_module
 from torch.nn.attention.flex_attention import (
     AuxRequest,
@@ -25,140 +29,51 @@ warnings.filterwarnings(
 )
 
 
-MaskPayload = Tuple[
-    tuple[int, int],
-    tuple[int, int],
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-]
-
-
-def _pack_block_mask(block_mask: BlockMask) -> MaskPayload:
-    return (
-        block_mask.seq_lengths,
-        block_mask.BLOCK_SIZE,
-        block_mask.kv_num_blocks,
-        block_mask.kv_indices,
-        block_mask.full_kv_num_blocks,
-        block_mask.full_kv_indices,
-        block_mask.q_num_blocks,
-        block_mask.q_indices,
-        block_mask.full_q_num_blocks,
-        block_mask.full_q_indices,
-    )
-
-
-def _unpack_block_mask(mask_payload: MaskPayload, mask_mod: Callable) -> BlockMask:
-    (
-        seq_lengths,
-        block_size,
-        kv_num_blocks,
-        kv_indices,
-        full_kv_num_blocks,
-        full_kv_indices,
-        q_num_blocks,
-        q_indices,
-        full_q_num_blocks,
-        full_q_indices,
-    ) = mask_payload
-
-    return BlockMask(
-        seq_lengths=seq_lengths,
-        kv_num_blocks=kv_num_blocks,
-        kv_indices=kv_indices,
-        full_kv_num_blocks=full_kv_num_blocks,
-        full_kv_indices=full_kv_indices,
-        q_num_blocks=q_num_blocks,
-        q_indices=q_indices,
-        full_q_num_blocks=full_q_num_blocks,
-        full_q_indices=full_q_indices,
-        BLOCK_SIZE=block_size,
-        mask_mod=mask_mod,
-    )
-
-
 class FlexAttentionForward(torch.nn.Module):
-    def __init__(self, mask_mod: Callable) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._mask_mod = mask_mod
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask_payload: MaskPayload,
+        block_mask: BlockMask,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        block = _unpack_block_mask(mask_payload, self._mask_mod)
         output, aux = flex_attention(
             query,
             key,
             value,
-            block_mask=block,
+            block_mask=block_mask,
             return_aux=AuxRequest(lse=True),
         )
-        if aux.lse is None:
-            raise RuntimeError("Expected log-sum-exp output when requesting AuxRequest(lse=True.)")
         return output, aux.lse
 
 
-class FlexAttentionBackward(torch.nn.Module):
-    def __init__(self, mask_mod: Callable) -> None:
-        super().__init__()
-        self._mask_mod = mask_mod
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        grad_out: torch.Tensor,
-        mask_payload: MaskPayload,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not (query.requires_grad and key.requires_grad and value.requires_grad):
-            raise RuntimeError("Inputs to FlexAttentionBackward must require gradients.")
-
-        block = _unpack_block_mask(mask_payload, self._mask_mod)
-        result = flex_attention(query, key, value, block_mask=block)
-        loss = (result * grad_out).sum()
-        dq, dk, dv = torch.autograd.grad(loss, (query, key, value), allow_unused=False)
-        return dq, dk, dv
-
-
-def _run_exported_forward(
-    module: FlexAttentionForward,
+def build_aot_flex_attention(
+    block_mask: BlockMask,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask_payload: MaskPayload,
-    package_path: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    exported = torch.export.export(module, (query, key, value, mask_payload))
-    compiled_path = torch._inductor.aoti_compile_and_package(exported, package_path=package_path)
-    runtime = torch._inductor.aoti_load_package(compiled_path)
-    return runtime(query, key, value, mask_payload)
-
-
-def _run_compiled_forward(
-    module_ctor: Callable[[], FlexAttentionForward],
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask_payload: MaskPayload,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    compiled_module = torch.compile(module_ctor(), fullgraph=True, backend="inductor")
-    output, lse = compiled_module(query, key, value, mask_payload)
-    return output, lse
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hooks = Hooks()
+    example_inputs = [
+        ModelInput(
+            (query, key, value, block_mask),
+            {},
+            [
+                nullcontext(),
+            ],
+        ),
+    ]
+    module = FlexAttentionForward()
+    backend = lookup_backend("inductor")
+    aot_compiled_flex = aot_compile_module(module, example_inputs, hooks=hooks, backend=backend)
+    return aot_compiled_flex
 
 
 def build_and_run() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     torch.manual_seed(0)
     q = torch.randn(2, 2, 128, 64, device=device, dtype=torch.float16, requires_grad=True)
     k = torch.randn_like(q, requires_grad=True)
@@ -180,41 +95,39 @@ def build_and_run() -> None:
         KV_LEN=k.shape[2],
         device=device,
     )
-    mask_payload = _pack_block_mask(block)
 
-    import torch.autograd.profiler as profiler
+    compiled_flex = torch.compile(flex_attention_module.flex_attention, backend="inductor")
+    aot_module = build_aot_flex_attention(block, q, k, v)
+    out_compile, out_lse = compiled_flex(q, k, v, block, return_aux=AuxRequest(lse=True))
+    out_aot, lse_aot = aot_module(q, k, v, block)
 
-    with profiler.record_function("exported_forward"):
-        fwd = FlexAttentionForward(mask_mod=causal_mask).to(device)
-        fwd_path = os.path.join(os.getcwd(), "data/flex_attention_fwd.pt2")
-        out_aoti, lse_aoti = _run_exported_forward(fwd, q, k, v, mask_payload, fwd_path)
-        print(f"AOTI   output_norm={out_aoti.norm().item():.4f}")
-        print(f"AOTI   lse_norm={lse_aoti.norm().item():.4f}")
+    print(f"compile output_norm={out_compile.norm().item():.4f}")
+    print(f"compile lse_norm={out_lse.norm().item():.4f}")
 
-    def compiled_module_ctor() -> FlexAttentionForward:
-        return FlexAttentionForward(mask_mod=causal_mask).to(device)
-
-    with profiler.record_function("compiled_forward"):
-        out_compiled, lse_compiled = _run_compiled_forward(
-            compiled_module_ctor,
-            q,
-            k,
-            v,
-            mask_payload,
-        )
-    print(f"compile output_norm={out_compiled.norm().item():.4f}")
-    print(f"compile lse_norm={lse_compiled.norm().item():.4f}")
-
-    max_output_diff = (out_aoti - out_compiled).abs().max()
-    max_lse_diff = (lse_aoti - lse_compiled).abs().max()
+    max_output_diff = (out_aot - out_compile).abs().max()
+    max_lse_diff = (lse_aot - out_lse).abs().max()
     print(f"max |output diff|={max_output_diff.item():.4e}")
     print(f"max |lse diff|={max_lse_diff.item():.4e}")
+
+    print("\n--- Testing Exported Backward ---")
+    grad_q, grad_k, grad_v = torch.autograd.grad(
+        out_compile, (q, k, v), grad_outputs=torch.ones_like(out_compile)
+    )
+    grad_q_aot, grad_k_aot, grad_v_aot = torch.autograd.grad(
+        out_aot, (q, k, v), grad_outputs=torch.ones_like(out_aot)
+    )
+    max_grad_q_diff = (grad_q_aot - grad_q).abs().max()
+    max_grad_k_diff = (grad_k_aot - grad_k).abs().max()
+    max_grad_v_diff = (grad_v_aot - grad_v).abs().max()
+
+    print(f"max |grad_q diff|={max_grad_q_diff.item():.4e}")
+    print(f"max |grad_k diff|={max_grad_k_diff.item():.4e}")
+    print(f"max |grad_v diff|={max_grad_v_diff.item():.4e}")
 
 
 if __name__ == "__main__":
     from transformer_nuggets import init_logging
-    from transformer_nuggets.utils.benchmark import profiler
 
     init_logging()
-    with profiler("build_and_run") as p:
-        build_and_run()
+    # with profiler("build_and_run") as p:
+    build_and_run()
