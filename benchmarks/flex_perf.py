@@ -26,6 +26,12 @@ from torch.nn.attention.flex_attention import (
 )
 from torch._inductor.runtime.benchmarking import benchmarker
 
+import warnings
+
+warnings.filterwarnings("ignore", message=".*dynamo_pgo force disabled.*")
+warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*is deprecated.*")
+
 
 def cleanup_memory():
     """Aggressively free GPU memory"""
@@ -415,6 +421,8 @@ def run_single_experiment(
     dynamic=False,
     max_autotune=False,
     kernel_options_override: Optional[dict] = None,
+    block_q: int | None = None,
+    block_kv: int | None = None,
 ) -> dict[str, ExperimentResults]:
     device = torch.device("cuda")
     batch_size, q_heads, q_seq_len, kv_heads, kv_seq_len, head_dim = config.shape
@@ -431,7 +439,9 @@ def run_single_experiment(
         nested_tensors=config.attn_type == "document_mask",
     )
     score_mod = generate_score_mod(config.attn_type, config.shape)
-    block_mask, mask_kwargs = generate_block_mask(config.attn_type, config.shape)
+    block_mask, mask_kwargs = generate_block_mask(
+        config.attn_type, config.shape, block_q, block_kv
+    )
     kernel_options = get_kernel_options(config.attn_type, config.shape)
 
     # Merge in overrides: supports either a flat dict (applies to all)
@@ -848,7 +858,10 @@ prefix_length = 512
 
 
 def generate_block_mask(
-    attn_type: AttentionType, shape: tuple[int, int, int, int, int, int]
+    attn_type: AttentionType,
+    shape: tuple[int, int, int, int, int, int],
+    block_q: int | None = None,
+    block_kv: int | None = None,
 ) -> tuple[BlockMask, dict]:
     B, Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
@@ -917,10 +930,16 @@ def generate_block_mask(
 
     mask_shape = (1, 1, M, N) if attn_type != "document_mask" else (1, 1, M * B, N * B)
     compiled_block_mask = torch.compile(create_block_mask)
+
+    block_mask_kwargs = {}
+    if block_q is not None and block_kv is not None:
+        block_size = (block_q, block_kv)
+        block_mask_kwargs["BLOCK_SIZE"] = block_size
+
     if new_mask_mod:
-        block_mask = compiled_block_mask(new_mask_mod, *mask_shape, "cuda")
+        block_mask = compiled_block_mask(new_mask_mod, *mask_shape, "cuda", **block_mask_kwargs)
     else:
-        block_mask = compiled_block_mask(noop_mask, *mask_shape, "cuda")
+        block_mask = compiled_block_mask(noop_mask, *mask_shape, "cuda", **block_mask_kwargs)
     return block_mask, mask_mod_kwargs
 
 
@@ -1290,6 +1309,8 @@ def main(
     show_speedups: bool = False,
     save_path: Optional[str] = None,
     kernel_options: Optional[dict] = None,
+    block_q: int | None = None,
+    block_kv: int | None = None,
 ) -> None:
     """Run sweep over sizes and score mods for flex attention.
 
@@ -1331,6 +1352,8 @@ def main(
         kernel_options: Dict of overrides merged into defaults from get_kernel_options. Either a
             flat dict applied to all types, or a dict keyed by attention type, with optional
             "global" key as fallback.
+        block_q: Block size for Q dimension (default: None uses PyTorch defaults)
+        block_kv: Block size for KV dimension (default: None uses PyTorch defaults)
     """
     # Convert dtype string to torch dtype
     import torch
@@ -1368,6 +1391,8 @@ def main(
             dynamic=dynamic,
             max_autotune=max_autotune,
             kernel_options_override=kernel_options,
+            block_q=block_q,
+            block_kv=block_kv,
         )
         results.append(Experiment(exp_config, experiment_result))
 
