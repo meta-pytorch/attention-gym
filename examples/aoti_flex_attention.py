@@ -1,13 +1,13 @@
 import warnings
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
+from tabulate import tabulate
 from torch._dynamo import lookup_backend
-from torch._dynamo.aot_compile import aot_compile_module, ModelInput
-
-# from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
+from torch._dynamo.aot_compile import AOTCompiledModel, ModelInput, aot_compile_module
+from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
 from torch._dynamo.hooks import Hooks
-from torch.nn.attention import flex_attention as flex_attention_module
 from torch.nn.attention.flex_attention import (
     AuxRequest,
     BlockMask,
@@ -15,7 +15,6 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-flex_attention_module._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
 
 warnings.filterwarnings(
     "ignore",
@@ -50,6 +49,11 @@ class FlexAttentionForward(torch.nn.Module):
         return output, aux.lse
 
 
+def serializable_inductor_backend(gm, example_inputs):
+    compiled = lookup_backend("inductor")(gm, example_inputs)
+    return BundledAOTAutogradSerializableCallable(compiled)
+
+
 def build_aot_flex_attention(
     block_mask: BlockMask,
     query: torch.Tensor,
@@ -59,17 +63,58 @@ def build_aot_flex_attention(
     hooks = Hooks()
     example_inputs = [
         ModelInput(
-            (query, key, value, block_mask),
-            {},
+            (query, key, value),
+            {"block_mask": block_mask},
             [
                 nullcontext(),
             ],
         ),
     ]
     module = FlexAttentionForward()
-    backend = lookup_backend("inductor")
-    aot_compiled_flex = aot_compile_module(module, example_inputs, hooks=hooks, backend=backend)
+    aot_compiled_flex = aot_compile_module(
+        module, example_inputs, hooks=hooks, backend=serializable_inductor_backend
+    )
     return aot_compiled_flex
+
+
+def save_aot_module(aot_model: AOTCompiledModel, path: Path) -> None:
+    payload = aot_model.serialize()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def load_aot_module(path: Path) -> AOTCompiledModel:
+    payload = path.read_bytes()
+    module = FlexAttentionForward()
+    return AOTCompiledModel.deserialize(module, payload)
+
+
+def report_differences(
+    reference_outputs: tuple[torch.Tensor, torch.Tensor],
+    reference_grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    comparisons: list[tuple[str, torch.Tensor, torch.Tensor]],
+    grad_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    out_ref, lse_ref = reference_outputs
+    grad_q_ref, grad_k_ref, grad_v_ref = reference_grads
+    rows: list[dict[str, float]] = []
+    for tag, out_test, lse_test in comparisons:
+        max_output_diff = (out_test - out_ref).abs().max()
+        max_lse_diff = (lse_test - lse_ref).abs().max()
+        grad_q_test, grad_k_test, grad_v_test = torch.autograd.grad(
+            out_test, grad_inputs, grad_outputs=torch.ones_like(out_test)
+        )
+        rows.append(
+            {
+                "tag": tag,
+                "max|out diff|": max_output_diff.item(),
+                "max|lse diff|": max_lse_diff.item(),
+                "max|grad_q diff|": (grad_q_test - grad_q_ref).abs().max().item(),
+                "max|grad_k diff|": (grad_k_test - grad_k_ref).abs().max().item(),
+                "max|grad_v diff|": (grad_v_test - grad_v_ref).abs().max().item(),
+            }
+        )
+    print(tabulate(rows, headers="keys", tablefmt="github", floatfmt=".4e"))
 
 
 def build_and_run() -> None:
@@ -96,33 +141,46 @@ def build_and_run() -> None:
         device=device,
     )
 
-    compiled_flex = torch.compile(flex_attention_module.flex_attention, backend="inductor")
+    compiled_flex = torch.compile(flex_attention, backend="inductor")
+    out_compile, out_aux = compiled_flex(
+        q, k, v, block_mask=block, return_aux=AuxRequest(lse=True)
+    )
+    out_lse = out_aux.lse
+
     aot_module = build_aot_flex_attention(block, q, k, v)
-    out_compile, out_lse = compiled_flex(q, k, v, block, return_aux=AuxRequest(lse=True))
     out_aot, lse_aot = aot_module(q, k, v, block)
 
-    print(f"compile output_norm={out_compile.norm().item():.4f}")
-    print(f"compile lse_norm={out_lse.norm().item():.4f}")
-
-    max_output_diff = (out_aot - out_compile).abs().max()
-    max_lse_diff = (lse_aot - out_lse).abs().max()
-    print(f"max |output diff|={max_output_diff.item():.4e}")
-    print(f"max |lse diff|={max_lse_diff.item():.4e}")
-
-    print("\n--- Testing Exported Backward ---")
     grad_q, grad_k, grad_v = torch.autograd.grad(
         out_compile, (q, k, v), grad_outputs=torch.ones_like(out_compile)
     )
-    grad_q_aot, grad_k_aot, grad_v_aot = torch.autograd.grad(
-        out_aot, (q, k, v), grad_outputs=torch.ones_like(out_aot)
-    )
-    max_grad_q_diff = (grad_q_aot - grad_q).abs().max()
-    max_grad_k_diff = (grad_k_aot - grad_k).abs().max()
-    max_grad_v_diff = (grad_v_aot - grad_v).abs().max()
+    print("\n--- Testing Exported Backward ---")
+    comparisons: list[tuple[str, torch.Tensor, torch.Tensor]] = [
+        ("fresh", out_aot, lse_aot),
+    ]
 
-    print(f"max |grad_q diff|={max_grad_q_diff.item():.4e}")
-    print(f"max |grad_k diff|={max_grad_k_diff.item():.4e}")
-    print(f"max |grad_v diff|={max_grad_v_diff.item():.4e}")
+    from transformer_nuggets.utils.benchmark import profiler, record_function
+
+    with (
+        profiler("aot_run", with_stack=True),
+        record_function("aot_flex_attention_save_load"),
+    ):
+        artifact_path = Path("data/aot_flex_attention_artifact.bin")
+        with record_function("aot_flex_attention_save_load"):
+            save_aot_module(aot_module, artifact_path)
+        print(f"AOT artifact saved to {artifact_path}")
+        with record_function("aot_flex_attention_reload"):
+            reloaded_aot = load_aot_module(artifact_path)
+        print(f"Reloaded artifact from {artifact_path}")
+
+        with record_function("aot_flex_attention_run_reloaded"):
+            out_aot_reloaded, lse_aot_reloaded = reloaded_aot(q, k, v, block)
+        comparisons.append(("reloaded", out_aot_reloaded, lse_aot_reloaded))
+    report_differences(
+        (out_compile, out_lse),
+        (grad_q, grad_k, grad_v),
+        comparisons,
+        (q, k, v),
+    )
 
 
 if __name__ == "__main__":
