@@ -16,8 +16,17 @@ try:
 except ImportError:
     from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
 from contextlib import nullcontext
+from torch._inductor.utils import do_bench_using_profiling
+from collections.abc import Callable
 
 Tensor = torch.Tensor
+
+
+def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench_using_profiling"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench_using_profiling(no_args)
+    return time * 1e3
 
 
 def create_score_mod(
