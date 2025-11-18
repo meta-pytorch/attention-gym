@@ -1,12 +1,12 @@
+from torch import _TorchCompileAOTInductorWrapper, _TorchCompileInductorWrapper
+import argparse
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 from tabulate import tabulate
-from torch._dynamo import lookup_backend
 from torch._dynamo.aot_compile import AOTCompiledModel, ModelInput, aot_compile_module
-from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
 from torch._dynamo.hooks import Hooks
 from torch.nn.attention.flex_attention import (
     AuxRequest,
@@ -49,16 +49,12 @@ class FlexAttentionForward(torch.nn.Module):
         return output, aux.lse
 
 
-def serializable_inductor_backend(gm, example_inputs):
-    compiled = lookup_backend("inductor")(gm, example_inputs)
-    return BundledAOTAutogradSerializableCallable(compiled)
-
-
 def build_aot_flex_attention(
     block_mask: BlockMask,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    use_aoti: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hooks = Hooks()
     example_inputs = [
@@ -71,8 +67,17 @@ def build_aot_flex_attention(
         ),
     ]
     module = FlexAttentionForward()
+    backend = (
+        _TorchCompileAOTInductorWrapper(None, None, None)
+        if use_aoti
+        else _TorchCompileInductorWrapper(None, None, None)
+    )
+
     aot_compiled_flex = aot_compile_module(
-        module, example_inputs, hooks=hooks, backend=serializable_inductor_backend
+        module,
+        example_inputs,
+        hooks=hooks,
+        backend=backend,
     )
     return aot_compiled_flex
 
@@ -117,7 +122,7 @@ def report_differences(
     print(tabulate(rows, headers="keys", tablefmt="github", floatfmt=".4e"))
 
 
-def build_and_run() -> None:
+def build_and_run(use_aoti: bool = True) -> None:
     device = "cuda"
     torch.manual_seed(0)
     q = torch.randn(2, 2, 128, 64, device=device, dtype=torch.float16, requires_grad=True)
@@ -147,7 +152,8 @@ def build_and_run() -> None:
     )
     out_lse = out_aux.lse
 
-    aot_module = build_aot_flex_attention(block, q, k, v)
+    print(f"\n--- Running with {'AOTI' if use_aoti else 'non-AOTI'} backend ---")
+    aot_module = build_aot_flex_attention(block, q, k, v, use_aoti=use_aoti)
     out_aot, lse_aot = aot_module(q, k, v, block)
 
     grad_q, grad_k, grad_v = torch.autograd.grad(
@@ -186,6 +192,16 @@ def build_and_run() -> None:
 if __name__ == "__main__":
     from transformer_nuggets import init_logging
 
+    parser = argparse.ArgumentParser(description="Run FlexAttention with AOTI or Python backend")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["aoti", "python"],
+        default="aoti",
+        help="Backend mode: 'aoti' uses _TorchCompileAOTInductorWrapper, 'python' uses _TorchCompileInductorWrapper",
+    )
+    args = parser.parse_args()
+
     init_logging()
-    # with profiler("build_and_run") as p:
-    build_and_run()
+    use_aoti = args.mode == "aoti"
+    build_and_run(use_aoti=use_aoti)
