@@ -1,6 +1,7 @@
 import torch
 from typing import Optional
 from pathlib import Path
+from contextlib import contextmanager, nullcontext
 import numpy as np
 import math
 from torch.nn.attention.flex_attention import (
@@ -8,14 +9,15 @@ from torch.nn.attention.flex_attention import (
     _mask_mod_signature,
     _vmap_for_bhqkv,
     _ModificationType,
+    _DEFAULT_SPARSE_BLOCK_SIZE,
 )
+from torch.profiler import profile, ProfilerActivity
 
 # TODO This was moved on nightly, this enables 2.5 and 2.6 | we should remove this once 2.5 is no longer supported
 try:
     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
 except ImportError:
     from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
-from contextlib import nullcontext
 from torch._inductor.utils import do_bench_using_profiling
 from collections.abc import Callable
 
@@ -288,3 +290,68 @@ def cdiv(a: int, b: int) -> int:
 def round_up(x: int, y: int) -> int:
     """Round up x to the nearest multiple of y"""
     return cdiv(x, y) * y
+
+
+# =============================================================================
+# Flash Backend Utilities
+# =============================================================================
+
+
+@contextmanager
+def cuda_kernel_profiler(kernel_pattern: str = "flash_attncute"):
+    """
+    Context manager that profiles CUDA kernels and checks for a pattern.
+
+    Usage:
+        with cuda_kernel_profiler("flash_attncute") as result:
+            flex_attention(...)
+        print(result["found"])  # True if flash kernel was called
+        print(result["kernel_names"])  # List of all CUDA kernel names
+    """
+    result = {"found": False, "kernel_names": []}
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        yield result
+
+    kernel_names = [
+        evt.name
+        for evt in prof.events()
+        if evt.device_type == torch.autograd.DeviceType.CUDA and evt.name
+    ]
+    result["kernel_names"] = kernel_names
+    result["found"] = any(kernel_pattern in name for name in kernel_names)
+
+
+def get_flash_block_size(device: str = "cuda") -> tuple[int, int]:
+    """
+    Get block size for Flash backend based on GPU compute capability.
+
+    On SM100+ (Blackwell): Q block must be 256, KV block is 128.
+    On SM80/SM90: Both use default 128.
+    """
+    q_block = _DEFAULT_SPARSE_BLOCK_SIZE
+    kv_block = _DEFAULT_SPARSE_BLOCK_SIZE
+
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        major, _ = torch.cuda.get_device_capability(dev)
+        if major >= 10:
+            q_block *= 2
+
+    return (q_block, kv_block)
+
+
+def calculate_tflops(
+    batch: int,
+    heads: int,
+    seq_q: int,
+    seq_kv: int,
+    head_dim: int,
+    time_ms: float,
+    sparsity: float = 0.0,
+) -> float:
+    """Calculate TFLOPs for attention forward pass."""
+    qk_flops = 2 * seq_q * seq_kv * head_dim
+    sv_flops = 2 * seq_q * head_dim * seq_kv
+    total_flops = batch * heads * (qk_flops + sv_flops) * (1 - sparsity)
+    return total_flops / (time_ms * 1e9)  # ms to TFLOPs
