@@ -48,71 +48,68 @@ def create_causal_block_mask_fast(
     num_q_blocks = cdiv(q_seq_len, q_block_size)
     num_kv_blocks = cdiv(kv_seq_len, kv_block_size)
 
-    # For causal mask, each query block can attend to all KV blocks up to and including
-    # the diagonal block
-    kv_num_blocks = torch.zeros(
-        (batch_size, num_heads, num_q_blocks), dtype=torch.int32, device=device
-    )
-    kv_indices = torch.zeros(
-        (batch_size, num_heads, num_q_blocks, num_kv_blocks), dtype=torch.int32, device=device
-    )
+    q_block_indices = torch.arange(num_q_blocks, device=device, dtype=torch.int32)
+    kv_block_indices = torch.arange(num_kv_blocks, device=device, dtype=torch.int32)
+
+    num_full_per_row = torch.clamp(q_block_indices, max=num_kv_blocks)
+    has_partial = q_block_indices < num_kv_blocks
 
     if separate_full_blocks:
-        full_kv_num_blocks = torch.zeros(
-            (batch_size, num_heads, num_q_blocks), dtype=torch.int32, device=device
+        min_q_indices = q_block_indices * q_block_size
+        max_kv_indices = torch.clamp((q_block_indices + 1) * kv_block_size - 1, max=kv_seq_len - 1)
+        is_diagonal_full = has_partial & (min_q_indices >= max_kv_indices)
+
+        full_counts = torch.where(is_diagonal_full, num_full_per_row + 1, num_full_per_row)
+        partial_counts = torch.where(is_diagonal_full, 0, has_partial.int())
+
+        full_kv_num_blocks = (
+            full_counts.view(1, 1, num_q_blocks)
+            .expand(batch_size, num_heads, num_q_blocks)
+            .contiguous()
         )
-        full_kv_indices = torch.zeros(
+        kv_num_blocks = (
+            partial_counts.view(1, 1, num_q_blocks)
+            .expand(batch_size, num_heads, num_q_blocks)
+            .contiguous()
+        )
+
+        full_mask = kv_block_indices.unsqueeze(0) < full_counts.unsqueeze(1)
+        full_kv_indices = (
+            torch.where(
+                full_mask, kv_block_indices.unsqueeze(0), torch.zeros_like(kv_block_indices)
+            )
+            .view(1, 1, num_q_blocks, num_kv_blocks)
+            .expand(batch_size, num_heads, num_q_blocks, num_kv_blocks)
+            .contiguous()
+        )
+
+        partial_indices = torch.where(
+            partial_counts > 0, q_block_indices, torch.zeros_like(q_block_indices)
+        )
+        kv_indices = torch.zeros(
             (batch_size, num_heads, num_q_blocks, num_kv_blocks), dtype=torch.int32, device=device
+        )
+        kv_indices[:, :, :, 0] = partial_indices.view(1, 1, num_q_blocks).expand(
+            batch_size, num_heads, num_q_blocks
         )
     else:
         full_kv_num_blocks = None
         full_kv_indices = None
 
-    for q_block_idx in range(num_q_blocks):
-        # For causal attention, query block i can attend to KV blocks [0, i]
-        # The last block in the diagonal may be partial
-        num_full_blocks = min(q_block_idx, num_kv_blocks)
-        num_partial_blocks = 1 if q_block_idx < num_kv_blocks else 0
+        total_counts = num_full_per_row + has_partial.int()
+        kv_num_blocks = (
+            total_counts.view(1, 1, num_q_blocks)
+            .expand(batch_size, num_heads, num_q_blocks)
+            .contiguous()
+        )
 
-        if separate_full_blocks:
-            assert full_kv_num_blocks is not None
-            assert full_kv_indices is not None
-
-            if num_partial_blocks > 0:
-                min_q_index = q_block_idx * q_block_size
-                max_kv_index = min((q_block_idx + 1) * kv_block_size - 1, kv_seq_len - 1)
-                is_diagonal_full = min_q_index >= max_kv_index
-            else:
-                is_diagonal_full = False
-
-            if is_diagonal_full:
-                # Diagonal block is full - move it from partial to full
-                full_kv_num_blocks[:, :, q_block_idx] = num_full_blocks + 1
-                kv_num_blocks[:, :, q_block_idx] = 0  # No partial blocks
-
-                # Set indices for all full blocks (including diagonal)
-                indices = torch.arange(num_full_blocks + 1, device=device)
-                full_kv_indices[:, :, q_block_idx, : num_full_blocks + 1] = indices
-            else:
-                # Diagonal block is partial (or doesn't exist)
-                full_kv_num_blocks[:, :, q_block_idx] = num_full_blocks
-                kv_num_blocks[:, :, q_block_idx] = num_partial_blocks
-
-                # Set indices for full blocks
-                if num_full_blocks > 0:
-                    indices = torch.arange(num_full_blocks, device=device)
-                    full_kv_indices[:, :, q_block_idx, :num_full_blocks] = indices
-
-                # Set index for partial block
-                if num_partial_blocks > 0:
-                    kv_indices[:, :, q_block_idx, 0] = q_block_idx
-        else:
-            # All blocks go into partial
-            total_blocks = num_full_blocks + num_partial_blocks
-            kv_num_blocks[:, :, q_block_idx] = total_blocks
-            if total_blocks > 0:
-                indices = torch.arange(total_blocks, device=device)
-                kv_indices[:, :, q_block_idx, :total_blocks] = indices
+        mask = kv_block_indices.unsqueeze(0) < total_counts.unsqueeze(1)
+        kv_indices = (
+            torch.where(mask, kv_block_indices.unsqueeze(0), torch.zeros_like(kv_block_indices))
+            .view(1, 1, num_q_blocks, num_kv_blocks)
+            .expand(batch_size, num_heads, num_q_blocks, num_kv_blocks)
+            .contiguous()
+        )
 
     return BlockMask.from_kv_blocks(
         kv_num_blocks=kv_num_blocks,
