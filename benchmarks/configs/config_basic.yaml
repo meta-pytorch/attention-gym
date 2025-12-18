@@ -3,7 +3,7 @@
 
 # Core parameters
 dynamic: false
-calculate_bwd: false
+calculate_bwd: True
 dtype: "bfloat16"
 
 # Shape parameters
@@ -29,14 +29,15 @@ show_speedups: false  # Show speedup calculations
 save_path: null  # No CSV output
 
 # Uncomment to change
+# BACKEND options: AUTO (default), FLASH (FAv4), TRITON, TRITON_DECODE
 # kernel_options:
-#   global:
-#     force_flash: true
+  # global:
+    # BACKEND: FLASH
 #     BLOCK_M: 64
 #     BLOCK_N: 128
 #     num_warps: 8
 #     num_stages: 2
 
-# Block Sparse Sizes
-block_q: 128
-block_kv: 128
+# Block Sparse Sizes -> Uncomment if using FLASH backend
+# block_q: 256
+# block_kv: 128

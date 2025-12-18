@@ -853,7 +853,7 @@ def generate_score_mod(
     return new_score_mod
 
 
-sliding_window_size = 512
+sliding_window_size = 2048
 prefix_length = 512
 
 
