@@ -1046,13 +1046,19 @@ def generate_FA_callable(
             raise
     elif backend == "fav3":
         try:
-            from flash_attn.flash_attn_interface import (
+            from flash_attn_interface import (
                 flash_attn_func,
                 flash_attn_varlen_func,
             )
         except ImportError:
-            print("Flash attention 3 is not installed. Please install it to run fav3 backend. ")
-            raise
+            try:
+                from flash_attn.flash_attn_interface import (
+                    flash_attn_func,
+                    flash_attn_varlen_func,
+                )
+            except ImportError:
+                print("Flash attention 3 is not installed. Please install it to run fav3 backend. ")
+                raise
     else:
         print("Unknown backend " + backend)
         return None
