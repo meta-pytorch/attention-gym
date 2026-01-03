@@ -31,14 +31,13 @@ warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
 torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
 torch._dynamo.config.recompile_limit = 1000
 
-# IMPORTANT: Select backend via kernel_options={"BACKEND": "FLASH"} or "TRITON"
-# Using partial to pre-set the kernel_options for convenience
-flex_flash_compiled = torch.compile(
-    partial(flex_attention, kernel_options={"BACKEND": "FLASH"}), dynamic=False
-)
-flex_triton_compiled = torch.compile(
-    partial(flex_attention, kernel_options={"BACKEND": "TRITON"}), dynamic=False
-)
+
+def compile_flex(backend: Literal["FLASH", "TRITON"], *, dynamic: bool) -> Callable:
+    """Compile flex_attention with a fixed backend."""
+    return torch.compile(
+        partial(flex_attention, kernel_options={"BACKEND": backend}),
+        dynamic=dynamic,
+    )
 
 
 # =============================================================================
@@ -67,6 +66,9 @@ def compare_backends(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    flex_flash: Callable,
+    flex_triton: Callable,
     score_mod: Optional[Callable] = None,
     block_mask: Optional[BlockMask] = None,
     backward: bool = False,
@@ -95,7 +97,7 @@ def compare_backends(
             k.detach().requires_grad_(True),
             v.detach().requires_grad_(True),
         )
-        flash_out = flex_flash_compiled(
+        flash_out = flex_flash(
             q_flash, k_flash, v_flash, score_mod=score_mod, block_mask=block_mask
         )
         flash_out.backward(grad_out.to(flash_out.dtype))
@@ -105,7 +107,7 @@ def compare_backends(
             k.detach().requires_grad_(True),
             v.detach().requires_grad_(True),
         )
-        triton_out = flex_triton_compiled(
+        triton_out = flex_triton(
             q_triton, k_triton, v_triton, score_mod=score_mod, block_mask=block_mask
         )
         triton_out.backward(grad_out.to(triton_out.dtype))
@@ -128,15 +130,23 @@ def compare_backends(
     ref = flex_attention(
         q.float(), k.float(), v.float(), score_mod=score_mod, block_mask=block_mask
     ).to(q.dtype)
-    flash_out = flex_flash_compiled(q, k, v, score_mod=score_mod, block_mask=block_mask)
-    triton_out = flex_triton_compiled(q, k, v, score_mod=score_mod, block_mask=block_mask)
+    flash_out = flex_flash(q, k, v, score_mod=score_mod, block_mask=block_mask)
+    triton_out = flex_triton(q, k, v, score_mod=score_mod, block_mask=block_mask)
 
     flash_err = (flash_out - ref).abs().max().item()
     triton_err = (triton_out - ref).abs().max().item()
     return flash_err, triton_err, 0.0, 0.0
 
 
-def run_comparison(B=2, H=8, S=2048, D=64, dtype=torch.bfloat16):
+def run_comparison(
+    flex_flash: Callable,
+    flex_triton: Callable,
+    B=2,
+    H=8,
+    S=2048,
+    D=64,
+    dtype=torch.bfloat16,
+):
     """Compare Flash vs Triton numerical accuracy (forward and backward)."""
     print("\n=== NUMERICAL COMPARISON ===")
     print("Max absolute error vs FP32 reference:\n")
@@ -159,7 +169,14 @@ def run_comparison(B=2, H=8, S=2048, D=64, dtype=torch.bfloat16):
     results = []
     for name, score_mod, bm in tests:
         flash_fwd, triton_fwd, flash_bwd, triton_bwd = compare_backends(
-            q, k, v, score_mod=score_mod, block_mask=bm, backward=True
+            q,
+            k,
+            v,
+            flex_flash=flex_flash,
+            flex_triton=flex_triton,
+            score_mod=score_mod,
+            block_mask=bm,
+            backward=True,
         )
         results.append(
             [
@@ -184,7 +201,16 @@ def run_comparison(B=2, H=8, S=2048, D=64, dtype=torch.bfloat16):
 # =============================================================================
 
 
-def run_benchmark(B=4, H=32, S=8192, D=128, dtype=torch.bfloat16, use_mask=True):
+def run_benchmark(
+    flex_flash: Callable,
+    flex_triton: Callable,
+    B=4,
+    H=32,
+    S=8192,
+    D=128,
+    dtype=torch.bfloat16,
+    use_mask=True,
+):
     """Benchmark Flash vs Triton performance (forward and backward)."""
     print("\n=== PERFORMANCE BENCHMARK ===\n")
 
@@ -215,18 +241,18 @@ def run_benchmark(B=4, H=32, S=8192, D=128, dtype=torch.bfloat16, use_mask=True)
     grad_out = torch.randn(B, H, S, D, device=device, dtype=dtype)
 
     def run_flash_fwd():
-        return flex_flash_compiled(q, k, v, block_mask=block_mask)
+        return flex_flash(q, k, v, block_mask=block_mask)
 
     def run_triton_fwd():
-        return flex_triton_compiled(q, k, v, block_mask=block_mask)
+        return flex_triton(q, k, v, block_mask=block_mask)
 
     prev_donated_buffer = torch._functorch.config.donated_buffer
     torch._functorch.config.donated_buffer = False
 
     q_flash, k_flash, v_flash = make_qkv()
     q_triton, k_triton, v_triton = make_qkv()
-    flash_out = flex_flash_compiled(q_flash, k_flash, v_flash, block_mask=block_mask)
-    triton_out = flex_triton_compiled(q_triton, k_triton, v_triton, block_mask=block_mask)
+    flash_out = flex_flash(q_flash, k_flash, v_flash, block_mask=block_mask)
+    triton_out = flex_triton(q_triton, k_triton, v_triton, block_mask=block_mask)
 
     def run_flash_bwd():
         return torch.autograd.grad(
@@ -336,6 +362,7 @@ def main(
     H: int = 8,
     S: int = 2048,
     D: int = 64,
+    dynamic: bool = False,
 ):
     """
     FlexAttention with Flash Backend demo.
@@ -356,14 +383,17 @@ def main(
     if not available:
         return
 
+    flex_flash_compiled = compile_flex("FLASH", dynamic=dynamic)
+    flex_triton_compiled = compile_flex("TRITON", dynamic=dynamic)
+
     if mode in ("all", "compare"):
-        run_comparison(B, H, S, D)
+        run_comparison(flex_flash_compiled, flex_triton_compiled, B, H, S, D)
 
     if mode in ("all",):
         print_limitations()
 
     if mode in ("all", "benchmark"):
-        run_benchmark(B=4, H=32, S=8192, D=128)
+        run_benchmark(flex_flash_compiled, flex_triton_compiled, B=4, H=32, S=8192, D=128)
 
 
 if __name__ == "__main__":
