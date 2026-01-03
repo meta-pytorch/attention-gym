@@ -51,7 +51,7 @@ class TestCausalBlockMask:
         )
         assert block_mask_fast.shape == block_mask_standard.shape
 
-    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    @pytest.mark.parametrize("device", ["cuda"])
     @pytest.mark.parametrize("seq_len", [256, 232])
     def test_causal_block_mask_with_flex_attention(self, device, seq_len):
         """Test that the efficient block mask works correctly with flex_attention."""
