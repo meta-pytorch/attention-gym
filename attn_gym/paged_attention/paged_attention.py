@@ -242,7 +242,7 @@ class PagedAttention:
                 .to(torch.int32)
             )
 
-        new_mask_mod = self.get_mask_mod(block_mask.mask_mod)
+        new_mask_mod = self.get_mask_mod(block_mask.mask_mod, batch_idx=batch_idx)
 
         seq_lengths = (block_mask.seq_lengths[0], self.n_pages * self.page_size)
         return BlockMask.from_kv_blocks(
@@ -255,13 +255,18 @@ class PagedAttention:
             seq_lengths=seq_lengths,
         )
 
-    def get_mask_mod(self, mask_mod: Optional[_mask_mod_signature]) -> _mask_mod_signature:
+    def get_mask_mod(
+        self,
+        mask_mod: Optional[_mask_mod_signature],
+        batch_idx: Optional[torch.Tensor] = None
+    ) -> _mask_mod_signature:
         """
         Converts a mask_mod based on mapping from the physical block index to the logical
         block index.
 
         Args:
             mask_mod (_mask_mod_signature): mask_mod based on the logical block index.
+            batch_idx (Tensor): batch index corresponding to the mask_mod
         """
         if mask_mod is None:
             mask_mod = noop_mask
@@ -274,7 +279,10 @@ class PagedAttention:
         ):
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
-            logical_block_idx = self.physical_to_logical[b, physical_kv_block]
+            if batch_idx is not None:
+                logical_block_idx = self.physical_to_logical[batch_idx[b], physical_kv_block]
+            else:
+                logical_block_idx = self.physical_to_logical[b, physical_kv_block]
             logical_kv_idx = logical_block_idx * self.page_size + physical_kv_offset
             return torch.where(
                 logical_block_idx >= 0, mask_mod(b, h, q_idx, logical_kv_idx), False
@@ -282,13 +290,18 @@ class PagedAttention:
 
         return new_mask_mod
 
-    def get_score_mod(self, score_mod: Optional[_score_mod_signature]) -> _score_mod_signature:
+    def get_score_mod(
+        self,
+        score_mod: Optional[_score_mod_signature],
+        batch_idx: Optional[torch.Tensor] = None
+    ) -> _score_mod_signature:
         """
         Converts a score_mod based on mapping from the physical block index to the logical
         block index.
 
         Args:
             score_mod (_score_mod_signature): score_mod based on the logical block index.
+            batch_idx (Tensor): batch index corresponding to the score_mod
         """
         if score_mod is None:
             score_mod = _identity
@@ -302,7 +315,10 @@ class PagedAttention:
         ):
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
-            logical_block_idx = self.physical_to_logical[b, physical_kv_block]
+            if batch_idx is not None:
+                logical_block_idx = self.physical_to_logical[batch_idx[b], physical_kv_block]
+            else:
+                logical_block_idx = self.physical_to_logical[b, physical_kv_block]
             logical_kv_idx = logical_block_idx * self.page_size + physical_kv_offset
             return torch.where(
                 logical_block_idx >= 0,

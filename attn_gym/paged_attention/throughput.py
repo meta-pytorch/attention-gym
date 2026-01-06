@@ -110,7 +110,10 @@ class Server:
         converted_block_mask = self.paged_attention.convert_logical_block_mask(
             new_block_mask, torch.tensor([batch_idx], device="cuda")
         )
-        converted_score_mod = self.paged_attention.get_score_mod(_identity)
+        converted_score_mod = self.paged_attention.get_score_mod(
+            _identity, 
+            torch.tensor([batch_idx], device="cuda")
+        )
 
         prefill_input_pos = torch.arange(prompt_len, device="cuda").view(1, -1)
         token_embedding = self.model(
@@ -173,7 +176,7 @@ class Server:
         input_pos = self.input_pos[batch_idx]  # [B]
         mask = self.get_decode_mask(batch_idx, input_pos)
         converted_block_mask = self.paged_attention.convert_logical_block_mask(mask, batch_idx)
-        converted_score_mod = self.paged_attention.get_score_mod(_identity)
+        converted_score_mod = self.paged_attention.get_score_mod(_identity, batch_idx=batch_idx)
         self.token_embedding[batch_idx] = self.model(
             batch_idx,
             input_pos.view(B, 1),
