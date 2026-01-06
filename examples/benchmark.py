@@ -50,7 +50,7 @@ torch._dynamo.config.cache_size_limit = 1000
 flex_attention = torch.compile(flex_attention, dynamic=False)
 
 # For better performance, you can use:
-# flex_attention = torch.compile(_flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+# flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 data_type = torch.float16
 
