@@ -270,6 +270,11 @@ class PagedAttention:
         """
         if mask_mod is None:
             mask_mod = noop_mask
+        
+        if batch_idx is not None:
+            physical_to_logical = self.physical_to_logical[batch_idx]
+        else:
+            physical_to_logical = self.physical_to_logical
 
         def new_mask_mod(
             b: torch.Tensor,
@@ -279,10 +284,7 @@ class PagedAttention:
         ):
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
-            if batch_idx is not None:
-                logical_block_idx = self.physical_to_logical[batch_idx[b], physical_kv_block]
-            else:
-                logical_block_idx = self.physical_to_logical[b, physical_kv_block]
+            logical_block_idx = physical_to_logical[b, physical_kv_block]
             logical_kv_idx = logical_block_idx * self.page_size + physical_kv_offset
             return torch.where(
                 logical_block_idx >= 0, mask_mod(b, h, q_idx, logical_kv_idx), False
@@ -305,6 +307,11 @@ class PagedAttention:
         """
         if score_mod is None:
             score_mod = _identity
+        
+        if batch_idx is not None:
+            physical_to_logical = self.physical_to_logical[batch_idx]
+        else:
+            physical_to_logical = self.physical_to_logical
 
         def new_score_mod(
             score: torch.Tensor,
@@ -315,10 +322,7 @@ class PagedAttention:
         ):
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
-            if batch_idx is not None:
-                logical_block_idx = self.physical_to_logical[batch_idx[b], physical_kv_block]
-            else:
-                logical_block_idx = self.physical_to_logical[b, physical_kv_block]
+            logical_block_idx = physical_to_logical[b, physical_kv_block]
             logical_kv_idx = logical_block_idx * self.page_size + physical_kv_offset
             return torch.where(
                 logical_block_idx >= 0,
