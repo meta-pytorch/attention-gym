@@ -256,9 +256,7 @@ class PagedAttention:
         )
 
     def get_mask_mod(
-        self,
-        mask_mod: Optional[_mask_mod_signature],
-        batch_idx: Optional[torch.Tensor] = None
+        self, mask_mod: Optional[_mask_mod_signature], batch_idx: Optional[torch.Tensor] = None
     ) -> _mask_mod_signature:
         """
         Converts a mask_mod based on mapping from the physical block index to the logical
@@ -270,7 +268,7 @@ class PagedAttention:
         """
         if mask_mod is None:
             mask_mod = noop_mask
-        
+
         if batch_idx is not None:
             physical_to_logical = self.physical_to_logical[batch_idx]
         else:
@@ -293,9 +291,7 @@ class PagedAttention:
         return new_mask_mod
 
     def get_score_mod(
-        self,
-        score_mod: Optional[_score_mod_signature],
-        batch_idx: Optional[torch.Tensor] = None
+        self, score_mod: Optional[_score_mod_signature], batch_idx: Optional[torch.Tensor] = None
     ) -> _score_mod_signature:
         """
         Converts a score_mod based on mapping from the physical block index to the logical
@@ -307,7 +303,7 @@ class PagedAttention:
         """
         if score_mod is None:
             score_mod = _identity
-        
+
         if batch_idx is not None:
             physical_to_logical = self.physical_to_logical[batch_idx]
         else:

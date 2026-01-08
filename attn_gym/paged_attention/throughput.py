@@ -111,8 +111,7 @@ class Server:
             new_block_mask, torch.tensor([batch_idx], device="cuda")
         )
         converted_score_mod = self.paged_attention.get_score_mod(
-            _identity, 
-            torch.tensor([batch_idx], device="cuda")
+            _identity, torch.tensor([batch_idx], device="cuda")
         )
 
         prefill_input_pos = torch.arange(prompt_len, device="cuda").view(1, -1)
