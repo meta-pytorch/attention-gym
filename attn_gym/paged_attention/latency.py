@@ -87,7 +87,7 @@ def benchmark(
 
     # Score mod
     score_mod = generate_score_mod(attn_type)
-    converted_score_mod = paged_attention.get_score_mod(score_mod)
+    converted_score_mod = paged_attention.get_score_mod(score_mod, batch_idx=batch_idx)
 
     benchmark_layer(
         bsz,
