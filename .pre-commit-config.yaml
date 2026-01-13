@@ -1,5 +1,5 @@
-# See https://pre-commit.com for more information
-# See https://pre-commit.com/hooks.html for more hooks
+# https://github.com/j178/prek - compatible with pre-commit hooks
+# See https://pre-commit.com/hooks.html for available hooks
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.4.0
