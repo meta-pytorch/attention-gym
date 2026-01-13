@@ -19,6 +19,7 @@ import warnings
 from functools import partial
 from typing import Callable, Optional, Literal
 
+from tqdm import tqdm
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 from torch._inductor.utils import do_bench_using_profiling
 from tabulate import tabulate
@@ -159,15 +160,17 @@ def run_comparison(
     block_size = get_flash_block_size(device)
     causal_bm = create_block_mask(causal_mask, B, H, S, S, device=device, BLOCK_SIZE=block_size)
 
+    # (name, score_mod, block_mask, captures_scalars)
+    # captures_scalars=True means score_mod captures Python scalars (use dynamic=False)
     tests = [
-        ("No mod", None, None),
-        ("Causal", None, causal_bm),
-        ("ALiBi", generate_alibi_bias(H), None),
-        ("Softcap", generate_tanh_softcap(30), None),
+        ("No mod", None, None, False),
+        ("Causal", None, causal_bm, False),
+        ("ALiBi", generate_alibi_bias(H), None, True),
+        ("Softcap", generate_tanh_softcap(30), None, True),
     ]
 
     results = []
-    for name, score_mod, bm in tests:
+    for name, score_mod, bm, captures_scalars in tqdm(tests):
         flash_fwd, triton_fwd, flash_bwd, triton_bwd = compare_backends(
             q,
             k,
@@ -240,6 +243,7 @@ def run_benchmark(
     q, k, v = make_qkv()
     grad_out = torch.randn(B, H, S, D, device=device, dtype=dtype)
 
+    # Benchmark uses causal mask only (no captured scalars) -> use dynamic variants
     def run_flash_fwd():
         return flex_flash(q, k, v, block_mask=block_mask)
 
@@ -347,7 +351,19 @@ PERFORMANCE:
       you can use get_flash_block_size() to auto-detect, or you'll get:
       ValueError: mask_block_cnt shape mismatch with the default Q_BLOCK_SIZE of 128 in the forward.
 
-  - Dynamic shapes is not setup correctly in inductor. Will be soon.
+DYNAMIC:
+  - Dynamic tensor shapes (B, H, S, D): ✓ Supported
+      Symbols from tensor size/stride (TensorPropertySource) resolve at runtime.
+
+  - Captured dynamic scalars in score_mod/mask_mod: ✗ Not supported with dynamic=True
+      The FLASH backend cannot inline captured scalar symbolic values into the CuteDSL template.
+
+      Example - softcap captures `soft_cap` in closure:
+          def tanh_softcap(score, b, h, q_idx, kv_idx):
+              return soft_cap * tanh(score / soft_cap)  # soft_cap becomes symbolic!
+
+      Workaround: Use dynamic=False for score_mods with captured scalars.
+      This script demonstrates both patterns - see flex_*_dynamic vs flex_*_static.
 """)
 
 
