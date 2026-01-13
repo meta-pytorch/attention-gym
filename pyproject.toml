@@ -23,14 +23,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pre-commit==3.6.0",
+    "prek",
     "bumpver",
     "pip-tools",
     "pytest",
     "ruff",
     "jsonargparse",
     "docstring-parser",
-    "pytest",
     "numpy"
 ]
 
