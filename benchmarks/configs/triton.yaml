@@ -8,7 +8,7 @@ dtype: "bfloat16"
 
 # Shape parameters
 b: [4]  # batch sizes
-nh: ["16, 16", ]  # [query_heads,key_value_heads]
+nh: ["16, 4", "16, 16"]   # [query_heads,key_value_heads]
 s: [2048, 4096, 8192, 16384, 32768]  # sequence lengths
 d: [64, 128]  # head dimensions
 
@@ -16,8 +16,8 @@ d: [64, 128]  # head dimensions
 mods: ["noop", "causal", "alibi", "sliding_window", "document_mask"]
 
 # Backend and optimization
-backend: []
-max_autotune: True
+backend: ["cudnn"]
+max_autotune: true
 
 # Decoding and cache settings
 decoding: false
