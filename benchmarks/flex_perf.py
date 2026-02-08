@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention import sdpa_kernel, SDPBackend, activate_flash_attention_impl
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask,
@@ -68,7 +68,7 @@ def safe_backend(backend_name=None):
 
 
 # Type definitions
-Backend = Literal["math", "efficient", "cudnn", "fav2", "fav3", "fakv", "og-eager"]
+Backend = Literal["math", "efficient", "cudnn", "fav2", "fav3", "fav4", "fakv", "og-eager"]
 AttentionType = Literal[
     "noop",
     "causal",
@@ -502,6 +502,9 @@ def run_single_experiment(
         enable_gqa=True,
         kernel_options=kernel_options,
     )
+
+    if "fav4" in config.backends:
+        activate_flash_attention_impl("FA4")
 
     results = {}
     for backend in config.backends:
@@ -1017,6 +1020,7 @@ def get_backend_context(backend: Backend):
         "math": sdpa_kernel(SDPBackend.MATH),
         "efficient": sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION),
         "fav3": nullcontext(),
+        "fav4": sdpa_kernel(SDPBackend.FLASH_ATTENTION),
         "fakv": nullcontext(),
         "og-eager": nullcontext(),
     }
