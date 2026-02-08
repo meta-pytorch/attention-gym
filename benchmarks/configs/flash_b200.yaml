@@ -13,7 +13,7 @@ s: [2048, 4096, 8192, 16384, 32768]  # sequence lengths
 d: [64, 128]  # head dimensions
 
 # Attention types to benchmark
-mods: [ "causal", ]
+mods: ["noop", "causal", "alibi", "sliding_window", "document_mask"]
 
 # Backend and optimization
 backend: ["fav4"]
