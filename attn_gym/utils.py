@@ -91,7 +91,7 @@ def visualize_attention_scores(
     batch_idx: int = 0,
     head_idx: int = 0,
     scale: Optional[float] = None,
-):
+) -> None:
     """
     Generate and save a visualization of attention scores.
 

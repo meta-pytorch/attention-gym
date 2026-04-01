@@ -1,0 +1,212 @@
+/* ── Frontier Editorial: Attention Gym ── */
+
+:root {
+  --md-primary-fg-color: #0e0e0e;
+  --accent-green: #6f8f7b;
+  --accent-green-dim: #5f7f67;
+  --rule-color: #202020;
+}
+
+/* ── Dark scheme overrides ── */
+
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #0e0e0e;
+  --md-default-fg-color: #d4d4d4;
+  --md-default-fg-color--light: #999;
+  --md-default-fg-color--lighter: #666;
+  --md-typeset-color: #d4d4d4;
+  --md-accent-fg-color: #6f8f7b;
+  --md-code-bg-color: #161616;
+  --md-code-fg-color: #c8c8c8;
+  --md-footer-bg-color: #0a0a0a;
+  --md-footer-fg-color: #999;
+}
+
+[data-md-color-scheme="slate"] .md-header {
+  background-color: #0a0a0a;
+  border-bottom: 1px solid #1a1a1a;
+}
+
+[data-md-color-scheme="slate"] .md-tabs {
+  background-color: #0a0a0a;
+  border-bottom: 1px solid #1a1a1a;
+}
+
+[data-md-color-scheme="slate"] .md-nav__link--active,
+[data-md-color-scheme="slate"] .md-nav__link:hover {
+  color: #6f8f7b;
+}
+
+/* ── Light scheme overrides ── */
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #f4f0e8;
+  --md-default-fg-color: #1a2e22;
+  --md-default-fg-color--light: #3a4a3e;
+  --md-default-fg-color--lighter: #6a7a6e;
+  --md-typeset-color: #1a2e22;
+  --md-accent-fg-color: #5f7f67;
+  --md-code-bg-color: #eae6de;
+  --md-code-fg-color: #1a2e22;
+  --md-footer-bg-color: #e8e4dc;
+  --md-footer-fg-color: #3a4a3e;
+}
+
+[data-md-color-scheme="default"] .md-header {
+  background-color: #ece8e0;
+  border-bottom: 1px solid #d8d4cc;
+  color: #1a2e22;
+}
+
+[data-md-color-scheme="default"] .md-header__topic {
+  color: #1a2e22;
+}
+
+[data-md-color-scheme="default"] .md-tabs {
+  background-color: #ece8e0;
+  border-bottom: 1px solid #d8d4cc;
+}
+
+[data-md-color-scheme="default"] .md-search__input {
+  background-color: #e4e0d8;
+}
+
+/* ── Typography ── */
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.4em;
+}
+
+.md-typeset h2 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 2.4em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--rule-color);
+}
+
+[data-md-color-scheme="default"] .md-typeset h2 {
+  border-bottom-color: #d0ccc4;
+}
+
+.md-typeset h3 {
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+/* ── Code blocks ── */
+
+.md-typeset pre {
+  border-radius: 2px;
+  border: 1px solid #1a1a1a;
+}
+
+[data-md-color-scheme="default"] .md-typeset pre {
+  border-color: #d0ccc4;
+}
+
+.md-typeset code {
+  border-radius: 2px;
+  font-size: 0.82em;
+  padding: 0.1em 0.3em;
+}
+
+/* ── Tables ── */
+
+.md-typeset table:not([class]) {
+  font-size: 0.82rem;
+  border: 1px solid #1a1a1a;
+}
+
+[data-md-color-scheme="default"] .md-typeset table:not([class]) {
+  border-color: #d0ccc4;
+}
+
+.md-typeset table:not([class]) th {
+  font-weight: 600;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ── Admonitions ── */
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 2px;
+  border-left-width: 3px;
+  font-size: 0.88rem;
+}
+
+/* ── Navigation ── */
+
+.md-nav__link {
+  font-size: 0.84rem;
+}
+
+.md-sidebar--secondary .md-nav__link {
+  font-size: 0.78rem;
+}
+
+/* ── Footer ── */
+
+.md-footer-meta {
+  border-top: 1px solid #1a1a1a;
+}
+
+[data-md-color-scheme="default"] .md-footer-meta {
+  border-top-color: #d0ccc4;
+}
+
+/* ── Content width ── */
+
+.md-grid {
+  max-width: 72rem;
+}
+
+/* ── Permalink anchors ── */
+
+.md-typeset .headerlink {
+  color: var(--accent-green-dim);
+  opacity: 0.4;
+}
+
+.md-typeset .headerlink:hover {
+  opacity: 1;
+  color: var(--accent-green);
+}
+
+/* ── API docs (mkdocstrings) ── */
+
+.doc-heading {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.9rem;
+}
+
+.doc-param-details {
+  font-size: 0.84rem;
+}
+
+/* ── Site logo ── */
+
+.md-header__button.md-logo img {
+  height: 1.6rem;
+  width: auto;
+  border-radius: 2px;
+}
+
+/* ── Hero image on index ── */
+
+.md-typeset img[alt="Attention Gym"] {
+  max-width: 100%;
+  border-radius: 4px;
+  border: 1px solid #1a1a1a;
+  margin-bottom: 1.2rem;
+}
+
+[data-md-color-scheme="default"] .md-typeset img[alt="Attention Gym"] {
+  border-color: #d0ccc4;
+}
