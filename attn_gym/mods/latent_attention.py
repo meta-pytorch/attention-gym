@@ -18,8 +18,8 @@ def generate_mla_rope_score_mod(
     """Returns an MLA RoPE score modification function to be used w/ FlexAttention
 
     Args:
-        query_pe: Positional embeddings for queries [batch, num_heads, seq_len, head_dim]
-        key_pe: Positional embeddings for keys [batch, num_heads//128, seq_len, head_dim]
+        query_rope: Positional embeddings for queries [batch, num_heads, seq_len, head_dim]
+        key_rope: Positional embeddings for keys [batch, num_heads//128, seq_len, head_dim]
         num_heads: The number of query heads
         scale: Scaling factor for the positional embedding contribution
 

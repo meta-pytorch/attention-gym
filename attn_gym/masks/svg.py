@@ -63,7 +63,6 @@ def generate_temporal_head_mask_mod(
         num_frames: The number of frames in the video.
         token_per_frame: The number of tokens per frame.
         width: The width of the temporal head mask, determine the number of frames that can be attended.
-        round_width: The number to round to for better hardware utilization, usually set to 128.
     """
 
     def get_token_id_in_frame(idx, prompt_length):

@@ -2,6 +2,7 @@
 
 Attention Gym is a collection of helpful tools and examples for working with [flex-attention](https://pytorch.org/docs/main/nn.attention.flex_attention.html#module-torch.nn.attention.flex_attention)
 
+[**📚 Docs**](https://meta-pytorch.github.io/attention-gym/) |
 [**🎯 Features**](#-features) |
 [**🚀 Getting Started**](#-getting-started) |
 [**💻 Usage**](#-usage) |

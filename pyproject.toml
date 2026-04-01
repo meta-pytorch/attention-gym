@@ -43,6 +43,12 @@ viz = [
     "marimo",
 ]
 
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    "numpy",
+]
+
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]
 source = "vcs"

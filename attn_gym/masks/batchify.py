@@ -10,8 +10,8 @@ def batchify_mask_mod(mask_mod: _mask_mod_signature, batchify_size: int) -> _mas
     """Given arbirary mask_mod, batchify it to only allow attention within the same batch.
 
     Args:
-        mask_mod: The mask mod to apply to the documents
-        batch_size: The number of tokens in each batch.
+        mask_mod: The mask mod to apply within each batch.
+        batchify_size: The number of tokens in each batch.
     """
 
     def batched_mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor):
