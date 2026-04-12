@@ -79,14 +79,14 @@ python examples/flex_determinism.py
 
 Tests forward and backward determinism across configurations (eager, inductor default, forced reduction filtering) with shapes covering standard attention, decode, GQA, and long-context scenarios.
 
-## Standalone Backward Call
+## Ring Attention
 
-[`examples/standalone_backwards_call.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/standalone_backwards_call.py) — Build a custom attention op using FlexAttention's forward and backward primitives independently.
+[`examples/ring_attention.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/ring_attention.py) — Build a custom distributed ring-attention op by directly invoking FlexAttention's forward and backward primitives.
 
-Implements pseudo-ring attention: chunked forward passes with online softmax merging, then explicit backward using the merged LSE. Demonstrates the pattern for real ring attention where KV chunks arrive via communication.
+Implements a generic single-node ring-attention example launched with `torchrun`. Each rank owns a contiguous sequence shard of `q/k/v`, rotates `k/v` with point-to-point communication, merges the local `(out, lse)` online, then routes `dk/dv` contributions back to the owning rank by circulating gradient accumulators with each shard in backward. The script validates local slices and gathered outputs and gradients against a single-process causal reference.
 
 ```bash
-python examples/standalone_backwards_call.py
+torchrun --standalone --nproc_per_node=4 examples/ring_attention.py --seq-len 131072
 ```
 
 ## Kernel Tuning
