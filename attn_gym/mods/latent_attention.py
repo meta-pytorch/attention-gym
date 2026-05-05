@@ -1,8 +1,4 @@
-"""Implementation of Multi-head Latent Attention (MLA) RoPE score modification from DeepSeek-V2.
-
-Reference: https://arxiv.org/pdf/2405.04434 - DeepSeek-V2: A Strong, Economical, and
-Efficient Mixture-of-Experts Language Model
-"""
+"""Multi-head Latent Attention RoPE score modification from DeepSeek-V2."""
 
 import torch
 from torch import Tensor
@@ -15,16 +11,16 @@ def generate_mla_rope_score_mod(
     num_heads: int,
     scale: float = 1.0,
 ) -> _score_mod_signature:
-    """Returns an MLA RoPE score modification function to be used w/ FlexAttention
+    """Return an MLA RoPE score modification function for FlexAttention.
 
     Args:
-        query_rope: Positional embeddings for queries [batch, num_heads, seq_len, head_dim]
-        key_rope: Positional embeddings for keys [batch, num_heads//128, seq_len, head_dim]
-        num_heads: The number of query heads
-        scale: Scaling factor for the positional embedding contribution
+        query_rope: Query positional embeddings with shape ``(B, H, T, D)``.
+        key_rope: Key positional embeddings with shape ``(B, H_kv, T, D)``.
+        num_heads: Number of query heads.
+        scale: Scaling factor for the positional embedding contribution.
 
     Returns:
-        mla_rope_score_mod: Score modification function for FlexAttention
+        Score modification function for FlexAttention.
     """
 
     def mla_rope_score_mod(
@@ -42,29 +38,23 @@ def main(device: str = "cuda"):
     """Visualize the attention scores with MLA RoPE modification.
 
     Args:
-        device: Device to use for computation
+        device: Device to use for computation.
     """
     from attn_gym import visualize_attention_scores
 
-    # Example dimensions
     B, H, SEQ_LEN, LATENT_HEAD_DIM = 1, 128, 8, 512
     ROPE_HEAD_DIM = 64
 
-    # Create random tensors for visualization
     query = torch.rand(B, H, SEQ_LEN, LATENT_HEAD_DIM, device=device)
-
     key = torch.rand(B, 1, SEQ_LEN, LATENT_HEAD_DIM, device=device)
 
-    # Create positional embeddings
     query_pe = torch.rand(B, H, SEQ_LEN, ROPE_HEAD_DIM, device=device)
     key_pe = torch.rand(B, 1, SEQ_LEN, ROPE_HEAD_DIM, device=device)
 
-    # Generate the score modification function
     mla_rope_score_mod = generate_mla_rope_score_mod(
         query_rope=query_pe, key_rope=key_pe, num_heads=H
     )
 
-    # Visualize attention scores with MLA RoPE modification
     visualize_attention_scores(
         query, key, score_mod=mla_rope_score_mod, device=device, name="mla_rope_score_mod"
     )
