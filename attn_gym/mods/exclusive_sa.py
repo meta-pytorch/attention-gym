@@ -1,18 +1,8 @@
 from __future__ import annotations
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-
-try:
-    from torch.nn.attention.flex_attention import flex_attention
-
-    HAS_FLEX_ATTENTION = True
-except ImportError:
-    HAS_FLEX_ATTENTION = False
-
-
+from torch.nn.attention.flex_attention import flex_attention
 def exclusive_output_mod(Y: Tensor, V: Tensor) -> Tensor:
     """Remove each attention output vector's projection onto its value vector."""
     v_sq_norm = (V * V).sum(dim=-1, keepdim=True)
@@ -88,24 +78,6 @@ class XSAMultiheadAttention(nn.Module):
         Q = self._split_heads(self.W_q(x))
         K = self._split_heads(self.W_k(x))
         V = self._split_heads(self.W_v(x))
-
-        if HAS_FLEX_ATTENTION and (score_mod is not None or block_mask is not None):
-            Y = flex_attention(
-                Q,
-                K,
-                V,
-                score_mod=score_mod,
-                block_mask=block_mask,
-            )
-        else:
-            dp = self.dropout if self.training else 0.0
-            Y = F.scaled_dot_product_attention(
-                Q,
-                K,
-                V,
-                dropout_p=dp,
-                is_causal=is_causal,
-            )
-
+        Y = flex_attention(Q, K, V, score_mod=score_mod, block_mask=block_mask)
         Z = exclusive_output_mod(Y, V)
         return self.W_o(self._merge_heads(Z))
