@@ -31,6 +31,31 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     return time * 1e3
 
 
+def merge_attention(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    other_out: torch.Tensor,
+    other_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two attention outputs computed over disjoint KV sets.
+
+    Args:
+        lse: Log-sum-exp as returned by public ``flex_attention`` with
+            ``return_aux=AuxRequest(lse=True)``.
+        other_lse: Log-sum-exp in the same domain as ``lse``.
+    """
+    lse = lse.unsqueeze(-1)
+    other_lse = other_lse.unsqueeze(-1)
+    max_lse = torch.maximum(lse, other_lse)
+    exp_lse = torch.exp(lse - max_lse)
+    exp_other_lse = torch.exp(other_lse - max_lse)
+    denom = exp_lse + exp_other_lse
+    return (
+        (out * exp_lse + other_out * exp_other_lse) / denom,
+        (max_lse + torch.log(denom)).squeeze(-1),
+    )
+
+
 def create_score_mod(
     query: torch.Tensor,
     key: torch.Tensor,
