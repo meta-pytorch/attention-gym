@@ -60,6 +60,25 @@ def generate_doc_mask_mod(mask_mod: _mask_mod_signature, offsets: Tensor) -> _ma
     return doc_mask_mod
 
 
+def generate_packed_causal_doc_mask_mod(offsets: Tensor) -> _mask_mod_signature:
+    """Generates a causal document mask for packed sequences sharing one offset layout.
+
+    Args:
+        offsets: Cumulative document token counts with shape ``(num_documents + 1,)``.
+
+    Note:
+        This is equivalent to ``generate_doc_mask_mod(causal_mask, offsets)`` for packed
+        causal attention, but expresses each query row as one contiguous KV interval.
+    """
+    document_id = _offsets_to_doc_ids_tensor(offsets)
+
+    def doc_causal_mask_mod(b, h, q_idx, kv_idx):
+        doc_start = offsets[document_id[q_idx]]
+        return (kv_idx >= doc_start) & causal_mask(b, h, q_idx, kv_idx)
+
+    return doc_causal_mask_mod
+
+
 def generate_random_lengths(total_length, num_documents):
     # Initialize all lengths to 1 to ensure each document has at least one token
     lengths = [1] * num_documents

@@ -1,7 +1,7 @@
 from attn_gym.masks.causal import causal_mask
 from attn_gym.masks.sliding_window import generate_sliding_window
 from attn_gym.masks.prefix_lm import generate_prefix_lm_mask
-from attn_gym.masks.document_mask import generate_doc_mask_mod
+from attn_gym.masks.document_mask import generate_doc_mask_mod, generate_packed_causal_doc_mask_mod
 from attn_gym.masks.dilated_sliding_window import generate_dilated_sliding_window
 from attn_gym.masks.natten import generate_natten, generate_tiled_natten, generate_morton_natten
 from attn_gym.masks.sta import generate_sta_mask_mod_2d, generate_sta_mask_mod_3d
