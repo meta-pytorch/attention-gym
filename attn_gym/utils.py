@@ -22,6 +22,7 @@ from torch._inductor.utils import do_bench_using_profiling
 from collections.abc import Callable
 
 Tensor = torch.Tensor
+LN2 = math.log(2)
 
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -29,6 +30,40 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
     return time * 1e3
+
+
+def flex_attention_lse_to_merge_lse(
+    lse: torch.Tensor, kernel_options: dict[str, object] | None = None
+) -> torch.Tensor:
+    """Convert flex_attention AuxRequest LSE to the log domain used by merge_attention."""
+    if kernel_options is not None and kernel_options.get("BACKEND") == "FLASH":
+        return lse / LN2
+    return lse
+
+
+def merge_attention(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    other_out: torch.Tensor,
+    other_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two attention outputs computed over disjoint KV sets.
+
+    Args:
+        lse: Log-sum-exp in merge domain. Convert FLASH backend LSE with
+            ``flex_attention_lse_to_merge_lse`` before calling this function.
+        other_lse: Log-sum-exp in the same domain as ``lse``.
+    """
+    lse = lse.unsqueeze(-1)
+    other_lse = other_lse.unsqueeze(-1)
+    max_lse = torch.maximum(lse, other_lse)
+    exp_lse = torch.exp(lse - max_lse)
+    exp_other_lse = torch.exp(other_lse - max_lse)
+    denom = exp_lse + exp_other_lse
+    return (
+        (out * exp_lse + other_out * exp_other_lse) / denom,
+        (max_lse + torch.log(denom)).squeeze(-1),
+    )
 
 
 def create_score_mod(
