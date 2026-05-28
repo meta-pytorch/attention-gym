@@ -63,6 +63,21 @@ mask_mod = generate_doc_mask_mod(causal_mask, offsets)
 
 ::: attn_gym.masks.document_mask.generate_doc_mask_mod
 
+For causal packed sequences where every batch element shares the same document layout, use the
+causal-only offset form. It is equivalent to wrapping `causal_mask`, but exposes each query row as
+one contiguous KV interval.
+
+```python
+from attn_gym.masks import generate_packed_causal_doc_mask_mod
+from attn_gym.masks.document_mask import length_to_offsets
+
+lengths = [3, 2, 5]
+offsets = length_to_offsets(lengths, device="cuda")
+mask_mod = generate_packed_causal_doc_mask_mod(offsets)
+```
+
+::: attn_gym.masks.document_mask.generate_packed_causal_doc_mask_mod
+
 ## Neighborhood Attention (NATTEN)
 
 Multi-dimensional neighborhood attention patterns.
