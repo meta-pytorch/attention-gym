@@ -22,6 +22,7 @@ from attn_gym.masks import (
     generate_sliding_window,
     generate_prefix_lm_mask,
     generate_doc_mask_mod,
+    generate_sink_mask,
 )
 from attn_gym.mods import generate_alibi_bias, generate_tanh_softcap
 
@@ -38,6 +39,7 @@ AVAILABLE_EXAMPLES = {
     "softcap_approx": lambda: test_mask(
         score_mod=generate_tanh_softcap(30, approx=True), skip_correctness=True
     ),
+    "sink_attn": lambda: test_mask(mask_mod=generate_sink_mask(window_size=1024)),
 }
 
 
