@@ -1,8 +1,14 @@
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.mods.exclusive_sa import XSAMultiheadAttention, exclusive_output_mod
+from attn_gym.mods.exclusive_sa import exclusive_output_mod
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
+from xsa_attention import XSAMultiheadAttention
 
 
 @pytest.fixture

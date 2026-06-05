@@ -3,6 +3,7 @@
 import time
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -14,7 +15,60 @@ except ImportError:
     HAS_FLEX = False
     print("flex_attention not available; using SDPA fallback.")
 
-from attn_gym.mods.exclusive_sa import XSAMultiheadAttention, exclusive_output_mod
+from attn_gym.mods.exclusive_sa import exclusive_output_mod
+
+
+class XSAMultiheadAttention(nn.Module):
+    """Multi-head self-attention with exclusive output projection."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        self.dropout = dropout
+
+        self.W_q = nn.Linear(d_model, d_model, bias=bias)
+        self.W_k = nn.Linear(d_model, d_model, bias=bias)
+        self.W_v = nn.Linear(d_model, d_model, bias=bias)
+        self.W_o = nn.Linear(d_model, d_model, bias=bias)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        for m in [self.W_q, self.W_k, self.W_v, self.W_o]:
+            nn.init.xavier_uniform_(m.weight)
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        B, T, _ = x.shape
+        return x.reshape(B, T, self.num_heads, self.d_head).transpose(1, 2).contiguous()
+
+    def _merge_heads(self, x: Tensor) -> Tensor:
+        B, H, T, d = x.shape
+        return x.transpose(1, 2).reshape(B, T, H * d).contiguous()
+
+    def forward(
+        self,
+        x: Tensor,
+        score_mod=None,
+        block_mask=None,
+        is_causal: bool = True,
+    ) -> Tensor:
+        assert HAS_FLEX, "flex_attention is required for XSAMultiheadAttention"
+        Q = self._split_heads(self.W_q(x))
+        K = self._split_heads(self.W_k(x))
+        V = self._split_heads(self.W_v(x))
+        Y = flex_attention(Q, K, V, score_mod=score_mod, block_mask=block_mask)
+        Z = exclusive_output_mod(Y, V)
+        return self.W_o(self._merge_heads(Z))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}\n")
@@ -72,16 +126,13 @@ def example_composable():
     print("Example 2: XSA + ALiBi score_mod")
     print("=" * 60)
 
+    assert HAS_FLEX, "flex_attention is required for this example"
+
     Q, K, V = make_qkv(T=128)
 
-    if HAS_FLEX:
-        Y_alibi = flex_attention(Q, K, V, score_mod=alibi_score_mod)
-        Z_xsa_alibi = exclusive_output_mod(Y_alibi, V)
-        print("  XSA + ALiBi via flex_attention + output_mod:")
-    else:
-        Y_plain = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        Z_xsa_alibi = exclusive_output_mod(Y_plain, V)
-        print("  XSA with SDPA fallback:")
+    Y_alibi = flex_attention(Q, K, V, score_mod=alibi_score_mod)
+    Z_xsa_alibi = exclusive_output_mod(Y_alibi, V)
+    print("  XSA + ALiBi via flex_attention + output_mod:")
 
     cos = F.cosine_similarity(Z_xsa_alibi, V, dim=-1).abs()
     print(f"  Output shape:               {Z_xsa_alibi.shape}")
@@ -93,8 +144,6 @@ def example_module():
     print("=" * 60)
     print("Example 3: XSAMultiheadAttention module")
     print("=" * 60)
-
-    import torch.nn as nn
 
     d_model, num_heads, T = 256, 8, 64
     x = torch.randn(2, T, d_model, device=DEVICE)
