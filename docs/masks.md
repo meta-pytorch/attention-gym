@@ -47,6 +47,55 @@ mask_mod = generate_prefix_lm_mask(prefix_length=512)
 
 ::: attn_gym.masks.prefix_lm.generate_prefix_lm_mask
 
+## JetSpec Tree Attention
+
+Tree-verification attention for [JetSpec](https://arxiv.org/abs/2606.18394): each tree
+query attends to cached prefix keys and to flattened tree keys only when they are ancestors
+of that query node, including self. The example below uses the Figure 3 candidate-tree
+order: `return, a, -, +, B, b, sum`.
+
+```python
+from attn_gym.masks import build_tree_ancestor_matrix, generate_jetspec_tree_causal_mask_mod
+
+parent_indices = [-1, 0, 1, 1, 3, 3, 0]
+ancestor = build_tree_ancestor_matrix(parent_indices, device="cuda")
+mask_mod = generate_jetspec_tree_causal_mask_mod(prefix_length=1024, ancestor_matrix=ancestor)
+block_mask = create_block_mask(
+    mask_mod,
+    B,
+    H,
+    ancestor.shape[0],
+    1024 + ancestor.shape[0],
+    device="cuda",
+)
+```
+
+::: attn_gym.masks.jetspec.build_tree_ancestor_matrix
+
+::: attn_gym.masks.jetspec.generate_jetspec_tree_causal_mask_mod
+
+JetSpec's draft-head training path uses a different multi-block causal mask: sampled-block
+queries attend to all verified prefix keys and causally within their own sampled block.
+
+```python
+from attn_gym.masks import generate_jetspec_training_mask_mod
+
+prefix_length = 4096
+block_size = 16
+num_blocks = 3
+mask_mod = generate_jetspec_training_mask_mod(prefix_length, block_size)
+block_mask = create_block_mask(
+    mask_mod,
+    B,
+    H,
+    num_blocks * block_size,
+    prefix_length + num_blocks * block_size,
+    device="cuda",
+)
+```
+
+::: attn_gym.masks.jetspec.generate_jetspec_training_mask_mod
+
 ## Document Mask
 
 For packed sequences: restrict attention to within document boundaries by wrapping a base
