@@ -11,3 +11,22 @@ from attn_gym.masks.jetspec import (
     generate_jetspec_training_mask_mod,
     generate_jetspec_tree_causal_mask_mod,
 )
+from attn_gym.masks.vsa import (
+    VSACoarseResult,
+    VSATileMetadata,
+    compute_vsa_coarse_attention,
+    compute_vsa_tile_scores,
+    compute_vsa_topk_indices,
+    create_vsa_block_mask,
+    create_vsa_flash_block_mask,
+    create_vsa_tile_metadata,
+    generate_vsa_mask_mod,
+    lift_vsa_tile_output,
+    pool_to_vsa_tiles,
+    tile_vsa_sequence,
+    untile_vsa_sequence,
+    vsa_additive_combine,
+    vsa_gated_mix,
+    validate_vsa_block_mask_inputs,
+    vsa_topk_from_sparsity,
+)

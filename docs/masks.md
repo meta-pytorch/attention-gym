@@ -143,6 +143,36 @@ Multi-dimensional neighborhood attention patterns.
 
 ::: attn_gym.masks.sta.generate_sta_mask_mod_3d
 
+## VSA (Video Sparse Attention)
+
+VSA's fine sparse pass can be represented by precomputing each query tile's top-k KV
+tiles and turning those tile ids into a `BlockMask`. Use `create_vsa_block_mask` for
+the direct Triton construction path; deriving the same mask with generic
+`create_block_mask` is intended only for visualization or small correctness checks.
+For current Flex FLASH all-full tile paths, use `create_vsa_flash_block_mask`. The
+coarse top-k selection and FastVideo-style additive coarse/fine output combine run
+outside the FlexAttention kernel.
+
+```python
+from attn_gym.masks import compute_vsa_coarse_attention, create_vsa_block_mask
+
+coarse = compute_vsa_coarse_attention(q, k, v, tile_numel=64, top_k=78)
+block_mask = create_vsa_block_mask(
+    coarse.topk_indices,
+    tile_numel=64,
+    num_kv_tiles=k.shape[-2] // 64,
+)
+out = flex_attention(q, k, v, block_mask=block_mask)
+```
+
+::: attn_gym.masks.vsa.compute_vsa_coarse_attention
+
+::: attn_gym.masks.vsa.create_vsa_block_mask
+
+::: attn_gym.masks.vsa.create_vsa_flash_block_mask
+
+::: attn_gym.masks.vsa.generate_vsa_mask_mod
+
 ## Batchify
 
 Groups tokens into batches where attention is only allowed within the same group.
