@@ -550,6 +550,7 @@ def create_vsa_flash_block_mask(
     topk_indices: Tensor,
     tile_numel: int,
     num_kv_tiles: int,
+    kv_block_size: int = 128,
 ) -> BlockMask:
     """Build the all-full-block VSA mask representation required by Flex FLASH.
 
@@ -557,6 +558,11 @@ def create_vsa_flash_block_mask(
         topk_indices: Selected KV tile ids with shape ``(B, H, Q_TILES, TOP_K)``.
         tile_numel: Number of fine tokens in one VSA tile.
         num_kv_tiles: Total number of KV tiles before top-k pruning.
+        kv_block_size: KV block size of the returned mask. FA4 requires this to
+            equal its KV tile size (``tile_n``, 128 on SM100 for head_dim 128), so
+            each selected VSA tile is expanded into ``tile_numel // kv_block_size``
+            consecutive KV blocks. The Q block size stays ``tile_numel`` because FA4
+            only requires it to be a multiple of its effective Q tile.
 
     Returns:
         A full-block ``BlockMask`` plus a tile-level mask_mod. Current Flex FLASH
@@ -573,22 +579,35 @@ def create_vsa_flash_block_mask(
         raise ValueError(f"tile_numel must be positive, got {tile_numel}")
     if num_kv_tiles <= 0:
         raise ValueError(f"num_kv_tiles must be positive, got {num_kv_tiles}")
+    if kv_block_size <= 0 or tile_numel % kv_block_size != 0:
+        raise ValueError(
+            f"kv_block_size must be positive and divide tile_numel {tile_numel}, "
+            f"got {kv_block_size}"
+        )
 
     selected_indices = topk_indices.to(dtype=torch.int32).sort(dim=-1).values.contiguous()
     top_k = selected_indices.shape[-1]
     if top_k > num_kv_tiles:
         raise ValueError(f"TOP_K must be <= num_kv_tiles, got {top_k} and {num_kv_tiles}")
 
+    kv_factor = tile_numel // kv_block_size
+    expanded_indices = (
+        selected_indices[..., None] * kv_factor
+        + torch.arange(kv_factor, device=selected_indices.device, dtype=torch.int32)
+    ).flatten(-2)
     kv_indices = torch.zeros(
         *selected_indices.shape[:-1],
-        num_kv_tiles,
+        num_kv_tiles * kv_factor,
         dtype=torch.int32,
         device=selected_indices.device,
     )
     full_kv_indices = torch.zeros_like(kv_indices)
-    full_kv_indices[..., :top_k] = selected_indices
+    full_kv_indices[..., : top_k * kv_factor] = expanded_indices
     full_kv_num_blocks = torch.full(
-        selected_indices.shape[:-1], top_k, dtype=torch.int32, device=selected_indices.device
+        selected_indices.shape[:-1],
+        top_k * kv_factor,
+        dtype=torch.int32,
+        device=selected_indices.device,
     )
     block_map = torch.zeros(
         *selected_indices.shape[:-1],
@@ -602,7 +621,7 @@ def create_vsa_flash_block_mask(
         kv_indices=kv_indices,
         full_kv_num_blocks=full_kv_num_blocks,
         full_kv_indices=full_kv_indices,
-        BLOCK_SIZE=tile_numel,
+        BLOCK_SIZE=(tile_numel, kv_block_size),
         mask_mod=generate_vsa_block_map_mask_mod(block_map, tile_numel),
         seq_lengths=(selected_indices.shape[-2] * tile_numel, num_kv_tiles * tile_numel),
     )
