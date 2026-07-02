@@ -20,8 +20,6 @@ Example:
 
 import math
 import time
-from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -129,26 +127,12 @@ def maybe_fix_14b_transformer(model_dir: Path) -> None:
     print(f"repaired 14B transformer export in {tdir}")
 
 
-@dataclass
-class VSALayout:
-    """Tile-major permutation for an exactly-divisible latent grid."""
-
-    tile_numel: int
-    num_tiles: int
-    perm: Tensor
-    inverse_perm: Tensor
-
-    @classmethod
-    def build(cls, grid: tuple[int, int, int], tile: tuple[int, int, int], device) -> "VSALayout":
-        metadata = create_vsa_tile_metadata(grid, tile, device=device)
-        if metadata.padded_seq_length != metadata.total_seq_length:
-            raise ValueError(f"grid {grid} does not divide into tiles {tile}")
-        return cls(
-            tile_numel=metadata.tile_numel,
-            num_tiles=math.prod(metadata.num_tiles),
-            perm=metadata.tile_partition_indices,
-            inverse_perm=metadata.reverse_tile_partition_indices,
-        )
+def exact_tile_metadata(grid: tuple[int, int, int], tile: tuple[int, int, int], device):
+    """Tile metadata for a grid that divides exactly, so no padding predicates are needed."""
+    metadata = create_vsa_tile_metadata(grid, tile, device=device)
+    if metadata.padded_seq_length != metadata.total_seq_length:
+        raise ValueError(f"grid {grid} does not divide into tiles {tile}")
+    return metadata
 
 
 def import_upstream_vsa():
@@ -174,36 +158,71 @@ def import_upstream_vsa():
         sys.path = saved_path
 
 
-@lru_cache(maxsize=2)
-def compiled_flex_vsa(tile_numel: int, num_tiles: int, top_k: int):
-    """One compiled region: coarse attn + topk + block mask build + FLASH fine pass."""
+class SparseVSAAttention:
+    """Tile-major VSA self-attention over BHSD tensors for one fixed latent grid.
 
-    def flex_vsa(q: Tensor, k: Tensor, v: Tensor, gate: Tensor) -> Tensor:
-        coarse = compute_vsa_coarse_attention(q, k, v, tile_numel=tile_numel, top_k=top_k)
+    Built once per run for the requested backend only, so grids that only
+    divide one backend's tiling still work for that backend. The flex path
+    compiles coarse attn + topk + block-mask build + FLASH fine pass as one
+    region.
+    """
+
+    def __init__(self, mode: str, grid: tuple[int, int, int], device):
+        tile = UPSTREAM_TILE if mode == "upstream" else FLEX_TILE
+        metadata = exact_tile_metadata(grid, tile, device)
+        self.mode = mode
+        self.tile_numel = metadata.tile_numel
+        self.num_tiles = math.prod(metadata.num_tiles)
+        self.top_k = vsa_topk_from_sparsity(
+            math.prod(grid), self.tile_numel, self.num_tiles, VSA_SPARSITY
+        )
+        self.perm = metadata.tile_partition_indices
+        self.inverse_perm = metadata.reverse_tile_partition_indices
+        self.variable_block_sizes = metadata.variable_block_sizes.to(device)
+        self.flex_vsa = torch.compile(self._flex_vsa, dynamic=False) if mode == "flex" else None
+
+    def _flex_vsa(self, q: Tensor, k: Tensor, v: Tensor, gate: Tensor) -> Tensor:
+        coarse = compute_vsa_coarse_attention(
+            q, k, v, tile_numel=self.tile_numel, top_k=self.top_k
+        )
         block_mask = create_vsa_flash_block_mask(
-            coarse.topk_indices, tile_numel=tile_numel, num_kv_tiles=num_tiles
+            coarse.topk_indices, tile_numel=self.tile_numel, num_kv_tiles=self.num_tiles
         )
         fine = flex_attention(q, k, v, block_mask=block_mask, kernel_options={"BACKEND": "FLASH"})
-        return vsa_additive_combine(fine, coarse.output, gate, tile_numel=tile_numel)
+        return vsa_additive_combine(fine, coarse.output, gate, tile_numel=self.tile_numel)
 
-    return torch.compile(flex_vsa, dynamic=False)
+    def __call__(self, q: Tensor, k: Tensor, v: Tensor, gate: Tensor) -> Tensor:
+        q, k, v, gate = (t[:, :, self.perm] for t in (q, k, v, gate))
+        match self.mode:
+            case "upstream":
+                out = import_upstream_vsa().video_sparse_attn(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    self.variable_block_sizes,
+                    topk=self.top_k,
+                    block_size=UPSTREAM_TILE,
+                    compress_attn_weight=gate.contiguous(),
+                )
+            case "flex":
+                out = self.flex_vsa(q, k, v, gate)
+            case _:
+                raise ValueError(f"unknown sparse mode {self.mode}")
+        return out[:, :, self.inverse_perm]
 
 
 class WanVSASelfAttnProcessor:
     """Drop-in replacement for Wan self-attention with swappable VSA backends.
 
     Mirrors diffusers' WanAttnProcessor projection/rope path, then runs the
-    fine+coarse VSA flow in tile-major order with the checkpoint's learned
-    compress gate. ``mode`` selects dense SDPA, the upstream `vsa` kernel, or
-    the attention-gym Flex FLASH implementation.
+    fine+coarse VSA flow with the checkpoint's learned compress gate.
+    ``sparse_attn=None`` selects dense SDPA.
     """
 
-    def __init__(self, mode: str, layer: int, gates, layouts, grid):
-        self.mode = mode
+    def __init__(self, layer: int, gates, sparse_attn: SparseVSAAttention | None):
         self.layer = layer
         self.gates = gates
-        self.layouts = layouts
-        self.seq_len = math.prod(grid)
+        self.sparse_attn = sparse_attn
         self.attn_us: list[float] = []
 
     def __call__(
@@ -231,39 +250,12 @@ class WanVSASelfAttnProcessor:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        if self.mode == "dense":
+        if self.sparse_attn is None:
             out = F.scaled_dot_product_attention(q, k, v)
         else:
             gate_w, gate_b = self.gates[self.layer]
             gate = F.linear(hidden_states, gate_w, gate_b).unflatten(2, (attn.heads, -1))
-            layout = self.layouts[self.mode]
-            q_t, k_t, v_t, gate_t = (t[:, :, layout.perm] for t in (q, k, v, gate.transpose(1, 2)))
-            if self.mode == "upstream":
-                upstream_vsa = import_upstream_vsa()
-
-                out = upstream_vsa.video_sparse_attn(
-                    q_t.contiguous(),
-                    k_t.contiguous(),
-                    v_t.contiguous(),
-                    torch.full(
-                        (layout.num_tiles,), layout.tile_numel, dtype=torch.long, device=q.device
-                    ),
-                    topk=vsa_topk_from_sparsity(
-                        self.seq_len, layout.tile_numel, layout.num_tiles, VSA_SPARSITY
-                    ),
-                    block_size=UPSTREAM_TILE,
-                    compress_attn_weight=gate_t.contiguous(),
-                )
-            else:
-                flex_fn = compiled_flex_vsa(
-                    layout.tile_numel,
-                    layout.num_tiles,
-                    vsa_topk_from_sparsity(
-                        self.seq_len, layout.tile_numel, layout.num_tiles, VSA_SPARSITY
-                    ),
-                )
-                out = flex_fn(q_t, k_t, v_t, gate_t)
-            out = out[:, :, layout.inverse_perm]
+            out = self.sparse_attn(q, k, v, gate.transpose(1, 2))
         end.record()
         end.synchronize()
         self.attn_us.append(start.elapsed_time(end) * 1e3)
@@ -320,7 +312,6 @@ def main(
     from diffusers.utils import export_to_video
     from huggingface_hub import snapshot_download
 
-    assert mode in ("dense", "upstream", "flex")
     device, dtype = "cuda", torch.bfloat16
     model_dir = Path(snapshot_download(model_id, ignore_patterns=["assets/*", "examples/*"]))
     maybe_fix_14b_transformer(model_dir)
@@ -339,21 +330,19 @@ def main(
         height // pipe.vae_scale_factor_spatial // transformer.config.patch_size[1],
         width // pipe.vae_scale_factor_spatial // transformer.config.patch_size[2],
     )
-    processors = {}
-    if mode != "dense":
-        gates = load_gate_weights(model_dir, device, dtype)
-        layouts = {
-            "upstream": VSALayout.build(grid, UPSTREAM_TILE, device),
-            "flex": VSALayout.build(grid, FLEX_TILE, device),
-        }
-        for name in transformer.attn_processors:
-            if "attn1" in name:
-                layer = int(name.split(".")[1])
-                processors[name] = WanVSASelfAttnProcessor(mode, layer, gates, layouts, grid)
-    else:
-        for name in transformer.attn_processors:
-            if "attn1" in name:
-                processors[name] = WanVSASelfAttnProcessor(mode, -1, None, None, grid)
+    match mode:
+        case "dense":
+            gates, sparse_attn = None, None
+        case "upstream" | "flex":
+            gates = load_gate_weights(model_dir, device, dtype)
+            sparse_attn = SparseVSAAttention(mode, grid, device)
+        case _:
+            raise ValueError(f"mode must be dense, upstream, or flex, got {mode}")
+    processors = {
+        name: WanVSASelfAttnProcessor(int(name.split(".")[1]), gates, sparse_attn)
+        for name in transformer.attn_processors
+        if "attn1" in name
+    }
     transformer.set_attn_processor({**transformer.attn_processors, **processors})
 
     prompt_embeds, _ = pipe.encode_prompt(
