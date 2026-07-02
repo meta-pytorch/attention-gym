@@ -38,6 +38,7 @@ from attn_gym.masks import (
 )
 
 MODEL_ID = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
+MODEL_ID_14B = "FastVideo/FastWan2.1-T2V-14B-Diffusers"
 DMD_TIMESTEPS = (1000, 757, 522)
 FLOW_SHIFT = 3.0
 VSA_SPARSITY = 0.8
@@ -59,17 +60,73 @@ def load_gate_weights(model_dir: Path, device, dtype) -> dict[int, tuple[Tensor,
     """Load the learned VSA compress-gate projections that diffusers ignores."""
     from safetensors import safe_open
 
+    shards = sorted((model_dir / "transformer").glob("diffusion_pytorch_model*.safetensors"))
     gates: dict[int, tuple[Tensor, Tensor]] = {}
-    with safe_open(model_dir / "transformer" / "diffusion_pytorch_model.safetensors", "pt") as f:
-        keys = [k for k in f.keys() if "to_gate_compress.weight" in k]
-        for key in keys:
+    pending: dict[str, Tensor] = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt") as f:
+            for key in f.keys():
+                if "to_gate_compress" in key:
+                    pending[key] = f.get_tensor(key).to(device=device, dtype=dtype)
+    for key, weight in pending.items():
+        if key.endswith(".weight"):
             layer = int(key.split(".")[1])
-            weight = f.get_tensor(key).to(device=device, dtype=dtype)
-            bias = f.get_tensor(key.replace("weight", "bias")).to(device=device, dtype=dtype)
-            gates[layer] = (weight, bias)
+            gates[layer] = (weight, pending[key.replace(".weight", ".bias")])
     if not gates:
         raise RuntimeError("checkpoint has no to_gate_compress weights; not a VSA model")
     return gates
+
+
+FASTVIDEO_KEY_RENAMES = (
+    ("ffn.fc_in.", "ffn.net.0.proj."),
+    ("ffn.fc_out.", "ffn.net.2."),
+    ("attn2.to_out.", "attn2.to_out.0."),
+    ("to_out.", "attn1.to_out.0."),
+    ("to_q.", "attn1.to_q."),
+    ("to_k.", "attn1.to_k."),
+    ("to_v.", "attn1.to_v."),
+)
+
+
+def maybe_fix_14b_transformer(model_dir: Path) -> None:
+    """Repair the FastWan 14B diffusers export in the local snapshot, once.
+
+    The published 14B repo ships sharded transformer weights without the
+    safetensors index and with half of the keys still in FastVideo naming
+    (``blocks.N.to_q``, ``ffn.fc_in``, ...), which diffusers loads as meta
+    tensors. Consolidate to one bf16 file with diffusers key names, keeping the
+    VSA ``to_gate_compress`` weights for :func:`load_gate_weights`.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    tdir = model_dir / "transformer"
+    shards = sorted(tdir.glob("diffusion_pytorch_model-*.safetensors"))
+    if not shards or (tdir / "diffusion_pytorch_model.safetensors.index.json").exists():
+        return
+    state: dict[str, Tensor] = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt") as f:
+            for key in f.keys():
+                state[key] = f.get_tensor(key).to(torch.bfloat16)
+
+    def diffusers_key(key: str) -> str:
+        if not key.startswith("blocks.") or ".attn1." in key or ".attn2.to_out.0." in key:
+            return key
+        prefix, _, rest = key.partition(".")
+        block, _, rest = rest.partition(".")
+        for src, dst in FASTVIDEO_KEY_RENAMES:
+            if rest.startswith(src):
+                rest = dst + rest[len(src) :]
+                break
+        return f"{prefix}.{block}.{rest}"
+
+    fixed = {diffusers_key(k): v for k, v in state.items()}
+    fixed.update({k: v for k, v in state.items() if ".attn1." in k or ".ffn.net." in k})
+    save_file(fixed, tdir / "diffusion_pytorch_model.safetensors")
+    for shard in shards:
+        shard.unlink()
+    print(f"repaired 14B transformer export in {tdir}")
 
 
 @dataclass
@@ -246,20 +303,27 @@ def main(
         "its mane flowing in the warm wind, cinematic lighting, photorealistic."
     ),
     mode: str = "flex",
+    model_id: str = MODEL_ID,
     num_frames: int = 61,
     height: int = 448,
     width: int = 832,
     seed: int = 42,
     output_dir: str = "outputs",
 ):
-    """Generate a FastWan video with the selected self-attention backend."""
+    """Generate a FastWan video with the selected self-attention backend.
+
+    The latent grid (num_frames, height, width dependent) must divide exactly
+    into both VSA tilings; 61x448x832 (1.3B native) and 61x768x1280 (14B
+    high-res) both satisfy this.
+    """
     from diffusers import AutoencoderKLWan, WanPipeline, WanTransformer3DModel
     from diffusers.utils import export_to_video
     from huggingface_hub import snapshot_download
 
     assert mode in ("dense", "upstream", "flex")
     device, dtype = "cuda", torch.bfloat16
-    model_dir = Path(snapshot_download(MODEL_ID, ignore_patterns=["assets/*", "examples/*"]))
+    model_dir = Path(snapshot_download(model_id, ignore_patterns=["assets/*", "examples/*"]))
+    maybe_fix_14b_transformer(model_dir)
 
     transformer = WanTransformer3DModel.from_pretrained(
         model_dir / "transformer", torch_dtype=dtype
@@ -330,10 +394,11 @@ def main(
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    export_to_video(frames, str(out / f"fastwan_{mode}.mp4"), fps=16)
+    tag = f"{mode}_14b" if model_id == MODEL_ID_14B else mode
+    export_to_video(frames, str(out / f"fastwan_{tag}.mp4"), fps=16)
     for idx in (0, len(frames) // 2, len(frames) - 1):
-        frames[idx].save(out / f"fastwan_{mode}_frame{idx:02d}.png")
-    print(f"saved video + frames to {out}/fastwan_{mode}*")
+        frames[idx].save(out / f"fastwan_{tag}_frame{idx:02d}.png")
+    print(f"saved video + frames to {out}/fastwan_{tag}*")
 
 
 if __name__ == "__main__":
