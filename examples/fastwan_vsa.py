@@ -1,7 +1,8 @@
 """End-to-end FastWan2.1 (DMD, VSA-trained) inference with FlexAttention VSA.
 
-Runs FastVideo/FastWan2.1-T2V-1.3B-Diffusers (3-step DMD, trained with VSA at 0.8
-sparsity) and swaps the self-attention implementation per run:
+Runs FastVideo's FastWan2.1 diffusers checkpoints (3-step DMD, sparse-distilled
+with VSA at 0.8 sparsity; 14B by default, use ``--model_id`` for 1.3B) and swaps
+the self-attention implementation per run:
 
 - ``dense``: plain SDPA (quality/timing reference, no sparsity).
 - ``upstream``: FastVideo's `vsa` package kernel at (4,4,4) 64-token cubes
@@ -35,7 +36,7 @@ from attn_gym.masks import (
     vsa_topk_from_sparsity,
 )
 
-MODEL_ID = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
+MODEL_ID_1_3B = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
 MODEL_ID_14B = "FastVideo/FastWan2.1-T2V-14B-Diffusers"
 DMD_TIMESTEPS = (1000, 757, 522)
 FLOW_SHIFT = 3.0
@@ -295,7 +296,7 @@ def main(
         "its mane flowing in the warm wind, cinematic lighting, photorealistic."
     ),
     mode: str = "flex",
-    model_id: str = MODEL_ID,
+    model_id: str = MODEL_ID_14B,
     num_frames: int = 61,
     height: int = 448,
     width: int = 832,
