@@ -35,6 +35,22 @@ Sliding window with dilation — attends to every `dilation`-th token within the
 
 ::: attn_gym.masks.dilated_sliding_window.generate_dilated_sliding_window
 
+## Global + Sliding Window
+
+Longformer-style attention ([paper](https://arxiv.org/abs/2004.05150)): a bidirectional sliding window plus designated global tokens (e.g. CLS) that attend to and are attended by every position.
+
+```python
+import torch
+from attn_gym.masks import generate_global_sliding_window
+
+is_global = torch.zeros(S, dtype=torch.bool, device=device)
+is_global[0] = True  # CLS token
+mask_mod = generate_global_sliding_window(window_size=512, is_global=is_global)
+block_mask = create_block_mask(mask_mod, B, H, S, S, device=device)
+```
+
+::: attn_gym.masks.global_sliding_window.generate_global_sliding_window
+
 ## Prefix LM
 
 Bidirectional attention over a prefix, causal attention over the rest.
