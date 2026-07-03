@@ -63,6 +63,19 @@ mask_mod = generate_prefix_lm_mask(prefix_length=512)
 
 ::: attn_gym.masks.prefix_lm.generate_prefix_lm_mask
 
+## Block Diffusion
+
+Hybrid attention mask for Block Diffusion language models (BD3-LM, [paper](https://arxiv.org/abs/2503.09573)). Training attends over a concatenated `[x_t; x_0]` sequence of length `2 * S`: noised tokens attend bidirectionally within their block and to clean tokens in previous blocks, while clean tokens attend block-causally to other clean tokens. The mask is highly block-sparse, so FlexAttention can achieve large speedups over dense SDPA.
+
+```python
+from attn_gym.masks import generate_block_diffusion_mask
+
+mask_mod = generate_block_diffusion_mask(seq_len=S, block_size=16)
+block_mask = create_block_mask(mask_mod, B, H, 2 * S, 2 * S, device=device)
+```
+
+::: attn_gym.masks.block_diffusion.generate_block_diffusion_mask
+
 ## JetSpec Tree Attention
 
 Tree-verification attention for [JetSpec](https://arxiv.org/abs/2606.18394): each tree
