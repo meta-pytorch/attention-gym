@@ -34,6 +34,19 @@ out = flex_attention(query, key, value, score_mod=softcap)
 
 ::: attn_gym.mods.softcapping.generate_tanh_softcap
 
+## Sandwich
+
+Sandwich relative positional bias ([paper](https://arxiv.org/abs/2212.10356)) — the position-position inner product of sinusoidal embeddings with ALiBi-style per-head compression ratios, enabling length extrapolation without learned parameters.
+
+```python
+from attn_gym.mods import generate_sandwich_bias
+
+sandwich = generate_sandwich_bias(H=num_heads, max_seq_len=S, device=device)
+out = flex_attention(query, key, value, score_mod=sandwich)
+```
+
+::: attn_gym.mods.sandwich.generate_sandwich_bias
+
 ## Activation Score Mod
 
 Wraps an activation function to operate in log-space on attention scores.
