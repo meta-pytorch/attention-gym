@@ -47,6 +47,41 @@ out = flex_attention(query, key, value, score_mod=sandwich)
 
 ::: attn_gym.mods.sandwich.generate_sandwich_bias
 
+## Graphormer
+
+Graphormer attention biases ([paper](https://arxiv.org/abs/2106.05234)) — two learnable terms added to attention scores between graph node pairs. Gradients flow back into the captured bias tables through flex_attention's backward, so both train end to end.
+
+**Spatial encoding** — a learnable per-head bias indexed by the shortest-path distance between node pairs:
+
+```python
+import torch
+from attn_gym.mods import generate_graphormer_spatial_bias, shortest_path_distances
+
+distances = shortest_path_distances(adjacency, max_distance=5)  # (B, N, N)
+spatial_bias = torch.nn.Parameter(torch.zeros(num_heads, 5 + 2, device=device))
+graphormer = generate_graphormer_spatial_bias(spatial_bias, distances)
+out = flex_attention(query, key, value, score_mod=graphormer)
+```
+
+**Edge encoding** — averages a learnable scalar per (head, path position, edge type) over the edges along each pair's shortest path:
+
+```python
+from attn_gym.mods import generate_graphormer_edge_bias, shortest_path_edge_types
+
+path_types, path_lengths = shortest_path_edge_types(adjacency, edge_types, max_path_len=4)
+edge_bias = torch.nn.Parameter(torch.zeros(num_heads, 4, num_edge_types, device=device))
+graphormer_edge = generate_graphormer_edge_bias(edge_bias, path_types, path_lengths)
+out = flex_attention(query, key, value, score_mod=graphormer_edge)
+```
+
+::: attn_gym.mods.graphormer.generate_graphormer_spatial_bias
+
+::: attn_gym.mods.graphormer.generate_graphormer_edge_bias
+
+::: attn_gym.mods.graphormer.shortest_path_distances
+
+::: attn_gym.mods.graphormer.shortest_path_edge_types
+
 ## Activation Score Mod
 
 Wraps an activation function to operate in log-space on attention scores.
