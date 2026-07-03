@@ -218,7 +218,7 @@ def run_document_masking(max_seq_len: int, num_docs: int):
     lengths = generate_random_lengths(max_seq_len, num_docs)
     offsets = length_to_offsets(lengths, "cuda")
     document_causal_mask = generate_doc_mask_mod(causal_mask, offsets)
-    test_mask(mask_mod=document_causal_mask, S=32768)
+    test_mask(mask_mod=document_causal_mask, S=max_seq_len)
 
 
 def main(examples: List[str] = ["all"]):
