@@ -196,7 +196,7 @@ def main():
         {"dynamic": False, "backend": "inductor", "mode": "default"},
 
         # Using Inductor's deterministic mode also enforces consistent reduction loops
-        # {"dynamic": False, "backend": "inductor", "mode": "default", "inductor_config": {"deterministic": True}},
+        {"dynamic": False, "backend": "inductor", "mode": "default", "inductor_config": {"deterministic": True}},
 
         # Noisy neighbor problem also can be found here
         # Not running since takes some time
