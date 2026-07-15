@@ -187,7 +187,10 @@ class SparseVSAAttention:
             q, k, v, tile_numel=self.tile_numel, top_k=self.top_k
         )
         block_mask = create_vsa_flash_block_mask(
-            coarse.topk_indices, tile_numel=self.tile_numel, num_kv_tiles=self.num_tiles
+            coarse.topk_indices,
+            tile_numel=self.tile_numel,
+            num_kv_tiles=self.num_tiles,
+            variable_block_sizes=self.variable_block_sizes,
         )
         fine = flex_attention(q, k, v, block_mask=block_mask, kernel_options={"BACKEND": "FLASH"})
         return vsa_additive_combine(fine, coarse.output, gate, tile_numel=self.tile_numel)

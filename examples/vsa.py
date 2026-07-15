@@ -107,6 +107,7 @@ def main(
             coarse.topk_indices,
             tile_numel=metadata.tile_numel,
             num_kv_tiles=num_kv_tiles,
+            variable_block_sizes=metadata.variable_block_sizes,
         )
     else:
         block_mask = create_vsa_block_mask(

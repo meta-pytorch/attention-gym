@@ -339,6 +339,51 @@ def test_vsa_flex_flash_backend_sm100_matches_reference():
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_vsa_flex_flash_backend_sm100_masks_partial_kv_subblocks():
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Flex FLASH block-sparse path requires SM100+")
+    flex_flash = pytest.importorskip("torch._inductor.kernel.flex.flex_flash_attention")
+    if not flex_flash.ensure_flash_available():
+        pytest.skip("Flex FLASH backend is not available")
+
+    torch.manual_seed(0)
+    batch, heads, q_tiles, kv_tiles, tile_numel, head_dim = 1, 2, 2, 2, 256, 128
+    q = torch.randn(
+        batch, heads, q_tiles * tile_numel, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch, heads, kv_tiles * tile_numel, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn(
+        batch, heads, kv_tiles * tile_numel, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    variable_block_sizes = torch.tensor([tile_numel, 64], device="cuda", dtype=torch.long)
+    topk_indices = torch.tensor(
+        [[[[0, 1], [0, 1]], [[0, 1], [0, 1]]]], device="cuda", dtype=torch.int32
+    )
+    block_mask = create_vsa_flash_block_mask(
+        topk_indices,
+        tile_numel=tile_numel,
+        num_kv_tiles=kv_tiles,
+        variable_block_sizes=variable_block_sizes,
+    )
+    attention = torch.compile(
+        partial(flex_attention, kernel_options={"BACKEND": "FLASH"}), dynamic=False
+    )
+
+    actual = attention(q, k, v, block_mask=block_mask)
+    mask = dense_vsa_token_mask(
+        topk_indices,
+        tile_numel=tile_numel,
+        num_kv_tiles=kv_tiles,
+        variable_block_sizes=variable_block_sizes,
+    )
+    expected = masked_reference_attention(q, k, v, mask)
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
 def test_vsa_additive_combine_matches_manual_lift():
     torch.manual_seed(0)
     fine_output = torch.randn(1, 2, 12, 4)
