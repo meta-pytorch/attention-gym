@@ -49,6 +49,7 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Concepts: concepts.md
+  - Determinism: determinism.md
   - Masks: masks.md
   - Score Mods: mods.md
   - Examples: examples.md

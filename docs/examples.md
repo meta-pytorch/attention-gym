@@ -77,7 +77,7 @@ python examples/mla.py --mode perf    # Performance comparison
 python examples/flex_determinism.py
 ```
 
-Tests forward and backward determinism across configurations (eager, inductor default, forced reduction filtering) with shapes covering standard attention, decode, GQA, and long-context scenarios.
+Tests forward and backward determinism across configurations (eager, Inductor default, forced reduction filtering) with shapes covering standard attention, decode, GQA, and long-context scenarios. See the [FlexAttention determinism guide](determinism.md) for recommended production settings and an explanation of the backward-pass reduction behavior.
 
 ## Ring Attention
 
