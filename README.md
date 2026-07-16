@@ -70,8 +70,8 @@ Attention Gym is organized for easy exploration of attention mechanisms:
 
 - `attn_gym.masks`: Examples creating `BlockMasks`
 - `attn_gym.mods`: Examples creating `score_mods`
-- `attn_gym.paged_attention`: Examples using `PagedAttention`
 - `examples/`: Detailed implementations using FlexAttention
+- `examples/paged_attention`: Paged KV-cache examples using FlexAttention
 
 ## 🛠️ Dev
 

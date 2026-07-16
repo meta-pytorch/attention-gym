@@ -105,11 +105,13 @@ python examples/flex_grid_sweep.py --B 4 --H 32 --S 8192 --D 128
 
 ## Paged Attention
 
-[`attn_gym/paged_attention/`](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/paged_attention) — Efficient inference with FlexAttention for batches with variable-length KV caches. KV tensors are split into fixed-size pages and stored compactly instead of padding to the maximum length.
+[`examples/paged_attention/`](https://github.com/meta-pytorch/attention-gym/tree/main/examples/paged_attention) — Efficient inference examples using FlexAttention with batches of variable-length KV caches. KV tensors are split into fixed-size pages and stored compactly instead of padding to the maximum length.
+
+From a repository checkout:
 
 ```python
 import torch
-from attn_gym.paged_attention.paged_attention import PagedAttention
+from examples.paged_attention.paged_attention import PagedAttention
 
 paged_attn = PagedAttention(
     n_pages=256,
@@ -136,7 +138,7 @@ Key methods:
 - **`convert_logical_block_mask(block_mask)`** — remap logical block indices to physical page indices
 - **`get_mask_mod(mask_mod)`** / **`get_score_mod(score_mod)`** — wrap mods to operate in physical page space
 
-See [`paged_attention.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/paged_attention/paged_attention.py) for full implementation.
+See [`paged_attention.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/paged_attention/paged_attention.py) for the full example implementation.
 
 ## ROWS_GUARANTEED_SAFE Demo
 

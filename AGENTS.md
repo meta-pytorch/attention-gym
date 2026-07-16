@@ -22,7 +22,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 - `graphormer` — Graphormer spatial + edge encodings (learnable shortest-path biases)
 - `latent_attention` — latent/compressed attention
 
-**Paged attention** (`attn_gym/paged_attention/`) — `PagedAttention` class for efficient inference with variable-length KV caches using fixed-size page blocks.
+**Paged attention example** (`examples/paged_attention/`) — `PagedAttention` example for efficient inference with variable-length KV caches using fixed-size page blocks.
 
 **Utilities** (`attn_gym/utils.py`) — helpers for visualizing and debugging `score_mod`/`mask_mod` functions.
 
