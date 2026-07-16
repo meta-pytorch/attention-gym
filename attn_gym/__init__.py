@@ -5,9 +5,10 @@ from attn_gym.utils import (
     benchmark_cuda_function_in_microseconds,
     cuda_kernel_profiler,
 )
-import attn_gym.mods
+import attn_gym.linear
 import attn_gym.masks
-import attn_gym.paged_attention
+import attn_gym.mods
+import attn_gym.sparse
 
 __all__ = [
     "visualize_attention_scores",
@@ -15,7 +16,8 @@ __all__ = [
     "calculate_tflops",
     "benchmark_cuda_function_in_microseconds",
     "cuda_kernel_profiler",
-    "mods",
+    "linear",
     "masks",
-    "paged_attention",
+    "mods",
+    "sparse",
 ]
