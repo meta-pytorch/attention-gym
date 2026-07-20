@@ -1,4 +1,4 @@
-"""Benchmark the full SM100 CuTe CSA backend against the eager reference."""
+"""Benchmark the full SM100 CuTe CSA backend on long sequences that OOM the eager reference."""
 
 from __future__ import annotations
 
@@ -9,13 +9,7 @@ import torch
 import triton
 
 from attn_gym.sparse import compressed_sparse_attention
-from .benchmark_compressed_sparse_attention_triton import (
-    make_inputs,
-)
-
-
-ERROR_ATOL = 1e-2
-ERROR_RTOL = 1e-2
+from benchmarks.sparse.benchmark_compressed_sparse_attention_triton import make_inputs
 
 
 def useful_flops(args: argparse.Namespace) -> tuple[int, int, int, int]:
@@ -75,25 +69,11 @@ def main() -> None:
         raise RuntimeError("This benchmark targets SM100 exclusively.")
 
     inputs = make_inputs(args)
-    eager = lambda: compressed_sparse_attention(*inputs, backend="eager")
     optimized = lambda: compressed_sparse_attention(*inputs, backend="cute")
 
     with torch.inference_mode():
-        expected = eager()
         actual = optimized()
         torch.cuda.synchronize()
-        error = (actual.float() - expected.float()).abs()
-        max_abs_error = error.max().item()
-        mean_abs_error = error.mean().item()
-        if not torch.allclose(actual, expected, atol=ERROR_ATOL, rtol=ERROR_RTOL):
-            raise AssertionError(
-                f"CuTe output is not allclose to the reference with "
-                f"atol={ERROR_ATOL:g} and rtol={ERROR_RTOL:g}; "
-                f"max absolute error is {max_abs_error:.6g}."
-            )
-        eager_ms = triton.testing.do_bench(
-            eager, warmup=args.warmup, rep=args.rep, return_mode="median"
-        )
         cute_ms = triton.testing.do_bench(
             optimized, warmup=args.warmup, rep=args.rep, return_mode="median"
         )
@@ -117,10 +97,7 @@ def main() -> None:
         f"useful FLOPs: indexer={indexer_flops / 1e9:.6f} GF, "
         f"selected QK+PV={attention_flops / 1e9:.6f} GF, total={total_flops / 1e9:.6f} GF"
     )
-    print(f"error: max_abs={max_abs_error:.7g} mean_abs={mean_abs_error:.7g}")
-    print(f"eager end-to-end: {eager_ms:.4f} ms")
     print(f"CuTe end-to-end:  {cute_ms:.4f} ms")
-    print(f"speedup: {eager_ms / cute_ms:.2f}x")
     print(f"CuTe useful sparse throughput: {total_flops / (cute_ms * 1e9):.2f} TFLOP/s")
 
 
