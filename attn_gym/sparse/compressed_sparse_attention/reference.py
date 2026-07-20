@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-
+import math
 def pad_to_block_size(x: torch.Tensor, m: int, value: float):
     n = x.shape[-2] # sequence dimension
     pad_length = (-n)%m
@@ -184,24 +184,6 @@ def apply_rope(
 
 
 def CSA(Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight, attention_sink, compression_rate, num_topk_blocks, sliding_window_size, rope_dims: int, share_kv: bool):
-    '''
-    Naming of args uses convention from Deepseek v4 paper
-
-    Rope is applied within the function 
-    Q: Query vector for attention; expected to be normalized beforehand
-    Q_I: Query vector for indexing; expected to be normalized beforehand
-
-    KV: Projection from residual stream, represents K and V vectors for SWA
-    C_a, C_b: Projections from the residual stream that will be attended to
-    Z_a, Z_b: Projections from the residual stream
-
-    W_I: Projection from the residual stream, weight on indexer scores (Batch, sequence, num_heads)
-    K_Ia, K_Ib: Projections from the residual stream for computing indexing
-    Z_Ia, Z_Ib: Projections from the residual stream 
-
-    num_topk_blocks: number of blocks to attend to per query
-    sink: Learned weight in shape of (num_heads, )
-    '''
     device = Q.device
     dtype = Q.dtype
     b, h, s, head_dim = Q.shape
@@ -345,3 +327,25 @@ if __name__ == "__main__":
     out = CSA(Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight, attention_sink, compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv = True)
     loss = out.sum()
     loss.backward()
+
+    compiled_CSA = torch.compile(CSA)
+    for i in range(10):
+        out = compiled_CSA(Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight, attention_sink, compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv = True)
+    import time
+    start = time.perf_counter()
+    for i in range(20):
+        out = compiled_CSA(Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight, attention_sink, compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv = True)
+        loss = out.sum()
+        loss.backward()
+        torch.cuda.synchronize()
+    print("COMPILED: ", time.perf_counter() - start)
+
+    start = time.perf_counter()
+    for i in range(20):
+        out = CSA(Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight, attention_sink, compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv = True)
+        loss = out.sum()
+        loss.backward()
+        torch.cuda.synchronize()
+    print("EAGER: ", time.perf_counter() - start)
+
+    
