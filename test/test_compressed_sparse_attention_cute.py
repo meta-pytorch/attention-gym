@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import pytest
 import torch
@@ -7,8 +8,19 @@ from attn_gym.sparse import compressed_sparse_attention
 
 pytest.importorskip("flash_attn.cute.interface")
 
-from attn_gym.sparse.compressed_sparse_attention.cute import _require_sm100
-from benchmarks.sparse.benchmark_compressed_sparse_attention import make_inputs
+from attn_gym.sparse.compressed_sparse_attention.cute import (
+    _radix_topk_indices,
+    _require_sm100,
+)
+from attn_gym.sparse.compressed_sparse_attention.cute.kernels import (
+    compile_index_scores,
+    compile_index_topk,
+    compile_selected_gather,
+    cute_dtype,
+)
+from benchmarks.sparse.compressed_sparse_attention.benchmark_compressed_sparse_attention_triton import (
+    make_inputs,
+)
 
 
 MAX_ABS_ERROR = 1e-2
@@ -113,6 +125,141 @@ def test_cute_generalized_shapes_match_reference(overrides):
 
     assert actual.shape == expected.shape
     assert (actual.float() - expected.float()).abs().max().item() <= MAX_ABS_ERROR
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 0),
+    reason="the CuTe backend targets SM100 exclusively",
+)
+@pytest.mark.parametrize(
+    ("topk", "tied_scores", "index_heads", "index_dim"),
+    [
+        pytest.param(64, False, 4, 64, id="topk64-common-index-shape"),
+        pytest.param(96, False, 4, 64, id="topk96-common-index-shape"),
+        pytest.param(96, True, 4, 64, id="topk96-tied-scores"),
+        pytest.param(64, False, 3, 320, id="topk64-general-index-shape"),
+    ],
+)
+def test_cute_radix_topk_matches_insertion_selection(
+    topk, tied_scores, index_heads, index_dim
+):
+    batch = 1
+    sequence = 800
+    compression_rate = 8
+    window = 64
+    rope_dims = 64
+    num_blocks = math.ceil(sequence / compression_rate)
+    gather_length = math.ceil((topk + window) / 128) * 128
+    dtype = torch.bfloat16
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    q_i = torch.randn(
+        batch,
+        index_heads,
+        sequence,
+        index_dim,
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    compressed_indices = torch.randn(
+        batch,
+        num_blocks,
+        1,
+        index_dim,
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    weights = torch.randn(
+        batch,
+        sequence,
+        index_heads,
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    if tied_scores:
+        weights.zero_()
+    cos = torch.randn(
+        sequence,
+        rope_dims // 2,
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    sin = torch.randn_like(cos)
+    score_keys = torch.empty(
+        batch * sequence,
+        num_blocks,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    completed_lengths = torch.empty(
+        batch * sequence,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    actual = torch.empty(
+        batch,
+        sequence,
+        gather_length,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    expected = torch.empty_like(actual)
+
+    score_kernel = compile_index_scores(
+        cute_dtype(q_i),
+        batch,
+        sequence,
+        index_heads,
+        index_dim,
+        num_blocks,
+        compression_rate,
+        rope_dims,
+    )
+    score_kernel(
+        q_i,
+        compressed_indices,
+        weights,
+        cos,
+        sin,
+        score_keys,
+        completed_lengths,
+    )
+    selected_indices = _radix_topk_indices(
+        score_keys,
+        completed_lengths,
+        topk,
+    )
+    compile_selected_gather(
+        batch,
+        sequence,
+        num_blocks,
+        topk,
+        window,
+        gather_length,
+    )(selected_indices, actual)
+    compile_index_topk(
+        cute_dtype(q_i),
+        batch,
+        sequence,
+        index_heads,
+        index_dim,
+        num_blocks,
+        compression_rate,
+        topk,
+        window,
+        rope_dims,
+        gather_length,
+    )(q_i, compressed_indices, weights, cos, sin, expected)
+
+    assert torch.equal(
+        actual[:, :, :topk].sort(dim=-1).values,
+        expected[:, :, :topk].sort(dim=-1).values,
+    )
+    assert torch.equal(actual[:, :, topk:], expected[:, :, topk:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

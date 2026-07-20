@@ -15,12 +15,33 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, const_expr
+from cutlass._mlir.dialects import llvm
+from cutlass._mlir.extras import types as T
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.reduce import row_reduce
 
 
 _RMS_EPS = 1.1920928955078125e-7
+
+
+@cute.jit
+def _score_index_key(value, index, num_blocks):
+    """Encode a low-precision score and lower-index tie break as an ordered FP32 key."""
+
+    bits = cutlass.Uint16(
+        llvm.bitcast(cutlass.Uint16.mlir_type, value.ir_value())
+    )
+    ordered = cutlass.Uint32(0)
+    if bits & cutlass.Uint16(0x8000):
+        ordered = cutlass.Uint32(bits ^ cutlass.Uint16(0xFFFF))
+    else:
+        ordered = cutlass.Uint32(bits ^ cutlass.Uint16(0x8000))
+    key_bits = (
+        ordered * cutlass.Uint32(num_blocks + 1)
+        + cutlass.Uint32(num_blocks - index)
+    )
+    return Float32(llvm.bitcast(T.f32(), key_bits.ir_value()))
 
 
 class CompressionNormRope:
@@ -386,6 +407,317 @@ class QueryRopeTranspose:
                     if head < self.mirror_heads:
                         mirror_out[batch_idx, position, head, d0] = y0.to(self.dtype)
                         mirror_out[batch_idx, position, head, d0 + 1] = y1.to(self.dtype)
+
+
+class IndexScores:
+    """Compute causal index scores for the scalable radix top-k path."""
+
+    def __init__(
+        self,
+        dtype,
+        batch: int,
+        sequence: int,
+        index_heads: int,
+        index_dim: int,
+        num_blocks: int,
+        rate: int,
+        rope: int,
+    ):
+        self.dtype = dtype
+        self.batch = batch
+        self.sequence = sequence
+        self.index_heads = index_heads
+        self.index_dim = index_dim
+        self.num_blocks = num_blocks
+        self.rate = rate
+        self.rope = rope
+        self.num_threads = 128
+        self.head_groups = (index_heads + 3) // 4
+        self.pairs_per_lane = (
+            index_dim // 2 + cute.arch.WARP_SIZE - 1
+        ) // cute.arch.WARP_SIZE
+        self.use_warp_rows = index_heads <= 4 and index_dim <= 128
+
+    @cute.jit
+    def __call__(
+        self,
+        q_i: cute.Tensor,
+        compressed_indices: cute.Tensor,
+        weights: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        scores: cute.Tensor,
+        completed_lengths: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        if const_expr(self.use_warp_rows):
+            self.kernel_warp_rows(
+                q_i,
+                compressed_indices,
+                weights,
+                cos,
+                sin,
+                scores,
+                completed_lengths,
+            ).launch(
+                grid=[cute.ceil_div(self.batch * self.sequence, 4), 1, 1],
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+            )
+            return
+        self.kernel(
+            q_i,
+            compressed_indices,
+            weights,
+            cos,
+            sin,
+            scores,
+            completed_lengths,
+        ).launch(
+            grid=[self.batch * self.sequence, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel_warp_rows(
+        self,
+        q_i: cute.Tensor,
+        compressed_indices: cute.Tensor,
+        weights: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        scores: cute.Tensor,
+        completed_lengths: cute.Tensor,
+    ):
+        """Assign one query row to each warp for the common HI/DI shape."""
+
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        warp = tid // cute.arch.WARP_SIZE
+        lane = tid % cute.arch.WARP_SIZE
+        row = block * 4 + warp
+
+        if row < self.batch * self.sequence:
+            batch_idx = row // self.sequence
+            position = row - batch_idx * self.sequence
+            completed = (position + 1) // self.rate
+            if lane == 0:
+                completed_lengths[row] = Int32(completed)
+
+            q_values = cute.make_rmem_tensor(
+                (self.index_heads, self.pairs_per_lane, 2), Float32
+            )
+            for head in cutlass.range_constexpr(self.index_heads):
+                for item in cutlass.range_constexpr(self.pairs_per_lane):
+                    pair = lane + item * cute.arch.WARP_SIZE
+                    d0 = pair * 2
+                    q0 = q_i[batch_idx, head, position, d0].to(Float32)
+                    q1 = q_i[batch_idx, head, position, d0 + 1].to(Float32)
+                    rq0, rq1 = q0, q1
+                    if d0 >= self.index_dim - self.rope:
+                        rope_pair = (d0 - (self.index_dim - self.rope)) // 2
+                        c = cos[position, rope_pair].to(Float32)
+                        s = sin[position, rope_pair].to(Float32)
+                        rq0 = q0 * c - q1 * s
+                        rq1 = q0 * s + q1 * c
+                    q_values[head, item, 0] = rq0.to(self.dtype).to(Float32)
+                    q_values[head, item, 1] = rq1.to(self.dtype).to(Float32)
+
+            for n in cutlass.range(completed, unroll=1):
+                partials = cute.make_rmem_tensor((self.index_heads,), Float32)
+                for head in cutlass.range_constexpr(self.index_heads):
+                    partials[head] = Float32(0.0)
+
+                for item in cutlass.range_constexpr(self.pairs_per_lane):
+                    pair = lane + item * cute.arch.WARP_SIZE
+                    d0 = pair * 2
+                    k0 = compressed_indices[batch_idx, n, 0, d0].to(Float32)
+                    k1 = compressed_indices[batch_idx, n, 0, d0 + 1].to(Float32)
+                    for head in cutlass.range_constexpr(self.index_heads):
+                        partials[head] += (
+                            q_values[head, item, 0] * k0
+                            + q_values[head, item, 1] * k1
+                        )
+
+                score = Float32(0.0)
+                for head in cutlass.range_constexpr(self.index_heads):
+                    dot = cute.arch.warp_reduction_sum(partials[head])
+                    if lane == 0:
+                        rounded_dot = dot.to(self.dtype).to(Float32)
+                        activated = cute.arch.fmax(rounded_dot, Float32(0.0))
+                        activated = (
+                            activated / math.sqrt(self.index_dim * self.index_heads)
+                        ).to(self.dtype).to(Float32)
+                        score += (
+                            activated * weights[batch_idx, position, head].to(Float32)
+                        ).to(self.dtype).to(Float32)
+
+                if lane == 0:
+                    rounded_score = score.to(self.dtype)
+                    scores[row, n] = _score_index_key(
+                        rounded_score, n, self.num_blocks
+                    )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_i: cute.Tensor,
+        compressed_indices: cute.Tensor,
+        weights: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        scores: cute.Tensor,
+        completed_lengths: cute.Tensor,
+    ):
+        """Use four cooperating warps for larger index-head/dimension shapes."""
+
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        batch_idx = row // self.sequence
+        position = row - batch_idx * self.sequence
+        warp = tid // cute.arch.WARP_SIZE
+        lane = tid % cute.arch.WARP_SIZE
+        completed = (position + 1) // self.rate
+        if tid == 0:
+            completed_lengths[row] = Int32(completed)
+
+        smem = cutlass.utils.SmemAllocator()
+        contributions = smem.allocate_tensor(
+            Float32, cute.make_layout((4,)), byte_alignment=16
+        )
+        score_sum = smem.allocate_tensor(
+            Float32, cute.make_layout((1,)), byte_alignment=16
+        )
+
+        q_values = cute.make_rmem_tensor(
+            (self.head_groups, self.pairs_per_lane, 2), Float32
+        )
+        for group in cutlass.range_constexpr(self.head_groups):
+            head = group * 4 + warp
+            for item in cutlass.range_constexpr(self.pairs_per_lane):
+                pair = lane + item * cute.arch.WARP_SIZE
+                d0 = pair * 2
+                rq0 = Float32(0.0)
+                rq1 = Float32(0.0)
+                if head < self.index_heads and d0 < self.index_dim:
+                    q0 = q_i[batch_idx, head, position, d0].to(Float32)
+                    q1 = q_i[batch_idx, head, position, d0 + 1].to(Float32)
+                    rq0, rq1 = q0, q1
+                    if d0 >= self.index_dim - self.rope:
+                        rope_pair = (d0 - (self.index_dim - self.rope)) // 2
+                        c = cos[position, rope_pair].to(Float32)
+                        s = sin[position, rope_pair].to(Float32)
+                        rq0 = q0 * c - q1 * s
+                        rq1 = q0 * s + q1 * c
+                    rq0 = rq0.to(self.dtype).to(Float32)
+                    rq1 = rq1.to(self.dtype).to(Float32)
+                q_values[group, item, 0] = rq0
+                q_values[group, item, 1] = rq1
+
+        for n in cutlass.range(completed, unroll=1):
+            if tid == 0:
+                score_sum[0] = Float32(0.0)
+            cute.arch.barrier()
+
+            for group in cutlass.range_constexpr(self.head_groups):
+                head = group * 4 + warp
+                partial = Float32(0.0)
+                if head < self.index_heads:
+                    for item in cutlass.range_constexpr(self.pairs_per_lane):
+                        pair = lane + item * cute.arch.WARP_SIZE
+                        d0 = pair * 2
+                        if d0 < self.index_dim:
+                            rq0 = q_values[group, item, 0]
+                            rq1 = q_values[group, item, 1]
+                            k0 = compressed_indices[batch_idx, n, 0, d0].to(Float32)
+                            k1 = compressed_indices[batch_idx, n, 0, d0 + 1].to(Float32)
+                            partial += rq0 * k0 + rq1 * k1
+                dot = cute.arch.warp_reduction_sum(partial)
+                if lane == 0:
+                    weighted = Float32(0.0)
+                    if head < self.index_heads:
+                        rounded_dot = dot.to(self.dtype).to(Float32)
+                        activated = cute.arch.fmax(rounded_dot, Float32(0.0))
+                        activated = (
+                            activated / math.sqrt(self.index_dim * self.index_heads)
+                        ).to(self.dtype).to(Float32)
+                        weighted = (
+                            activated * weights[batch_idx, position, head].to(Float32)
+                        ).to(self.dtype).to(Float32)
+                    contributions[warp] = weighted
+                cute.arch.barrier()
+                if tid == 0:
+                    for group_head in cutlass.range_constexpr(4):
+                        score_sum[0] += contributions[group_head]
+                cute.arch.barrier()
+
+            if tid == 0:
+                rounded_score = score_sum[0].to(self.dtype)
+                scores[row, n] = _score_index_key(
+                    rounded_score, n, self.num_blocks
+                )
+            cute.arch.barrier()
+
+
+class SelectedGather:
+    """Pack radix-selected compressed blocks and the causal local window."""
+
+    def __init__(
+        self,
+        batch: int,
+        sequence: int,
+        num_blocks: int,
+        topk: int,
+        window: int,
+        gather_length: int,
+    ):
+        self.batch = batch
+        self.sequence = sequence
+        self.num_blocks = num_blocks
+        self.topk = topk
+        self.window = min(window, sequence)
+        self.gather_length = gather_length
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        selected_indices: cute.Tensor,
+        gather: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(selected_indices, gather).launch(
+            grid=[cute.ceil_div(self.batch * self.sequence, 4), 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, selected_indices: cute.Tensor, gather: cute.Tensor):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        warp = tid // cute.arch.WARP_SIZE
+        lane = tid % cute.arch.WARP_SIZE
+        row = block * 4 + warp
+
+        if row < self.batch * self.sequence:
+            batch_idx = row // self.sequence
+            position = row - batch_idx * self.sequence
+            local_count = min(self.window, position + 1)
+            for item in cutlass.range_constexpr(
+                self.gather_length // cute.arch.WARP_SIZE
+            ):
+                slot = lane + item * cute.arch.WARP_SIZE
+                value = Int32(-1)
+                if slot < self.topk:
+                    value = selected_indices[row, slot]
+                else:
+                    local_slot = slot - self.topk
+                    if local_slot < local_count:
+                        key = position - local_count + 1 + local_slot
+                        value = Int32(self.num_blocks + key)
+                gather[batch_idx, position, slot] = value
 
 
 class IndexTopK:
@@ -1271,6 +1603,51 @@ def compile_query_rope(
 
 
 @lru_cache
+def compile_index_scores(
+    dtype,
+    batch,
+    sequence,
+    index_heads,
+    index_dim,
+    num_blocks,
+    rate,
+    rope,
+):
+    return cute.compile(
+        IndexScores(
+            dtype,
+            batch,
+            sequence,
+            index_heads,
+            index_dim,
+            num_blocks,
+            rate,
+            rope,
+        ),
+        _fake(dtype, (batch, index_heads, sequence, index_dim)),
+        _fake(dtype, (batch, num_blocks, 1, index_dim)),
+        _fake(dtype, (batch, sequence, index_heads)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (batch * sequence, num_blocks)),
+        _fake(Int32, (batch * sequence,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache
+def compile_selected_gather(batch, sequence, num_blocks, topk, window, gather_length):
+    return cute.compile(
+        SelectedGather(batch, sequence, num_blocks, topk, window, gather_length),
+        _fake(Int32, (batch * sequence, topk)),
+        _fake(Int32, (batch, sequence, gather_length)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache
 def compile_index_topk(
     dtype,
     batch,
@@ -1451,10 +1828,12 @@ def cute_dtype(tensor: torch.Tensor):
 __all__ = [
     "compile_compression",
     "compile_compressed_merge",
+    "compile_index_scores",
     "compile_index_topk",
     "compile_local_norm",
     "compile_merge",
     "compile_prefix",
     "compile_query_rope",
+    "compile_selected_gather",
     "cute_dtype",
 ]

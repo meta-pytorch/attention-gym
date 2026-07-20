@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from attn_gym.sparse import compressed_sparse_attention
 
 MAX_ABS_ERROR = 1e-2
+DIFFERENTIABLE_INPUTS = (0, 2, 3, 4, 5, 6, 7, 8, 16, 18, 19)
 
 
 def make_inputs(
@@ -74,6 +75,21 @@ def assert_matches_reference(inputs):
     assert max_abs_error <= MAX_ABS_ERROR
 
 
+def _with_gradients(inputs):
+    return tuple(
+        value.detach().clone().requires_grad_(index in DIFFERENTIABLE_INPUTS)
+        if isinstance(value, torch.Tensor)
+        else value
+        for index, value in enumerate(inputs)
+    )
+
+
+def _gradients(inputs, backend, grad_output):
+    output = compressed_sparse_attention(*inputs, backend=backend)
+    targets = tuple(inputs[index] for index in DIFFERENTIABLE_INPUTS)
+    return torch.autograd.grad(output, targets, grad_outputs=grad_output)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -121,3 +137,101 @@ def test_triton_accepts_mixed_shared_and_expanded_heads():
     inputs[4] = inputs[4].expand(-1, 2, -1, -1).contiguous()
     inputs[12] = inputs[12].expand(-1, 2, -1, -1).contiguous()
     assert_matches_reference(tuple(inputs))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("share_kv", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_triton_backward_matches_reference(share_kv, dtype):
+    inputs = make_inputs(
+        share_kv,
+        dtype,
+        batch=1,
+        heads=2,
+        sequence_length=17,
+        head_dim=32,
+        index_heads=2,
+        index_dim=16,
+        compression_rate=4,
+        topk=3,
+        window=5,
+        rope_dims=8,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(321)
+    grad_output = torch.randn(
+        inputs[0].shape,
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    ) * 0.01
+    expected = _gradients(_with_gradients(inputs), "eager", grad_output)
+    actual = _gradients(_with_gradients(inputs), "triton", grad_output)
+
+    for index, (actual_gradient, expected_gradient) in enumerate(zip(actual, expected)):
+        assert torch.allclose(actual_gradient, expected_gradient, atol=1e-2, rtol=1e-2), (
+            f"gradient for input {DIFFERENTIABLE_INPUTS[index]} differs; "
+            f"max abs error "
+            f"{(actual_gradient.float() - expected_gradient.float()).abs().max().item():.6g}"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("topk", "window"),
+    [
+        pytest.param(0, 0, id="sink-only"),
+        pytest.param(3, 0, id="compressed-only"),
+        pytest.param(0, 5, id="local-only"),
+    ],
+)
+def test_triton_backward_selection_edge_cases(topk, window):
+    inputs = make_inputs(
+        True,
+        torch.float32,
+        batch=1,
+        heads=2,
+        sequence_length=17,
+        head_dim=32,
+        index_heads=2,
+        index_dim=16,
+        compression_rate=4,
+        topk=topk,
+        window=window,
+        rope_dims=8,
+    )
+    grad_output = torch.randn_like(inputs[0]) * 0.01
+    expected = _gradients(_with_gradients(inputs), "eager", grad_output)
+    actual = _gradients(_with_gradients(inputs), "triton", grad_output)
+
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        assert torch.allclose(actual_gradient, expected_gradient, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_triton_backward_leaves_discrete_indexer_inputs_without_gradients():
+    inputs = make_inputs(
+        True,
+        torch.float32,
+        batch=1,
+        heads=2,
+        sequence_length=17,
+        head_dim=32,
+        index_heads=2,
+        index_dim=16,
+        compression_rate=4,
+        topk=3,
+        window=5,
+        rope_dims=8,
+    )
+    inputs = tuple(
+        value.detach().clone().requires_grad_(True)
+        if isinstance(value, torch.Tensor)
+        else value
+        for value in inputs
+    )
+    output = compressed_sparse_attention(*inputs, backend="triton")
+    output.backward(torch.randn_like(output) * 0.01)
+
+    differentiable = set(DIFFERENTIABLE_INPUTS)
+    for index, value in enumerate(inputs[:20]):
+        assert (value.grad is not None) == (index in differentiable)
