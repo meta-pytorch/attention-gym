@@ -9,7 +9,7 @@ import torch
 import triton
 
 from attn_gym.sparse import compressed_sparse_attention
-from .benchmark_compressed_sparse_attention_triton import (
+from benchmarks.sparse.benchmark_compressed_sparse_attention_triton import (
     DTYPES,
     make_inputs,
     useful_matmul_flops,

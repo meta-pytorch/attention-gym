@@ -14,9 +14,7 @@ import torch
 import triton
 
 from attn_gym.sparse import compressed_sparse_attention
-from .benchmark_compressed_sparse_attention_triton import (
-    make_inputs,
-)
+from benchmarks.sparse.benchmark_compressed_sparse_attention_triton import make_inputs
 
 
 # These are the tensor arguments for which the CuTe backward returns gradients.
