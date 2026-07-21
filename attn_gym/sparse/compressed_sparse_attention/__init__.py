@@ -1,3 +1,5 @@
-"""Sparse attention primitives."""
+"""Compressed sparse attention."""
 
-__all__: list[str] = []
+from .api import compressed_sparse_attention
+
+__all__ = ["compressed_sparse_attention"]
