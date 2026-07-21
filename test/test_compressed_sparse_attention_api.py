@@ -10,37 +10,45 @@ csa_package = importlib.import_module("attn_gym.sparse.compressed_sparse_attenti
 sparse_package = importlib.import_module("attn_gym.sparse")
 
 
-def make_arguments(*, share_kv=False):
-    batch, heads, sequence, head_dim = 2, 3, 5, 8
-    index_heads, index_dim, compression_rate = 2, 4, 2
-    kv_heads = 1 if share_kv else heads
-    index_kv_heads = 1 if share_kv else index_heads
+def make_arguments():
+    batch = 1
+    heads = 2
+    index_heads = 2
+    sequence_length = 4
+    head_dim = 4
+    index_dim = 4
+    compression_rate = 2
+    dtype = torch.float32
+
+    def tensor(*shape):
+        return torch.empty(shape, dtype=dtype)
+
     return (
-        torch.randn(batch, heads, sequence, head_dim),
-        torch.randn(batch, index_heads, sequence, index_dim),
-        torch.randn(batch, kv_heads, sequence, head_dim),
-        torch.randn(batch, kv_heads, sequence, head_dim),
-        torch.randn(batch, kv_heads, sequence, head_dim),
-        torch.randn(batch, kv_heads, sequence, head_dim),
-        torch.randn(batch, kv_heads, sequence, head_dim),
-        torch.randn(compression_rate, head_dim),
-        torch.randn(compression_rate, head_dim),
-        torch.randn(batch, sequence, index_heads),
-        torch.randn(batch, index_kv_heads, sequence, index_dim),
-        torch.randn(batch, index_kv_heads, sequence, index_dim),
-        torch.randn(batch, index_kv_heads, sequence, index_dim),
-        torch.randn(batch, index_kv_heads, sequence, index_dim),
-        torch.randn(compression_rate, index_dim),
-        torch.randn(compression_rate, index_dim),
-        torch.randn(head_dim),
-        torch.randn(index_dim),
-        torch.randn(head_dim),
-        torch.randn(heads),
+        tensor(batch, heads, sequence_length, head_dim),  # Q
+        tensor(batch, index_heads, sequence_length, index_dim),  # Q_I
+        tensor(batch, heads, sequence_length, head_dim),  # KV
+        tensor(batch, heads, sequence_length, head_dim),  # C_a
+        tensor(batch, heads, sequence_length, head_dim),  # C_b
+        tensor(batch, heads, sequence_length, head_dim),  # Z_a
+        tensor(batch, heads, sequence_length, head_dim),  # Z_b
+        tensor(compression_rate, head_dim),  # B_a
+        tensor(compression_rate, head_dim),  # B_b
+        tensor(batch, sequence_length, index_heads),  # W_I
+        tensor(batch, index_heads, sequence_length, index_dim),  # K_Ia
+        tensor(batch, index_heads, sequence_length, index_dim),  # K_Ib
+        tensor(batch, index_heads, sequence_length, index_dim),  # Z_Ia
+        tensor(batch, index_heads, sequence_length, index_dim),  # Z_Ib
+        tensor(compression_rate, index_dim),  # B_Ia
+        tensor(compression_rate, index_dim),  # B_Ib
+        tensor(head_dim),  # KV_norm_weight
+        tensor(index_dim),  # compressed_indices_norm_weight
+        tensor(head_dim),  # compressed_kv_norm_weight
+        tensor(heads),  # attention_sink
         compression_rate,
-        3,
-        5,
-        4,
-        share_kv,
+        1,  # num_topk_blocks
+        2,  # sliding_window_size
+        4,  # rope_dims
+        False,  # share_kv
     )
 
 
@@ -145,6 +153,22 @@ def test_missing_flash_attention_dependency_has_clear_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="(?i)flash-attn-4"):
         api.compressed_sparse_attention(*make_arguments(), backend="cute")
+
+
+def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
+    versions = {
+        distribution: expected
+        for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
+    }
+    versions["nvidia-cutlass-dsl"] = "0.0.0"
+    monkeypatch.setattr(api.importlib, "import_module", lambda _module: object())
+    monkeypatch.setattr(api.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"nvidia-cutlass-dsl==4\.5\.2 is required; found 0\.0\.0",
+    ):
+        api._validate_cute_dependencies()
 
 
 def test_invalid_backend_is_rejected_without_loading_an_implementation(monkeypatch):

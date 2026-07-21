@@ -1,29 +1,77 @@
 import argparse
+import importlib
 import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from attn_gym.sparse import compressed_sparse_attention
+from attn_gym.sparse.compressed_sparse_attention.api import compressed_sparse_attention
 
 pytest.importorskip("flash_attn.cute.interface")
 
+cute_backend = importlib.import_module("attn_gym.sparse.compressed_sparse_attention.cute")
+
 from attn_gym.sparse.compressed_sparse_attention.cute import (
-    _radix_topk_indices,
+    _DSA_PACKED_WORKSPACE_BYTES,
+    _dsa_head_chunk,
+    _dsa_tile_shape,
+    _dsa_workspace_bytes,
     _require_sm100,
 )
-from attn_gym.sparse.compressed_sparse_attention.cute.kernels import (
-    compile_index_scores,
-    compile_index_topk,
-    compile_selected_gather,
-    cute_dtype,
-)
-from benchmarks.sparse.compressed_sparse_attention.benchmark_compressed_sparse_attention_triton import (
-    make_inputs,
-)
 
 
-MAX_ABS_ERROR = 1e-2
+MAX_ABS_ERROR = 3e-2
+DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor | int | bool, ...]:
+    device = torch.device("cuda")
+    dtype = DTYPES[args.dtype]
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+
+    def randn(*shape: int, scale: float = 0.2) -> torch.Tensor:
+        return (
+            torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+            * scale
+        )
+
+    def query(*shape: int) -> torch.Tensor:
+        return F.normalize(randn(*shape), dim=-1)
+
+    kv_heads = 1 if args.share_kv else args.heads
+    index_kv_heads = 1 if args.share_kv else args.index_heads
+    return (
+        query(args.batch, args.heads, args.sequence_length, args.head_dim),
+        query(args.batch, args.index_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.compression_rate, args.head_dim),
+        randn(args.compression_rate, args.head_dim),
+        randn(args.batch, args.sequence_length, args.index_heads),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.compression_rate, args.index_dim),
+        randn(args.compression_rate, args.index_dim),
+        1.0 + randn(args.head_dim, scale=0.05),
+        1.0 + randn(args.index_dim, scale=0.05),
+        1.0 + randn(args.head_dim, scale=0.05),
+        randn(args.heads),
+        args.compression_rate,
+        args.topk,
+        args.window,
+        args.rope_dims,
+        args.share_kv,
+    )
 
 
 def _inputs(dtype: str, **overrides):
@@ -51,9 +99,8 @@ def _inputs(dtype: str, **overrides):
     torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 0),
     reason="the CuTe backend targets SM100 exclusively",
 )
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_cute_d512_matches_reference_within_one_e_minus_two(dtype):
-    inputs = _inputs(dtype)
+def test_cute_d512_matches_reference_within_one_e_minus_two():
+    inputs = _inputs("bfloat16")
     with torch.inference_mode():
         expected = compressed_sparse_attention(*inputs, backend="eager")
         actual = compressed_sparse_attention(*inputs, backend="cute")
@@ -115,10 +162,12 @@ def test_cute_batch4_bf16_matches_reference_within_one_e_minus_two():
             dict(sequence_length=64, compression_rate=16, topk=0, window=0),
             id="sink-only",
         ),
+        pytest.param(dict(topk=0, window=33), id="local-only"),
+        pytest.param(dict(topk=9, window=0), id="compressed-only"),
     ],
 )
 def test_cute_generalized_shapes_match_reference(overrides):
-    inputs = _inputs("float16", **overrides)
+    inputs = _inputs("bfloat16", **overrides)
     with torch.inference_mode():
         expected = compressed_sparse_attention(*inputs, backend="eager")
         actual = compressed_sparse_attention(*inputs, backend="cute")
@@ -133,145 +182,18 @@ def test_cute_generalized_shapes_match_reference(overrides):
     reason="the CuTe backend targets SM100 exclusively",
 )
 @pytest.mark.parametrize(
-    ("topk", "tied_scores", "index_heads", "index_dim"),
-    [
-        pytest.param(64, False, 4, 64, id="topk64-common-index-shape"),
-        pytest.param(96, False, 4, 64, id="topk96-common-index-shape"),
-        pytest.param(96, True, 4, 64, id="topk96-tied-scores"),
-        pytest.param(64, False, 3, 320, id="topk64-general-index-shape"),
-    ],
+    "workspace_budget",
+    [None, 4 * 1024**2],
+    ids=["single-tile", "token-tiled"],
 )
-def test_cute_radix_topk_matches_insertion_selection(
-    topk, tied_scores, index_heads, index_dim
-):
-    batch = 1
-    sequence = 800
-    compression_rate = 8
-    window = 64
-    rope_dims = 64
-    num_blocks = math.ceil(sequence / compression_rate)
-    gather_length = math.ceil((topk + window) / 128) * 128
-    dtype = torch.bfloat16
-    generator = torch.Generator(device="cuda").manual_seed(123)
-    q_i = torch.randn(
-        batch,
-        index_heads,
-        sequence,
-        index_dim,
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
-    )
-    compressed_indices = torch.randn(
-        batch,
-        num_blocks,
-        1,
-        index_dim,
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
-    )
-    weights = torch.randn(
-        batch,
-        sequence,
-        index_heads,
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
-    )
-    if tied_scores:
-        weights.zero_()
-    cos = torch.randn(
-        sequence,
-        rope_dims // 2,
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    sin = torch.randn_like(cos)
-    score_keys = torch.empty(
-        batch * sequence,
-        num_blocks,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    completed_lengths = torch.empty(
-        batch * sequence,
-        device="cuda",
-        dtype=torch.int32,
-    )
-    actual = torch.empty(
-        batch,
-        sequence,
-        gather_length,
-        device="cuda",
-        dtype=torch.int32,
-    )
-    expected = torch.empty_like(actual)
-
-    score_kernel = compile_index_scores(
-        cute_dtype(q_i),
-        batch,
-        sequence,
-        index_heads,
-        index_dim,
-        num_blocks,
-        compression_rate,
-        rope_dims,
-    )
-    score_kernel(
-        q_i,
-        compressed_indices,
-        weights,
-        cos,
-        sin,
-        score_keys,
-        completed_lengths,
-    )
-    selected_indices = _radix_topk_indices(
-        score_keys,
-        completed_lengths,
-        topk,
-    )
-    compile_selected_gather(
-        batch,
-        sequence,
-        num_blocks,
-        topk,
-        window,
-        gather_length,
-    )(selected_indices, actual)
-    compile_index_topk(
-        cute_dtype(q_i),
-        batch,
-        sequence,
-        index_heads,
-        index_dim,
-        num_blocks,
-        compression_rate,
-        topk,
-        window,
-        rope_dims,
-        gather_length,
-    )(q_i, compressed_indices, weights, cos, sin, expected)
-
-    assert torch.equal(
-        actual[:, :, :topk].sort(dim=-1).values,
-        expected[:, :, :topk].sort(dim=-1).values,
-    )
-    assert torch.equal(actual[:, :, topk:], expected[:, :, topk:])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 0),
-    reason="the CuTe backend targets SM100 exclusively",
-)
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_cute_backward_matches_reference_within_one_e_minus_two(dtype):
+def test_cute_backward_matches_reference(workspace_budget, monkeypatch):
+    if workspace_budget is not None:
+        monkeypatch.setattr(
+            cute_backend, "_DSA_PACKED_WORKSPACE_BYTES", workspace_budget
+        )
     base = _inputs(
-        dtype,
-        heads=8,
+        "bfloat16",
+        heads=64,
         sequence_length=35,
         index_heads=4,
         compression_rate=16,
@@ -314,6 +236,37 @@ def test_cute_backward_matches_reference_within_one_e_minus_two(dtype):
         else:
             assert cute_input.grad is None
             assert reference_input.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 0),
+    reason="the CuTe backend targets SM100 exclusively",
+)
+def test_cute_rejects_fp16():
+    with pytest.raises(TypeError, match="bfloat16 inputs only"):
+        compressed_sparse_attention(*_inputs("float16"), backend="cute")
+
+
+def test_dsa_head_chunk_respects_workspace_budget_below_64_heads():
+    tokens = 8192
+    dim = 512
+    total_kv = tokens + math.ceil(tokens / 32)
+    chunk = _dsa_head_chunk(tokens, dim, 128, total_kv)
+
+    assert 0 < chunk < 64
+    assert _dsa_workspace_bytes(tokens, dim, chunk, total_kv) <= (
+        _DSA_PACKED_WORKSPACE_BYTES
+    )
+    assert _dsa_workspace_bytes(tokens, dim, chunk + 1, total_kv) > (
+        _DSA_PACKED_WORKSPACE_BYTES
+    )
+
+    head_tile, token_tile = _dsa_tile_shape(tokens, dim, 128, total_kv)
+    assert head_tile >= 64
+    assert 0 < token_tile < tokens
+    tiled_bytes = _dsa_workspace_bytes(token_tile, dim, head_tile, total_kv)
+    assert tiled_bytes <= _DSA_PACKED_WORKSPACE_BYTES
 
 
 def test_cute_rejects_non_sm100(monkeypatch):

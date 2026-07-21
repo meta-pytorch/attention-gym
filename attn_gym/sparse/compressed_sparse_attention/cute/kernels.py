@@ -1383,6 +1383,7 @@ class PrefixAttention:
         rope: int,
         prefix: int,
         raw_query: bool = False,
+        store_lse: bool = False,
     ):
         self.dtype = dtype
         self.batch = batch
@@ -1394,9 +1395,10 @@ class PrefixAttention:
         self.rope = rope
         self.prefix = prefix
         self.raw_query = raw_query
+        self.store_lse = store_lse
         self.num_threads = 128
         self.values_per_thread = dim // self.num_threads
-        assert dim == 512 and prefix <= 16
+        assert dim == 512 and prefix > 0
         assert tile_heads in (64, 128)
         assert 0 < active_heads <= tile_heads
         assert 0 <= head_offset and head_offset + active_heads <= total_heads
@@ -1410,9 +1412,10 @@ class PrefixAttention:
         cos: cute.Tensor,
         sin: cute.Tensor,
         out: cute.Tensor,
+        lse: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
-        self.kernel(query, local_kv, sink, cos, sin, out).launch(
+        self.kernel(query, local_kv, sink, cos, sin, out, lse).launch(
             grid=[self.batch * self.active_heads * self.prefix, 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -1427,6 +1430,7 @@ class PrefixAttention:
         cos: cute.Tensor,
         sin: cute.Tensor,
         out: cute.Tensor,
+        lse: cute.Tensor | None,
     ):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -1463,7 +1467,7 @@ class PrefixAttention:
             Float32, cute.make_layout((1, (self.num_threads // 32, 1))), byte_alignment=16
         )
         scores = smem.allocate_tensor(Float32, cute.make_layout((self.prefix,)), byte_alignment=16)
-        for key in cutlass.range_constexpr(self.prefix):
+        for key in cutlass.range(self.prefix, unroll=1):
             partial = Float32(0.0)
             if key <= position:
                 for j in cutlass.range_constexpr(self.values_per_thread):
@@ -1487,24 +1491,37 @@ class PrefixAttention:
             cute.arch.barrier()
 
         maximum = sink[global_head].to(Float32)
-        for key in cutlass.range_constexpr(self.prefix):
+        for key in cutlass.range(self.prefix, unroll=1):
             maximum = cute.arch.fmax(maximum, scores[key])
-        weights = cute.make_rmem_tensor((self.prefix,), Float32)
         weight_sum = Float32(0.0)
-        for key in cutlass.range_constexpr(self.prefix):
+        for key in cutlass.range(self.prefix, unroll=1):
             delta = (scores[key] - maximum).to(self.dtype).to(Float32)
             weight = Float32(self.dtype(cute.math.exp(delta, fastmath=False)))
-            weights[key] = weight
             weight_sum += weight
         sink_delta = (sink[global_head].to(Float32) - maximum).to(self.dtype).to(Float32)
         sink_weight = Float32(self.dtype(cute.math.exp(sink_delta, fastmath=False)))
         denominator = Float32(self.dtype(Float32(self.dtype(weight_sum)) + sink_weight))
+        if const_expr(self.store_lse):
+            if tid == 0:
+                kv_maximum = -Float32.inf
+                for key in cutlass.range(self.prefix, unroll=1):
+                    kv_maximum = cute.arch.fmax(kv_maximum, scores[key])
+                kv_weight_sum = Float32(0.0)
+                for key in cutlass.range(self.prefix, unroll=1):
+                    kv_weight_sum += cute.math.exp(
+                        scores[key] - kv_maximum, fastmath=False
+                    )
+                lse[batch_idx, position, global_head] = kv_maximum + cute.math.log(
+                    kv_weight_sum, fastmath=False
+                )
 
         values = cute.make_rmem_tensor((self.values_per_thread,), Float32)
         for j in cutlass.range_constexpr(self.values_per_thread):
             value = Float32(0.0)
-            for key in cutlass.range_constexpr(self.prefix):
-                probability = Float32(self.dtype(weights[key] / denominator))
+            for key in cutlass.range(self.prefix, unroll=1):
+                delta = (scores[key] - maximum).to(self.dtype).to(Float32)
+                weight = Float32(self.dtype(cute.math.exp(delta, fastmath=False)))
+                probability = Float32(self.dtype(weight / denominator))
                 if key <= position:
                     value += probability * local_kv[batch_idx, key, 0, d_base + j].to(Float32)
             values[j] = Float32(self.dtype(value))
@@ -1791,6 +1808,7 @@ def compile_prefix(
     rope,
     prefix=16,
     raw_query=False,
+    store_lse=False,
 ):
     return cute.compile(
         PrefixAttention(
@@ -1804,6 +1822,7 @@ def compile_prefix(
             rope,
             prefix,
             raw_query,
+            store_lse,
         ),
         _fake(
             dtype,
@@ -1816,6 +1835,7 @@ def compile_prefix(
         _fake(Float32, (sequence, rope // 2)),
         _fake(Float32, (sequence, rope // 2)),
         _fake(dtype, (batch, total_heads, sequence, dim)),
+        _fake(Float32, (batch, sequence, total_heads)) if store_lse else None,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
