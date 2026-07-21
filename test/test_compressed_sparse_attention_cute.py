@@ -2,16 +2,66 @@ import argparse
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from attn_gym.sparse import compressed_sparse_attention
+from attn_gym.sparse.compressed_sparse_attention.api import compressed_sparse_attention
 
 pytest.importorskip("flash_attn.cute.interface")
 
 from attn_gym.sparse.compressed_sparse_attention.cute import _require_sm100
-from benchmarks.sparse.benchmark_compressed_sparse_attention import make_inputs
 
 
 MAX_ABS_ERROR = 1e-2
+DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor | int | bool, ...]:
+    device = torch.device("cuda")
+    dtype = DTYPES[args.dtype]
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+
+    def randn(*shape: int, scale: float = 0.2) -> torch.Tensor:
+        return (
+            torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+            * scale
+        )
+
+    def query(*shape: int) -> torch.Tensor:
+        return F.normalize(randn(*shape), dim=-1)
+
+    kv_heads = 1 if args.share_kv else args.heads
+    index_kv_heads = 1 if args.share_kv else args.index_heads
+    return (
+        query(args.batch, args.heads, args.sequence_length, args.head_dim),
+        query(args.batch, args.index_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.batch, kv_heads, args.sequence_length, args.head_dim),
+        randn(args.compression_rate, args.head_dim),
+        randn(args.compression_rate, args.head_dim),
+        randn(args.batch, args.sequence_length, args.index_heads),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.batch, index_kv_heads, args.sequence_length, args.index_dim),
+        randn(args.compression_rate, args.index_dim),
+        randn(args.compression_rate, args.index_dim),
+        1.0 + randn(args.head_dim, scale=0.05),
+        1.0 + randn(args.index_dim, scale=0.05),
+        1.0 + randn(args.head_dim, scale=0.05),
+        randn(args.heads),
+        args.compression_rate,
+        args.topk,
+        args.window,
+        args.rope_dims,
+        args.share_kv,
+    )
 
 
 def _inputs(dtype: str, **overrides):
