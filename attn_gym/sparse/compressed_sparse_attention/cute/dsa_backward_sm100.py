@@ -864,9 +864,8 @@ class FlashAttentionDSABackwardSm100:
         )
         compute_tmastore_dQ_pipeline = self.make_and_init_compute_tmastore_dQ_pipeline()
 
-        tmem_holding_buf = storage.tmem_holding_buf
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],
         )
@@ -2773,6 +2772,8 @@ class FlashAttentionDSABackwardSm100:
 
 # The code below is Attention Gym's local PyTorch launcher. It replaces the
 # cudnn.deepseek_sparse_attention APIBase/interface layers; the kernel above is vendored.
+from collections import OrderedDict
+
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -2870,7 +2871,8 @@ def sparse_attention_backward_wrapper(
         block_tile,
         topk_length is not None,
     )
-    compiled = sparse_attention_backward_wrapper.compile_cache.get(compile_key)
+    compile_cache = sparse_attention_backward_wrapper.compile_cache
+    compiled = compile_cache.get(compile_key)
     if compiled is None:
         kernel = FlashAttentionDSABackwardSm100(head_dim, head_dim_v, block_tile)
         compiled = cute.compile(
@@ -2893,7 +2895,11 @@ def sparse_attention_backward_wrapper(
             stream,
             options="--enable-tvm-ffi",
         )
-        sparse_attention_backward_wrapper.compile_cache[compile_key] = compiled
+        compile_cache[compile_key] = compiled
+        if len(compile_cache) > 64:
+            compile_cache.popitem(last=False)
+    else:
+        compile_cache.move_to_end(compile_key)
 
     compiled(
         problem_shape,
@@ -2916,4 +2922,4 @@ def sparse_attention_backward_wrapper(
     return {"dq": dq, "dkv": dkv, "d_sink": d_sink}
 
 
-sparse_attention_backward_wrapper.compile_cache = {}
+sparse_attention_backward_wrapper.compile_cache = OrderedDict()

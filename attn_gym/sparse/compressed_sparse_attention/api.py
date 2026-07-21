@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 import importlib
+from importlib import metadata
 import math
 from typing import Literal
 
@@ -9,6 +10,18 @@ import torch
 
 Backend = Literal["eager", "triton", "cute"]
 Mode = Literal["auto", "chunked", "recurrent"]
+
+_CUTE_RUNTIME_DEPENDENCIES = (
+    ("cuda-python", "cuda.bindings.driver", "13.3.1"),
+    ("nvidia-cutlass-dsl", "cutlass.cute", "4.5.2"),
+    ("flash-attn-4", "flash_attn.cute.interface", "4.0.0b17"),
+    ("quack-kernels", "quack", "0.5.0"),
+    (
+        "nvidia-cudnn-frontend",
+        "cudnn.deepseek_sparse_attention.indexer_top_k",
+        "1.25.0",
+    ),
+)
 
 
 def _validate_inputs(
@@ -154,12 +167,35 @@ def _load_triton_implementation() -> Callable[..., torch.Tensor]:
     return implementation
 
 
+def _validate_cute_dependencies() -> None:
+    problems = []
+    for distribution, module, expected_version in _CUTE_RUNTIME_DEPENDENCIES:
+        try:
+            importlib.import_module(module.partition(".")[0])
+            importlib.import_module(module)
+        except (ImportError, RuntimeError) as error:
+            problems.append(f"{distribution}=={expected_version} is unavailable ({error})")
+            continue
+        try:
+            installed_version = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            problems.append(f"{distribution}=={expected_version} is not installed")
+            continue
+        if installed_version != expected_version:
+            problems.append(
+                f"{distribution}=={expected_version} is required; found {installed_version}"
+            )
+    if problems:
+        details = "; ".join(problems)
+        raise RuntimeError(
+            "The CuTe DSL backend dependency set is incompatible. "
+            f"Install attn_gym[cute]. Details: {details}."
+        )
+
+
 def _load_cute_implementation() -> Callable[..., torch.Tensor]:
+    _validate_cute_dependencies()
     try:
-        # Probe roots explicitly even when an earlier CuTe import left its internal
-        # modules cached.  This keeps missing optional dependencies deterministic.
-        for dependency in ("cuda", "cutlass", "quack", "flash_attn"):
-            importlib.import_module(dependency)
         from .cute import compressed_sparse_attention as implementation
     except ModuleNotFoundError as error:
         missing_module = error.name or ""
@@ -244,7 +280,8 @@ def compressed_sparse_attention(
     rope_dims: number of dimensions to apply rope to
     share_kv: True if all query heads attented to one kv head; SM100 backend only supports share_kv = true
     mode: Currently only auto/chunked are supported (implementations are prefill only as of now)
-    backend: One of eager, triton, or cute. Cute is supported for SM100 only
+    backend: One of eager, triton, or cute. CuTe requires SM100, CUDA 13.3, shared KV,
+        D=512, and bfloat16 inputs.
     '''
     if backend not in ("eager", "triton", "cute"):
         raise ValueError(
