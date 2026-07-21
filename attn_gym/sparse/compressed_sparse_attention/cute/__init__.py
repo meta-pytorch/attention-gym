@@ -16,11 +16,13 @@ from cutlass import BFloat16
 
 from .kernels import (
     compile_compression,
+    compile_index_scores,
     compile_index_topk,
     compile_local_norm,
     compile_merge,
     compile_prefix,
     compile_query_rope,
+    compile_selected_gather,
     cute_dtype,
 )
 from .local_attention import compressed_attention
@@ -41,6 +43,9 @@ _HEAD_DIM = 512
 _INDEX_DIM = 64
 _COMPRESSION_RATE = 32
 _ROPE_DIMS = 64
+_RADIX_TOPK_THRESHOLD = 64
+_RADIX_TOPK_MAX = 2048
+_RADIX_TOPK_MAX_BLOCKS = 8192
 _query_streams: dict[int, torch.cuda.Stream] = {}
 _DSA_PACKED_WORKSPACE_BYTES = 1536 * 1024 * 1024
 
@@ -51,6 +56,31 @@ def _query_stream(device_index: int) -> torch.cuda.Stream:
         stream = torch.cuda.Stream(device=device_index)
         _query_streams[device_index] = stream
     return stream
+
+
+def _radix_topk_indices(
+    score_keys: torch.Tensor,
+    completed_lengths: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Select large top-k sets with cuDNN's cooperative SM90+ radix kernel."""
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_wrapper
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "CuTe compressed sparse attention with topk >= 64 requires the cuDNN "
+            "frontend radix top-k kernels."
+        ) from error
+
+    result = indexer_top_k_wrapper(
+        score_keys,
+        completed_lengths,
+        topk,
+        next_n=1,
+        return_val=False,
+    )
+    return result["indices"]
 
 
 def _dsa_head_chunk(tokens: int, dim: int, heads: int) -> int:
@@ -115,22 +145,6 @@ def _rope_tables(
         return angles.cos(), angles.sin()
 
 
-def _validate_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shape: tuple[int, ...],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    if tuple(tensor.shape) != shape:
-        raise ValueError(f"{name} must have shape {shape}; got {tuple(tensor.shape)}.")
-    if tensor.device != device or tensor.dtype != dtype:
-        raise ValueError(f"{name} must use device={device} and dtype={dtype}.")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous.")
-
-
 def _validate_configuration(
     Q: torch.Tensor,
     Q_I: torch.Tensor,
@@ -152,10 +166,6 @@ def _validate_configuration(
     compressed_indices_norm_weight: torch.Tensor,
     compressed_kv_norm_weight: torch.Tensor,
     attention_sink: torch.Tensor,
-    compression_rate: int,
-    num_topk_blocks: int,
-    sliding_window_size: int,
-    rope_dims: int,
     share_kv: bool,
 ) -> tuple[int, int, int, int, int]:
     if not Q.is_cuda:
@@ -163,62 +173,54 @@ def _validate_configuration(
     _require_sm100(Q.device)
     if Q.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("The CuTe backend supports bfloat16 and float16 inputs.")
-    if Q.ndim != 4:
-        raise ValueError("Q must have shape [B, H, S, D].")
     batch, heads, sequence_length, head_dim = Q.shape
-    if batch <= 0 or heads <= 0 or sequence_length <= 0:
-        raise ValueError("B, H, and S must be positive.")
     if sequence_length >= 2**31:
         raise ValueError("The CuTe backend requires S < 2**31.")
     if head_dim != _HEAD_DIM:
         raise ValueError("The SM100 CuTe specialization requires D=512.")
-    if Q_I.ndim != 4:
-        raise ValueError("Q_I must have shape [B, HI, S, DI].")
     index_heads, index_dim = Q_I.shape[1], Q_I.shape[3]
-    if index_heads <= 0 or index_dim <= 0 or index_dim % 64:
-        raise ValueError("HI must be positive and DI must be a positive multiple of 64.")
+    if index_dim % 64:
+        raise ValueError("The SM100 CuTe specialization requires DI to be a multiple of 64.")
     if not share_kv:
         raise ValueError("The SM100 CuTe specialization requires share_kv=True.")
-    if compression_rate <= 0:
-        raise ValueError("compression_rate must be positive.")
-    if num_topk_blocks < 0:
-        raise ValueError("num_topk_blocks must be nonnegative.")
-    if sliding_window_size < 0:
-        raise ValueError("sliding_window_size must be nonnegative.")
-    if rope_dims <= 0 or rope_dims % 2 or rope_dims > min(head_dim, index_dim):
-        raise ValueError("rope_dims must be positive, even, and at most min(D, DI).")
 
-    device, dtype = Q.device, Q.dtype
-    attention_shape = (batch, 1, sequence_length, head_dim)
-    index_shape = (batch, 1, sequence_length, index_dim)
-    expected = (
-        ("Q", Q, (batch, heads, sequence_length, head_dim)),
-        ("Q_I", Q_I, (batch, index_heads, sequence_length, index_dim)),
-        ("KV", KV, attention_shape),
-        ("C_a", C_a, attention_shape),
-        ("C_b", C_b, attention_shape),
-        ("Z_a", Z_a, attention_shape),
-        ("Z_b", Z_b, attention_shape),
-        ("B_a", B_a, (compression_rate, head_dim)),
-        ("B_b", B_b, (compression_rate, head_dim)),
-        ("W_I", W_I, (batch, sequence_length, index_heads)),
-        ("K_Ia", K_Ia, index_shape),
-        ("K_Ib", K_Ib, index_shape),
-        ("Z_Ia", Z_Ia, index_shape),
-        ("Z_Ib", Z_Ib, index_shape),
-        ("B_Ia", B_Ia, (compression_rate, index_dim)),
-        ("B_Ib", B_Ib, (compression_rate, index_dim)),
-        ("KV_norm_weight", KV_norm_weight, (head_dim,)),
-        (
-            "compressed_indices_norm_weight",
-            compressed_indices_norm_weight,
-            (index_dim,),
-        ),
-        ("compressed_kv_norm_weight", compressed_kv_norm_weight, (head_dim,)),
-        ("attention_sink", attention_sink, (heads,)),
+    shared_attention_inputs = (
+        ("KV", KV),
+        ("C_a", C_a),
+        ("C_b", C_b),
+        ("Z_a", Z_a),
+        ("Z_b", Z_b),
     )
-    for name, tensor, shape in expected:
-        _validate_tensor(name, tensor, shape, device=device, dtype=dtype)
+    shared_index_inputs = (
+        ("K_Ia", K_Ia),
+        ("K_Ib", K_Ib),
+        ("Z_Ia", Z_Ia),
+        ("Z_Ib", Z_Ib),
+    )
+    for name, tensor in (*shared_attention_inputs, *shared_index_inputs):
+        if tensor.shape[1] != 1:
+            raise ValueError(
+                f"{name} must physically have one KV head for the SM100 CuTe backend."
+            )
+
+    tensors = (
+        ("Q", Q),
+        ("Q_I", Q_I),
+        *shared_attention_inputs,
+        ("B_a", B_a),
+        ("B_b", B_b),
+        ("W_I", W_I),
+        *shared_index_inputs,
+        ("B_Ia", B_Ia),
+        ("B_Ib", B_Ib),
+        ("KV_norm_weight", KV_norm_weight),
+        ("compressed_indices_norm_weight", compressed_indices_norm_weight),
+        ("compressed_kv_norm_weight", compressed_kv_norm_weight),
+        ("attention_sink", attention_sink),
+    )
+    for name, tensor in tensors:
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous for the CuTe backend.")
     return batch, heads, sequence_length, index_heads, index_dim
 
 
@@ -273,10 +275,6 @@ def _compressed_sparse_attention_forward(
         compressed_indices_norm_weight,
         compressed_kv_norm_weight,
         attention_sink,
-        compression_rate,
-        num_topk_blocks,
-        sliding_window_size,
-        rope_dims,
         share_kv,
     )
     num_blocks = math.ceil(sequence_length / compression_rate)
@@ -305,34 +303,7 @@ def _compressed_sparse_attention_forward(
     prefetched_query = None
     prefetched_local_query = None
     query_torch_stream = None
-    use_query_overlap = (
-        batch == 1
-        and sequence_length >= 1024
-        and not (selected_width and heads >= 128)
-    )
-    if use_query_overlap:
-        active_heads = min(128, heads)
-        local_tile_heads = 128
-        prefetched_query = torch.empty(
-            batch, sequence_length, 128, _HEAD_DIM, device=Q.device, dtype=Q.dtype
-        )
-        prefetched_local_query = prefetched_query
-        caller_stream = torch.cuda.current_stream(Q.device)
-        query_torch_stream = _query_stream(device_index)
-        query_torch_stream.wait_stream(caller_stream)
-        with torch.cuda.stream(query_torch_stream):
-            compile_query_rope(
-                dtype,
-                batch,
-                heads,
-                128,
-                active_heads,
-                0,
-                sequence_length,
-                _HEAD_DIM,
-                rope_dims,
-                0,
-            )(Q, cos, sin, prefetched_query, prefetched_local_query)
+
 
     if use_specialized_preprocess:
         local_kv, compressed_kv, compressed_indices = preprocess_shared_kv(
@@ -410,30 +381,86 @@ def _compressed_sparse_attention_forward(
         compressed_lse_state = torch.full_like(local_lse_state, -torch.inf)
 
     index_torch_stream = None
+    score_keys = None
+    completed_lengths = None
     if selected_width:
         index_torch_stream = (
             parallel_preprocess_stream(KV)
             if use_specialized_preprocess and effective_topk
             else None
         )
-        index_topk = compile_index_topk(
-            dtype,
-            batch,
-            sequence_length,
-            index_heads,
-            index_dim,
-            num_blocks,
-            compression_rate,
-            effective_topk,
-            selected_window,
-            rope_dims,
-            gather_length,
+        use_radix_topk = (
+            effective_topk >= _RADIX_TOPK_THRESHOLD
+            and effective_topk <= _RADIX_TOPK_MAX
+            and num_blocks <= _RADIX_TOPK_MAX_BLOCKS
         )
+
+        def launch_indexer() -> None:
+            nonlocal score_keys, completed_lengths
+            if use_radix_topk:
+                score_keys = torch.empty(
+                    batch * sequence_length,
+                    num_blocks,
+                    device=Q.device,
+                    dtype=torch.float32,
+                )
+                completed_lengths = torch.empty(
+                    batch * sequence_length,
+                    device=Q.device,
+                    dtype=torch.int32,
+                )
+                compile_index_scores(
+                    dtype,
+                    batch,
+                    sequence_length,
+                    index_heads,
+                    index_dim,
+                    num_blocks,
+                    compression_rate,
+                    rope_dims,
+                )(
+                    Q_I,
+                    compressed_indices,
+                    W_I,
+                    cos,
+                    sin,
+                    score_keys,
+                    completed_lengths,
+                )
+                selected_indices = _radix_topk_indices(
+                    score_keys,
+                    completed_lengths,
+                    effective_topk,
+                )
+                compile_selected_gather(
+                    batch,
+                    sequence_length,
+                    num_blocks,
+                    effective_topk,
+                    selected_window,
+                    gather_length,
+                )(selected_indices, gather)
+            else:
+                index_topk = compile_index_topk(
+                    dtype,
+                    batch,
+                    sequence_length,
+                    index_heads,
+                    index_dim,
+                    num_blocks,
+                    compression_rate,
+                    effective_topk,
+                    selected_window,
+                    rope_dims,
+                    gather_length,
+                )
+                index_topk(Q_I, compressed_indices, W_I, cos, sin, gather)
+
         if index_torch_stream is not None:
             with torch.cuda.stream(index_torch_stream):
-                index_topk(Q_I, compressed_indices, W_I, cos, sin, gather)
+                launch_indexer()
         else:
-            index_topk(Q_I, compressed_indices, W_I, cos, sin, gather)
+            launch_indexer()
 
     # The first few very short reductions have the sharpest BF16 ordering error.
     # Replaying through row 9 covers the validated B=1 and B=4 short-/long-context
