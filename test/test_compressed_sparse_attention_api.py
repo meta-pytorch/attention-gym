@@ -2,6 +2,7 @@ import importlib
 import sys
 
 import pytest
+import torch
 
 
 api = importlib.import_module("attn_gym.sparse.compressed_sparse_attention.api")
@@ -10,7 +11,45 @@ sparse_package = importlib.import_module("attn_gym.sparse")
 
 
 def make_arguments():
-    return tuple(object() for _ in range(25))
+    batch = 1
+    heads = 2
+    index_heads = 2
+    sequence_length = 4
+    head_dim = 4
+    index_dim = 4
+    compression_rate = 2
+    dtype = torch.float32
+
+    def tensor(*shape):
+        return torch.empty(shape, dtype=dtype)
+
+    return (
+        tensor(batch, heads, sequence_length, head_dim),  # Q
+        tensor(batch, index_heads, sequence_length, index_dim),  # Q_I
+        tensor(batch, heads, sequence_length, head_dim),  # KV
+        tensor(batch, heads, sequence_length, head_dim),  # C_a
+        tensor(batch, heads, sequence_length, head_dim),  # C_b
+        tensor(batch, heads, sequence_length, head_dim),  # Z_a
+        tensor(batch, heads, sequence_length, head_dim),  # Z_b
+        tensor(compression_rate, head_dim),  # B_a
+        tensor(compression_rate, head_dim),  # B_b
+        tensor(batch, sequence_length, index_heads),  # W_I
+        tensor(batch, index_heads, sequence_length, index_dim),  # K_Ia
+        tensor(batch, index_heads, sequence_length, index_dim),  # K_Ib
+        tensor(batch, index_heads, sequence_length, index_dim),  # Z_Ia
+        tensor(batch, index_heads, sequence_length, index_dim),  # Z_Ib
+        tensor(compression_rate, index_dim),  # B_Ia
+        tensor(compression_rate, index_dim),  # B_Ib
+        tensor(head_dim),  # KV_norm_weight
+        tensor(index_dim),  # compressed_indices_norm_weight
+        tensor(head_dim),  # compressed_kv_norm_weight
+        tensor(heads),  # attention_sink
+        compression_rate,
+        1,  # num_topk_blocks
+        2,  # sliding_window_size
+        4,  # rope_dims
+        False,  # share_kv
+    )
 
 
 def fail_loader():
