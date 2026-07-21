@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 
 import cutlass.cute as cute
@@ -11,7 +12,22 @@ from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 from .fa4_local import FlashAttentionMLAForwardSm100
 
 
-_compile_cache: dict[tuple[object, ...], object] = {}
+_COMPILE_CACHE_MAXSIZE = 64
+_compile_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
+
+
+def _cache_get(key: tuple[object, ...]) -> object | None:
+    compiled = _compile_cache.get(key)
+    if compiled is not None:
+        _compile_cache.move_to_end(key)
+    return compiled
+
+
+def _cache_put(key: tuple[object, ...], compiled: object) -> None:
+    _compile_cache[key] = compiled
+    _compile_cache.move_to_end(key)
+    if len(_compile_cache) > _COMPILE_CACHE_MAXSIZE:
+        _compile_cache.popitem(last=False)
 
 
 def _compile_local(
@@ -30,7 +46,7 @@ def _compile_local(
         tuple(output.stride()),
         window,
     )
-    compiled = _compile_cache.get(key)
+    compiled = _cache_get(key)
     if compiled is not None:
         return compiled
 
@@ -70,10 +86,11 @@ def _compile_local(
         None,
         None,
         None,
+        None,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
-    _compile_cache[key] = compiled
+    _cache_put(key, compiled)
     return compiled
 
 
@@ -113,7 +130,7 @@ def _compile_compressed(
         csa_topk,
         csa_window,
     )
-    compiled = _compile_cache.get(key)
+    compiled = _cache_get(key)
     if compiled is not None:
         return compiled
 
@@ -163,7 +180,7 @@ def _compile_compressed(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
-    _compile_cache[key] = compiled
+    _cache_put(key, compiled)
     return compiled
 
 
@@ -216,6 +233,7 @@ def local_attention(
         None,
         window - 1,
         0,
+        None,
         None,
         None,
         None,

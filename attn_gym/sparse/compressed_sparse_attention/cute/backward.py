@@ -731,11 +731,11 @@ class SinkReduce:
 
 
 class PrepareDsaBackward:
-    """Rotate/transpose Q, O, dO and combine the two KV-only LSE partials."""
+    """Rotate/transpose Q, O, and dO while packing the combined attention LSE."""
 
     def __init__(
         self, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-        sequence, dim, rope,
+        sequence, packed_tokens, token_offset, dim, rope,
     ):
         self.dtype = dsa_dtype
         self.batch = batch
@@ -743,6 +743,8 @@ class PrepareDsaBackward:
         self.packed_heads = packed_heads
         self.head_offset = head_offset
         self.sequence = sequence
+        self.packed_tokens = packed_tokens
+        self.token_offset = token_offset
         self.dim = dim
         self.rope = rope
         self.num_threads = 128
@@ -750,30 +752,31 @@ class PrepareDsaBackward:
 
     @cute.jit
     def __call__(
-        self, q, out, dout, local_lse, compressed_lse, cos, sin,
+        self, q, out, dout, combined_lse, cos, sin,
         q_packed, out_packed, dout_packed, lse, stream: cuda.CUstream,
     ):
         self.kernel(
-            q, out, dout, local_lse, compressed_lse, cos, sin,
+            q, out, dout, combined_lse, cos, sin,
             q_packed, out_packed, dout_packed, lse,
         ).launch(
-            grid=[self.batch * self.sequence * self.packed_heads, 1, 1],
+            grid=[self.packed_tokens * self.packed_heads, 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
     def kernel(
-        self, q, out, dout, local_lse, compressed_lse, cos, sin,
+        self, q, out, dout, combined_lse, cos, sin,
         q_packed, out_packed, dout_packed, lse,
     ):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         packed_head = row % self.packed_heads
         token = row // self.packed_heads
+        global_token = self.token_offset + token
         head = self.head_offset + packed_head
-        pos = token % self.sequence
-        b = token // self.sequence
+        pos = global_token % self.sequence
+        b = global_token // self.sequence
         base = tid * self.values_per_thread
         for pair in cutlass.range_constexpr(self.values_per_thread // 2):
             j = pair * 2
@@ -798,20 +801,7 @@ class PrepareDsaBackward:
             dout_packed[token, packed_head, d] = g0.to(self.dtype)
             dout_packed[token, packed_head, d + 1] = g1.to(self.dtype)
         if tid == 0:
-            a = local_lse[b, pos, head]
-            c_lse = compressed_lse[b, pos, head]
-            maximum = cute.arch.fmax(a, c_lse)
-            combined = maximum
-            if maximum != -Float32.inf:
-                exp_sum = Float32(
-                    cute.math.exp(a - maximum, fastmath=False)
-                    + cute.math.exp(c_lse - maximum, fastmath=False)
-                )
-                combined = maximum + cute.math.log(
-                    exp_sum,
-                    fastmath=False,
-                )
-            lse[token, packed_head] = combined
+            lse[token, packed_head] = combined_lse[b, pos, head]
 
 
 class PackDsaKvIndices:
@@ -827,7 +817,8 @@ class PackDsaKvIndices:
         self.topk = topk
         self.window = min(window, sequence)
         self.width = width
-        self.kv_per_batch = blocks + sequence
+        self.local_length = sequence if self.window > 0 else 0
+        self.kv_per_batch = blocks + self.local_length
 
     @cute.jit
     def __call__(
@@ -900,7 +891,7 @@ class PackDsaKvIndices:
 class UnpackDsaGradients:
     def __init__(
         self, output_dtype, batch, total_heads, packed_heads, head_offset,
-        sequence, dim, rope, blocks,
+        sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
     ):
         self.dtype = output_dtype
         self.batch = batch
@@ -908,15 +899,18 @@ class UnpackDsaGradients:
         self.packed_heads = packed_heads
         self.head_offset = head_offset
         self.sequence = sequence
+        self.packed_tokens = packed_tokens
+        self.token_offset = token_offset
         self.dim = dim
         self.rope = rope
         self.blocks = blocks
-        self.kv_per_batch = blocks + sequence
+        self.local_length = local_length
+        self.kv_per_batch = blocks + local_length
 
     @cute.jit
     def __call__(self, dq_packed, dkv, cos, sin, dq, dlocal, dcompressed, stream: cuda.CUstream):
         self.dq_kernel(dq_packed, cos, sin, dq).launch(
-            grid=[self.batch * self.sequence * self.packed_heads, 1, 1], block=[128, 1, 1], stream=stream,
+            grid=[self.packed_tokens * self.packed_heads, 1, 1], block=[128, 1, 1], stream=stream,
         )
         self.dkv_kernel(dkv, dlocal, dcompressed).launch(
             grid=[cute.ceil_div(self.batch * self.kv_per_batch * self.dim, 256), 1, 1],
@@ -927,8 +921,9 @@ class UnpackDsaGradients:
     def dq_kernel(self, source, cos, sin, dest):
         tid, _, _ = cute.arch.thread_idx(); row, _, _ = cute.arch.block_idx()
         packed_head = row % self.packed_heads; token = row // self.packed_heads
+        global_token = self.token_offset + token
         head = self.head_offset + packed_head
-        pos = token % self.sequence; b = token // self.sequence
+        pos = global_token % self.sequence; b = global_token // self.sequence
         base = tid * (self.dim // 128)
         for pair in cutlass.range_constexpr(self.dim // 128 // 2):
             j = pair * 2; d = base + j
@@ -1002,21 +997,20 @@ def compile_sink_reduce(dtype, batch, heads, sequence):
 @lru_cache
 def compile_prepare_dsa_backward(
     input_dtype, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-    sequence, dim, rope,
+    sequence, packed_tokens, token_offset, dim, rope,
 ):
     return cute.compile(
         PrepareDsaBackward(
             dsa_dtype, batch, total_heads, packed_heads, head_offset,
-            sequence, dim, rope,
+            sequence, packed_tokens, token_offset, dim, rope,
         ),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(Float32, (batch, sequence, total_heads)),
-        _fake(Float32, (batch, sequence, total_heads)),
         _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
-        *[_fake(dsa_dtype, (batch * sequence, packed_heads, dim)) for _ in range(3)],
-        _fake(Float32, (batch * sequence, packed_heads)),
+        *[_fake(dsa_dtype, (packed_tokens, packed_heads, dim)) for _ in range(3)],
+        _fake(Float32, (packed_tokens, packed_heads)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
     )
 
@@ -1026,13 +1020,15 @@ def compile_pack_dsa_kv_indices(
     input_dtype, dsa_dtype, batch, sequence, dim, blocks, rate,
     topk, window, width, heads, gather_width,
 ):
+    local_length = sequence if window > 0 else 0
     return cute.compile(
         PackDsaKvIndices(
             dsa_dtype, batch, sequence, dim, blocks, rate, topk, window, width
         ),
-        _fake(input_dtype, (batch, blocks, 1, dim)), _fake(input_dtype, (batch, sequence, 1, dim)),
+        _fake(input_dtype, (batch, blocks, 1, dim)),
+        _fake(input_dtype, (batch, local_length, 1, dim)),
         _fake(Int32, (batch, sequence, gather_width)),
-        _fake(dsa_dtype, (batch * (blocks + sequence), dim)),
+        _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
         _fake(Int32, (batch * sequence, width)),
         _fake(Int32, (batch * sequence,)),
         _fake(input_dtype, (heads,)), _fake(Float32, (heads,)),
@@ -1043,18 +1039,18 @@ def compile_pack_dsa_kv_indices(
 @lru_cache
 def compile_unpack_dsa_gradients(
     output_dtype, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-    sequence, dim, rope, blocks,
+    sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
 ):
     return cute.compile(
         UnpackDsaGradients(
             output_dtype, batch, total_heads, packed_heads, head_offset,
-            sequence, dim, rope, blocks,
+            sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
         ),
-        _fake(dsa_dtype, (batch * sequence, packed_heads, dim)),
-        _fake(dsa_dtype, (batch * (blocks + sequence), dim)),
+        _fake(dsa_dtype, (packed_tokens, packed_heads, dim)),
+        _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
         _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
         _fake(output_dtype, (batch, total_heads, sequence, dim)),
-        _fake(Float32, (batch, sequence, 1, dim)),
+        _fake(Float32, (batch, local_length, 1, dim)),
         _fake(Float32, (batch, blocks, 1, dim)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
     )
