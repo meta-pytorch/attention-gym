@@ -84,12 +84,13 @@ def _radix_topk_indices(
 def _dsa_workspace_bytes(tokens: int, dim: int, heads: int, total_kv: int) -> int:
     """Estimate live packed tensors and vendored DSA workspaces for one chunk."""
     # Q, output, dOutput, and dQ are BF16. Packed LSE is FP32, while the vendored
-    # LSE/OdO workspace has two FP32 values at an eight-row alignment.
+    # LSE/OdO workspace aligns its two FP32 regions over eight tokens and 64 heads.
     rounded_tokens = math.ceil(tokens / 8) * 8
+    rounded_heads = math.ceil(heads / 64) * 64
     rounded_dim = math.ceil(dim / 8) * 8
     head_dependent = (
         tokens * heads * (4 * dim * 2 + 4)
-        + rounded_tokens * heads * 2 * 4
+        + rounded_tokens * rounded_heads * 2 * 4
         + heads * (4 + 4 + 2 + 4)
     )
     # Packed KV, dKV, and the vendored FP32 dKV reduction workspace coexist.
@@ -101,22 +102,33 @@ def _dsa_workspace_bytes(tokens: int, dim: int, heads: int, total_kv: int) -> in
 def _dsa_head_chunk(tokens: int, dim: int, heads: int, total_kv: int = 0) -> int:
     """Choose the largest head chunk under the packed-workspace budget."""
     fixed_bytes = _dsa_workspace_bytes(tokens, dim, 0, total_kv)
-    bytes_per_head = _dsa_workspace_bytes(tokens, dim, 1, 0)
     if fixed_bytes >= _DSA_PACKED_WORKSPACE_BYTES:
         raise RuntimeError(
             "The CuTe backward fixed KV workspace exceeds the "
             f"{_DSA_PACKED_WORKSPACE_BYTES / 2**30:.1f} GiB budget."
         )
-    budget_heads = (_DSA_PACKED_WORKSPACE_BYTES - fixed_bytes) // bytes_per_head
-    if budget_heads < 1:
+    max_heads = min(128, heads)
+    if (
+        max_heads < 1
+        or _dsa_workspace_bytes(tokens, dim, 1, total_kv)
+        > _DSA_PACKED_WORKSPACE_BYTES
+    ):
         raise RuntimeError(
             "The CuTe backward workspace cannot fit one attention head within "
             f"the {_DSA_PACKED_WORKSPACE_BYTES / 2**30:.1f} GiB budget."
         )
-    bounded_heads = min(128, heads, budget_heads)
-    if bounded_heads >= 64:
-        return bounded_heads // 64 * 64
-    return bounded_heads
+
+    lower, upper = 1, max_heads
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        if (
+            _dsa_workspace_bytes(tokens, dim, middle, total_kv)
+            <= _DSA_PACKED_WORKSPACE_BYTES
+        ):
+            lower = middle
+        else:
+            upper = middle - 1
+    return lower
 
 
 def _dsa_tile_shape(tokens: int, dim: int, heads: int, total_kv: int) -> tuple[int, int]:
