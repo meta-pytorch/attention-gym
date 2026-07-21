@@ -15,6 +15,8 @@ compiled kernels on PyTorch's current CUDA stream.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -519,7 +521,8 @@ class _CompressRmsNormRopeSm100:
         )
 
 
-_compile_cache: dict[tuple[object, ...], object] = {}
+_COMPILE_CACHE_MAXSIZE = 64
+_compile_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
 _aux_streams: dict[int, torch.cuda.Stream] = {}
 
 
@@ -544,6 +547,20 @@ def _as_cute(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor, assumed_align=16)
 
 
+def _cache_get(key: tuple[object, ...]) -> object | None:
+    compiled = _compile_cache.get(key)
+    if compiled is not None:
+        _compile_cache.move_to_end(key)
+    return compiled
+
+
+def _cache_put(key: tuple[object, ...], compiled: object) -> None:
+    _compile_cache[key] = compiled
+    _compile_cache.move_to_end(key)
+    if len(_compile_cache) > _COMPILE_CACHE_MAXSIZE:
+        _compile_cache.popitem(last=False)
+
+
 def _compiled_rms_rope(
     tensor: torch.Tensor,
     weight: torch.Tensor,
@@ -560,7 +577,7 @@ def _compiled_rms_rope(
         tensor.shape[-1],
         position_stride,
     )
-    compiled = _compile_cache.get(key)
+    compiled = _cache_get(key)
     if compiled is None:
         compiled = cute.compile(
             _RmsNormRopeSm100(tensor.shape[-1], position_stride),
@@ -569,7 +586,7 @@ def _compiled_rms_rope(
             _as_cute(output),
             stream,
         )
-        _compile_cache[key] = compiled
+        _cache_put(key, compiled)
     return compiled
 
 
@@ -587,14 +604,14 @@ def _compiled_compress(
         tuple(output.stride()),
         output.shape[-1],
     )
-    compiled = _compile_cache.get(key)
+    compiled = _cache_get(key)
     if compiled is None:
         compiled = cute.compile(
             _CompressRmsNormRopeSm100(output.shape[-1], _COMPRESSION_RATE),
             *(_as_cute(tensor) for tensor in tensors),
             stream,
         )
-        _compile_cache[key] = compiled
+        _cache_put(key, compiled)
     return compiled
 
 
@@ -611,14 +628,14 @@ def _compiled_compress_only(
         tuple(output.shape),
         output.shape[-1],
     )
-    compiled = _compile_cache.get(key)
+    compiled = _cache_get(key)
     if compiled is None:
         compiled = cute.compile(
             _CompressOnlySm100(output.shape[-1], _COMPRESSION_RATE),
             *(_as_cute(tensor) for tensor in tensors),
             stream,
         )
-        _compile_cache[key] = compiled
+        _cache_put(key, compiled)
     return compiled
 
 

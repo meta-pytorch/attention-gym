@@ -155,6 +155,22 @@ def test_missing_flash_attention_dependency_has_clear_error(monkeypatch):
         api.compressed_sparse_attention(*make_arguments(), backend="cute")
 
 
+def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
+    versions = {
+        distribution: expected
+        for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
+    }
+    versions["nvidia-cutlass-dsl"] = "0.0.0"
+    monkeypatch.setattr(api.importlib, "import_module", lambda _module: object())
+    monkeypatch.setattr(api.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"nvidia-cutlass-dsl==4\.5\.2 is required; found 0\.0\.0",
+    ):
+        api._validate_cute_dependencies()
+
+
 def test_invalid_backend_is_rejected_without_loading_an_implementation(monkeypatch):
     monkeypatch.setattr(api, "_load_eager_implementation", fail_loader)
     monkeypatch.setattr(api, "_load_triton_implementation", fail_loader)
