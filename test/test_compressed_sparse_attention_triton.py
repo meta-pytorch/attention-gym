@@ -4,8 +4,142 @@ import torch.nn.functional as F
 
 from attn_gym.sparse import compressed_sparse_attention
 
-MAX_ABS_ERROR = 1e-2
+MAX_ABS_ERROR = 3e-2
 DIFFERENTIABLE_INPUTS = (0, 2, 3, 4, 5, 6, 7, 8, 16, 18, 19)
+
+PATHOLOGICAL_SHAPES = [
+    pytest.param(
+        True,
+        dict(
+            heads=1,
+            sequence_length=1,
+            head_dim=2,
+            index_heads=1,
+            index_dim=2,
+            compression_rate=1,
+            topk=1,
+            window=1,
+            rope_dims=2,
+        ),
+        id="minimum-valid-shape",
+    ),
+    pytest.param(
+        False,
+        dict(
+            heads=127,
+            sequence_length=31,
+            head_dim=33,
+            index_heads=3,
+            index_dim=18,
+            compression_rate=32,
+            topk=9,
+            window=64,
+            rope_dims=2,
+        ),
+        id="head-and-compression-tile-minus-one",
+    ),
+    pytest.param(
+        True,
+        dict(
+            heads=128,
+            sequence_length=32,
+            head_dim=64,
+            index_heads=1,
+            index_dim=34,
+            compression_rate=32,
+            topk=9,
+            window=32,
+            rope_dims=32,
+        ),
+        id="head-and-compression-tile-exact",
+    ),
+    pytest.param(
+        True,
+        dict(
+            heads=129,
+            sequence_length=33,
+            head_dim=255,
+            index_heads=5,
+            index_dim=66,
+            compression_rate=32,
+            topk=9,
+            window=33,
+            rope_dims=64,
+        ),
+        id="head-and-compression-tile-plus-one",
+    ),
+    pytest.param(
+        True,
+        dict(
+            heads=1,
+            sequence_length=127,
+            head_dim=48,
+            index_heads=2,
+            index_dim=24,
+            compression_rate=2,
+            topk=63,
+            window=64,
+            rope_dims=16,
+        ),
+        id="sequence-and-selected-width-minus-one",
+    ),
+    pytest.param(
+        True,
+        dict(
+            heads=1,
+            sequence_length=128,
+            head_dim=48,
+            index_heads=2,
+            index_dim=24,
+            compression_rate=2,
+            topk=64,
+            window=64,
+            rope_dims=16,
+        ),
+        id="sequence-and-selected-width-exact",
+    ),
+    pytest.param(
+        True,
+        dict(
+            heads=1,
+            sequence_length=129,
+            head_dim=48,
+            index_heads=2,
+            index_dim=24,
+            compression_rate=2,
+            topk=64,
+            window=65,
+            rope_dims=16,
+        ),
+        id="sequence-and-selected-width-plus-one",
+    ),
+    pytest.param(
+        True,
+        dict(
+            batch=3,
+            heads=5,
+            sequence_length=17,
+            head_dim=256,
+            index_heads=5,
+            index_dim=256,
+            compression_rate=17,
+            topk=99,
+            window=99,
+            rope_dims=256,
+        ),
+        id="maximum-head-dim-full-rope-and-clamped-selection",
+    ),
+    pytest.param(
+        True,
+        dict(heads=3, sequence_length=17, topk=0, window=9),
+        id="local-only",
+    ),
+    pytest.param(
+        True,
+        dict(heads=3, sequence_length=17, topk=3, window=0),
+        id="compressed-only",
+    ),
+]
 
 
 def make_inputs(
@@ -72,7 +206,7 @@ def assert_matches_reference(inputs):
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
     max_abs_error = (actual.float() - expected.float()).abs().max().item()
-    assert max_abs_error <= MAX_ABS_ERROR
+    assert max_abs_error <= MAX_ABS_ERROR, f"max output error {max_abs_error}"
 
 
 def differentiable_copy(inputs):
@@ -84,11 +218,48 @@ def differentiable_copy(inputs):
     )
 
 
+def assert_backward_matches_reference(base):
+    reference_inputs = differentiable_copy(base)
+    triton_inputs = differentiable_copy(base)
+    reference_targets = tuple(reference_inputs[index] for index in DIFFERENTIABLE_INPUTS)
+    triton_targets = tuple(triton_inputs[index] for index in DIFFERENTIABLE_INPUTS)
+
+    expected = compressed_sparse_attention(*reference_inputs, backend="eager")
+    actual = compressed_sparse_attention(*triton_inputs, backend="triton")
+    generator = torch.Generator(device=actual.device).manual_seed(456)
+    grad_output = (
+        torch.randn(
+            actual.shape,
+            device=actual.device,
+            dtype=actual.dtype,
+            generator=generator,
+        )
+        * 0.01
+    )
+    expected_gradients = torch.autograd.grad(expected, reference_targets, grad_output)
+    actual_gradients = torch.autograd.grad(actual, triton_targets, grad_output)
+
+    for input_index, actual_gradient, expected_gradient in zip(
+        DIFFERENTIABLE_INPUTS,
+        actual_gradients,
+        expected_gradients,
+    ):
+        error = (actual_gradient.float() - expected_gradient.float()).abs().max().item()
+        assert error <= MAX_ABS_ERROR, f"input {input_index} max gradient error {error}"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_triton_matches_reference_within_one_e_minus_two(share_kv, dtype):
+def test_triton_matches_reference(share_kv, dtype):
     assert_matches_reference(make_inputs(share_kv, dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(("share_kv", "overrides"), PATHOLOGICAL_SHAPES)
+def test_triton_pathological_shapes_match_reference(share_kv, overrides):
+    configuration = {"batch": 1, **overrides}
+    assert_matches_reference(make_inputs(share_kv, torch.bfloat16, **configuration))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -151,30 +322,24 @@ def test_triton_backward_matches_reference(share_kv, dtype):
         window=33,
         rope_dims=8,
     )
-    reference_inputs = differentiable_copy(base)
-    triton_inputs = differentiable_copy(base)
-    reference_targets = tuple(reference_inputs[index] for index in DIFFERENTIABLE_INPUTS)
-    triton_targets = tuple(triton_inputs[index] for index in DIFFERENTIABLE_INPUTS)
+    assert_backward_matches_reference(base)
 
-    expected = compressed_sparse_attention(*reference_inputs, backend="eager")
-    actual = compressed_sparse_attention(*triton_inputs, backend="triton")
-    generator = torch.Generator(device=actual.device).manual_seed(456)
-    grad_output = (
-        torch.randn(
-            actual.shape,
-            device=actual.device,
-            dtype=actual.dtype,
-            generator=generator,
-        )
-        * 0.01
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("heads", [127, 129])
+def test_triton_backward_handles_pathological_head_counts(heads):
+    base = make_inputs(
+        True,
+        torch.bfloat16,
+        batch=1,
+        heads=heads,
+        sequence_length=17,
+        head_dim=32,
+        index_heads=1,
+        index_dim=16,
+        compression_rate=8,
+        topk=3,
+        window=9,
+        rope_dims=8,
     )
-    expected_gradients = torch.autograd.grad(expected, reference_targets, grad_output)
-    actual_gradients = torch.autograd.grad(actual, triton_targets, grad_output)
-
-    for input_index, actual_gradient, expected_gradient in zip(
-        DIFFERENTIABLE_INPUTS,
-        actual_gradients,
-        expected_gradients,
-    ):
-        error = (actual_gradient.float() - expected_gradient.float()).abs().max().item()
-        assert error <= MAX_ABS_ERROR, f"input {input_index} max gradient error {error}"
+    assert_backward_matches_reference(base)

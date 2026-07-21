@@ -2465,6 +2465,14 @@ class FlashAttentionMLAForwardSm100:
                                         x0 * sine + x1 * cosine
                                     ).to(self.dtype_Qv)
                             else:
+                                # CuTe carries assigned Python locals through a dynamic
+                                # region. Keep their DSL types stable for a RoPE boundary
+                                # that cuts through this 64-coordinate group.
+                                rope_pair = Int32(0)
+                                cosine = Float32(1.0)
+                                sine = Float32(0.0)
+                                x0 = Float32(0.0)
+                                x1 = Float32(0.0)
                                 if global_d0 >= rope_start:
                                     rope_pair = (global_d0 - rope_start) // 2
                                     cosine = mCsaCos[position, rope_pair].to(Float32)

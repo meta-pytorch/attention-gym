@@ -173,6 +173,7 @@ class FlashAttentionDSABackwardSm100:
         # q is total seqlen, b=1
         d = (d + 7) // 8 * 8  # round up to 8
         q = (q + 7) // 8 * 8  # round up to 8
+        h = (h + 63) // 64 * 64  # align the two FP32 workspace regions
         workspace_bytes = 0
         # OdO vector
         workspace_bytes += acc_dtype.width // 8
@@ -209,9 +210,14 @@ class FlashAttentionDSABackwardSm100:
 
         D = cute.round_up(D, 8)
         total_seqlen_Q = cute.round_up(total_seqlen_Q, 8)
+        workspace_heads = cute.round_up(H, 64)
 
         acc_bytes = acc_dtype.width // 8
-        sum_OdO_bytes = cute.assume(H * total_seqlen_Q * acc_bytes, divby=acc_bytes * 64)
+        workspace_head_stride = cute.assume(workspace_heads, divby=64)
+        sum_OdO_bytes = cute.assume(
+            workspace_head_stride * total_seqlen_Q * acc_bytes,
+            divby=acc_bytes * 64,
+        )
 
         sum_OdO_iter = workspace_LSE_OdO.iterator
         scaled_lse_iter = sum_OdO_iter + sum_OdO_bytes
@@ -223,11 +229,17 @@ class FlashAttentionDSABackwardSm100:
 
         sum_OdO = cute.make_tensor(
             sum_OdO_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout(
+                (H, (total_seqlen_Q, 1)),
+                stride=(1, (workspace_head_stride, 0)),
+            ),
         )
         scaled_lse = cute.make_tensor(
             scaled_lse_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout(
+                (H, (total_seqlen_Q, 1)),
+                stride=(1, (workspace_head_stride, 0)),
+            ),
         )
         dKV_acc = cute.make_tensor(
             dKV_acc_iter,
