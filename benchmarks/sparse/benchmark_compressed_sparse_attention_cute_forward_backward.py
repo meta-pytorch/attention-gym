@@ -29,8 +29,7 @@ def useful_flops(args: argparse.Namespace) -> tuple[int, int, int, int]:
     selectable_blocks = args.sequence_length // args.compression_rate
     effective_topk = min(args.topk, selectable_blocks)
     local_pairs = sum(
-        min(args.window, query_position + 1)
-        for query_position in range(args.sequence_length)
+        min(args.window, query_position + 1) for query_position in range(args.sequence_length)
     )
     compressed_pairs = sum(
         min(args.topk, (query_position + 1) // args.compression_rate)
@@ -43,19 +42,9 @@ def useful_flops(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
     indexer_forward = 0
     if 0 < effective_topk < selectable_blocks:
-        indexer_forward = (
-            2
-            * args.batch
-            * args.index_heads
-            * completed_pairs
-            * args.index_dim
-        )
+        indexer_forward = 2 * args.batch * args.index_heads * completed_pairs * args.index_dim
     attention_forward = (
-        4
-        * args.batch
-        * args.heads
-        * args.head_dim
-        * (local_pairs + compressed_pairs)
+        4 * args.batch * args.heads * args.head_dim * (local_pairs + compressed_pairs)
     )
 
     # Each forward QK or PV matmul has two corresponding backward matmuls.
