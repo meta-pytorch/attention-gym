@@ -734,17 +734,15 @@ class PrepareDsaBackward:
     """Rotate/transpose Q, O, and dO while packing the combined attention LSE."""
 
     def __init__(
-        self, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-        sequence, packed_tokens, token_offset, dim, rope,
+        self, dsa_dtype, batch, total_heads, packed_heads,
+        sequence, packed_tokens, dim, rope,
     ):
         self.dtype = dsa_dtype
         self.batch = batch
         self.total_heads = total_heads
         self.packed_heads = packed_heads
-        self.head_offset = head_offset
         self.sequence = sequence
         self.packed_tokens = packed_tokens
-        self.token_offset = token_offset
         self.dim = dim
         self.rope = rope
         self.num_threads = 128
@@ -753,11 +751,12 @@ class PrepareDsaBackward:
     @cute.jit
     def __call__(
         self, q, out, dout, combined_lse, cos, sin,
-        q_packed, out_packed, dout_packed, lse, stream: cuda.CUstream,
+        q_packed, out_packed, dout_packed, lse,
+        head_offset: Int32, token_offset: Int32, stream: cuda.CUstream,
     ):
         self.kernel(
             q, out, dout, combined_lse, cos, sin,
-            q_packed, out_packed, dout_packed, lse,
+            q_packed, out_packed, dout_packed, lse, head_offset, token_offset,
         ).launch(
             grid=[self.packed_tokens * self.packed_heads, 1, 1],
             block=[self.num_threads, 1, 1],
@@ -768,13 +767,14 @@ class PrepareDsaBackward:
     def kernel(
         self, q, out, dout, combined_lse, cos, sin,
         q_packed, out_packed, dout_packed, lse,
+        head_offset: Int32, token_offset: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         packed_head = row % self.packed_heads
         token = row // self.packed_heads
-        global_token = self.token_offset + token
-        head = self.head_offset + packed_head
+        global_token = token_offset + token
+        head = head_offset + packed_head
         pos = global_token % self.sequence
         b = global_token // self.sequence
         base = tid * self.values_per_thread
@@ -804,33 +804,23 @@ class PrepareDsaBackward:
             lse[token, packed_head] = combined_lse[b, pos, head]
 
 
-class PackDsaKvIndices:
-    def __init__(
-        self, dsa_dtype, batch, sequence, dim, blocks, rate, topk, window, width
-    ):
+class PackDsaKvSink:
+    """Pack shared KV and the learned sink once for tiled DSA backward."""
+
+    def __init__(self, dsa_dtype, batch, dim, blocks, local_length):
         self.dtype = dsa_dtype
         self.batch = batch
-        self.sequence = sequence
         self.dim = dim
         self.blocks = blocks
-        self.rate = rate
-        self.topk = topk
-        self.window = min(window, sequence)
-        self.width = width
-        self.local_length = sequence if self.window > 0 else 0
+        self.local_length = local_length
         self.kv_per_batch = blocks + self.local_length
 
     @cute.jit
     def __call__(
-        self, compressed, local, gather, kv, indices, lengths,
-        sink, sink_fp32, stream: cuda.CUstream,
+        self, compressed, local, sink, kv, sink_fp32, stream: cuda.CUstream,
     ):
         self.kv_kernel(compressed, local, kv).launch(
             grid=[cute.ceil_div(self.batch * self.kv_per_batch * self.dim, 256), 1, 1],
-            block=[256, 1, 1], stream=stream,
-        )
-        self.index_kernel(gather, indices, lengths).launch(
-            grid=[cute.ceil_div(self.batch * self.sequence * self.width, 256), 1, 1],
             block=[256, 1, 1], stream=stream,
         )
         self.sink_kernel(sink, sink_fp32).launch(
@@ -839,7 +829,8 @@ class PackDsaKvIndices:
 
     @cute.kernel
     def kv_kernel(self, compressed, local, kv):
-        tid, _, _ = cute.arch.thread_idx(); bid, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
         linear = bid * 256 + tid
         total = self.batch * self.kv_per_batch * self.dim
         if linear < total:
@@ -853,13 +844,61 @@ class PackDsaKvIndices:
                 kv[row, d] = local[b, within - self.blocks, 0, d]
 
     @cute.kernel
-    def index_kernel(self, gather, indices, lengths):
-        tid, _, _ = cute.arch.thread_idx(); bid, _, _ = cute.arch.block_idx()
+    def sink_kernel(self, sink, sink_fp32):
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        i = bid * 256 + tid
+        if i < cute.size(sink):
+            sink_fp32[i] = sink[i].to(Float32)
+
+
+class PackDsaIndices:
+    """Generate one bounded token slab of sparse DSA indices."""
+
+    def __init__(
+        self, batch, sequence, blocks, rate, topk, window, width, token_capacity
+    ):
+        self.batch = batch
+        self.sequence = sequence
+        self.blocks = blocks
+        self.rate = rate
+        self.topk = topk
+        self.window = min(window, sequence)
+        self.width = width
+        self.token_capacity = token_capacity
+        self.local_length = sequence if self.window > 0 else 0
+        self.kv_per_batch = blocks + self.local_length
+
+    @cute.jit
+    def __call__(
+        self,
+        gather,
+        indices,
+        lengths,
+        token_offset: Int32,
+        active_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.index_kernel(
+            gather, indices, lengths, token_offset, active_tokens
+        ).launch(
+            grid=[cute.ceil_div(active_tokens * self.width, 256), 1, 1],
+            block=[256, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def index_kernel(
+        self, gather, indices, lengths, token_offset: Int32, active_tokens: Int32
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
         linear = bid * 256 + tid
-        total = self.batch * self.sequence * self.width
+        total = active_tokens * self.width
         if linear < total:
             slot = linear % self.width
-            token = linear // self.width
+            slab_token = linear // self.width
+            token = token_offset + slab_token
             pos = token % self.sequence
             b = token // self.sequence
             compressed_count = min(self.topk, (pos + 1) // self.rate)
@@ -874,33 +913,24 @@ class PackDsaKvIndices:
             elif slot < valid_length:
                 key = pos - local_count + 1 + (slot - compressed_count)
                 index = Int32(base + self.blocks + key)
-            indices[token, slot] = index
+            indices[slab_token, slot] = index
             if slot == 0:
                 # The vendored DSA loader always executes its first tile. A single masked
                 # sentinel represents an otherwise empty selected row safely.
-                lengths[token] = Int32(max(1, valid_length))
-
-    @cute.kernel
-    def sink_kernel(self, sink, sink_fp32):
-        tid, _, _ = cute.arch.thread_idx(); bid, _, _ = cute.arch.block_idx()
-        i = bid * 256 + tid
-        if i < cute.size(sink):
-            sink_fp32[i] = sink[i].to(Float32)
+                lengths[slab_token] = Int32(max(1, valid_length))
 
 
 class UnpackDsaGradients:
     def __init__(
-        self, output_dtype, batch, total_heads, packed_heads, head_offset,
-        sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
+        self, output_dtype, batch, total_heads, packed_heads,
+        sequence, packed_tokens, dim, rope, blocks, local_length,
     ):
         self.dtype = output_dtype
         self.batch = batch
         self.total_heads = total_heads
         self.packed_heads = packed_heads
-        self.head_offset = head_offset
         self.sequence = sequence
         self.packed_tokens = packed_tokens
-        self.token_offset = token_offset
         self.dim = dim
         self.rope = rope
         self.blocks = blocks
@@ -908,8 +938,13 @@ class UnpackDsaGradients:
         self.kv_per_batch = blocks + local_length
 
     @cute.jit
-    def __call__(self, dq_packed, dkv, cos, sin, dq, dlocal, dcompressed, stream: cuda.CUstream):
-        self.dq_kernel(dq_packed, cos, sin, dq).launch(
+    def __call__(
+        self, dq_packed, dkv, cos, sin, dq, dlocal, dcompressed,
+        head_offset: Int32, token_offset: Int32, stream: cuda.CUstream,
+    ):
+        self.dq_kernel(
+            dq_packed, cos, sin, dq, head_offset, token_offset
+        ).launch(
             grid=[self.packed_tokens * self.packed_heads, 1, 1], block=[128, 1, 1], stream=stream,
         )
         self.dkv_kernel(dkv, dlocal, dcompressed).launch(
@@ -918,31 +953,42 @@ class UnpackDsaGradients:
         )
 
     @cute.kernel
-    def dq_kernel(self, source, cos, sin, dest):
-        tid, _, _ = cute.arch.thread_idx(); row, _, _ = cute.arch.block_idx()
-        packed_head = row % self.packed_heads; token = row // self.packed_heads
-        global_token = self.token_offset + token
-        head = self.head_offset + packed_head
-        pos = global_token % self.sequence; b = global_token // self.sequence
+    def dq_kernel(
+        self, source, cos, sin, dest, head_offset: Int32, token_offset: Int32
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        packed_head = row % self.packed_heads
+        token = row // self.packed_heads
+        global_token = token_offset + token
+        head = head_offset + packed_head
+        pos = global_token % self.sequence
+        b = global_token // self.sequence
         base = tid * (self.dim // 128)
         for pair in cutlass.range_constexpr(self.dim // 128 // 2):
-            j = pair * 2; d = base + j
-            x0 = source[token, packed_head, d].to(Float32); x1 = source[token, packed_head, d + 1].to(Float32)
+            j = pair * 2
+            d = base + j
+            x0 = source[token, packed_head, d].to(Float32)
+            x1 = source[token, packed_head, d + 1].to(Float32)
             if d >= self.dim - self.rope:
                 rp = (d - (self.dim - self.rope)) // 2
-                c = cos[pos, rp]; s = sin[pos, rp]
+                c = cos[pos, rp]
+                s = sin[pos, rp]
                 x0, x1 = x0 * c + x1 * s, -x0 * s + x1 * c
             dest[b, head, pos, d] = x0.to(self.dtype)
             dest[b, head, pos, d + 1] = x1.to(self.dtype)
 
     @cute.kernel
     def dkv_kernel(self, source, dlocal, dcompressed):
-        tid, _, _ = cute.arch.thread_idx(); bid, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
         linear = bid * 256 + tid
         total = self.batch * self.kv_per_batch * self.dim
         if linear < total:
-            d = linear % self.dim; row = linear // self.dim
-            within = row % self.kv_per_batch; b = row // self.kv_per_batch
+            d = linear % self.dim
+            row = linear // self.dim
+            within = row % self.kv_per_batch
+            b = row // self.kv_per_batch
             value = source[row, d].to(Float32)
             if within < self.blocks:
                 dcompressed[b, within, 0, d] += value
@@ -996,13 +1042,13 @@ def compile_sink_reduce(dtype, batch, heads, sequence):
 
 @lru_cache
 def compile_prepare_dsa_backward(
-    input_dtype, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-    sequence, packed_tokens, token_offset, dim, rope,
+    input_dtype, dsa_dtype, batch, total_heads, packed_heads,
+    sequence, packed_tokens, dim, rope,
 ):
     return cute.compile(
         PrepareDsaBackward(
-            dsa_dtype, batch, total_heads, packed_heads, head_offset,
-            sequence, packed_tokens, token_offset, dim, rope,
+            dsa_dtype, batch, total_heads, packed_heads,
+            sequence, packed_tokens, dim, rope,
         ),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
@@ -1011,47 +1057,61 @@ def compile_prepare_dsa_backward(
         _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
         *[_fake(dsa_dtype, (packed_tokens, packed_heads, dim)) for _ in range(3)],
         _fake(Float32, (packed_tokens, packed_heads)),
+        Int32(0), Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
     )
 
 
 @lru_cache
-def compile_pack_dsa_kv_indices(
-    input_dtype, dsa_dtype, batch, sequence, dim, blocks, rate,
-    topk, window, width, heads, gather_width,
+def compile_pack_dsa_kv_sink(
+    input_dtype, dsa_dtype, batch, sequence, dim, blocks, local_length, heads
 ):
-    local_length = sequence if window > 0 else 0
     return cute.compile(
-        PackDsaKvIndices(
-            dsa_dtype, batch, sequence, dim, blocks, rate, topk, window, width
-        ),
-        _fake(input_dtype, (batch, blocks, 1, dim)),
-        _fake(input_dtype, (batch, local_length, 1, dim)),
-        _fake(Int32, (batch, sequence, gather_width)),
+        PackDsaKvSink(dsa_dtype, batch, dim, blocks, local_length),
+        _fake(input_dtype, (batch, max(blocks, 1), 1, dim)),
+        _fake(input_dtype, (batch, max(local_length, 1), 1, dim)),
+        _fake(input_dtype, (heads,)),
         _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
-        _fake(Int32, (batch * sequence, width)),
-        _fake(Int32, (batch * sequence,)),
-        _fake(input_dtype, (heads,)), _fake(Float32, (heads,)),
+        _fake(Float32, (heads,)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache
+def compile_pack_dsa_indices(
+    batch, sequence, blocks, rate, topk, window, width, gather_width, token_capacity
+):
+    return cute.compile(
+        PackDsaIndices(
+            batch, sequence, blocks, rate, topk, window, width, token_capacity
+        ),
+        _fake(Int32, (batch, sequence, gather_width)),
+        _fake(Int32, (token_capacity, width)),
+        _fake(Int32, (token_capacity,)),
+        Int32(0),
+        Int32(token_capacity),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
 @lru_cache
 def compile_unpack_dsa_gradients(
-    output_dtype, dsa_dtype, batch, total_heads, packed_heads, head_offset,
-    sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
+    output_dtype, dsa_dtype, batch, total_heads, packed_heads,
+    sequence, packed_tokens, dim, rope, blocks, local_length,
 ):
     return cute.compile(
         UnpackDsaGradients(
-            output_dtype, batch, total_heads, packed_heads, head_offset,
-            sequence, packed_tokens, token_offset, dim, rope, blocks, local_length,
+            output_dtype, batch, total_heads, packed_heads,
+            sequence, packed_tokens, dim, rope, blocks, local_length,
         ),
         _fake(dsa_dtype, (packed_tokens, packed_heads, dim)),
         _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
         _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
         _fake(output_dtype, (batch, total_heads, sequence, dim)),
-        _fake(Float32, (batch, local_length, 1, dim)),
-        _fake(Float32, (batch, blocks, 1, dim)),
+        _fake(Float32, (batch, max(local_length, 1), 1, dim)),
+        _fake(Float32, (batch, max(blocks, 1), 1, dim)),
+        Int32(0), Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
     )
 
@@ -1060,6 +1120,7 @@ __all__ = [
     "compile_attention_backward", "compile_local_norm_backward",
     "compile_compression_backward", "compile_cast_gradient", "cute_dtype",
     "compile_sink_reduce",
-    "compile_prepare_dsa_backward", "compile_pack_dsa_kv_indices",
+    "compile_prepare_dsa_backward", "compile_pack_dsa_kv_sink",
+    "compile_pack_dsa_indices",
     "compile_unpack_dsa_gradients",
 ]
