@@ -56,7 +56,7 @@ def test_sandwich_flex_matches_sdpa_with_grads():
     )
     torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
 
-    grads = grad(out.sum(), (q, k, v), retain_graph=True)
+    grads = grad(out.sum(), (q, k, v))
     ref_grads = grad(ref.sum(), (q, k, v))
     for g, rg in zip(grads, ref_grads):
         torch.testing.assert_close(g, rg, rtol=2e-3, atol=2e-3)
