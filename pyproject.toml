@@ -10,9 +10,12 @@ authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
 description = "Helpful tools and examples for working with flex-attention"
 readme = "README.md"
 dynamic = ["version"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
 ]
@@ -24,8 +27,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "prek",
-    "bumpver",
-    "pip-tools",
     "pytest",
     "ruff",
     "jsonargparse",

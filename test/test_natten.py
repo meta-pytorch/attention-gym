@@ -76,6 +76,7 @@ def test_natten_masks(
     T_W=8,
     print_mask=True,
 ):
+    torch.compiler.reset()
     query = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
     key = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
     value = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)

@@ -232,7 +232,7 @@ def run_benchmark(
 
     print(f"Config: B={B}, H={H}, S={S}, D={D}, dtype={dtype}")
     if use_mask:
-        print(f"Mask: causal, sparsity={sparsity*100:.1f}%")
+        print(f"Mask: causal, sparsity={sparsity * 100:.1f}%")
 
     def make_qkv():
         q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)

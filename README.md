@@ -18,6 +18,7 @@ This repository aims to provide a playground for experimenting with various atte
 ## 🎯 Features
 
 - Implementations of various attention mechanisms using FlexAttention
+- Reference implementations for linear-attention recurrences
 - Utility functions for creating and combining attention masks
 - Examples of how to use FlexAttention in real-world scenarios
 
@@ -70,6 +71,7 @@ Attention Gym is organized for easy exploration of attention mechanisms:
 
 - `attn_gym.masks`: Examples creating `BlockMasks`
 - `attn_gym.mods`: Examples creating `score_mods`
+- `attn_gym.linear`: Reference linear-attention implementations
 - `examples/`: Detailed implementations using FlexAttention
 - `examples/paged_attention`: Paged KV-cache examples using FlexAttention
 
@@ -80,9 +82,11 @@ Install dev requirements
 pip install -e ".[dev]"
 ```
 
-Install pre-commit hooks
+Install and run the repository hooks:
+
 ```bash
-pre-commit install
+prek install
+prek run --all-files
 ```
 
 ## 🤝 Contributing
@@ -93,7 +97,7 @@ We welcome contributions to Attention Gym, especially new Masks or score mods! H
 1. Create a new file in the [attn_gym/masks/](attn_gym/masks) for mask_mods or [attn_gym/mods/](attn_gym/mods) for score_mods.
 2. Implement your function, and add a simple main function that showcases your new function.
 3. Update the `attn_gym/*/__init__.py` file to include your new function.
-5. [Optinally] Add an end to end example using your new func in the [examples/](examples/) directory.
+4. Optionally, add an end-to-end example using your new function in the [examples/](examples/) directory.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 

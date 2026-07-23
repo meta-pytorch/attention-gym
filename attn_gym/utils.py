@@ -137,9 +137,9 @@ def visualize_attention_scores(
     """
     import matplotlib.pyplot as plt
 
-    assert (
-        score_mod is not None or mask_mod is not None
-    ), "Must provide either score_mod or mask_mod"
+    assert score_mod is not None or mask_mod is not None, (
+        "Must provide either score_mod or mask_mod"
+    )
     query = query[batch_idx, head_idx, :, :]
     key = key[batch_idx, head_idx, :, :]
     scores_viz = create_score_mod(
@@ -240,9 +240,9 @@ def plot_attention_scores(
     """
     import matplotlib.pyplot as plt
 
-    assert (
-        score_mod is not None or mask_mod is not None
-    ), "Must provide either score_mod or mask_mod"
+    assert score_mod is not None or mask_mod is not None, (
+        "Must provide either score_mod or mask_mod"
+    )
     query = query[batch_idx, head_idx, :, :]
     key = key[batch_idx, head_idx, :, :]
     scores_viz = create_score_mod(

@@ -324,13 +324,13 @@ def sweep_forward_configs(
         if success and time_us < best_time:
             best_time = time_us
             best_config = config
-            tqdm.write(f"  New best! {config} -> {time_us/1000:.3f} ms")
+            tqdm.write(f"  New best! {config} -> {time_us / 1000:.3f} ms")
 
     # Sort results by time
     results.sort(key=lambda x: x["time_us"] if x["success"] else float("inf"))
 
     print(f"\n✓ Best forward config: {best_config}")
-    print(f"✓ Best time: {best_time/1000:.3f} ms")
+    print(f"✓ Best time: {best_time / 1000:.3f} ms")
 
     return best_config, best_time, results
 
@@ -390,13 +390,13 @@ def sweep_backward_configs(
         if success and time_us < best_time:
             best_time = time_us
             best_config = config
-            tqdm.write(f"  New best! {config} -> {time_us/1000:.3f} ms")
+            tqdm.write(f"  New best! {config} -> {time_us / 1000:.3f} ms")
 
     # Sort results by time
     results.sort(key=lambda x: x["time_us"] if x["success"] else float("inf"))
 
     print(f"\n✓ Best backward config: {best_config}")
-    print(f"✓ Best time: {best_time/1000:.3f} ms")
+    print(f"✓ Best time: {best_time / 1000:.3f} ms")
 
     return best_config, best_time, results
 
@@ -498,9 +498,9 @@ def main(
     print("=" * 80)
     print("\nBest FlexKernelOptions:")
     print(json.dumps(best_kernel_options, indent=2))
-    print(f"\nForward time: {best_fwd_time/1000:.3f} ms")
-    print(f"Backward time: {best_bwd_time/1000:.3f} ms")
-    print(f"Total time: {(best_fwd_time + best_bwd_time)/1000:.3f} ms")
+    print(f"\nForward time: {best_fwd_time / 1000:.3f} ms")
+    print(f"Backward time: {best_bwd_time / 1000:.3f} ms")
+    print(f"Total time: {(best_fwd_time + best_bwd_time) / 1000:.3f} ms")
 
     # Save results
     output = {
