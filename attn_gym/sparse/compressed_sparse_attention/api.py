@@ -1,11 +1,9 @@
 """Public API and backend dispatch for compressed sparse attention."""
 
 from collections.abc import Callable
-from functools import lru_cache
 import importlib
 from importlib import metadata
 import math
-import sys
 from typing import Literal
 
 import torch
@@ -26,6 +24,7 @@ _CUTE_RUNTIME_DEPENDENCIES = (
 )
 
 _cute_implementation: Callable[..., torch.Tensor] | None = None
+_cute_initialization_error: Exception | None = None
 
 
 def _validate_inputs(
@@ -171,9 +170,8 @@ def _load_triton_implementation() -> Callable[..., torch.Tensor]:
     return implementation
 
 
-@lru_cache(maxsize=1)
 def _validate_cute_dependencies() -> None:
-    """Validate the pinned CuTe stack once per process, not once per kernel launch."""
+    """Validate the pinned CuTe stack during backend initialization."""
     problems = []
     for distribution, module, expected_version in _CUTE_RUNTIME_DEPENDENCIES:
         try:
@@ -200,11 +198,7 @@ def _validate_cute_dependencies() -> None:
 
 
 def _load_cute_implementation() -> Callable[..., torch.Tensor]:
-    global _cute_implementation
     module_name = f"{__package__}.cute"
-    if _cute_implementation is not None and sys.modules.get(module_name) is not None:
-        return _cute_implementation
-
     _validate_cute_dependencies()
     try:
         module = importlib.import_module(module_name)
@@ -223,8 +217,22 @@ def _load_cute_implementation() -> Callable[..., torch.Tensor]:
             ) from error
         raise
 
-    _cute_implementation = module.compressed_sparse_attention
-    return _cute_implementation
+    return module.compressed_sparse_attention
+
+
+def _initialize_cute_backend() -> None:
+    """Resolve and register the optional CuTe backend before Dynamo can trace calls."""
+    global _cute_implementation, _cute_initialization_error
+    if _cute_implementation is not None or _cute_initialization_error is not None:
+        return
+    try:
+        _cute_implementation = _load_cute_implementation()
+    except Exception as error:
+        # An optional backend must not make the base attn_gym package unimportable.
+        _cute_initialization_error = error
+
+
+_initialize_cute_backend()
 
 
 def compressed_sparse_attention(
@@ -343,7 +351,10 @@ def compressed_sparse_attention(
     elif backend == "triton":
         implementation = _load_triton_implementation()
     else:
-        implementation = _load_cute_implementation()
+        if _cute_implementation is None:
+            assert _cute_initialization_error is not None
+            raise RuntimeError(str(_cute_initialization_error)) from _cute_initialization_error
+        implementation = _cute_implementation
 
     return implementation(
         Q,

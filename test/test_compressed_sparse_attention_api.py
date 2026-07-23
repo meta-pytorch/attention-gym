@@ -48,6 +48,11 @@ def fail_loader():
     raise AssertionError("unexpected backend loader call")
 
 
+def reset_cute_backend(monkeypatch):
+    monkeypatch.setattr(api, "_cute_implementation", None)
+    monkeypatch.setattr(api, "_cute_initialization_error", None)
+
+
 def test_compressed_sparse_attention_is_publicly_exported():
     assert csa_package.compressed_sparse_attention is api.compressed_sparse_attention
     assert sparse_package.compressed_sparse_attention is api.compressed_sparse_attention
@@ -105,12 +110,42 @@ def test_cute_dispatch(monkeypatch):
 
     monkeypatch.setattr(api, "_load_eager_implementation", fail_loader)
     monkeypatch.setattr(api, "_load_triton_implementation", fail_loader)
-    monkeypatch.setattr(api, "_load_cute_implementation", lambda: implementation)
+    monkeypatch.setattr(api, "_load_cute_implementation", fail_loader)
+    monkeypatch.setattr(api, "_cute_implementation", implementation)
 
     result = api.compressed_sparse_attention(*arguments, backend="cute")
 
     assert result is expected
     assert calls == [arguments]
+
+
+def test_cute_dispatch_reaches_registered_op_without_loading_during_trace(monkeypatch):
+    if api._cute_implementation is None:
+        pytest.skip(f"CuTe backend is unavailable: {api._cute_initialization_error}")
+
+    captured_graphs = []
+
+    def capture_backend(graph_module, _example_inputs):
+        captured_graphs.append(graph_module)
+        return lambda *args: (torch.empty_like(args[0]),)
+
+    def run(*args):
+        return api.compressed_sparse_attention(*args, backend="cute")
+
+    monkeypatch.setattr(api, "_load_cute_implementation", fail_loader)
+    monkeypatch.setattr(api, "_validate_cute_dependencies", fail_loader)
+    torch._dynamo.reset()
+    compiled = torch.compile(run, backend=capture_backend, fullgraph=True)
+    result = compiled(*make_arguments(share_kv=True))
+
+    assert result.shape == (2, 3, 5, 8)
+    assert result.dtype == torch.float32
+    assert len(captured_graphs) == 1
+    assert any(
+        node.target
+        is torch.ops.attention_gym._cute_compressed_sparse_attention_forward.default
+        for node in captured_graphs[0].graph.nodes
+    )
 
 
 def test_unavailable_triton_backend_has_clear_error(monkeypatch):
@@ -131,26 +166,27 @@ def test_missing_external_triton_dependency_has_clear_error(monkeypatch):
 
 
 def test_unavailable_cute_backend_has_clear_error(monkeypatch):
-    api._validate_cute_dependencies.cache_clear()
+    reset_cute_backend(monkeypatch)
     module_name = "attn_gym.sparse.compressed_sparse_attention.cute"
     monkeypatch.setitem(sys.modules, module_name, None)
+    api._initialize_cute_backend()
 
     with pytest.raises(RuntimeError, match="(?i)cute"):
         api.compressed_sparse_attention(*make_arguments(), backend="cute")
 
 
 def test_missing_flash_attention_dependency_has_clear_error(monkeypatch):
-    api._validate_cute_dependencies.cache_clear()
+    reset_cute_backend(monkeypatch)
     module_name = "attn_gym.sparse.compressed_sparse_attention.cute"
     monkeypatch.delitem(sys.modules, module_name, raising=False)
     monkeypatch.setitem(sys.modules, "flash_attn", None)
+    api._initialize_cute_backend()
 
     with pytest.raises(RuntimeError, match="(?i)flash-attn-4"):
         api.compressed_sparse_attention(*make_arguments(), backend="cute")
 
 
 def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
-    api._validate_cute_dependencies.cache_clear()
     versions = {
         distribution: expected
         for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
@@ -166,32 +202,43 @@ def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
         api._validate_cute_dependencies()
 
 
-def test_cute_dependency_validation_is_cached(monkeypatch):
-    api._validate_cute_dependencies.cache_clear()
-    versions = {
-        distribution: expected
-        for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
-    }
-    version_calls = 0
+def test_cute_backend_initialization_runs_once(monkeypatch):
+    reset_cute_backend(monkeypatch)
+    implementation = object()
+    load_calls = 0
 
-    def version(distribution):
-        nonlocal version_calls
-        version_calls += 1
-        return versions[distribution]
+    def load():
+        nonlocal load_calls
+        load_calls += 1
+        return implementation
 
-    monkeypatch.setattr(api.importlib, "import_module", lambda _module: object())
-    monkeypatch.setattr(api.metadata, "version", version)
-    api._validate_cute_dependencies()
-    api._validate_cute_dependencies()
+    monkeypatch.setattr(api, "_load_cute_implementation", load)
+    api._initialize_cute_backend()
+    api._initialize_cute_backend()
 
-    assert version_calls == len(api._CUTE_RUNTIME_DEPENDENCIES)
-    api._validate_cute_dependencies.cache_clear()
+    assert api._cute_implementation is implementation
+    assert load_calls == 1
+
+
+def test_cute_initialization_failure_is_deferred_until_backend_use(monkeypatch):
+    reset_cute_backend(monkeypatch)
+    error = ValueError("broken optional backend")
+
+    def load():
+        raise error
+
+    monkeypatch.setattr(api, "_load_cute_implementation", load)
+    api._initialize_cute_backend()
+
+    assert api._cute_initialization_error is error
+    with pytest.raises(RuntimeError, match="broken optional backend"):
+        api.compressed_sparse_attention(*make_arguments(), backend="cute")
 
 
 def test_invalid_backend_is_rejected_without_loading_an_implementation(monkeypatch):
     monkeypatch.setattr(api, "_load_eager_implementation", fail_loader)
     monkeypatch.setattr(api, "_load_triton_implementation", fail_loader)
-    monkeypatch.setattr(api, "_load_cute_implementation", fail_loader)
+    monkeypatch.setattr(api, "_cute_implementation", fail_loader)
 
     with pytest.raises(ValueError, match="(?i)backend"):
         api.compressed_sparse_attention(*make_arguments(), backend="cuda")
@@ -203,7 +250,7 @@ def test_shared_shape_validation_happens_before_backend_loading(monkeypatch, bac
     arguments[9] = torch.randn(2, 5, 1)
     monkeypatch.setattr(api, "_load_eager_implementation", fail_loader)
     monkeypatch.setattr(api, "_load_triton_implementation", fail_loader)
-    monkeypatch.setattr(api, "_load_cute_implementation", fail_loader)
+    monkeypatch.setattr(api, "_cute_implementation", fail_loader)
 
     with pytest.raises(ValueError, match="W_I must have shape"):
         api.compressed_sparse_attention(*arguments, backend=backend)
