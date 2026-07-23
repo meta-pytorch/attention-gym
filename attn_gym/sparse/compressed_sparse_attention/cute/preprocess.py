@@ -135,9 +135,7 @@ class _RmsNormRopeSm100:
             raise ValueError("The SM100 RMSNorm specialization supports D=512 or D=64.")
         self.rows_per_cta = _THREADS // self.threads_per_row
         self.vector_width = 8
-        self.vectors_per_thread = dimension // (
-            self.threads_per_row * self.vector_width
-        )
+        self.vectors_per_thread = dimension // (self.threads_per_row * self.vector_width)
 
     @cute.jit
     def __call__(
@@ -184,9 +182,7 @@ class _RmsNormRopeSm100:
         while offset > 0:
             local_sum += cute.arch.shuffle_sync_bfly(local_sum, offset=offset)
             offset //= 2
-        scale = cute.math.rsqrt(
-            local_sum / Float32(dimension) + Float32(_RMS_EPS), fastmath=True
-        )
+        scale = cute.math.rsqrt(local_sum / Float32(dimension) + Float32(_RMS_EPS), fastmath=True)
 
         # Store the RMSNorm result in the output dtype first.  The reference applies RoPE to
         # this rounded tensor, rather than fusing normalization and rotation in FP32.
@@ -199,8 +195,7 @@ class _RmsNormRopeSm100:
                 for item in cutlass.range_constexpr(self.vector_width):
                     d = vector_start + item
                     mOut[batch, row, 0, d] = out_dtype(
-                        (Float32(mX[batch, 0, row, d]) * scale)
-                        * Float32(mWeight[d])
+                        (Float32(mX[batch, 0, row, d]) * scale) * Float32(mWeight[d])
                     )
         cute.arch.sync_threads()
         if flat_row < total_rows:
@@ -412,8 +407,7 @@ class _CompressRmsNormRopeSm100:
                         source_b = (block - 1) * rate + offset
                         logit_b = Float32(
                             out_dtype(
-                                Float32(mZb[batch, 0, source_b, d])
-                                + Float32(mBb[offset, d])
+                                Float32(mZb[batch, 0, source_b, d]) + Float32(mBb[offset, d])
                             )
                         )
                         maximum = cute.arch.fmax(maximum, logit_b)
@@ -437,8 +431,7 @@ class _CompressRmsNormRopeSm100:
                         source_b = (block - 1) * rate + offset
                         logit_b = Float32(
                             out_dtype(
-                                Float32(mZb[batch, 0, source_b, d])
-                                + Float32(mBb[offset, d])
+                                Float32(mZb[batch, 0, source_b, d]) + Float32(mBb[offset, d])
                             )
                         )
                         exp_b = cute.math.exp(logit_b - maximum, fastmath=False)
@@ -453,14 +446,11 @@ class _CompressRmsNormRopeSm100:
                         out_dtype(Float32(mZa[batch, 0, source_a, d]) + Float32(mBa[offset, d]))
                     )
                     if cutlass.const_expr(dimension > _INDEX_DIM):
-                        probability_a = Float32(
-                            out_dtype(exponentials[offset] / denominator)
-                        )
+                        probability_a = Float32(out_dtype(exponentials[offset] / denominator))
                     else:
                         probability_a = Float32(
                             out_dtype(
-                                cute.math.exp(logit_a - maximum, fastmath=False)
-                                / denominator
+                                cute.math.exp(logit_a - maximum, fastmath=False) / denominator
                             )
                         )
                     product_a = Float32(
@@ -472,8 +462,7 @@ class _CompressRmsNormRopeSm100:
                         source_b = (block - 1) * rate + offset
                         logit_b = Float32(
                             out_dtype(
-                                Float32(mZb[batch, 0, source_b, d])
-                                + Float32(mBb[offset, d])
+                                Float32(mZb[batch, 0, source_b, d]) + Float32(mBb[offset, d])
                             )
                         )
                         if cutlass.const_expr(dimension > _INDEX_DIM):
@@ -483,8 +472,7 @@ class _CompressRmsNormRopeSm100:
                         else:
                             probability_b = Float32(
                                 out_dtype(
-                                    cute.math.exp(logit_b - maximum, fastmath=False)
-                                    / denominator
+                                    cute.math.exp(logit_b - maximum, fastmath=False) / denominator
                                 )
                             )
                         product_b = Float32(
@@ -517,9 +505,7 @@ class _CompressRmsNormRopeSm100:
                     Float32(mOut[batch, block, 0, d]) * scale * Float32(mWeight[d])
                 )
         cute.arch.sync_threads()
-        _rotate_tail_in_place(
-            mOut, batch, block, block * rate, tidx, dimension, _THREADS
-        )
+        _rotate_tail_in_place(mOut, batch, block, block * rate, tidx, dimension, _THREADS)
 
 
 _COMPILE_CACHE_MAXSIZE = 64
@@ -755,17 +741,23 @@ def preprocess_shared_kv(
             KV.shape[0], 1, num_blocks, _INDEX_DIM, dtype=dtype, device=device
         )
         for source_args, raw, weight, output in (
-            ((C_a, C_b, Z_a, Z_b, B_a, B_b), raw_attention, compressed_kv_norm_weight, compressed_kv),
-            ((K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib), raw_indices, compressed_indices_norm_weight, compressed_indices),
+            (
+                (C_a, C_b, Z_a, Z_b, B_a, B_b),
+                raw_attention,
+                compressed_kv_norm_weight,
+                compressed_kv,
+            ),
+            (
+                (K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib),
+                raw_indices,
+                compressed_indices_norm_weight,
+                compressed_indices,
+            ),
         ):
             compression_args = (*source_args, raw)
             compression_compiled = _compiled_compress_only(compression_args, stream)
-            compression_compiled(
-                *(_as_cute(tensor) for tensor in compression_args), stream
-            )
-            norm_compiled = _compiled_rms_rope(
-                raw, weight, output, stream, _COMPRESSION_RATE
-            )
+            compression_compiled(*(_as_cute(tensor) for tensor in compression_args), stream)
+            norm_compiled = _compiled_rms_rope(raw, weight, output, stream, _COMPRESSION_RATE)
             norm_compiled(_as_cute(raw), _as_cute(weight), _as_cute(output), stream)
     else:
         attention_args = (

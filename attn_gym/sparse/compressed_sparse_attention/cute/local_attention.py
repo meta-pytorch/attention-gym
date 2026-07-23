@@ -207,8 +207,7 @@ def local_attention(
     batch, sequence, heads, dim = query.shape
     if heads not in (64, 128) or dim != 512 or value.shape != (batch, sequence, 1, 512):
         raise ValueError(
-            "local CuTe attention requires Q=[B,S,H,512] with H in {64,128} "
-            "and V=[B,S,1,512]."
+            "local CuTe attention requires Q=[B,S,H,512] with H in {64,128} and V=[B,S,1,512]."
         )
     if not 1 <= window <= sequence:
         raise ValueError("window must be in [1, sequence].")
@@ -219,9 +218,7 @@ def local_attention(
     if output is None:
         output = torch.empty_like(query)
     elif (
-        output.shape != query.shape
-        or output.device != query.device
-        or output.dtype != query.dtype
+        output.shape != query.shape or output.device != query.device or output.dtype != query.dtype
     ):
         raise ValueError("output must match query's shape, device, and dtype.")
     if lse is None:
@@ -304,17 +301,13 @@ def compressed_attention(
             or local_value.dtype != value.dtype
             or local_value.device != value.device
         ):
-            raise ValueError(
-                "local values must be contiguous and match compressed device/dtype."
-            )
+            raise ValueError("local values must be contiguous and match compressed device/dtype.")
         if csa_topk < 0 or csa_window < 0 or csa_topk + csa_window > gather.shape[-1]:
             raise ValueError("CSA top-k/window counts must fit within the gather width.")
     if output is None:
         output = torch.empty_like(query)
     elif (
-        output.shape != query.shape
-        or output.device != query.device
-        or output.dtype != query.dtype
+        output.shape != query.shape or output.device != query.device or output.dtype != query.dtype
     ):
         raise ValueError("output must match query's shape, device, and dtype.")
     if lse is None and store_lse:
@@ -333,11 +326,7 @@ def compressed_attention(
     if fuse_q_rope and cos is None:
         raise ValueError("fused query RoPE requires sink, cosine, and sine tensors.")
     if sink is not None:
-        if (
-            sink.ndim != 1
-            or sink.numel() < head_offset + heads
-            or sink.device != query.device
-        ):
+        if sink.ndim != 1 or sink.numel() < head_offset + heads or sink.device != query.device:
             raise ValueError("sink must cover this head tile on query's device.")
         expected_rope_shape = (sequence, rope_dims // 2)
         for name, table in (("cos", cos), ("sin", sin)):
@@ -346,9 +335,7 @@ def compressed_attention(
                 or table.device != query.device
                 or table.dtype != torch.float32
             ):
-                raise ValueError(
-                    f"{name} must be FP32 with shape {expected_rope_shape}."
-                )
+                raise ValueError(f"{name} must be FP32 with shape {expected_rope_shape}.")
     compiled = _compile_compressed(
         query,
         value,
