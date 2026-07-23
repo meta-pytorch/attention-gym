@@ -14,13 +14,16 @@ import math
 import torch
 from cutlass import BFloat16, Int32
 
+from .index_scores import exact_bf16_index_scores
 from .kernels import (
     compile_causal_gather,
     compile_compression,
+    compile_index_score_keys,
     compile_index_scores,
     compile_index_topk,
     compile_local_norm,
     compile_merge,
+    compile_pad_index_weights,
     compile_prefix,
     compile_query_rope,
     compile_selected_gather,
@@ -48,6 +51,7 @@ _ROPE_DIMS = 64
 _RADIX_TOPK_THRESHOLD = 64
 _RADIX_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
 _COMBINED_GATHER_WORKSPACE_BYTES = 128 * 1024 * 1024
+_TENSOR_INDEX_PACKED_HEADS = 64
 _TESTED_CUDA_VERSION = "13.3"
 _DIFFERENTIABLE_INPUT_INDICES = (0, 2, 3, 4, 5, 6, 7, 8, 16, 18, 19)
 _query_streams: dict[int, torch.cuda.Stream] = {}
@@ -56,6 +60,10 @@ _rope_table_cache: OrderedDict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
 ] = OrderedDict()
 _DSA_PACKED_WORKSPACE_BYTES = 1536 * 1024 * 1024
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
 
 
 def _query_stream(device_index: int) -> torch.cuda.Stream:
@@ -600,19 +608,40 @@ def _compressed_sparse_attention_forward(
                 gather_window,
                 gather_length,
             )(gather)
-        use_warp_streaming_topk = (
-            effective_topk == 64 and index_heads <= 4 and index_dim <= 128
+        tensor_score_row_capacity = _radix_score_row_chunk(
+            batch * sequence_length,
+            num_blocks,
+            effective_topk,
         )
-        use_radix_topk = (
-            effective_topk >= _RADIX_TOPK_THRESHOLD and not use_warp_streaming_topk
+        use_tensor_index_scores = (
+            need_index_scores
+            and Q.dtype == torch.bfloat16
+            and _is_power_of_two(index_heads)
+            and index_heads <= _TENSOR_INDEX_PACKED_HEADS
+            and index_dim == 64
+            and num_blocks % 64 == 0
+            and sequence_length % compression_rate == 0
+            and tensor_score_row_capacity >= sequence_length
+            and effective_topk >= _RADIX_TOPK_THRESHOLD
         )
+        use_radix_topk = use_tensor_index_scores or effective_topk >= _RADIX_TOPK_THRESHOLD
+
+        if use_tensor_index_scores:
+            if output is None:
+                output = torch.empty_like(Q)
 
         def launch_indexer() -> None:
             nonlocal score_keys, completed_lengths
             if use_radix_topk:
                 total_rows = batch * sequence_length
-                row_chunk = _radix_score_row_chunk(
-                    total_rows, num_blocks, effective_topk
+                row_chunk = (
+                    sequence_length
+                    if use_tensor_index_scores
+                    else _radix_score_row_chunk(
+                        total_rows,
+                        num_blocks,
+                        effective_topk,
+                    )
                 )
                 score_keys = torch.empty(
                     row_chunk,
@@ -625,30 +654,157 @@ def _compressed_sparse_attention_forward(
                     device=Q.device,
                     dtype=torch.int32,
                 )
-                index_scores = compile_index_scores(
-                    dtype,
-                    batch,
-                    sequence_length,
-                    index_heads,
-                    index_dim,
-                    num_blocks,
-                    compression_rate,
-                    rope_dims,
-                    row_chunk,
-                )
+                if use_tensor_index_scores:
+                    index_scores = None
+                    index_score_keys = compile_index_score_keys(
+                        dtype,
+                        sequence_length,
+                        num_blocks,
+                        compression_rate,
+                        row_chunk,
+                    )
+                    batch_chunk = row_chunk // sequence_length
+                    query_elements = (
+                        batch_chunk
+                        * sequence_length
+                        * _TENSOR_INDEX_PACKED_HEADS
+                        * index_dim
+                    )
+                    weight_elements = (
+                        0
+                        if index_heads == _TENSOR_INDEX_PACKED_HEADS
+                        else batch_chunk
+                        * sequence_length
+                        * _TENSOR_INDEX_PACKED_HEADS
+                    )
+                    workspace_elements = query_elements + weight_elements
+                    assert output is not None
+                    if output.numel() >= workspace_elements:
+                        index_workspace = output.view(-1)[:workspace_elements]
+                    else:
+                        index_workspace = torch.empty(
+                            workspace_elements,
+                            device=Q.device,
+                            dtype=Q.dtype,
+                        )
+                    tensor_index_query = index_workspace[
+                        :query_elements
+                    ].view(
+                        batch_chunk,
+                        sequence_length,
+                        _TENSOR_INDEX_PACKED_HEADS,
+                        index_dim,
+                    )
+                    if index_heads == _TENSOR_INDEX_PACKED_HEADS:
+                        tensor_index_weights = None
+                    else:
+                        tensor_index_weights = index_workspace[
+                            query_elements:workspace_elements
+                        ].view(
+                            batch_chunk,
+                            sequence_length,
+                            _TENSOR_INDEX_PACKED_HEADS,
+                        )
+                else:
+                    index_scores = compile_index_scores(
+                        dtype,
+                        batch,
+                        sequence_length,
+                        index_heads,
+                        index_dim,
+                        num_blocks,
+                        compression_rate,
+                        rope_dims,
+                        row_chunk,
+                    )
+                    index_score_keys = None
+                    tensor_index_query = None
+                    tensor_index_weights = None
                 for row_offset in range(0, total_rows, row_chunk):
                     active_rows = min(row_chunk, total_rows - row_offset)
-                    index_scores(
-                        Q_I,
-                        compressed_indices,
-                        W_I,
-                        cos,
-                        sin,
-                        score_keys,
-                        completed_lengths,
-                        Int32(row_offset),
-                        Int32(active_rows),
-                    )
+                    if use_tensor_index_scores:
+                        assert tensor_index_query is not None
+                        assert index_score_keys is not None
+                        batch_offset = row_offset // sequence_length
+                        active_batches = active_rows // sequence_length
+                        query_slab = tensor_index_query[:active_batches]
+                        compile_query_rope(
+                            dtype,
+                            active_batches,
+                            index_heads,
+                            _TENSOR_INDEX_PACKED_HEADS,
+                            index_heads,
+                            0,
+                            sequence_length,
+                            index_dim,
+                            rope_dims,
+                        )(
+                            Q_I[
+                                batch_offset : batch_offset + active_batches
+                            ],
+                            cos,
+                            sin,
+                            query_slab,
+                            query_slab,
+                        )
+                        if index_heads == _TENSOR_INDEX_PACKED_HEADS:
+                            weight_slab = W_I[
+                                batch_offset : batch_offset + active_batches
+                            ]
+                        else:
+                            assert tensor_index_weights is not None
+                            weight_slab = tensor_index_weights[
+                                :active_batches
+                            ]
+                            compile_pad_index_weights(
+                                dtype,
+                                active_batches,
+                                sequence_length,
+                                index_heads,
+                                _TENSOR_INDEX_PACKED_HEADS,
+                            )(
+                                W_I[
+                                    batch_offset : batch_offset
+                                    + active_batches
+                                ],
+                                weight_slab,
+                            )
+                        score_slab = score_keys[:active_rows].view(
+                            active_batches,
+                            sequence_length,
+                            num_blocks,
+                        )
+                        exact_bf16_index_scores(
+                            query_slab,
+                            compressed_indices[
+                                batch_offset : batch_offset + active_batches
+                            ],
+                            weight_slab,
+                            ratio=compression_rate,
+                            qhead_per_kv_head=_TENSOR_INDEX_PACKED_HEADS,
+                            out=score_slab,
+                            sm_scale=1.0
+                            / math.sqrt(index_dim * index_heads),
+                        )
+                        index_score_keys(
+                            score_keys,
+                            completed_lengths,
+                            Int32(row_offset),
+                            Int32(active_rows),
+                        )
+                    else:
+                        assert index_scores is not None
+                        index_scores(
+                            Q_I,
+                            compressed_indices,
+                            W_I,
+                            cos,
+                            sin,
+                            score_keys,
+                            completed_lengths,
+                            Int32(row_offset),
+                            Int32(active_rows),
+                        )
                     selected_indices = _radix_topk_indices(
                         score_keys[:active_rows],
                         completed_lengths[:active_rows],
