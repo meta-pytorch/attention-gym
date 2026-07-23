@@ -196,11 +196,11 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== register usage ====
         if self.num_warps == 16:
-            self.num_regs_load = 80
-            self.num_regs_mma = 80
-            self.num_regs_softmax = 208
+            self.num_regs_load = 112
+            self.num_regs_mma = 112
+            self.num_regs_softmax = 192
             self.num_regs_epilogue = 128
-            self.num_regs_cpasync = 96 if self.use_cpasync_load_KV else 0
+            self.num_regs_cpasync = 80 if self.use_cpasync_load_KV else 0
             self.num_regs_other = 48
         else:
             self.num_regs_load = 168 - 40
@@ -281,7 +281,7 @@ class FlashAttentionMLAForwardSm100:
         self.num_stages_P = 1
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
-        self.num_stages_bitmask = 4
+        self.num_stages_bitmask = 2
         assert self.num_stages_S == 2, "mainloops expect 2 stages for S"
 
         # ==== dtype info ====
@@ -3209,7 +3209,9 @@ class FlashAttentionMLAForwardSm100:
 
             # write row max and sum to smem
             sRowSum[tidx % self.cta_tile_m, warp_idx // self.cta_group_size] = softmax.row_sum[0]
-            if const_expr(mLSE is not None):
+            # The fused CSA sink epilogue also consumes the global row maximum even
+            # when the caller does not request an LSE output.
+            if const_expr(mLSE is not None or self.fuse_csa_epilogue):
                 if tidx < self.cta_tile_m:
                     sRowMax[tidx, 0] = softmax.row_max[0]
             self.sm_stats_barrier_full.arrive()

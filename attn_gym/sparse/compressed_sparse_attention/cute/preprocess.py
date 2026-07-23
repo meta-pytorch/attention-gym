@@ -502,11 +502,12 @@ class _CompressRmsNormRopeSm100:
         # was widened; the extra warps contribute zero and are ignored by _block_rsqrt.
         local_sum = Float32(0.0)
         norm_values_per_thread = cute.ceil_div(dimension, _THREADS)
-        for item in cutlass.range_constexpr(norm_values_per_thread):
-            d = tidx + item * _THREADS
-            if d < dimension:
-                value = Float32(mOut[batch, block, 0, d])
-                local_sum += value * value
+        if tidx < _THREADS:
+            for item in cutlass.range_constexpr(norm_values_per_thread):
+                d = tidx + item * _THREADS
+                if d < dimension:
+                    value = Float32(mOut[batch, block, 0, d])
+                    local_sum += value * value
         scale = _block_rsqrt(local_sum, tidx, warp_sums, dimension)
 
         for item in cutlass.range_constexpr(values_per_thread):
@@ -792,8 +793,8 @@ def preprocess_shared_kv(
         )
         index_compiled = _compiled_compress(index_args, index_stream)
         index_compiled(*(_as_cute(tensor) for tensor in index_args), index_stream)
-        if use_parallel_stream:
-            torch_stream.wait_stream(index_torch_stream)
+    if use_parallel_stream:
+        torch_stream.wait_stream(index_torch_stream)
     return local_kv, compressed_kv, compressed_indices
 
 
