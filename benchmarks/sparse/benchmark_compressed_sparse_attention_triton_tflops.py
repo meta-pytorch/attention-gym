@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--index-heads", type=int, default=4)
     parser.add_argument("--index-dim", type=int, default=64)
-    parser.add_argument("--compression-rate", type=int, default=8)
+    parser.add_argument("--compression-rate", type=int, default=4)
     parser.add_argument("--topk", type=int, default=64)
     parser.add_argument("--window", type=int, default=512)
     parser.add_argument("--rope-dims", type=int, default=64)

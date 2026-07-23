@@ -8,8 +8,6 @@ algorithmic gradient FLOPs and the effective useful FLOPs including that recompu
 from __future__ import annotations
 
 import argparse
-import math
-
 import torch
 import triton
 
@@ -28,7 +26,8 @@ def useful_flops(args: argparse.Namespace) -> tuple[int, int, int, int]:
     normalization, RoPE, top-k, and softmax are intentionally omitted, matching the
     usual useful sparse-attention throughput convention.
     """
-    num_blocks = math.ceil(args.sequence_length / args.compression_rate)
+    selectable_blocks = args.sequence_length // args.compression_rate
+    effective_topk = min(args.topk, selectable_blocks)
     local_pairs = sum(
         min(args.window, query_position + 1)
         for query_position in range(args.sequence_length)
@@ -38,14 +37,19 @@ def useful_flops(args: argparse.Namespace) -> tuple[int, int, int, int]:
         for query_position in range(args.sequence_length)
     )
 
-    indexer_forward = (
-        2
-        * args.batch
-        * args.index_heads
-        * args.sequence_length
-        * num_blocks
-        * args.index_dim
+    completed_pairs = sum(
+        (query_position + 1) // args.compression_rate
+        for query_position in range(args.sequence_length)
     )
+    indexer_forward = 0
+    if 0 < effective_topk < selectable_blocks:
+        indexer_forward = (
+            2
+            * args.batch
+            * args.index_heads
+            * completed_pairs
+            * args.index_dim
+        )
     attention_forward = (
         4
         * args.batch
@@ -69,11 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=512)
     parser.add_argument("--index-heads", type=int, default=4)
     parser.add_argument("--index-dim", type=int, default=64)
-    parser.add_argument("--compression-rate", type=int, default=8)
+    parser.add_argument("--compression-rate", type=int, default=4)
     parser.add_argument("--topk", type=int, default=64)
     parser.add_argument("--window", type=int, default=512)
     parser.add_argument("--rope-dims", type=int, default=64)
-    parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--share-kv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=int, default=100, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=500, help="Measurement duration in ms")
