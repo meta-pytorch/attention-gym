@@ -608,6 +608,127 @@ class IndexScores:
             cute.arch.barrier()
 
 
+class IndexScoreKeys:
+    """Round tensor-core scores and encode deterministic radix-order keys in place."""
+
+    def __init__(
+        self,
+        dtype,
+        sequence: int,
+        num_blocks: int,
+        rate: int,
+        row_chunk: int,
+    ):
+        self.dtype = dtype
+        self.sequence = sequence
+        self.num_blocks = num_blocks
+        self.rate = rate
+        self.row_chunk = row_chunk
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        scores: cute.Tensor,
+        completed_lengths: cute.Tensor,
+        row_offset: Int32,
+        active_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            scores,
+            completed_lengths,
+            row_offset,
+            active_rows,
+        ).launch(
+            grid=[active_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        scores: cute.Tensor,
+        completed_lengths: cute.Tensor,
+        row_offset: Int32,
+        active_rows: Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        slab_row, _, _ = cute.arch.block_idx()
+        if slab_row < active_rows:
+            row = row_offset + slab_row
+            position = row % self.sequence
+            completed = (position + 1) // self.rate
+            if tid == 0:
+                completed_lengths[slab_row] = Int32(completed)
+            for n in cutlass.range(
+                tid,
+                completed,
+                self.num_threads,
+                unroll=1,
+            ):
+                rounded_score = scores[slab_row, n].to(self.dtype)
+                scores[slab_row, n] = _score_index_key(
+                    rounded_score,
+                    n,
+                    self.num_blocks,
+                )
+
+
+class PadIndexWeights:
+    """Zero-pad index-head weights to a tensor-core packing width."""
+
+    def __init__(
+        self,
+        dtype,
+        batch: int,
+        sequence: int,
+        source_heads: int,
+        packed_heads: int,
+    ):
+        self.dtype = dtype
+        self.batch = batch
+        self.sequence = sequence
+        self.source_heads = source_heads
+        self.packed_heads = packed_heads
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        weights: cute.Tensor,
+        packed_weights: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(weights, packed_weights).launch(
+            grid=[self.batch * self.sequence, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        weights: cute.Tensor,
+        packed_weights: cute.Tensor,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        batch_idx = row // self.sequence
+        position = row - batch_idx * self.sequence
+        for head in cutlass.range(
+            tid,
+            self.packed_heads,
+            self.num_threads,
+            unroll=1,
+        ):
+            value = self.dtype(0)
+            if head < self.source_heads:
+                value = weights[batch_idx, position, head]
+            packed_weights[batch_idx, position, head] = value
+
+
 class SelectedGather:
     """Pack a radix-selected row slab and its causal local window."""
 
@@ -769,12 +890,6 @@ class IndexTopK:
         self.num_threads = 128
         self.head_groups = (index_heads + 3) // 4
         self.pairs_per_lane = (index_dim // 2 + cute.arch.WARP_SIZE - 1) // cute.arch.WARP_SIZE
-        # The common DeepSeek indexer has four 64/128-wide heads.  Assigning one warp to
-        # each query row lets the warp reuse every compressed-index load across all heads
-        # and removes the CTA barriers from the quadratic block scan.  Keep the distributed
-        # four-warp implementation below for larger HI/DI combinations whose stationary QI
-        # values would otherwise require excessive registers in one warp.
-        self.use_warp_rows = topk == 0 or (index_heads <= 4 and index_dim <= 128)
         assert index_heads > 0 and index_dim % 64 == 0 and topk >= 0
         assert gather_length >= topk + self.window and gather_length % 128 == 0
 
@@ -789,240 +904,11 @@ class IndexTopK:
         gather: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        if const_expr(self.use_warp_rows):
-            self.kernel_warp_rows(q_i, compressed_indices, weights, cos, sin, gather).launch(
-                grid=[cute.ceil_div(self.batch * self.sequence, 4), 1, 1],
-                block=[self.num_threads, 1, 1],
-                stream=stream,
-            )
-            return
         self.kernel(q_i, compressed_indices, weights, cos, sin, gather).launch(
             grid=[self.batch * self.sequence, 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
-
-    @cute.kernel
-    def kernel_warp_rows(
-        self,
-        q_i: cute.Tensor,
-        compressed_indices: cute.Tensor,
-        weights: cute.Tensor,
-        cos: cute.Tensor,
-        sin: cute.Tensor,
-        gather: cute.Tensor,
-    ):
-        """Scan one independent query row per warp for the small-HI indexer."""
-
-        tid, _, _ = cute.arch.thread_idx()
-        block, _, _ = cute.arch.block_idx()
-        warp = tid // cute.arch.WARP_SIZE
-        lane = tid % cute.arch.WARP_SIZE
-        row = block * 4 + warp
-
-        if row < self.batch * self.sequence:
-            batch_idx = row // self.sequence
-            position = row - batch_idx * self.sequence
-
-            # Each warp owns its gather row, so initialization and the appended local window
-            # need neither shared memory nor CTA synchronization.
-            for item in cutlass.range_constexpr(self.gather_length // cute.arch.WARP_SIZE):
-                slot = lane + item * cute.arch.WARP_SIZE
-                gather[batch_idx, position, slot] = Int32(-1)
-
-            if const_expr(self.topk > 0):
-                if const_expr(self.topk <= 64):
-                    # Keep up to 64 descending elements distributed across the warp:
-                    # lane L owns ranks L and L + 32. Every candidate is inserted with
-                    # ballots and cooperative one-position shuffles instead of K serial
-                    # comparisons and shifts in lane 0.
-                    warp_best_keys = cute.make_rmem_tensor((2,), cutlass.Uint32)
-                    warp_best_indices = cute.make_rmem_tensor((2,), Int32)
-                    for k in cutlass.range_constexpr(2):
-                        warp_best_keys[k] = cutlass.Uint32(0)
-                        warp_best_indices[k] = Int32(-1)
-                else:
-                    serial_best_values = cute.make_rmem_tensor((self.topk,), Float32)
-                    serial_best_indices = cute.make_rmem_tensor((self.topk,), Int32)
-                    if lane == 0:
-                        for k in cutlass.range_constexpr(self.topk):
-                            serial_best_values[k] = -Float32.inf
-                            serial_best_indices[k] = Int32(-1)
-
-                # Keep the rounded, RoPE-transformed QI values stationary for the complete
-                # causal scan.  This is at most 16 FP32 values/lane for HI=4, DI=128.
-                q_values = cute.make_rmem_tensor(
-                    (self.index_heads, self.pairs_per_lane, 2), Float32
-                )
-                for head in cutlass.range_constexpr(self.index_heads):
-                    for item in cutlass.range_constexpr(self.pairs_per_lane):
-                        pair = lane + item * cute.arch.WARP_SIZE
-                        d0 = pair * 2
-                        q0 = q_i[batch_idx, head, position, d0].to(Float32)
-                        q1 = q_i[batch_idx, head, position, d0 + 1].to(Float32)
-                        rq0, rq1 = q0, q1
-                        if d0 >= self.index_dim - self.rope:
-                            rope_pair = (d0 - (self.index_dim - self.rope)) // 2
-                            c = cos[position, rope_pair].to(Float32)
-                            s = sin[position, rope_pair].to(Float32)
-                            rq0 = q0 * c - q1 * s
-                            rq1 = q0 * s + q1 * c
-                        q_values[head, item, 0] = rq0.to(self.dtype).to(Float32)
-                        q_values[head, item, 1] = rq1.to(self.dtype).to(Float32)
-
-                completed = (position + 1) // self.rate
-                for n in cutlass.range(completed, unroll=1):
-                    partials = cute.make_rmem_tensor((self.index_heads,), Float32)
-                    for head in cutlass.range_constexpr(self.index_heads):
-                        partials[head] = Float32(0.0)
-
-                    # K_I is shared by every indexer head.  Load each pair once and reuse it
-                    # for all heads instead of issuing one identical load from every warp.
-                    for item in cutlass.range_constexpr(self.pairs_per_lane):
-                        pair = lane + item * cute.arch.WARP_SIZE
-                        d0 = pair * 2
-                        k0 = compressed_indices[batch_idx, n, 0, d0].to(Float32)
-                        k1 = compressed_indices[batch_idx, n, 0, d0 + 1].to(Float32)
-                        for head in cutlass.range_constexpr(self.index_heads):
-                            partials[head] += (
-                                q_values[head, item, 0] * k0
-                                + q_values[head, item, 1] * k1
-                            )
-
-                    score = Float32(0.0)
-                    for head in cutlass.range_constexpr(self.index_heads):
-                        dot = cute.arch.warp_reduction_sum(partials[head])
-                        if lane == 0:
-                            rounded_dot = dot.to(self.dtype).to(Float32)
-                            activated = cute.arch.fmax(rounded_dot, Float32(0.0))
-                            activated = (
-                                activated / math.sqrt(self.index_dim * self.index_heads)
-                            ).to(self.dtype).to(Float32)
-                            score += (
-                                activated * weights[batch_idx, position, head].to(Float32)
-                            ).to(self.dtype).to(Float32)
-
-                    if const_expr(self.topk <= 64):
-                        warp_candidate_key = cutlass.Uint32(0)
-                        warp_candidate_index = Int32(-1)
-                        if lane == 0:
-                            warp_candidate_index = Int32(n)
-                            warp_candidate_key = _score_order_key(
-                                score.to(self.dtype), warp_candidate_index, self.num_blocks
-                            )
-                        warp_candidate_key = cute.arch.shuffle_sync(
-                            warp_candidate_key, offset=0
-                        )
-                        warp_candidate_index = cute.arch.shuffle_sync(
-                            warp_candidate_index, offset=0
-                        )
-                        last_slot = 0 if const_expr(self.topk <= 32) else 1
-                        last_lane = (self.topk - 1) % cute.arch.WARP_SIZE
-                        last_key = cute.arch.shuffle_sync(
-                            warp_best_keys[last_slot], offset=last_lane
-                        )
-                        last_index = cute.arch.shuffle_sync(
-                            warp_best_indices[last_slot], offset=last_lane
-                        )
-                        # Once the set is full, almost all long-context candidates lose to
-                        # rank 63. The predicate is warp-uniform, so skip every ballot and
-                        # shift for those candidates without introducing divergence.
-                        if warp_candidate_key > last_key or (
-                            warp_candidate_key == last_key
-                            and warp_candidate_index < last_index
-                        ):
-                            insertion_rank = cute.arch.popc(
-                                cute.arch.vote_ballot_sync(
-                                    warp_best_keys[0] > warp_candidate_key
-                                    or (
-                                        warp_best_keys[0] == warp_candidate_key
-                                        and warp_best_indices[0] < warp_candidate_index
-                                    )
-                                    if lane < min(self.topk, cute.arch.WARP_SIZE)
-                                    else False
-                                )
-                            ) + cute.arch.popc(
-                                cute.arch.vote_ballot_sync(
-                                    warp_best_keys[1] > warp_candidate_key
-                                    or (
-                                        warp_best_keys[1] == warp_candidate_key
-                                        and warp_best_indices[1] < warp_candidate_index
-                                    )
-                                    if lane + cute.arch.WARP_SIZE < self.topk
-                                    else False
-                                )
-                            )
-
-                            previous_key_0 = cute.arch.shuffle_sync_up(
-                                warp_best_keys[0], offset=1, mask_and_clamp=0
-                            )
-                            previous_index_0 = cute.arch.shuffle_sync_up(
-                                warp_best_indices[0], offset=1, mask_and_clamp=0
-                            )
-                            previous_key_1 = cute.arch.shuffle_sync_up(
-                                warp_best_keys[1], offset=1, mask_and_clamp=0
-                            )
-                            previous_index_1 = cute.arch.shuffle_sync_up(
-                                warp_best_indices[1], offset=1, mask_and_clamp=0
-                            )
-                            previous_key_cross = cute.arch.shuffle_sync(
-                                warp_best_keys[0], offset=31
-                            )
-                            previous_index_cross = cute.arch.shuffle_sync(
-                                warp_best_indices[0], offset=31
-                            )
-                            if lane == 0:
-                                previous_key_1 = previous_key_cross
-                                previous_index_1 = previous_index_cross
-
-                            rank_0 = lane
-                            if rank_0 == insertion_rank:
-                                warp_best_keys[0] = warp_candidate_key
-                                warp_best_indices[0] = warp_candidate_index
-                            elif rank_0 > insertion_rank and rank_0 < self.topk:
-                                warp_best_keys[0] = previous_key_0
-                                warp_best_indices[0] = previous_index_0
-
-                            rank_1 = lane + cute.arch.WARP_SIZE
-                            if rank_1 == insertion_rank:
-                                warp_best_keys[1] = warp_candidate_key
-                                warp_best_indices[1] = warp_candidate_index
-                            elif rank_1 > insertion_rank and rank_1 < self.topk:
-                                warp_best_keys[1] = previous_key_1
-                                warp_best_indices[1] = previous_index_1
-                    elif lane == 0:
-                        serial_candidate_value = score.to(self.dtype).to(Float32)
-                        serial_candidate_index = Int32(n)
-                        for k in cutlass.range_constexpr(self.topk):
-                            if serial_candidate_value > serial_best_values[k] or (
-                                serial_candidate_value == serial_best_values[k]
-                                and serial_candidate_index < serial_best_indices[k]
-                            ):
-                                old_value = serial_best_values[k]
-                                old_index = serial_best_indices[k]
-                                serial_best_values[k] = serial_candidate_value
-                                serial_best_indices[k] = serial_candidate_index
-                                serial_candidate_value = old_value
-                                serial_candidate_index = old_index
-
-                if const_expr(self.topk <= 64):
-                    if lane < self.topk:
-                        gather[batch_idx, position, lane] = warp_best_indices[0]
-                    if lane + cute.arch.WARP_SIZE < self.topk:
-                        gather[
-                            batch_idx, position, lane + cute.arch.WARP_SIZE
-                        ] = warp_best_indices[1]
-                elif lane == 0:
-                    for k in cutlass.range_constexpr(self.topk):
-                        gather[batch_idx, position, k] = serial_best_indices[k]
-
-            local_count = min(self.window, position + 1)
-            for item in cutlass.range_constexpr(self.gather_length // cute.arch.WARP_SIZE):
-                slot = lane + item * cute.arch.WARP_SIZE
-                local_slot = slot - self.topk
-                if local_slot >= 0 and local_slot < local_count:
-                    key = position - local_count + 1 + local_slot
-                    gather[batch_idx, position, slot] = Int32(self.num_blocks + key)
 
     @cute.kernel
     def kernel(
@@ -1810,6 +1696,54 @@ def compile_index_scores(
 
 
 @lru_cache
+def compile_index_score_keys(
+    dtype,
+    sequence,
+    num_blocks,
+    rate,
+    row_chunk,
+):
+    return cute.compile(
+        IndexScoreKeys(
+            dtype,
+            sequence,
+            num_blocks,
+            rate,
+            row_chunk,
+        ),
+        _fake(Float32, (row_chunk, num_blocks)),
+        _fake(Int32, (row_chunk,)),
+        Int32(0),
+        Int32(row_chunk),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache
+def compile_pad_index_weights(
+    dtype,
+    batch,
+    sequence,
+    source_heads,
+    packed_heads,
+):
+    return cute.compile(
+        PadIndexWeights(
+            dtype,
+            batch,
+            sequence,
+            source_heads,
+            packed_heads,
+        ),
+        _fake(dtype, (batch, sequence, source_heads)),
+        _fake(dtype, (batch, sequence, packed_heads)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@lru_cache
 def compile_selected_gather(
     batch, sequence, num_blocks, topk, window, gather_length, row_chunk
 ):
@@ -2028,9 +1962,11 @@ __all__ = [
     "compile_compression",
     "compile_compressed_merge",
     "compile_index_scores",
+    "compile_index_score_keys",
     "compile_index_topk",
     "compile_local_norm",
     "compile_merge",
+    "compile_pad_index_weights",
     "compile_prefix",
     "compile_query_rope",
     "compile_selected_gather",
