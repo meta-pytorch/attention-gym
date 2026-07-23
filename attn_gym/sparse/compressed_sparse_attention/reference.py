@@ -30,9 +30,7 @@ def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
     Z_a = pad_to_block_size(Z_a, compression_rate, float("-inf"))
     Z_b = pad_to_block_size(Z_b, compression_rate, float("-inf"))
 
-    C_b = F.pad(C_b, (0, 0, compression_rate, 0), "constant", 0.0)[
-        :, :, :-compression_rate, :
-    ]
+    C_b = F.pad(C_b, (0, 0, compression_rate, 0), "constant", 0.0)[:, :, :-compression_rate, :]
     Z_b = F.pad(Z_b, (0, 0, compression_rate, 0), "constant", float("-inf"))[
         :, :, :-compression_rate, :
     ]
@@ -63,9 +61,8 @@ def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
 def make_sliding_window_mask(query_length, window_size, device, dtype):
     query_positions = torch.arange(query_length, device=device)[:, None]
     key_positions = torch.arange(query_length, device=device)[None, :]
-    valid = (
-        (key_positions <= query_positions)
-        & (key_positions >= query_positions - window_size + 1)
+    valid = (key_positions <= query_positions) & (
+        key_positions >= query_positions - window_size + 1
     )
     return torch.zeros(
         (query_length, query_length),
@@ -152,9 +149,7 @@ def apply_rope(
     if inverse:
         frequencies_complex = frequencies_complex.conj()
 
-    x_complex = torch.view_as_complex(
-        x.float().reshape(*x.shape[:-1], rotary_dim // 2, 2)
-    )
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], rotary_dim // 2, 2))
     frequencies_complex = frequencies_complex.view(
         *([1] * (x.ndim - 2)),
         sequence_length,
@@ -208,21 +203,13 @@ def CSA(
         Z_Ib = Z_Ib.expand(-1, h_I, -1, -1)
 
     compressed_kv = compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate)
-    compressed_indices = compress(
-        K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate
-    )
+    compressed_indices = compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
     num_total_blocks = compressed_kv.shape[-2]
 
-    Q = torch.cat(
-        [Q[:, :, :, :-rope_dims], apply_rope(Q[:, :, :, -rope_dims:])], dim=-1
-    )
-    Q_I = torch.cat(
-        [Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1
-    )
+    Q = torch.cat([Q[:, :, :, :-rope_dims], apply_rope(Q[:, :, :, -rope_dims:])], dim=-1)
+    Q_I = torch.cat([Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1)
     KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
-    KV = torch.cat(
-        [KV[:, :, :, :-rope_dims], apply_rope(KV[:, :, :, -rope_dims:])], dim=-1
-    )
+    KV = torch.cat([KV[:, :, :, :-rope_dims], apply_rope(KV[:, :, :, -rope_dims:])], dim=-1)
 
     compressed_indices = F.rms_norm(
         compressed_indices,
@@ -257,13 +244,9 @@ def CSA(
         dim=-1,
     )
 
-    indexer_mask = make_block_mask(
-        s, num_total_blocks, compression_rate, device, dtype
-    )
+    indexer_mask = make_block_mask(s, num_total_blocks, compression_rate, device, dtype)
     indexer_scale = (head_dim_I * h_I) ** 0.5
-    scores = F.relu(
-        Q_I @ torch.permute(compressed_indices, (0, 1, 3, 2))
-    ) / indexer_scale
+    scores = F.relu(Q_I @ torch.permute(compressed_indices, (0, 1, 3, 2))) / indexer_scale
     W_I = torch.permute(W_I, (0, 2, 1)).unsqueeze(-1)
     scores = torch.sum(torch.multiply(W_I, scores), dim=1) + indexer_mask
 
@@ -275,9 +258,7 @@ def CSA(
     topk_mask = torch.full(scores.shape, float("-inf"), device=device, dtype=dtype)
     topk_mask.scatter_(dim=-1, index=topk_blocks, value=0.0)
     topk_mask += indexer_mask
-    SWA_mask = make_sliding_window_mask(
-        s, sliding_window_size, device, dtype
-    ).unsqueeze(0)
+    SWA_mask = make_sliding_window_mask(s, sliding_window_size, device, dtype).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)
 
     attention_kv = torch.cat([compressed_kv, KV], dim=-2)
@@ -285,8 +266,7 @@ def CSA(
     scale = head_dim**0.5
 
     P = sink_softmax(
-        torch.matmul(Q, torch.permute(attention_kv, (0, 1, 3, 2))) / scale
-        + attention_mask,
+        torch.matmul(Q, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask,
         attention_sink,
         dim=-1,
     )

@@ -6,10 +6,7 @@ import pytest
 
 
 BENCHMARK_DIRECTORY = (
-    Path(__file__).parents[1]
-    / "benchmarks"
-    / "sparse"
-    / "benchmark_compressed_sparse_attention"
+    Path(__file__).parents[1] / "benchmarks" / "sparse" / "benchmark_compressed_sparse_attention"
 )
 BENCHMARK_SCRIPTS = (
     "benchmark_compressed_sparse_attention_cute.py",

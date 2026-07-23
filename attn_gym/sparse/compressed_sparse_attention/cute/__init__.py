@@ -150,8 +150,7 @@ def _dsa_head_chunk(tokens: int, dim: int, heads: int, total_kv: int = 0) -> int
     max_heads = min(128, heads)
     if (
         max_heads < 1
-        or _dsa_workspace_bytes(tokens, dim, 1, total_kv)
-        > _DSA_PACKED_WORKSPACE_BYTES
+        or _dsa_workspace_bytes(tokens, dim, 1, total_kv) > _DSA_PACKED_WORKSPACE_BYTES
     ):
         raise RuntimeError(
             "The CuTe backward workspace cannot fit one attention head within "
@@ -161,10 +160,7 @@ def _dsa_head_chunk(tokens: int, dim: int, heads: int, total_kv: int = 0) -> int
     lower, upper = 1, max_heads
     while lower < upper:
         middle = (lower + upper + 1) // 2
-        if (
-            _dsa_workspace_bytes(tokens, dim, middle, total_kv)
-            <= _DSA_PACKED_WORKSPACE_BYTES
-        ):
+        if _dsa_workspace_bytes(tokens, dim, middle, total_kv) <= _DSA_PACKED_WORKSPACE_BYTES:
             lower = middle
         else:
             upper = middle - 1
@@ -182,9 +178,7 @@ def _dsa_tile_shape(
             f"{_DSA_PACKED_WORKSPACE_BYTES / 2**30:.1f} GiB budget."
         )
 
-    candidates = {
-        min(heads, candidate) for candidate in (128, 64, 32, 16, 8, 4, 2, 1)
-    }
+    candidates = {min(heads, candidate) for candidate in (128, 64, 32, 16, 8, 4, 2, 1)}
     best: tuple[int, int, int] | None = None
     for head_tile in candidates:
         if head_tile <= 0:
@@ -193,9 +187,7 @@ def _dsa_tile_shape(
         while low < high:
             middle = (low + high + 1) // 2
             if (
-                _dsa_workspace_bytes(
-                    middle, dim, head_tile, total_kv, index_width
-                )
+                _dsa_workspace_bytes(middle, dim, head_tile, total_kv, index_width)
                 <= _DSA_PACKED_WORKSPACE_BYTES
             ):
                 low = middle
@@ -243,29 +235,23 @@ def _rope_tables(
     device = torch.device("cuda", device_index)
     if cached is None:
         with torch.cuda.device(device):
-            pair_positions = torch.arange(
-                0, rope_dims, 2, device=device, dtype=torch.float32
-            )
+            pair_positions = torch.arange(0, rope_dims, 2, device=device, dtype=torch.float32)
             frequencies = 1.0 / (160_000.0 ** (pair_positions / rope_dims))
             correction_scale = 2 * math.log(160_000.0)
             low = math.floor(
                 rope_dims * math.log(65_536 / (32.0 * 2 * math.pi)) / correction_scale
             )
-            high = math.ceil(
-                rope_dims * math.log(65_536 / (1.0 * 2 * math.pi)) / correction_scale
-            )
+            high = math.ceil(rope_dims * math.log(65_536 / (1.0 * 2 * math.pi)) / correction_scale)
             low = max(low, 0)
             high = min(high, rope_dims - 1)
             if low == high:
                 high += 0.001
-            ramp = (
-                torch.arange(rope_dims // 2, device=device, dtype=torch.float32) - low
-            ) / (high - low)
+            ramp = (torch.arange(rope_dims // 2, device=device, dtype=torch.float32) - low) / (
+                high - low
+            )
             smooth = 1 - ramp.clamp(0, 1)
             frequencies = frequencies / 16.0 * (1 - smooth) + frequencies * smooth
-            positions = torch.arange(
-                sequence_length, device=device, dtype=torch.float32
-            )
+            positions = torch.arange(sequence_length, device=device, dtype=torch.float32)
             angles = torch.outer(positions, frequencies)
             cos, sin = angles.cos(), angles.sin()
             ready = torch.cuda.Event()
@@ -440,12 +426,8 @@ def _compressed_sparse_attention_forward(
         if device_index is None:
             device_index = torch.cuda.current_device()
         cos, sin = _rope_tables(device_index, sequence_length, rope_dims)
-        empty_kv = torch.empty(
-            batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype
-        )
-        gather = torch.empty(
-            batch, sequence_length, 1, device=Q.device, dtype=torch.int32
-        )
+        empty_kv = torch.empty(batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype)
+        gather = torch.empty(batch, sequence_length, 1, device=Q.device, dtype=torch.int32)
         combined_lse = (
             attention_sink.view(1, 1, heads)
             .expand(batch, sequence_length, heads)
@@ -460,9 +442,7 @@ def _compressed_sparse_attention_forward(
         device_index = torch.cuda.current_device()
     cos, sin = _rope_tables(device_index, sequence_length, rope_dims)
     selected_width = effective_topk + selected_window
-    combined_gather_length = (
-        math.ceil(selected_width / 128) * 128 if has_compressed else 0
-    )
+    combined_gather_length = math.ceil(selected_width / 128) * 128 if has_compressed else 0
     # The dual-source FA4 path gives local and compressed logits one online softmax,
     # but explicitly listing every local key makes its metadata O(B*S*W). Keep that
     # fast path only while the list is bounded; the split path below uses FA4's
@@ -476,9 +456,7 @@ def _compressed_sparse_attention_forward(
     )
     gather_window = selected_window if use_combined_attention else 0
     gather_width = effective_topk + gather_window
-    gather_length = (
-        math.ceil(gather_width / 128) * 128 if has_compressed else 0
-    )
+    gather_length = math.ceil(gather_width / 128) * 128 if has_compressed else 0
     gather = None
     if has_compressed:
         gather = torch.empty(
@@ -497,16 +475,9 @@ def _compressed_sparse_attention_forward(
     prefetched_local_query = None
     query_torch_stream = None
 
-
-    local_kv = torch.empty(
-        batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype
-    )
-    compressed_kv = torch.empty(
-        batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype
-    )
-    compressed_indices = torch.empty(
-        batch, 0, 1, index_dim, device=Q.device, dtype=Q.dtype
-    )
+    local_kv = torch.empty(batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype)
+    compressed_kv = torch.empty(batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype)
+    compressed_indices = torch.empty(batch, 0, 1, index_dim, device=Q.device, dtype=Q.dtype)
     if has_local and has_compressed and use_specialized_preprocess:
         local_kv, compressed_kv, compressed_indices = preprocess_shared_kv(
             KV,
@@ -533,9 +504,9 @@ def _compressed_sparse_attention_forward(
             local_kv = torch.empty(
                 batch, sequence_length, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype
             )
-            compile_local_norm(
-                dtype, batch, sequence_length, _HEAD_DIM, rope_dims, 0
-            )(KV, KV_norm_weight, cos, sin, local_kv)
+            compile_local_norm(dtype, batch, sequence_length, _HEAD_DIM, rope_dims, 0)(
+                KV, KV_norm_weight, cos, sin, local_kv
+            )
         if has_compressed:
             compressed_kv = torch.empty(
                 batch, num_blocks, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype
@@ -665,17 +636,12 @@ def _compressed_sparse_attention_forward(
                     )
                     batch_chunk = row_chunk // sequence_length
                     query_elements = (
-                        batch_chunk
-                        * sequence_length
-                        * _TENSOR_INDEX_PACKED_HEADS
-                        * index_dim
+                        batch_chunk * sequence_length * _TENSOR_INDEX_PACKED_HEADS * index_dim
                     )
                     weight_elements = (
                         0
                         if index_heads == _TENSOR_INDEX_PACKED_HEADS
-                        else batch_chunk
-                        * sequence_length
-                        * _TENSOR_INDEX_PACKED_HEADS
+                        else batch_chunk * sequence_length * _TENSOR_INDEX_PACKED_HEADS
                     )
                     workspace_elements = query_elements + weight_elements
                     assert output is not None
@@ -687,9 +653,7 @@ def _compressed_sparse_attention_forward(
                             device=Q.device,
                             dtype=Q.dtype,
                         )
-                    tensor_index_query = index_workspace[
-                        :query_elements
-                    ].view(
+                    tensor_index_query = index_workspace[:query_elements].view(
                         batch_chunk,
                         sequence_length,
                         _TENSOR_INDEX_PACKED_HEADS,
@@ -739,23 +703,17 @@ def _compressed_sparse_attention_forward(
                             index_dim,
                             rope_dims,
                         )(
-                            Q_I[
-                                batch_offset : batch_offset + active_batches
-                            ],
+                            Q_I[batch_offset : batch_offset + active_batches],
                             cos,
                             sin,
                             query_slab,
                             query_slab,
                         )
                         if index_heads == _TENSOR_INDEX_PACKED_HEADS:
-                            weight_slab = W_I[
-                                batch_offset : batch_offset + active_batches
-                            ]
+                            weight_slab = W_I[batch_offset : batch_offset + active_batches]
                         else:
                             assert tensor_index_weights is not None
-                            weight_slab = tensor_index_weights[
-                                :active_batches
-                            ]
+                            weight_slab = tensor_index_weights[:active_batches]
                             compile_pad_index_weights(
                                 dtype,
                                 active_batches,
@@ -763,10 +721,7 @@ def _compressed_sparse_attention_forward(
                                 index_heads,
                                 _TENSOR_INDEX_PACKED_HEADS,
                             )(
-                                W_I[
-                                    batch_offset : batch_offset
-                                    + active_batches
-                                ],
+                                W_I[batch_offset : batch_offset + active_batches],
                                 weight_slab,
                             )
                         score_slab = score_keys[:active_rows].view(
@@ -776,15 +731,12 @@ def _compressed_sparse_attention_forward(
                         )
                         exact_bf16_index_scores(
                             query_slab,
-                            compressed_indices[
-                                batch_offset : batch_offset + active_batches
-                            ],
+                            compressed_indices[batch_offset : batch_offset + active_batches],
                             weight_slab,
                             ratio=compression_rate,
                             qhead_per_kv_head=_TENSOR_INDEX_PACKED_HEADS,
                             out=score_slab,
-                            sm_scale=1.0
-                            / math.sqrt(index_dim * index_heads),
+                            sm_scale=1.0 / math.sqrt(index_dim * index_heads),
                         )
                         index_score_keys(
                             score_keys,
@@ -901,9 +853,7 @@ def _compressed_sparse_attention_forward(
             )(Q, cos, sin, query, local_query)
         if output is None:
             output = torch.empty_like(Q)
-        fuse_attention_epilogue = (
-            has_compressed and active_heads == 128 and not split_attention
-        )
+        fuse_attention_epilogue = has_compressed and active_heads == 128 and not split_attention
 
         if split_attention:
             assert gather is not None
@@ -973,9 +923,9 @@ def _compressed_sparse_attention_forward(
             del local_output, local_lse, compressed_output, compressed_lse
         else:
             if fuse_attention_epilogue:
-                selected_output = output[
-                    :, head_offset : head_offset + active_heads
-                ].permute(0, 2, 1, 3)
+                selected_output = output[:, head_offset : head_offset + active_heads].permute(
+                    0, 2, 1, 3
+                )
             else:
                 selected_output = torch.empty_like(query)
             store_selected_lse = _return_state or not fuse_attention_epilogue
@@ -1023,9 +973,9 @@ def _compressed_sparse_attention_forward(
             if _return_state:
                 assert combined_lse_state is not None
                 assert selected_lse is not None
-                combined_lse_state[
-                    :, :, head_offset : head_offset + active_heads
-                ].copy_(selected_lse[:, :, :active_heads])
+                combined_lse_state[:, :, head_offset : head_offset + active_heads].copy_(
+                    selected_lse[:, :, :active_heads]
+                )
             if not fuse_attention_epilogue:
                 assert selected_lse is not None
                 compile_merge(
@@ -1107,30 +1057,86 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I,
-        K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-        KV_norm_weight, compressed_indices_norm_weight,
-        compressed_kv_norm_weight, attention_sink,
-        compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv,
+        Q,
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        share_kv,
     ):
         forward_tensors = tuple(
             tensor.detach()
             for tensor in (
-                Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I,
-                K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-                KV_norm_weight, compressed_indices_norm_weight,
-                compressed_kv_norm_weight, attention_sink,
+                Q,
+                Q_I,
+                KV,
+                C_a,
+                C_b,
+                Z_a,
+                Z_b,
+                B_a,
+                B_b,
+                W_I,
+                K_Ia,
+                K_Ib,
+                Z_Ia,
+                Z_Ib,
+                B_Ia,
+                B_Ib,
+                KV_norm_weight,
+                compressed_indices_norm_weight,
+                compressed_kv_norm_weight,
+                attention_sink,
             )
         )
         output = _compressed_sparse_attention_forward(
             *forward_tensors,
-            compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv,
+            compression_rate,
+            num_topk_blocks,
+            sliding_window_size,
+            rope_dims,
+            share_kv,
         )
         ctx.save_for_backward(
-            Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I,
-            K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-            KV_norm_weight, compressed_indices_norm_weight,
-            compressed_kv_norm_weight, attention_sink,
+            Q,
+            Q_I,
+            KV,
+            C_a,
+            C_b,
+            Z_a,
+            Z_b,
+            B_a,
+            B_b,
+            W_I,
+            K_Ia,
+            K_Ib,
+            Z_Ia,
+            Z_Ib,
+            B_Ia,
+            B_Ib,
+            KV_norm_weight,
+            compressed_indices_norm_weight,
+            compressed_kv_norm_weight,
+            attention_sink,
         )
         ctx.compression_rate = compression_rate
         ctx.num_topk_blocks = num_topk_blocks
@@ -1142,10 +1148,26 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         (
-            Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I,
-            K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-            KV_norm_weight, compressed_indices_norm_weight,
-            compressed_kv_norm_weight, attention_sink,
+            Q,
+            Q_I,
+            KV,
+            C_a,
+            C_b,
+            Z_a,
+            Z_b,
+            B_a,
+            B_b,
+            W_I,
+            K_Ia,
+            K_Ib,
+            Z_Ia,
+            Z_Ib,
+            B_Ia,
+            B_Ib,
+            KV_norm_weight,
+            compressed_indices_norm_weight,
+            compressed_kv_norm_weight,
+            attention_sink,
         ) = ctx.saved_tensors
         dout = dout.contiguous()
         batch, heads, sequence, dim = Q.shape
@@ -1180,7 +1202,8 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
             index_width = math.ceil((topk + window) / 64) * 64
             total_kv = batch * (blocks + local_length)
             kv_packed = torch.empty(
-                total_kv, dim,
+                total_kv,
+                dim,
                 device=Q.device,
                 dtype=torch.bfloat16,
             )
@@ -1195,9 +1218,7 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                 )
             packed_local_source = local_kv
             if local_length == 0:
-                packed_local_source = torch.empty(
-                    batch, 1, 1, dim, device=Q.device, dtype=Q.dtype
-                )
+                packed_local_source = torch.empty(batch, 1, 1, dim, device=Q.device, dtype=Q.dtype)
             dcompressed_target = dcompressed
             if blocks == 0:
                 dcompressed_target = torch.empty(
@@ -1205,9 +1226,7 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                 )
             dlocal_target = dlocal
             if local_length == 0:
-                dlocal_target = torch.empty(
-                    batch, 1, 1, dim, device=Q.device, dtype=torch.float32
-                )
+                dlocal_target = torch.empty(batch, 1, 1, dim, device=Q.device, dtype=torch.float32)
 
             compile_pack_dsa_kv_sink(
                 dtype,
@@ -1225,18 +1244,10 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                 kv_packed,
                 sink_fp32,
             )
-            head_chunk, token_chunk = _dsa_tile_shape(
-                tokens, dim, heads, total_kv, index_width
-            )
-            indices = torch.empty(
-                token_chunk, index_width, device=Q.device, dtype=torch.int32
-            )
-            topk_lengths = torch.empty(
-                token_chunk, device=Q.device, dtype=torch.int32
-            )
-            d_sink_accumulator = torch.empty(
-                heads, device=Q.device, dtype=torch.float32
-            )
+            head_chunk, token_chunk = _dsa_tile_shape(tokens, dim, heads, total_kv, index_width)
+            indices = torch.empty(token_chunk, index_width, device=Q.device, dtype=torch.int32)
+            topk_lengths = torch.empty(token_chunk, device=Q.device, dtype=torch.int32)
+            d_sink_accumulator = torch.empty(heads, device=Q.device, dtype=torch.float32)
             d_sink_accumulator.zero_()
             pack_indices = compile_pack_dsa_indices(
                 batch,
@@ -1262,9 +1273,7 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                 )
                 for head_offset in range(0, heads, head_chunk):
                     packed_heads = min(head_chunk, heads - head_offset)
-                    selected_sink = sink_fp32[
-                        head_offset : head_offset + packed_heads
-                    ]
+                    selected_sink = sink_fp32[head_offset : head_offset + packed_heads]
                     q_packed = torch.empty(
                         packed_tokens,
                         packed_heads,
@@ -1291,9 +1300,18 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                         dim,
                         ctx.rope_dims,
                     )(
-                        Q, output, dout, combined_lse, cos, sin,
-                        q_packed, out_packed, dout_packed, lse_packed,
-                        Int32(head_offset), Int32(token_offset),
+                        Q,
+                        output,
+                        dout,
+                        combined_lse,
+                        cos,
+                        sin,
+                        q_packed,
+                        out_packed,
+                        dout_packed,
+                        lse_packed,
+                        Int32(head_offset),
+                        Int32(token_offset),
                     )
                     result = sparse_attention_backward_wrapper(
                         q_packed,
@@ -1319,18 +1337,22 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                         blocks,
                         local_length,
                     )(
-                        result["dq"], result["dkv"], cos, sin,
-                        dQ, dlocal_target, dcompressed_target,
-                        Int32(head_offset), Int32(token_offset),
+                        result["dq"],
+                        result["dkv"],
+                        cos,
+                        sin,
+                        dQ,
+                        dlocal_target,
+                        dcompressed_target,
+                        Int32(head_offset),
+                        Int32(token_offset),
                     )
-                    d_sink_accumulator[
-                        head_offset : head_offset + packed_heads
-                    ].add_(result["d_sink"])
+                    d_sink_accumulator[head_offset : head_offset + packed_heads].add_(
+                        result["d_sink"]
+                    )
                     del q_packed, out_packed, dout_packed, lse_packed, result
             d_attention_sink = torch.empty_like(attention_sink)
-            compile_cast_gradient(dtype, heads)(
-                d_sink_accumulator, d_attention_sink
-            )
+            compile_cast_gradient(dtype, heads)(d_sink_accumulator, d_attention_sink)
             del (
                 kv_packed,
                 indices,
@@ -1352,9 +1374,7 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
                 KV, KV_norm_weight, cos, sin, dlocal, dKV, dKV_weight_fp32
             )
             dKV_weight = torch.empty_like(KV_norm_weight)
-            compile_cast_gradient(dtype, KV_norm_weight.numel())(
-                dKV_weight_fp32, dKV_weight
-            )
+            compile_cast_gradient(dtype, KV_norm_weight.numel())(dKV_weight_fp32, dKV_weight)
         else:
             dKV = torch.zeros_like(KV)
             dKV_weight = torch.zeros_like(KV_norm_weight)
@@ -1372,19 +1392,29 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
             compile_compression_backward(
                 dtype, batch, sequence, dim, ctx.compression_rate, ctx.rope_dims
             )(
-                C_a, C_b, Z_a, Z_b, B_a, B_b, compressed_kv_norm_weight,
-                cos, sin, dcompressed, dC_a, dC_b, dZ_a, dZ_b,
-                dB_a_fp32, dB_b_fp32, dcompressed_weight_fp32,
+                C_a,
+                C_b,
+                Z_a,
+                Z_b,
+                B_a,
+                B_b,
+                compressed_kv_norm_weight,
+                cos,
+                sin,
+                dcompressed,
+                dC_a,
+                dC_b,
+                dZ_a,
+                dZ_b,
+                dB_a_fp32,
+                dB_b_fp32,
+                dcompressed_weight_fp32,
             )
             dB_a = torch.empty_like(B_a)
             dB_b = torch.empty_like(B_b)
             dcompressed_weight = torch.empty_like(compressed_kv_norm_weight)
-            compile_cast_gradient(dtype, B_a.numel())(
-                dB_a_fp32.view(-1), dB_a.view(-1)
-            )
-            compile_cast_gradient(dtype, B_b.numel())(
-                dB_b_fp32.view(-1), dB_b.view(-1)
-            )
+            compile_cast_gradient(dtype, B_a.numel())(dB_a_fp32.view(-1), dB_a.view(-1))
+            compile_cast_gradient(dtype, B_b.numel())(dB_b_fp32.view(-1), dB_b.view(-1))
             compile_cast_gradient(dtype, compressed_kv_norm_weight.numel())(
                 dcompressed_weight_fp32, dcompressed_weight
             )
@@ -1398,10 +1428,31 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
             dcompressed_weight = torch.zeros_like(compressed_kv_norm_weight)
 
         grads = (
-            dQ, None, dKV, dC_a, dC_b, dZ_a, dZ_b, dB_a, dB_b, None,
-            None, None, None, None, None, None,
-            dKV_weight, None, dcompressed_weight, d_attention_sink,
-            None, None, None, None, None,
+            dQ,
+            None,
+            dKV,
+            dC_a,
+            dC_b,
+            dZ_a,
+            dZ_b,
+            dB_a,
+            dB_b,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dKV_weight,
+            None,
+            dcompressed_weight,
+            d_attention_sink,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         return tuple(g if need else None for g, need in zip(grads, ctx.needs_input_grad))
 
@@ -1758,11 +1809,31 @@ def compressed_sparse_attention(
     _return_state: bool = False,
 ):
     args = (
-        Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b, W_I,
-        K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-        KV_norm_weight, compressed_indices_norm_weight,
-        compressed_kv_norm_weight, attention_sink,
-        compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv,
+        Q,
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        share_kv,
     )
     if _return_state:
         with torch.cuda.device(Q.device):

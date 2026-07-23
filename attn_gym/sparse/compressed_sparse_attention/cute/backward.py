@@ -159,9 +159,9 @@ class AttentionBackward:
                 partial = Float32(0.0)
                 if key >= 0:
                     for j in cutlass.range_constexpr(self.values_per_thread):
-                        partial += q_values[j] * local_kv[
-                            batch_idx, key, 0, d_base + j
-                        ].to(Float32)
+                        partial += q_values[j] * local_kv[batch_idx, key, 0, d_base + j].to(
+                            Float32
+                        )
                 dot = row_reduce(
                     partial,
                     cute.ReductionOp.ADD,
@@ -179,9 +179,9 @@ class AttentionBackward:
                 partial = Float32(0.0)
                 if block >= 0:
                     for j in cutlass.range_constexpr(self.values_per_thread):
-                        partial += q_values[j] * compressed_kv[
-                            batch_idx, block, 0, d_base + j
-                        ].to(Float32)
+                        partial += q_values[j] * compressed_kv[batch_idx, block, 0, d_base + j].to(
+                            Float32
+                        )
                 dot = row_reduce(
                     partial,
                     cute.ReductionOp.ADD,
@@ -205,9 +205,9 @@ class AttentionBackward:
                 partial = Float32(0.0)
                 if block >= 0:
                     for j in cutlass.range_constexpr(self.values_per_thread):
-                        partial += q_values[j] * compressed_kv[
-                            batch_idx, block, 0, d_base + j
-                        ].to(Float32)
+                        partial += q_values[j] * compressed_kv[batch_idx, block, 0, d_base + j].to(
+                            Float32
+                        )
                 dot = row_reduce(
                     partial,
                     cute.ReductionOp.ADD,
@@ -226,9 +226,9 @@ class AttentionBackward:
                 partial = Float32(0.0)
                 if key >= 0:
                     for j in cutlass.range_constexpr(self.values_per_thread):
-                        partial += q_values[j] * local_kv[
-                            batch_idx, key, 0, d_base + j
-                        ].to(Float32)
+                        partial += q_values[j] * local_kv[batch_idx, key, 0, d_base + j].to(
+                            Float32
+                        )
                 dot = row_reduce(
                     partial,
                     cute.ReductionOp.ADD,
@@ -257,8 +257,12 @@ class AttentionBackward:
                         value = compressed_kv[batch_idx, block, 0, d_base + j].to(Float32)
                         qk_partial += q_values[j] * value
                         dp_partial += do_values[j] * value
-                qk = row_reduce(qk_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
-                dp = row_reduce(dp_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
+                qk = row_reduce(
+                    qk_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+                )
+                dp = row_reduce(
+                    dp_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+                )
                 if tid == 0 and block >= 0:
                     score = (qk.to(self.dtype).to(Float32) * scale).to(self.dtype).to(Float32)
                     delta = (score - scalars[0]).to(self.dtype).to(Float32)
@@ -276,8 +280,12 @@ class AttentionBackward:
                         value = local_kv[batch_idx, key, 0, d_base + j].to(Float32)
                         qk_partial += q_values[j] * value
                         dp_partial += do_values[j] * value
-                qk = row_reduce(qk_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
-                dp = row_reduce(dp_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
+                qk = row_reduce(
+                    qk_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+                )
+                dp = row_reduce(
+                    dp_partial, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+                )
                 if tid == 0 and key >= 0:
                     score = (qk.to(self.dtype).to(Float32) * scale).to(self.dtype).to(Float32)
                     delta = (score - scalars[0]).to(self.dtype).to(Float32)
@@ -508,8 +516,12 @@ class LocalNormBackward:
             cute.make_layout((1, (self.num_threads // cute.arch.WARP_SIZE, 1))),
             byte_alignment=16,
         )
-        sum_sq = row_reduce(local_sq, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
-        dot = row_reduce(local_dot, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
+        sum_sq = row_reduce(
+            local_sq, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+        )
+        dot = row_reduce(
+            local_dot, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+        )
         rstd = cute.math.rsqrt(sum_sq / self.dim + _RMS_EPS, fastmath=True)
         correction = dot * rstd * rstd / self.dim
         for j in cutlass.range_constexpr(self.values_per_thread):
@@ -536,12 +548,44 @@ class CompressionBackward:
 
     @cute.jit
     def __call__(
-        self, ca, cb, za, zb, ba, bb, weight, cos, sin, dy,
-        dca, dcb, dza, dzb, dba, dbb, dweight, stream: cuda.CUstream,
+        self,
+        ca,
+        cb,
+        za,
+        zb,
+        ba,
+        bb,
+        weight,
+        cos,
+        sin,
+        dy,
+        dca,
+        dcb,
+        dza,
+        dzb,
+        dba,
+        dbb,
+        dweight,
+        stream: cuda.CUstream,
     ):
         self.kernel(
-            ca, cb, za, zb, ba, bb, weight, cos, sin, dy,
-            dca, dcb, dza, dzb, dba, dbb, dweight,
+            ca,
+            cb,
+            za,
+            zb,
+            ba,
+            bb,
+            weight,
+            cos,
+            sin,
+            dy,
+            dca,
+            dcb,
+            dza,
+            dzb,
+            dba,
+            dbb,
+            dweight,
         ).launch(
             grid=[self.batch * self.blocks, 1, 1],
             block=[self.num_threads, 1, 1],
@@ -550,8 +594,24 @@ class CompressionBackward:
 
     @cute.kernel
     def kernel(
-        self, ca, cb, za, zb, ba, bb, weight, cos, sin, dy,
-        dca, dcb, dza, dzb, dba, dbb, dweight,
+        self,
+        ca,
+        cb,
+        za,
+        zb,
+        ba,
+        bb,
+        weight,
+        cos,
+        sin,
+        dy,
+        dca,
+        dcb,
+        dza,
+        dzb,
+        dba,
+        dbb,
+        dweight,
     ):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -570,39 +630,69 @@ class CompressionBackward:
                 pa = block * self.rate + r
                 if pa < self.sequence:
                     maximum = cute.arch.fmax(
-                        maximum, (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32)
+                        maximum,
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32),
                     )
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
                         maximum = cute.arch.fmax(
-                            maximum, (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32)
+                            maximum,
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32),
                         )
             denom = Float32(0.0)
             for r in cutlass.range(self.rate, unroll=1):
                 pa = block * self.rate + r
                 if pa < self.sequence:
-                    la = (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32)
+                    la = (
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     denom += cute.math.exp(la - maximum, fastmath=False)
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
-                        lb = (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32)
+                        lb = (
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         denom += cute.math.exp(lb - maximum, fastmath=False)
             value = Float32(0.0)
             for r in cutlass.range(self.rate, unroll=1):
                 pa = block * self.rate + r
                 va = Float32(0.0)
                 if pa < self.sequence:
-                    la = (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32)
-                    p = (cute.math.exp(la - maximum, fastmath=False) / denom).to(self.dtype).to(Float32)
+                    la = (
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
+                    p = (
+                        (cute.math.exp(la - maximum, fastmath=False) / denom)
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     va = (ca[b, 0, pa, d].to(Float32) * p).to(self.dtype).to(Float32)
                 vb = Float32(0.0)
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
-                        lb = (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32)
-                        p = (cute.math.exp(lb - maximum, fastmath=False) / denom).to(self.dtype).to(Float32)
+                        lb = (
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
+                        p = (
+                            (cute.math.exp(lb - maximum, fastmath=False) / denom)
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         vb = (cb[b, 0, pb, d].to(Float32) * p).to(self.dtype).to(Float32)
                 value += (va + vb).to(self.dtype).to(Float32)
             value = value.to(self.dtype).to(Float32)
@@ -633,8 +723,12 @@ class CompressionBackward:
             cute.make_layout((1, (self.num_threads // cute.arch.WARP_SIZE, 1))),
             byte_alignment=16,
         )
-        sum_sq = row_reduce(local_sq, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
-        dot = row_reduce(local_dot, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0)
+        sum_sq = row_reduce(
+            local_sq, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+        )
+        dot = row_reduce(
+            local_dot, cute.ReductionOp.ADD, self.num_threads, reduction, init_val=0.0
+        )
         rstd = cute.math.rsqrt(sum_sq / self.dim + _RMS_EPS, fastmath=True)
         correction = dot * rstd * rstd / self.dim
 
@@ -646,27 +740,53 @@ class CompressionBackward:
             for r in cutlass.range(self.rate, unroll=1):
                 pa = block * self.rate + r
                 if pa < self.sequence:
-                    maximum = cute.arch.fmax(maximum, (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32))
+                    maximum = cute.arch.fmax(
+                        maximum,
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32),
+                    )
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
-                        maximum = cute.arch.fmax(maximum, (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32))
+                        maximum = cute.arch.fmax(
+                            maximum,
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32),
+                        )
             denom = Float32(0.0)
             for r in cutlass.range(self.rate, unroll=1):
                 pa = block * self.rate + r
                 if pa < self.sequence:
-                    la = (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32)
+                    la = (
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     denom += cute.math.exp(la - maximum, fastmath=False)
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
-                        lb = (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32)
+                        lb = (
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         denom += cute.math.exp(lb - maximum, fastmath=False)
             for r in cutlass.range(self.rate, unroll=1):
                 pa = block * self.rate + r
                 if pa < self.sequence:
-                    la = (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32)).to(self.dtype).to(Float32)
-                    p = (cute.math.exp(la - maximum, fastmath=False) / denom).to(self.dtype).to(Float32)
+                    la = (
+                        (za[b, 0, pa, d].to(Float32) + ba[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
+                    p = (
+                        (cute.math.exp(la - maximum, fastmath=False) / denom)
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     cv = ca[b, 0, pa, d].to(Float32)
                     dca[b, 0, pa, d] = (p * draw).to(self.dtype)
                     gz = p * (cv - raw[j]) * draw
@@ -675,8 +795,16 @@ class CompressionBackward:
                 if block > 0:
                     pb = (block - 1) * self.rate + r
                     if pb < self.sequence:
-                        lb = (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32)).to(self.dtype).to(Float32)
-                        p = (cute.math.exp(lb - maximum, fastmath=False) / denom).to(self.dtype).to(Float32)
+                        lb = (
+                            (zb[b, 0, pb, d].to(Float32) + bb[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
+                        p = (
+                            (cute.math.exp(lb - maximum, fastmath=False) / denom)
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         cv = cb[b, 0, pb, d].to(Float32)
                         dcb[b, 0, pb, d] = (p * draw).to(self.dtype)
                         gz = p * (cv - raw[j]) * draw
@@ -691,7 +819,9 @@ class CastGradient:
 
     @cute.jit
     def __call__(self, source, dest, stream: cuda.CUstream):
-        self.kernel(source, dest).launch(grid=[cute.ceil_div(self.length, 256), 1, 1], block=[256, 1, 1], stream=stream)
+        self.kernel(source, dest).launch(
+            grid=[cute.ceil_div(self.length, 256), 1, 1], block=[256, 1, 1], stream=stream
+        )
 
     @cute.kernel
     def kernel(self, source, dest):
@@ -723,7 +853,9 @@ class SinkReduce:
                 value += rows[b, head, pos]
         smem = cutlass.utils.SmemAllocator()
         reduction = smem.allocate_tensor(
-            Float32, cute.make_layout((1, (4, 1))), byte_alignment=16,
+            Float32,
+            cute.make_layout((1, (4, 1))),
+            byte_alignment=16,
         )
         total = row_reduce(value, cute.ReductionOp.ADD, 128, reduction, init_val=0.0)
         if tid == 0:
@@ -734,8 +866,15 @@ class PrepareDsaBackward:
     """Rotate/transpose Q, O, and dO while packing the combined attention LSE."""
 
     def __init__(
-        self, dsa_dtype, batch, total_heads, packed_heads,
-        sequence, packed_tokens, dim, rope,
+        self,
+        dsa_dtype,
+        batch,
+        total_heads,
+        packed_heads,
+        sequence,
+        packed_tokens,
+        dim,
+        rope,
     ):
         self.dtype = dsa_dtype
         self.batch = batch
@@ -750,13 +889,34 @@ class PrepareDsaBackward:
 
     @cute.jit
     def __call__(
-        self, q, out, dout, combined_lse, cos, sin,
-        q_packed, out_packed, dout_packed, lse,
-        head_offset: Int32, token_offset: Int32, stream: cuda.CUstream,
+        self,
+        q,
+        out,
+        dout,
+        combined_lse,
+        cos,
+        sin,
+        q_packed,
+        out_packed,
+        dout_packed,
+        lse,
+        head_offset: Int32,
+        token_offset: Int32,
+        stream: cuda.CUstream,
     ):
         self.kernel(
-            q, out, dout, combined_lse, cos, sin,
-            q_packed, out_packed, dout_packed, lse, head_offset, token_offset,
+            q,
+            out,
+            dout,
+            combined_lse,
+            cos,
+            sin,
+            q_packed,
+            out_packed,
+            dout_packed,
+            lse,
+            head_offset,
+            token_offset,
         ).launch(
             grid=[self.packed_tokens * self.packed_heads, 1, 1],
             block=[self.num_threads, 1, 1],
@@ -765,9 +925,19 @@ class PrepareDsaBackward:
 
     @cute.kernel
     def kernel(
-        self, q, out, dout, combined_lse, cos, sin,
-        q_packed, out_packed, dout_packed, lse,
-        head_offset: Int32, token_offset: Int32,
+        self,
+        q,
+        out,
+        dout,
+        combined_lse,
+        cos,
+        sin,
+        q_packed,
+        out_packed,
+        dout_packed,
+        lse,
+        head_offset: Int32,
+        token_offset: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -817,14 +987,23 @@ class PackDsaKvSink:
 
     @cute.jit
     def __call__(
-        self, compressed, local, sink, kv, sink_fp32, stream: cuda.CUstream,
+        self,
+        compressed,
+        local,
+        sink,
+        kv,
+        sink_fp32,
+        stream: cuda.CUstream,
     ):
         self.kv_kernel(compressed, local, kv).launch(
             grid=[cute.ceil_div(self.batch * self.kv_per_batch * self.dim, 256), 1, 1],
-            block=[256, 1, 1], stream=stream,
+            block=[256, 1, 1],
+            stream=stream,
         )
         self.sink_kernel(sink, sink_fp32).launch(
-            grid=[cute.ceil_div(cute.size(sink), 256), 1, 1], block=[256, 1, 1], stream=stream,
+            grid=[cute.ceil_div(cute.size(sink), 256), 1, 1],
+            block=[256, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
@@ -855,9 +1034,7 @@ class PackDsaKvSink:
 class PackDsaIndices:
     """Generate one bounded token slab of sparse DSA indices."""
 
-    def __init__(
-        self, batch, sequence, blocks, rate, topk, window, width, token_capacity
-    ):
+    def __init__(self, batch, sequence, blocks, rate, topk, window, width, token_capacity):
         self.batch = batch
         self.sequence = sequence
         self.blocks = blocks
@@ -879,18 +1056,14 @@ class PackDsaIndices:
         active_tokens: Int32,
         stream: cuda.CUstream,
     ):
-        self.index_kernel(
-            gather, indices, lengths, token_offset, active_tokens
-        ).launch(
+        self.index_kernel(gather, indices, lengths, token_offset, active_tokens).launch(
             grid=[cute.ceil_div(active_tokens * self.width, 256), 1, 1],
             block=[256, 1, 1],
             stream=stream,
         )
 
     @cute.kernel
-    def index_kernel(
-        self, gather, indices, lengths, token_offset: Int32, active_tokens: Int32
-    ):
+    def index_kernel(self, gather, indices, lengths, token_offset: Int32, active_tokens: Int32):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         linear = bid * 256 + tid
@@ -922,8 +1095,17 @@ class PackDsaIndices:
 
 class UnpackDsaGradients:
     def __init__(
-        self, output_dtype, batch, total_heads, packed_heads,
-        sequence, packed_tokens, dim, rope, blocks, local_length,
+        self,
+        output_dtype,
+        batch,
+        total_heads,
+        packed_heads,
+        sequence,
+        packed_tokens,
+        dim,
+        rope,
+        blocks,
+        local_length,
     ):
         self.dtype = output_dtype
         self.batch = batch
@@ -939,23 +1121,31 @@ class UnpackDsaGradients:
 
     @cute.jit
     def __call__(
-        self, dq_packed, dkv, cos, sin, dq, dlocal, dcompressed,
-        head_offset: Int32, token_offset: Int32, stream: cuda.CUstream,
+        self,
+        dq_packed,
+        dkv,
+        cos,
+        sin,
+        dq,
+        dlocal,
+        dcompressed,
+        head_offset: Int32,
+        token_offset: Int32,
+        stream: cuda.CUstream,
     ):
-        self.dq_kernel(
-            dq_packed, cos, sin, dq, head_offset, token_offset
-        ).launch(
-            grid=[self.packed_tokens * self.packed_heads, 1, 1], block=[128, 1, 1], stream=stream,
+        self.dq_kernel(dq_packed, cos, sin, dq, head_offset, token_offset).launch(
+            grid=[self.packed_tokens * self.packed_heads, 1, 1],
+            block=[128, 1, 1],
+            stream=stream,
         )
         self.dkv_kernel(dkv, dlocal, dcompressed).launch(
             grid=[cute.ceil_div(self.batch * self.kv_per_batch * self.dim, 256), 1, 1],
-            block=[256, 1, 1], stream=stream,
+            block=[256, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
-    def dq_kernel(
-        self, source, cos, sin, dest, head_offset: Int32, token_offset: Int32
-    ):
+    def dq_kernel(self, source, cos, sin, dest, head_offset: Int32, token_offset: Int32):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         packed_head = row % self.packed_heads
@@ -1000,11 +1190,15 @@ class UnpackDsaGradients:
 def compile_local_norm_backward(dtype, batch, sequence, dim, rope):
     return cute.compile(
         LocalNormBackward(dtype, batch, sequence, dim, rope),
-        _fake(dtype, (batch, 1, sequence, dim)), _fake(dtype, (dim,)),
-        _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
+        _fake(dtype, (batch, 1, sequence, dim)),
+        _fake(dtype, (dim,)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
         _fake(Float32, (batch, sequence, 1, dim)),
-        _fake(dtype, (batch, 1, sequence, dim)), _fake(Float32, (dim,)),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        _fake(dtype, (batch, 1, sequence, dim)),
+        _fake(Float32, (dim,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1014,20 +1208,29 @@ def compile_compression_backward(dtype, batch, sequence, dim, rate, rope):
     return cute.compile(
         CompressionBackward(dtype, batch, sequence, dim, rate, rope),
         *[_fake(dtype, (batch, 1, sequence, dim)) for _ in range(4)],
-        _fake(dtype, (rate, dim)), _fake(dtype, (rate, dim)), _fake(dtype, (dim,)),
-        _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
+        _fake(dtype, (rate, dim)),
+        _fake(dtype, (rate, dim)),
+        _fake(dtype, (dim,)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
         _fake(Float32, (batch, blocks, 1, dim)),
         *[_fake(dtype, (batch, 1, sequence, dim)) for _ in range(4)],
-        _fake(Float32, (rate, dim)), _fake(Float32, (rate, dim)), _fake(Float32, (dim,)),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        _fake(Float32, (rate, dim)),
+        _fake(Float32, (rate, dim)),
+        _fake(Float32, (dim,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
 @lru_cache
 def compile_cast_gradient(dtype, length):
     return cute.compile(
-        CastGradient(dtype, length), _fake(Float32, (length,)), _fake(dtype, (length,)),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        CastGradient(dtype, length),
+        _fake(Float32, (length,)),
+        _fake(dtype, (length,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1035,30 +1238,48 @@ def compile_cast_gradient(dtype, length):
 def compile_sink_reduce(dtype, batch, heads, sequence):
     return cute.compile(
         SinkReduce(dtype, batch, heads, sequence),
-        _fake(Float32, (batch, heads, sequence)), _fake(dtype, (heads,)),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        _fake(Float32, (batch, heads, sequence)),
+        _fake(dtype, (heads,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
 @lru_cache
 def compile_prepare_dsa_backward(
-    input_dtype, dsa_dtype, batch, total_heads, packed_heads,
-    sequence, packed_tokens, dim, rope,
+    input_dtype,
+    dsa_dtype,
+    batch,
+    total_heads,
+    packed_heads,
+    sequence,
+    packed_tokens,
+    dim,
+    rope,
 ):
     return cute.compile(
         PrepareDsaBackward(
-            dsa_dtype, batch, total_heads, packed_heads,
-            sequence, packed_tokens, dim, rope,
+            dsa_dtype,
+            batch,
+            total_heads,
+            packed_heads,
+            sequence,
+            packed_tokens,
+            dim,
+            rope,
         ),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(input_dtype, (batch, total_heads, sequence, dim)),
         _fake(Float32, (batch, sequence, total_heads)),
-        _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
         *[_fake(dsa_dtype, (packed_tokens, packed_heads, dim)) for _ in range(3)],
         _fake(Float32, (packed_tokens, packed_heads)),
-        Int32(0), Int32(0),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        Int32(0),
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1073,7 +1294,8 @@ def compile_pack_dsa_kv_sink(
         _fake(input_dtype, (heads,)),
         _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
         _fake(Float32, (heads,)),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1082,9 +1304,7 @@ def compile_pack_dsa_indices(
     batch, sequence, blocks, rate, topk, window, width, gather_width, token_capacity
 ):
     return cute.compile(
-        PackDsaIndices(
-            batch, sequence, blocks, rate, topk, window, width, token_capacity
-        ),
+        PackDsaIndices(batch, sequence, blocks, rate, topk, window, width, token_capacity),
         _fake(Int32, (batch, sequence, gather_width)),
         _fake(Int32, (token_capacity, width)),
         _fake(Int32, (token_capacity,)),
@@ -1097,30 +1317,54 @@ def compile_pack_dsa_indices(
 
 @lru_cache
 def compile_unpack_dsa_gradients(
-    output_dtype, dsa_dtype, batch, total_heads, packed_heads,
-    sequence, packed_tokens, dim, rope, blocks, local_length,
+    output_dtype,
+    dsa_dtype,
+    batch,
+    total_heads,
+    packed_heads,
+    sequence,
+    packed_tokens,
+    dim,
+    rope,
+    blocks,
+    local_length,
 ):
     return cute.compile(
         UnpackDsaGradients(
-            output_dtype, batch, total_heads, packed_heads,
-            sequence, packed_tokens, dim, rope, blocks, local_length,
+            output_dtype,
+            batch,
+            total_heads,
+            packed_heads,
+            sequence,
+            packed_tokens,
+            dim,
+            rope,
+            blocks,
+            local_length,
         ),
         _fake(dsa_dtype, (packed_tokens, packed_heads, dim)),
         _fake(dsa_dtype, (batch * (blocks + local_length), dim)),
-        _fake(Float32, (sequence, rope // 2)), _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
+        _fake(Float32, (sequence, rope // 2)),
         _fake(output_dtype, (batch, total_heads, sequence, dim)),
         _fake(Float32, (batch, max(local_length, 1), 1, dim)),
         _fake(Float32, (batch, max(blocks, 1), 1, dim)),
-        Int32(0), Int32(0),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi",
+        Int32(0),
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
 __all__ = [
-    "compile_attention_backward", "compile_local_norm_backward",
-    "compile_compression_backward", "compile_cast_gradient", "cute_dtype",
+    "compile_attention_backward",
+    "compile_local_norm_backward",
+    "compile_compression_backward",
+    "compile_cast_gradient",
+    "cute_dtype",
     "compile_sink_reduce",
-    "compile_prepare_dsa_backward", "compile_pack_dsa_kv_sink",
+    "compile_prepare_dsa_backward",
+    "compile_pack_dsa_kv_sink",
     "compile_pack_dsa_indices",
     "compile_unpack_dsa_gradients",
 ]

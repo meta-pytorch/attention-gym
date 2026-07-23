@@ -123,8 +123,7 @@ def _validate_inputs(
         ):
             expected_heads = "1 or index_heads" if share_kv else "index_heads"
             raise ValueError(
-                f"{name} must have shape "
-                f"[batch, {expected_heads}, sequence, index_dim]."
+                f"{name} must have shape [batch, {expected_heads}, sequence, index_dim]."
             )
 
     expected_shapes = {
@@ -265,7 +264,7 @@ def compressed_sparse_attention(
     mode: Mode = "auto",
     backend: Backend = "eager",
 ) -> torch.Tensor:
-    '''
+    """
     Naming of args uses convention from Deepseek v4 paper
 
     Shape notation: B=batch size, H=attention heads, H_I=indexer heads, S=sequence length,
@@ -302,18 +301,19 @@ def compressed_sparse_attention(
     mode: Currently only auto/chunked are supported (implementations are prefill only as of now)
     backend: One of eager, triton, or cute. CuTe requires SM100, CUDA 13.3, shared KV,
         D=512, and bfloat16 inputs.
-    '''
+    """
     if backend not in ("eager", "triton", "cute"):
         raise ValueError(
             f"Unsupported compressed sparse attention backend {backend!r}; "
             "expected 'eager', 'triton', or 'cute'."
         )
     if mode not in ("auto", "chunked", "recurrent"):
-        raise ValueError( f"Unsupported compressed sparse attention mode {mode!r}; "
+        raise ValueError(
+            f"Unsupported compressed sparse attention mode {mode!r}; "
             "expected 'auto', 'chunked', or 'recurrent'."
         )
     if mode == "recurrent":
-        raise ValueError(f"Recurrent backed is currently unsupported")
+        raise ValueError("Recurrent backed is currently unsupported")
 
     tensors = (
         ("Q", Q),

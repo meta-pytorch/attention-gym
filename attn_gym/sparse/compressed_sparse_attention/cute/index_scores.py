@@ -73,11 +73,7 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
         weights_per_vector = 4
         sW_f32_ptr = cute.make_ptr(
             Float32,
-            (
-                sW.iterator
-                + weight_base
-                + q_stage_idx * self.m_block_size
-            ).llvm_ptr,
+            (sW.iterator + weight_base + q_stage_idx * self.m_block_size).llvm_ptr,
             cute.AddressSpace.smem,
             assumed_align=16,
         )
@@ -121,9 +117,7 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
                     )
             cute.copy(thr_tmem_load, tStS_t2r, tSrS)
             cute.arch.fence_view_async_tmem_load()
-            cute.arch.mbarrier_arrive(
-                S_mbar_ptr + self.q_stage + q_stage_idx
-            )
+            cute.arch.mbarrier_arrive(S_mbar_ptr + self.q_stage + q_stage_idx)
 
             # The reference rounds each per-head QK dot, scale, and weighted
             # contribution to BF16. Transform the TMEM fragment in place so the
@@ -135,44 +129,31 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
                     cute.autovec_copy(
                         rW_vectors[
                             None,
-                            query
-                            * (qhpkv // 2 // weights_per_vector)
-                            + head_vector,
+                            query * (qhpkv // 2 // weights_per_vector) + head_vector,
                         ],
                         rW_buffer_f32,
                     )
 
                     for item in cutlass.range_constexpr(weights_per_vector):
                         head0 = (head_vector * weights_per_vector + item) * 2
-                        head1 = head0 + 1
                         index0 = query * qhpkv + head0
                         index1 = index0 + 1
 
                         value0 = tSrS[index0].to(self.q_dtype).to(Float32)
-                        value0 = (
-                            value0
-                            if value0 > Float32(0.0)
-                            else Float32(0.0)
-                        )
-                        value0 = (
-                            value0 * Float32(sm_scale)
-                        ).to(self.q_dtype).to(Float32)
+                        value0 = value0 if value0 > Float32(0.0) else Float32(0.0)
+                        value0 = (value0 * Float32(sm_scale)).to(self.q_dtype).to(Float32)
                         tSrS[index0] = (
-                            value0 * rW_buffer[2 * item].to(Float32)
-                        ).to(self.w_dtype).to(Float32)
+                            (value0 * rW_buffer[2 * item].to(Float32)).to(self.w_dtype).to(Float32)
+                        )
 
                         value1 = tSrS[index1].to(self.q_dtype).to(Float32)
-                        value1 = (
-                            value1
-                            if value1 > Float32(0.0)
-                            else Float32(0.0)
-                        )
-                        value1 = (
-                            value1 * Float32(sm_scale)
-                        ).to(self.q_dtype).to(Float32)
+                        value1 = value1 if value1 > Float32(0.0) else Float32(0.0)
+                        value1 = (value1 * Float32(sm_scale)).to(self.q_dtype).to(Float32)
                         tSrS[index1] = (
-                            value1 * rW_buffer[2 * item + 1].to(Float32)
-                        ).to(self.w_dtype).to(Float32)
+                            (value1 * rW_buffer[2 * item + 1].to(Float32))
+                            .to(self.w_dtype)
+                            .to(Float32)
+                        )
 
             scores = cute.make_rmem_tensor(
                 (self.q_tokens_per_tile,),
@@ -188,18 +169,13 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
 
             if iter_idx > 0:
                 cute.arch.mbarrier_wait(
-                    Score_store_mbar_ptr
-                    + self.q_stage
-                    + q_stage_idx,
+                    Score_store_mbar_ptr + self.q_stage + q_stage_idx,
                     score_empty_phase,
                 )
                 score_empty_phase = score_empty_phase ^ 1
 
             kv_offset = tScS[0][0]
-            query_base = (
-                (self.q_stage * m_block + q_stage_idx)
-                * self.q_tokens_per_tile
-            )
+            query_base = (self.q_stage * m_block + q_stage_idx) * self.q_tokens_per_tile
             if iter_idx < local_count:
                 kv_token = kv_offset + n_block * self.n_block_size
                 for query in cutlass.range(
@@ -208,13 +184,8 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
                 ):
                     query_token = query_base + query
                     value = -Float32.inf
-                    if (
-                        query_token < seqlen_q
-                        and kv_token < seqlen_k
-                    ):
-                        column_limit = (
-                            q_global_start + query_token + 1
-                        ) // ratio
+                    if query_token < seqlen_q and kv_token < seqlen_k:
+                        column_limit = (q_global_start + query_token + 1) // ratio
                         if kv_token < column_limit:
                             value = scores[query]
                     scores[query] = value
@@ -239,9 +210,7 @@ class ExactBf16IndexerForwardSm100(IndexerForwardSm100):
 
         if num_n_blocks > 0:
             cute.arch.mbarrier_wait(
-                Score_store_mbar_ptr
-                + self.q_stage
-                + q_stage_idx,
+                Score_store_mbar_ptr + self.q_stage + q_stage_idx,
                 score_empty_phase,
             )
             score_empty_phase = score_empty_phase ^ 1
@@ -274,11 +243,7 @@ def exact_bf16_index_scores(
 
     batch, sequence, query_heads, head_dim = q.shape
     key_batch, num_blocks, key_heads, key_dim = k.shape
-    if (
-        key_batch != batch
-        or key_dim != head_dim
-        or query_heads != qhead_per_kv_head * key_heads
-    ):
+    if key_batch != batch or key_dim != head_dim or query_heads != qhead_per_kv_head * key_heads:
         raise ValueError("Incompatible tensor-core index-score shapes.")
     if weights.shape != (batch, sequence, query_heads):
         raise ValueError("Incompatible tensor-core index-weight shape.")

@@ -12,13 +12,11 @@ pytest.importorskip("flash_attn.cute.interface")
 
 cute_backend = importlib.import_module("attn_gym.sparse.compressed_sparse_attention.cute")
 
-from attn_gym.sparse.compressed_sparse_attention.cute import (
-    _DSA_PACKED_WORKSPACE_BYTES,
-    _dsa_head_chunk,
-    _dsa_tile_shape,
-    _dsa_workspace_bytes,
-    _require_sm100,
-)
+_DSA_PACKED_WORKSPACE_BYTES = cute_backend._DSA_PACKED_WORKSPACE_BYTES
+_dsa_head_chunk = cute_backend._dsa_head_chunk
+_dsa_tile_shape = cute_backend._dsa_tile_shape
+_dsa_workspace_bytes = cute_backend._dsa_workspace_bytes
+_require_sm100 = cute_backend._require_sm100
 
 
 MAX_ABS_ERROR = 3e-2
@@ -162,10 +160,7 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor | int | bool, ..
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     def randn(*shape: int, scale: float = 0.2) -> torch.Tensor:
-        return (
-            torch.randn(*shape, device=device, dtype=dtype, generator=generator)
-            * scale
-        )
+        return torch.randn(*shape, device=device, dtype=dtype, generator=generator) * scale
 
     def query(*shape: int) -> torch.Tensor:
         return F.normalize(randn(*shape), dim=-1)
@@ -288,9 +283,10 @@ def assert_backward_matches_reference(base):
     assert len(saved) == 20
     assert all(value.data_ptr() in input_pointers for value in saved)
     generator = torch.Generator(device=actual.device).manual_seed(456)
-    grad_output = torch.randn(
-        actual.shape, device=actual.device, dtype=actual.dtype, generator=generator
-    ) * 0.01
+    grad_output = (
+        torch.randn(actual.shape, device=actual.device, dtype=actual.dtype, generator=generator)
+        * 0.01
+    )
     expected.backward(grad_output)
     actual.backward(grad_output)
 
@@ -320,9 +316,7 @@ def assert_backward_matches_reference(base):
 )
 def test_cute_backward_matches_reference(workspace_budget, monkeypatch):
     if workspace_budget is not None:
-        monkeypatch.setattr(
-            cute_backend, "_DSA_PACKED_WORKSPACE_BYTES", workspace_budget
-        )
+        monkeypatch.setattr(cute_backend, "_DSA_PACKED_WORKSPACE_BYTES", workspace_budget)
     base = _inputs(
         "bfloat16",
         heads=64,
@@ -373,12 +367,8 @@ def test_dsa_head_chunk_respects_workspace_budget_below_64_heads():
     chunk = _dsa_head_chunk(tokens, dim, 128, total_kv)
 
     assert 0 < chunk < 64
-    assert _dsa_workspace_bytes(tokens, dim, chunk, total_kv) <= (
-        _DSA_PACKED_WORKSPACE_BYTES
-    )
-    assert _dsa_workspace_bytes(tokens, dim, chunk + 1, total_kv) > (
-        _DSA_PACKED_WORKSPACE_BYTES
-    )
+    assert _dsa_workspace_bytes(tokens, dim, chunk, total_kv) <= (_DSA_PACKED_WORKSPACE_BYTES)
+    assert _dsa_workspace_bytes(tokens, dim, chunk + 1, total_kv) > (_DSA_PACKED_WORKSPACE_BYTES)
 
     head_tile, token_tile = _dsa_tile_shape(tokens, dim, 128, total_kv)
     assert head_tile >= 64
