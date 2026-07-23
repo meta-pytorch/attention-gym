@@ -97,15 +97,15 @@ class TestCausalBlockMask:
         )
 
         # Check that gradients match
-        assert torch.allclose(
-            grads_fast[0], grads_standard[0], atol=1e-5, rtol=1e-4
-        ), "Query gradients don't match"
-        assert torch.allclose(
-            grads_fast[1], grads_standard[1], atol=1e-5, rtol=1e-4
-        ), "Key gradients don't match"
-        assert torch.allclose(
-            grads_fast[2], grads_standard[2], atol=1e-5, rtol=1e-4
-        ), "Value gradients don't match"
+        assert torch.allclose(grads_fast[0], grads_standard[0], atol=1e-5, rtol=1e-4), (
+            "Query gradients don't match"
+        )
+        assert torch.allclose(grads_fast[1], grads_standard[1], atol=1e-5, rtol=1e-4), (
+            "Key gradients don't match"
+        )
+        assert torch.allclose(grads_fast[2], grads_standard[2], atol=1e-5, rtol=1e-4), (
+            "Value gradients don't match"
+        )
 
     def test_causal_block_mask_edge_cases(self):
         """Test edge cases for the efficient causal block mask."""

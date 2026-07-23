@@ -49,9 +49,9 @@ def test_block_diffusion_structure():
         torch.block_diag(*[torch.ones(block_size, block_size, dtype=torch.bool)] * 2),
     )
     assert noised[block_size, seq_len : seq_len + block_size].all()
-    assert not noised[
-        block_size - 1, seq_len:
-    ].any(), "first-block noised tokens have no clean context"
+    assert not noised[block_size - 1, seq_len:].any(), (
+        "first-block noised tokens have no clean context"
+    )
     assert clean[block_size, seq_len : seq_len + block_size + 1].all()
     assert not clean[block_size - 1, seq_len + block_size :].any()
 

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - PyTorch 2.5+ (for FlexAttention support)
 
 ## Installation
