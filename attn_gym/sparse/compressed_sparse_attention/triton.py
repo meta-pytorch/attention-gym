@@ -32,12 +32,8 @@ def _compress(
     z_a = _pad_to_block_size(z_a, compression_rate, float("-inf"))
     z_b = _pad_to_block_size(z_b, compression_rate, float("-inf"))
 
-    c_b = F.pad(c_b, (0, 0, compression_rate, 0), value=0.0)[
-        :, :, :-compression_rate, :
-    ]
-    z_b = F.pad(z_b, (0, 0, compression_rate, 0), value=float("-inf"))[
-        :, :, :-compression_rate, :
-    ]
+    c_b = F.pad(c_b, (0, 0, compression_rate, 0), value=0.0)[:, :, :-compression_rate, :]
+    z_b = F.pad(z_b, (0, 0, compression_rate, 0), value=float("-inf"))[:, :, :-compression_rate, :]
 
     batch, heads, padded_sequence, dimension = c_a.shape
     num_blocks = padded_sequence // compression_rate
@@ -62,25 +58,21 @@ def _rope_frequencies(rotary_dim: int, device: torch.device) -> torch.Tensor:
     beta_fast = 32.0
     beta_slow = 1.0
     frequencies = 1.0 / (
-        base
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
+        base ** (torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim)
     )
 
     def correction_dimension(num_rotations: float) -> float:
-        return rotary_dim * math.log(
-            original_seq_len / (num_rotations * 2 * math.pi)
-        ) / (2 * math.log(base))
+        return (
+            rotary_dim
+            * math.log(original_seq_len / (num_rotations * 2 * math.pi))
+            / (2 * math.log(base))
+        )
 
     low = max(math.floor(correction_dimension(beta_fast)), 0)
     high = min(math.ceil(correction_dimension(beta_slow)), rotary_dim - 1)
     if low == high:
         high += 0.001
-    ramp = (
-        torch.arange(rotary_dim // 2, device=device, dtype=torch.float32) - low
-    ) / (high - low)
+    ramp = (torch.arange(rotary_dim // 2, device=device, dtype=torch.float32) - low) / (high - low)
     smooth = 1 - ramp.clamp(0, 1)
     return frequencies / factor * (1 - smooth) + frequencies * smooth
 
@@ -103,9 +95,7 @@ def _apply_rope(
     tail = x[..., -rotary_dim:].float().reshape(*x.shape[:-1], rotary_dim // 2, 2)
     tail = torch.view_as_complex(tail)
     frequency_shape = [1] * (x.ndim - 2) + [x.shape[-2], rotary_dim // 2]
-    rotated = torch.view_as_real(
-        tail * frequencies_complex.view(*frequency_shape)
-    ).flatten(-2)
+    rotated = torch.view_as_real(tail * frequencies_complex.view(*frequency_shape)).flatten(-2)
     return torch.cat((x[..., :-rotary_dim], rotated.to(x.dtype)), dim=-1)
 
 
@@ -183,10 +173,7 @@ def _tiled_selected_attention_fwd(
     # time while retaining the query tile and accumulator in registers.
     for selected_slot in tl.static_range(0, TOPK):
         selected_block = tl.load(
-            topk_ptr
-            + batch * stride_tb
-            + offsets_m * stride_ts
-            + selected_slot * stride_tk,
+            topk_ptr + batch * stride_tb + offsets_m * stride_ts + selected_slot * stride_tk,
             mask=query_mask,
             other=0,
         )
@@ -260,10 +247,7 @@ def _tiled_selected_attention_fwd(
         mask=query_mask[:, None] & dimension_mask[None, :],
     )
     tl.store(
-        lse_ptr
-        + batch * stride_leb
-        + head * stride_leh
-        + offsets_m * stride_les,
+        lse_ptr + batch * stride_leb + head * stride_leh + offsets_m * stride_les,
         running_max + tl.log(running_sum),
         mask=query_mask,
     )
@@ -324,10 +308,7 @@ def _selected_compressed_attention_merge_fwd(
         other=0.0,
     )
     selected_blocks = tl.load(
-        topk_ptr
-        + batch * stride_tb
-        + query_position * stride_ts
-        + offsets_k * stride_tk,
+        topk_ptr + batch * stride_tb + query_position * stride_ts + offsets_k * stride_tk,
         mask=offsets_k < TOPK,
         other=0,
     )
@@ -360,10 +341,7 @@ def _selected_compressed_attention_merge_fwd(
     )
 
     local_lse = tl.load(
-        local_lse_ptr
-        + batch * stride_leb
-        + head * stride_leh
-        + query_position * stride_les
+        local_lse_ptr + batch * stride_leb + head * stride_leh + query_position * stride_les
     )
     combined_max = tl.where(
         has_compressed,
@@ -386,14 +364,9 @@ def _selected_compressed_attention_merge_fwd(
         mask=dimension_mask,
         other=0.0,
     )
-    output = (
-        local_output * local_scale + compressed_numerator * compressed_scale
-    ) / denominator
+    output = (local_output * local_scale + compressed_numerator * compressed_scale) / denominator
     tl.store(
-        local_lse_ptr
-        + batch * stride_leb
-        + head * stride_leh
-        + query_position * stride_les,
+        local_lse_ptr + batch * stride_leb + head * stride_leh + query_position * stride_les,
         combined_max + tl.log(denominator),
     )
     tl.store(
@@ -427,10 +400,7 @@ def _build_selected_block_mask(
     batch = tl.program_id(1)
     offsets_k = tl.arange(0, BLOCK_K)
     selected_blocks = tl.load(
-        topk_ptr
-        + batch * stride_tb
-        + query_position * stride_ts
-        + offsets_k * stride_tk,
+        topk_ptr + batch * stride_tb + query_position * stride_ts + offsets_k * stride_tk,
         mask=offsets_k < TOPK,
         other=0,
     )
@@ -442,10 +412,7 @@ def _build_selected_block_mask(
         & (selected_blocks < N_BLOCKS)
     )
     tl.store(
-        mask_ptr
-        + batch * stride_mb
-        + query_position * stride_ms
-        + selected_blocks * stride_mn,
+        mask_ptr + batch * stride_mb + query_position * stride_ms + selected_blocks * stride_mn,
         1,
         mask=valid,
     )
@@ -520,10 +487,7 @@ def _local_attention_bwd_dq(
         other=0.0,
     )
     lse = tl.load(
-        lse_ptr
-        + batch * stride_leb
-        + head * stride_leh
-        + offsets_m * stride_les,
+        lse_ptr + batch * stride_leb + head * stride_leh + offsets_m * stride_les,
         mask=query_mask,
         other=0.0,
     )
@@ -558,11 +522,14 @@ def _local_attention_bwd_dq(
             input_precision="tf32x3",
         )
         grad_scores = probabilities * (grad_probabilities - delta[:, None])
-        grad_query += tl.dot(
-            grad_scores.to(local_values.dtype),
-            local_values,
-            input_precision="tf32x3",
-        ) * SCALE
+        grad_query += (
+            tl.dot(
+                grad_scores.to(local_values.dtype),
+                local_values,
+                input_precision="tf32x3",
+            )
+            * SCALE
+        )
 
     tl.store(
         grad_q_ptr
@@ -649,10 +616,7 @@ def _compressed_attention_bwd_dq(
         other=0.0,
     )
     lse = tl.load(
-        lse_ptr
-        + batch * stride_leb
-        + head * stride_leh
-        + offsets_m * stride_les,
+        lse_ptr + batch * stride_leb + head * stride_leh + offsets_m * stride_les,
         mask=query_mask,
         other=0.0,
     )
@@ -688,9 +652,7 @@ def _compressed_attention_bwd_dq(
             other=0,
         )
         valid = query_mask[:, None] & key_mask[None, :] & (selected != 0)
-        scores = (
-            tl.dot(query, tl.trans(compressed_values), input_precision="tf32x3") * SCALE
-        )
+        scores = tl.dot(query, tl.trans(compressed_values), input_precision="tf32x3") * SCALE
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
         grad_probabilities = tl.dot(
@@ -699,11 +661,14 @@ def _compressed_attention_bwd_dq(
             input_precision="tf32x3",
         )
         grad_scores = probabilities * (grad_probabilities - delta[:, None])
-        grad_query += tl.dot(
-            grad_scores.to(compressed_values.dtype),
-            compressed_values,
-            input_precision="tf32x3",
-        ) * SCALE
+        grad_query += (
+            tl.dot(
+                grad_scores.to(compressed_values.dtype),
+                compressed_values,
+                input_precision="tf32x3",
+            )
+            * SCALE
+        )
 
     tl.store(
         grad_q_ptr
@@ -797,10 +762,7 @@ def _local_attention_bwd_dkv(
             other=0.0,
         )
         lse = tl.load(
-            lse_ptr
-            + batch * stride_leb
-            + head * stride_leh
-            + offsets_m * stride_les,
+            lse_ptr + batch * stride_leb + head * stride_leh + offsets_m * stride_les,
             mask=query_mask,
             other=0.0,
         )
@@ -825,11 +787,14 @@ def _local_attention_bwd_dkv(
             grad_output,
             input_precision="tf32x3",
         )
-        grad_values += tl.dot(
-            tl.trans(grad_scores.to(query.dtype)),
-            query,
-            input_precision="tf32x3",
-        ) * SCALE
+        grad_values += (
+            tl.dot(
+                tl.trans(grad_scores.to(query.dtype)),
+                query,
+                input_precision="tf32x3",
+            )
+            * SCALE
+        )
 
     tl.store(
         grad_local_kv_ptr
@@ -930,10 +895,7 @@ def _compressed_attention_bwd_dkv(
             other=0.0,
         )
         lse = tl.load(
-            lse_ptr
-            + batch * stride_leb
-            + head * stride_leh
-            + offsets_m * stride_les,
+            lse_ptr + batch * stride_leb + head * stride_leh + offsets_m * stride_les,
             mask=query_mask,
             other=0.0,
         )
@@ -947,9 +909,7 @@ def _compressed_attention_bwd_dkv(
             other=0,
         )
         valid = query_mask[:, None] & key_mask[None, :] & (selected != 0)
-        scores = (
-            tl.dot(query, tl.trans(compressed_values), input_precision="tf32x3") * SCALE
-        )
+        scores = tl.dot(query, tl.trans(compressed_values), input_precision="tf32x3") * SCALE
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
         grad_probabilities = tl.dot(
@@ -963,11 +923,14 @@ def _compressed_attention_bwd_dkv(
             grad_output,
             input_precision="tf32x3",
         )
-        grad_values += tl.dot(
-            tl.trans(grad_scores.to(query.dtype)),
-            query,
-            input_precision="tf32x3",
-        ) * SCALE
+        grad_values += (
+            tl.dot(
+                tl.trans(grad_scores.to(query.dtype)),
+                query,
+                input_precision="tf32x3",
+            )
+            * SCALE
+        )
 
     tl.store(
         grad_compressed_kv_ptr
@@ -997,9 +960,7 @@ def _launch_selected_attention(
     block_n = 128
     block_d = max(16, triton.next_power_of_2(head_dim))
     num_local_tiles = (
-        triton.cdiv(sliding_window_size + block_m - 1, block_n)
-        if sliding_window_size
-        else 0
+        triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
     output = torch.empty_like(query)
     local_lse = torch.empty(
@@ -1112,14 +1073,10 @@ def _launch_selected_attention_backward(
     )
 
     num_local_key_tiles = (
-        triton.cdiv(sliding_window_size + block_m - 1, block_n)
-        if sliding_window_size
-        else 0
+        triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
     num_local_query_tiles = (
-        triton.cdiv(sliding_window_size + block_n - 1, block_m)
-        if sliding_window_size
-        else 0
+        triton.cdiv(sliding_window_size + block_n - 1, block_m) if sliding_window_size else 0
     )
     query_grid = (triton.cdiv(sequence_length, block_m), batch * heads)
     _local_attention_bwd_dq[query_grid](
@@ -1410,18 +1367,14 @@ def _prepare_attention_inputs(
     index_heads, index_dim = Q_I.shape[1], Q_I.shape[3]
     kv_inputs = (KV, C_a, C_b, Z_a, Z_b)
     if share_kv and len({tensor.shape[1] for tensor in kv_inputs}) > 1:
-        KV, C_a, C_b, Z_a, Z_b = (
-            tensor.expand(-1, heads, -1, -1) for tensor in kv_inputs
-        )
+        KV, C_a, C_b, Z_a, Z_b = (tensor.expand(-1, heads, -1, -1) for tensor in kv_inputs)
     index_inputs = (K_Ia, K_Ib, Z_Ia, Z_Ib)
     if share_kv and len({tensor.shape[1] for tensor in index_inputs}) > 1:
         K_Ia, K_Ib, Z_Ia, Z_Ib = (
             tensor.expand(-1, index_heads, -1, -1) for tensor in index_inputs
         )
     compressed_kv = _compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate)
-    compressed_indices = _compress(
-        K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate
-    )
+    compressed_indices = _compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
     num_blocks = compressed_kv.shape[-2]
 
     query = _apply_rope(Q, rope_dims)
@@ -1433,12 +1386,8 @@ def _prepare_attention_inputs(
     compressed_indices = F.rms_norm(
         compressed_indices, (index_dim,), weight=compressed_indices_norm_weight
     )
-    compressed_indices = _apply_rope(
-        compressed_indices, rope_dims, positions=compressed_positions
-    )
-    compressed_kv = F.rms_norm(
-        compressed_kv, (head_dim,), weight=compressed_kv_norm_weight
-    )
+    compressed_indices = _apply_rope(compressed_indices, rope_dims, positions=compressed_positions)
+    compressed_kv = F.rms_norm(compressed_kv, (head_dim,), weight=compressed_kv_norm_weight)
     compressed_kv = _apply_rope(compressed_kv, rope_dims, positions=compressed_positions)
 
     if compressed_indices.shape[1] == 1 and index_heads != 1:

@@ -79,14 +79,7 @@ def useful_matmul_flops(args: argparse.Namespace) -> tuple[int, int]:
         + min(args.window, query_position + 1)
         for query_position in range(sequence_length)
     )
-    indexer = (
-        2
-        * args.batch
-        * args.index_heads
-        * sequence_length
-        * num_blocks
-        * args.index_dim
-    )
+    indexer = 2 * args.batch * args.index_heads * sequence_length * num_blocks * args.index_dim
     attention = 4 * args.batch * args.heads * args.head_dim * selected_pairs
     return indexer, attention
 
@@ -158,12 +151,15 @@ def main() -> None:
         )
 
     generator = torch.Generator(device=actual.device).manual_seed(args.seed + 1)
-    grad_output = torch.randn(
-        actual.shape,
-        device=actual.device,
-        dtype=actual.dtype,
-        generator=generator,
-    ) * 0.01
+    grad_output = (
+        torch.randn(
+            actual.shape,
+            device=actual.device,
+            dtype=actual.dtype,
+            generator=generator,
+        )
+        * 0.01
+    )
 
     def eager_backward():
         return torch.autograd.grad(
@@ -189,9 +185,7 @@ def main() -> None:
         actual_gradients,
         expected_gradients,
     ):
-        gradient_error = (
-            actual_gradient.float() - expected_gradient.float()
-        ).abs().max().item()
+        gradient_error = (actual_gradient.float() - expected_gradient.float()).abs().max().item()
         max_gradient_error = max(max_gradient_error, gradient_error)
         if not torch.allclose(
             actual_gradient,

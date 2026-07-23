@@ -19,9 +19,7 @@ def _make_inputs(share_kv: bool, dtype: torch.dtype):
     generator = torch.Generator(device="cuda").manual_seed(123)
 
     def randn(*shape: int, scale: float = 0.2) -> torch.Tensor:
-        return (
-            torch.randn(*shape, device="cuda", dtype=dtype, generator=generator) * scale
-        )
+        return torch.randn(*shape, device="cuda", dtype=dtype, generator=generator) * scale
 
     def query(*shape: int) -> torch.Tensor:
         return F.normalize(randn(*shape), dim=-1)
@@ -74,9 +72,7 @@ def test_reference_is_batch_invariant(share_kv, dtype):
         batched = compressed_sparse_attention(*inputs, backend="eager")
         independent = torch.cat(
             [
-                compressed_sparse_attention(
-                    *_select_batch(inputs, batch_index), backend="eager"
-                )
+                compressed_sparse_attention(*_select_batch(inputs, batch_index), backend="eager")
                 for batch_index in range(inputs[0].shape[0])
             ]
         )

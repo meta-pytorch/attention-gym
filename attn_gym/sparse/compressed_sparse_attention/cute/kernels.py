@@ -28,9 +28,7 @@ _RMS_EPS = 1.1920928955078125e-7
 @cute.jit
 def _score_order_key(value, index, num_blocks):
     """Return ordered BF16 score bits; keep the index separate for tie breaks."""
-    bits = cutlass.Uint16(
-        llvm.bitcast(cutlass.Uint16.mlir_type, value.ir_value())
-    )
+    bits = cutlass.Uint16(llvm.bitcast(cutlass.Uint16.mlir_type, value.ir_value()))
     if (bits & cutlass.Uint16(0x7FFF)) == cutlass.Uint16(0):
         bits = cutlass.Uint16(0)
     ordered = cutlass.Uint32(0)
@@ -54,9 +52,7 @@ def _score_index_key(value, index, num_blocks):
         score_order = _score_order_key(value, index, num_blocks)
         # Canonicalize either NaN sign to the +inf rank before rebasing into the
         # contiguous non-NaN interval.
-        if score_order < cutlass.Uint32(0x007F) or score_order > cutlass.Uint32(
-            0xFF80
-        ):
+        if score_order < cutlass.Uint32(0x007F) or score_order > cutlass.Uint32(0xFF80):
             score_order = cutlass.Uint32(0xFF80)
         score_rank = score_order - cutlass.Uint32(0x007F)
         composite_rank = (
@@ -139,17 +135,19 @@ class CompressionNormRope:
                 pos_a = block_idx * self.rate + r
                 if pos_a < self.sequence:
                     logit_a = (
-                        z_a[batch_idx, 0, pos_a, d].to(Float32)
-                        + bias_a[r, d].to(Float32)
-                    ).to(self.dtype).to(Float32)
+                        (z_a[batch_idx, 0, pos_a, d].to(Float32) + bias_a[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     maximum = cute.arch.fmax(maximum, logit_a)
                 if block_idx > 0:
                     pos_b = (block_idx - 1) * self.rate + r
                     if pos_b < self.sequence:
                         logit_b = (
-                            z_b[batch_idx, 0, pos_b, d].to(Float32)
-                            + bias_b[r, d].to(Float32)
-                        ).to(self.dtype).to(Float32)
+                            (z_b[batch_idx, 0, pos_b, d].to(Float32) + bias_b[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         maximum = cute.arch.fmax(maximum, logit_b)
 
             denominator = Float32(0.0)
@@ -157,9 +155,10 @@ class CompressionNormRope:
                 pos_a = block_idx * self.rate + r
                 if pos_a < self.sequence:
                     logit_a = (
-                        z_a[batch_idx, 0, pos_a, d].to(Float32)
-                        + bias_a[r, d].to(Float32)
-                    ).to(self.dtype).to(Float32)
+                        (z_a[batch_idx, 0, pos_a, d].to(Float32) + bias_a[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     denominator += cute.math.exp(
                         logit_a - maximum,
                         fastmath=False,
@@ -168,9 +167,10 @@ class CompressionNormRope:
                     pos_b = (block_idx - 1) * self.rate + r
                     if pos_b < self.sequence:
                         logit_b = (
-                            z_b[batch_idx, 0, pos_b, d].to(Float32)
-                            + bias_b[r, d].to(Float32)
-                        ).to(self.dtype).to(Float32)
+                            (z_b[batch_idx, 0, pos_b, d].to(Float32) + bias_b[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         denominator += cute.math.exp(
                             logit_b - maximum,
                             fastmath=False,
@@ -182,29 +182,39 @@ class CompressionNormRope:
                 product_a = Float32(0.0)
                 if pos_a < self.sequence:
                     logit_a = (
-                        z_a[batch_idx, 0, pos_a, d].to(Float32)
-                        + bias_a[r, d].to(Float32)
-                    ).to(self.dtype).to(Float32)
+                        (z_a[batch_idx, 0, pos_a, d].to(Float32) + bias_a[r, d].to(Float32))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     probability_a = (
-                        cute.math.exp(logit_a - maximum, fastmath=False) / denominator
-                    ).to(self.dtype).to(Float32)
+                        (cute.math.exp(logit_a - maximum, fastmath=False) / denominator)
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                     product_a = (
-                        c_a[batch_idx, 0, pos_a, d].to(Float32) * probability_a
-                    ).to(self.dtype).to(Float32)
+                        (c_a[batch_idx, 0, pos_a, d].to(Float32) * probability_a)
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                 product_b = Float32(0.0)
                 if block_idx > 0:
                     pos_b = (block_idx - 1) * self.rate + r
                     if pos_b < self.sequence:
                         logit_b = (
-                            z_b[batch_idx, 0, pos_b, d].to(Float32)
-                            + bias_b[r, d].to(Float32)
-                        ).to(self.dtype).to(Float32)
+                            (z_b[batch_idx, 0, pos_b, d].to(Float32) + bias_b[r, d].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         probability_b = (
-                            cute.math.exp(logit_b - maximum, fastmath=False) / denominator
-                        ).to(self.dtype).to(Float32)
+                            (cute.math.exp(logit_b - maximum, fastmath=False) / denominator)
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         product_b = (
-                            c_b[batch_idx, 0, pos_b, d].to(Float32) * probability_b
-                        ).to(self.dtype).to(Float32)
+                            (c_b[batch_idx, 0, pos_b, d].to(Float32) * probability_b)
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                 value += (product_a + product_b).to(self.dtype).to(Float32)
 
             # Compression is stored before RMSNorm in the oracle.
@@ -231,12 +241,12 @@ class CompressionNormRope:
         for pair in cutlass.range_constexpr(self.values_per_thread // 2):
             j0 = pair * 2
             d0 = d_base + j0
-            x0 = (
-                compressed[j0] * rstd * norm_weight[d0].to(Float32)
-            ).to(self.dtype).to(Float32)
+            x0 = (compressed[j0] * rstd * norm_weight[d0].to(Float32)).to(self.dtype).to(Float32)
             x1 = (
-                compressed[j0 + 1] * rstd * norm_weight[d0 + 1].to(Float32)
-            ).to(self.dtype).to(Float32)
+                (compressed[j0 + 1] * rstd * norm_weight[d0 + 1].to(Float32))
+                .to(self.dtype)
+                .to(Float32)
+            )
             y0, y1 = x0, x1
             if d0 >= self.dim - self.rope:
                 rope_pair = (d0 - (self.dim - self.rope)) // 2
@@ -324,12 +334,12 @@ class LocalNormRope:
             for pair in cutlass.range_constexpr(self.values_per_thread // 2):
                 j0 = pair * 2
                 d0 = d_base + j0
-                x0 = (
-                    values[j0] * rstd * norm_weight[d0].to(Float32)
-                ).to(self.dtype).to(Float32)
+                x0 = (values[j0] * rstd * norm_weight[d0].to(Float32)).to(self.dtype).to(Float32)
                 x1 = (
-                    values[j0 + 1] * rstd * norm_weight[d0 + 1].to(Float32)
-                ).to(self.dtype).to(Float32)
+                    (values[j0 + 1] * rstd * norm_weight[d0 + 1].to(Float32))
+                    .to(self.dtype)
+                    .to(Float32)
+                )
                 y0, y1 = x0, x1
                 if d0 >= self.dim - self.rope:
                     rope_pair = (d0 - (self.dim - self.rope)) // 2
@@ -463,9 +473,7 @@ class IndexScores:
         self.row_chunk = row_chunk
         self.num_threads = 128
         self.head_groups = (index_heads + 3) // 4
-        self.pairs_per_lane = (
-            index_dim // 2 + cute.arch.WARP_SIZE - 1
-        ) // cute.arch.WARP_SIZE
+        self.pairs_per_lane = (index_dim // 2 + cute.arch.WARP_SIZE - 1) // cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -528,9 +536,7 @@ class IndexScores:
             byte_alignment=16,
         )
 
-        q_values = cute.make_rmem_tensor(
-            (self.head_groups, self.pairs_per_lane, 2), Float32
-        )
+        q_values = cute.make_rmem_tensor((self.head_groups, self.pairs_per_lane, 2), Float32)
         for group in cutlass.range_constexpr(self.head_groups):
             head = group * 4 + warp
             for item in cutlass.range_constexpr(self.pairs_per_lane):
@@ -554,9 +560,7 @@ class IndexScores:
                 q_values[group, item, 1] = rq1
 
         for n in cutlass.range(completed, unroll=1):
-            k_values = cute.make_rmem_tensor(
-                (self.pairs_per_lane, 2), Float32
-            )
+            k_values = cute.make_rmem_tensor((self.pairs_per_lane, 2), Float32)
             for item in cutlass.range_constexpr(self.pairs_per_lane):
                 pair = lane + item * cute.arch.WARP_SIZE
                 d0 = pair * 2
@@ -588,11 +592,15 @@ class IndexScores:
                         rounded_dot = dot.to(self.dtype).to(Float32)
                         activated = cute.arch.fmax(rounded_dot, Float32(0.0))
                         activated = (
-                            activated / math.sqrt(self.index_dim * self.index_heads)
-                        ).to(self.dtype).to(Float32)
+                            (activated / math.sqrt(self.index_dim * self.index_heads))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         weighted = (
-                            activated * weights[batch_idx, position, head].to(Float32)
-                        ).to(self.dtype).to(Float32)
+                            (activated * weights[batch_idx, position, head].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                     contributions[group * 4 + warp] = weighted
 
             cute.arch.barrier()
@@ -602,9 +610,7 @@ class IndexScores:
                     for group_head in cutlass.range_constexpr(4):
                         score += contributions[group * 4 + group_head]
                 rounded_score = score.to(self.dtype)
-                scores[slab_row, n] = _score_index_key(
-                    rounded_score, n, self.num_blocks
-                )
+                scores[slab_row, n] = _score_index_key(rounded_score, n, self.num_blocks)
             cute.arch.barrier()
 
 
@@ -760,9 +766,7 @@ class SelectedGather:
         active_rows: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(
-            selected_indices, gather, row_offset, active_rows
-        ).launch(
+        self.kernel(selected_indices, gather, row_offset, active_rows).launch(
             grid=[cute.ceil_div(active_rows, 4), 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -787,9 +791,7 @@ class SelectedGather:
             batch_idx = row // self.sequence
             position = row - batch_idx * self.sequence
             local_count = min(self.window, position + 1)
-            for item in cutlass.range_constexpr(
-                self.gather_length // cute.arch.WARP_SIZE
-            ):
+            for item in cutlass.range_constexpr(self.gather_length // cute.arch.WARP_SIZE):
                 slot = lane + item * cute.arch.WARP_SIZE
                 value = Int32(-1)
                 if slot < self.topk:
@@ -844,9 +846,7 @@ class CausalGather:
             position = row - batch_idx * self.sequence
             completed = min(self.topk, (position + 1) // self.rate)
             local_count = min(self.window, position + 1)
-            for item in cutlass.range_constexpr(
-                self.gather_length // cute.arch.WARP_SIZE
-            ):
+            for item in cutlass.range_constexpr(self.gather_length // cute.arch.WARP_SIZE):
                 slot = lane + item * cute.arch.WARP_SIZE
                 value = Int32(-1)
                 if slot < completed:
@@ -931,9 +931,7 @@ class IndexTopK:
             gather[batch_idx, position, tid + item * self.num_threads] = Int32(-1)
 
         smem = cutlass.utils.SmemAllocator()
-        contributions = smem.allocate_tensor(
-            Float32, cute.make_layout((4,)), byte_alignment=16
-        )
+        contributions = smem.allocate_tensor(Float32, cute.make_layout((4,)), byte_alignment=16)
         score_sum = smem.allocate_tensor(Float32, cute.make_layout((1,)), byte_alignment=16)
         # CuTe rmem tensors cannot be empty, so retain one dead slot for local-only attention.
         best_values = cute.make_rmem_tensor((max(1, self.topk),), Float32)
@@ -946,9 +944,7 @@ class IndexTopK:
         completed = (position + 1) // self.rate
         # QI is stationary across all compressed blocks. Rotate and round it once instead of
         # reloading and reapplying RoPE inside the block loop.
-        q_values = cute.make_rmem_tensor(
-            (self.head_groups, self.pairs_per_lane, 2), Float32
-        )
+        q_values = cute.make_rmem_tensor((self.head_groups, self.pairs_per_lane, 2), Float32)
         for group in cutlass.range_constexpr(self.head_groups):
             head = group * 4 + warp
             for item in cutlass.range_constexpr(self.pairs_per_lane):
@@ -999,11 +995,15 @@ class IndexTopK:
                         rounded_dot = dot.to(self.dtype).to(Float32)
                         activated = cute.arch.fmax(rounded_dot, Float32(0.0))
                         activated = (
-                            activated / math.sqrt(self.index_dim * self.index_heads)
-                        ).to(self.dtype).to(Float32)
+                            (activated / math.sqrt(self.index_dim * self.index_heads))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                         weighted = (
-                            activated * weights[batch_idx, position, head].to(Float32)
-                        ).to(self.dtype).to(Float32)
+                            (activated * weights[batch_idx, position, head].to(Float32))
+                            .to(self.dtype)
+                            .to(Float32)
+                        )
                     contributions[warp] = weighted
                 cute.arch.barrier()
                 if tid == 0:
@@ -1017,8 +1017,7 @@ class IndexTopK:
                 candidate_index = Int32(n)
                 for k in cutlass.range_constexpr(self.topk):
                     if candidate_value > best_values[k] or (
-                        candidate_value == best_values[k]
-                        and candidate_index < best_indices[k]
+                        candidate_value == best_values[k] and candidate_index < best_indices[k]
                     ):
                         old_value = best_values[k]
                         old_index = best_indices[k]
@@ -1168,10 +1167,8 @@ class MergeSinkInverseRope:
                     ) + cute.math.exp(lse_c - attention_max, fastmath=True)
                 elif const_expr(self.has_compressed):
                     attention_max = lse_c
-                attention_lse[
-                    batch_idx, position, self.head_offset + head
-                ] = attention_max + cute.math.log(
-                    Float32(attention_sum), fastmath=True
+                attention_lse[batch_idx, position, self.head_offset + head] = (
+                    attention_max + cute.math.log(Float32(attention_sum), fastmath=True)
                 )
         cute.arch.barrier()
 
@@ -1191,10 +1188,7 @@ class MergeSinkInverseRope:
                     x1 += local_out[batch_idx, position, head, d0 + 1].to(Float32) * weight_l
                 if const_expr(self.has_compressed):
                     x0 += compressed_out[batch_idx, position, head, d0].to(Float32) * weight_c
-                    x1 += (
-                        compressed_out[batch_idx, position, head, d0 + 1].to(Float32)
-                        * weight_c
-                    )
+                    x1 += compressed_out[batch_idx, position, head, d0 + 1].to(Float32) * weight_c
                 denominator = merge_weights[head_local, 2]
                 x0 /= denominator
                 x1 /= denominator
@@ -1309,9 +1303,7 @@ class CompressedMergeSinkInverseRope:
         smem = cutlass.utils.SmemAllocator()
         reduction = smem.allocate_tensor(
             Float32,
-            cute.make_layout(
-                (self.head_tile, (self.threads_per_head // cute.arch.WARP_SIZE, 1))
-            ),
+            cute.make_layout((self.head_tile, (self.threads_per_head // cute.arch.WARP_SIZE, 1))),
             byte_alignment=16,
         )
         scores = smem.allocate_tensor(
@@ -1338,8 +1330,10 @@ class CompressedMergeSinkInverseRope:
                 if selected_block >= 0:
                     # QK and the scalar division are BF16/FP16 boundaries in the oracle.
                     score = (
-                        dot.to(self.dtype).to(Float32) / math.sqrt(self.dim)
-                    ).to(self.dtype).to(Float32)
+                        (dot.to(self.dtype).to(Float32) / math.sqrt(self.dim))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                 scores[head_local, selected] = score
             # Protect both the score publication and reduction scratch before its next reuse.
             cute.arch.barrier()
@@ -1380,9 +1374,7 @@ class CompressedMergeSinkInverseRope:
             for selected in cutlass.range_constexpr(self.topk):
                 selected_block = gather[batch_idx, position, selected]
                 if selected_block >= 0:
-                    probability = Float32(
-                        self.dtype(compressed_weights[selected] / denominator)
-                    )
+                    probability = Float32(self.dtype(compressed_weights[selected] / denominator))
                     value += probability * compressed_kv[
                         batch_idx, selected_block, 0, d_base + j
                     ].to(Float32)
@@ -1509,9 +1501,9 @@ class PrefixAttention:
             partial = Float32(0.0)
             if key <= position:
                 for j in cutlass.range_constexpr(self.values_per_thread):
-                    partial += query_values[j] * local_kv[
-                        batch_idx, key, 0, d_base + j
-                    ].to(Float32)
+                    partial += query_values[j] * local_kv[batch_idx, key, 0, d_base + j].to(
+                        Float32
+                    )
             dot = row_reduce(
                 partial,
                 cute.ReductionOp.ADD,
@@ -1523,8 +1515,10 @@ class PrefixAttention:
                 score = -Float32.inf
                 if key <= position:
                     score = (
-                        dot.to(self.dtype).to(Float32) / math.sqrt(self.dim)
-                    ).to(self.dtype).to(Float32)
+                        (dot.to(self.dtype).to(Float32) / math.sqrt(self.dim))
+                        .to(self.dtype)
+                        .to(Float32)
+                    )
                 scores[key] = score
             cute.arch.barrier()
 
@@ -1546,9 +1540,7 @@ class PrefixAttention:
                     kv_maximum = cute.arch.fmax(kv_maximum, scores[key])
                 kv_weight_sum = Float32(0.0)
                 for key in cutlass.range(self.prefix, unroll=1):
-                    kv_weight_sum += cute.math.exp(
-                        scores[key] - kv_maximum, fastmath=False
-                    )
+                    kv_weight_sum += cute.math.exp(scores[key] - kv_maximum, fastmath=False)
                 lse[batch_idx, position, global_head] = kv_maximum + cute.math.log(
                     kv_weight_sum, fastmath=False
                 )
@@ -1586,9 +1578,7 @@ def _fake(dtype, shape):
 @lru_cache
 def compile_compression(dtype, batch, sequence, dim, rate, rope):
     num_blocks = (sequence + rate - 1) // rate
-    tensors = [
-        _fake(dtype, (batch, 1, sequence, dim)) for _ in range(4)
-    ]
+    tensors = [_fake(dtype, (batch, 1, sequence, dim)) for _ in range(4)]
     biases = [_fake(dtype, (rate, dim)) for _ in range(2)]
     weight = _fake(dtype, (dim,))
     cos = _fake(Float32, (sequence, rope // 2))
@@ -1744,13 +1734,9 @@ def compile_pad_index_weights(
 
 
 @lru_cache
-def compile_selected_gather(
-    batch, sequence, num_blocks, topk, window, gather_length, row_chunk
-):
+def compile_selected_gather(batch, sequence, num_blocks, topk, window, gather_length, row_chunk):
     return cute.compile(
-        SelectedGather(
-            batch, sequence, num_blocks, topk, window, gather_length, row_chunk
-        ),
+        SelectedGather(batch, sequence, num_blocks, topk, window, gather_length, row_chunk),
         _fake(Int32, (row_chunk, topk)),
         _fake(Int32, (batch, sequence, gather_length)),
         Int32(0),
@@ -1761,13 +1747,9 @@ def compile_selected_gather(
 
 
 @lru_cache
-def compile_causal_gather(
-    batch, sequence, num_blocks, rate, topk, window, gather_length
-):
+def compile_causal_gather(batch, sequence, num_blocks, rate, topk, window, gather_length):
     return cute.compile(
-        CausalGather(
-            batch, sequence, num_blocks, rate, topk, window, gather_length
-        ),
+        CausalGather(batch, sequence, num_blocks, rate, topk, window, gather_length),
         _fake(Int32, (batch, sequence, gather_length)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -1939,9 +1921,7 @@ def compile_prefix(
         ),
         _fake(
             dtype,
-            (batch, total_heads, sequence, dim)
-            if raw_query
-            else (batch, prefix, tile_heads, dim),
+            (batch, total_heads, sequence, dim) if raw_query else (batch, prefix, tile_heads, dim),
         ),
         _fake(dtype, (batch, sequence, 1, dim)),
         _fake(dtype, (total_heads,)),

@@ -142,8 +142,7 @@ def test_cute_dispatch_reaches_registered_op_without_loading_during_trace(monkey
     assert result.dtype == torch.float32
     assert len(captured_graphs) == 1
     assert any(
-        node.target
-        is torch.ops.attention_gym._cute_compressed_sparse_attention_forward.default
+        node.target is torch.ops.attention_gym._cute_compressed_sparse_attention_forward.default
         for node in captured_graphs[0].graph.nodes
     )
 
