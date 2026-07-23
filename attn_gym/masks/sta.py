@@ -24,18 +24,18 @@ def generate_sta_mask_mod_2d(
     kernel_h, kernel_w = kernel_hw
     tile_h, tile_w = tile_hw
     tile_numel = tile_h * tile_w
-    assert (
-        canvas_h % tile_h == 0
-    ), f"Canvas height {canvas_h} is not divisible by tile height {tile_h}"
-    assert (
-        canvas_w % tile_w == 0
-    ), f"Canvas width {canvas_w} is not divisible by tile width {tile_w}"
-    assert (
-        kernel_h % tile_h == 0
-    ), f"Kernel height {kernel_h} is not divisible by tile height {tile_h}"
-    assert (
-        kernel_w % tile_w == 0
-    ), f"Kernel width {kernel_w} is not divisible by tile width {tile_w}"
+    assert canvas_h % tile_h == 0, (
+        f"Canvas height {canvas_h} is not divisible by tile height {tile_h}"
+    )
+    assert canvas_w % tile_w == 0, (
+        f"Canvas width {canvas_w} is not divisible by tile width {tile_w}"
+    )
+    assert kernel_h % tile_h == 0, (
+        f"Kernel height {kernel_h} is not divisible by tile height {tile_h}"
+    )
+    assert kernel_w % tile_w == 0, (
+        f"Kernel width {kernel_w} is not divisible by tile width {tile_w}"
+    )
     canvas_tile_h, canvas_tile_w = canvas_h // tile_h, canvas_w // tile_w
     kernel_tile_h, kernel_tile_w = kernel_h // tile_h, kernel_w // tile_w
     vision_seq_len = canvas_h * canvas_w
@@ -103,19 +103,19 @@ def generate_sta_mask_mod_3d(
     tile_t, tile_h, tile_w = tile_twh
     tile_numel = tile_t * tile_h * tile_w
     assert canvas_t % tile_t == 0, f"Canvas time {canvas_t} is not divisible by tile time {tile_t}"
-    assert (
-        canvas_h % tile_h == 0
-    ), f"Canvas height {canvas_h} is not divisible by tile height {tile_h}"
-    assert (
-        canvas_w % tile_w == 0
-    ), f"Canvas width {canvas_w} is not divisible by tile width {tile_w}"
+    assert canvas_h % tile_h == 0, (
+        f"Canvas height {canvas_h} is not divisible by tile height {tile_h}"
+    )
+    assert canvas_w % tile_w == 0, (
+        f"Canvas width {canvas_w} is not divisible by tile width {tile_w}"
+    )
     assert kernel_t % tile_t == 0, f"Kernel time {kernel_t} is not divisible by tile time {tile_t}"
-    assert (
-        kernel_h % tile_h == 0
-    ), f"Kernel height {kernel_h} is not divisible by tile height {tile_h}"
-    assert (
-        kernel_w % tile_w == 0
-    ), f"Kernel width {kernel_w} is not divisible by tile width {tile_w}"
+    assert kernel_h % tile_h == 0, (
+        f"Kernel height {kernel_h} is not divisible by tile height {tile_h}"
+    )
+    assert kernel_w % tile_w == 0, (
+        f"Kernel width {kernel_w} is not divisible by tile width {tile_w}"
+    )
     canvas_tile_t, canvas_tile_h, canvas_tile_w = (
         canvas_t // tile_t,
         canvas_h // tile_h,

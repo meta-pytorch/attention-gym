@@ -12,4 +12,4 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Run prek
-      uses: j178/prek-action@v1
+      uses: j178/prek-action@v2

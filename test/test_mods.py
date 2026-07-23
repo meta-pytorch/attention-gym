@@ -7,6 +7,7 @@ from attn_gym.mods import generate_tanh_softcap
 
 
 def test_tanh_approx():
+    torch.compiler.reset()
     softcap_mod = generate_tanh_softcap(30, approx=False)
     softcap_mod_approx = generate_tanh_softcap(30, approx=True)
     make_tensor = partial(

@@ -208,8 +208,8 @@ def print_results(experiments: List[Experiment]):
                 experiment.config.N,
                 experiment.config.mask_mod_name,
                 f"{experiment.result.creation_time_ms:.4f}",
-                f"{experiment.result.memory_bytes/(1024**3):.4f}",
-                f"{experiment.result.max_memory_usage/(1024**3):.4f}",
+                f"{experiment.result.memory_bytes / (1024**3):.4f}",
+                f"{experiment.result.max_memory_usage / (1024**3):.4f}",
             ]
         )
     # Sort rows for better readability (e.g., by B, H, M, N)

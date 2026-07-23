@@ -6,5 +6,6 @@ from attn_gym.mods.graphormer import (
     shortest_path_distances,
     shortest_path_edge_types,
 )
+from attn_gym.mods.latent_attention import generate_mla_rope_score_mod
 from attn_gym.mods.sandwich import generate_sandwich_bias
 from attn_gym.mods.softcapping import generate_tanh_softcap
