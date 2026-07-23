@@ -131,6 +131,7 @@ def test_missing_external_triton_dependency_has_clear_error(monkeypatch):
 
 
 def test_unavailable_cute_backend_has_clear_error(monkeypatch):
+    api._validate_cute_dependencies.cache_clear()
     module_name = "attn_gym.sparse.compressed_sparse_attention.cute"
     monkeypatch.setitem(sys.modules, module_name, None)
 
@@ -139,6 +140,7 @@ def test_unavailable_cute_backend_has_clear_error(monkeypatch):
 
 
 def test_missing_flash_attention_dependency_has_clear_error(monkeypatch):
+    api._validate_cute_dependencies.cache_clear()
     module_name = "attn_gym.sparse.compressed_sparse_attention.cute"
     monkeypatch.delitem(sys.modules, module_name, raising=False)
     monkeypatch.setitem(sys.modules, "flash_attn", None)
@@ -148,6 +150,7 @@ def test_missing_flash_attention_dependency_has_clear_error(monkeypatch):
 
 
 def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
+    api._validate_cute_dependencies.cache_clear()
     versions = {
         distribution: expected
         for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
@@ -161,6 +164,28 @@ def test_incompatible_cute_dependency_version_has_clear_error(monkeypatch):
         match=r"nvidia-cutlass-dsl==4\.5\.2 is required; found 0\.0\.0",
     ):
         api._validate_cute_dependencies()
+
+
+def test_cute_dependency_validation_is_cached(monkeypatch):
+    api._validate_cute_dependencies.cache_clear()
+    versions = {
+        distribution: expected
+        for distribution, _module, expected in api._CUTE_RUNTIME_DEPENDENCIES
+    }
+    version_calls = 0
+
+    def version(distribution):
+        nonlocal version_calls
+        version_calls += 1
+        return versions[distribution]
+
+    monkeypatch.setattr(api.importlib, "import_module", lambda _module: object())
+    monkeypatch.setattr(api.metadata, "version", version)
+    api._validate_cute_dependencies()
+    api._validate_cute_dependencies()
+
+    assert version_calls == len(api._CUTE_RUNTIME_DEPENDENCIES)
+    api._validate_cute_dependencies.cache_clear()
 
 
 def test_invalid_backend_is_rejected_without_loading_an_implementation(monkeypatch):

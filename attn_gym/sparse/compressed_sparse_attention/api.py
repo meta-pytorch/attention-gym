@@ -1,9 +1,11 @@
 """Public API and backend dispatch for compressed sparse attention."""
 
 from collections.abc import Callable
+from functools import lru_cache
 import importlib
 from importlib import metadata
 import math
+import sys
 from typing import Literal
 
 import torch
@@ -22,6 +24,8 @@ _CUTE_RUNTIME_DEPENDENCIES = (
         "1.25.0",
     ),
 )
+
+_cute_implementation: Callable[..., torch.Tensor] | None = None
 
 
 def _validate_inputs(
@@ -167,7 +171,9 @@ def _load_triton_implementation() -> Callable[..., torch.Tensor]:
     return implementation
 
 
+@lru_cache(maxsize=1)
 def _validate_cute_dependencies() -> None:
+    """Validate the pinned CuTe stack once per process, not once per kernel launch."""
     problems = []
     for distribution, module, expected_version in _CUTE_RUNTIME_DEPENDENCIES:
         try:
@@ -194,9 +200,14 @@ def _validate_cute_dependencies() -> None:
 
 
 def _load_cute_implementation() -> Callable[..., torch.Tensor]:
+    global _cute_implementation
+    module_name = f"{__package__}.cute"
+    if _cute_implementation is not None and sys.modules.get(module_name) is not None:
+        return _cute_implementation
+
     _validate_cute_dependencies()
     try:
-        from .cute import compressed_sparse_attention as implementation
+        module = importlib.import_module(module_name)
     except ModuleNotFoundError as error:
         missing_module = error.name or ""
         if missing_module == f"{__package__}.cute" or missing_module.split(".")[0] in (
@@ -212,7 +223,8 @@ def _load_cute_implementation() -> Callable[..., torch.Tensor]:
             ) from error
         raise
 
-    return implementation
+    _cute_implementation = module.compressed_sparse_attention
+    return _cute_implementation
 
 
 def compressed_sparse_attention(

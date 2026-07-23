@@ -43,6 +43,7 @@ _INDEX_DIM = 64
 _COMPRESSION_RATE = 32
 _ROPE_DIMS = 64
 _RADIX_TOPK_THRESHOLD = 64
+_DIFFERENTIABLE_INPUT_INDICES = (0, 2, 3, 4, 5, 6, 7, 8, 16, 18, 19)
 _TESTED_CUDA_VERSION = "13.3"
 _query_streams: dict[int, torch.cuda.Stream] = {}
 _DSA_PACKED_WORKSPACE_BYTES = 1536 * 1024 * 1024
@@ -1013,6 +1014,328 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
         return tuple(g if need else None for g, need in zip(grads, ctx.needs_input_grad))
 
 
+class _RuntimeBackwardContext:
+    """Minimal context used to run the existing manual backward behind an opaque op."""
+
+    def __init__(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        compression_rate: int,
+        num_topk_blocks: int,
+        sliding_window_size: int,
+        rope_dims: int,
+        share_kv: bool,
+    ) -> None:
+        self.saved_tensors = tensors
+        self.compression_rate = compression_rate
+        self.num_topk_blocks = num_topk_blocks
+        self.sliding_window_size = sliding_window_size
+        self.rope_dims = rope_dims
+        self.share_kv = share_kv
+        self.needs_input_grad = tuple(
+            index in _DIFFERENTIABLE_INPUT_INDICES for index in range(25)
+        )
+
+
+@torch.library.custom_op(
+    "attention_gym::_cute_compressed_sparse_attention_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _cute_compressed_sparse_attention_backward(
+    Q: torch.Tensor,
+    Q_I: torch.Tensor,
+    KV: torch.Tensor,
+    C_a: torch.Tensor,
+    C_b: torch.Tensor,
+    Z_a: torch.Tensor,
+    Z_b: torch.Tensor,
+    B_a: torch.Tensor,
+    B_b: torch.Tensor,
+    W_I: torch.Tensor,
+    K_Ia: torch.Tensor,
+    K_Ib: torch.Tensor,
+    Z_Ia: torch.Tensor,
+    Z_Ib: torch.Tensor,
+    B_Ia: torch.Tensor,
+    B_Ib: torch.Tensor,
+    KV_norm_weight: torch.Tensor,
+    compressed_indices_norm_weight: torch.Tensor,
+    compressed_kv_norm_weight: torch.Tensor,
+    attention_sink: torch.Tensor,
+    dout: torch.Tensor,
+    compression_rate: int,
+    num_topk_blocks: int,
+    sliding_window_size: int,
+    rope_dims: int,
+    share_kv: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    tensors = (
+        Q,
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+    )
+    runtime_ctx = _RuntimeBackwardContext(
+        tensors,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        share_kv,
+    )
+    with torch.cuda.device(Q.device):
+        grads = _CuteCompressedSparseAttention.backward(runtime_ctx, dout)
+    differentiable_grads = tuple(grads[index] for index in _DIFFERENTIABLE_INPUT_INDICES)
+    assert all(isinstance(grad, torch.Tensor) for grad in differentiable_grads)
+    return differentiable_grads
+
+
+@_cute_compressed_sparse_attention_backward.register_fake
+def _cute_compressed_sparse_attention_backward_fake(
+    Q,
+    Q_I,
+    KV,
+    C_a,
+    C_b,
+    Z_a,
+    Z_b,
+    B_a,
+    B_b,
+    W_I,
+    K_Ia,
+    K_Ib,
+    Z_Ia,
+    Z_Ib,
+    B_Ia,
+    B_Ib,
+    KV_norm_weight,
+    compressed_indices_norm_weight,
+    compressed_kv_norm_weight,
+    attention_sink,
+    dout,
+    compression_rate,
+    num_topk_blocks,
+    sliding_window_size,
+    rope_dims,
+    share_kv,
+):
+    del (
+        Q_I,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        compressed_indices_norm_weight,
+        dout,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        share_kv,
+    )
+    return tuple(
+        torch.empty_like(tensor)
+        for tensor in (
+            Q,
+            KV,
+            C_a,
+            C_b,
+            Z_a,
+            Z_b,
+            B_a,
+            B_b,
+            KV_norm_weight,
+            compressed_kv_norm_weight,
+            attention_sink,
+        )
+    )
+
+
+@torch.library.custom_op(
+    "attention_gym::_cute_compressed_sparse_attention_forward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _cute_compressed_sparse_attention_forward_op(
+    Q: torch.Tensor,
+    Q_I: torch.Tensor,
+    KV: torch.Tensor,
+    C_a: torch.Tensor,
+    C_b: torch.Tensor,
+    Z_a: torch.Tensor,
+    Z_b: torch.Tensor,
+    B_a: torch.Tensor,
+    B_b: torch.Tensor,
+    W_I: torch.Tensor,
+    K_Ia: torch.Tensor,
+    K_Ib: torch.Tensor,
+    Z_Ia: torch.Tensor,
+    Z_Ib: torch.Tensor,
+    B_Ia: torch.Tensor,
+    B_Ib: torch.Tensor,
+    KV_norm_weight: torch.Tensor,
+    compressed_indices_norm_weight: torch.Tensor,
+    compressed_kv_norm_weight: torch.Tensor,
+    attention_sink: torch.Tensor,
+    compression_rate: int,
+    num_topk_blocks: int,
+    sliding_window_size: int,
+    rope_dims: int,
+    share_kv: bool,
+) -> torch.Tensor:
+    with torch.cuda.device(Q.device):
+        return _compressed_sparse_attention_forward(
+            Q,
+            Q_I,
+            KV,
+            C_a,
+            C_b,
+            Z_a,
+            Z_b,
+            B_a,
+            B_b,
+            W_I,
+            K_Ia,
+            K_Ib,
+            Z_Ia,
+            Z_Ib,
+            B_Ia,
+            B_Ib,
+            KV_norm_weight,
+            compressed_indices_norm_weight,
+            compressed_kv_norm_weight,
+            attention_sink,
+            compression_rate,
+            num_topk_blocks,
+            sliding_window_size,
+            rope_dims,
+            share_kv,
+        )
+
+
+@_cute_compressed_sparse_attention_forward_op.register_fake
+def _cute_compressed_sparse_attention_forward_fake(
+    Q,
+    Q_I,
+    KV,
+    C_a,
+    C_b,
+    Z_a,
+    Z_b,
+    B_a,
+    B_b,
+    W_I,
+    K_Ia,
+    K_Ib,
+    Z_Ia,
+    Z_Ib,
+    B_Ia,
+    B_Ib,
+    KV_norm_weight,
+    compressed_indices_norm_weight,
+    compressed_kv_norm_weight,
+    attention_sink,
+    compression_rate,
+    num_topk_blocks,
+    sliding_window_size,
+    rope_dims,
+    share_kv,
+):
+    del (
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        share_kv,
+    )
+    return torch.empty_like(Q)
+
+
+def _cute_compressed_sparse_attention_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs[:20])
+    (
+        ctx.compression_rate,
+        ctx.num_topk_blocks,
+        ctx.sliding_window_size,
+        ctx.rope_dims,
+        ctx.share_kv,
+    ) = inputs[20:]
+
+
+def _cute_compressed_sparse_attention_autograd_backward(ctx, dout):
+    grads = _cute_compressed_sparse_attention_backward(
+        *ctx.saved_tensors,
+        dout,
+        ctx.compression_rate,
+        ctx.num_topk_blocks,
+        ctx.sliding_window_size,
+        ctx.rope_dims,
+        ctx.share_kv,
+    )
+    result = [None] * 25
+    for index, grad in zip(_DIFFERENTIABLE_INPUT_INDICES, grads):
+        result[index] = grad
+    return tuple(result)
+
+
+_cute_compressed_sparse_attention_forward_op.register_autograd(
+    _cute_compressed_sparse_attention_autograd_backward,
+    setup_context=_cute_compressed_sparse_attention_setup_context,
+)
+
+
 def compressed_sparse_attention(
     Q: torch.Tensor,
     Q_I: torch.Tensor,
@@ -1050,12 +1373,13 @@ def compressed_sparse_attention(
         compression_rate, num_topk_blocks, sliding_window_size, rope_dims, share_kv,
     )
     if _return_state:
-        return _compressed_sparse_attention_forward(*args, _return_state=True)
-    if torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in args[:20] if isinstance(tensor, torch.Tensor)
-    ):
-        return _CuteCompressedSparseAttention.apply(*args)
-    return _compressed_sparse_attention_forward(*args)
+        with torch.cuda.device(Q.device):
+            return _compressed_sparse_attention_forward(*args, _return_state=True)
+    operator_args = tuple(
+        value.detach() if index < 20 and index not in _DIFFERENTIABLE_INPUT_INDICES else value
+        for index, value in enumerate(args)
+    )
+    return _cute_compressed_sparse_attention_forward_op(*operator_args)
 
 
 __all__ = ["compressed_sparse_attention"]
