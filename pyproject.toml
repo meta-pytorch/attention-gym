@@ -30,6 +30,7 @@ tests = [
     "jsonargparse",
     "docstring-parser",
     "numpy",
+    "flash-attn-4[cu13]~=4.0.0b23; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 dev = [

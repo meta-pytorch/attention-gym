@@ -42,5 +42,5 @@ jobs:
         export VIRTUAL_ENV="$PWD/.venv"
         export PATH="$VIRTUAL_ENV/bin:$PATH"
         PIP_EXTRA_INDEX_URL= UV_EXTRA_INDEX_URL= uv pip install ${{ matrix.torch-spec }}
-        uv pip install '.[tests]'
+        uv pip install --prerelease allow '.[tests]'
         uv run --no-sync pytest test
