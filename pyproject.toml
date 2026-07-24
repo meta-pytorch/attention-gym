@@ -58,6 +58,14 @@ docs = [
     "numpy",
 ]
 
+cute = [
+    "cuda-python==13.3.1",
+    "nvidia-cutlass-dsl==4.5.2",
+    "flash-attn-4==4.0.0b17",
+    "quack-kernels==0.5.0",
+    "nvidia-cudnn-frontend==1.25.0",
+]
+
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]
 source = "vcs"
