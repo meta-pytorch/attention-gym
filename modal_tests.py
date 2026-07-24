@@ -4,24 +4,12 @@ from pathlib import Path
 import modal
 
 ROOT_PATH = Path(__file__).parent
-PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu130"
+PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "filelock",
-        "typing-extensions",
-        "setuptools<82",
-        "sympy",
-        "networkx",
-        "jinja2",
-        "fsspec",
-        "numpy",
-        "pillow",
-        "spmd-types",
-    )
     .pip_install("torch", pre=True, index_url=PYTORCH_NIGHTLY_INDEX, force_build=True)
-    .pip_install("pytest", "jsonargparse", "docstring-parser")
+    .pip_install_from_pyproject(str(ROOT_PATH / "pyproject.toml"), optional_dependencies=["tests"])
     .add_local_python_source("attn_gym")
     .add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
 )

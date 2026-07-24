@@ -25,13 +25,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tests = [
+    "pytest",
+    "jsonargparse",
+    "docstring-parser",
+    "numpy",
+]
+
 dev = [
     "prek",
     "pytest",
     "ruff",
     "jsonargparse",
     "docstring-parser",
-    "numpy"
+    "numpy",
 ]
 
 viz = [
