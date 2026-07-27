@@ -70,7 +70,7 @@ def make_sliding_window_mask(query_length, window_size, device, dtype):
         dtype=dtype,
     ).masked_fill(~valid, float("-inf"))
 
-
+# performs softmax with an attention sink
 def sink_softmax(x, sink, dim):
     sink = sink[None, :, None, None]
     maximums = torch.max(x, dim=dim, keepdim=True).values
