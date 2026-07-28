@@ -11,21 +11,6 @@ import torch
 Backend = Literal["eager", "triton", "cute"]
 Mode = Literal["auto", "chunked", "recurrent"]
 
-_CUTE_RUNTIME_DEPENDENCIES = (
-    ("cuda-python", "cuda.bindings.driver", "13.3.1"),
-    ("nvidia-cutlass-dsl", "cutlass.cute", "4.5.2"),
-    ("flash-attn-4", "flash_attn.cute.interface", "4.0.0b17"),
-    ("quack-kernels", "quack", "0.5.0"),
-    (
-        "nvidia-cudnn-frontend",
-        "cudnn.deepseek_sparse_attention.indexer_top_k",
-        "1.25.0",
-    ),
-)
-
-_cute_implementation: Callable[..., torch.Tensor] | None = None
-_cute_initialization_error: Exception | None = None
-
 
 def _validate_inputs(
     tensors: tuple[tuple[str, object], ...],
@@ -146,93 +131,20 @@ def _validate_inputs(
             )
 
 
-def _load_eager_implementation() -> Callable[..., torch.Tensor]:
-    from . import reference
-
-    # The checked-in oracle uses ``math`` in RoPE without importing it. Keep the reference file
-    # untouched while making its public eager entry point runnable.
-    reference.math = math
-    return reference.CSA
-
-
 def _load_triton_implementation() -> Callable[..., torch.Tensor]:
-    try:
-        from .triton import compressed_sparse_attention as implementation
-    except ModuleNotFoundError as error:
-        if error.name in (f"{__package__}.triton", "triton"):
-            raise RuntimeError(
-                "The Triton backend for compressed sparse attention is not available; "
-                "install Triton and ensure the backend module is packaged."
-            ) from error
-        raise
+    from .triton import compressed_sparse_attention as implementation
 
     return implementation
 
 
-def _validate_cute_dependencies() -> None:
-    """Validate the pinned CuTe stack during backend initialization."""
-    problems = []
-    for distribution, module, expected_version in _CUTE_RUNTIME_DEPENDENCIES:
-        try:
-            importlib.import_module(module.partition(".")[0])
-            importlib.import_module(module)
-        except (ImportError, RuntimeError) as error:
-            problems.append(f"{distribution}=={expected_version} is unavailable ({error})")
-            continue
-        try:
-            installed_version = metadata.version(distribution)
-        except metadata.PackageNotFoundError:
-            problems.append(f"{distribution}=={expected_version} is not installed")
-            continue
-        if installed_version != expected_version:
-            problems.append(
-                f"{distribution}=={expected_version} is required; found {installed_version}"
-            )
-    if problems:
-        details = "; ".join(problems)
-        raise RuntimeError(
-            "The CuTe DSL backend dependency set is incompatible. "
-            f"Install attn_gym[cute]. Details: {details}."
-        )
-
-
 def _load_cute_implementation() -> Callable[..., torch.Tensor]:
     module_name = f"{__package__}.cute"
-    _validate_cute_dependencies()
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError as error:
-        missing_module = error.name or ""
-        if missing_module == f"{__package__}.cute" or missing_module.split(".")[0] in (
-            "flash_attn",
-            "cutlass",
-            "cuda",
-            "quack",
-        ):
-            raise RuntimeError(
-                "The CuTe DSL backend for compressed sparse attention is not available; "
-                "install nvidia-cutlass-dsl, flash-attn-4, and quack-kernels and ensure "
-                "the backend module is packaged."
-            ) from error
-        raise
-
+    module = importlib.import_module(module_name)
     return module.compressed_sparse_attention
 
-
-def _initialize_cute_backend() -> None:
-    """Resolve and register the optional CuTe backend before Dynamo can trace calls."""
-    global _cute_implementation, _cute_initialization_error
-    if _cute_implementation is not None or _cute_initialization_error is not None:
-        return
-    try:
-        _cute_implementation = _load_cute_implementation()
-    except Exception as error:
-        # An optional backend must not make the base attn_gym package unimportable.
-        _cute_initialization_error = error
-
-
-_initialize_cute_backend()
-
+def _load_eager_implementation() -> Callable[..., torch.Tensor]:
+    from . import reference
+    return reference.CSA
 
 def compressed_sparse_attention(
     Q: torch.Tensor,
@@ -346,15 +258,15 @@ def compressed_sparse_attention(
         share_kv,
     )
 
-    if backend == "eager":
-        implementation = _load_eager_implementation()
-    elif backend == "triton":
-        implementation = _load_triton_implementation()
-    else:
-        if _cute_implementation is None:
-            assert _cute_initialization_error is not None
-            raise RuntimeError(str(_cute_initialization_error)) from _cute_initialization_error
-        implementation = _cute_implementation
+    match backend:
+        case "eager":
+            implementation = _load_eager_implementation()
+        case "triton":
+            implementation = _load_triton_implementation()
+        case "cute":
+            implementation = _load_cute_implementation()
+        case _:
+            raise ValueError(f"Unsupported backend: {backend!r}")
 
     return implementation(
         Q,
