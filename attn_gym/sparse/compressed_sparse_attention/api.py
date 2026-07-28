@@ -1,9 +1,7 @@
 """Public API and backend dispatch for compressed sparse attention."""
 
-from collections.abc import Callable
 import importlib
-from importlib import metadata
-import math
+from collections.abc import Callable
 from typing import Literal
 
 import torch

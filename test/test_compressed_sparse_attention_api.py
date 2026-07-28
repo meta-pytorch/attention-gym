@@ -1,9 +1,7 @@
 import importlib
-import sys
 
 import pytest
 import torch
-
 
 api = importlib.import_module("attn_gym.sparse.compressed_sparse_attention.api")
 csa_package = importlib.import_module("attn_gym.sparse.compressed_sparse_attention")
