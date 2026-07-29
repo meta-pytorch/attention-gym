@@ -219,12 +219,6 @@ def _require_sm100(device: torch.device) -> None:
             "The CuTe compressed sparse attention backend targets SM100 exclusively; "
             f"device {device} has compute capability {capability[0]}.{capability[1]}."
         )
-    if torch.version.cuda != _TESTED_CUDA_VERSION:
-        raise RuntimeError(
-            "The CuTe compressed sparse attention backend is validated with CUDA "
-            f"{_TESTED_CUDA_VERSION}; this PyTorch build uses CUDA {torch.version.cuda}."
-        )
-
 
 def _rope_tables(
     device_index: int, sequence_length: int, rope_dims: int
