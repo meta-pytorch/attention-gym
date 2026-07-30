@@ -1,5 +1,5 @@
 """Sparse attention primitives."""
 
-from .api import compressed_sparse_attention
+from .compressed_sparse_attention import compressed_sparse_attention
 
 __all__ = ["compressed_sparse_attention"]
