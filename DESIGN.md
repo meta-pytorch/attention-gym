@@ -184,54 +184,163 @@ The first operators can use small per-operation dispatch functions. A shared bac
 be introduced only if it removes demonstrated duplication. Public registration of arbitrary
 third-party backends is not an initial requirement.
 
-## Proposed package structure
+## Repository and implementation structure
 
-The package should be organized variant-first. This keeps the formula, reference, optimized kernels,
-and tests for an operation understandable as a unit.
+The repository is organized first by public concept and then, for end-to-end operators, by
+attention variant. The existing `masks` and `mods` namespaces remain collections of FlexAttention
+building blocks. The `linear` and `sparse` namespaces contain complete attention operations with a
+stable public API and one or more interchangeable implementations.
 
 ```text
 attn_gym/
-  linear/
-    __init__.py
-    <variant>/
-      __init__.py
-      api.py
-      reference.py
-      triton.py
-      cute.py
-  sparse/
-    __init__.py
-    <variant>/
-      __init__.py
-      api.py
-      reference.py
-      flex.py
-      triton.py
-      cute.py
+  masks/                         # FlexAttention mask and BlockMask construction
+  mods/                          # FlexAttention score modifications
+  linear/                        # End-to-end linear attention operators
+    __init__.py                  # Public exports for all linear variants
+    <variant>/                   # One complete mathematical attention variant
+      __init__.py                # Thin re-export of the variant's public symbols
+      api.py                     # Public API, validation, and lazy backend dispatch
+      impl/                      # Private interchangeable implementations
+        __init__.py              # Marks the private implementation package
+        common.py                # Shared semantic primitives used by multiple backends
+        reference.py             # Readable eager PyTorch correctness oracle
+        triton.py                # Triton kernels, launchers, and backend constraints
+        cute.py                  # CuTeDSL kernels, launchers, and backend constraints
+  sparse/                        # End-to-end specialized sparse attention operators
+    __init__.py                  # Public exports for all sparse variants
+    <variant>/                   # One complete mathematical attention variant
+      __init__.py                # Thin re-export of the variant's public symbols
+      api.py                     # Public API, validation, and lazy backend dispatch
+      impl/                      # Private interchangeable implementations
+        __init__.py              # Marks the private implementation package
+        common.py                # Shared semantic primitives used by multiple backends
+        reference.py             # Readable eager PyTorch correctness oracle
+        flex.py                  # FlexAttention-based implementation and constraints
+        triton.py                # Triton kernels, launchers, and backend constraints
+        cute.py                  # CuTeDSL kernels, launchers, and backend constraints
 
 test/
-  linear/
-    test_<variant>.py
-  sparse/
-    test_<variant>.py
+  linear/                        # Linear variant correctness and integration tests
+    test_<variant>.py            # Public API and focused private-primitive tests
+  sparse/                        # Sparse variant correctness and integration tests
+    test_<variant>.py            # Public API and focused private-primitive tests
 
 benchmarks/
-  linear/
-  sparse/
+  linear/                        # Reproducible linear attention benchmarks
+  sparse/                        # Reproducible sparse attention benchmarks
 ```
 
-Not every variant needs every backend file. Empty placeholder modules should not be created.
+Not every operation needs every backend file. Empty placeholders should not be created. A backend
+may start as one module and become a package if its implementation becomes too large; for example,
+a large Triton backend may evolve from `impl/triton.py` into
+`impl/triton/{forward,backward}.py` without changing the public API.
 
-Public symbols are re-exported from the namespace root:
+### Module responsibilities
+
+Each operation has one public API layer and a private implementation layer:
+
+- `<variant>/__init__.py` is a thin re-export layer for the variant's documented public symbols.
+- `api.py` is the sole public module for the variant. It may define a small cohesive set of public
+  functions and types, such as the main operation, its output type, and a variant-specific state
+  type. It owns backend-independent validation, mode validation, and lazy backend dispatch, and it
+  must not import optional backend dependencies at module import time.
+- `impl/common.py` contains named mathematical primitives, shared private types, and backend-neutral
+  tensor transformations used unchanged by at least two implementations.
+- `impl/reference.py` is the readable eager PyTorch correctness oracle.
+- `impl/triton.py`, `impl/cute.py`, and `impl/flex.py` own backend constraints, backend-specific
+  preparation, kernel launch logic, and custom autograd code. Their entry points are implementation
+  details, not additional public APIs.
+
+The allowed dependency direction is:
+
+```text
+namespace __init__.py
+        |
+        v
+      api.py
+        |
+        +----> impl/reference.py ----+
+        +----> impl/triton.py -------+----> impl/common.py
+        +----> impl/cute.py ---------+
+        +----> impl/flex.py ---------+
+```
+
+Implementation modules may import `common.py`, but they must not import one another. In particular,
+an optimized backend must not import from `reference.py`. If reference and Triton need the exact
+same helper, that helper belongs in `common.py`. If they merely implement the same mathematics using
+different decompositions, each backend keeps its own implementation.
+
+`common.py` is not a general utility drawer. Code belongs there only when both conditions hold:
+
+1. the behavior is part of the operation's mathematical semantics; and
+2. at least two implementations use the code unchanged.
+
+Shared helpers should have semantic names. For compressed sparse attention, for example,
+`compress_interleaved_blocks(...)` is preferable to `compress(...)`, and its docstring should state
+the padding, shifted B branch, joint normalization, and output shape. Dense reference masks,
+Triton launch configuration, contiguity checks, and kernel-specific indexing remain in their
+respective implementation modules.
+
+### Public exports
+
+Public functions are re-exported from the namespace root:
 
 ```python
 from attn_gym.linear import gated_delta_rule
-from attn_gym.sparse import compresed_sp
+from attn_gym.sparse import compressed_sparse_attention
 ```
 
-The operation names above are illustrative; this design does not choose the first variants.
-Backend implementation functions are not public API unless there is a demonstrated need for direct
-access.
+Backend entry points are private and use a consistent internal name such as `forward`. A backend
+may additionally provide a small private capability check when dispatch needs one. Users select an
+implementation through the public `backend=` argument rather than importing implementation modules
+directly.
+
+The initial dispatch should remain explicit and local to `api.py`: map a documented backend name to
+one lazily imported implementation, validate that implementation's capabilities, and call it. Do
+not introduce registration side effects or a repository-wide priority registry until several
+operations demonstrate that the same mechanism would remove meaningful duplication. Automatic
+selection should use an inspectable ordered policy and report why explicitly requested backends are
+unsupported.
+
+### Applying the structure to compressed sparse attention
+
+The current compressed sparse attention code should move to:
+
+```text
+attn_gym/sparse/compressed_sparse_attention/
+  __init__.py
+  api.py
+  impl/
+    __init__.py
+    common.py
+    reference.py
+    triton.py
+```
+
+The refactor should be mechanical and behavior-preserving:
+
+1. Move shared padding, interleaved block compression, and the shared RoPE formulation into
+   `impl/common.py`. Give these helpers explicit names, type annotations, shape documentation, and
+   tests. Preserve separate backend implementations when sharing would compromise readability,
+   compilation, or backend requirements.
+2. Move the eager implementation into `impl/reference.py`, rename `CSA` to the private backend
+   entry point `forward`, and retain dense-only helpers such as mask materialization and sink
+   softmax there.
+3. Move the Triton implementation into `impl/triton.py`, rename its public-looking entry point to
+   `forward`, and retain Triton kernels, launchers, custom autograd, backend constraints, and
+   Triton-specific preparation there.
+4. Update `api.py` to lazily load `impl.reference.forward` or `impl.triton.forward`. Keep all public
+   argument and shape validation in `api.py`; keep device, dtype, contiguity, architecture, and
+   backend capability validation in the selected implementation.
+5. Keep `compressed_sparse_attention/__init__.py` and `attn_gym/sparse/__init__.py` as thin public
+   re-export layers.
+6. Update tests to import only the public API except for focused unit tests of private mathematical
+   primitives. Run the existing eager-versus-Triton forward and backward matrix before and after
+   the move to demonstrate that the refactor did not change behavior.
+
+The initial refactor should not introduce a global backend registry, redesign the public signature,
+or fuse additional work into kernels. Those are separate changes and should follow only after the
+module boundaries are established.
 
 ## Relationship to existing FlexAttention APIs
 
