@@ -45,6 +45,24 @@ Each benchmark reports forward and backward time (ms) and TFLOPS for three imple
 
 The key takeaway: FlexAttention with block sparsity can match or beat dense SDPA while supporting arbitrary attention patterns.
 
+### Compressed Sparse Attention
+
+The standalone CSA benchmarks live in
+`benchmarks/sparse/benchmark_compressed_sparse_attention/` and can be run directly from
+the repository root. For example:
+
+```bash
+python benchmarks/sparse/benchmark_compressed_sparse_attention/benchmark_compressed_sparse_attention_triton.py
+python benchmarks/sparse/benchmark_compressed_sparse_attention/benchmark_compressed_sparse_attention_cute_forward_backward.py
+```
+
+Install the SM100 CuTe backend dependencies with `pip install -e ".[cute]"`. That optional
+dependency set pins the validated runtime: CUDA Python 13.3.1, CUTLASS DSL 4.5.2,
+FlashAttention 4.0.0b17, Quack 0.5.0, and cuDNN frontend 1.25.0. The backend requires an
+SM100 GPU, a PyTorch build using CUDA 13.3, shared KV, `D=512`, and BF16 inputs for both
+forward and backward. Backend dispatch reports all missing or incompatible components in a
+single diagnostic.
+
 ## Flash Backend Comparison
 
 [`examples/flex_flash_attention.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_flash_attention.py) — Compare the Flash (CuTeDSL-based) and Triton backends for FlexAttention.
