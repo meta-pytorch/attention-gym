@@ -193,6 +193,13 @@ stable public API and one or more interchangeable implementations.
 
 ```text
 attn_gym/
+  _backends/                     # Private infrastructure shared across attention variants
+    triton/
+      autotune.py                # Reusable Triton tuning and configuration machinery
+      tensor_checks.py           # Triton-specific device, dtype, layout, and shape checks
+    cute/
+      compilation.py             # Reusable CuTeDSL compilation and caching machinery
+      tensor_checks.py           # CuTeDSL-specific device, dtype, layout, and shape checks
   masks/                         # FlexAttention mask and BlockMask construction
   mods/                          # FlexAttention score modifications
   linear/                        # End-to-end linear attention operators
@@ -280,6 +287,62 @@ Shared helpers should have semantic names. For compressed sparse attention, for 
 the padding, shifted B branch, joint normalization, and output shape. Dense reference masks,
 Triton launch configuration, contiguity checks, and kernel-specific indexing remain in their
 respective implementation modules.
+
+### Shared backend infrastructure
+
+Backend-specific infrastructure that is reused unchanged across attention variants belongs in the
+private `attn_gym._backends` package. Examples include Triton autotuning machinery, CuTeDSL
+compilation caches, and backend-specific tensor capability checks. This code is shared because it
+integrates a kernel DSL with PyTorch, not because it implements shared attention mathematics.
+
+Use the narrowest ownership level that fits the behavior:
+
+- mathematical behavior shared by two implementations of one variant belongs in
+  `<variant>/impl/common.py`;
+- Triton infrastructure shared by different variants belongs in `attn_gym/_backends/triton/`;
+- CuTeDSL infrastructure shared by different variants belongs in `attn_gym/_backends/cute/`;
+- public types shared by multiple linear or sparse operations belong in a namespace-level module
+  such as `attn_gym/linear/types.py`, not in an implementation package.
+
+The `_backends` package must remain private and dependency-oriented. Its modules should be named for
+specific responsibilities such as `autotune.py`, `compilation.py`, or `tensor_checks.py`; do not
+create a backend-wide `common.py` or `utils.py` drawer. As elsewhere, add shared modules only after
+at least two real callers establish the common contract. Variant implementation modules may import
+the corresponding shared backend package, but shared backend packages must not import variant APIs
+or encode variant-specific formulas, state layouts, or dispatch policy. Optional Triton and CuTeDSL
+dependencies must still be imported lazily.
+
+### Compilation and custom operator boundaries
+
+The public operation should remain an ordinary Python function that validates backend-independent
+semantics and dispatches to a private implementation. Supporting `torch.compile` does not by itself
+require turning the public API or every implementation into a custom operator.
+
+Use the least opaque integration that provides the required compiler behavior:
+
+1. Keep eager/reference implementations as traceable compositions of PyTorch operations whenever
+   practical. Do not wrap traceable PyTorch code in a custom operator merely to hide it from the
+   compiler.
+2. Prefer compiler-visible Triton integration when the backend can be represented with PyTorch's
+   Triton operator APIs. This lets the compiler reason about the implementation instead of treating
+   the entire backend as an opaque call.
+3. Use a private custom operator boundary for CuTeDSL launchers, external-library adapters, or other
+   backend code that `torch.compile` cannot trace correctly. The custom operator is an implementation
+   detail behind `backend=` and is not a second public Attention Gym API.
+4. Keep variant semantics at the variant layer. Shared `_backends` code may provide registration,
+   compilation, caching, or validation machinery, but the variant backend owns its operator schema,
+   fake implementation, mutation declaration, autograd registration, and output/state metadata.
+
+Every custom operator used by an optimized backend must provide the compiler metadata required by
+its supported contract, including a fake implementation for shape and dtype propagation. Training
+backends must define an autograd formula or clearly reject gradient-requiring inputs. Mutation and
+aliasing must be declared accurately. Custom operators should be validated with PyTorch operator
+checks in addition to end-to-end eager-versus-compiled tests.
+
+Compilation is a public-operation property, not merely a kernel-launch property. Tests should call
+the documented function through `torch.compile`, including its validation, dispatch, structured
+result, forward path, backward path when supported, and initial/final state behavior. A backend that
+works only when its private launcher is invoked directly does not satisfy the compilation contract.
 
 ### Public exports
 
@@ -557,12 +620,15 @@ Every new operation should include the applicable parts of this matrix.
 
 ### Integration
 
-- `torch.compile` behavior where supported.
-- Fake tensor or tracing behavior where required by downstream integration.
+- Public API execution through `torch.compile`, including full-graph capture where supported.
+- Fake tensor behavior for every custom operator and tracing behavior required by downstream
+  integration.
+- PyTorch operator checks for custom operator schemas, fake implementations, mutation, and autograd.
+- Compiled forward and backward correctness against eager execution for supported training paths.
 - Autocast behavior.
 - Contiguous and intentionally supported non-contiguous layouts.
+- CUDA Graph capture and replay for supported optimized backends.
 - TorchTitan integration for at least the first production-targeted operator.
-- We want our functions to be compilable and cuda-graphable.
 
 ### Hardware
 
@@ -611,5 +677,10 @@ A PR adding a new attention operation should include:
 ## References
 
 - PyTorch FlexAttention documentation: <https://pytorch.org/docs/main/nn.attention.flex_attention.html>
+- PyTorch custom operators: <https://docs.pytorch.org/docs/stable/library.html>
+- PyTorch custom operators and `torch.compile` tutorial:
+  <https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html>
+- PyTorch user-defined Triton kernels with `torch.compile`:
+  <https://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html>
 - Flash Linear Attention: <https://github.com/fla-org/flash-linear-attention>
 - NVIDIA CUTLASS and CuTeDSL: <https://github.com/NVIDIA/cutlass>
