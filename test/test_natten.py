@@ -76,6 +76,9 @@ def test_natten_masks(
     T_W=8,
     print_mask=True,
 ):
+    if torch.cuda.get_device_capability()[0] == 10:
+        pytest.skip("SM100 ptxas miscompile: https://github.com/pytorch/pytorch/issues/190973")
+
     torch.compiler.reset()
     query = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
     key = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
