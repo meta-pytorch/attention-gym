@@ -26,6 +26,14 @@ def make_sliding_window_mask(query_length, window_size, device, dtype):
 
 
 def sink_softmax(x, sink, dim):
+    '''
+    Args: 
+        x: tensor in shape of (batch, num_heads, sequence, dim)
+        sink: tensor in shape of (num_heads, )
+        dim: integer, dimension to apply softmax on
+    Returns:
+        tensor in shape of x, where tensor[a, b, c, d] = exp(x[a, b, c, d]) / (sum(exp(x[a, b, c, :]) + exp(sink[b])))
+    '''
     sink = sink[None, :, None, None]
     maximums = torch.max(x, dim=dim, keepdim=True).values
     maximums = torch.maximum(maximums, sink)

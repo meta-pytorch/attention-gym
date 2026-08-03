@@ -249,8 +249,9 @@ def CSA(
     H_KV=H and H_IKV=H_I when share_kv=False. When share_kv=True, those dimensions
     may instead be 1.
 
-    Rope and normalization are applied within the function for KV vectors, but not for Q or Q_I
-    This is because Q and Q_I are expected to be projected from the same normalized and pre-rotated latent
+    Normalization is applied within the function for KV vectors, but not for Q or Q_I
+    All rope is applied within the function
+    This is because Q and Q_I are expected to be projected from the same normalized latent
     Q: Query vector for attention; expected to be normalized beforehand; expected shape: (B, H, S, D)
     Q_I: Query vector for indexing; expected to be normalized beforehand; expected shape: (B, H_I, S, D_I)
 
