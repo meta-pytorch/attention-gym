@@ -38,7 +38,6 @@ def _validate_inputs(
     assert isinstance(Q, torch.Tensor)
     assert isinstance(KV, torch.Tensor)
     assert isinstance(index_kv, torch.Tensor)
-    assert isinstance(indices, torch.Tensor)
     assert isinstance(attention_sink, torch.Tensor)
 
     if Q.ndim != 4:
@@ -126,7 +125,7 @@ def selected_attention(
             Otherwise represented as (batch_size, num_heads, X, head_dim)
             where X is any number greater than
 
-        indices: Which indices to attend to. Shape of (batch, num_heads, num_topk_blocks), integer tensor
+        indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
@@ -136,6 +135,8 @@ def selected_attention(
             If doc_ids[i, j] = doc_ids[i, j-y], then Q[i, j] can causally attend to KV[i, j-y]
             Should be monotonically increasing on the sequence axis
             If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the same document.
+            Only applies to the sliding window branch.
+            It's the caller's responsibility to make sure indices don't cross document boundaries
 
         sliding_window_size: Integer, size of sliding window
 

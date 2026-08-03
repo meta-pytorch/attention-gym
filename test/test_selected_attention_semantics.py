@@ -135,7 +135,6 @@ def test_selected_block_only_manual(backend):
     dtype = torch.float64 if backend == "eager" else torch.float32
     b, h, s, d = 1, 1, 4, 8
     index_seq_len = 6
-    topk = 3
 
     torch.manual_seed(11)
     Q = torch.randn(b, h, s, d, device=device, dtype=dtype)
@@ -277,6 +276,69 @@ def test_sink_very_negative_has_no_effect(backend):
 
     atol = 1e-4 if backend == "triton" else 1e-6
     torch.testing.assert_close(out, expected, atol=atol, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# 5. Repeated selections (backends must agree)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
+@pytest.mark.parametrize("num_repeats", [2, 3])
+@pytest.mark.parametrize("sliding_window_size", [0, 4])
+def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
+    """Repeated indices should produce identical results in eager and triton."""
+    device = torch.device("cuda")
+    dtype = torch.float32
+    b, h, s, d = 1, 2, 8, 16
+    index_seq_len = 6
+
+    torch.manual_seed(88)
+    Q = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    KV = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    index_kv = torch.randn(b, h, index_seq_len, d, device=device, dtype=dtype)
+    sink = torch.randn(h, device=device, dtype=dtype)
+
+    # All slots repeat position 2
+    indices = torch.full((b, s, num_repeats), 2, dtype=torch.long, device=device)
+
+    out_eager = selected_attention(
+        Q, KV, index_kv, indices, sink, None, sliding_window_size, False, backend="eager"
+    )
+    out_triton = selected_attention(
+        Q, KV, index_kv, indices, sink, None, sliding_window_size, False, backend="triton"
+    )
+
+    torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
+def test_mixed_repeated_and_unique_indices_backends_match():
+    """Mix of repeated and unique indices should match between backends."""
+    device = torch.device("cuda")
+    dtype = torch.float32
+    b, h, s, d = 1, 2, 6, 16
+    index_seq_len = 5
+
+    torch.manual_seed(99)
+    Q = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    KV = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    index_kv = torch.randn(b, h, index_seq_len, d, device=device, dtype=dtype)
+    sink = torch.randn(h, device=device, dtype=dtype)
+
+    # Mix: some rows have repeats, some are unique, some have -1 sentinels
+    indices = torch.tensor(
+        [[[0, 0, 1], [2, 2, 2], [0, 1, 2], [3, 3, -1], [-1, -1, -1], [4, 4, 4]]],
+        dtype=torch.long,
+        device=device,
+    )
+
+    out_eager = selected_attention(Q, KV, index_kv, indices, sink, None, 3, False, backend="eager")
+    out_triton = selected_attention(
+        Q, KV, index_kv, indices, sink, None, 3, False, backend="triton"
+    )
+
+    torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------

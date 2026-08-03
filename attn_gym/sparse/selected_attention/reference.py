@@ -88,7 +88,7 @@ def selected_attention(
             Otherwise represented as (batch_size, num_heads, X, head_dim)
             where X is any number greater than
 
-        indices: Which indices to attend to. Shape of (batch, num_heads, num_topk_blocks), integer tensor
+        indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
             If less than num_topk_blocks should be indexed, pad the tensor with -1
             Duplicate indices will be computed multiple times.

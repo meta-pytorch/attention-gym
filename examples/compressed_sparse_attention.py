@@ -299,9 +299,13 @@ def CSA(
 
     Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
     Q_I = torch.cat([Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1)
+    KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
     KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
 
     compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
+    compressed_indices = F.rms_norm(
+        compressed_indices, (compressed_indices.shape[-1],), weight=compressed_indices_norm_weight
+    )
     # Apply rope to the last rope_dim dimensions
     compressed_indices = torch.cat(
         [
@@ -312,6 +316,9 @@ def CSA(
             ),
         ],
         dim=-1,
+    )
+    compressed_kv = F.rms_norm(
+        compressed_kv, (compressed_kv.shape[-1],), weight=compressed_kv_norm_weight
     )
     compressed_kv = torch.cat(
         [

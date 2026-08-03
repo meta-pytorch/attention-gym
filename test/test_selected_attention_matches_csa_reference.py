@@ -1,26 +1,44 @@
 """Verify that composing CSA from selected_attention matches the standalone reference.
 
-This test is self-contained: both the standalone CSA reference and the helper
-functions (compress, apply_rope, make_block_mask) that the selected_attention
-composition path needs are defined inline so that no external CSA module is
-required.
+The composition path (CSA built from selected_attention) is imported directly
+from examples/compressed_sparse_attention.py. The standalone reference CSA is
+defined inline here for comparison.
 """
 
 import math
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-from attn_gym.sparse.selected_attention import selected_attention
 
 ATOL = 1e-8
 RTOL = 1e-5
 
 
 # ---------------------------------------------------------------------------
-# Helper functions (shared by both the reference and the selected_attention
-# composition path).
+# Load the CSA example module (composition path via selected_attention).
+# ---------------------------------------------------------------------------
+
+
+def _load_csa_example():
+    example_path = (
+        Path(__file__).resolve().parents[1] / "examples" / "compressed_sparse_attention.py"
+    )
+    spec = spec_from_file_location("_compressed_sparse_attention_example", example_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load example from {example_path}")
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+csa_example = _load_csa_example()
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for the standalone reference.
 # ---------------------------------------------------------------------------
 
 
@@ -212,15 +230,24 @@ def reference_CSA(
 
     Q = torch.cat([Q[:, :, :, :-rope_dims], apply_rope(Q[:, :, :, -rope_dims:])], dim=-1)
     Q_I = torch.cat([Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1)
+    KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
     KV = torch.cat([KV[:, :, :, :-rope_dims], apply_rope(KV[:, :, :, -rope_dims:])], dim=-1)
 
     compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
+    compressed_indices = F.rms_norm(
+        compressed_indices,
+        (compressed_indices.shape[-1],),
+        weight=compressed_indices_norm_weight,
+    )
     compressed_indices = torch.cat(
         [
             compressed_indices[:, :, :, :-rope_dims],
             apply_rope(compressed_indices[:, :, :, -rope_dims:], positions=compressed_positions),
         ],
         dim=-1,
+    )
+    compressed_kv = F.rms_norm(
+        compressed_kv, (compressed_kv.shape[-1],), weight=compressed_kv_norm_weight
     )
     compressed_kv = torch.cat(
         [
@@ -258,149 +285,6 @@ def reference_CSA(
         [
             attn_output[..., :-rope_dims],
             apply_rope(attn_output[..., -rope_dims:], inverse=True),
-        ],
-        dim=-1,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CSA composed from the selected_attention primitive.
-# ---------------------------------------------------------------------------
-
-
-def _selected_attention_with_causal_blocks(
-    Q,
-    KV,
-    compressed_kv,
-    topk_blocks,
-    indexer_mask,
-    attention_sink,
-    sliding_window_size,
-):
-    """Call selected_attention while preserving the completed-block constraint.
-
-    Invalid (causally unavailable) selections are replaced with -1 sentinels.
-    """
-    if topk_blocks.shape[-1] == 0:
-        return selected_attention(
-            Q,
-            KV,
-            compressed_kv,
-            topk_blocks,
-            attention_sink,
-            None,
-            sliding_window_size,
-            False,
-        )
-
-    valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
-    selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
-
-    # Replace causally invalid selections with -1 sentinel
-    causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
-
-    return selected_attention(
-        Q,
-        KV,
-        compressed_kv,
-        causal_topk_blocks,
-        attention_sink,
-        None,
-        sliding_window_size,
-        False,
-    )
-
-
-def _csa_with_selected_attention(
-    Q,
-    Q_I,
-    KV,
-    C_a,
-    C_b,
-    Z_a,
-    Z_b,
-    B_a,
-    B_b,
-    W_I,
-    K_Ia,
-    K_Ib,
-    Z_Ia,
-    Z_Ib,
-    B_Ia,
-    B_Ib,
-    KV_norm_weight,
-    compressed_indices_norm_weight,
-    compressed_kv_norm_weight,
-    attention_sink,
-    compression_rate,
-    num_topk_blocks,
-    sliding_window_size,
-    rope_dims: int,
-    share_kv: bool,
-):
-    device = Q.device
-    dtype = Q.dtype
-    _, num_heads, sequence_length, _ = Q.shape
-    _, num_index_heads, _, index_head_dim = Q_I.shape
-    if share_kv:
-        KV = KV.expand(-1, num_heads, -1, -1)
-        C_a = C_a.expand(-1, num_heads, -1, -1)
-        C_b = C_b.expand(-1, num_heads, -1, -1)
-        Z_a = Z_a.expand(-1, num_heads, -1, -1)
-        Z_b = Z_b.expand(-1, num_heads, -1, -1)
-
-        K_Ia = K_Ia.expand(-1, num_index_heads, -1, -1)
-        K_Ib = K_Ib.expand(-1, num_index_heads, -1, -1)
-        Z_Ia = Z_Ia.expand(-1, num_index_heads, -1, -1)
-        Z_Ib = Z_Ib.expand(-1, num_index_heads, -1, -1)
-
-    compressed_kv = compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate)
-    compressed_indices = compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
-    num_total_blocks = compressed_kv.shape[-2]
-
-    Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
-    Q_I = torch.cat([Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1)
-    KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
-
-    compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
-    compressed_indices = torch.cat(
-        [
-            compressed_indices[..., :-rope_dims],
-            apply_rope(compressed_indices[..., -rope_dims:], positions=compressed_positions),
-        ],
-        dim=-1,
-    )
-    compressed_kv = torch.cat(
-        [
-            compressed_kv[..., :-rope_dims],
-            apply_rope(compressed_kv[..., -rope_dims:], positions=compressed_positions),
-        ],
-        dim=-1,
-    )
-
-    indexer_mask = make_block_mask(
-        sequence_length, num_total_blocks, compression_rate, device, dtype
-    )
-    indexer_scale = math.sqrt(index_head_dim * num_index_heads)
-    scores = F.relu(Q_I @ compressed_indices.transpose(-2, -1)) / indexer_scale
-    index_head_weights = W_I.transpose(1, 2).unsqueeze(-1)
-    scores = torch.sum(index_head_weights * scores, dim=1) + indexer_mask
-
-    topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1).indices
-    attention_output = _selected_attention_with_causal_blocks(
-        Q,
-        KV,
-        compressed_kv,
-        topk_blocks,
-        indexer_mask,
-        attention_sink,
-        sliding_window_size,
-    )
-
-    return torch.cat(
-        [
-            attention_output[..., :-rope_dims],
-            apply_rope(attention_output[..., -rope_dims:], inverse=True),
         ],
         dim=-1,
     )
@@ -483,7 +367,7 @@ def test_selected_attention_matches_csa_reference_fp64(share_kv, num_topk_blocks
 
     with torch.inference_mode():
         expected = reference_CSA(*inputs)
-        actual = _csa_with_selected_attention(*inputs)
+        actual = csa_example.CSA(*inputs)
 
     assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
@@ -500,7 +384,7 @@ def test_selected_attention_matches_csa_reference_cuda_fp32():
 
     with torch.inference_mode():
         expected = reference_CSA(*inputs)
-        actual = _csa_with_selected_attention(*inputs)
+        actual = csa_example.CSA(*inputs)
 
     assert actual.device.type == expected.device.type == "cuda"
     assert actual.dtype == expected.dtype == torch.float32
