@@ -66,7 +66,7 @@ def make_packed_mask(
         dtype=dtype,
         device=device,
     )
-    mask.masked_fill_(allowed, 0.0)
+    mask.masked_fill_(same_document, 0.0)
 
     # Head-broadcasting dimension.
     return mask[:, None, :, :]
@@ -113,8 +113,7 @@ def selected_attention(
     index_sequence_length = index_kv.shape[2]
     if share_kv:
         KV = KV.expand(-1, h, -1, -1)
-        if indices is None:
-            index_kv = index_kv.expand(-1, h, -1, -1)
+        index_kv = index_kv.expand(-1, h, -1, -1)
     if indices is not None:
         # We have s queries that each potentially attend to index_sequence_length elements
         topk_mask = torch.full((b, s, index_sequence_length), float("-inf"), device=device, dtype=dtype)
@@ -125,8 +124,9 @@ def selected_attention(
     SWA_mask = SWA_mask.expand(b, -1, -1)
 
     if doc_ids is not None:
-        packing_mask = make_packed_mask(doc_ids, dtype = dtype)
-    
+        packing_mask = make_packed_mask(doc_ids, dtype=dtype)
+        # packing_mask is [B, 1, S, S], SWA_mask is [B, S, S]
+        SWA_mask = SWA_mask + packing_mask.squeeze(1)
 
     if indices is not None:
         attention_kv = torch.cat([index_kv, KV], dim=-2)

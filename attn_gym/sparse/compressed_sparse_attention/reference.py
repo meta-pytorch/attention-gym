@@ -208,14 +208,10 @@ def CSA(
 
     Q = torch.cat([Q[:, :, :, :-rope_dims], apply_rope(Q[:, :, :, -rope_dims:])], dim=-1)
     Q_I = torch.cat([Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1)
-    KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
+
     KV = torch.cat([KV[:, :, :, :-rope_dims], apply_rope(KV[:, :, :, -rope_dims:])], dim=-1)
 
-    compressed_indices = F.rms_norm(
-        compressed_indices,
-        (compressed_indices.shape[-1],),
-        weight=compressed_indices_norm_weight,
-    )
+
     compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
     compressed_indices = torch.cat(
         [
@@ -228,11 +224,7 @@ def CSA(
         dim=-1,
     )
 
-    compressed_kv = F.rms_norm(
-        compressed_kv,
-        (compressed_kv.shape[-1],),
-        weight=compressed_kv_norm_weight,
-    )
+
     compressed_kv = torch.cat(
         [
             compressed_kv[:, :, :, :-rope_dims],
@@ -258,11 +250,15 @@ def CSA(
     topk_mask = torch.full(scores.shape, float("-inf"), device=device, dtype=dtype)
     topk_mask.scatter_(dim=-1, index=topk_blocks, value=0.0)
     topk_mask += indexer_mask
+    
     SWA_mask = make_sliding_window_mask(s, sliding_window_size, device, dtype).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)
 
+
+
     attention_kv = torch.cat([compressed_kv, KV], dim=-2)
     attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
+
     scale = head_dim**0.5
 
     P = sink_softmax(
@@ -278,3 +274,198 @@ def CSA(
         ],
         dim=-1,
     )
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    # Main dimensions
+    batch_size = 2
+    num_heads = 4
+    num_index_heads = 2
+    sequence_length = 9
+    head_dim = 16
+    index_head_dim = 16
+
+    compression_rate = 2
+    num_topk_blocks = 2
+    sliding_window_size = 4
+    rope_dims = 8
+    share_kv = True
+
+    # compress() produces ceil(sequence_length / compression_rate) blocks.
+    num_blocks = (
+        sequence_length + compression_rate - 1
+    ) // compression_rate
+
+    Q = torch.randn(
+        batch_size,
+        num_heads,
+        sequence_length,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    Q_I = torch.randn(
+        batch_size,
+        num_index_heads,
+        sequence_length,
+        index_head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    # Since share_kv=True, these initially have one head and are expanded in CSA.
+    KV = torch.randn(
+        batch_size,
+        1,
+        sequence_length,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    C_a = torch.randn(
+        batch_size,
+        1,
+        sequence_length,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    C_b = torch.randn_like(C_a)
+
+    # Compression logits have a final singleton dimension so they broadcast over
+    # the compressed vector dimension.
+    Z_a = torch.randn(
+        batch_size,
+        1,
+        sequence_length,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+
+    Z_b = torch.randn_like(Z_a)
+
+    # After splitting, Z_a and Z_b have shapes:
+    # [batch, heads, num_blocks, compression_rate, 1]
+    #
+    # These biases must broadcast to that shape.
+    B_a = torch.randn(
+        1,
+        num_heads,
+        num_blocks,
+        1,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+
+    B_b = torch.randn_like(B_a)
+
+    # W_I is later permuted from [batch, sequence, index_heads]
+    # to [batch, index_heads, sequence, 1].
+    W_I = torch.randn(
+        batch_size,
+        sequence_length,
+        num_index_heads,
+        device=device,
+        dtype=dtype,
+    )
+
+    K_Ia = torch.randn(
+        batch_size,
+        1,
+        sequence_length,
+        index_head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    K_Ib = torch.randn_like(K_Ia)
+
+    Z_Ia = torch.randn(
+        batch_size,
+        1,
+        sequence_length,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+
+    Z_Ib = torch.randn_like(Z_Ia)
+
+    B_Ia = torch.randn(
+        1,
+        num_index_heads,
+        num_blocks,
+        1,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+
+    B_Ib = torch.randn_like(B_Ia)
+
+    KV_norm_weight = torch.ones(
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    compressed_indices_norm_weight = torch.ones(
+        index_head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    compressed_kv_norm_weight = torch.ones(
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    # One sink value per attention head.
+    attention_sink = torch.zeros(
+        num_heads,
+        device=device,
+        dtype=dtype,
+    )
+
+    output = CSA(
+        Q=Q,
+        Q_I=Q_I,
+        KV=KV,
+        C_a=C_a,
+        C_b=C_b,
+        Z_a=Z_a,
+        Z_b=Z_b,
+        B_a=B_a,
+        B_b=B_b,
+        W_I=W_I,
+        K_Ia=K_Ia,
+        K_Ib=K_Ib,
+        Z_Ia=Z_Ia,
+        Z_Ib=Z_Ib,
+        B_Ia=B_Ia,
+        B_Ib=B_Ib,
+        KV_norm_weight=KV_norm_weight,
+        compressed_indices_norm_weight=compressed_indices_norm_weight,
+        compressed_kv_norm_weight=compressed_kv_norm_weight,
+        attention_sink=attention_sink,
+        compression_rate=compression_rate,
+        num_topk_blocks=num_topk_blocks,
+        sliding_window_size=sliding_window_size,
+        rope_dims=rope_dims,
+        share_kv=share_kv,
+    )
+
+    print("Output shape:", output.shape)
+    print("All finite:", torch.isfinite(output).all().item())
+    print(output)
