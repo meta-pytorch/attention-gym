@@ -81,7 +81,7 @@ def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
         device: device to create mask on
         dtype: dtype of mask
     Returns:
-        Mask in shape of (num_blocks, query_length), with entries of -inf or 0
+        Mask in shape of (query_length, num_blocks), with entries of -inf or 0
     """
     query_positions = torch.arange(query_length, device=device)
     block_positions = torch.arange(num_blocks, device=device)

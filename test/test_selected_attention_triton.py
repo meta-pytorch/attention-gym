@@ -412,8 +412,8 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
 
     # Sanity checks to make sure we don't get anything insane
     # Not really meant for checking correctness
-    # This test is intended to be run with pytest -s
-    assert tri_fwd_diff < 0.1, f"Triton fwd diff too large: {tri_fwd_diff}"
-    assert tri_dq < 0.1, f"Triton dQ diff too large: {tri_dq}"
-    assert tri_dkv < 0.1, f"Triton dKV diff too large: {tri_dkv}"
-    assert tri_dsink < 0.1, f"Triton dSink diff too large: {tri_dsink}"
+    assert r_fwd < 5, f"Triton fwd diff too large, ratio of triton bf16 to ref bf16 error is: {r_fwd}"
+    assert r_dq < 5, f"Triton dQ diff too large, ratio of triton bf16 to ref bf16 error is: {tri_dq}"
+    assert r_dkv < 5, f"Triton dKV diff too large, ratio of triton bf16 to ref bf16 error is: {tri_dkv}"
+    assert r_didx < 5, f"Triton dSink diff too large, ratio of triton bf16 to ref bf16 error is: {r_didx}"
+    assert r_dsink < 5, f"Triton dSink diff too large, ratio of triton bf16 to ref bf16 error is: {r_dsink}"
