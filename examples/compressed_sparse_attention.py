@@ -257,12 +257,15 @@ def CSA(
     KV: Projection from residual stream; expected shape: (B, H_KV, S, D)
     C_a, C_b: Projections from the residual stream that will be attended to; each expected shape: (B, H_KV, S, D)
     Z_a, Z_b: Projections from the residual stream that weight C_a and C_b; each expected shape: (B, H_KV, S, D)
-    B_a, B_b: Biases for C_a * Z_a + B_a computation; each expected shape: (R, D)
+    B_a, B_b: Learnable per-position-within-block biases (Eq 11 in the paper). Added to Z_a, Z_b
+        after reshaping into blocks. Expected shape: any broadcastable to (B, H_KV, num_blocks, R, D)
+        — typically (R, D) or (1, 1, 1, R, D).
 
     W_I: Projection from the residual stream, per-head weight on indexer scores (Batch, sequence, num_heads); expected shape: (B, S, H_I)
     K_Ia, K_Ib: Projections from the residual stream for computing indexing; each expected shape: (B, H_IKV, S, D_I)
     Z_Ia, Z_Ib: Projections from the residual stream, performs similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
-    B_Ia, B_Ib: Similar role to B_a, but for the indexing branch; each expected shape: (R, D_I)
+    B_Ia, B_Ib: Same role as B_a/B_b but for the indexing branch. Expected shape: any broadcastable
+        to (B, H_IKV, num_blocks, R, D_I) — typically (R, D_I) or (1, 1, 1, R, D_I).
 
     KV_norm_weight: RMS norm weights for KV; expected shape: (D,)
     compressed_indices_norm_weight: RMS weights for compressed indices; expected shape: (D_I,)
@@ -270,7 +273,8 @@ def CSA(
 
     attention_sink: Learned weight in shape of (num_heads, ), functions as attention sink; expected shape: (H,)
 
-    compression_rate: size of each compressed block / 2 (due to block interleaving)
+    compression_rate: size of each compressed block (the paper's m). Block interleaving means
+        each compressed entry draws from 2m tokens, but the compression ratio is m:1.
     num_topk_blocks: number of blocks to attend to per query
     sliding_window_size: size of sliding window for SWA
     rope_dims: number of dimensions to apply rope to
