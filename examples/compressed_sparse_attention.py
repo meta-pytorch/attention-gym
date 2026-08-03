@@ -1,4 +1,7 @@
-"""Compose compressed sparse attention from the selected-attention primitive."""
+"""
+Compose compressed sparse attention from the selected-attention primitive.
+Implementation of compressed sparse attention for here: https://arxiv.org/html/2606.19348v1
+"""
 
 import math
 
@@ -9,6 +12,9 @@ from attn_gym.sparse.selected_attention import selected_attention
 
 
 def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
+    """
+    Pads a tensor such that the tensor's sequence_length % m == 0
+    """
     n = x.shape[-2]
     pad_length = (-n) % m
     if pad_length == 0:
@@ -17,7 +23,13 @@ def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
 
 
 def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
-    """Split the sequence dimension into block and within-block dimensions."""
+    """
+    Args:
+        x: tensor in shape of (batch, heads, sequence_length, dim)
+        compression_rate: integer, size of each blog
+    Returns:
+        tensor in shape of (batch, heads, sequence_length/compression_rate, compression_rate, dim)
+    """
     return x.reshape(
         *x.shape[:-2],
         x.shape[-2] // compression_rate,
@@ -27,31 +39,50 @@ def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
 
 
 def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
+    """
+    Args:
+        C_a, C_b, Z_a, Z_b, B_a, B_b: Tensors from CSA inputs
+        compression_rate: int, size of each block (and also how much they're compressed by)
+    Returns:
+        Weighted, tensor in shape of (batch, num_heads, sequence_length, head_dim)
+    """
+    # Pad everything to be evenly divisible by block size
     C_a = pad_to_block_size(C_a, compression_rate, 0.0)
     C_b = pad_to_block_size(C_b, compression_rate, 0.0)
     Z_a = pad_to_block_size(Z_a, compression_rate, float("-inf"))
     Z_b = pad_to_block_size(Z_b, compression_rate, float("-inf"))
-
+    # Shift C_b, Z_b one block to the right and pad / index accordingly
     C_b = F.pad(C_b, (0, 0, compression_rate, 0), "constant", 0.0)[:, :, :-compression_rate, :]
     Z_b = F.pad(Z_b, (0, 0, compression_rate, 0), "constant", float("-inf"))[
         :, :, :-compression_rate, :
     ]
-
+    # Reshape tensors into blocks
     Z_a = _split_blocks(Z_a, compression_rate)
     Z_b = _split_blocks(Z_b, compression_rate)
     C_a = _split_blocks(C_a, compression_rate)
     C_b = _split_blocks(C_b, compression_rate)
-
+    # Add biases, perform a softmax, and split out the blocks
     logits = torch.cat([Z_a + B_a, Z_b + B_b], dim=-2)
     logits_normalized = F.softmax(logits, dim=-2)
     S_a = logits_normalized[:, :, :, :compression_rate, :]
     S_b = logits_normalized[:, :, :, compression_rate:, :]
-
+    # Perform a weighted multiplication and reduce to compress information
     weighted = C_a * S_a + C_b * S_b
     return torch.sum(weighted, dim=-2)
 
 
 def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
+    """
+    Masks out causally invalid blocks (queries can only attend to blocks created by KV values before it)
+    Args:
+        query_length: int, length of query
+        num_blocks: int, total numbers of blocks
+        compression_rate: int, size of each block
+        device: device to create mask on
+        dtype: dtype of mask
+    Returns:
+        Mask in shape of (num_blocks, query_length), with entries of -inf or 0
+    """
     query_positions = torch.arange(query_length, device=device)
     block_positions = torch.arange(num_blocks, device=device)
     completed_blocks = (query_positions + 1) // compression_rate
@@ -71,6 +102,9 @@ def apply_rope(
     position_offset: int = 0,
     inverse: bool = False,
 ) -> torch.Tensor:
+    """
+    Applies YaRN as mentioned in the paper
+    """
     sequence_length = x.shape[-2]
     rotary_dim = x.shape[-1]
 
@@ -146,7 +180,10 @@ def _selected_attention_with_causal_blocks(
     attention_sink,
     sliding_window_size,
 ):
-    """Call selected_attention while preserving the completed-block constraint."""
+    """Call selected_attention while preserving the completed-block constraint.
+
+    Invalid (causally unavailable) selections are replaced with -1 sentinels.
+    """
     if topk_blocks.shape[-1] == 0:
         return selected_attention(
             Q,
@@ -162,13 +199,10 @@ def _selected_attention_with_causal_blocks(
     valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
     selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
 
-    # scatter() treats duplicate indices as one selection. Replacing an invalid
-    # top-k entry with any valid entry therefore reproduces the original additive mask.
-    first_valid_slot = selected_is_valid.to(torch.int64).argmax(dim=-1, keepdim=True)
-    first_valid_block = topk_blocks.gather(dim=-1, index=first_valid_slot)
-    causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, first_valid_block)
+    # Replace causally invalid selections with -1 sentinel
+    causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
-    selected_output = selected_attention(
+    return selected_attention(
         Q,
         KV,
         compressed_kv,
@@ -178,21 +212,6 @@ def _selected_attention_with_causal_blocks(
         sliding_window_size,
         False,
     )
-
-    # Before the first compressed block is complete there is no valid replacement.
-    # An empty index tensor keeps the compressed branch present but fully masked.
-    local_output = selected_attention(
-        Q,
-        KV,
-        compressed_kv,
-        topk_blocks[..., :0],
-        attention_sink,
-        None,
-        sliding_window_size,
-        False,
-    )
-    has_selected_block = selected_is_valid.any(dim=-1)[:, None, :, None]
-    return torch.where(has_selected_block, selected_output, local_output)
 
 
 def CSA(
@@ -222,6 +241,42 @@ def CSA(
     rope_dims: int,
     share_kv: bool,
 ):
+    """
+    Naming of args uses convention from Deepseek v4 paper
+
+    Shape notation: B=batch size, H=attention heads, H_I=indexer heads, S=sequence length,
+    D=attention dimension, D_I=index dimension, R=compression_rate,
+    H_KV=H and H_IKV=H_I when share_kv=False. When share_kv=True, those dimensions
+    may instead be 1.
+
+    Rope and normalization are applied within the function for KV vectors, but not for Q or Q_I
+    This is because Q and Q_I are expected to be projected from the same normalized and pre-rotated latent
+    Q: Query vector for attention; expected to be normalized beforehand; expected shape: (B, H, S, D)
+    Q_I: Query vector for indexing; expected to be normalized beforehand; expected shape: (B, H_I, S, D_I)
+
+    KV: Projection from residual stream; expected shape: (B, H_KV, S, D)
+    C_a, C_b: Projections from the residual stream that will be attended to; each expected shape: (B, H_KV, S, D)
+    Z_a, Z_b: Projections from the residual stream that weight C_a and C_b; each expected shape: (B, H_KV, S, D)
+    B_a, B_b: Biases for C_a * Z_a + B_a computation; each expected shape: (R, D)
+
+    W_I: Projection from the residual stream, per-head weight on indexer scores (Batch, sequence, num_heads); expected shape: (B, S, H_I)
+    K_Ia, K_Ib: Projections from the residual stream for computing indexing; each expected shape: (B, H_IKV, S, D_I)
+    Z_Ia, Z_Ib: Projections from the residual stream, performs similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
+    B_Ia, B_Ib: Similar role to B_a, but for the indexing branch; each expected shape: (R, D_I)
+
+    KV_norm_weight: RMS norm weights for KV; expected shape: (D,)
+    compressed_indices_norm_weight: RMS weights for compressed indices; expected shape: (D_I,)
+    compressed_kv_norm_weight: RMS norm weights for compressed blocks; expected shape: (D,)
+
+    attention_sink: Learned weight in shape of (num_heads, ), functions as attention sink; expected shape: (H,)
+
+    compression_rate: size of each compressed block / 2 (due to block interleaving)
+    num_topk_blocks: number of blocks to attend to per query
+    sliding_window_size: size of sliding window for SWA
+    rope_dims: number of dimensions to apply rope to
+    share_kv: True if all query heads attented to one kv head
+    """
+
     device = Q.device
     dtype = Q.dtype
     _, num_heads, sequence_length, _ = Q.shape
@@ -247,6 +302,7 @@ def CSA(
     KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
 
     compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
+    # Apply rope to the last rope_dim dimensions
     compressed_indices = torch.cat(
         [
             compressed_indices[..., :-rope_dims],

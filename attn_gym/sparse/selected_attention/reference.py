@@ -90,6 +90,8 @@ def selected_attention(
 
         indices: Which indices to attend to. Shape of (batch, num_heads, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
+            If less than num_topk_blocks should be indexed, pad the tensor with -1
+            Duplicate indices will be computed multiple times.
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
@@ -113,11 +115,24 @@ def selected_attention(
         KV = KV.expand(-1, h, -1, -1)
         index_kv = index_kv.expand(-1, h, -1, -1)
     if indices is not None:
-        # We have s queries that each potentially attend to index_sequence_length elements
-        topk_mask = torch.full(
-            (b, s, index_sequence_length), float("-inf"), device=device, dtype=dtype
+        # We have s queries that each potentially attend to index_sequence_length elements.
+        # Indices of -1 are sentinel values meaning "no selection for this slot".
+        # Repeated indices get extra weight (equivalent to multiple copies in the attention set).
+        # This is specifically for edge case handling,
+        # since most uses of this will have indices pass through torch.topk
+        valid_mask = indices >= 0
+        safe_indices = indices.clamp(min=0)
+        # Count how many times each position is selected per query (ignoring sentinels)
+        counts = torch.zeros(b, s, index_sequence_length, device=device, dtype=dtype)
+        counts.scatter_add_(
+            dim=-1,
+            index=safe_indices,
+            src=valid_mask.to(dtype),
         )
-        topk_mask.scatter_(dim=-1, index=indices, value=0.0)
+        # Convert counts to additive log-mask: 0 selections → -inf, k selections → log(k)
+        topk_mask = torch.where(
+            counts > 0, torch.log(counts), torch.full_like(counts, float("-inf"))
+        )
 
     SWA_mask = make_sliding_window_mask(s, sliding_window_size, device, dtype).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)

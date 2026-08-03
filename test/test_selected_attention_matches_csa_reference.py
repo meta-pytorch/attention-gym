@@ -277,7 +277,10 @@ def _selected_attention_with_causal_blocks(
     attention_sink,
     sliding_window_size,
 ):
-    """Call selected_attention while preserving the completed-block constraint."""
+    """Call selected_attention while preserving the completed-block constraint.
+
+    Invalid (causally unavailable) selections are replaced with -1 sentinels.
+    """
     if topk_blocks.shape[-1] == 0:
         return selected_attention(
             Q,
@@ -293,11 +296,10 @@ def _selected_attention_with_causal_blocks(
     valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
     selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
 
-    first_valid_slot = selected_is_valid.to(torch.int64).argmax(dim=-1, keepdim=True)
-    first_valid_block = topk_blocks.gather(dim=-1, index=first_valid_slot)
-    causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, first_valid_block)
+    # Replace causally invalid selections with -1 sentinel
+    causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
-    selected_output = selected_attention(
+    return selected_attention(
         Q,
         KV,
         compressed_kv,
@@ -307,19 +309,6 @@ def _selected_attention_with_causal_blocks(
         sliding_window_size,
         False,
     )
-
-    local_output = selected_attention(
-        Q,
-        KV,
-        compressed_kv,
-        topk_blocks[..., :0],
-        attention_sink,
-        None,
-        sliding_window_size,
-        False,
-    )
-    has_selected_block = selected_is_valid.any(dim=-1)[:, None, :, None]
-    return torch.where(has_selected_block, selected_output, local_output)
 
 
 def _csa_with_selected_attention(

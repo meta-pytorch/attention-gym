@@ -90,6 +90,7 @@ def _validate_inputs(
             f"attention_sink must have shape [{heads}], got {list(attention_sink.shape)}."
         )
 
+    # --- doc_ids (optional) ---
     if doc_ids is not None:
         if not isinstance(doc_ids, torch.Tensor):
             raise TypeError(
@@ -146,9 +147,10 @@ def selected_attention(
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
-    _validate_inputs(
-        Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv
-    )
+    if not torch.compiler.is_compiling():
+        _validate_inputs(
+            Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv
+        )
 
     match backend:
         case "eager":
