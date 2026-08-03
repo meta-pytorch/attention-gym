@@ -280,7 +280,7 @@ def _selected_attention_bwd_dq(
         )
 
     # Index branch gradient
-    for selected_slot in tl.static_range(0, TOPK):
+    for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
             indices_ptr
             + batch * stride_xb
@@ -308,7 +308,7 @@ def _selected_attention_bwd_dq(
     # Local window gradient
     first_key = query_block * BLOCK_M - WINDOW + 1
     offsets_n_base = tl.arange(0, BLOCK_N)
-    for key_tile in tl.static_range(0, NUM_LOCAL_TILES):
+    for key_tile in tl.range(0, NUM_LOCAL_TILES):
         offsets_n = first_key + key_tile * BLOCK_N + offsets_n_base
         key_mask = (offsets_n >= 0) & (offsets_n < S)
         local_values = tl.load(
