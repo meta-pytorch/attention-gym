@@ -24,6 +24,7 @@ def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
 
 def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
     """
+    Chunk the sequence into blocks as mentioned in the paper.
     Args:
         x: tensor in shape of (batch, heads, sequence_length, dim)
         compression_rate: integer, size of each blog
@@ -40,6 +41,8 @@ def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
 
 def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
     """
+    Function to compress the non-sliding window KV into blocks
+    Formula is from the paper.
     Args:
         C_a, C_b, Z_a, Z_b, B_a, B_b: Tensors from CSA inputs
         compression_rate: int, size of each block (and also how much they're compressed by)
@@ -103,7 +106,8 @@ def apply_rope(
     inverse: bool = False,
 ) -> torch.Tensor:
     """
-    Applies YaRN as mentioned in the paper
+    Applies YaRN as mentioned in the inference code on huggingface here:
+    https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/model.py
     """
     sequence_length = x.shape[-2]
     rotary_dim = x.shape[-1]

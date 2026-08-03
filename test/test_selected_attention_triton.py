@@ -282,10 +282,11 @@ def test_triton_larger_sequence():
 
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 2, 4])
-def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
-    """Report max forward/backward diffs between bf16 and fp64 reference runs.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_precision_vs_fp64(share_kv, num_topk, dtype):
+    """Report max forward/backward diffs between a lower-precision dtype and fp64.
 
-    This characterizes the numerical error introduced by bf16 precision so that
+    This characterizes the numerical error introduced by the given precision so that
     tolerance thresholds for kernel tests can be set with confidence.
     """
     _skip_no_cuda()
@@ -295,6 +296,7 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
     kv_heads = 1 if share_kv else heads
     seed = 77
     device = torch.device("cuda")
+    dtype_name = str(dtype).removeprefix("torch.")
 
     # --- Generate inputs in fp64 (ground truth) ---
     gen64 = torch.Generator(device=device).manual_seed(seed)
@@ -318,16 +320,16 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
         heads, dtype=torch.float64, device=device, generator=gen64, requires_grad=True
     )
 
-    # --- bf16 copies on CUDA (cast from the same fp64 values) ---
-    Q_bf_ref = Q_64.detach().to(torch.bfloat16).requires_grad_(True)
-    KV_bf_ref = KV_64.detach().to(torch.bfloat16).requires_grad_(True)
-    index_kv_bf_ref = index_kv_64.detach().to(torch.bfloat16).requires_grad_(True)
-    sink_bf_ref = sink_64.detach().to(torch.bfloat16).requires_grad_(True)
+    # --- Lower-precision copies on CUDA (cast from the same fp64 values) ---
+    Q_lp_ref = Q_64.detach().to(dtype).requires_grad_(True)
+    KV_lp_ref = KV_64.detach().to(dtype).requires_grad_(True)
+    index_kv_lp_ref = index_kv_64.detach().to(dtype).requires_grad_(True)
+    sink_lp_ref = sink_64.detach().to(dtype).requires_grad_(True)
 
-    Q_bf_tri = Q_64.detach().to(torch.bfloat16).requires_grad_(True)
-    KV_bf_tri = KV_64.detach().to(torch.bfloat16).requires_grad_(True)
-    index_kv_bf_tri = index_kv_64.detach().to(torch.bfloat16).requires_grad_(True)
-    sink_bf_tri = sink_64.detach().to(torch.bfloat16).requires_grad_(True)
+    Q_lp_tri = Q_64.detach().to(dtype).requires_grad_(True)
+    KV_lp_tri = KV_64.detach().to(dtype).requires_grad_(True)
+    index_kv_lp_tri = index_kv_64.detach().to(dtype).requires_grad_(True)
+    sink_lp_tri = sink_64.detach().to(dtype).requires_grad_(True)
 
     # --- Forward (fp64 reference as ground truth) ---
     out_64 = selected_attention(
@@ -341,52 +343,52 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
         share_kv,
         backend="eager",
     )
-    out_bf_ref = selected_attention(
-        Q_bf_ref,
-        KV_bf_ref,
-        index_kv_bf_ref,
+    out_lp_ref = selected_attention(
+        Q_lp_ref,
+        KV_lp_ref,
+        index_kv_lp_ref,
         indices,
-        sink_bf_ref,
+        sink_lp_ref,
         None,
         sliding_window_size,
         share_kv,
         backend="eager",
     )
-    out_bf_tri = selected_attention(
-        Q_bf_tri,
-        KV_bf_tri,
-        index_kv_bf_tri,
+    out_lp_tri = selected_attention(
+        Q_lp_tri,
+        KV_lp_tri,
+        index_kv_lp_tri,
         indices,
-        sink_bf_tri,
+        sink_lp_tri,
         None,
         sliding_window_size,
         share_kv,
         backend="triton",
     )
 
-    ref_fwd_diff = (out_64.float() - out_bf_ref.float()).abs().max().item()
-    tri_fwd_diff = (out_64.float() - out_bf_tri.float()).abs().max().item()
+    ref_fwd_diff = (out_64.float() - out_lp_ref.float()).abs().max().item()
+    tri_fwd_diff = (out_64.float() - out_lp_tri.float()).abs().max().item()
 
     # --- Backward ---
     grad_gen = torch.Generator(device=device).manual_seed(1234)
     grad_64 = torch.randn(out_64.shape, dtype=torch.float64, device=device, generator=grad_gen)
-    grad_bf = grad_64.to(torch.bfloat16)
+    grad_lp = grad_64.to(dtype)
 
     out_64.backward(grad_64)
-    out_bf_ref.backward(grad_bf)
-    out_bf_tri.backward(grad_bf)
+    out_lp_ref.backward(grad_lp)
+    out_lp_tri.backward(grad_lp)
 
-    ref_dq = (Q_64.grad.float() - Q_bf_ref.grad.float()).abs().max().item()
-    tri_dq = (Q_64.grad.float() - Q_bf_tri.grad.float()).abs().max().item()
-    ref_dkv = (KV_64.grad.float() - KV_bf_ref.grad.float()).abs().max().item()
-    tri_dkv = (KV_64.grad.float() - KV_bf_tri.grad.float()).abs().max().item()
-    ref_didx = (index_kv_64.grad.float() - index_kv_bf_ref.grad.float()).abs().max().item()
-    tri_didx = (index_kv_64.grad.float() - index_kv_bf_tri.grad.float()).abs().max().item()
-    ref_dsink = (sink_64.grad.float() - sink_bf_ref.grad.float()).abs().max().item()
-    tri_dsink = (sink_64.grad.float() - sink_bf_tri.grad.float()).abs().max().item()
+    ref_dq = (Q_64.grad.float() - Q_lp_ref.grad.float()).abs().max().item()
+    tri_dq = (Q_64.grad.float() - Q_lp_tri.grad.float()).abs().max().item()
+    ref_dkv = (KV_64.grad.float() - KV_lp_ref.grad.float()).abs().max().item()
+    tri_dkv = (KV_64.grad.float() - KV_lp_tri.grad.float()).abs().max().item()
+    ref_didx = (index_kv_64.grad.float() - index_kv_lp_ref.grad.float()).abs().max().item()
+    tri_didx = (index_kv_64.grad.float() - index_kv_lp_tri.grad.float()).abs().max().item()
+    ref_dsink = (sink_64.grad.float() - sink_lp_ref.grad.float()).abs().max().item()
+    tri_dsink = (sink_64.grad.float() - sink_lp_tri.grad.float()).abs().max().item()
 
     # Compute ratios (triton error / reference error). Ratio ~1 means triton
-    # adds no precision loss beyond bf16 itself. >1 means triton is worse.
+    # adds no precision loss beyond the dtype itself. >1 means triton is worse.
     def _ratio(tri_val, ref_val):
         if ref_val == 0:
             return float("inf") if tri_val > 0 else 1.0
@@ -400,11 +402,11 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
 
     # Print a report (visible with pytest -s)
     print(
-        f"\n[share_kv={share_kv}, topk={num_topk}]"
+        f"\n[{dtype_name}, share_kv={share_kv}, topk={num_topk}]"
         f"\n  {'':15s} {'fwd':>10s} {'dQ':>10s} {'dKV':>10s} {'dIdx':>10s} {'dSink':>10s}"
-        f"\n  {'ref bf16':15s} {ref_fwd_diff:10.4e} {ref_dq:10.4e} {ref_dkv:10.4e}"
+        f"\n  {f'ref {dtype_name}':15s} {ref_fwd_diff:10.4e} {ref_dq:10.4e} {ref_dkv:10.4e}"
         f" {ref_didx:10.4e} {ref_dsink:10.4e}"
-        f"\n  {'triton bf16':15s} {tri_fwd_diff:10.4e} {tri_dq:10.4e} {tri_dkv:10.4e}"
+        f"\n  {f'triton {dtype_name}':15s} {tri_fwd_diff:10.4e} {tri_dq:10.4e} {tri_dkv:10.4e}"
         f" {tri_didx:10.4e} {tri_dsink:10.4e}"
         f"\n  {'triton/ref':15s} {r_fwd:10.2f}x {r_dq:10.2f}x {r_dkv:10.2f}x"
         f" {r_didx:10.2f}x {r_dsink:10.2f}x"
@@ -414,16 +416,16 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
     # Not really meant for checking correctness
     assert (
         r_fwd < 5
-    ), f"Triton fwd diff too large, ratio of triton bf16 to ref bf16 error is: {r_fwd}"
+    ), f"Triton fwd diff too large, ratio of triton to ref {dtype_name} error is: {r_fwd}"
     assert (
         r_dq < 5
-    ), f"Triton dQ diff too large, ratio of triton bf16 to ref bf16 error is: {tri_dq}"
+    ), f"Triton dQ diff too large, ratio of triton to ref {dtype_name} error is: {r_dq}"
     assert (
         r_dkv < 5
-    ), f"Triton dKV diff too large, ratio of triton bf16 to ref bf16 error is: {tri_dkv}"
+    ), f"Triton dKV diff too large, ratio of triton to ref {dtype_name} error is: {r_dkv}"
     assert (
         r_didx < 5
-    ), f"Triton dSink diff too large, ratio of triton bf16 to ref bf16 error is: {r_didx}"
+    ), f"Triton dIdx diff too large, ratio of triton to ref {dtype_name} error is: {r_didx}"
     assert (
         r_dsink < 5
-    ), f"Triton dSink diff too large, ratio of triton bf16 to ref bf16 error is: {r_dsink}"
+    ), f"Triton dSink diff too large, ratio of triton to ref {dtype_name} error is: {r_dsink}"
