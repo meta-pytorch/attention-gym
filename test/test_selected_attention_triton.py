@@ -1,9 +1,9 @@
-'''
+"""
 To check reference bf16 vs triton bf16 diffs, run:
 python -m pytest test/test_selected_attention_triton.py::test_reference_bf16_vs_fp64_precision -v -s
 
 Triton max diff is between 0.59-1.23x the reference's max diff
-'''
+"""
 
 import pytest
 import torch
@@ -97,14 +97,18 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
     """Triton forward with doc_ids matches the eager reference."""
     _skip_no_cuda()
     seq_len = 32
-    doc_ids = torch.cat([
-        torch.zeros(seq_len // 2, dtype=torch.long),
-        torch.ones(seq_len // 2, dtype=torch.long),
-    ]).unsqueeze(0).expand(2, -1)
-
-    inputs = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids
+    doc_ids = (
+        torch.cat(
+            [
+                torch.zeros(seq_len // 2, dtype=torch.long),
+                torch.ones(seq_len // 2, dtype=torch.long),
+            ]
+        )
+        .unsqueeze(0)
+        .expand(2, -1)
     )
+
+    inputs = _make_inputs(share_kv=share_kv, num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids)
 
     with torch.inference_mode():
         expected = selected_attention(**inputs, backend="eager")
@@ -118,12 +122,8 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
 def test_triton_backward_dq(share_kv, num_topk):
     """Triton backward produces correct gradients for Q."""
     _skip_no_cuda()
-    inputs_ref = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123
-    )
-    inputs_tri = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123
-    )
+    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123)
+    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123)
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -143,12 +143,8 @@ def test_triton_backward_dq(share_kv, num_topk):
 def test_triton_backward_dlocal_kv(share_kv, num_topk):
     """Triton backward produces correct gradients for local KV."""
     _skip_no_cuda()
-    inputs_ref = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456
-    )
-    inputs_tri = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456
-    )
+    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456)
+    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456)
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -168,12 +164,8 @@ def test_triton_backward_dlocal_kv(share_kv, num_topk):
 def test_triton_backward_dindex_kv(share_kv, num_topk):
     """Triton backward produces correct gradients for index KV."""
     _skip_no_cuda()
-    inputs_ref = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789
-    )
-    inputs_tri = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789
-    )
+    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789)
+    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789)
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -196,12 +188,8 @@ def test_triton_backward_dindex_kv(share_kv, num_topk):
 def test_triton_backward_dsink(share_kv, num_topk):
     """Triton backward produces correct gradients for attention_sink."""
     _skip_no_cuda()
-    inputs_ref = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321
-    )
-    inputs_tri = _make_inputs(
-        share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321
-    )
+    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321)
+    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321)
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -224,10 +212,16 @@ def test_triton_backward_with_doc_ids(num_topk):
     """Triton backward with doc_ids matches the reference."""
     _skip_no_cuda()
     seq_len = 32
-    doc_ids = torch.cat([
-        torch.zeros(seq_len // 2, dtype=torch.long),
-        torch.ones(seq_len // 2, dtype=torch.long),
-    ]).unsqueeze(0).expand(2, -1)
+    doc_ids = (
+        torch.cat(
+            [
+                torch.zeros(seq_len // 2, dtype=torch.long),
+                torch.ones(seq_len // 2, dtype=torch.long),
+            ]
+        )
+        .unsqueeze(0)
+        .expand(2, -1)
+    )
 
     inputs_ref = _make_inputs(
         num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
@@ -270,8 +264,13 @@ def test_triton_larger_sequence():
     """Triton handles larger sequence lengths correctly."""
     _skip_no_cuda()
     inputs = _make_inputs(
-        batch=1, heads=2, seq_len=256, head_dim=64,
-        index_seq_len=64, num_topk=4, sliding_window_size=32,
+        batch=1,
+        heads=2,
+        seq_len=256,
+        head_dim=64,
+        index_seq_len=64,
+        num_topk=4,
+        sliding_window_size=32,
     )
 
     with torch.inference_mode():
@@ -332,16 +331,37 @@ def test_reference_bf16_vs_fp64_precision(share_kv, num_topk):
 
     # --- Forward (fp64 reference as ground truth) ---
     out_64 = selected_attention(
-        Q_64, KV_64, index_kv_64, indices, sink_64, None,
-        sliding_window_size, share_kv, backend="eager",
+        Q_64,
+        KV_64,
+        index_kv_64,
+        indices,
+        sink_64,
+        None,
+        sliding_window_size,
+        share_kv,
+        backend="eager",
     )
     out_bf_ref = selected_attention(
-        Q_bf_ref, KV_bf_ref, index_kv_bf_ref, indices, sink_bf_ref, None,
-        sliding_window_size, share_kv, backend="eager",
+        Q_bf_ref,
+        KV_bf_ref,
+        index_kv_bf_ref,
+        indices,
+        sink_bf_ref,
+        None,
+        sliding_window_size,
+        share_kv,
+        backend="eager",
     )
     out_bf_tri = selected_attention(
-        Q_bf_tri, KV_bf_tri, index_kv_bf_tri, indices, sink_bf_tri, None,
-        sliding_window_size, share_kv, backend="triton",
+        Q_bf_tri,
+        KV_bf_tri,
+        index_kv_bf_tri,
+        indices,
+        sink_bf_tri,
+        None,
+        sliding_window_size,
+        share_kv,
+        backend="triton",
     )
 
     ref_fwd_diff = (out_64.float() - out_bf_ref.float()).abs().max().item()

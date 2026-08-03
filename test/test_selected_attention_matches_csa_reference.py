@@ -90,10 +90,7 @@ def apply_rope(
         positions = positions.to(device=x.device, dtype=torch.float32)
 
     frequencies = 1.0 / (
-        base
-        ** (
-            torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim
-        )
+        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim)
     )
 
     if original_seq_len > 0:
@@ -110,9 +107,9 @@ def apply_rope(
         if low == high:
             high += 0.001
 
-        ramp = (
-            torch.arange(rotary_dim // 2, device=x.device, dtype=torch.float32) - low
-        ) / (high - low)
+        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=torch.float32) - low) / (
+            high - low
+        )
         smooth = 1 - ramp.clamp(0, 1)
         frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
 
@@ -151,9 +148,9 @@ def _make_sliding_window_mask(query_length, window_size, device, dtype):
     valid = (key_positions <= query_positions) & (
         key_positions >= query_positions - window_size + 1
     )
-    return torch.zeros(
-        (query_length, query_length), device=device, dtype=dtype
-    ).masked_fill(~valid, float("-inf"))
+    return torch.zeros((query_length, query_length), device=device, dtype=dtype).masked_fill(
+        ~valid, float("-inf")
+    )
 
 
 def _sink_softmax(x, sink, dim):
@@ -167,11 +164,31 @@ def _sink_softmax(x, sink, dim):
 
 
 def reference_CSA(
-    Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b,
-    W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-    KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight,
-    attention_sink, compression_rate, num_topk_blocks, sliding_window_size,
-    rope_dims: int, share_kv: bool,
+    Q,
+    Q_I,
+    KV,
+    C_a,
+    C_b,
+    Z_a,
+    Z_b,
+    B_a,
+    B_b,
+    W_I,
+    K_Ia,
+    K_Ib,
+    Z_Ia,
+    Z_Ib,
+    B_Ia,
+    B_Ib,
+    KV_norm_weight,
+    compressed_indices_norm_weight,
+    compressed_kv_norm_weight,
+    attention_sink,
+    compression_rate,
+    num_topk_blocks,
+    sliding_window_size,
+    rope_dims: int,
+    share_kv: bool,
 ):
     device = Q.device
     dtype = Q.dtype
@@ -194,9 +211,7 @@ def reference_CSA(
     num_total_blocks = compressed_kv.shape[-2]
 
     Q = torch.cat([Q[:, :, :, :-rope_dims], apply_rope(Q[:, :, :, -rope_dims:])], dim=-1)
-    Q_I = torch.cat(
-        [Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1
-    )
+    Q_I = torch.cat([Q_I[:, :, :, :-rope_dims], apply_rope(Q_I[:, :, :, -rope_dims:])], dim=-1)
     KV = torch.cat([KV[:, :, :, :-rope_dims], apply_rope(KV[:, :, :, -rope_dims:])], dim=-1)
 
     compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
@@ -221,9 +236,7 @@ def reference_CSA(
     W_I_perm = torch.permute(W_I, (0, 2, 1)).unsqueeze(-1)
     scores = torch.sum(torch.multiply(W_I_perm, scores), dim=1) + indexer_mask
 
-    _, topk_blocks = torch.topk(
-        scores, k=min(num_topk_blocks, num_total_blocks), dim=-1
-    )
+    _, topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1)
     topk_mask = torch.full(scores.shape, float("-inf"), device=device, dtype=dtype)
     topk_mask.scatter_(dim=-1, index=topk_blocks, value=0.0)
     topk_mask += indexer_mask
@@ -233,7 +246,7 @@ def reference_CSA(
 
     attention_kv = torch.cat([compressed_kv, KV], dim=-2)
     attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
-    scale = head_dim ** 0.5
+    scale = head_dim**0.5
 
     P = _sink_softmax(
         torch.matmul(Q, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask,
@@ -256,13 +269,25 @@ def reference_CSA(
 
 
 def _selected_attention_with_causal_blocks(
-    Q, KV, compressed_kv, topk_blocks, indexer_mask, attention_sink, sliding_window_size,
+    Q,
+    KV,
+    compressed_kv,
+    topk_blocks,
+    indexer_mask,
+    attention_sink,
+    sliding_window_size,
 ):
     """Call selected_attention while preserving the completed-block constraint."""
     if topk_blocks.shape[-1] == 0:
         return selected_attention(
-            Q, KV, compressed_kv, topk_blocks, attention_sink, None,
-            sliding_window_size, False,
+            Q,
+            KV,
+            compressed_kv,
+            topk_blocks,
+            attention_sink,
+            None,
+            sliding_window_size,
+            False,
         )
 
     valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
@@ -273,24 +298,56 @@ def _selected_attention_with_causal_blocks(
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, first_valid_block)
 
     selected_output = selected_attention(
-        Q, KV, compressed_kv, causal_topk_blocks, attention_sink, None,
-        sliding_window_size, False,
+        Q,
+        KV,
+        compressed_kv,
+        causal_topk_blocks,
+        attention_sink,
+        None,
+        sliding_window_size,
+        False,
     )
 
     local_output = selected_attention(
-        Q, KV, compressed_kv, topk_blocks[..., :0], attention_sink, None,
-        sliding_window_size, False,
+        Q,
+        KV,
+        compressed_kv,
+        topk_blocks[..., :0],
+        attention_sink,
+        None,
+        sliding_window_size,
+        False,
     )
     has_selected_block = selected_is_valid.any(dim=-1)[:, None, :, None]
     return torch.where(has_selected_block, selected_output, local_output)
 
 
 def _csa_with_selected_attention(
-    Q, Q_I, KV, C_a, C_b, Z_a, Z_b, B_a, B_b,
-    W_I, K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib,
-    KV_norm_weight, compressed_indices_norm_weight, compressed_kv_norm_weight,
-    attention_sink, compression_rate, num_topk_blocks, sliding_window_size,
-    rope_dims: int, share_kv: bool,
+    Q,
+    Q_I,
+    KV,
+    C_a,
+    C_b,
+    Z_a,
+    Z_b,
+    B_a,
+    B_b,
+    W_I,
+    K_Ia,
+    K_Ib,
+    Z_Ia,
+    Z_Ib,
+    B_Ia,
+    B_Ib,
+    KV_norm_weight,
+    compressed_indices_norm_weight,
+    compressed_kv_norm_weight,
+    attention_sink,
+    compression_rate,
+    num_topk_blocks,
+    sliding_window_size,
+    rope_dims: int,
+    share_kv: bool,
 ):
     device = Q.device
     dtype = Q.dtype
@@ -340,11 +397,15 @@ def _csa_with_selected_attention(
     index_head_weights = W_I.transpose(1, 2).unsqueeze(-1)
     scores = torch.sum(index_head_weights * scores, dim=1) + indexer_mask
 
-    topk_blocks = torch.topk(
-        scores, k=min(num_topk_blocks, num_total_blocks), dim=-1
-    ).indices
+    topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1).indices
     attention_output = _selected_attention_with_causal_blocks(
-        Q, KV, compressed_kv, topk_blocks, indexer_mask, attention_sink, sliding_window_size,
+        Q,
+        KV,
+        compressed_kv,
+        topk_blocks,
+        indexer_mask,
+        attention_sink,
+        sliding_window_size,
     )
 
     return torch.cat(

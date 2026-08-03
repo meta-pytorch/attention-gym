@@ -1,13 +1,11 @@
 """Torch-only compressed sparse attention reference implementation."""
 
-import math
 import torch
-import torch.nn.functional as F
 
 
 def make_sliding_window_mask(query_length, window_size, device, dtype):
     """
-    Args: 
+    Args:
         query_length: Integer, length of query
         window_size: Integer, length of sliding window
         device: String, device to create tensors on
@@ -67,34 +65,35 @@ def make_packed_mask(
     # Head-broadcasting dimension.
     return mask[:, None, :, :]
 
+
 def selected_attention(
     Q,
     KV,
     index_kv,
-    indices, 
+    indices,
     attention_sink,
     doc_ids,
     sliding_window_size: int,
     share_kv: bool,
 ):
-    '''
+    """
     Args:
         Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        KV: Key and Value for the sliding window branch, 
+        KV: Key and Value for the sliding window branch,
             represented as a shared tensor, (batch_size, 1, sequence_length, head_dim) if share_kv = False
             Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
 
         index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim) if share_kv = False
             Otherwise represented as (batch_size, num_heads, X, head_dim)
-            where X is any number greater than 
+            where X is any number greater than
 
         indices: Which indices to attend to. Shape of (batch, num_heads, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
-        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None. 
+        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
             If doc_ids[i, j] = doc_ids[i, j-y], then Q[i, j] can causally attend to KV[i, j-y]
             Should be monotonically increasing on the sequence axis
@@ -103,9 +102,9 @@ def selected_attention(
         sliding_window_size: Integer, size of sliding window
 
         share_kv: bool, true iff all query heads attend to the same KV head
-    Returns: 
+    Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
-    '''
+    """
     device = Q.device
     dtype = Q.dtype
     b, h, s, head_dim = Q.shape
@@ -115,10 +114,11 @@ def selected_attention(
         index_kv = index_kv.expand(-1, h, -1, -1)
     if indices is not None:
         # We have s queries that each potentially attend to index_sequence_length elements
-        topk_mask = torch.full((b, s, index_sequence_length), float("-inf"), device=device, dtype=dtype)
+        topk_mask = torch.full(
+            (b, s, index_sequence_length), float("-inf"), device=device, dtype=dtype
+        )
         topk_mask.scatter_(dim=-1, index=indices, value=0.0)
-    
-    
+
     SWA_mask = make_sliding_window_mask(s, sliding_window_size, device, dtype).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)
 

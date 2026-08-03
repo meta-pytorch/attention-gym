@@ -95,14 +95,9 @@ def _validate_inputs(
             raise TypeError(
                 f"doc_ids must be a torch.Tensor or None, got {type(doc_ids).__name__}."
             )
-        if (
-            doc_ids.ndim != 2
-            or doc_ids.shape[0] != batch
-            or doc_ids.shape[1] != sequence_length
-        ):
+        if doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length:
             raise ValueError(
-                f"doc_ids must have shape [batch, sequence_length], "
-                f"got {list(doc_ids.shape)}."
+                f"doc_ids must have shape [batch, sequence_length], " f"got {list(doc_ids.shape)}."
             )
 
 
@@ -112,30 +107,30 @@ def selected_attention(
     index_kv,
     indices,
     attention_sink,
-    doc_ids = None,
+    doc_ids=None,
     sliding_window_size: int = 512,
     share_kv: bool = True,
     backend: Backend = "eager",
     mode: Mode = "auto",
 ):
-    '''
+    """
     Args:
         Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        KV: Key and Value for the sliding window branch, 
+        KV: Key and Value for the sliding window branch,
             represented as a shared tensor, (batch_size, 1, sequence_length, head_dim) if share_kv = False
             Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
 
         index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim) if share_kv = False
             Otherwise represented as (batch_size, num_heads, X, head_dim)
-            where X is any number greater than 
+            where X is any number greater than
 
         indices: Which indices to attend to. Shape of (batch, num_heads, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
-        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None. 
+        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
             If doc_ids[i, j] = doc_ids[i, j-y], then Q[i, j] can causally attend to KV[i, j-y]
             Should be monotonically increasing on the sequence axis
@@ -150,8 +145,10 @@ def selected_attention(
         mode: Currently only chunked is supported; auto defaults to chunked
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
-    '''
-    _validate_inputs(Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv)
+    """
+    _validate_inputs(
+        Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv
+    )
 
     match backend:
         case "eager":
@@ -181,6 +178,4 @@ def selected_attention(
                 share_kv,
             )
         case _:
-            raise NotImplementedError(
-                f"Backend {backend!r} is not supported yet."
-            )
+            raise NotImplementedError(f"Backend {backend!r} is not supported yet.")

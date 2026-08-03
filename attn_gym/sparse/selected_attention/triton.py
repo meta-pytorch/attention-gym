@@ -93,10 +93,7 @@ def _selected_attention_fwd(
     # Phase 1: Selected index blocks (each query selects different positions)
     for selected_slot in tl.static_range(0, TOPK):
         selected_idx = tl.load(
-            indices_ptr
-            + batch * stride_xb
-            + offsets_m * stride_xs
-            + selected_slot * stride_xk,
+            indices_ptr + batch * stride_xb + offsets_m * stride_xs + selected_slot * stride_xk,
             mask=query_mask,
             other=0,
         )
@@ -282,10 +279,7 @@ def _selected_attention_bwd_dq(
     # Index branch gradient
     for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
-            indices_ptr
-            + batch * stride_xb
-            + offsets_m * stride_xs
-            + selected_slot * stride_xk,
+            indices_ptr + batch * stride_xb + offsets_m * stride_xs + selected_slot * stride_xk,
             mask=query_mask,
             other=0,
         )
@@ -338,9 +332,7 @@ def _selected_attention_bwd_dq(
 
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
-        grad_probabilities = tl.dot(
-            grad_output, tl.trans(local_values), input_precision="tf32x3"
-        )
+        grad_probabilities = tl.dot(grad_output, tl.trans(local_values), input_precision="tf32x3")
         grad_scores = probabilities * (grad_probabilities - delta[:, None])
         grad_query += (
             tl.dot(
@@ -488,9 +480,7 @@ def _selected_attention_bwd_dlocal_kv(
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
-        grad_probabilities = tl.dot(
-            grad_output, tl.trans(local_values), input_precision="tf32x3"
-        )
+        grad_probabilities = tl.dot(grad_output, tl.trans(local_values), input_precision="tf32x3")
         grad_scores = probabilities * (grad_probabilities - delta[:, None])
         grad_values += tl.dot(
             tl.trans(probabilities.to(grad_output.dtype)),
@@ -584,12 +574,8 @@ def _selected_attention_bwd_dindex_kv(
         0.0,
     )
     grad_value = tl.zeros((16, BLOCK_D), tl.float32)
-    entry_start = tl.load(
-        block_offsets_ptr + batch * stride_bob + selected_block * stride_bon
-    )
-    entry_end = tl.load(
-        block_offsets_ptr + batch * stride_bob + (selected_block + 1) * stride_bon
-    )
+    entry_start = tl.load(block_offsets_ptr + batch * stride_bob + selected_block * stride_bon)
+    entry_end = tl.load(block_offsets_ptr + batch * stride_bob + (selected_block + 1) * stride_bon)
 
     for entry_tile in tl.range(entry_start, entry_end, BLOCK_M):
         entry_offsets = entry_tile + offsets_m_base
@@ -609,9 +595,7 @@ def _selected_attention_bwd_dindex_kv(
         )
         query = tl.load(q_ptr + query_offsets, mask=matrix_mask, other=0.0)
         output = tl.load(output_ptr + query_offsets, mask=matrix_mask, other=0.0)
-        grad_output = tl.load(
-            grad_output_ptr + query_offsets, mask=matrix_mask, other=0.0
-        )
+        grad_output = tl.load(grad_output_ptr + query_offsets, mask=matrix_mask, other=0.0)
         lse = tl.load(
             lse_ptr + batch * stride_leb + head * stride_leh + query_positions * stride_les,
             mask=query_mask,
@@ -620,9 +604,7 @@ def _selected_attention_bwd_dindex_kv(
         score_tile = tl.dot(query, dot_value, input_precision="tf32x3")
         scores = tl.sum(score_tile * (dot_rows[None, :] == 0), axis=1) * SCALE
         grad_probability_tile = tl.dot(grad_output, dot_value, input_precision="tf32x3")
-        grad_probabilities = tl.sum(
-            grad_probability_tile * (dot_rows[None, :] == 0), axis=1
-        )
+        grad_probabilities = tl.sum(grad_probability_tile * (dot_rows[None, :] == 0), axis=1)
         delta = tl.sum(grad_output * output, axis=1)
         probabilities = tl.where(query_mask, tl.exp(scores - lse), 0.0)
         grad_scores = probabilities * (grad_probabilities - delta)
@@ -733,9 +715,7 @@ def _build_index_query_map(
     flat_indices = indices.flatten(1)
     sorted_indices, sorted_entries = torch.sort(flat_indices, dim=-1)
     selected_queries = torch.div(sorted_entries, topk, rounding_mode="floor").to(torch.int32)
-    block_ids = torch.arange(
-        index_seq_len + 1, device=indices.device, dtype=sorted_indices.dtype
-    )
+    block_ids = torch.arange(index_seq_len + 1, device=indices.device, dtype=sorted_indices.dtype)
     block_ids = block_ids.unsqueeze(0).expand(batch, -1).contiguous()
     block_offsets = torch.searchsorted(sorted_indices, block_ids).to(torch.int32)
     return selected_queries.contiguous(), block_offsets.contiguous()
@@ -893,15 +873,26 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         sliding_window_size: int,
     ) -> torch.Tensor:
         output, lse = _launch_forward(
-            Q, index_kv, local_kv, indices, attention_sink, doc_ids,
-            sliding_window_size, _return_lse=True,
+            Q,
+            index_kv,
+            local_kv,
+            indices,
+            attention_sink,
+            doc_ids,
+            sliding_window_size,
+            _return_lse=True,
         )
-        selected_queries, block_offsets = _build_index_query_map(
-            indices, index_kv.shape[2]
-        )
+        selected_queries, block_offsets = _build_index_query_map(indices, index_kv.shape[2])
         ctx.save_for_backward(
-            Q, index_kv, local_kv, indices, selected_queries, block_offsets,
-            attention_sink, output, lse,
+            Q,
+            index_kv,
+            local_kv,
+            indices,
+            selected_queries,
+            block_offsets,
+            attention_sink,
+            output,
+            lse,
         )
         ctx.doc_ids = doc_ids
         ctx.sliding_window_size = sliding_window_size
@@ -910,12 +901,28 @@ class _SelectedAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (
-            Q, index_kv, local_kv, indices, selected_queries, block_offsets,
-            attention_sink, output, lse,
+            Q,
+            index_kv,
+            local_kv,
+            indices,
+            selected_queries,
+            block_offsets,
+            attention_sink,
+            output,
+            lse,
         ) = ctx.saved_tensors
         grad_Q, grad_index_kv, grad_local_kv, grad_sink = _launch_backward(
-            Q, index_kv, local_kv, indices, selected_queries, block_offsets,
-            attention_sink, ctx.doc_ids, output, lse, grad_output,
+            Q,
+            index_kv,
+            local_kv,
+            indices,
+            selected_queries,
+            block_offsets,
+            attention_sink,
+            ctx.doc_ids,
+            output,
+            lse,
+            grad_output,
             ctx.sliding_window_size,
         )
         return grad_Q, grad_index_kv, grad_local_kv, None, grad_sink, None, None
@@ -965,12 +972,8 @@ def selected_attention(
     if doc_ids is not None:
         doc_ids = doc_ids.contiguous()
 
-    if torch.is_grad_enabled() and any(
-        t.requires_grad for t in (Q, KV, index_kv, attention_sink)
-    ):
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (Q, KV, index_kv, attention_sink)):
         return _SelectedAttentionFunction.apply(
             Q, index_kv, KV, indices, attention_sink, doc_ids, sliding_window_size
         )
-    return _launch_forward(
-        Q, index_kv, KV, indices, attention_sink, doc_ids, sliding_window_size
-    )
+    return _launch_forward(Q, index_kv, KV, indices, attention_sink, doc_ids, sliding_window_size)
