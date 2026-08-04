@@ -70,7 +70,6 @@ def _make_inputs(
         "attention_sink": attention_sink,
         "doc_ids": doc_ids,
         "sliding_window_size": sliding_window_size,
-        "share_kv": share_kv,
     }
 
 
@@ -340,7 +339,6 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sink_64,
         None,
         sliding_window_size,
-        share_kv,
         backend="eager",
     )
     out_lp_ref = selected_attention(
@@ -351,7 +349,6 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sink_lp_ref,
         None,
         sliding_window_size,
-        share_kv,
         backend="eager",
     )
     out_lp_tri = selected_attention(
@@ -362,12 +359,11 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sink_lp_tri,
         None,
         sliding_window_size,
-        share_kv,
         backend="triton",
     )
 
-    ref_fwd_diff = (out_64.float() - out_lp_ref.float()).abs().max().item()
-    tri_fwd_diff = (out_64.float() - out_lp_tri.float()).abs().max().item()
+    ref_fwd_diff = (out_64 - out_lp_ref).abs().max().item()
+    tri_fwd_diff = (out_64 - out_lp_tri).abs().max().item()
 
     # --- Backward ---
     grad_gen = torch.Generator(device=device).manual_seed(1234)
@@ -378,14 +374,14 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     out_lp_ref.backward(grad_lp)
     out_lp_tri.backward(grad_lp)
 
-    ref_dq = (Q_64.grad.float() - Q_lp_ref.grad.float()).abs().max().item()
-    tri_dq = (Q_64.grad.float() - Q_lp_tri.grad.float()).abs().max().item()
-    ref_dkv = (KV_64.grad.float() - KV_lp_ref.grad.float()).abs().max().item()
-    tri_dkv = (KV_64.grad.float() - KV_lp_tri.grad.float()).abs().max().item()
-    ref_didx = (index_kv_64.grad.float() - index_kv_lp_ref.grad.float()).abs().max().item()
-    tri_didx = (index_kv_64.grad.float() - index_kv_lp_tri.grad.float()).abs().max().item()
-    ref_dsink = (sink_64.grad.float() - sink_lp_ref.grad.float()).abs().max().item()
-    tri_dsink = (sink_64.grad.float() - sink_lp_tri.grad.float()).abs().max().item()
+    ref_dq = (Q_64.grad.double() - Q_lp_ref.grad.double()).abs().max().item()
+    tri_dq = (Q_64.grad.double() - Q_lp_tri.grad.double()).abs().max().item()
+    ref_dkv = (KV_64.grad.double() - KV_lp_ref.grad.double()).abs().max().item()
+    tri_dkv = (KV_64.grad.double() - KV_lp_tri.grad.double()).abs().max().item()
+    ref_didx = (index_kv_64.grad.double() - index_kv_lp_ref.grad.double()).abs().max().item()
+    tri_didx = (index_kv_64.grad.double() - index_kv_lp_tri.grad.double()).abs().max().item()
+    ref_dsink = (sink_64.grad.double() - sink_lp_ref.grad.double()).abs().max().item()
+    tri_dsink = (sink_64.grad.double() - sink_lp_tri.grad.double()).abs().max().item()
 
     # Compute ratios (triton error / reference error). Ratio ~1 means triton
     # adds no precision loss beyond the dtype itself. >1 means triton is worse.

@@ -1,28 +1,23 @@
 from typing import Literal
 
 import torch
-
-
-Backend = Literal["eager", "triton", "cute"]
-Mode = Literal["auto", "chunked", "recurrent"]
+from torch import Tensor
 
 
 def _validate_inputs(
-    Q: object,
-    KV: object,
-    index_kv: object,
-    indices: object,
-    attention_sink: object,
-    doc_ids: object,
-    sliding_window_size: object,
-    share_kv: object,
+    Q: Tensor,
+    KV: Tensor,
+    index_kv: Tensor,
+    indices: Tensor,
+    attention_sink: Tensor,
+    doc_ids: Tensor,
+    sliding_window_size: Tensor,
+    share_kv: bool,
 ) -> None:
     if type(sliding_window_size) is not int:
         raise TypeError(
             f"sliding_window_size must be a Python int, got {type(sliding_window_size).__name__}."
         )
-    if type(share_kv) is not bool:
-        raise TypeError(f"share_kv must be a Python bool, got {type(share_kv).__name__}.")
 
     tensors = {
         "Q": Q,
@@ -65,6 +60,18 @@ def _validate_inputs(
             f"got {list(KV.shape)}."
         )
     index_seq_len = index_kv.shape[2]
+
+    if (
+        index_kv.ndim != 4
+        or index_kv.shape[0] != batch
+        or index_kv.shape[1] != expected_kv_heads
+        or index_kv.shape[3] != head_dim
+    ):
+        expected_h = "1 or heads" if share_kv else "heads"
+        raise ValueError(
+            f"index_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
+            f"got {list(index_kv.shape)}."
+        )
 
     if indices.ndim != 3 or indices.shape[0] != batch or indices.shape[1] != sequence_length:
         raise ValueError(
@@ -109,23 +116,27 @@ def selected_attention(
     attention_sink,
     doc_ids=None,
     sliding_window_size: int = 512,
-    share_kv: bool = True,
-    backend: Backend = "eager",
-    mode: Mode = "auto",
+    backend: str = "triton",
+    mode: str = "auto",
 ):
     """
+    Performs selected attention
+        Each query attends to the previous sliding_window_size elements in the KV tensor 
+        As well the positions in index_kv pointed to by indices
+        Only one softmax is applied, and it covers the index_kv values as well as the sliding window values
     Args:
         Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
         KV: Key and Value for the sliding window branch,
-            represented as a shared tensor, (batch_size, 1, sequence_length, head_dim) if share_kv = False
-            Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
+            represented as a shared tensor, (batch_size, 1, sequence_length, head_dim)
+            Or represented as (batch_size, num_heads, sequence_length, head_dim)
 
-        index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim) if share_kv = False
-            Otherwise represented as (batch_size, num_heads, X, head_dim)
-            where X is any number greater than
+        index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim)
+            Or shaped as (batch_size, num_heads, X, head_dim)
+            where X is any integer
 
         indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
+            The Q[i, j] token will attend to all index_kv[i, indices[k]] tokens for all k < num_topk_blocks
             If None, index_kv will be ignored
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
@@ -140,14 +151,13 @@ def selected_attention(
 
         sliding_window_size: Integer, size of sliding window
 
-        share_kv: bool, true iff all query heads attend to the same KV head
-
         backend: one of eager, triton, or cute, controls which backend executes this code
 
         mode: Currently only chunked is supported; auto defaults to chunked
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
+    share_kv = (index_kv.shape[1] == 1)
     if not torch.compiler.is_compiling():
         _validate_inputs(
             Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv
