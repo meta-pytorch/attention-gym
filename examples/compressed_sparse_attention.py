@@ -183,6 +183,7 @@ def _selected_attention_with_causal_blocks(
     indexer_mask,
     attention_sink,
     sliding_window_size,
+    backend
 ):
     """Call selected_attention while preserving the completed-block constraint.
 
@@ -215,6 +216,7 @@ def _selected_attention_with_causal_blocks(
         None,
         sliding_window_size,
         False,
+        backend=backend
     )
 
 
@@ -244,6 +246,7 @@ def CSA(
     sliding_window_size,
     rope_dims: int,
     share_kv: bool,
+    backend="eager"
 ):
     """
     Naming of args uses convention from Deepseek v4 paper
@@ -306,39 +309,44 @@ def CSA(
     compressed_indices = compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
     num_total_blocks = compressed_kv.shape[-2]
 
-    Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
-    Q_I = torch.cat([Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1)
     KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
-    KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
-
-    compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
     compressed_indices = F.rms_norm(
         compressed_indices, (compressed_indices.shape[-1],), weight=compressed_indices_norm_weight
-    )
-    # Apply rope to the last rope_dim dimensions
-    compressed_indices = torch.cat(
-        [
-            compressed_indices[..., :-rope_dims],
-            apply_rope(
-                compressed_indices[..., -rope_dims:],
-                positions=compressed_positions,
-            ),
-        ],
-        dim=-1,
     )
     compressed_kv = F.rms_norm(
         compressed_kv, (compressed_kv.shape[-1],), weight=compressed_kv_norm_weight
     )
-    compressed_kv = torch.cat(
-        [
-            compressed_kv[..., :-rope_dims],
-            apply_rope(
-                compressed_kv[..., -rope_dims:],
-                positions=compressed_positions,
-            ),
-        ],
-        dim=-1,
-    )
+
+    if rope_dims != 0:
+        Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
+        Q_I = torch.cat(
+            [Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1
+        )
+        KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
+
+        compressed_positions = (
+            torch.arange(num_total_blocks, device=device) * compression_rate
+        )
+        compressed_indices = torch.cat(
+            [
+                compressed_indices[..., :-rope_dims],
+                apply_rope(
+                    compressed_indices[..., -rope_dims:],
+                    positions=compressed_positions,
+                ),
+            ],
+            dim=-1,
+        )
+        compressed_kv = torch.cat(
+            [
+                compressed_kv[..., :-rope_dims],
+                apply_rope(
+                    compressed_kv[..., -rope_dims:],
+                    positions=compressed_positions,
+                ),
+            ],
+            dim=-1,
+        )
 
     indexer_mask = make_block_mask(
         sequence_length,
@@ -366,15 +374,18 @@ def CSA(
         indexer_mask,
         attention_sink,
         sliding_window_size,
+        backend = backend
     )
 
-    return torch.cat(
-        [
-            attention_output[..., :-rope_dims],
-            apply_rope(attention_output[..., -rope_dims:], inverse=True),
-        ],
-        dim=-1,
-    )
+    if rope_dims != 0:
+        return torch.cat(
+            [
+                attention_output[..., :-rope_dims],
+                apply_rope(attention_output[..., -rope_dims:], inverse=True),
+            ],
+            dim=-1,
+        )
+    return attention_output
 
 
 def main() -> None:

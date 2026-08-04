@@ -2,7 +2,6 @@ from typing import Literal
 
 import torch
 
-
 Backend = Literal["eager", "triton", "cute"]
 Mode = Literal["auto", "chunked", "recurrent"]
 
@@ -97,7 +96,7 @@ def _validate_inputs(
             )
         if doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length:
             raise ValueError(
-                f"doc_ids must have shape [batch, sequence_length], " f"got {list(doc_ids.shape)}."
+                f"doc_ids must have shape [batch, sequence_length], got {list(doc_ids.shape)}."
             )
 
 
@@ -171,6 +170,19 @@ def selected_attention(
             from . import triton as triton_backend
 
             return triton_backend.selected_attention(
+                Q,
+                KV,
+                index_kv,
+                indices,
+                attention_sink,
+                doc_ids,
+                sliding_window_size,
+                share_kv,
+            )
+        case "cute":
+            from . import cute as cute_backend
+
+            return cute_backend.selected_attention(
                 Q,
                 KV,
                 index_kv,
