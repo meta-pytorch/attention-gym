@@ -301,16 +301,21 @@ LOG2E = math.log2(math.e)
 
 class _SelectedAttentionCuTe(torch.autograd.Function):
     @staticmethod
-    def forward(Q, KV, index_kv, indices, sliding_window_size):
+    def forward(Q, KV, index_kv, indices, sliding_window_size, prebuilt_topk_idxs):
         _b, _h, s, d = Q.shape
         local_kv_len = KV.shape[2]
         device = Q.device
         nheads = Q.shape[1]
 
         unified_kv = torch.cat([KV, index_kv], dim=2)
-        topk_idxs, padded_topk_length = _build_unified_topk_indices(
-            s, sliding_window_size, indices, index_offset=local_kv_len, device=device
-        )
+
+        if prebuilt_topk_idxs is not None:
+            topk_idxs = prebuilt_topk_idxs.view_as(prebuilt_topk_idxs)
+            padded_topk_length = topk_idxs.shape[-1]
+        else:
+            topk_idxs, padded_topk_length = _build_unified_topk_indices(
+                s, sliding_window_size, indices, index_offset=local_kv_len, device=device
+            )
 
         Qv = Q.permute(0, 2, 1, 3)
         V = unified_kv.permute(0, 2, 1, 3)
@@ -326,7 +331,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        Q, KV, index_kv, indices, sliding_window_size = inputs
+        Q, KV, index_kv, indices, sliding_window_size, prebuilt_topk_idxs = inputs
         O, lse, P, RowMax, topk_idxs, unified_kv = output
         ctx.save_for_backward(Q, O, lse, P, RowMax, topk_idxs, unified_kv)
         ctx.sliding_window_size = sliding_window_size
@@ -375,7 +380,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
         dKV = dV_bf16[:, :, :local_kv_len, :]
         d_ikv = dV_bf16[:, :, local_kv_len:, :]
 
-        return dQ, dKV, d_ikv, None, None
+        return dQ, dKV, d_ikv, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +433,7 @@ def selected_attention(
             Q, KV, index_kv, indices, doc_ids, sliding_window_size
         )
 
-    result = _SelectedAttentionCuTe.apply(Q, KV, index_kv, indices, sliding_window_size)
+    result = _SelectedAttentionCuTe.apply(Q, KV, index_kv, indices, sliding_window_size, None)
     O = result[0]
     return O
 
@@ -470,25 +475,16 @@ def _selected_attention_with_doc_ids(Q, KV, index_kv, indices, doc_ids, sliding_
         )
         unified = torch.cat([unified, padding], dim=-1)
 
-    return _selected_attention_with_prebuilt_indices(Q, KV, index_kv, unified, sliding_window_size)
-
-
-def _selected_attention_with_prebuilt_indices(Q, KV, index_kv, topk_idxs, sliding_window_size):
-    """Forward with pre-built indices (doc_ids path). Uses same kernel op."""
-    _b, _h, _s, d = Q.shape
-    nheads = Q.shape[1]
-    device = Q.device
-
-    unified_kv = torch.cat([KV, index_kv], dim=2)
-    padded_topk_length = topk_idxs.shape[-1]
-
-    Qv = Q.permute(0, 2, 1, 3)
-    V = unified_kv.permute(0, 2, 1, 3)
-
-    softmax_scale = 1.0 / math.sqrt(d)
-
-    O_bshd, lse, P, RowMax = torch.ops.selected_attn.fwd_kernel(
-        Qv, V, topk_idxs, padded_topk_length, nheads, softmax_scale,
+    return _selected_attention_with_prebuilt_indices(
+        Q, KV, index_kv, indices, unified, sliding_window_size
     )
 
-    return O_bshd.permute(0, 2, 1, 3)
+
+def _selected_attention_with_prebuilt_indices(Q, KV, index_kv, indices, topk_idxs,
+                                              sliding_window_size):
+    """Forward+backward with pre-built indices (doc_ids path)."""
+    result = _SelectedAttentionCuTe.apply(
+        Q, KV, index_kv, indices, sliding_window_size, topk_idxs
+    )
+    O = result[0]
+    return O

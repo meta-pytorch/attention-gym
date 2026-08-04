@@ -363,3 +363,79 @@ def test_cute_backward_precision_vs_fp64(num_topk):
     print(f"\n[topk={num_topk}] dQ: ref_bf16={ref_dq_diff:.4e} cute_bf16={cute_dq_diff:.4e} ratio={r:.2f}x")
 
     assert r < 5, f"CuTe dQ error {r:.2f}x reference (must be < 5x)"
+
+
+# ---------------------------------------------------------------------------
+# Backward with doc_ids tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_topk", [16, 32])
+def test_cute_backward_doc_ids_dq(num_topk):
+    """CuTe backward with doc_ids produces correct dQ gradients."""
+    _skip_no_sm100()
+    seq_len = 256
+    batch = 1
+    doc_ids = (
+        torch.cat(
+            [
+                torch.zeros(seq_len // 2, dtype=torch.long),
+                torch.ones(seq_len // 2, dtype=torch.long),
+            ]
+        )
+        .unsqueeze(0)
+        .expand(batch, -1)
+        .cuda()
+    )
+
+    Q, KV, index_kv, indices, sink, window = _make_inputs_grad(
+        batch=batch, seq_len=seq_len, num_topk=num_topk, seed=400
+    )
+    Q2 = Q.detach().clone().requires_grad_(True)
+    KV2 = KV.detach().clone().requires_grad_(True)
+    ikv2 = index_kv.detach().clone().requires_grad_(True)
+
+    out_cute = selected_attention(Q, KV, index_kv, indices, sink, doc_ids, window, True, backend="cute")
+    out_ref = selected_attention(Q2, KV2, ikv2, indices, sink, doc_ids, window, True, backend="eager")
+
+    grad = torch.randn_like(out_cute)
+    out_cute.backward(grad)
+    out_ref.backward(grad)
+
+    torch.testing.assert_close(Q.grad, Q2.grad, atol=ATOL_BWD, rtol=RTOL_BWD)
+
+
+@pytest.mark.parametrize("num_topk", [16, 32])
+def test_cute_backward_doc_ids_dkv(num_topk):
+    """CuTe backward with doc_ids produces correct dKV gradients."""
+    _skip_no_sm100()
+    seq_len = 256
+    batch = 1
+    doc_ids = (
+        torch.cat(
+            [
+                torch.zeros(seq_len // 2, dtype=torch.long),
+                torch.ones(seq_len // 2, dtype=torch.long),
+            ]
+        )
+        .unsqueeze(0)
+        .expand(batch, -1)
+        .cuda()
+    )
+
+    Q, KV, index_kv, indices, sink, window = _make_inputs_grad(
+        batch=batch, seq_len=seq_len, num_topk=num_topk, seed=500
+    )
+    Q2 = Q.detach().clone().requires_grad_(True)
+    KV2 = KV.detach().clone().requires_grad_(True)
+    ikv2 = index_kv.detach().clone().requires_grad_(True)
+
+    out_cute = selected_attention(Q, KV, index_kv, indices, sink, doc_ids, window, True, backend="cute")
+    out_ref = selected_attention(Q2, KV2, ikv2, indices, sink, doc_ids, window, True, backend="eager")
+
+    grad = torch.randn_like(out_cute)
+    out_cute.backward(grad)
+    out_ref.backward(grad)
+
+    torch.testing.assert_close(KV.grad, KV2.grad, atol=ATOL_BWD, rtol=RTOL_BWD)
+    torch.testing.assert_close(index_kv.grad, ikv2.grad, atol=ATOL_BWD, rtol=RTOL_BWD)
