@@ -372,7 +372,7 @@ def test_selected_attention_matches_csa_reference_fp64(share_kv, num_topk_blocks
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selected_attention_matches_csa_reference_cuda_fp32():
+def test_selected_attention_matches_csa_reference_cuda_fp64():
     inputs = _make_inputs(
         True,
         1,

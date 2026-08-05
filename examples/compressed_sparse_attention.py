@@ -1,6 +1,6 @@
 """
 Compose compressed sparse attention from the selected-attention primitive.
-Implementation of compressed sparse attention for here: https://arxiv.org/html/2606.19348v1
+Implementation of compressed sparse attention from here: https://arxiv.org/html/2606.19348v1
 """
 
 import math
@@ -27,7 +27,7 @@ def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
     Chunk the sequence into blocks as mentioned in the paper.
     Args:
         x: tensor in shape of (batch, heads, sequence_length, dim)
-        compression_rate: integer, size of each blog
+        compression_rate: integer, size of each block
     Returns:
         tensor in shape of (batch, heads, sequence_length/compression_rate, compression_rate, dim)
     """
@@ -47,7 +47,7 @@ def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
         C_a, C_b, Z_a, Z_b, B_a, B_b: Tensors from CSA inputs
         compression_rate: int, size of each block (and also how much they're compressed by)
     Returns:
-        Weighted, tensor in shape of (batch, num_heads, sequence_length, head_dim)
+        Weighted, tensor in shape of (batch, num_heads, sequence_length / compression_rate, head_dim)
     """
     # Pad everything to be evenly divisible by block size
     C_a = pad_to_block_size(C_a, compression_rate, 0.0)
@@ -76,10 +76,10 @@ def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
 
 def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
     """
-    Masks out causally invalid blocks (queries can only attend to blocks created by KV values before it)
+    Masks out causally invalid blocks (queries can only attend to blocks created by KV values before them)
     Args:
         query_length: int, length of query
-        num_blocks: int, total numbers of blocks
+        num_blocks: int, total number of blocks
         compression_rate: int, size of each block
         device: device to create mask on
         dtype: dtype of mask
@@ -236,7 +236,7 @@ def CSA(
     share_kv: bool,
 ):
     """
-    Naming of args uses convention from Deepseek v4 paper
+    Naming of args uses convention from DeepSeek V4 paper
 
     Shape notation: B=batch size, H=attention heads, H_I=indexer heads, S=sequence length,
     D=attention dimension, D_I=index dimension, R=compression_rate,
@@ -258,7 +258,7 @@ def CSA(
 
     W_I: Projection from the residual stream, per-head weight on indexer scores (Batch, sequence, num_heads); expected shape: (B, S, H_I)
     K_Ia, K_Ib: Projections from the residual stream for computing indexing; each expected shape: (B, H_IKV, S, D_I)
-    Z_Ia, Z_Ib: Projections from the residual stream, performs similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
+    Z_Ia, Z_Ib: Projections from the residual stream, perform similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
     B_Ia, B_Ib: Same role as B_a/B_b but for the indexing branch. Expected shape: any broadcastable
         to (B, H_IKV, num_blocks, R, D_I) — typically (R, D_I) or (1, 1, 1, R, D_I).
 
@@ -273,7 +273,7 @@ def CSA(
     num_topk_blocks: number of blocks to attend to per query
     sliding_window_size: size of sliding window for SWA
     rope_dims: number of dimensions to apply rope to
-    share_kv: True if all query heads attented to one kv head
+    share_kv: True if all query heads attend to one kv head
     """
 
     device = Q.device

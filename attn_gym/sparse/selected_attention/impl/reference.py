@@ -1,4 +1,4 @@
-"""Torch-only compressed sparse attention reference implementation."""
+"""Torch-only selected attention reference implementation."""
 
 import torch
 from torch import Tensor
@@ -78,9 +78,9 @@ def selected_attention(
         if share_kv:
             expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
         For each token, Q_i, in query:
-            first_token_of_document = torch.where(x == x[i])[0].min()
+            first_token_of_document = torch.where(doc_ids == doc_ids[i])[0].min()
             farthest_past_token_index = max(i - sliding_window, first_token_of_document)
-            KV = cat([local_kv[farthest_past_token_index: i], sparse_kv[indices]])
+            KV = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
             P = Q @ KV.T / head_dim ** 0.5
             P = softmax(cat([P, sink]))[:P.sequence_length]
             return P @ V

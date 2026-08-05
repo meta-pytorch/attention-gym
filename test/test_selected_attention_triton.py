@@ -195,7 +195,7 @@ def test_triton_backward_with_doc_ids(num_topk):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
 @pytest.mark.parametrize("sliding_window_size", [0, 4])
-def test_repeated_indices_backends_match(sliding_window_size):
+def test_empty_sliding_window(sliding_window_size):
     """Repeated indices should produce identical results in eager and triton."""
     device = torch.device("cuda")
     dtype = torch.float32
