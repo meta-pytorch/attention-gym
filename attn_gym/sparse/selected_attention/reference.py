@@ -129,6 +129,8 @@ def selected_attention(
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
             If doc_ids[i, j] = doc_ids[i, j-y], then query[i, j] can causally attend to local_kv[i, j-y]
             Should be monotonically increasing on the sequence axis
+            Only applies to the sliding window branch.
+            It's the caller's responsibility to make sure kv_indices don't cross document boundaries
             If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the same document.
 
         sliding_window_size: Integer, size of sliding window
