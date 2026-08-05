@@ -1,6 +1,6 @@
 """
 To check reference bf16 vs triton bf16 diffs, run:
-python -m pytest test/test_selected_attention_triton.py::test_reference_bf16_vs_fp64_precision -v -s
+python -m pytest test/test_selected_attention_triton.py::test_precision_vs_fp64 -v -s
 
 Triton max diff is between 0.59-1.23x the reference's max diff
 """
@@ -117,12 +117,14 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
 
 
 @pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 2])
-def test_triton_backward_dq(share_kv, num_topk):
-    """Triton backward produces correct gradients for Q."""
+@pytest.mark.parametrize("num_topk", [0, 1, 2, 3])
+@pytest.mark.parametrize("grad_target", ["query", "local_kv", "sparse_kv", "attention_sink"])
+def test_triton_backward(share_kv, num_topk, grad_target):
+    """Triton backward produces correct gradients for all differentiable inputs."""
     _skip_no_cuda()
-    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123)
-    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=123)
+
+    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=42)
+    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=42)
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -133,74 +135,8 @@ def test_triton_backward_dq(share_kv, num_topk):
     out_tri.backward(grad_output)
 
     torch.testing.assert_close(
-        inputs_tri["query"].grad, inputs_ref["query"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
-    )
-
-
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 2])
-def test_triton_backward_dlocal_kv(share_kv, num_topk):
-    """Triton backward produces correct gradients for local KV."""
-    _skip_no_cuda()
-    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456)
-    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=456)
-
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_tri = selected_attention(**inputs_tri, backend="triton")
-
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(0)
-    grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
-    out_ref.backward(grad_output)
-    out_tri.backward(grad_output)
-
-    torch.testing.assert_close(
-        inputs_tri["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
-    )
-
-
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [1, 3])
-def test_triton_backward_dindex_kv(share_kv, num_topk):
-    """Triton backward produces correct gradients for index KV."""
-    _skip_no_cuda()
-    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789)
-    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=789)
-
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_tri = selected_attention(**inputs_tri, backend="triton")
-
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(9999)
-    grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
-    out_ref.backward(grad_output)
-    out_tri.backward(grad_output)
-
-    torch.testing.assert_close(
-        inputs_tri["sparse_kv"].grad,
-        inputs_ref["sparse_kv"].grad,
-        atol=ATOL_BWD,
-        rtol=RTOL_BWD,
-    )
-
-
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 2])
-def test_triton_backward_dsink(share_kv, num_topk):
-    """Triton backward produces correct gradients for attention_sink."""
-    _skip_no_cuda()
-    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321)
-    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=321)
-
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_tri = selected_attention(**inputs_tri, backend="triton")
-
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(5555)
-    grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
-    out_ref.backward(grad_output)
-    out_tri.backward(grad_output)
-
-    torch.testing.assert_close(
-        inputs_tri["attention_sink"].grad,
-        inputs_ref["attention_sink"].grad,
+        inputs_tri[grad_target].grad,
+        inputs_ref[grad_target].grad,
         atol=ATOL_BWD,
         rtol=RTOL_BWD,
     )

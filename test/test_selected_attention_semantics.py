@@ -454,6 +454,8 @@ def test_torch_compile_fullgraph_backward(backend):
     torch.testing.assert_close(out_c, out_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(query_c.grad, query_ref.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(local_kv_c.grad, local_kv_ref.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sparse_kv_c.grad, sparse_kv_ref.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sink_c.grad, sink_ref.grad, atol=1e-5, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------

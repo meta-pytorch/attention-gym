@@ -227,20 +227,10 @@ def test_doc_id_matches_separate_execution(share_kv):
 
     # For the sparse branch, pack both sparse KVs and adjust indices for doc2
     sparse_kv_packed = torch.cat([sparse_kv1, sparse_kv2], dim=2)
-    packed_sparse_len = sparse_kv1_len + sparse_kv2_len
 
     # Build packed indices: doc1 indices stay the same, doc2 indices offset
-    # by sparse_kv1_len. Pad both to have `packed_len` query positions.
-    indices1_padded = torch.zeros(
-        1, packed_len, min(num_topk_blocks, sparse_kv1_len), dtype=torch.long
-    )
-    indices1_padded[:, :doc1_len, :] = kv_indices1
-    # doc2 indices should point into the second half of the packed sparse_kv
+    # by sparse_kv1_len.
     indices2_shifted = kv_indices2 + sparse_kv1_len
-    indices2_padded = torch.zeros(
-        1, packed_len, min(num_topk_blocks, sparse_kv2_len), dtype=torch.long
-    )
-    indices2_padded[:, doc1_len:, :] = indices2_shifted
 
     # We need a common topk width — use the max
     topk_width = max(
