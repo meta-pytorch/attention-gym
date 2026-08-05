@@ -187,37 +187,63 @@ def test_selected_block_only_manual(backend):
 def test_joint_normalization(backend):
     """When both local and sparse branches are active, they share normalization.
 
-    Adding sparse blocks should change the output even for positions that are
-    within the local window (because the denominator changes).
+    We verify against a manual computation that runs a single softmax over the
+    concatenation of sparse and local logits. 
     """
     device = _device_for_backend(backend)
-    dtype = _dtype_for_backend(backend)
-    b, h, s, d = 1, 2, 8, 16
-    window = 4
+    dtype = torch.float64 if backend == "eager" else torch.float32
+    b, h, s, d = 1, 1, 4, 8
+    window = 2
+    sparse_seq_len = 3
+    num_topk = 2
 
     torch.manual_seed(55)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype)
     local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, 6, d, device=device, dtype=dtype)
-    sink = torch.zeros(h, device=device, dtype=dtype)
+    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
+    sink = torch.randn(h, device=device, dtype=dtype)
 
-    # Local-only
-    kv_indices_empty = torch.zeros(b, s, 0, dtype=torch.long, device=device)
-    out_local = selected_attention(
-        query, local_kv, sparse_kv, kv_indices_empty, sink, None, window, backend=backend
-    )
+    kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
-    # With sparse blocks
-    scores = torch.randn(b, s, 6, device=device)
-    _, kv_indices = torch.topk(scores, k=2, dim=-1)
-    out_joint = selected_attention(
+    out = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
     )
 
-    # They should differ (joint normalization changes the local contribution)
-    assert not torch.allclose(
-        out_local, out_joint, atol=1e-3
-    ), "Adding sparse blocks should change output due to shared normalization"
+    # --- Manual: single softmax over gathered sparse + local window + sink ---
+    scale = d**0.5
+    q = query[0, 0]  # (s, d)
+    lkv = local_kv[0, 0]  # (s, d)
+    skv = sparse_kv[0, 0]  # (sparse_seq_len, d)
+    sink_val = sink[0]
+
+    expected = torch.zeros(s, d, device=device, dtype=dtype)
+    for seq in range(s):
+        # Gather sparse entries (with duplicates)
+        gathered_sparse = skv[kv_indices[0, seq]]  # (num_topk, d)
+
+        # Gather local window entries
+        first = max(0, seq - window + 1)
+        local_entries = lkv[first:seq + 1]  # (window_len, d)
+
+        # Concatenate all KV entries this query attends to
+        all_kv = torch.cat([gathered_sparse, local_entries], dim=0)  # (num_topk + window_len, d)
+
+        # Compute logits over all entries + sink
+        logits = (q[seq] @ all_kv.T) / scale  # (num_topk + window_len,)
+        logits_with_sink = torch.cat([logits, sink_val.unsqueeze(0)])
+        probs_with_sink = torch.softmax(logits_with_sink, dim=0)
+
+        # Verify probs sum to 1 (joint normalization)
+        assert torch.allclose(
+            probs_with_sink.sum(), torch.ones(1, device=device, dtype=dtype), atol=1e-10
+        )
+
+        # Drop the sink prob, compute output
+        probs = probs_with_sink[:-1]
+        expected[seq] = probs @ all_kv
+
+    atol = 1e-4 if backend == "triton" else 1e-10
+    torch.testing.assert_close(out[0, 0], expected, atol=atol, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
