@@ -159,7 +159,6 @@ def selected_attention(
         kv_indices: Which entries to select from sparse_kv.
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             query[i, j] will attend to all sparse_kv[i, kv_indices[k]] for all k < num_topk_blocks
-            If None, sparse_kv will be ignored
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies
             denominator of softmax

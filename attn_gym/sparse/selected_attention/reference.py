@@ -86,13 +86,26 @@ def selected_attention(
     query: Tensor,
     local_kv: Tensor,
     sparse_kv: Tensor,
-    kv_indices: Tensor | None,
+    kv_indices: Tensor,
     attention_sink: Tensor,
     doc_ids: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
 ) -> Tensor:
     """
+    Performs selected attention as follows:
+        if share_kv:
+            expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
+        For each token, Q_i, in query: 
+            first_token_of_document = torch.where(x == x[i])[0].min()
+            farthest_past_token_index = max(i - sliding_window, first_token_of_document)
+            KV = cat([local_kv[farthest_past_token_index: i], sparse_kv[indices]])
+            P = Q @ KV.T / head_dim ** 0.5
+            P = softmax(cat([P, sink]))[:P.sequence_length]
+            return P @ V
+
+            
+
     Args:
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
@@ -106,7 +119,6 @@ def selected_attention(
 
         kv_indices: Which entries to select from sparse_kv.
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
-            If None, sparse_kv will be ignored
             If less than num_topk_blocks should be indexed, pad the tensor with -1
             Duplicate indices will be computed multiple times.
 
@@ -160,12 +172,9 @@ def selected_attention(
         # packing_mask is [B, 1, S, S], SWA_mask is [B, S, S]
         SWA_mask = SWA_mask + packing_mask.squeeze(1)
 
-    if kv_indices is not None:
-        attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
-        attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
-    else:
-        attention_kv = local_kv
-        attention_mask = SWA_mask
+    attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
+    attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
+
     scale = head_dim**0.5
 
     P = sink_softmax(

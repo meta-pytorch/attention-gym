@@ -96,19 +96,19 @@ def apply_rope(
 ) -> torch.Tensor:
     sequence_length = x.shape[-2]
     rotary_dim = x.shape[-1]
-
+    dtype = x.dtype
     if positions is None:
         positions = torch.arange(
             position_offset,
             position_offset + sequence_length,
             device=x.device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
     else:
-        positions = positions.to(device=x.device, dtype=torch.float32)
+        positions = positions.to(device=x.device, dtype=dtype)
 
     frequencies = 1.0 / (
-        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim)
+        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=dtype) / rotary_dim)
     )
 
     if original_seq_len > 0:
@@ -125,7 +125,7 @@ def apply_rope(
         if low == high:
             high += 0.001
 
-        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=torch.float32) - low) / (
+        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=dtype) - low) / (
             high - low
         )
         smooth = 1 - ramp.clamp(0, 1)
