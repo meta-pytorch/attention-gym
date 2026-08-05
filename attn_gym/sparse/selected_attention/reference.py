@@ -58,11 +58,11 @@ def make_packed_mask(
 
     Args:
         doc_ids: Has shape (batch, sequence) and integer dtype.
-            Tokens in the same document have the same ID and are allowed to attention to each other.
-            Tokens from different documents recieve -inf for the attention mask, and tokens from the same document receive 0
+            Tokens in the same document have the same ID and will be allowed to attention to each other.
 
     Returns:
         Additive attention mask of shape (batch, 1, sequence, sequence)
+        Tokens from different documents recieve -inf for the attention mask, and tokens from the same document receive 0
     """
     batch_size, seq_len = doc_ids.shape
     device = doc_ids.device

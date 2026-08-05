@@ -438,3 +438,70 @@ def test_torch_compile_fullgraph_backward(backend):
     torch.testing.assert_close(out_c, out_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(query_c.grad, query_ref.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(local_kv_c.grad, local_kv_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 7. Repeated selections against manual computation
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_indices_manual_forward_and_backward():
+    """Verify repeated-index semantics against a manual computation.
+    This test builds that manually and checks both forward and backward.
+    """
+    dtype = torch.float64
+    b, h, s, d = 1, 1, 3, 4
+    sparse_seq_len = 4
+    num_topk = 3
+
+    torch.manual_seed(77)
+    query = torch.randn(b, h, s, d, dtype=dtype, requires_grad=True)
+    local_kv = torch.randn(b, h, s, d, dtype=dtype)
+    sparse_kv = torch.randn(b, h, sparse_seq_len, d, dtype=dtype, requires_grad=True)
+    sink = torch.full((h,), float("-inf"), dtype=dtype)
+
+    # kv_indices: query 0 selects [0,0,1] (pos 0 twice, pos 1 once),
+    #             query 1 selects [2,2,2] (pos 2 three times),
+    #             query 2 selects [1,3,3] (pos 1 once, pos 3 twice)
+    kv_indices = torch.tensor([[[0, 0, 1], [2, 2, 2], [1, 3, 3]]])
+
+    out = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend="eager"
+    )
+
+    # --- Manual forward ---
+    scale = d**0.5
+    q = query[0, 0, :, :]
+
+    # If an element in indexed 3 times, it should show up in effective KV 3 times
+    # Build a different effective kv for each query index
+    expected = torch.empty((s, d), dtype=dtype)
+    for seq in range(s):
+        effective_kv = torch.empty((num_topk, d), dtype=dtype)
+        for v in range(num_topk):
+            effective_kv[v, :] = sparse_kv[0, 0, kv_indices[0, seq, v], :]
+
+        scores = torch.exp((q[seq] @ effective_kv.T) / scale)
+        probs = scores / scores.sum()
+        expected[seq, :] = probs @ effective_kv
+
+    torch.testing.assert_close(out[0, 0], expected, atol=1e-12, rtol=1e-12)
+
+    # --- Backward: sum output and check gradients ---
+    out.sum().backward()
+
+    query_m = query.detach().clone().requires_grad_(True)
+    sparse_kv_m = sparse_kv.detach().clone().requires_grad_(True)
+    q_m = query_m[0, 0]
+    expected_m = torch.zeros((s, d), dtype=dtype)
+    for seq in range(s):
+        effective_kv_m = torch.empty((num_topk, d), dtype=dtype)
+        for v in range(num_topk):
+            effective_kv_m[v, :] = sparse_kv_m[0, 0, kv_indices[0, seq, v], :]
+        scores_m = torch.exp((q_m[seq] @ effective_kv_m.T) / scale)
+        probs_m = scores_m / scores_m.sum()
+        expected_m[seq, :] = probs_m @ effective_kv_m
+    expected_m.sum().backward()
+
+    torch.testing.assert_close(query.grad, query_m.grad, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(sparse_kv.grad, sparse_kv_m.grad, atol=1e-12, rtol=1e-12)
