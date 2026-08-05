@@ -1,16 +1,17 @@
 """Torch-only compressed sparse attention reference implementation."""
 
 import torch
+from torch import Tensor
 
 
-def make_sliding_window_mask(query_length, window_size, device, dtype):
+def make_sliding_window_mask(query_length: int, window_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     """
     Makes a mask for sliding window attention
     Args:
-        query_length: Integer, length of query
-        window_size: Integer, length of sliding window
-        device: String, device to create tensors on
-        dtype: Dtype, dtype of the output mask
+        query_length: length of query
+        window_size: length of sliding window
+        device: device to create tensors on
+        dtype: dtype of the output mask
     Returns:
         A mask in shape (query_length, query_length), where valid attention positions are 0, invalid are -inf
     """
@@ -26,15 +27,17 @@ def make_sliding_window_mask(query_length, window_size, device, dtype):
     ).masked_fill(~valid, float("-inf"))
 
 
-def sink_softmax(x, sink, dim):
+def sink_softmax(x: Tensor, sink: Tensor, dim: int) -> Tensor:
     """
-    Applies a softmax with an attention sink
+    Applies a softmax with an attention sink. 
+    The sink contributes to the demoninator but not the numerator, so it is not returned
+    Computes Y, where Y[a, b, c, d] = exp(x[a, b, c, d]) / (sum(exp(x[a, b, c, :]) + exp(sink[b])))
     Args:
-        x: tensor in shape of (batch, num_heads, sequence, dim)
-        sink: tensor in shape of (num_heads, )
-        dim: integer, dimension to apply softmax on
+        x: shape of (batch, num_heads, sequence, dim)
+        sink: shape of (num_heads, )
+        dim: dimension to apply softmax on
     Returns:
-        tensor in shape of x, where tensor[a, b, c, d] = exp(x[a, b, c, d]) / (sum(exp(x[a, b, c, :]) + exp(sink[b])))
+        Y, same shape as X 
     """
     sink = sink[None, :, None, None]
     maximums = torch.max(x, dim=dim, keepdim=True).values
@@ -48,15 +51,18 @@ def sink_softmax(x, sink, dim):
 def make_packed_mask(
     doc_ids: torch.Tensor,
     *,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     """
+    Creates an attention mask that prevents documents from attenting across boundaries
+    
     Args:
-        doc_ids: Integer tensor of shape [batch, sequence].
-                 Tokens in the same document have the same ID.
+        doc_ids: Has shape (batch, sequence) and integer dtype.
+            Tokens in the same document have the same ID and are allowed to attention to each other. 
+            Tokens from documents recieve -inf for the attention mask, and tokens from the same document receive 0
 
     Returns:
-        Additive attention mask of shape [batch, 1, sequence, sequence]
+        Additive attention mask of shape (batch, 1, sequence, sequence)
     """
     batch_size, seq_len = doc_ids.shape
     device = doc_ids.device
@@ -77,15 +83,15 @@ def make_packed_mask(
 
 
 def selected_attention(
-    Q,
-    KV,
-    index_kv,
-    indices,
-    attention_sink,
-    doc_ids,
+    Q: Tensor,
+    KV: Tensor,
+    index_kv: Tensor,
+    indices: Tensor | None,
+    attention_sink: Tensor,
+    doc_ids: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
-):
+) -> Tensor:
     """
     Args:
         Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
@@ -95,13 +101,13 @@ def selected_attention(
             Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
 
         index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim) if share_kv = False
-            Otherwise represented as (batch_size, num_heads, X, head_dim)
-            where X is any number greater than
+            Otherwise represented as (batch_size, num_heads, X, head_dim), where X can be any nonzero integer
 
         indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             If None, index_kv will be ignored
             If less than num_topk_blocks should be indexed, pad the tensor with -1
             Duplicate indices will be computed multiple times.
+
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 

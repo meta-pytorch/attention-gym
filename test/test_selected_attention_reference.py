@@ -5,7 +5,7 @@ from attn_gym.sparse.selected_attention import selected_attention
 
 
 def _run_selected_attention(Q, KV, index_kv, indices, attention_sink, doc_ids,
-                            sliding_window_size, share_kv):
+                            sliding_window_size):
     """Helper that calls selected_attention and returns the output."""
     return selected_attention(
         Q,
@@ -15,7 +15,7 @@ def _run_selected_attention(Q, KV, index_kv, indices, attention_sink, doc_ids,
         attention_sink,
         doc_ids,
         sliding_window_size,
-        share_kv,
+        backend="eager",
     )
 
 
@@ -47,7 +47,7 @@ def test_batch_invariance(share_kv, num_topk_blocks):
 
     # Run full batch
     full_out = _run_selected_attention(
-        Q, KV, idx_kv, indices, attention_sink, None, sliding_window_size, share_kv
+        Q, KV, idx_kv, indices, attention_sink, None, sliding_window_size
     )
 
     # Run each batch element independently and compare
@@ -60,7 +60,6 @@ def test_batch_invariance(share_kv, num_topk_blocks):
             attention_sink,
             None,
             sliding_window_size,
-            share_kv,
         )
         torch.testing.assert_close(
             full_out[i : i + 1],
@@ -119,7 +118,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
 
     out_packed = _run_selected_attention(
         Q_packed, KV_packed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        attention_sink, doc_ids, sliding_window_size,
     )
 
     # ---------- Perturb the other document's data ----------
@@ -136,7 +135,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
 
     out_perturbed = _run_selected_attention(
         Q_perturbed, KV_perturbed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        attention_sink, doc_ids, sliding_window_size,
     )
 
     # Doc1's output must be unchanged
@@ -160,7 +159,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
 
     out_perturbed2 = _run_selected_attention(
         Q_perturbed2, KV_perturbed2, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        attention_sink, doc_ids, sliding_window_size,
     )
 
     torch.testing.assert_close(
@@ -216,10 +215,10 @@ def test_doc_id_matches_separate_execution(share_kv):
 
     # Run each document independently (no doc_ids needed — single doc)
     out1 = _run_selected_attention(
-        Q1, KV1, idx_kv1, indices1, attention_sink, None, sliding_window_size, share_kv,
+        Q1, KV1, idx_kv1, indices1, attention_sink, None, sliding_window_size,
     )
     out2 = _run_selected_attention(
-        Q2, KV2, idx_kv2, indices2, attention_sink, None, sliding_window_size, share_kv,
+        Q2, KV2, idx_kv2, indices2, attention_sink, None, sliding_window_size,
     )
 
     # ---------- Pack into one sequence ----------
@@ -255,7 +254,7 @@ def test_doc_id_matches_separate_execution(share_kv):
 
     out_packed = _run_selected_attention(
         Q_packed, KV_packed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        attention_sink, doc_ids, sliding_window_size,
     )
 
     # Verify doc1 tokens match

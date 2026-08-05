@@ -44,13 +44,13 @@ def test_local_only_attention(backend):
     indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, backend=backend)
 
     # Output should be a weighted combination of local KV only.
     # Changing index_kv should have zero effect.
     index_kv2 = torch.randn(b, h, 4, d, device=device, dtype=dtype)
     out2 = selected_attention(
-        Q, KV, index_kv2, indices, sink, None, window, False, backend=backend
+        Q, KV, index_kv2, indices, sink, None, window, backend=backend
     )
     torch.testing.assert_close(out, out2, atol=1e-5, rtol=1e-5)
 
@@ -73,7 +73,7 @@ def test_local_only_matches_manual_computation(backend):
     indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, backend=backend)
 
     # Manual: build causal sliding window mask, compute attention
     scale = d**0.5
@@ -118,11 +118,11 @@ def test_selected_block_only(backend):
     _, indices = torch.topk(scores, k=topk, dim=-1)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, 0, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, 0, backend=backend)
 
     # Changing local KV should have zero effect when window=0
     KV2 = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    out2 = selected_attention(Q, KV2, index_kv, indices, sink, None, 0, False, backend=backend)
+    out2 = selected_attention(Q, KV2, index_kv, indices, sink, None, 0, backend=backend)
     torch.testing.assert_close(out, out2, atol=1e-5, rtol=1e-5)
 
     assert out.shape == (b, h, s, d)
@@ -145,7 +145,7 @@ def test_selected_block_only_manual(backend):
 
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, 0, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, 0, backend=backend)
 
     # Manual computation: for each query, gather the selected index_kv positions
     scale = d**0.5
@@ -194,14 +194,14 @@ def test_joint_normalization(backend):
     # Local-only
     indices_empty = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     out_local = selected_attention(
-        Q, KV, index_kv, indices_empty, sink, None, window, False, backend=backend
+        Q, KV, index_kv, indices_empty, sink, None, window, backend=backend
     )
 
     # With index blocks
     scores = torch.randn(b, s, 6, device=device)
     _, indices = torch.topk(scores, k=2, dim=-1)
     out_joint = selected_attention(
-        Q, KV, index_kv, indices, sink, None, window, False, backend=backend
+        Q, KV, index_kv, indices, sink, None, window, backend=backend
     )
 
     # They should differ (joint normalization changes the local contribution)
@@ -233,7 +233,7 @@ def test_sink_large_absorbs_probability(backend):
     # Very large positive sink
     sink = torch.full((h,), 50.0, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, backend=backend)
 
     # Output should be near zero (sink absorbs essentially all probability)
     assert (
@@ -261,7 +261,7 @@ def test_sink_very_negative_has_no_effect(backend):
     # Very negative sink (contributes nothing)
     sink = torch.full((h,), -100.0, device=device, dtype=dtype)
 
-    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, False, backend=backend)
+    out = selected_attention(Q, KV, index_kv, indices, sink, None, window, backend=backend)
 
     # Manual standard softmax (no sink in denominator)
     scale = d**0.5
@@ -303,10 +303,10 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     indices = torch.full((b, s, num_repeats), 2, dtype=torch.long, device=device)
 
     out_eager = selected_attention(
-        Q, KV, index_kv, indices, sink, None, sliding_window_size, False, backend="eager"
+        Q, KV, index_kv, indices, sink, None, sliding_window_size, backend="eager"
     )
     out_triton = selected_attention(
-        Q, KV, index_kv, indices, sink, None, sliding_window_size, False, backend="triton"
+        Q, KV, index_kv, indices, sink, None, sliding_window_size, backend="triton"
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
@@ -333,9 +333,9 @@ def test_mixed_repeated_and_unique_indices_backends_match():
         device=device,
     )
 
-    out_eager = selected_attention(Q, KV, index_kv, indices, sink, None, 3, False, backend="eager")
+    out_eager = selected_attention(Q, KV, index_kv, indices, sink, None, 3, backend="eager")
     out_triton = selected_attention(
-        Q, KV, index_kv, indices, sink, None, 3, False, backend="triton"
+        Q, KV, index_kv, indices, sink, None, 3, backend="triton"
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
@@ -366,7 +366,7 @@ def test_torch_compile_fullgraph_forward(backend):
 
     def fn(Q, KV, index_kv, indices, sink):
         return selected_attention(
-            Q, KV, index_kv, indices, sink, None, window, False, backend=backend
+            Q, KV, index_kv, indices, sink, None, window, backend=backend
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
@@ -394,7 +394,7 @@ def test_torch_compile_fullgraph_backward(backend):
 
     def fn(Q, KV, index_kv, sink):
         return selected_attention(
-            Q, KV, index_kv, indices, sink, None, window, False, backend=backend
+            Q, KV, index_kv, indices, sink, None, window, backend=backend
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)

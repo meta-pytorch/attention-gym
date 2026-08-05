@@ -188,17 +188,6 @@ def _selected_attention_with_causal_blocks(
 
     Invalid (causally unavailable) selections are replaced with -1 sentinels.
     """
-    if topk_blocks.shape[-1] == 0:
-        return selected_attention(
-            Q,
-            KV,
-            compressed_kv,
-            topk_blocks,
-            attention_sink,
-            None,
-            sliding_window_size,
-            False,
-        )
 
     valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
     selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
@@ -214,7 +203,7 @@ def _selected_attention_with_causal_blocks(
         attention_sink,
         None,
         sliding_window_size,
-        False,
+        backend="eager",
     )
 
 

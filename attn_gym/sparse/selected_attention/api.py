@@ -26,14 +26,30 @@ def _validate_inputs(
         "indices": indices,
         "attention_sink": attention_sink,
     }
+
+    
+
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
+
+
 
     assert isinstance(Q, torch.Tensor)
     assert isinstance(KV, torch.Tensor)
     assert isinstance(index_kv, torch.Tensor)
     assert isinstance(attention_sink, torch.Tensor)
+
+    assert KV.dtype == Q.dtype, f"KV must have the same dtype as Q, but got {KV.dtype} and {Q.dtype}."
+    assert index_kv.dtype == Q.dtype, f"index_kv must have the same dtype as Q, but got {index_kv.dtype} and {Q.dtype}."
+    assert attention_sink.dtype == Q.dtype, f"attention_sink must have the same dtype as Q, but got {attention_sink.dtype} and {Q.dtype}."
+
+    assert KV.device == Q.device, f"KV must be on the same device as Q, but got {KV.device} and {Q.device}."
+    assert index_kv.device == Q.device, f"index_kv must be on the same device as Q, but got {index_kv.device} and {Q.device}."
+    assert attention_sink.device == Q.device, f"attention_sink must be on the same device as Q, but got {attention_sink.device} and {Q.device}."
+    if doc_ids is not None:
+        assert doc_ids.device == Q.device, f"doc_ids must be on the same device as Q, but got {doc_ids.device} and {Q.device}."
+
 
     if Q.ndim != 4:
         raise ValueError("Q must have shape [batch, heads, sequence_length, head_dim].")
