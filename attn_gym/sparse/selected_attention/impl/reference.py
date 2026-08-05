@@ -85,8 +85,6 @@ def selected_attention(
             P = softmax(cat([P, sink]))[:P.sequence_length]
             return P @ V
 
-
-
     Args:
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
@@ -101,7 +99,7 @@ def selected_attention(
         kv_indices: Which entries to select from sparse_kv.
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             If less than num_topk_blocks should be indexed, pad the tensor with -1
-            Duplicate indices will be computed multiple times.
+            Duplicate indices will be upweighted based on the number of times they were duplicated
 
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
