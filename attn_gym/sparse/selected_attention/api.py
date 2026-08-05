@@ -191,7 +191,7 @@ def selected_attention(
 
     match backend:
         case "eager":
-            from . import reference
+            from .impl import reference
 
             return reference.selected_attention(
                 query,
@@ -204,7 +204,7 @@ def selected_attention(
                 share_kv,
             )
         case "triton":
-            from . import triton as triton_backend
+            from .impl import triton as triton_backend
 
             return triton_backend.selected_attention(
                 query,
