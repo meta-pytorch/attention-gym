@@ -511,7 +511,6 @@ def _selected_attention_bwd_dlocal_kv(
 def _selected_attention_bwd_dindex_kv(
     q_ptr,
     index_kv_ptr,
-    indices_ptr,
     selected_queries_ptr,
     block_offsets_ptr,
     output_ptr,
@@ -526,9 +525,6 @@ def _selected_attention_bwd_dindex_kv(
     stride_ih: tl.constexpr,
     stride_in: tl.constexpr,
     stride_id: tl.constexpr,
-    stride_xb: tl.constexpr,
-    stride_xs: tl.constexpr,
-    stride_xk: tl.constexpr,
     stride_sqb: tl.constexpr,
     stride_sqe: tl.constexpr,
     stride_bob: tl.constexpr,
@@ -543,7 +539,6 @@ def _selected_attention_bwd_dindex_kv(
     H: tl.constexpr,
     S: tl.constexpr,
     D: tl.constexpr,
-    INDEX_SEQ_LEN: tl.constexpr,
     SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -659,7 +654,7 @@ def _launch_forward(
 
     has_doc_ids = doc_ids is not None
     if doc_ids is None:
-        doc_ids = torch.empty(batch, seq_len, device=query.device, dtype=torch.int32)
+        doc_ids = query
         doc_strides = (0, 0)
     else:
         doc_strides = doc_ids.stride()
@@ -747,13 +742,20 @@ def _launch_backward(
     scale = 1.0 / math.sqrt(head_dim)
     grad_output = grad_output.contiguous()
 
+    # When KV heads are shared (stride-zero from expand), make contiguous for
+    # kernel reads and allocate full-head gradient tensors, then sum afterward.
+    share_kv = local_kv.stride(1) == 0
+    if share_kv:
+        local_kv = local_kv.contiguous()
+        sparse_kv = sparse_kv.contiguous()
+
     grad_query = torch.empty_like(query)
     grad_local_kv = torch.empty_like(local_kv)
     grad_sink_fp32 = torch.zeros(heads, device=query.device, dtype=torch.float32)
 
     has_doc_ids = doc_ids is not None
     if doc_ids is None:
-        doc_ids_t = torch.empty(batch, seq_len, device=query.device, dtype=torch.int32)
+        doc_ids_t = query
         doc_strides = (0, 0)
     else:
         doc_ids_t = doc_ids
@@ -833,7 +835,6 @@ def _launch_backward(
         _selected_attention_bwd_dindex_kv[(sparse_seq_len, batch * heads)](
             query,
             sparse_kv,
-            kv_indices,
             selected_queries,
             block_offsets,
             output,
@@ -842,7 +843,6 @@ def _launch_backward(
             grad_sparse_kv,
             *query.stride(),
             *sparse_kv.stride(),
-            *kv_indices.stride(),
             *selected_queries.stride(),
             *block_offsets.stride(),
             *lse.stride(),
@@ -850,7 +850,6 @@ def _launch_backward(
             H=heads,
             S=seq_len,
             D=head_dim,
-            INDEX_SEQ_LEN=sparse_seq_len,
             SCALE=scale,
             BLOCK_M=compressed_block_m,
             BLOCK_D=block_d,
@@ -963,13 +962,10 @@ def selected_attention(
     if query.device.type != "cuda":
         raise ValueError("The Triton selected attention backend requires CUDA tensors.")
 
-    # Expand shared KV heads
+    # Expand shared KV heads (stride-zero broadcast; no memory duplication)
     if share_kv:
-        local_kv = local_kv.expand(-1, h, -1, -1).contiguous()
-        sparse_kv = sparse_kv.expand(-1, h, -1, -1).contiguous()
-    else:
-        local_kv = local_kv.contiguous()
-        sparse_kv = sparse_kv.contiguous()
+        local_kv = local_kv.expand(-1, h, -1, -1)
+        sparse_kv = sparse_kv.expand(-1, h, -1, -1)
 
     query = query.contiguous()
     kv_indices = kv_indices.contiguous()

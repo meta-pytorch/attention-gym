@@ -27,27 +27,6 @@ def make_sliding_window_mask(query_length: int, window_size: int, device: torch.
     ).masked_fill(~valid, float("-inf"))
 
 
-def sink_softmax(x: Tensor, sink: Tensor, dim: int) -> Tensor:
-    """
-    Applies a softmax with an attention sink.
-    The sink contributes to the demoninator but not the numerator, so it is not returned
-    Computes Y, where Y[a, b, c, d] = exp(x[a, b, c, d]) / (sum(exp(x[a, b, c, :]) + exp(sink[b])))
-    Args:
-        x: shape of (batch, num_heads, sequence, dim)
-        sink: shape of (num_heads, )
-        dim: dimension to apply softmax on
-    Returns:
-        Y, same shape as X
-    """
-    sink = sink[None, :, None, None]
-    maximums = torch.max(x, dim=dim, keepdim=True).values
-    maximums = torch.maximum(maximums, sink)
-    x = x - maximums
-    sink = sink - maximums
-    x = torch.exp(x)
-    return x / (torch.sum(x, dim, keepdim=True) + torch.exp(sink))
-
-
 def make_packed_mask(
     doc_ids: torch.Tensor,
     *,
@@ -179,10 +158,13 @@ def selected_attention(
 
     scale = head_dim**0.5
 
-    P = sink_softmax(
-        torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask,
-        attention_sink,
-        dim=-1,
-    )
-    attn_output = P @ attention_kv
+    logits = torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask
+
+    # Concatenate sink as an extra column, apply standard softmax, then drop it
+    sink_logit = attention_sink[None, :, None, None].expand(b, -1, s, 1)
+    logits_with_sink = torch.cat([logits, sink_logit], dim=-1)
+    probs_with_sink = torch.softmax(logits_with_sink, dim=-1)
+    probs = probs_with_sink[..., :-1]
+
+    attn_output = probs @ attention_kv
     return attn_output
