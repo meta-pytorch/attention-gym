@@ -699,7 +699,7 @@ def _build_index_query_map(
     sparse_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Invert query-major indices into block-major query lists (CSR format)."""
-    batch, seq_len, topk = kv_indices.shape
+    batch, _seq_len, topk = kv_indices.shape
     if topk == 0:
         selected_queries = torch.empty(batch, 0, device=kv_indices.device, dtype=torch.int32)
         block_offsets = torch.zeros(
@@ -883,9 +883,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             sliding_window_size,
             _return_lse=True,
         )
-        selected_queries, block_offsets = _build_index_query_map(
-            kv_indices, sparse_kv.shape[2]
-        )
+        selected_queries, block_offsets = _build_index_query_map(kv_indices, sparse_kv.shape[2])
         ctx.save_for_backward(
             query,
             sparse_kv,
@@ -956,7 +954,7 @@ def selected_attention(
     Returns:
         Attention output with same shape as query.
     """
-    b, h, s, head_dim = query.shape
+    _b, h, _s, _head_dim = query.shape
 
     # Validate CUDA
     if query.device.type != "cuda":

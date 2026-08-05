@@ -1,5 +1,3 @@
-from typing import Literal
-
 import torch
 from torch import Tensor
 
@@ -27,29 +25,38 @@ def _validate_inputs(
         "attention_sink": attention_sink,
     }
 
-
-
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
-
-
 
     assert isinstance(query, torch.Tensor)
     assert isinstance(local_kv, torch.Tensor)
     assert isinstance(sparse_kv, torch.Tensor)
     assert isinstance(attention_sink, torch.Tensor)
 
-    assert local_kv.dtype == query.dtype, f"local_kv must have the same dtype as query, but got {local_kv.dtype} and {query.dtype}."
-    assert sparse_kv.dtype == query.dtype, f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
-    assert attention_sink.dtype == query.dtype, f"attention_sink must have the same dtype as query, but got {attention_sink.dtype} and {query.dtype}."
+    assert local_kv.dtype == query.dtype, (
+        f"local_kv must have the same dtype as query, but got {local_kv.dtype} and {query.dtype}."
+    )
+    assert sparse_kv.dtype == query.dtype, (
+        f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
+    )
+    assert attention_sink.dtype == query.dtype, (
+        f"attention_sink must have the same dtype as query, but got {attention_sink.dtype} and {query.dtype}."
+    )
 
-    assert local_kv.device == query.device, f"local_kv must be on the same device as query, but got {local_kv.device} and {query.device}."
-    assert sparse_kv.device == query.device, f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
-    assert attention_sink.device == query.device, f"attention_sink must be on the same device as query, but got {attention_sink.device} and {query.device}."
+    assert local_kv.device == query.device, (
+        f"local_kv must be on the same device as query, but got {local_kv.device} and {query.device}."
+    )
+    assert sparse_kv.device == query.device, (
+        f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
+    )
+    assert attention_sink.device == query.device, (
+        f"attention_sink must be on the same device as query, but got {attention_sink.device} and {query.device}."
+    )
     if doc_ids is not None:
-        assert doc_ids.device == query.device, f"doc_ids must be on the same device as query, but got {doc_ids.device} and {query.device}."
-
+        assert doc_ids.device == query.device, (
+            f"doc_ids must be on the same device as query, but got {doc_ids.device} and {query.device}."
+        )
 
     if query.ndim != 4:
         raise ValueError("query must have shape [batch, heads, sequence_length, head_dim].")
@@ -124,21 +131,21 @@ def _validate_inputs(
             )
         if doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length:
             raise ValueError(
-                f"doc_ids must have shape [batch, sequence_length], " f"got {list(doc_ids.shape)}."
+                f"doc_ids must have shape [batch, sequence_length], got {list(doc_ids.shape)}."
             )
 
 
 def selected_attention(
-    query,
-    local_kv,
-    sparse_kv,
-    kv_indices,
-    attention_sink,
-    doc_ids=None,
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor,
+    attention_sink: Tensor,
+    doc_ids: Tensor | None = None,
     sliding_window_size: int = 512,
     backend: str = "triton",
     mode: str = "auto",
-):
+) -> Tensor:
     """
     Performs selected attention
         Each query attends to the previous sliding_window_size elements in the local_kv tensor
@@ -182,11 +189,17 @@ def selected_attention(
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
-    share_kv = (sparse_kv.shape[1] == 1)
+    share_kv = sparse_kv.shape[1] == 1
     if not torch.compiler.is_compiling():
         _validate_inputs(
-            query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids,
-            sliding_window_size, share_kv
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            sliding_window_size,
+            share_kv,
         )
 
     match backend:

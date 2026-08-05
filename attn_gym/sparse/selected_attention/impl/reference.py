@@ -4,7 +4,9 @@ import torch
 from torch import Tensor
 
 
-def make_sliding_window_mask(query_length: int, window_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def make_sliding_window_mask(
+    query_length: int, window_size: int, device: torch.device, dtype: torch.dtype
+) -> Tensor:
     """
     Makes a mask for sliding window attention
     Args:
@@ -33,15 +35,15 @@ def make_packed_mask(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Creates an attention mask that prevents documents from attenting across boundaries
+    Creates an attention mask that prevents documents from attending across boundaries
 
     Args:
         doc_ids: Has shape (batch, sequence) and integer dtype.
-            Tokens in the same document have the same ID and will be allowed to attention to each other.
+            Tokens in the same document have the same ID and will be allowed to attend to each other.
 
     Returns:
         Additive attention mask of shape (batch, 1, sequence, sequence)
-        Tokens from different documents recieve -inf for the attention mask, and tokens from the same document receive 0
+        Tokens from different documents receive -inf for the attention mask, and tokens from the same document receive 0
     """
     batch_size, seq_len = doc_ids.shape
     device = doc_ids.device
@@ -75,7 +77,7 @@ def selected_attention(
     Performs selected attention as follows:
         if share_kv:
             expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
-        For each token, Q_i, in query: 
+        For each token, Q_i, in query:
             first_token_of_document = torch.where(x == x[i])[0].min()
             farthest_past_token_index = max(i - sliding_window, first_token_of_document)
             KV = cat([local_kv[farthest_past_token_index: i], sparse_kv[indices]])
@@ -83,7 +85,7 @@ def selected_attention(
             P = softmax(cat([P, sink]))[:P.sequence_length]
             return P @ V
 
-            
+
 
     Args:
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
@@ -158,7 +160,9 @@ def selected_attention(
 
     scale = head_dim**0.5
 
-    logits = torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask
+    logits = (
+        torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask
+    )
 
     # Concatenate sink as an extra column, apply standard softmax, then drop it
     sink_logit = attention_sink[None, :, None, None].expand(b, -1, s, 1)

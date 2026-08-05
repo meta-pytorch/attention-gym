@@ -125,9 +125,7 @@ def apply_rope(
         if low == high:
             high += 0.001
 
-        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=dtype) - low) / (
-            high - low
-        )
+        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=dtype) - low) / (high - low)
         smooth = 1 - ramp.clamp(0, 1)
         frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
 

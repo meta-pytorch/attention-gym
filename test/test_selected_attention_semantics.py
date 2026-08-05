@@ -10,7 +10,6 @@ import torch
 
 from attn_gym.sparse.selected_attention import selected_attention
 
-
 BACKENDS = ["eager"]
 if torch.cuda.is_available():
     BACKENDS.append("triton")
@@ -188,14 +187,13 @@ def test_joint_normalization(backend):
     """When both local and sparse branches are active, they share normalization.
 
     We verify against a manual computation that runs a single softmax over the
-    concatenation of sparse and local logits. 
+    concatenation of sparse and local logits.
     """
     device = _device_for_backend(backend)
     dtype = torch.float64 if backend == "eager" else torch.float32
     b, h, s, d = 1, 1, 4, 8
     window = 2
     sparse_seq_len = 3
-    num_topk = 2
 
     torch.manual_seed(55)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype)
@@ -223,7 +221,7 @@ def test_joint_normalization(backend):
 
         # Gather local window entries
         first = max(0, seq - window + 1)
-        local_entries = lkv[first:seq + 1]  # (window_len, d)
+        local_entries = lkv[first : seq + 1]  # (window_len, d)
 
         # Concatenate all KV entries this query attends to
         all_kv = torch.cat([gathered_sparse, local_entries], dim=0)  # (num_topk + window_len, d)
@@ -274,9 +272,9 @@ def test_sink_large_absorbs_probability(backend):
     )
 
     # Output should be near zero (sink absorbs essentially all probability)
-    assert (
-        out.abs().max().item() < 0.01
-    ), f"With large sink, output should be near zero, got max={out.abs().max().item()}"
+    assert out.abs().max().item() < 0.01, (
+        f"With large sink, output should be near zero, got max={out.abs().max().item()}"
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -336,7 +334,9 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     torch.manual_seed(0)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype, requires_grad=True)
     local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype, requires_grad=True)
-    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype, requires_grad=True)
+    sparse_kv = torch.randn(
+        b, h, sparse_seq_len, d, device=device, dtype=dtype, requires_grad=True
+    )
     sink = torch.randn(h, device=device, dtype=dtype, requires_grad=True)
 
     # All slots repeat position 2

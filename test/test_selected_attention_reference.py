@@ -4,8 +4,9 @@ import torch
 from attn_gym.sparse.selected_attention import selected_attention
 
 
-def _run_selected_attention(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids,
-                            sliding_window_size):
+def _run_selected_attention(
+    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
+):
     """Helper that calls selected_attention and returns the output."""
     return selected_attention(
         query,
@@ -95,9 +96,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     # ---------- Packed inputs (both docs in one sequence) ----------
     query_packed = torch.randn(1, h, packed_len, head_dim, generator=generator)
     local_kv_packed = torch.randn(1, kv_heads, packed_len, head_dim, generator=generator)
-    sparse_kv_packed = torch.randn(
-        1, kv_heads, sparse_seq_len, head_dim, generator=generator
-    )
+    sparse_kv_packed = torch.randn(1, kv_heads, sparse_seq_len, head_dim, generator=generator)
 
     if num_topk_blocks > 0:
         _, kv_indices_packed = torch.topk(
@@ -111,14 +110,21 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     attention_sink = torch.randn(h, generator=generator)
 
     # doc_ids: [0,0,0,0,0,0, 1,1,1,1,1,1,1,1]
-    doc_ids = torch.cat([
-        torch.zeros(doc1_len, dtype=torch.long),
-        torch.ones(doc2_len, dtype=torch.long),
-    ]).unsqueeze(0)  # shape (1, packed_len)
+    doc_ids = torch.cat(
+        [
+            torch.zeros(doc1_len, dtype=torch.long),
+            torch.ones(doc2_len, dtype=torch.long),
+        ]
+    ).unsqueeze(0)  # shape (1, packed_len)
 
     out_packed = _run_selected_attention(
-        query_packed, local_kv_packed, sparse_kv_packed, kv_indices_packed,
-        attention_sink, doc_ids, sliding_window_size,
+        query_packed,
+        local_kv_packed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # ---------- Perturb the other document's data ----------
@@ -134,8 +140,13 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     )
 
     out_perturbed = _run_selected_attention(
-        query_perturbed, local_kv_perturbed, sparse_kv_packed, kv_indices_packed,
-        attention_sink, doc_ids, sliding_window_size,
+        query_perturbed,
+        local_kv_perturbed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # Doc1's output must be unchanged
@@ -158,8 +169,13 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     )
 
     out_perturbed2 = _run_selected_attention(
-        query_perturbed2, local_kv_perturbed2, sparse_kv_packed, kv_indices_packed,
-        attention_sink, doc_ids, sliding_window_size,
+        query_perturbed2,
+        local_kv_perturbed2,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     torch.testing.assert_close(
@@ -215,10 +231,22 @@ def test_doc_id_matches_separate_execution(share_kv):
 
     # Run each document independently (no doc_ids needed — single doc)
     out1 = _run_selected_attention(
-        query1, local_kv1, sparse_kv1, kv_indices1, attention_sink, None, sliding_window_size,
+        query1,
+        local_kv1,
+        sparse_kv1,
+        kv_indices1,
+        attention_sink,
+        None,
+        sliding_window_size,
     )
     out2 = _run_selected_attention(
-        query2, local_kv2, sparse_kv2, kv_indices2, attention_sink, None, sliding_window_size,
+        query2,
+        local_kv2,
+        sparse_kv2,
+        kv_indices2,
+        attention_sink,
+        None,
+        sliding_window_size,
     )
 
     # ---------- Pack into one sequence ----------
@@ -238,17 +266,24 @@ def test_doc_id_matches_separate_execution(share_kv):
         min(num_topk_blocks, sparse_kv2_len),
     )
     kv_indices_packed = torch.zeros(1, packed_len, topk_width, dtype=torch.long)
-    kv_indices_packed[:, :doc1_len, :min(num_topk_blocks, sparse_kv1_len)] = kv_indices1
-    kv_indices_packed[:, doc1_len:, :min(num_topk_blocks, sparse_kv2_len)] = indices2_shifted
+    kv_indices_packed[:, :doc1_len, : min(num_topk_blocks, sparse_kv1_len)] = kv_indices1
+    kv_indices_packed[:, doc1_len:, : min(num_topk_blocks, sparse_kv2_len)] = indices2_shifted
 
-    doc_ids = torch.cat([
-        torch.zeros(doc1_len, dtype=torch.long),
-        torch.ones(doc2_len, dtype=torch.long),
-    ]).unsqueeze(0)
+    doc_ids = torch.cat(
+        [
+            torch.zeros(doc1_len, dtype=torch.long),
+            torch.ones(doc2_len, dtype=torch.long),
+        ]
+    ).unsqueeze(0)
 
     out_packed = _run_selected_attention(
-        query_packed, local_kv_packed, sparse_kv_packed, kv_indices_packed,
-        attention_sink, doc_ids, sliding_window_size,
+        query_packed,
+        local_kv_packed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # Verify doc1 tokens match

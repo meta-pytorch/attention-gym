@@ -10,7 +10,6 @@ import torch
 
 from attn_gym.sparse.selected_attention import selected_attention
 
-
 ATOL_FWD = 1e-2
 RTOL_FWD = 1e-2
 ATOL_BWD = 1e-2
@@ -119,12 +118,25 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 1, 2, 3])
 @pytest.mark.parametrize("grad_target", ["query", "local_kv", "sparse_kv", "attention_sink"])
-def test_triton_backward(share_kv, num_topk, grad_target):
+@pytest.mark.parametrize("sliding_window_size", [0, 8])
+def test_triton_backward(share_kv, num_topk, grad_target, sliding_window_size):
     """Triton backward produces correct gradients for all differentiable inputs."""
     _skip_no_cuda()
 
-    inputs_ref = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=42)
-    inputs_tri = _make_inputs(share_kv=share_kv, num_topk=num_topk, requires_grad=True, seed=42)
+    inputs_ref = _make_inputs(
+        share_kv=share_kv,
+        num_topk=num_topk,
+        sliding_window_size=sliding_window_size,
+        requires_grad=True,
+        seed=42,
+    )
+    inputs_tri = _make_inputs(
+        share_kv=share_kv,
+        num_topk=num_topk,
+        sliding_window_size=sliding_window_size,
+        requires_grad=True,
+        seed=42,
+    )
 
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
@@ -180,6 +192,7 @@ def test_triton_backward_with_doc_ids(num_topk):
         inputs_tri["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
 @pytest.mark.parametrize("sliding_window_size", [0, 4])
 def test_repeated_indices_backends_match(sliding_window_size):
@@ -206,6 +219,7 @@ def test_repeated_indices_backends_match(sliding_window_size):
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_triton_forward_half_precision(dtype):
@@ -372,18 +386,18 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
 
     # Sanity checks to make sure we don't get anything insane
     # Not really meant for checking correctness
-    assert (
-        r_fwd < 5
-    ), f"Triton fwd diff too large, ratio of triton to ref {dtype_name} error is: {r_fwd}"
-    assert (
-        r_dq < 5
-    ), f"Triton dQ diff too large, ratio of triton to ref {dtype_name} error is: {r_dq}"
-    assert (
-        r_dkv < 5
-    ), f"Triton dKV diff too large, ratio of triton to ref {dtype_name} error is: {r_dkv}"
-    assert (
-        r_didx < 5
-    ), f"Triton dIdx diff too large, ratio of triton to ref {dtype_name} error is: {r_didx}"
-    assert (
-        r_dsink < 5
-    ), f"Triton dSink diff too large, ratio of triton to ref {dtype_name} error is: {r_dsink}"
+    assert r_fwd < 5, (
+        f"Triton fwd diff too large, ratio of triton to ref {dtype_name} error is: {r_fwd}"
+    )
+    assert r_dq < 5, (
+        f"Triton dQ diff too large, ratio of triton to ref {dtype_name} error is: {r_dq}"
+    )
+    assert r_dkv < 5, (
+        f"Triton dKV diff too large, ratio of triton to ref {dtype_name} error is: {r_dkv}"
+    )
+    assert r_didx < 5, (
+        f"Triton dIdx diff too large, ratio of triton to ref {dtype_name} error is: {r_didx}"
+    )
+    assert r_dsink < 5, (
+        f"Triton dSink diff too large, ratio of triton to ref {dtype_name} error is: {r_dsink}"
+    )
