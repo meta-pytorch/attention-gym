@@ -308,10 +308,10 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     sparse_seq_len = 6
 
     torch.manual_seed(0)
-    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
-    sink = torch.randn(h, device=device, dtype=dtype)
+    query = torch.randn(b, h, s, d, device=device, dtype=dtype, requires_grad=True)
+    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype, requires_grad=True)
+    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype, requires_grad=True)
+    sink = torch.randn(h, device=device, dtype=dtype, requires_grad=True)
 
     # All slots repeat position 2
     kv_indices = torch.full((b, s, num_repeats), 2, dtype=torch.long, device=device)
@@ -319,11 +319,27 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     out_eager = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
     )
+    out_eager.sum().backward()
+    grad_query_eager = query.grad.clone()
+    grad_local_kv_eager = local_kv.grad.clone()
+    grad_sparse_kv_eager = sparse_kv.grad.clone()
+    grad_sink_eager = sink.grad.clone()
+
+    query.grad = None
+    local_kv.grad = None
+    sparse_kv.grad = None
+    sink.grad = None
+
     out_triton = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
     )
+    out_triton.sum().backward()
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(query.grad, grad_query_eager, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(local_kv.grad, grad_local_kv_eager, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(sparse_kv.grad, grad_sparse_kv_eager, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(sink.grad, grad_sink_eager, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
