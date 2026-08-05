@@ -307,7 +307,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     b, h, s, d = 1, 2, 8, 16
     sparse_seq_len = 6
 
-    torch.manual_seed(88)
+    torch.manual_seed(0)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype)
     local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
     sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)

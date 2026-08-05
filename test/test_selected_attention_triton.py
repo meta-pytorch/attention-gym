@@ -148,7 +148,7 @@ def test_triton_backward_dlocal_kv(share_kv, num_topk):
     out_ref = selected_attention(**inputs_ref, backend="eager")
     out_tri = selected_attention(**inputs_tri, backend="triton")
 
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(8888)
+    grad_gen = torch.Generator(device=out_ref.device).manual_seed(0)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
     out_ref.backward(grad_output)
     out_tri.backward(grad_output)
@@ -244,6 +244,32 @@ def test_triton_backward_with_doc_ids(num_topk):
         inputs_tri["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
+@pytest.mark.parametrize("sliding_window_size", [0, 4])
+def test_repeated_indices_backends_match(sliding_window_size):
+    """Repeated indices should produce identical results in eager and triton."""
+    device = torch.device("cuda")
+    dtype = torch.float32
+    b, h, s, d = 1, 2, 8, 16
+    sparse_seq_len = 6
+
+    torch.manual_seed(0)
+    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
+    sink = torch.randn(h, device=device, dtype=dtype)
+
+    # All slots repeat position 2
+    kv_indices = torch.full((b, s, 1), 2, dtype=torch.long, device=device)
+
+    out_eager = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
+    )
+    out_triton = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
+    )
+
+    torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_triton_forward_half_precision(dtype):
