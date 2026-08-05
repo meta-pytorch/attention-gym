@@ -29,7 +29,7 @@ def make_sliding_window_mask(query_length: int, window_size: int, device: torch.
 
 def sink_softmax(x: Tensor, sink: Tensor, dim: int) -> Tensor:
     """
-    Applies a softmax with an attention sink. 
+    Applies a softmax with an attention sink.
     The sink contributes to the demoninator but not the numerator, so it is not returned
     Computes Y, where Y[a, b, c, d] = exp(x[a, b, c, d]) / (sum(exp(x[a, b, c, :]) + exp(sink[b])))
     Args:
@@ -37,7 +37,7 @@ def sink_softmax(x: Tensor, sink: Tensor, dim: int) -> Tensor:
         sink: shape of (num_heads, )
         dim: dimension to apply softmax on
     Returns:
-        Y, same shape as X 
+        Y, same shape as X
     """
     sink = sink[None, :, None, None]
     maximums = torch.max(x, dim=dim, keepdim=True).values
@@ -55,10 +55,10 @@ def make_packed_mask(
 ) -> torch.Tensor:
     """
     Creates an attention mask that prevents documents from attenting across boundaries
-    
+
     Args:
         doc_ids: Has shape (batch, sequence) and integer dtype.
-            Tokens in the same document have the same ID and are allowed to attention to each other. 
+            Tokens in the same document have the same ID and are allowed to attention to each other.
             Tokens from documents recieve -inf for the attention mask, and tokens from the same document receive 0
 
     Returns:
@@ -83,10 +83,10 @@ def make_packed_mask(
 
 
 def selected_attention(
-    Q: Tensor,
-    KV: Tensor,
-    index_kv: Tensor,
-    indices: Tensor | None,
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor | None,
     attention_sink: Tensor,
     doc_ids: Tensor | None,
     sliding_window_size: int,
@@ -94,17 +94,19 @@ def selected_attention(
 ) -> Tensor:
     """
     Args:
-        Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
+        query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        KV: Key and Value for the sliding window branch,
+        local_kv: Key and Value for the sliding window branch,
             represented as a shared tensor, (batch_size, 1, sequence_length, head_dim) if share_kv = False
             Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
 
-        index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim) if share_kv = False
+        sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
+            if share_kv = False
             Otherwise represented as (batch_size, num_heads, X, head_dim), where X can be any nonzero integer
 
-        indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
-            If None, index_kv will be ignored
+        kv_indices: Which entries to select from sparse_kv.
+            Shape of (batch, sequence_length, num_topk_blocks), integer tensor
+            If None, sparse_kv will be ignored
             If less than num_topk_blocks should be indexed, pad the tensor with -1
             Duplicate indices will be computed multiple times.
 
@@ -113,7 +115,7 @@ def selected_attention(
 
         doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
-            If doc_ids[i, j] = doc_ids[i, j-y], then Q[i, j] can causally attend to KV[i, j-y]
+            If doc_ids[i, j] = doc_ids[i, j-y], then query[i, j] can causally attend to local_kv[i, j-y]
             Should be monotonically increasing on the sequence axis
             If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the same document.
 
@@ -123,23 +125,23 @@ def selected_attention(
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
-    device = Q.device
-    dtype = Q.dtype
-    b, h, s, head_dim = Q.shape
-    index_sequence_length = index_kv.shape[2]
+    device = query.device
+    dtype = query.dtype
+    b, h, s, head_dim = query.shape
+    sparse_seq_len = sparse_kv.shape[2]
     if share_kv:
-        KV = KV.expand(-1, h, -1, -1)
-        index_kv = index_kv.expand(-1, h, -1, -1)
-    if indices is not None:
-        # We have s queries that each potentially attend to index_sequence_length elements.
+        local_kv = local_kv.expand(-1, h, -1, -1)
+        sparse_kv = sparse_kv.expand(-1, h, -1, -1)
+    if kv_indices is not None:
+        # We have s queries that each potentially attend to sparse_seq_len elements.
         # Indices of -1 are sentinel values meaning "no selection for this slot".
         # Repeated indices get extra weight (equivalent to multiple copies in the attention set).
         # This is specifically for edge case handling,
         # since most uses of this will have indices pass through torch.topk
-        valid_mask = indices >= 0
-        safe_indices = indices.clamp(min=0)
+        valid_mask = kv_indices >= 0
+        safe_indices = kv_indices.clamp(min=0)
         # Count how many times each position is selected per query (ignoring sentinels)
-        counts = torch.zeros(b, s, index_sequence_length, device=device, dtype=dtype)
+        counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=dtype)
         counts.scatter_add_(
             dim=-1,
             index=safe_indices,
@@ -158,16 +160,16 @@ def selected_attention(
         # packing_mask is [B, 1, S, S], SWA_mask is [B, S, S]
         SWA_mask = SWA_mask + packing_mask.squeeze(1)
 
-    if indices is not None:
-        attention_kv = torch.cat([index_kv, KV], dim=-2)
+    if kv_indices is not None:
+        attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
         attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
     else:
-        attention_kv = KV
+        attention_kv = local_kv
         attention_mask = SWA_mask
     scale = head_dim**0.5
 
     P = sink_softmax(
-        torch.matmul(Q, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask,
+        torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask,
         attention_sink,
         dim=-1,
     )

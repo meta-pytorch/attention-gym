@@ -176,9 +176,9 @@ def apply_rope(
 
 
 def _selected_attention_with_causal_blocks(
-    Q,
-    KV,
-    compressed_kv,
+    query,
+    local_kv,
+    sparse_kv,
     topk_blocks,
     indexer_mask,
     attention_sink,
@@ -189,21 +189,22 @@ def _selected_attention_with_causal_blocks(
     Invalid (causally unavailable) selections are replaced with -1 sentinels.
     """
 
-    valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
+    valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(query.shape[0], -1, -1)
     selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
 
     # Replace causally invalid selections with -1 sentinel
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
+    backend = "triton" if query.device.type == "cuda" else "eager"
     return selected_attention(
-        Q,
-        KV,
-        compressed_kv,
+        query,
+        local_kv,
+        sparse_kv,
         causal_topk_blocks,
         attention_sink,
         None,
         sliding_window_size,
-        backend="eager",
+        backend=backend,
     )
 
 

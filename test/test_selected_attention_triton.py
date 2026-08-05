@@ -27,7 +27,7 @@ def _make_inputs(
     heads: int = 4,
     seq_len: int = 32,
     head_dim: int = 64,
-    index_seq_len: int = 16,
+    sparse_seq_len: int = 16,
     num_topk: int = 3,
     sliding_window_size: int = 8,
     share_kv: bool = True,
@@ -45,15 +45,15 @@ def _make_inputs(
             *shape, device=device, dtype=dtype, generator=generator, requires_grad=requires_grad
         )
 
-    Q = randn(batch, heads, seq_len, head_dim)
-    KV = randn(batch, kv_heads, seq_len, head_dim)
-    index_kv = randn(batch, kv_heads, index_seq_len, head_dim)
+    query = randn(batch, heads, seq_len, head_dim)
+    local_kv = randn(batch, kv_heads, seq_len, head_dim)
+    sparse_kv = randn(batch, kv_heads, sparse_seq_len, head_dim)
 
     if num_topk > 0:
-        scores = torch.randn(batch, seq_len, index_seq_len, device=device, generator=generator)
-        _, indices = torch.topk(scores, k=min(num_topk, index_seq_len), dim=-1)
+        scores = torch.randn(batch, seq_len, sparse_seq_len, device=device, generator=generator)
+        _, kv_indices = torch.topk(scores, k=min(num_topk, sparse_seq_len), dim=-1)
     else:
-        indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
+        kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
 
     attention_sink = torch.randn(
         heads, device=device, dtype=dtype, generator=generator, requires_grad=requires_grad
@@ -63,10 +63,10 @@ def _make_inputs(
         doc_ids = doc_ids.to(device)
 
     return {
-        "Q": Q,
-        "KV": KV,
-        "index_kv": index_kv,
-        "indices": indices,
+        "query": query,
+        "local_kv": local_kv,
+        "sparse_kv": sparse_kv,
+        "kv_indices": kv_indices,
         "attention_sink": attention_sink,
         "doc_ids": doc_ids,
         "sliding_window_size": sliding_window_size,
@@ -133,7 +133,7 @@ def test_triton_backward_dq(share_kv, num_topk):
     out_tri.backward(grad_output)
 
     torch.testing.assert_close(
-        inputs_tri["Q"].grad, inputs_ref["Q"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
+        inputs_tri["query"].grad, inputs_ref["query"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
 
 
@@ -154,7 +154,7 @@ def test_triton_backward_dlocal_kv(share_kv, num_topk):
     out_tri.backward(grad_output)
 
     torch.testing.assert_close(
-        inputs_tri["KV"].grad, inputs_ref["KV"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
+        inputs_tri["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
 
 
@@ -175,8 +175,8 @@ def test_triton_backward_dindex_kv(share_kv, num_topk):
     out_tri.backward(grad_output)
 
     torch.testing.assert_close(
-        inputs_tri["index_kv"].grad,
-        inputs_ref["index_kv"].grad,
+        inputs_tri["sparse_kv"].grad,
+        inputs_ref["sparse_kv"].grad,
         atol=ATOL_BWD,
         rtol=RTOL_BWD,
     )
@@ -238,10 +238,10 @@ def test_triton_backward_with_doc_ids(num_topk):
     out_tri.backward(grad_output)
 
     torch.testing.assert_close(
-        inputs_tri["Q"].grad, inputs_ref["Q"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
+        inputs_tri["query"].grad, inputs_ref["query"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
     torch.testing.assert_close(
-        inputs_tri["KV"].grad, inputs_ref["KV"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
+        inputs_tri["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
     )
 
 
@@ -267,7 +267,7 @@ def test_triton_larger_sequence():
         heads=2,
         seq_len=256,
         head_dim=64,
-        index_seq_len=64,
+        sparse_seq_len=64,
         num_topk=4,
         sliding_window_size=32,
     )
@@ -290,7 +290,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     """
     _skip_no_cuda()
     batch, heads, seq_len, head_dim = 2, 4, 32, 64
-    index_seq_len = 16
+    sparse_seq_len = 16
     sliding_window_size = 8
     kv_heads = 1 if share_kv else heads
     seed = 77
@@ -305,57 +305,57 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
             *shape, dtype=torch.float64, device=device, generator=gen64, requires_grad=True
         )
 
-    Q_64 = randn64(batch, heads, seq_len, head_dim)
-    KV_64 = randn64(batch, kv_heads, seq_len, head_dim)
-    index_kv_64 = randn64(batch, kv_heads, index_seq_len, head_dim)
+    query_64 = randn64(batch, heads, seq_len, head_dim)
+    local_kv_64 = randn64(batch, kv_heads, seq_len, head_dim)
+    sparse_kv_64 = randn64(batch, kv_heads, sparse_seq_len, head_dim)
     scores_64 = torch.randn(
-        batch, seq_len, index_seq_len, dtype=torch.float64, device=device, generator=gen64
+        batch, seq_len, sparse_seq_len, dtype=torch.float64, device=device, generator=gen64
     )
     if num_topk > 0:
-        _, indices = torch.topk(scores_64, k=min(num_topk, index_seq_len), dim=-1)
+        _, kv_indices = torch.topk(scores_64, k=min(num_topk, sparse_seq_len), dim=-1)
     else:
-        indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
+        kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
     sink_64 = torch.randn(
         heads, dtype=torch.float64, device=device, generator=gen64, requires_grad=True
     )
 
     # --- Lower-precision copies on CUDA (cast from the same fp64 values) ---
-    Q_lp_ref = Q_64.detach().to(dtype).requires_grad_(True)
-    KV_lp_ref = KV_64.detach().to(dtype).requires_grad_(True)
-    index_kv_lp_ref = index_kv_64.detach().to(dtype).requires_grad_(True)
+    query_lp_ref = query_64.detach().to(dtype).requires_grad_(True)
+    local_kv_lp_ref = local_kv_64.detach().to(dtype).requires_grad_(True)
+    sparse_kv_lp_ref = sparse_kv_64.detach().to(dtype).requires_grad_(True)
     sink_lp_ref = sink_64.detach().to(dtype).requires_grad_(True)
 
-    Q_lp_tri = Q_64.detach().to(dtype).requires_grad_(True)
-    KV_lp_tri = KV_64.detach().to(dtype).requires_grad_(True)
-    index_kv_lp_tri = index_kv_64.detach().to(dtype).requires_grad_(True)
+    query_lp_tri = query_64.detach().to(dtype).requires_grad_(True)
+    local_kv_lp_tri = local_kv_64.detach().to(dtype).requires_grad_(True)
+    sparse_kv_lp_tri = sparse_kv_64.detach().to(dtype).requires_grad_(True)
     sink_lp_tri = sink_64.detach().to(dtype).requires_grad_(True)
 
     # --- Forward (fp64 reference as ground truth) ---
     out_64 = selected_attention(
-        Q_64,
-        KV_64,
-        index_kv_64,
-        indices,
+        query_64,
+        local_kv_64,
+        sparse_kv_64,
+        kv_indices,
         sink_64,
         None,
         sliding_window_size,
         backend="eager",
     )
     out_lp_ref = selected_attention(
-        Q_lp_ref,
-        KV_lp_ref,
-        index_kv_lp_ref,
-        indices,
+        query_lp_ref,
+        local_kv_lp_ref,
+        sparse_kv_lp_ref,
+        kv_indices,
         sink_lp_ref,
         None,
         sliding_window_size,
         backend="eager",
     )
     out_lp_tri = selected_attention(
-        Q_lp_tri,
-        KV_lp_tri,
-        index_kv_lp_tri,
-        indices,
+        query_lp_tri,
+        local_kv_lp_tri,
+        sparse_kv_lp_tri,
+        kv_indices,
         sink_lp_tri,
         None,
         sliding_window_size,
@@ -374,12 +374,12 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     out_lp_ref.backward(grad_lp)
     out_lp_tri.backward(grad_lp)
 
-    ref_dq = (Q_64.grad.double() - Q_lp_ref.grad.double()).abs().max().item()
-    tri_dq = (Q_64.grad.double() - Q_lp_tri.grad.double()).abs().max().item()
-    ref_dkv = (KV_64.grad.double() - KV_lp_ref.grad.double()).abs().max().item()
-    tri_dkv = (KV_64.grad.double() - KV_lp_tri.grad.double()).abs().max().item()
-    ref_didx = (index_kv_64.grad.double() - index_kv_lp_ref.grad.double()).abs().max().item()
-    tri_didx = (index_kv_64.grad.double() - index_kv_lp_tri.grad.double()).abs().max().item()
+    ref_dq = (query_64.grad.double() - query_lp_ref.grad.double()).abs().max().item()
+    tri_dq = (query_64.grad.double() - query_lp_tri.grad.double()).abs().max().item()
+    ref_dkv = (local_kv_64.grad.double() - local_kv_lp_ref.grad.double()).abs().max().item()
+    tri_dkv = (local_kv_64.grad.double() - local_kv_lp_tri.grad.double()).abs().max().item()
+    ref_didx = (sparse_kv_64.grad.double() - sparse_kv_lp_ref.grad.double()).abs().max().item()
+    tri_didx = (sparse_kv_64.grad.double() - sparse_kv_lp_tri.grad.double()).abs().max().item()
     ref_dsink = (sink_64.grad.double() - sink_lp_ref.grad.double()).abs().max().item()
     tri_dsink = (sink_64.grad.double() - sink_lp_tri.grad.double()).abs().max().item()
 

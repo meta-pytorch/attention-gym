@@ -634,19 +634,19 @@ def _selected_attention_bwd_dindex_kv(
 
 
 def _launch_forward(
-    Q: torch.Tensor,
-    index_kv: torch.Tensor,
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
     local_kv: torch.Tensor,
-    indices: torch.Tensor,
+    kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     *,
     _return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    batch, heads, seq_len, head_dim = Q.shape
-    topk = indices.shape[-1]
-    index_seq_len = index_kv.shape[2]
+    batch, heads, seq_len, head_dim = query.shape
+    topk = kv_indices.shape[-1]
+    sparse_seq_len = sparse_kv.shape[2]
     block_m = 64
     block_n = 128
     block_d = max(16, triton.next_power_of_2(head_dim))
@@ -654,36 +654,36 @@ def _launch_forward(
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
 
-    output = torch.empty_like(Q)
-    lse = torch.empty(batch, heads, seq_len, device=Q.device, dtype=torch.float32)
+    output = torch.empty_like(query)
+    lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
 
     has_doc_ids = doc_ids is not None
     if doc_ids is None:
-        doc_ids = torch.empty(batch, seq_len, device=Q.device, dtype=torch.int32)
+        doc_ids = torch.empty(batch, seq_len, device=query.device, dtype=torch.int32)
         doc_strides = (0, 0)
     else:
         doc_strides = doc_ids.stride()
 
     _selected_attention_fwd[(triton.cdiv(seq_len, block_m), batch * heads)](
-        Q,
-        index_kv,
+        query,
+        sparse_kv,
         local_kv,
-        indices,
+        kv_indices,
         doc_ids,
         attention_sink,
         output,
         lse,
-        *Q.stride(),
-        *index_kv.stride(),
+        *query.stride(),
+        *sparse_kv.stride(),
         *local_kv.stride(),
-        *indices.stride(),
+        *kv_indices.stride(),
         *doc_strides,
         *output.stride(),
         *lse.stride(),
         H=heads,
         S=seq_len,
         D=head_dim,
-        INDEX_SEQ_LEN=index_seq_len,
+        INDEX_SEQ_LEN=sparse_seq_len,
         TOPK=topk,
         WINDOW=sliding_window_size,
         SCALE=1.0 / math.sqrt(head_dim),
@@ -700,32 +700,34 @@ def _launch_forward(
 
 
 def _build_index_query_map(
-    indices: torch.Tensor,
-    index_seq_len: int,
+    kv_indices: torch.Tensor,
+    sparse_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Invert query-major indices into block-major query lists (CSR format)."""
-    batch, seq_len, topk = indices.shape
+    batch, seq_len, topk = kv_indices.shape
     if topk == 0:
-        selected_queries = torch.empty(batch, 0, device=indices.device, dtype=torch.int32)
+        selected_queries = torch.empty(batch, 0, device=kv_indices.device, dtype=torch.int32)
         block_offsets = torch.zeros(
-            batch, index_seq_len + 1, device=indices.device, dtype=torch.int32
+            batch, sparse_seq_len + 1, device=kv_indices.device, dtype=torch.int32
         )
         return selected_queries, block_offsets
 
-    flat_indices = indices.flatten(1)
+    flat_indices = kv_indices.flatten(1)
     sorted_indices, sorted_entries = torch.sort(flat_indices, dim=-1)
     selected_queries = torch.div(sorted_entries, topk, rounding_mode="floor").to(torch.int32)
-    block_ids = torch.arange(index_seq_len + 1, device=indices.device, dtype=sorted_indices.dtype)
+    block_ids = torch.arange(
+        sparse_seq_len + 1, device=kv_indices.device, dtype=sorted_indices.dtype
+    )
     block_ids = block_ids.unsqueeze(0).expand(batch, -1).contiguous()
     block_offsets = torch.searchsorted(sorted_indices, block_ids).to(torch.int32)
     return selected_queries.contiguous(), block_offsets.contiguous()
 
 
 def _launch_backward(
-    Q: torch.Tensor,
-    index_kv: torch.Tensor,
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
     local_kv: torch.Tensor,
-    indices: torch.Tensor,
+    kv_indices: torch.Tensor,
     selected_queries: torch.Tensor,
     block_offsets: torch.Tensor,
     attention_sink: torch.Tensor,
@@ -736,22 +738,22 @@ def _launch_backward(
     sliding_window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch backward kernels for selected attention."""
-    batch, heads, seq_len, head_dim = Q.shape
-    index_seq_len = index_kv.shape[2]
-    topk = indices.shape[-1]
+    batch, heads, seq_len, head_dim = query.shape
+    sparse_seq_len = sparse_kv.shape[2]
+    topk = kv_indices.shape[-1]
     block_m = 64
     block_n = 32
     block_d = max(16, triton.next_power_of_2(head_dim))
     scale = 1.0 / math.sqrt(head_dim)
     grad_output = grad_output.contiguous()
 
-    grad_Q = torch.empty_like(Q)
+    grad_query = torch.empty_like(query)
     grad_local_kv = torch.empty_like(local_kv)
-    grad_sink_fp32 = torch.zeros(heads, device=Q.device, dtype=torch.float32)
+    grad_sink_fp32 = torch.zeros(heads, device=query.device, dtype=torch.float32)
 
     has_doc_ids = doc_ids is not None
     if doc_ids is None:
-        doc_ids_t = torch.empty(batch, seq_len, device=Q.device, dtype=torch.int32)
+        doc_ids_t = torch.empty(batch, seq_len, device=query.device, dtype=torch.int32)
         doc_strides = (0, 0)
     else:
         doc_ids_t = doc_ids
@@ -766,27 +768,27 @@ def _launch_backward(
 
     # dQ kernel
     _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
-        Q,
-        index_kv,
+        query,
+        sparse_kv,
         local_kv,
-        indices,
+        kv_indices,
         doc_ids_t,
         output,
         grad_output,
         lse,
         attention_sink,
-        grad_Q,
+        grad_query,
         grad_sink_fp32,
-        *Q.stride(),
-        *index_kv.stride(),
+        *query.stride(),
+        *sparse_kv.stride(),
         *local_kv.stride(),
-        *indices.stride(),
+        *kv_indices.stride(),
         *doc_strides,
         *lse.stride(),
         H=heads,
         S=seq_len,
         D=head_dim,
-        INDEX_SEQ_LEN=index_seq_len,
+        INDEX_SEQ_LEN=sparse_seq_len,
         TOPK=topk,
         WINDOW=sliding_window_size,
         SCALE=scale,
@@ -800,14 +802,14 @@ def _launch_backward(
 
     # dKV (local) kernel
     _selected_attention_bwd_dlocal_kv[(triton.cdiv(seq_len, block_n), batch * heads)](
-        Q,
+        query,
         local_kv,
         doc_ids_t,
         output,
         grad_output,
         lse,
         grad_local_kv,
-        *Q.stride(),
+        *query.stride(),
         *local_kv.stride(),
         *doc_strides,
         *lse.stride(),
@@ -824,70 +826,72 @@ def _launch_backward(
         num_warps=8,
     )
 
-    # dindex_kv kernel
+    # d_sparse_kv kernel
     if topk > 0:
-        grad_index_kv = torch.empty_like(index_kv)
+        grad_sparse_kv = torch.empty_like(sparse_kv)
         compressed_block_m = 32 if head_dim <= 128 else 16
-        _selected_attention_bwd_dindex_kv[(index_seq_len, batch * heads)](
-            Q,
-            index_kv,
-            indices,
+        _selected_attention_bwd_dindex_kv[(sparse_seq_len, batch * heads)](
+            query,
+            sparse_kv,
+            kv_indices,
             selected_queries,
             block_offsets,
             output,
             grad_output,
             lse,
-            grad_index_kv,
-            *Q.stride(),
-            *index_kv.stride(),
-            *indices.stride(),
+            grad_sparse_kv,
+            *query.stride(),
+            *sparse_kv.stride(),
+            *kv_indices.stride(),
             *selected_queries.stride(),
             *block_offsets.stride(),
             *lse.stride(),
-            *grad_index_kv.stride(),
+            *grad_sparse_kv.stride(),
             H=heads,
             S=seq_len,
             D=head_dim,
-            INDEX_SEQ_LEN=index_seq_len,
+            INDEX_SEQ_LEN=sparse_seq_len,
             SCALE=scale,
             BLOCK_M=compressed_block_m,
             BLOCK_D=block_d,
             num_warps=8,
         )
     else:
-        grad_index_kv = torch.zeros_like(index_kv)
+        grad_sparse_kv = torch.zeros_like(sparse_kv)
 
-    return grad_Q, grad_index_kv, grad_local_kv, grad_sink_fp32.to(attention_sink.dtype)
+    return grad_query, grad_sparse_kv, grad_local_kv, grad_sink_fp32.to(attention_sink.dtype)
 
 
 class _SelectedAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        Q: torch.Tensor,
-        index_kv: torch.Tensor,
+        query: torch.Tensor,
+        sparse_kv: torch.Tensor,
         local_kv: torch.Tensor,
-        indices: torch.Tensor,
+        kv_indices: torch.Tensor,
         attention_sink: torch.Tensor,
         doc_ids: torch.Tensor | None,
         sliding_window_size: int,
     ) -> torch.Tensor:
         output, lse = _launch_forward(
-            Q,
-            index_kv,
+            query,
+            sparse_kv,
             local_kv,
-            indices,
+            kv_indices,
             attention_sink,
             doc_ids,
             sliding_window_size,
             _return_lse=True,
         )
-        selected_queries, block_offsets = _build_index_query_map(indices, index_kv.shape[2])
+        selected_queries, block_offsets = _build_index_query_map(
+            kv_indices, sparse_kv.shape[2]
+        )
         ctx.save_for_backward(
-            Q,
-            index_kv,
+            query,
+            sparse_kv,
             local_kv,
-            indices,
+            kv_indices,
             selected_queries,
             block_offsets,
             attention_sink,
@@ -901,21 +905,21 @@ class _SelectedAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (
-            Q,
-            index_kv,
+            query,
+            sparse_kv,
             local_kv,
-            indices,
+            kv_indices,
             selected_queries,
             block_offsets,
             attention_sink,
             output,
             lse,
         ) = ctx.saved_tensors
-        grad_Q, grad_index_kv, grad_local_kv, grad_sink = _launch_backward(
-            Q,
-            index_kv,
+        grad_query, grad_sparse_kv, grad_local_kv, grad_sink = _launch_backward(
+            query,
+            sparse_kv,
             local_kv,
-            indices,
+            kv_indices,
             selected_queries,
             block_offsets,
             attention_sink,
@@ -925,14 +929,14 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             grad_output,
             ctx.sliding_window_size,
         )
-        return grad_Q, grad_index_kv, grad_local_kv, None, grad_sink, None, None
+        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None
 
 
 def selected_attention(
-    Q: torch.Tensor,
-    KV: torch.Tensor,
-    index_kv: torch.Tensor,
-    indices: torch.Tensor,
+    query: torch.Tensor,
+    local_kv: torch.Tensor,
+    sparse_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
@@ -941,39 +945,43 @@ def selected_attention(
     """Triton implementation of selected attention.
 
     Args:
-        Q: (batch, heads, seq_len, head_dim) — queries.
-        KV: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values.
-        index_kv: (batch, 1 or heads, index_seq_len, head_dim) — indexed key-values.
-        indices: (batch, seq_len, topk) — which index_kv positions each query attends to.
+        query: (batch, heads, seq_len, head_dim) — queries.
+        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values.
+        sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
+        kv_indices: (batch, seq_len, topk) — which sparse_kv positions each query attends to.
         attention_sink: (heads,) — learned per-head sink weight.
         doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
         sliding_window_size: size of the causal sliding window.
         share_kv: if True, expand single-head KV to all heads.
 
     Returns:
-        Attention output with same shape as Q.
+        Attention output with same shape as query.
     """
-    b, h, s, head_dim = Q.shape
+    b, h, s, head_dim = query.shape
 
     # Validate CUDA
-    if Q.device.type != "cuda":
+    if query.device.type != "cuda":
         raise ValueError("The Triton selected attention backend requires CUDA tensors.")
 
     # Expand shared KV heads
     if share_kv:
-        KV = KV.expand(-1, h, -1, -1).contiguous()
-        index_kv = index_kv.expand(-1, h, -1, -1).contiguous()
+        local_kv = local_kv.expand(-1, h, -1, -1).contiguous()
+        sparse_kv = sparse_kv.expand(-1, h, -1, -1).contiguous()
     else:
-        KV = KV.contiguous()
-        index_kv = index_kv.contiguous()
+        local_kv = local_kv.contiguous()
+        sparse_kv = sparse_kv.contiguous()
 
-    Q = Q.contiguous()
-    indices = indices.contiguous()
+    query = query.contiguous()
+    kv_indices = kv_indices.contiguous()
     if doc_ids is not None:
         doc_ids = doc_ids.contiguous()
 
-    if torch.is_grad_enabled() and any(t.requires_grad for t in (Q, KV, index_kv, attention_sink)):
+    if torch.is_grad_enabled() and any(
+        t.requires_grad for t in (query, local_kv, sparse_kv, attention_sink)
+    ):
         return _SelectedAttentionFunction.apply(
-            Q, index_kv, KV, indices, attention_sink, doc_ids, sliding_window_size
+            query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
         )
-    return _launch_forward(Q, index_kv, KV, indices, attention_sink, doc_ids, sliding_window_size)
+    return _launch_forward(
+        query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
+    )

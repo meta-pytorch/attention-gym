@@ -5,10 +5,10 @@ from torch import Tensor
 
 
 def _validate_inputs(
-    Q: Tensor,
-    KV: Tensor,
-    index_kv: Tensor,
-    indices: Tensor,
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor,
     attention_sink: Tensor,
     doc_ids: Tensor,
     sliding_window_size: Tensor,
@@ -20,14 +20,14 @@ def _validate_inputs(
         )
 
     tensors = {
-        "Q": Q,
-        "KV": KV,
-        "index_kv": index_kv,
-        "indices": indices,
+        "query": query,
+        "local_kv": local_kv,
+        "sparse_kv": sparse_kv,
+        "kv_indices": kv_indices,
         "attention_sink": attention_sink,
     }
 
-    
+
 
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
@@ -35,28 +35,28 @@ def _validate_inputs(
 
 
 
-    assert isinstance(Q, torch.Tensor)
-    assert isinstance(KV, torch.Tensor)
-    assert isinstance(index_kv, torch.Tensor)
+    assert isinstance(query, torch.Tensor)
+    assert isinstance(local_kv, torch.Tensor)
+    assert isinstance(sparse_kv, torch.Tensor)
     assert isinstance(attention_sink, torch.Tensor)
 
-    assert KV.dtype == Q.dtype, f"KV must have the same dtype as Q, but got {KV.dtype} and {Q.dtype}."
-    assert index_kv.dtype == Q.dtype, f"index_kv must have the same dtype as Q, but got {index_kv.dtype} and {Q.dtype}."
-    assert attention_sink.dtype == Q.dtype, f"attention_sink must have the same dtype as Q, but got {attention_sink.dtype} and {Q.dtype}."
+    assert local_kv.dtype == query.dtype, f"local_kv must have the same dtype as query, but got {local_kv.dtype} and {query.dtype}."
+    assert sparse_kv.dtype == query.dtype, f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
+    assert attention_sink.dtype == query.dtype, f"attention_sink must have the same dtype as query, but got {attention_sink.dtype} and {query.dtype}."
 
-    assert KV.device == Q.device, f"KV must be on the same device as Q, but got {KV.device} and {Q.device}."
-    assert index_kv.device == Q.device, f"index_kv must be on the same device as Q, but got {index_kv.device} and {Q.device}."
-    assert attention_sink.device == Q.device, f"attention_sink must be on the same device as Q, but got {attention_sink.device} and {Q.device}."
+    assert local_kv.device == query.device, f"local_kv must be on the same device as query, but got {local_kv.device} and {query.device}."
+    assert sparse_kv.device == query.device, f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
+    assert attention_sink.device == query.device, f"attention_sink must be on the same device as query, but got {attention_sink.device} and {query.device}."
     if doc_ids is not None:
-        assert doc_ids.device == Q.device, f"doc_ids must be on the same device as Q, but got {doc_ids.device} and {Q.device}."
+        assert doc_ids.device == query.device, f"doc_ids must be on the same device as query, but got {doc_ids.device} and {query.device}."
 
 
-    if Q.ndim != 4:
-        raise ValueError("Q must have shape [batch, heads, sequence_length, head_dim].")
-    batch, heads, sequence_length, head_dim = Q.shape
+    if query.ndim != 4:
+        raise ValueError("query must have shape [batch, heads, sequence_length, head_dim].")
+    batch, heads, sequence_length, head_dim = query.shape
     if min(batch, heads, sequence_length, head_dim) <= 0:
-        raise ValueError("Q dimensions must all be positive.")
-    if not Q.is_floating_point():
+        raise ValueError("query dimensions must all be positive.")
+    if not query.is_floating_point():
         raise TypeError("Selected attention inputs must have a floating-point dtype.")
 
     if sliding_window_size < 0:
@@ -64,47 +64,51 @@ def _validate_inputs(
 
     expected_kv_heads = 1 if share_kv else heads
     if (
-        KV.ndim != 4
-        or KV.shape[0] != batch
-        or KV.shape[1] != expected_kv_heads
-        or KV.shape[2] != sequence_length
-        or KV.shape[3] != head_dim
+        local_kv.ndim != 4
+        or local_kv.shape[0] != batch
+        or local_kv.shape[1] != expected_kv_heads
+        or local_kv.shape[2] != sequence_length
+        or local_kv.shape[3] != head_dim
     ):
         expected_h = "1 or heads" if share_kv else "heads"
         raise ValueError(
-            f"KV must have shape [batch, {expected_h}, sequence_length, head_dim], "
-            f"got {list(KV.shape)}."
+            f"local_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
+            f"got {list(local_kv.shape)}."
         )
-    index_seq_len = index_kv.shape[2]
+    sparse_seq_len = sparse_kv.shape[2]
 
     if (
-        index_kv.ndim != 4
-        or index_kv.shape[0] != batch
-        or index_kv.shape[1] != expected_kv_heads
-        or index_kv.shape[3] != head_dim
+        sparse_kv.ndim != 4
+        or sparse_kv.shape[0] != batch
+        or sparse_kv.shape[1] != expected_kv_heads
+        or sparse_kv.shape[3] != head_dim
     ):
         expected_h = "1 or heads" if share_kv else "heads"
         raise ValueError(
-            f"index_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
-            f"got {list(index_kv.shape)}."
+            f"sparse_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
+            f"got {list(sparse_kv.shape)}."
         )
 
-    if indices.ndim != 3 or indices.shape[0] != batch or indices.shape[1] != sequence_length:
+    if (
+        kv_indices.ndim != 3
+        or kv_indices.shape[0] != batch
+        or kv_indices.shape[1] != sequence_length
+    ):
         raise ValueError(
-            f"indices must have shape [batch, sequence_length, num_topk], "
-            f"got {list(indices.shape)}."
+            f"kv_indices must have shape [batch, sequence_length, num_topk], "
+            f"got {list(kv_indices.shape)}."
         )
-    if indices.dtype not in (torch.int32, torch.int64):
+    if kv_indices.dtype not in (torch.int32, torch.int64):
         raise TypeError(
-            f"indices must be an integer tensor (int32 or int64), got {indices.dtype}."
+            f"kv_indices must be an integer tensor (int32 or int64), got {kv_indices.dtype}."
         )
-    if indices.device != Q.device:
-        raise ValueError(f"indices must be on {Q.device}, got {indices.device}.")
-    num_topk = indices.shape[2]
-    if num_topk > index_seq_len:
+    if kv_indices.device != query.device:
+        raise ValueError(f"kv_indices must be on {query.device}, got {kv_indices.device}.")
+    num_topk = kv_indices.shape[2]
+    if num_topk > sparse_seq_len:
         raise ValueError(
-            f"indices num_topk ({num_topk}) must not exceed "
-            f"index_kv sequence length ({index_seq_len})."
+            f"kv_indices num_topk ({num_topk}) must not exceed "
+            f"sparse_kv sequence length ({sparse_seq_len})."
         )
 
     if attention_sink.shape != (heads,):
@@ -125,10 +129,10 @@ def _validate_inputs(
 
 
 def selected_attention(
-    Q,
-    KV,
-    index_kv,
-    indices,
+    query,
+    local_kv,
+    sparse_kv,
+    kv_indices,
     attention_sink,
     doc_ids=None,
     sliding_window_size: int = 512,
@@ -137,33 +141,39 @@ def selected_attention(
 ):
     """
     Performs selected attention
-        Each query attends to the previous sliding_window_size elements in the KV tensor 
-        As well the positions in index_kv pointed to by indices
-        Only one softmax is applied, and it covers the index_kv values as well as the sliding window values
+        Each query attends to the previous sliding_window_size elements in the local_kv tensor
+        As well the positions in sparse_kv pointed to by kv_indices
+        Only one softmax is applied, and it covers the sparse_kv values as well as the sliding
+        window values
     Args:
-        Q: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
+        query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        KV: Key and Value for the sliding window branch,
+        local_kv: Key and Value for the sliding window branch,
             represented as a shared tensor, (batch_size, 1, sequence_length, head_dim)
             Or represented as (batch_size, num_heads, sequence_length, head_dim)
 
-        index_kv: KV for the indexing branch, shape of (batch, 1, X, head_dim)
+        sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
             Or shaped as (batch_size, num_heads, X, head_dim)
             where X is any integer
 
-        indices: Which indices to attend to. Shape of (batch, sequence_length, num_topk_blocks), integer tensor
-            The Q[i, j] token will attend to all index_kv[i, indices[k]] tokens for all k < num_topk_blocks
-            If None, index_kv will be ignored
+        kv_indices: Which entries to select from sparse_kv.
+            Shape of (batch, sequence_length, num_topk_blocks), integer tensor
+            query[i, j] will attend to all sparse_kv[i, kv_indices[k]] for all k < num_topk_blocks
+            If None, sparse_kv will be ignored
 
-        attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
+        attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies
+            denominator of softmax
 
         doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
-            Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
-            If doc_ids[i, j] = doc_ids[i, j-y], then Q[i, j] can causally attend to KV[i, j-y]
+            Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id
+            can causally attend to each other
+            If doc_ids[i, j] = doc_ids[i, j-y], then query[i, j] can causally attend to
+            local_kv[i, j-y]
             Should be monotonically increasing on the sequence axis
-            If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the same document.
+            If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the
+            same document.
             Only applies to the sliding window branch.
-            It's the caller's responsibility to make sure indices don't cross document boundaries
+            It's the caller's responsibility to make sure kv_indices don't cross document boundaries
 
         sliding_window_size: Integer, size of sliding window
 
@@ -173,10 +183,11 @@ def selected_attention(
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
-    share_kv = (index_kv.shape[1] == 1)
+    share_kv = (sparse_kv.shape[1] == 1)
     if not torch.compiler.is_compiling():
         _validate_inputs(
-            Q, KV, index_kv, indices, attention_sink, doc_ids, sliding_window_size, share_kv
+            query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids,
+            sliding_window_size, share_kv
         )
 
     match backend:
@@ -184,10 +195,10 @@ def selected_attention(
             from . import reference
 
             return reference.selected_attention(
-                Q,
-                KV,
-                index_kv,
-                indices,
+                query,
+                local_kv,
+                sparse_kv,
+                kv_indices,
                 attention_sink,
                 doc_ids,
                 sliding_window_size,
@@ -197,10 +208,10 @@ def selected_attention(
             from . import triton as triton_backend
 
             return triton_backend.selected_attention(
-                Q,
-                KV,
-                index_kv,
-                indices,
+                query,
+                local_kv,
+                sparse_kv,
+                kv_indices,
                 attention_sink,
                 doc_ids,
                 sliding_window_size,

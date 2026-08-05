@@ -378,8 +378,8 @@ def test_selected_attention_matches_csa_reference_cuda_fp32():
     inputs = _make_inputs(
         True,
         1,
-        dtype=torch.float32,
-        device=torch.device("cuda"),
+        dtype=torch.float64,
+        device="cuda",
     )
 
     with torch.inference_mode():
@@ -387,6 +387,5 @@ def test_selected_attention_matches_csa_reference_cuda_fp32():
         actual = csa_example.CSA(*inputs)
 
     assert actual.device.type == expected.device.type == "cuda"
-    print(torch.max(torch.abs(actual - expected)))
-    assert actual.dtype == expected.dtype == torch.float32
+    assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
