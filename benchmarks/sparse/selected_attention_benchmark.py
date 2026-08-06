@@ -99,9 +99,10 @@ def main() -> None:
     fwd_flops = useful_flops(args)
 
     for backend in args.backend:
-        requires_grad = args.calculate_bwd
+        # Benchmark forward without requires_grad so we measure pure forward compute
+        # (no autograd graph construction overhead).
         query, local_kv, sparse_kv, kv_indices, attention_sink = make_inputs(
-            args, requires_grad=requires_grad
+            args, requires_grad=False
         )
 
         def fwd(
@@ -123,7 +124,7 @@ def main() -> None:
                 backend=_backend,
             )
 
-        out = fwd()
+        fwd()
         fwd_ms = triton.testing.do_bench(
             fwd, warmup=args.warmup, rep=args.rep, return_mode="median"
         )
@@ -132,6 +133,18 @@ def main() -> None:
         print(f"[{backend}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} TFLOP/s)")
 
         if args.calculate_bwd:
+            # Create fresh inputs with requires_grad for backward benchmarking.
+            query, local_kv, sparse_kv, kv_indices, attention_sink = make_inputs(
+                args, requires_grad=True
+            )
+            out = fwd(
+                _query=query,
+                _local_kv=local_kv,
+                _sparse_kv=sparse_kv,
+                _kv_indices=kv_indices,
+                _attention_sink=attention_sink,
+                _backend=backend,
+            )
             grad_output = torch.randn_like(out)
 
             def bwd(
@@ -159,39 +172,6 @@ def main() -> None:
 
             bwd_tflops = fwd_flops * 2 / (bwd_ms * 1e9)
             print(f"[{backend}] backward: {bwd_ms:.3f} ms  ({bwd_tflops:.2f} TFLOP/s)")
-
-    if len(args.backend) == 2:
-        # Run both and report speedup
-        timings = {}
-        for backend in args.backend:
-            query, local_kv, sparse_kv, kv_indices, attention_sink = make_inputs(args)
-
-            def fwd(
-                b=backend,
-                _query=query,
-                _local_kv=local_kv,
-                _sparse_kv=sparse_kv,
-                _kv_indices=kv_indices,
-                _attention_sink=attention_sink,
-            ):
-                return selected_attention(
-                    _query,
-                    _local_kv,
-                    _sparse_kv,
-                    _kv_indices,
-                    _attention_sink,
-                    None,
-                    args.window,
-                    backend=b,
-                )
-
-            fwd()
-            timings[backend] = triton.testing.do_bench(
-                fwd, warmup=args.warmup, rep=args.rep, return_mode="median"
-            )
-        baseline = max(timings.values())
-        fastest = min(timings.values())
-        print(f"\nspeedup: {baseline / fastest:.2f}x")
 
 
 if __name__ == "__main__":
