@@ -207,9 +207,7 @@ def _selected_attention_bwd_dlocal_kv(
         offsets_m = query_start + offsets_m_base
         query_mask = offsets_m < S
         matrix_mask = query_mask[:, None] & dimension_mask[None, :]
-        query = load_bhsd(
-            query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
-        )
+        query = load_bhsd(query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
         output = load_bhsd(
             output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
         )
@@ -224,9 +222,7 @@ def _selected_attention_bwd_dlocal_kv(
         delta = tl.sum(grad_output * output, axis=1)
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
-            query_doc_ids = load_bs(
-                doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1
-            )
+            query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
             valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
@@ -335,9 +331,7 @@ def _selected_attention_bwd_dlocal_kv_tma(
         delta = tl.sum(grad_output * output, axis=1)
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
-            query_doc_ids = load_bs(
-                doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1
-            )
+            query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
             valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
