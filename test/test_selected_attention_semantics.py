@@ -14,6 +14,49 @@ BACKENDS = ["eager"]
 if torch.cuda.is_available():
     BACKENDS.append("triton")
 
+BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.fixture
+def shared_kv_blackwell_inputs():
+    """Create a packed shared-KV case that exercises both attention branches."""
+    torch.manual_seed(123)
+    batch, heads, seq_len, head_dim = 1, 24, 33, 32
+    sparse_seq_len, topk = 37, 7
+    query = torch.randn(
+        batch,
+        heads,
+        seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    local_kv = torch.randn(
+        batch,
+        1,
+        seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    sparse_kv = torch.randn(
+        batch,
+        1,
+        sparse_seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
+    kv_indices[:, ::3, -1] = -1
+    kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    doc_ids = torch.tensor([[0] * 11 + [1] * 9 + [2] * 13], device="cuda", dtype=torch.int32)
+    return query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids
+
 
 def _device_for_backend(backend):
     return torch.device("cuda") if backend == "triton" else torch.device("cpu")
@@ -355,8 +398,113 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
 
 # ---------------------------------------------------------------------------
-# 6. torch.compile fullgraph compatibility
+# 6. Shared-KV Blackwell forward
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
+    """The head-major shared-KV path matches eager forward and gradients."""
+    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    differentiable_inputs = query, local_kv, sparse_kv, attention_sink
+
+    expected = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        doc_ids,
+        19,
+        backend="eager",
+    )
+    actual = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        doc_ids,
+        19,
+        backend="triton",
+    )
+    grad_output = torch.randn_like(expected)
+    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
+
+    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0.06, rtol=0.03)
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_shared_kv_blackwell_sparse_only():
+    """The full head tile handles the zero-window sparse-only specialization."""
+    torch.manual_seed(321)
+    batch, heads, seq_len, head_dim = 1, 128, 17, 128
+    sparse_seq_len, topk = 19, 16
+    query = torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    local_kv = torch.randn(batch, 1, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    sparse_kv = torch.randn(
+        batch, 1, sparse_seq_len, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
+    kv_indices[:, ::3, -1] = -1
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16)
+
+    with torch.inference_mode():
+        expected = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            None,
+            0,
+            backend="eager",
+        )
+        actual = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            None,
+            0,
+            backend="triton",
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+
+
+# ---------------------------------------------------------------------------
+# 7. torch.compile fullgraph compatibility
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs):
+    """The shared-KV Triton path compiles without graph breaks."""
+    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+
+    def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids):
+        return selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            19,
+            backend="triton",
+        )
+
+    compiled_fn = torch.compile(fn, fullgraph=True)
+    with torch.inference_mode():
+        expected = fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
+        actual = compiled_fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
@@ -442,7 +590,7 @@ def test_torch_compile_fullgraph_backward(backend):
 
 
 # ---------------------------------------------------------------------------
-# 7. Repeated selections against manual computation
+# 8. Repeated selections against manual computation
 # ---------------------------------------------------------------------------
 
 

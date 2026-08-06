@@ -1,4 +1,4 @@
-"""Triton backend for selected attention."""
+"""Backward kernels and launcher for Triton selected attention."""
 
 import math
 
@@ -7,345 +7,9 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.tensor_checks import can_use_tma
+from attn_gym._backends.triton.utils import can_use_tma
 
-
-@triton.jit
-def _load_bhsd(
-    tensor_ptr,
-    strides: tl.constexpr,
-    batch,
-    head,
-    positions,
-    offsets_d,
-    mask,
-):
-    """Load a tile from a tensor in batch-head-sequence-dimension order."""
-    return tl.load(
-        tensor_ptr
-        + batch * strides[0]
-        + head * strides[1]
-        + positions[:, None] * strides[2]
-        + offsets_d[None, :] * strides[3],
-        mask=mask,
-        other=0.0,
-    )
-
-
-@triton.jit
-def _load_bs(
-    tensor_ptr,
-    strides: tl.constexpr,
-    batch,
-    positions,
-    mask,
-    other: tl.constexpr,
-):
-    """Load positions from a tensor in batch-sequence order."""
-    return tl.load(
-        tensor_ptr + batch * strides[0] + positions * strides[1],
-        mask=mask,
-        other=other,
-    )
-
-
-@triton.jit
-def _store_bhsd(
-    tensor_ptr,
-    value,
-    strides: tl.constexpr,
-    batch,
-    head,
-    positions,
-    offsets_d,
-    mask,
-):
-    """Store a tile to a tensor in batch-head-sequence-dimension order."""
-    tl.store(
-        tensor_ptr
-        + batch * strides[0]
-        + head * strides[1]
-        + positions[:, None] * strides[2]
-        + offsets_d[None, :] * strides[3],
-        value,
-        mask=mask,
-    )
-
-
-@triton.jit
-def _selected_attention_fwd(
-    query_ptr,
-    sparse_kv_ptr,
-    local_kv_ptr,
-    kv_indices_ptr,
-    doc_ids_ptr,
-    attention_sink_ptr,
-    output_ptr,
-    lse_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    LOCAL_KV_STRIDES: tl.constexpr,
-    KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
-    TOPK: tl.constexpr,
-    WINDOW: tl.constexpr,
-    SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
-    NUM_LOCAL_TILES: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Apply online softmax over selected sparse entries and the local window."""
-    query_block = tl.program_id(0)
-    batch_head = tl.program_id(1)
-    head = batch_head % H
-    batch = batch_head // H
-
-    offsets_m = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    offsets_d = tl.arange(0, BLOCK_D)
-    query_mask = offsets_m < S
-    dimension_mask = offsets_d < D
-
-    query = _load_bhsd(
-        query_ptr,
-        QUERY_STRIDES,
-        batch,
-        head,
-        offsets_m,
-        offsets_d,
-        query_mask[:, None] & dimension_mask[None, :],
-    )
-
-    if HAS_DOC_IDS:
-        query_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
-
-    sink = tl.load(attention_sink_ptr + head).to(tl.float32)
-    running_max = tl.full((BLOCK_M,), sink, tl.float32)
-    running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
-
-    # Each query has its own set of selected sparse entries.
-    for selected_slot in tl.static_range(0, TOPK):
-        selected_idx = tl.load(
-            kv_indices_ptr
-            + batch * KV_INDICES_STRIDES[0]
-            + offsets_m * KV_INDICES_STRIDES[1]
-            + selected_slot * KV_INDICES_STRIDES[2],
-            mask=query_mask,
-            other=0,
-        )
-        valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
-        sparse_value = _load_bhsd(
-            sparse_kv_ptr,
-            SPARSE_KV_STRIDES,
-            batch,
-            head,
-            selected_idx,
-            offsets_d,
-            valid[:, None] & dimension_mask[None, :],
-        )
-        logit = tl.sum(query * sparse_value, axis=1) * SCALE
-        logit = tl.where(valid, logit, -float("inf"))
-        new_max = tl.maximum(running_max, logit)
-        alpha = tl.exp(running_max - new_max)
-        probability = tl.exp(logit - new_max)
-        accumulator = accumulator * alpha[:, None] + probability[:, None] * sparse_value
-        running_sum = running_sum * alpha + probability
-        running_max = new_max
-
-    # The local window is processed in tensor-core-friendly tiles.
-    first_local_position = query_block * BLOCK_M - WINDOW + 1
-    offsets_n_base = tl.arange(0, BLOCK_N)
-    for local_tile in tl.static_range(0, NUM_LOCAL_TILES):
-        local_start = first_local_position + local_tile * BLOCK_N
-        offsets_n = local_start + offsets_n_base
-        local_mask = (offsets_n >= 0) & (offsets_n < S)
-        local_values = _load_bhsd(
-            local_kv_ptr,
-            LOCAL_KV_STRIDES,
-            batch,
-            head,
-            offsets_n,
-            offsets_d,
-            local_mask[:, None] & dimension_mask[None, :],
-        )
-        logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
-        causal_window_mask = (
-            query_mask[:, None]
-            & local_mask[None, :]
-            & (offsets_n[None, :] <= offsets_m[:, None])
-            & (offsets_n[None, :] >= offsets_m[:, None] - WINDOW + 1)
-        )
-        if HAS_DOC_IDS:
-            key_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, local_mask, -2)
-            doc_mask = query_doc_ids[:, None] == key_doc_ids[None, :]
-            causal_window_mask = causal_window_mask & doc_mask
-
-        logits = tl.where(causal_window_mask, logits, -float("inf"))
-        tile_max = tl.max(logits, axis=1)
-        new_max = tl.maximum(running_max, tile_max)
-        alpha = tl.exp(running_max - new_max)
-        probabilities = tl.exp(logits - new_max[:, None])
-        accumulator *= alpha[:, None]
-        accumulator += tl.dot(
-            probabilities.to(local_values.dtype), local_values, input_precision="tf32x3"
-        )
-        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
-        running_max = new_max
-
-    output = accumulator / running_sum[:, None]
-    _store_bhsd(
-        output_ptr,
-        output,
-        QUERY_STRIDES,
-        batch,
-        head,
-        offsets_m,
-        offsets_d,
-        query_mask[:, None] & dimension_mask[None, :],
-    )
-    tl.store(
-        lse_ptr + batch * LSE_STRIDES[0] + head * LSE_STRIDES[1] + offsets_m * LSE_STRIDES[2],
-        running_max + tl.log(running_sum),
-        mask=query_mask,
-    )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in (4, 8)
-        for num_stages in (1, 3)
-    ],
-    key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
-    cache_results=True,
-)
-@triton.jit
-def _selected_attention_fwd_tma(
-    query_desc,
-    sparse_kv_ptr,
-    local_desc,
-    kv_indices_ptr,
-    doc_ids_ptr,
-    attention_sink_ptr,
-    output_desc,
-    lse_ptr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
-    TOPK: tl.constexpr,
-    WINDOW: tl.constexpr,
-    SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
-    NUM_LOCAL_TILES: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """TMA forward using host-created descriptors for dense tiles."""
-    query_block = tl.program_id(0)
-    batch_head = tl.program_id(1)
-    head = batch_head % H
-    batch = batch_head // H
-
-    offsets_m = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    offsets_d = tl.arange(0, BLOCK_D)
-    query_mask = offsets_m < S
-    dimension_mask = offsets_d < D
-    query = tl.reshape(
-        query_desc.load([batch, head, query_block * BLOCK_M, 0]),
-        (BLOCK_M, BLOCK_D),
-    )
-
-    if HAS_DOC_IDS:
-        query_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
-
-    sink = tl.load(attention_sink_ptr + head).to(tl.float32)
-    running_max = tl.full((BLOCK_M,), sink, tl.float32)
-    running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
-
-    for selected_slot in tl.static_range(0, TOPK):
-        selected_idx = tl.load(
-            kv_indices_ptr
-            + batch * KV_INDICES_STRIDES[0]
-            + offsets_m * KV_INDICES_STRIDES[1]
-            + selected_slot * KV_INDICES_STRIDES[2],
-            mask=query_mask,
-            other=0,
-        )
-        valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
-        sparse_value = _load_bhsd(
-            sparse_kv_ptr,
-            SPARSE_KV_STRIDES,
-            batch,
-            head,
-            selected_idx,
-            offsets_d,
-            valid[:, None] & dimension_mask[None, :],
-        )
-        logit = tl.sum(query * sparse_value, axis=1) * SCALE
-        logit = tl.where(valid, logit, -float("inf"))
-        new_max = tl.maximum(running_max, logit)
-        alpha = tl.exp(running_max - new_max)
-        probability = tl.exp(logit - new_max)
-        accumulator = accumulator * alpha[:, None] + probability[:, None] * sparse_value
-        running_sum = running_sum * alpha + probability
-        running_max = new_max
-
-    first_local_position = query_block * BLOCK_M - WINDOW + 1
-    offsets_n_base = tl.arange(0, BLOCK_N)
-    for local_tile in tl.static_range(0, NUM_LOCAL_TILES):
-        local_start = first_local_position + local_tile * BLOCK_N
-        offsets_n = local_start + offsets_n_base
-        local_mask = (offsets_n >= 0) & (offsets_n < S)
-        local_values = tl.reshape(
-            local_desc.load([batch, head, local_start, 0]),
-            (BLOCK_N, BLOCK_D),
-        )
-        logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
-        valid = (
-            query_mask[:, None]
-            & local_mask[None, :]
-            & (offsets_n[None, :] <= offsets_m[:, None])
-            & (offsets_n[None, :] >= offsets_m[:, None] - WINDOW + 1)
-        )
-        if HAS_DOC_IDS:
-            key_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, local_mask, -2)
-            valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
-
-        logits = tl.where(valid, logits, -float("inf"))
-        tile_max = tl.max(logits, axis=1)
-        new_max = tl.maximum(running_max, tile_max)
-        alpha = tl.exp(running_max - new_max)
-        probabilities = tl.exp(logits - new_max[:, None])
-        accumulator *= alpha[:, None]
-        accumulator += tl.dot(
-            probabilities.to(local_values.dtype), local_values, input_precision="tf32x3"
-        )
-        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
-        running_max = new_max
-
-    output_desc.store(
-        [batch, head, query_block * BLOCK_M, 0],
-        tl.reshape(accumulator / running_sum[:, None], (1, 1, BLOCK_M, BLOCK_D)),
-    )
-    tl.store(
-        lse_ptr + batch * LSE_STRIDES[0] + head * LSE_STRIDES[1] + offsets_m * LSE_STRIDES[2],
-        running_max + tl.log(running_sum),
-        mask=query_mask,
-    )
+from .primitives import causal_window_mask, load_bhsd, load_bs, store_bhsd
 
 
 @triton.jit
@@ -392,9 +56,9 @@ def _selected_attention_bwd_dq(
     dimension_mask = offsets_d < D
     matrix_mask = query_mask[:, None] & dimension_mask[None, :]
 
-    query = _load_bhsd(query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
-    output = _load_bhsd(output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
-    grad_output = _load_bhsd(
+    query = load_bhsd(query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
+    output = load_bhsd(output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
+    grad_output = load_bhsd(
         grad_output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
     )
     lse = tl.load(
@@ -406,7 +70,7 @@ def _selected_attention_bwd_dq(
     grad_query = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
     if HAS_DOC_IDS:
-        query_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
+        query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
 
     for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
@@ -418,7 +82,7 @@ def _selected_attention_bwd_dq(
             other=0,
         )
         valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
-        sparse_value = _load_bhsd(
+        sparse_value = load_bhsd(
             sparse_kv_ptr,
             SPARSE_KV_STRIDES,
             batch,
@@ -439,7 +103,7 @@ def _selected_attention_bwd_dq(
         local_start = first_key + key_tile * BLOCK_N
         offsets_n = local_start + offsets_n_base
         key_mask = (offsets_n >= 0) & (offsets_n < S)
-        local_values = _load_bhsd(
+        local_values = load_bhsd(
             local_kv_ptr,
             LOCAL_KV_STRIDES,
             batch,
@@ -449,16 +113,10 @@ def _selected_attention_bwd_dq(
             key_mask[:, None] & dimension_mask[None, :],
         )
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
-        valid = (
-            query_mask[:, None]
-            & key_mask[None, :]
-            & (offsets_n[None, :] <= offsets_m[:, None])
-            & (offsets_n[None, :] >= offsets_m[:, None] - WINDOW + 1)
-        )
+        valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
-            key_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
-            doc_mask = query_doc_ids[:, None] == key_doc_ids[None, :]
-            valid = valid & doc_mask
+            key_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
+            valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
@@ -473,7 +131,7 @@ def _selected_attention_bwd_dq(
             * SCALE
         )
 
-    _store_bhsd(
+    store_bhsd(
         grad_query_ptr,
         grad_query,
         QUERY_STRIDES,
@@ -527,7 +185,7 @@ def _selected_attention_bwd_dlocal_kv(
     key_mask = offsets_n < S
     dimension_mask = offsets_d < D
 
-    local_values = _load_bhsd(
+    local_values = load_bhsd(
         local_kv_ptr,
         LOCAL_KV_STRIDES,
         batch,
@@ -538,7 +196,7 @@ def _selected_attention_bwd_dlocal_kv(
     )
 
     if HAS_DOC_IDS:
-        key_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
+        key_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
     first_query = key_block * BLOCK_N
@@ -549,13 +207,11 @@ def _selected_attention_bwd_dlocal_kv(
         offsets_m = query_start + offsets_m_base
         query_mask = offsets_m < S
         matrix_mask = query_mask[:, None] & dimension_mask[None, :]
-        query = _load_bhsd(
-            query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
-        )
-        output = _load_bhsd(
+        query = load_bhsd(query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
+        output = load_bhsd(
             output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
         )
-        grad_output = _load_bhsd(
+        grad_output = load_bhsd(
             grad_output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
         )
         lse = tl.load(
@@ -564,18 +220,10 @@ def _selected_attention_bwd_dlocal_kv(
             other=0.0,
         )
         delta = tl.sum(grad_output * output, axis=1)
-        valid = (
-            query_mask[:, None]
-            & key_mask[None, :]
-            & (offsets_n[None, :] <= offsets_m[:, None])
-            & (offsets_n[None, :] >= offsets_m[:, None] - WINDOW + 1)
-        )
+        valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
-            query_doc_ids = _load_bs(
-                doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1
-            )
-            doc_mask = query_doc_ids[:, None] == key_doc_ids[None, :]
-            valid = valid & doc_mask
+            query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
+            valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         probabilities = tl.exp(scores - lse[:, None])
@@ -596,7 +244,7 @@ def _selected_attention_bwd_dlocal_kv(
             * SCALE
         )
 
-    _store_bhsd(
+    store_bhsd(
         grad_local_kv_ptr,
         grad_values,
         GRAD_LOCAL_KV_STRIDES,
@@ -653,7 +301,7 @@ def _selected_attention_bwd_dlocal_kv_tma(
     )
 
     if HAS_DOC_IDS:
-        key_doc_ids = _load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
+        key_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, key_mask, -2)
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
     first_query = key_block * BLOCK_N
@@ -681,16 +329,9 @@ def _selected_attention_bwd_dlocal_kv_tma(
             other=0.0,
         )
         delta = tl.sum(grad_output * output, axis=1)
-        valid = (
-            query_mask[:, None]
-            & key_mask[None, :]
-            & (offsets_n[None, :] <= offsets_m[:, None])
-            & (offsets_n[None, :] >= offsets_m[:, None] - WINDOW + 1)
-        )
+        valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
-            query_doc_ids = _load_bs(
-                doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1
-            )
+            query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
             valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
@@ -805,13 +446,13 @@ def _selected_attention_bwd_dsparse_kv(
         )
         query_mask = entry_mask & (query_positions >= 0) & (query_positions < S)
         matrix_mask = query_mask[:, None] & dimension_mask[None, :]
-        query = _load_bhsd(
+        query = load_bhsd(
             query_ptr, QUERY_STRIDES, batch, head, query_positions, offsets_d, matrix_mask
         )
-        output = _load_bhsd(
+        output = load_bhsd(
             output_ptr, QUERY_STRIDES, batch, head, query_positions, offsets_d, matrix_mask
         )
-        grad_output = _load_bhsd(
+        grad_output = load_bhsd(
             grad_output_ptr, QUERY_STRIDES, batch, head, query_positions, offsets_d, matrix_mask
         )
         lse = tl.load(
@@ -852,98 +493,6 @@ def _selected_attention_bwd_dsparse_kv(
         tl.sum(grad_value * (dot_rows[:, None] == 0), axis=0),
         mask=dimension_mask,
     )
-
-
-def _launch_forward(
-    query: torch.Tensor,
-    sparse_kv: torch.Tensor,
-    local_kv: torch.Tensor,
-    kv_indices: torch.Tensor,
-    attention_sink: torch.Tensor,
-    doc_ids: torch.Tensor | None,
-    sliding_window_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch the forward kernel and return its output and log-sum-exp state."""
-    batch, heads, seq_len, head_dim = query.shape
-    topk = kv_indices.shape[-1]
-    sparse_seq_len = sparse_kv.shape[2]
-    block_m = 64
-    block_n = 128
-    block_d = max(16, triton.next_power_of_2(head_dim))
-    num_local_tiles = (
-        triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
-    )
-
-    output = torch.empty_like(query)
-    lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
-
-    has_doc_ids = doc_ids is not None
-    doc_ids = query if doc_ids is None else doc_ids
-    use_tma = can_use_tma(query) and can_use_tma(local_kv)
-
-    grid = (triton.cdiv(seq_len, block_m), batch * heads)
-    if use_tma:
-        query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
-        local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
-        output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
-        _selected_attention_fwd_tma[grid](
-            query_desc,
-            sparse_kv,
-            local_desc,
-            kv_indices,
-            doc_ids,
-            attention_sink,
-            output_desc,
-            lse,
-            SPARSE_KV_STRIDES=sparse_kv.stride(),
-            KV_INDICES_STRIDES=kv_indices.stride(),
-            DOC_IDS_STRIDES=doc_ids.stride(),
-            LSE_STRIDES=lse.stride(),
-            H=heads,
-            S=seq_len,
-            D=head_dim,
-            SPARSE_SEQ_LEN=sparse_seq_len,
-            TOPK=topk,
-            WINDOW=sliding_window_size,
-            SCALE=1.0 / math.sqrt(head_dim),
-            HAS_DOC_IDS=has_doc_ids,
-            NUM_LOCAL_TILES=num_local_tiles,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_D=block_d,
-        )
-    else:
-        _selected_attention_fwd[grid](
-            query,
-            sparse_kv,
-            local_kv,
-            kv_indices,
-            doc_ids,
-            attention_sink,
-            output,
-            lse,
-            QUERY_STRIDES=query.stride(),
-            SPARSE_KV_STRIDES=sparse_kv.stride(),
-            LOCAL_KV_STRIDES=local_kv.stride(),
-            KV_INDICES_STRIDES=kv_indices.stride(),
-            DOC_IDS_STRIDES=doc_ids.stride(),
-            LSE_STRIDES=lse.stride(),
-            H=heads,
-            S=seq_len,
-            D=head_dim,
-            SPARSE_SEQ_LEN=sparse_seq_len,
-            TOPK=topk,
-            WINDOW=sliding_window_size,
-            SCALE=1.0 / math.sqrt(head_dim),
-            HAS_DOC_IDS=has_doc_ids,
-            NUM_LOCAL_TILES=num_local_tiles,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_D=block_d,
-            num_warps=8,
-            num_stages=3,
-        )
-    return output, lse
 
 
 def _build_index_query_map(
@@ -1133,123 +682,3 @@ def _launch_backward(
         )
 
     return grad_query, grad_sparse_kv, grad_local_kv, grad_sink_fp32.to(attention_sink.dtype)
-
-
-class _SelectedAttentionFunction(torch.autograd.Function):
-    """Autograd wrapper around the Triton launchers."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        query: torch.Tensor,
-        sparse_kv: torch.Tensor,
-        local_kv: torch.Tensor,
-        kv_indices: torch.Tensor,
-        attention_sink: torch.Tensor,
-        doc_ids: torch.Tensor | None,
-        sliding_window_size: int,
-    ) -> torch.Tensor:
-        output, lse = _launch_forward(
-            query,
-            sparse_kv,
-            local_kv,
-            kv_indices,
-            attention_sink,
-            doc_ids,
-            sliding_window_size,
-        )
-        selected_queries, block_offsets = _build_index_query_map(kv_indices, sparse_kv.shape[2])
-        ctx.save_for_backward(
-            query,
-            sparse_kv,
-            local_kv,
-            kv_indices,
-            selected_queries,
-            block_offsets,
-            attention_sink,
-            output,
-            lse,
-        )
-        ctx.doc_ids = doc_ids
-        ctx.sliding_window_size = sliding_window_size
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (
-            query,
-            sparse_kv,
-            local_kv,
-            kv_indices,
-            selected_queries,
-            block_offsets,
-            attention_sink,
-            output,
-            lse,
-        ) = ctx.saved_tensors
-        grad_query, grad_sparse_kv, grad_local_kv, grad_sink = _launch_backward(
-            query,
-            sparse_kv,
-            local_kv,
-            kv_indices,
-            selected_queries,
-            block_offsets,
-            attention_sink,
-            ctx.doc_ids,
-            output,
-            lse,
-            grad_output,
-            ctx.sliding_window_size,
-        )
-        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None
-
-
-def selected_attention(
-    query: torch.Tensor,
-    local_kv: torch.Tensor,
-    sparse_kv: torch.Tensor,
-    kv_indices: torch.Tensor,
-    attention_sink: torch.Tensor,
-    doc_ids: torch.Tensor | None,
-    sliding_window_size: int,
-    share_kv: bool = True,
-) -> torch.Tensor:
-    """Triton implementation of selected attention.
-
-    Args:
-        query: (batch, heads, seq_len, head_dim) — queries.
-        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values.
-        sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
-        kv_indices: (batch, seq_len, topk) — which sparse_kv positions each query attends to.
-        attention_sink: (heads,) — learned per-head sink weight.
-        doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
-        sliding_window_size: size of the causal sliding window.
-        share_kv: if True, expand single-head KV to all heads.
-
-    Returns:
-        Attention output with same shape as query.
-    """
-    heads = query.shape[1]
-
-    if query.device.type != "cuda":
-        raise ValueError("The Triton selected attention backend requires CUDA tensors.")
-
-    # Expand shared KV heads (stride-zero broadcast; no memory duplication)
-    if share_kv:
-        local_kv = local_kv.expand(-1, heads, -1, -1)
-        sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
-
-    query = query.contiguous()
-    kv_indices = kv_indices.contiguous()
-    if doc_ids is not None:
-        doc_ids = doc_ids.contiguous()
-
-    if torch.is_grad_enabled() and any(
-        t.requires_grad for t in (query, local_kv, sparse_kv, attention_sink)
-    ):
-        return _SelectedAttentionFunction.apply(
-            query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
-        )
-    return _launch_forward(
-        query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
-    )[0]
