@@ -370,6 +370,78 @@ def test_float32_attention_sink(backend):
     )
 
 
+def test_eager_bfloat16_mixed_precision_schedule():
+    """Eager mirrors FP32 QK/softmax/PV accumulation and BF16 dot operands."""
+    torch.manual_seed(2027)
+    batch, heads, seq_len, head_dim = 1, 2, 5, 16
+    sparse_seq_len, window = 6, 3
+    query = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16)
+    local_kv = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16)
+    sparse_kv = torch.randn(batch, heads, sparse_seq_len, head_dim, dtype=torch.bfloat16)
+    kv_indices = torch.tensor(
+        [[[0, 0, 2], [1, 3, -1], [2, 4, 5], [0, 3, 5], [1, 1, 4]]],
+        dtype=torch.int64,
+    )
+    attention_sink = torch.randn(heads, dtype=torch.bfloat16)
+
+    valid_indices = kv_indices >= 0
+    counts = torch.zeros(batch, seq_len, sparse_seq_len, dtype=torch.float32)
+    counts.scatter_add_(
+        -1,
+        kv_indices.clamp(min=0),
+        valid_indices.to(torch.float32),
+    )
+    sparse_mask = torch.where(
+        counts > 0,
+        counts.log(),
+        torch.full_like(counts, -float("inf")),
+    )
+    query_positions = torch.arange(seq_len)[:, None]
+    key_positions = torch.arange(seq_len)[None, :]
+    local_valid = (key_positions <= query_positions) & (
+        key_positions >= query_positions - window + 1
+    )
+    local_mask = torch.zeros(seq_len, seq_len, dtype=torch.float32).masked_fill(
+        ~local_valid, -float("inf")
+    )
+    attention_mask = torch.cat([sparse_mask, local_mask.expand(batch, -1, -1)], dim=-1).unsqueeze(
+        1
+    )
+    attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
+    logits = (query.float() @ attention_kv.float().transpose(-2, -1)) / math.sqrt(
+        head_dim
+    ) + attention_mask
+    sink_logits = attention_sink.float()[None, :, None, None].expand(batch, -1, seq_len, 1)
+    probabilities = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)[..., :-1].to(
+        torch.bfloat16
+    )
+    expected = (probabilities.float() @ attention_kv.float()).to(torch.bfloat16)
+
+    actual = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        None,
+        window,
+        backend="eager",
+    )
+    actual_float32_sink = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink.float(),
+        None,
+        window,
+        backend="eager",
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual_float32_sink, expected, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # 5. Repeated selections (backends must agree)
 # ---------------------------------------------------------------------------
