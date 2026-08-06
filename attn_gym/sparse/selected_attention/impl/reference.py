@@ -120,6 +120,7 @@ def selected_attention(
     """
     device = query.device
     dtype = query.dtype
+    accumulation_dtype = torch.promote_types(dtype, torch.float32)
     b, h, s, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     if share_kv:
@@ -134,39 +135,47 @@ def selected_attention(
         valid_mask = kv_indices >= 0
         safe_indices = kv_indices.clamp(min=0)
         # Count how many times each position is selected per query (ignoring sentinels)
-        counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=dtype)
+        counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=accumulation_dtype)
         counts.scatter_add_(
             dim=-1,
             index=safe_indices,
-            src=valid_mask.to(dtype),
+            src=valid_mask.to(accumulation_dtype),
         )
         # Convert counts to additive log-mask: 0 selections → -inf, k selections → log(k)
         topk_mask = torch.where(
             counts > 0, torch.log(counts), torch.full_like(counts, float("-inf"))
         )
 
-    SWA_mask = make_sliding_window_mask(s, sliding_window_size, device, dtype).unsqueeze(0)
+    SWA_mask = make_sliding_window_mask(
+        s, sliding_window_size, device, accumulation_dtype
+    ).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)
 
     if doc_ids is not None:
-        packing_mask = make_packed_mask(doc_ids, dtype=dtype)
+        packing_mask = make_packed_mask(doc_ids, dtype=accumulation_dtype)
         # packing_mask is [B, 1, S, S], SWA_mask is [B, S, S]
         SWA_mask = SWA_mask + packing_mask.squeeze(1)
 
     attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
     attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
+    query_acc = query.to(accumulation_dtype)
+    attention_kv_acc = attention_kv.to(accumulation_dtype)
 
     scale = head_dim**0.5
 
+    # Match the optimized backends' mixed-precision boundaries: accumulate QK and
+    # softmax in FP32 for low-precision inputs, then quantize P for the PV dot.
     logits = (
-        torch.matmul(query, torch.permute(attention_kv, (0, 1, 3, 2))) / scale + attention_mask
+        torch.matmul(query_acc, torch.permute(attention_kv_acc, (0, 1, 3, 2))) / scale
+        + attention_mask
     )
 
-    # Concatenate sink as an extra column, apply standard softmax, then drop it
-    sink_logit = attention_sink[None, :, None, None].expand(b, -1, s, 1)
+    # Concatenate sink as an extra column, apply standard softmax, then drop it.
+    sink_logit = attention_sink.to(accumulation_dtype)[None, :, None, None].expand(b, -1, s, 1)
     logits_with_sink = torch.cat([logits, sink_logit], dim=-1)
     probs_with_sink = torch.softmax(logits_with_sink, dim=-1)
-    probs = probs_with_sink[..., :-1]
+    probs = probs_with_sink[..., :-1].to(dtype)
 
-    attn_output = probs @ attention_kv
-    return attn_output
+    # The low-precision P and KV operands accumulate in FP32 before the output
+    # is stored in the input dtype, as in a tensor-core dot.
+    return torch.matmul(probs.to(accumulation_dtype), attention_kv_acc).to(dtype)

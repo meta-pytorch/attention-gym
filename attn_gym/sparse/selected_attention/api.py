@@ -37,9 +37,10 @@ def _validate_inputs(
         raise ValueError(
             f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
         )
-    if attention_sink.dtype != query.dtype:
+    if attention_sink.dtype not in (query.dtype, torch.float32):
         raise ValueError(
-            f"attention_sink must have the same dtype as query, but got {attention_sink.dtype} and {query.dtype}."
+            "attention_sink must have the same dtype as query or use torch.float32, "
+            f"but got {attention_sink.dtype} and {query.dtype}."
         )
 
     if local_kv.device != query.device:
@@ -168,8 +169,8 @@ def selected_attention(
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
             query[i, j] will attend to all sparse_kv[i, kv_indices[k]] for all k < num_topk_blocks
 
-        attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies
-            denominator of softmax
+        attention_sink: tensor in shape of (num_heads, ), learnable per-head weight that occupies
+            the denominator of softmax. It may use the query dtype or torch.float32.
 
         doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where tokens with the same id
