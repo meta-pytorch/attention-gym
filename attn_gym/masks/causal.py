@@ -2,6 +2,7 @@
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
+
 from attn_gym.utils import cdiv
 
 
@@ -129,6 +130,7 @@ def main(device: str = "cpu"):
         device (str): Device to use for computation. Defaults
     """
     import torch
+
     from attn_gym import visualize_attention_scores
 
     B, H, SEQ_LEN, HEAD_DIM = 1, 1, 12, 8

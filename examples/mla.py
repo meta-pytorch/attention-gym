@@ -1,12 +1,11 @@
-import torch
-
-from torch.nn.attention.flex_attention import flex_attention
-from typing import Optional, Tuple
-from torch import nn
-import torch.nn.functional as F
 import math
-from attn_gym.mods.latent_attention import generate_mla_rope_score_mod
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.attention.flex_attention import flex_attention
+
+from attn_gym.mods.latent_attention import generate_mla_rope_score_mod
 
 torch._inductor.config.unroll_reductions_threshold = 65
 
@@ -56,7 +55,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
-    assert 0 <= 1 < ndim
+    assert 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
@@ -66,7 +65,7 @@ def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -153,7 +152,7 @@ class DeepseekV2AttentionVanilla(nn.Module):
         hidden_states: torch.Tensor,
         compressed_kv_normed_cache: torch.Tensor,
         k_pe_cache: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         bsz, q_len, _ = hidden_states.size()
         if q_len != 1:
             raise ValueError(f"Only support decode, but got hidden_states[{hidden_states.size()}]")
@@ -292,7 +291,7 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
         k_pe_cache: torch.Tensor,
         use_flex: bool,
         compile: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         bsz, _ = hidden_states.size()
 
         c_Q = torch.matmul(hidden_states, self.W_DQ)
@@ -464,11 +463,12 @@ def run_performance_test(
     compressed_kv_normed_cache: torch.Tensor,
     k_pe_cache: torch.Tensor,
 ):
+    from pathlib import Path
+
     from transformer_nuggets.utils.benchmark import (
         benchmark_cuda_function_in_microseconds,
         profiler,
     )
-    from pathlib import Path
 
     mla_mat_absorb = DeepseekV2AttentionMatAbsorbDecode(mla_vanilla).cuda(device=dev_id)
 

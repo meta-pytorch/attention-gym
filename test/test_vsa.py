@@ -1,5 +1,5 @@
-from functools import partial
 import math
+from functools import partial
 
 import pytest
 import torch

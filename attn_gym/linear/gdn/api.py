@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal, NamedTuple
 
 import torch
+
 from attn_gym.linear.gdn.impl.reference import forward
 
 Mode = Literal["auto", "chunked", "recurrent"]

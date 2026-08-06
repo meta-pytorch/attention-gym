@@ -1,8 +1,10 @@
+from functools import partial
+
+import pytest
 import torch
 from torch.autograd import grad
 from torch.nn.attention.flex_attention import flex_attention
-import pytest
-from functools import partial
+
 from attn_gym.mods import generate_tanh_softcap
 
 

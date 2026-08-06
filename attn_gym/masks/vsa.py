@@ -6,8 +6,8 @@ remain ordinary PyTorch work around the FlexAttention call rather than fused int
 single kernel.
 """
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor

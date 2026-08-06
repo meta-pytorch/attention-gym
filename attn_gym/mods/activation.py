@@ -14,12 +14,12 @@ return_aux=AuxRequest(lse=True) to retrieve log(ell), we can recover:
     f(S) @ V = O' * ell - N * sum_j(V_j)
 """
 
-import torch
-from torch import Tensor
-from torch.nn.attention.flex_attention import AuxRequest, _score_mod_signature
 from collections.abc import Callable
 
+import torch
 import torch.nn.functional as F
+from torch import Tensor
+from torch.nn.attention.flex_attention import AuxRequest, _score_mod_signature
 
 
 def generate_activation_score_mod(
@@ -68,6 +68,7 @@ def undo_softmax(
 def main(device: str = "cuda", compile: bool = False):
     """Demonstrate non-softmax attention via FlexAttention with correctness check."""
     import math
+
     from torch.nn.attention.flex_attention import flex_attention
 
     flex_fn = torch.compile(flex_attention) if compile else flex_attention

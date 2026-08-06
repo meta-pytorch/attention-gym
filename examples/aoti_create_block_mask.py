@@ -1,17 +1,18 @@
 import os
-import torch
-from torch import Tensor
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    create_block_mask,
-    _DEFAULT_SPARSE_BLOCK_SIZE,
-)
-from torch.export import Dim
-from typing import Callable
-from attn_gym.masks.causal import causal_mask
+import warnings
+from collections.abc import Callable
 from functools import lru_cache
 
-import warnings
+import torch
+from torch import Tensor
+from torch.export import Dim
+from torch.nn.attention.flex_attention import (
+    _DEFAULT_SPARSE_BLOCK_SIZE,
+    BlockMask,
+    create_block_mask,
+)
+
+from attn_gym.masks.causal import causal_mask
 
 # Suppress FutureWarning about LeafSpec deprecation in torch._dynamo
 warnings.filterwarnings(

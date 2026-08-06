@@ -113,7 +113,9 @@ def test_graphormer_flex_matches_sdpa_with_learnable_bias_grads(compile_flex):
     ref_grads = grad(ref, (q, k, v, spatial_bias), grad_out)
     for g, rg, name in zip(grads, ref_grads, ("q", "k", "v", "spatial_bias")):
         assert g.abs().sum() > 0, f"grad_{name} is all zeros"
-        torch.testing.assert_close(g, rg, rtol=2e-2, atol=2e-2, msg=lambda m: f"grad_{name}: {m}")
+        torch.testing.assert_close(
+            g, rg, rtol=2e-2, atol=2e-2, msg=lambda m, name=name: f"grad_{name}: {m}"
+        )
 
 
 @pytest.mark.parametrize("compile_flex", [False, True], ids=["eager", "compiled"])
@@ -145,7 +147,9 @@ def test_graphormer_edge_bias_flex_matches_sdpa_with_grads(compile_flex):
     ref_grads = grad(ref, (q, k, v, edge_bias), grad_out)
     for g, rg, name in zip(grads, ref_grads, ("q", "k", "v", "edge_bias")):
         assert g.abs().sum() > 0, f"grad_{name} is all zeros"
-        torch.testing.assert_close(g, rg, rtol=2e-2, atol=2e-2, msg=lambda m: f"grad_{name}: {m}")
+        torch.testing.assert_close(
+            g, rg, rtol=2e-2, atol=2e-2, msg=lambda m, name=name: f"grad_{name}: {m}"
+        )
 
 
 def test_graphormer_combined_spatial_and_edge_bias():
@@ -184,4 +188,6 @@ def test_graphormer_combined_spatial_and_edge_bias():
     ref_grads = grad(ref, (spatial_bias, edge_bias), grad_out)
     for g, rg, name in zip(grads, ref_grads, ("spatial_bias", "edge_bias")):
         assert g.abs().sum() > 0, f"grad_{name} is all zeros"
-        torch.testing.assert_close(g, rg, rtol=2e-2, atol=2e-2, msg=lambda m: f"grad_{name}: {m}")
+        torch.testing.assert_close(
+            g, rg, rtol=2e-2, atol=2e-2, msg=lambda m, name=name: f"grad_{name}: {m}"
+        )
