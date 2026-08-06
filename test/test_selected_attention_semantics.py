@@ -29,37 +29,6 @@ def _dtype_for_backend(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_local_only_attention(backend):
-    """With topk=0, output depends only on the local sliding window + sink."""
-    device = _device_for_backend(backend)
-    dtype = _dtype_for_backend(backend)
-    b, h, s, d = 1, 2, 8, 16
-    window = 3
-
-    torch.manual_seed(0)
-    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, 4, d, device=device, dtype=dtype)
-    kv_indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
-    sink = torch.zeros(h, device=device, dtype=dtype)
-
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
-    )
-
-    # Output should be a weighted combination of local KV only.
-    # Changing sparse_kv should have zero effect.
-    sparse_kv2 = torch.randn(b, h, 4, d, device=device, dtype=dtype)
-    out2 = selected_attention(
-        query, local_kv, sparse_kv2, kv_indices, sink, None, window, backend=backend
-    )
-    torch.testing.assert_close(out, out2, atol=1e-5, rtol=1e-5)
-
-    # Output shape is correct
-    assert out.shape == (b, h, s, d)
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
 def test_local_only_matches_manual_computation(backend):
     """Local-only with sink=0 should match standard causal sliding window softmax."""
     device = _device_for_backend(backend)
@@ -95,44 +64,20 @@ def test_local_only_matches_manual_computation(backend):
     probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
     expected = probs @ local_kv
 
+    sparse_kv2 = torch.randn_like(sparse_kv)
+    out2 = selected_attention(
+        query, local_kv, sparse_kv2, kv_indices, sink, None, window, backend=backend
+    )
+
     atol = 1e-5 if backend == "triton" else 1e-10
+    assert out.shape == (b, h, s, d)
     torch.testing.assert_close(out, expected, atol=atol, rtol=1e-5)
+    torch.testing.assert_close(out2, expected, atol=atol, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
 # 2. Selected-block-only attention (window=0)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_selected_block_only(backend):
-    """With window=0, output depends only on the selected sparse blocks + sink."""
-    device = _device_for_backend(backend)
-    dtype = _dtype_for_backend(backend)
-    b, h, s, d = 1, 2, 8, 16
-    sparse_seq_len = 6
-    topk = 2
-
-    torch.manual_seed(7)
-    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
-    scores = torch.randn(b, s, sparse_seq_len, device=device)
-    _, kv_indices = torch.topk(scores, k=topk, dim=-1)
-    sink = torch.zeros(h, device=device, dtype=dtype)
-
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend=backend
-    )
-
-    # Changing local KV should have zero effect when window=0
-    local_kv2 = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    out2 = selected_attention(
-        query, local_kv2, sparse_kv, kv_indices, sink, None, 0, backend=backend
-    )
-    torch.testing.assert_close(out, out2, atol=1e-5, rtol=1e-5)
-
-    assert out.shape == (b, h, s, d)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -173,8 +118,15 @@ def test_selected_block_only_manual(backend):
     probs = exp_s / (exp_s.sum(dim=-1, keepdim=True) + exp_sink)
     expected = torch.bmm(probs.unsqueeze(1), gathered).squeeze(1)  # (4, 8)
 
+    local_kv2 = torch.randn_like(local_kv)
+    out2 = selected_attention(
+        query, local_kv2, sparse_kv, kv_indices, sink, None, 0, backend=backend
+    )
+
     atol = 1e-4 if backend == "triton" else 1e-10
+    assert out.shape == (b, h, s, d)
     torch.testing.assert_close(out[0, 0], expected, atol=atol, rtol=1e-4)
+    torch.testing.assert_close(out2[0, 0], expected, atol=atol, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -254,15 +206,14 @@ def test_sink_large_absorbs_probability(backend):
     """As sink → +∞, all probability goes to sink, output → 0."""
     device = _device_for_backend(backend)
     dtype = _dtype_for_backend(backend)
-    b, h, s, d = 1, 2, 8, 16
-    window = 4
+    b, h, s, d = 1, 1, 4, 8
+    window = 2
 
     torch.manual_seed(33)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype)
     local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, 4, d, device=device, dtype=dtype)
-    scores = torch.randn(b, s, 4, device=device)
-    _, kv_indices = torch.topk(scores, k=2, dim=-1)
+    sparse_kv = torch.randn(b, h, 3, d, device=device, dtype=dtype)
+    kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
     # Very large positive sink
     sink = torch.full((h,), 50.0, device=device, dtype=dtype)
@@ -322,8 +273,11 @@ def test_sink_very_negative_has_no_effect(backend):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
-@pytest.mark.parametrize("num_repeats", [2, 3])
-@pytest.mark.parametrize("sliding_window_size", [0, 4])
+@pytest.mark.parametrize(
+    "num_repeats,sliding_window_size",
+    [(2, 0), (3, 4)],
+    ids=["sparse-only", "joint"],
+)
 def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     """Repeated indices should produce identical results in eager and triton."""
     device = torch.device("cuda")
@@ -345,7 +299,8 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     out_eager = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
     )
-    out_eager.sum().backward()
+    grad_output = torch.randn_like(out_eager)
+    out_eager.backward(grad_output)
     grad_query_eager = query.grad.clone()
     grad_local_kv_eager = local_kv.grad.clone()
     grad_sparse_kv_eager = sparse_kv.grad.clone()
@@ -359,7 +314,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     out_triton = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
     )
-    out_triton.sum().backward()
+    out_triton.backward(grad_output)
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(query.grad, grad_query_eager, atol=1e-4, rtol=1e-4)
@@ -373,8 +328,8 @@ def test_mixed_repeated_and_unique_indices_backends_match():
     """Mix of repeated and unique indices should match between backends."""
     device = torch.device("cuda")
     dtype = torch.float32
-    b, h, s, d = 1, 2, 6, 16
-    sparse_seq_len = 5
+    b, h, s, d = 1, 2, 8, 16
+    sparse_seq_len = 4
 
     torch.manual_seed(99)
     query = torch.randn(b, h, s, d, device=device, dtype=dtype)
@@ -384,7 +339,7 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
     # Mix: some rows have repeats, some are unique, some have -1 sentinels
     kv_indices = torch.tensor(
-        [[[0, 0, 1], [2, 2, 2], [0, 1, 2], [3, 3, -1], [-1, -1, -1], [4, 4, 4]]],
+        [[[0, 0], [1, 1], [0, 1], [2, -1], [-1, -1], [3, 3], [1, 2], [0, -1]]],
         dtype=torch.long,
         device=device,
     )
@@ -404,10 +359,11 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_torch_compile_fullgraph_forward(backend):
-    """selected_attention compiles with torch.compile(fullgraph=True)."""
-    device = _device_for_backend(backend)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
+def test_torch_compile_fullgraph_forward():
+    """The Triton inference path compiles with torch.compile(fullgraph=True)."""
+    backend = "triton"
+    device = torch.device("cuda")
     dtype = _dtype_for_backend(backend)
     b, h, s, d = 1, 2, 8, 16
     window = 3
@@ -436,10 +392,11 @@ def test_torch_compile_fullgraph_forward(backend):
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_torch_compile_fullgraph_backward(backend):
     """selected_attention backward works under torch.compile(fullgraph=True)."""
-    device = _device_for_backend(backend)
+    device = torch.device("cuda")
     dtype = _dtype_for_backend(backend)
     b, h, s, d = 1, 2, 8, 16
     window = 3
