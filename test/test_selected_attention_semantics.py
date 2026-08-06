@@ -272,9 +272,9 @@ def test_sink_large_absorbs_probability(backend):
     )
 
     # Output should be near zero (sink absorbs essentially all probability)
-    assert out.abs().max().item() < 0.01, (
-        f"With large sink, output should be near zero, got max={out.abs().max().item()}"
-    )
+    assert (
+        out.abs().max().item() < 0.01
+    ), f"With large sink, output should be near zero, got max={out.abs().max().item()}"
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
