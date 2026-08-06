@@ -5,6 +5,8 @@ attention sink behavior, and repeated selections.
 Tests both eager (reference) and triton backends.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -22,7 +24,7 @@ def shared_kv_blackwell_inputs():
     """Create a packed shared-KV case that exercises both attention branches."""
     torch.manual_seed(123)
     batch, heads, seq_len, head_dim = 1, 24, 33, 32
-    sparse_seq_len, topk = 37, 7
+    sparse_seq_len, topk = 79, 73
     query = torch.randn(
         batch,
         heads,
@@ -64,6 +66,27 @@ def _device_for_backend(backend):
 
 def _dtype_for_backend(backend):
     return torch.float32
+
+
+def assert_matches_low_precision_eager(
+    actual,
+    low_precision_expected,
+    high_precision_expected,
+    reduction_sizes,
+):
+    """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
+    assert torch.isfinite(actual).all()
+    actual_difference = (actual.double() - high_precision_expected).abs()
+    eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
+    accumulation_eps = (
+        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
+    )
+    output_rounding_eps = torch.finfo(actual.dtype).eps
+    rounding_eps = accumulation_eps + output_rounding_eps
+    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
+    max_atol = rounding_eps * high_precision_expected.abs().max().item()
+    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
+    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +333,43 @@ def test_sink_very_negative_has_no_effect(backend):
     torch.testing.assert_close(out, expected, atol=atol, rtol=1e-4)
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_float32_attention_sink(backend):
+    """A float32 sink is supported with lower-precision query and KV tensors."""
+    device = _device_for_backend(backend)
+    torch.manual_seed(101)
+    query = torch.randn(1, 2, 4, 16, device=device, dtype=torch.bfloat16)
+    local_kv = torch.randn(1, 2, 4, 16, device=device, dtype=torch.bfloat16)
+    sparse_kv = torch.randn(1, 2, 4, 16, device=device, dtype=torch.bfloat16)
+    kv_indices = torch.tensor([[[0, 1], [1, 2], [2, 3], [0, 3]]], device=device, dtype=torch.int32)
+    attention_sink = torch.randn(2, device=device, dtype=torch.float32)
+
+    high_precision_expected = selected_attention(
+        query.double(),
+        local_kv.double(),
+        sparse_kv.double(),
+        kv_indices,
+        attention_sink.double(),
+        None,
+        2,
+        backend="eager",
+    )
+    low_precision_expected = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend="eager"
+    )
+    actual = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend=backend
+    )
+
+    assert actual.dtype == torch.bfloat16
+    assert_matches_low_precision_eager(
+        actual,
+        low_precision_expected,
+        high_precision_expected,
+        reduction_sizes=(query.shape[-1], kv_indices.shape[-1] + 2, kv_indices.shape[-1] + 2),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. Repeated selections (backends must agree)
 # ---------------------------------------------------------------------------
@@ -475,6 +535,74 @@ def test_shared_kv_blackwell_sparse_only():
         )
 
     torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_shared_kv_blackwell_dsv4_forward():
+    """The tiled shared-KV forward handles DSV4's head dimension and sparse top-k."""
+    torch.manual_seed(2026)
+    batch, heads, seq_len, head_dim = 1, 64, 16, 512
+    sparse_seq_len, topk, window = 512, 512, 128
+    query = torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    local_kv = torch.randn(batch, 1, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    sparse_kv = torch.randn(
+        batch, 1, sparse_seq_len, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_indices = torch.stack(
+        [torch.randperm(sparse_seq_len, device="cuda")[:topk] for _ in range(seq_len)]
+    ).unsqueeze(0)
+    kv_indices[:, :4, -3:] = -1
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+
+    with torch.inference_mode():
+        high_precision_expected = selected_attention(
+            query.double(),
+            local_kv.double(),
+            sparse_kv.double(),
+            kv_indices,
+            attention_sink.double(),
+            None,
+            window,
+            backend="eager",
+        )
+        low_precision_expected = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            None,
+            window,
+            backend="eager",
+        )
+        actual = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            None,
+            window,
+            backend="triton",
+        )
+
+    assert_matches_low_precision_eager(
+        actual,
+        low_precision_expected,
+        high_precision_expected,
+        reduction_sizes=(head_dim, topk + window, topk + window),
+    )
+    with pytest.raises(NotImplementedError, match="head_dim=512 only for inference"):
+        selected_attention(
+            query.requires_grad_(),
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            None,
+            window,
+            backend="triton",
+        )
 
 
 # ---------------------------------------------------------------------------

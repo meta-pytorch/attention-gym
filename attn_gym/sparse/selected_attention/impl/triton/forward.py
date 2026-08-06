@@ -144,6 +144,13 @@ def _selected_attention_fwd(
     )
 
 
+def prune_shared_forward_configs(configs, _named_args, D, **_):
+    """Avoid local tiles that exceed shared memory for wide head dimensions."""
+    if D <= 128:
+        return configs
+    return [config for config in configs if config.kwargs["BLOCK_N"] == 64]
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
@@ -151,6 +158,7 @@ def _selected_attention_fwd(
         for num_warps in (4, 8)
     ],
     key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    prune_configs_by={"early_config_prune": prune_shared_forward_configs},
     cache_results=True,
 )
 @triton.jit
@@ -208,37 +216,42 @@ def _selected_attention_fwd_shared(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
     if TOPK:
+        # Keep on-chip storage bounded when the selected set contains hundreds of entries.
         offsets_k = tl.arange(0, BLOCK_K)
-        selected_idx = tl.load(
-            kv_indices_ptr + ptr_offset((batch, sequence, offsets_k), KV_INDICES_STRIDES),
-            mask=offsets_k < TOPK,
-            other=-1,
-        )
-        selected_valid = (offsets_k < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
-        selected_idx = tl.where(selected_valid, selected_idx, 0)
-        sparse_values = tl.load(
-            sparse_kv_ptr
-            + ptr_offset(
-                (batch, 0, selected_idx[:, None], offsets_d[None, :]),
-                SPARSE_KV_STRIDES,
-            ),
-            mask=selected_valid[:, None] & dimension_mask[None, :],
-            other=0.0,
-        )
-        logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
-        logits = tl.where(head_mask[:, None] & selected_valid[None, :], logits, -float("inf"))
-        accumulator, running_max, running_sum = online_softmax_update(
-            accumulator, running_max, running_sum, logits, sparse_values
-        )
+        for selected_start in tl.range(0, TOPK, BLOCK_K, num_stages=2):
+            selected_offsets = selected_start + offsets_k
+            selected_idx = tl.load(
+                kv_indices_ptr
+                + ptr_offset((batch, sequence, selected_offsets), KV_INDICES_STRIDES),
+                mask=selected_offsets < TOPK,
+                other=-1,
+            )
+            selected_valid = (
+                (selected_offsets < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+            )
+            selected_idx = tl.where(selected_valid, selected_idx, 0)
+            sparse_values = tl.load(
+                sparse_kv_ptr
+                + ptr_offset(
+                    (batch, 0, selected_idx[:, None], offsets_d[None, :]),
+                    SPARSE_KV_STRIDES,
+                ),
+                mask=selected_valid[:, None] & dimension_mask[None, :],
+                other=0.0,
+            )
+            logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
+            logits = tl.where(head_mask[:, None] & selected_valid[None, :], logits, -float("inf"))
+            accumulator, running_max, running_sum = online_softmax_update(
+                accumulator, running_max, running_sum, logits, sparse_values
+            )
 
     if HAS_DOC_IDS:
         query_doc_id = tl.load(doc_ids_ptr + ptr_offset((batch, sequence), DOC_IDS_STRIDES))
 
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
-    num_local_tiles: tl.constexpr = tl.cdiv(WINDOW, BLOCK_N)
-    for local_tile in tl.static_range(0, num_local_tiles):
-        offsets_n = first_local_position + local_tile * BLOCK_N + offsets_n_base
+    for local_start in tl.range(0, WINDOW, BLOCK_N, num_stages=2):
+        offsets_n = first_local_position + local_start + offsets_n_base
         local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
         local_values = tl.load(
             local_kv_ptr
@@ -428,12 +441,16 @@ def _launch_forward(
         and local_kv.stride(-1) == 1
         and 16 <= heads <= 128
         and head_dim % 16 == 0
-        and head_dim <= 128
-        and topk <= 64
+        and (head_dim <= 128 or head_dim == 512)
         and sliding_window_size <= 2048
     ):
-        block_h = max(16, triton.next_power_of_2(heads))
-        block_k = max(16, triton.next_power_of_2(topk)) if topk else 16
+        # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
+        block_h = (
+            triton.next_power_of_2(heads)
+            if head_dim <= 128
+            else min(32, triton.next_power_of_2(heads))
+        )
+        block_k = max(16, min(64, triton.next_power_of_2(topk))) if topk else 16
         _selected_attention_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,

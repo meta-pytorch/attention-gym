@@ -166,7 +166,7 @@ def selected_attention(
     sink_logit = attention_sink[None, :, None, None].expand(b, -1, s, 1)
     logits_with_sink = torch.cat([logits, sink_logit], dim=-1)
     probs_with_sink = torch.softmax(logits_with_sink, dim=-1)
-    probs = probs_with_sink[..., :-1]
+    probs = probs_with_sink[..., :-1].to(attention_kv.dtype)
 
     attn_output = probs @ attention_kv
     return attn_output
