@@ -64,7 +64,7 @@ def load_gate_weights(model_dir: Path, device, dtype) -> dict[int, tuple[Tensor,
     pending: dict[str, Tensor] = {}
     for shard in shards:
         with safe_open(shard, framework="pt") as f:
-            for key in f.keys():
+            for key in f.keys():  # noqa: SIM118
                 if "to_gate_compress" in key:
                     pending[key] = f.get_tensor(key).to(device=device, dtype=dtype)
     for key, weight in pending.items():
@@ -106,7 +106,7 @@ def maybe_fix_14b_transformer(model_dir: Path) -> None:
     state: dict[str, Tensor] = {}
     for shard in shards:
         with safe_open(shard, framework="pt") as f:
-            for key in f.keys():
+            for key in f.keys():  # noqa: SIM118
                 state[key] = f.get_tensor(key).to(torch.bfloat16)
 
     def diffusers_key(key: str) -> str:

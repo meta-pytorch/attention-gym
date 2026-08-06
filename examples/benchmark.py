@@ -1,30 +1,26 @@
 from functools import lru_cache
-from typing import Optional, List
 
 import torch
 import torch.nn.functional as F
-
 from tabulate import tabulate
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
+    _mask_mod_signature,
+    _score_mod_signature,
     create_block_mask,
     create_mask,
     flex_attention,
-    _score_mod_signature,
-    _mask_mod_signature,
 )
-
 from triton.testing import do_bench
 
-from attn_gym.masks.document_mask import length_to_offsets
 from attn_gym.masks import (
     causal_mask,
-    generate_sliding_window,
-    generate_prefix_lm_mask,
     generate_doc_mask_mod,
+    generate_prefix_lm_mask,
+    generate_sliding_window,
 )
+from attn_gym.masks.document_mask import length_to_offsets
 from attn_gym.mods import generate_alibi_bias, generate_tanh_softcap
-
 
 AVAILABLE_EXAMPLES = {
     "causal": lambda: test_mask(mask_mod=causal_mask),
@@ -76,8 +72,8 @@ def print_header(text):
 
 
 def test_mask(
-    score_mod: Optional[_score_mod_signature] = None,
-    mask_mod: Optional[_mask_mod_signature] = None,
+    score_mod: _score_mod_signature | None = None,
+    mask_mod: _mask_mod_signature | None = None,
     B: int = 16,
     H: int = 16,
     S: int = 8192,
@@ -116,7 +112,7 @@ def test_mask(
     for attn in (causal_fa2, sdpa_mask, flex_attention_call):
         fwd_time = do_bench(attn)
         fwd_out = attn()
-        bwd_time = do_bench(lambda: fwd_out.backward(gradOut, retain_graph=True))  # noqa: F821
+        bwd_time = do_bench(lambda fwd_out=fwd_out: fwd_out.backward(gradOut, retain_graph=True))
         times.append((fwd_time, bwd_time))
 
         del fwd_out
@@ -221,13 +217,15 @@ def run_document_masking(max_seq_len: int, num_docs: int):
     test_mask(mask_mod=document_causal_mask, S=max_seq_len)
 
 
-def main(examples: List[str] = ["all"]):
+def main(examples: list[str] | None = None):
     """Run the benchmark with the given examples.
 
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
     """
 
+    if examples is None:
+        examples = ["all"]
     if "all" in examples:
         ex_to_run = list(AVAILABLE_EXAMPLES.keys())
     else:

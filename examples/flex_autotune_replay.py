@@ -4,9 +4,10 @@ import tempfile
 from unittest.mock import patch
 
 import torch
-from torch.nn.attention.flex_attention import flex_attention, FlexKernelOptions, create_block_mask
-from attn_gym.utils import benchmark_cuda_function_in_microseconds
+from torch.nn.attention.flex_attention import FlexKernelOptions, create_block_mask, flex_attention
+
 from attn_gym.masks import causal_mask
+from attn_gym.utils import benchmark_cuda_function_in_microseconds
 
 torch.compiler.config.force_disable_caches = True
 torch._functorch.config.donated_buffer = False
@@ -56,10 +57,8 @@ def parse_log_and_get_best_options(log_file: str) -> FlexKernelOptions:
         prefix = "fwd_" if kernel_type == "forward" else "bwd_"
 
         for key, value in best_choice.items():
-            if key not in ["type", "time"]:
-                # Ensure the key is valid for FlexKernelOptions
-                if key in FlexKernelOptions.__annotations__:
-                    best_options[f"{prefix}{key}"] = value
+            if key not in ["type", "time"] and key in FlexKernelOptions.__annotations__:
+                best_options[f"{prefix}{key}"] = value
     print("Best kernel options extracted from logs:")
     print(json.dumps(best_options, indent=2))
     return best_options

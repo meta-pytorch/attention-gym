@@ -19,9 +19,9 @@ def test_shared_prefix_matches_duplicated_causal_samples_cuda():
     device = "cuda"
 
     prefix_response_docs = [
-        (range(0, 3), range(3, 5)),
-        (range(0, 3), range(5, 7)),
-        (range(0, 3), range(7, 9)),
+        (range(3), range(3, 5)),
+        (range(3), range(5, 7)),
+        (range(3), range(7, 9)),
         (range(9, 12), range(12, 14)),
         (range(9, 12), range(14, 16)),
         (range(9, 12), range(16, 18)),

@@ -121,9 +121,9 @@ def chunked_forward(
     value = value * beta[..., None]
     beta_key = key * beta[..., None]
 
-    query, key, value, beta_key = map(
-        lambda tensor: tensor.reshape(batch, heads, chunk_count, chunk_size, tensor.shape[-1]),
-        (query, key, value, beta_key),
+    query, key, value, beta_key = (
+        tensor.reshape(batch, heads, chunk_count, chunk_size, tensor.shape[-1])
+        for tensor in (query, key, value, beta_key)
     )
     cumulative_decay = log_decay.reshape(batch, heads, chunk_count, chunk_size).cumsum(-1)
 

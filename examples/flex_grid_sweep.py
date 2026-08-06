@@ -21,16 +21,15 @@ Example score_mod configurations:
 """
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import torch
 from torch.nn.attention.flex_attention import FlexKernelOptions, create_block_mask, flex_attention
-from attn_gym.utils import benchmark_cuda_function_in_microseconds
 from tqdm import tqdm
 
-import warnings
+from attn_gym.utils import benchmark_cuda_function_in_microseconds
 
 warnings.filterwarnings("ignore", message=".*dynamo_pgo force disabled.*")
 warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
@@ -136,7 +135,7 @@ def generate_reduced_bwd_configs() -> list[FlexBwdConfig]:
 
 
 def config_to_kernel_options(
-    fwd_config: Optional[FlexConfig] = None, bwd_config: Optional[FlexBwdConfig] = None
+    fwd_config: FlexConfig | None = None, bwd_config: FlexBwdConfig | None = None
 ) -> FlexKernelOptions:
     """Convert config objects to FlexKernelOptions dict."""
     options: FlexKernelOptions = {}
@@ -202,7 +201,7 @@ def benchmark_fwd_config(
 
         return time_us, True
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  Failed: {e}")
         # Clean up on failure
         torch.cuda.empty_cache()
@@ -215,7 +214,7 @@ def benchmark_bwd_config(
     value: torch.Tensor,
     block_mask,
     bwd_config: FlexBwdConfig,
-    fwd_config: Optional[FlexConfig] = None,
+    fwd_config: FlexConfig | None = None,
     score_mod=None,
     warmup_iters: int = 3,
 ) -> tuple[float, bool]:
@@ -272,7 +271,7 @@ def benchmark_bwd_config(
 
         return time_us, True
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  Failed: {e}")
         # Clean up on failure
         query.grad = None
@@ -288,7 +287,7 @@ def sweep_forward_configs(
     value: torch.Tensor,
     block_mask,
     score_mod=None,
-    configs: Optional[list[FlexConfig]] = None,
+    configs: list[FlexConfig] | None = None,
 ) -> tuple[FlexConfig, float, list[dict]]:
     """
     Sweep all forward configs and find the best one.
@@ -340,8 +339,8 @@ def sweep_backward_configs(
     key: torch.Tensor,
     value: torch.Tensor,
     block_mask,
-    best_fwd_config: Optional[FlexConfig] = None,
-    configs: Optional[list[FlexBwdConfig]] = None,
+    best_fwd_config: FlexConfig | None = None,
+    configs: list[FlexBwdConfig] | None = None,
     use_reduced: bool = True,
     score_mod=None,
 ) -> tuple[FlexBwdConfig, float, list[dict]]:

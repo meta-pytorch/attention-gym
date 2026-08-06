@@ -1,4 +1,3 @@
-from torch import _TorchCompileAOTInductorWrapper, _TorchCompileInductorWrapper
 import argparse
 import warnings
 from contextlib import nullcontext
@@ -6,6 +5,7 @@ from pathlib import Path
 
 import torch
 from tabulate import tabulate
+from torch import _TorchCompileAOTInductorWrapper, _TorchCompileInductorWrapper
 from torch._dynamo.aot_compile import AOTCompiledModel, ModelInput, aot_compile_module
 from torch._dynamo.hooks import Hooks
 from torch.nn.attention.flex_attention import (
@@ -14,7 +14,6 @@ from torch.nn.attention.flex_attention import (
     create_block_mask,
     flex_attention,
 )
-
 
 warnings.filterwarnings(
     "ignore",

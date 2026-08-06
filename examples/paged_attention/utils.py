@@ -1,9 +1,9 @@
 import torch
-from torch.nn.attention.flex_attention import (
-    _identity,
-    BlockMask,
-)
 from paged_attention import PagedAttention
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    _identity,
+)
 
 
 def batch_reserve(paged_attention: PagedAttention, target_seq_len: torch.Tensor):

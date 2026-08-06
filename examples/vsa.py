@@ -1,7 +1,7 @@
 """Demonstrates Video Sparse Attention top-k tiles with FlexAttention."""
 
-from functools import partial
 import math
+from functools import partial
 from typing import Literal
 
 import torch

@@ -1,23 +1,22 @@
-import itertools
-from dataclasses import dataclass
-from typing import List
 import importlib
+import itertools
 import sys
+from dataclasses import dataclass
 
 import torch
 from tabulate import tabulate
+from torch.nn.attention.flex_attention import _mask_mod_signature, create_block_mask, noop_mask
 from tqdm import tqdm
+
 from attn_gym.masks import (
     causal_mask,
-    generate_sliding_window,
-    generate_prefix_lm_mask,
-    generate_doc_mask_mod,
     generate_dilated_sliding_window,
+    generate_doc_mask_mod,
+    generate_prefix_lm_mask,
+    generate_sliding_window,
 )
 from attn_gym.masks.causal import create_causal_block_mask_fast
 from attn_gym.masks.document_mask import generate_random_lengths, length_to_offsets
-
-from torch.nn.attention.flex_attention import create_block_mask, _mask_mod_signature, noop_mask
 
 has_nuggies = importlib.util.find_spec("transformer_nuggets")
 if not has_nuggies:
@@ -28,10 +27,10 @@ if not has_nuggies:
     # Exit if the dependency is missing
     sys.exit(1)
 
-from transformer_nuggets.utils import (  # noqa: E402
-    max_memory_usage,
-    cuda_memory_usage,
+from transformer_nuggets.utils import (
     benchmark_cuda_function_in_microseconds_triton,
+    cuda_memory_usage,
+    max_memory_usage,
 )
 
 device = torch.device("cuda")
@@ -92,11 +91,11 @@ def get_mask_mod(c: ExperimentConfig) -> _mask_mod_signature:
 
 
 def get_configs(
-    mask_types: List[str] | None,
-    batch_sizes: List[int],
-    num_heads: List[int],
-    seq_lens: List[int],
-) -> List[ExperimentConfig]:
+    mask_types: list[str] | None,
+    batch_sizes: list[int],
+    num_heads: list[int],
+    seq_lens: list[int],
+) -> list[ExperimentConfig]:
     # Map string names to mask functions
     all_available_masks = list(FUNCTION_BASED_CREATORS.keys()) + list(CUSTOM_CREATORS.keys())
 
@@ -187,7 +186,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
 
 
-def print_results(experiments: List[Experiment]):
+def print_results(experiments: list[Experiment]):
     headers = [
         "B",
         "H",
@@ -218,10 +217,10 @@ def print_results(experiments: List[Experiment]):
 
 
 def main(
-    mask_types: List[str] | None = None,
-    batch_sizes: List[int] | None = None,
-    num_heads: List[int] | None = None,
-    seq_lens: List[int] | None = None,
+    mask_types: list[str] | None = None,
+    batch_sizes: list[int] | None = None,
+    num_heads: list[int] | None = None,
+    seq_lens: list[int] | None = None,
 ):
     """
     Run block mask benchmarks.
@@ -252,7 +251,7 @@ def main(
         try:
             result = run_experiment(config)
             results.append(Experiment(config=config, result=result))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Failed to run config {config}: {e}")
 
     print_results(results)

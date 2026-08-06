@@ -15,7 +15,6 @@ import torch.distributed as dist
 from torch._dynamo import config as dynamo_config
 from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
 
-
 dynamo_config.skip_guards_on_constant_func_defaults = False
 
 LN2 = math.log(2)

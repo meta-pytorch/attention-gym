@@ -22,19 +22,19 @@ We empirically observe that the max batch size to serve is 2448, which is 76x of
 max batch size without paged attention.
 """
 
-import torch
-from torch.nn.attention.flex_attention import (
-    _identity,
-    BlockMask,
-    create_block_mask,
-)
-from datasets import load_dataset
 import random
 from collections import deque
-from typing import Tuple
-from utils import gen_offset, slice_block_mask
+
+import torch
+from datasets import load_dataset
 from model import PagedAttentionLayer
 from paged_attention import PagedAttention
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    _identity,
+    create_block_mask,
+)
+from utils import gen_offset, slice_block_mask
 
 create_block_mask = torch.compile(create_block_mask)
 
@@ -85,7 +85,7 @@ class Server:
         # assume we know prompt length and response length in advance.
         self.request_queue.append((prompt_len, response_len))
 
-    def can_schedule(self, request: Tuple[int, int]) -> bool:
+    def can_schedule(self, request: tuple[int, int]) -> bool:
         return len(self.paged_attention.empty_pages) * self.paged_attention.page_size >= sum(
             request
         )

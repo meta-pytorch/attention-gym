@@ -1,9 +1,8 @@
 """Generates a NATTEN mask"""
 
 import torch
-from torch import IntTensor, BoolTensor
+from torch import BoolTensor, IntTensor
 from torch.nn.attention.flex_attention import _mask_mod_signature
-from typing import Tuple
 
 
 def generate_natten(
@@ -20,7 +19,7 @@ def generate_natten(
         kernel_h: The height of the kernel.
     """
 
-    def get_x_y(idx: IntTensor) -> Tuple[IntTensor, IntTensor]:
+    def get_x_y(idx: IntTensor) -> tuple[IntTensor, IntTensor]:
         return idx // canvas_w, idx % canvas_w
 
     def natten_mask_mod(
@@ -61,7 +60,7 @@ def generate_tiled_natten(
         T_H: The height of the tile.
     """
 
-    def get_x_y_tiled(idx: IntTensor) -> Tuple[IntTensor, IntTensor]:
+    def get_x_y_tiled(idx: IntTensor) -> tuple[IntTensor, IntTensor]:
         """
         Map 1-D index to 2-D coordinates for static tiles of T_H x T_W.
         """

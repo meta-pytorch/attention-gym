@@ -2,21 +2,21 @@ import csv
 import gc
 import itertools
 import random
+import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial, wraps
-from typing import Callable, Optional, Union, Literal
-
-from jsonargparse import CLI
+from typing import Literal
 
 import numpy as np
-from tabulate import tabulate
-from tqdm import tqdm
-
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend, activate_flash_attention_impl
+from jsonargparse import CLI
+from tabulate import tabulate
+from torch._inductor.runtime.benchmarking import benchmarker
+from torch.nn.attention import SDPBackend, activate_flash_attention_impl, sdpa_kernel
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask,
@@ -24,9 +24,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
     noop_mask,
 )
-from torch._inductor.runtime.benchmarking import benchmarker
-
-import warnings
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore", message=".*dynamo_pgo force disabled.*")
 warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
@@ -52,7 +50,7 @@ def safe_backend(backend_name=None):
             except torch.OutOfMemoryError:
                 print(f"[SKIP] OOM for {backend_name or func.__name__} with shape {config.shape}")
                 cleanup_memory()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(
                     f"[SKIP] Error for {backend_name or func.__name__} with shape {config.shape}: {e}"
                 )
@@ -128,12 +126,12 @@ class Times:
 @dataclass(frozen=True)
 class ExperimentResults:
     fwd_time: float
-    bwd_time: Optional[float]
-    sparsity: Optional[float] = None
-    fwd_tflops: Optional[float] = None
-    fwd_bandwidth: Optional[float] = None
-    bwd_tflops: Optional[float] = None
-    bwd_bandwidth: Optional[float] = None
+    bwd_time: float | None
+    sparsity: float | None = None
+    fwd_tflops: float | None = None
+    fwd_bandwidth: float | None = None
+    bwd_tflops: float | None = None
+    bwd_bandwidth: float | None = None
 
 
 @dataclass(frozen=True)
@@ -192,11 +190,9 @@ def generate_jagged_inputs(
     value: torch.Tensor,
     offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    B, Hq, M, Hkv, N, D = shape
+    _B, _Hq, _M, _Hkv, _N, _D = shape
 
-    def offsets_to_lengths(
-        offsets: torch.Tensor, device: Union[str, torch.device]
-    ) -> torch.Tensor:
+    def offsets_to_lengths(offsets: torch.Tensor, device: str | torch.device) -> torch.Tensor:
         """Converts a list of offsets to a list of lengths. Reverse op of attn_gym.masks.document_mask.length_to_offsets
 
         Args:
@@ -234,7 +230,7 @@ def query_key_value_clones(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Clones the query, key, and value tensors and moves them to the specified dtype."""
     if dtype is None:
@@ -252,8 +248,8 @@ def run_single_backend_sdpa(
     key: torch.Tensor,
     value: torch.Tensor,
     out_compile: torch.Tensor,
-    score_mod: Optional[Callable],
-    block_mask: Optional[BlockMask],
+    score_mod: Callable | None,
+    block_mask: BlockMask | None,
     mask_kwargs: dict,
     backend: Backend,
 ) -> ExperimentResults:
@@ -285,7 +281,7 @@ def run_single_backend_sdpa(
         if config.calculate_bwd_time:
             out_eager = eager_sdpa(q_eager, k_eager, v_eager)
             # TODO: debug backward pass for njt
-            if not config.attn_type == "document_mask":
+            if config.attn_type != "document_mask":
                 d_out = torch.randn_like(out_eager.transpose(1, 2)).transpose(1, 2)
                 backward_eager_time = benchmark_torch_function_in_microseconds(
                     out_eager.backward, d_out, retain_graph=True
@@ -307,8 +303,8 @@ def run_single_backend_FA(
     key: torch.Tensor,
     value: torch.Tensor,
     out_compile: torch.Tensor,
-    score_mod: Optional[Callable],
-    block_mask: Optional[BlockMask],
+    score_mod: Callable | None,
+    block_mask: BlockMask | None,
     mask_kwargs: dict,
     backend: Backend,
 ) -> ExperimentResults:
@@ -359,9 +355,9 @@ def run_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    score_mod: Optional[Callable],
-    block_mask: Optional[BlockMask],
-    kernel_options: Optional[dict] = None,
+    score_mod: Callable | None,
+    block_mask: BlockMask | None,
+    kernel_options: dict | None = None,
     dynamic: bool = False,
     max_autotune: bool = False,
 ) -> ExperimentResults:
@@ -400,7 +396,7 @@ def run_flex_attention(
             backward_compile_time = benchmark_torch_function_in_microseconds(
                 out_compile.backward, d_out, retain_graph=True
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[SKIP] Backward pass failed for flex_attention with shape {config.shape}: {e}")
             cleanup_memory()
             backward_compile_time = float("nan")
@@ -420,7 +416,7 @@ def run_single_experiment(
     config: ExperimentConfig,
     dynamic=False,
     max_autotune=False,
-    kernel_options_override: Optional[dict] = None,
+    kernel_options_override: dict | None = None,
     block_q: int | None = None,
     block_kv: int | None = None,
 ) -> dict[str, ExperimentResults]:
@@ -462,7 +458,7 @@ def run_single_experiment(
             "global",
         }
         if isinstance(kernel_options_override, dict) and any(
-            k in attn_keys for k in kernel_options_override.keys()
+            k in attn_keys for k in kernel_options_override
         ):
             selected_override = kernel_options_override.get(
                 config.attn_type, kernel_options_override.get("global")
@@ -539,7 +535,7 @@ def run_single_experiment(
             backward_compile_time = benchmark_torch_function_in_microseconds(
                 out_compile.backward, d_out, retain_graph=True
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(
                 f"[SKIP] Backward pass failed for {config.attn_type} with shape {config.shape}: {e}"
             )
@@ -641,7 +637,7 @@ def calculate_bandwidth(
 def calculate_tflops(
     config: ExperimentConfig, results: ExperimentResults, type: SpeedupType
 ) -> float:
-    (B, Hq, M, Hkv, N, D) = config.shape
+    (B, Hq, M, _Hkv, N, D) = config.shape
     sparsity = results.sparsity if results.sparsity is not None else 0.0
 
     # Forward pass FLOPs
@@ -726,7 +722,7 @@ def get_average_speedups(
 
 
 def print_results(
-    results: list[Experiment], save_path: Optional[str] = None, show_speedups: bool = False
+    results: list[Experiment], save_path: str | None = None, show_speedups: bool = False
 ):
     table_data = defaultdict(list)
 
@@ -818,8 +814,8 @@ dropout_p = 0.0
 
 def generate_score_mod(
     attn_type: AttentionType, shape: tuple[int, int, int, int, int, int]
-) -> Optional[Callable]:
-    B, Hq, M, Hkv, N, D = shape
+) -> Callable | None:
+    _B, Hq, M, _Hkv, N, _D = shape
     is_decoding = M == 1
     from attn_gym.mods import generate_alibi_bias, generate_tanh_softcap
 
@@ -866,7 +862,7 @@ def generate_block_mask(
     block_q: int | None = None,
     block_kv: int | None = None,
 ) -> tuple[BlockMask, dict]:
-    B, Hq, M, Hkv, N, D = shape
+    B, _Hq, M, _Hkv, N, _D = shape
     is_decoding = M == 1
 
     def causal(b, h, m, n):
@@ -902,7 +898,7 @@ def generate_block_mask(
     if attn_type == "document_mask":
         random.seed(0)
         lengths = generate_random_lengths(N * B, B)
-        mask_mod_kwargs = dict(offsets=length_to_offsets(lengths, "cuda"))
+        mask_mod_kwargs = {"offsets": length_to_offsets(lengths, "cuda")}
 
     mask_mod_dict = {
         "noop": None,
@@ -948,8 +944,8 @@ def generate_block_mask(
 
 def get_kernel_options(
     attn_type: AttentionType, shape: tuple[int, int, int, int, int, int]
-) -> Optional[dict]:
-    B, Hq, M, Hkv, N, D = shape
+) -> dict | None:
+    B, _Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
     kernel_opt_training_dict = {
         "noop": None,
@@ -1039,7 +1035,7 @@ def generate_FA_callable(
     dtype: torch.dtype,
     backend: Backend,
     **kwargs,
-) -> Optional[Callable]:
+) -> Callable | None:
     if dtype not in [torch.float16, torch.bfloat16]:
         return None
     if backend == "fav2":
@@ -1069,20 +1065,18 @@ def generate_FA_callable(
         print("Unknown backend " + backend)
         return None
 
-    B, Hq, M, Hkv, N, D = shape
+    _B, Hq, _M, _Hkv, _N, _D = shape
 
     FA_kwargs = {}
     if attn_type == "alibi":
         h = torch.arange(Hq, dtype=torch.float32, device="cuda")
         alibi_slopes = torch.exp2(-((h + 1) * 8.0 / Hq))
-        FA_kwargs = dict(alibi_slopes=alibi_slopes)
+        FA_kwargs = {"alibi_slopes": alibi_slopes}
     elif attn_type == "document_mask":
         FA_kwargs["cu_seqlens_q"] = kwargs["offsets"].to(torch.int32)
         FA_kwargs["cu_seqlens_k"] = kwargs["offsets"].to(torch.int32)
 
-        def offsets_to_lengths(
-            offsets: torch.Tensor, device: Union[str, torch.device]
-        ) -> torch.Tensor:
+        def offsets_to_lengths(offsets: torch.Tensor, device: str | torch.device) -> torch.Tensor:
             lengths = offsets[1:] - offsets[:-1]
             return lengths
 
@@ -1110,7 +1104,7 @@ def generate_FA_callable(
 
 def generate_FD_callable(
     attn_type: AttentionType, shape: tuple[int, int, int, int, int, int], dtype: torch.dtype
-) -> Optional[Callable]:
+) -> Callable | None:
     if dtype not in [torch.float16, torch.bfloat16]:
         return None
     try:
@@ -1119,7 +1113,7 @@ def generate_FD_callable(
         print("Flash attention 2 is not installed. Please install it to run fakv backend. ")
         raise
 
-    B, Hq, M, Hkv, N, D = shape
+    _B, Hq, M, _Hkv, N, _D = shape
 
     assert M == 1
 
@@ -1130,7 +1124,7 @@ def generate_FD_callable(
     if attn_type == "alibi":
         h = torch.arange(Hq, dtype=torch.float32, device="cuda")
         alibi_slopes = torch.exp2(-((h + 1) * 8.0 / Hq))
-        FA_kwargs = dict(alibi_slopes=alibi_slopes)
+        FA_kwargs = {"alibi_slopes": alibi_slopes}
 
     FD_dict = {
         "noop": partial(flash_attn_with_kvcache_renamed, causal=False),
@@ -1156,7 +1150,7 @@ def generate_attn_mask_linear_score_mod(
     block_mask: BlockMask,
     score_mod: Callable,
     dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     B, Hq, M, N = shape
     if block_mask is None and score_mod is None:
         return None
@@ -1182,11 +1176,11 @@ def generate_eager_sdpa(
     attn_type: AttentionType,
     shape: tuple[int, int, int, int, int, int],
     dtype: torch.dtype,
-    block_mask: Optional[BlockMask],
-    score_mod: Optional[Callable] = None,
+    block_mask: BlockMask | None,
+    score_mod: Callable | None = None,
     **kwargs,
-) -> Optional[Callable]:
-    B, Hq, M, Hkv, N, D = shape
+) -> Callable | None:
+    _B, Hq, M, Hkv, N, _D = shape
     is_decoding = M == 1
     if attn_type == "sliding_window" or attn_type == "prefix_lm":
         assert block_mask is not None
@@ -1246,7 +1240,7 @@ def generate_experiment_configs(
     head_dims: list[int],
     score_mods_str: list[AttentionType],
     decoding: bool,
-    kv_cache_size: Optional[list[int]],
+    kv_cache_size: list[int] | None,
     cal_bandwidth: bool,
     backends: list[Backend],
 ) -> list[ExperimentConfig]:
@@ -1265,7 +1259,7 @@ def generate_experiment_configs(
         (q_seq_len, kv_seq_len),
         head_dim,
         attn_type,
-        dtype,
+        torch_dtype,
     ) in itertools.product(
         kv_cache_size if kv_cache_size else batch_sizes,
         num_heads,
@@ -1275,7 +1269,7 @@ def generate_experiment_configs(
         dtypes,
     ):
         if kv_cache_size:
-            head_size_bytes = torch.finfo(dtype).bits / 8 * head_dim
+            head_size_bytes = torch.finfo(torch_dtype).bits / 8 * head_dim
             bsz = int((bsz * 1024 * 1024) // (kv_heads * kv_seq_len * head_size_bytes * 2))
             if bsz <= 0:
                 continue
@@ -1286,7 +1280,7 @@ def generate_experiment_configs(
             ExperimentConfig(
                 shape=(bsz, q_heads, q_seq_len, kv_heads, kv_seq_len, head_dim),
                 attn_type=attn_type,
-                dtype=dtype,
+                dtype=torch_dtype,
                 calculate_bwd_time=calculate_bwd,
                 cal_bandwidth=cal_bandwidth,
                 backends=backends,
@@ -1308,19 +1302,19 @@ def main(
     dynamic: bool = False,
     calculate_bwd: bool = False,
     dtype: DtypeString = "bfloat16",
-    b: list[int] = [2, 8, 16],
-    nh: list[str] = ["16,16", "16,2"],
-    s: list[int] = [512, 1024, 4096],
-    d: list[int] = [64, 128],
-    mods: list[AttentionType] = ["noop", "causal", "alibi", "sliding_window"],
-    backend: list[Backend] = ["efficient"],
+    b: list[int] | None = None,
+    nh: list[str] | None = None,
+    s: list[int] | None = None,
+    d: list[int] | None = None,
+    mods: list[AttentionType] | None = None,
+    backend: list[Backend] | None = None,
     max_autotune: bool = False,
     decoding: bool = False,
-    kv_size: Optional[list[int]] = None,
+    kv_size: list[int] | None = None,
     throughput: bool = True,
     show_speedups: bool = False,
-    save_path: Optional[str] = None,
-    kernel_options: Optional[dict] = None,
+    save_path: str | None = None,
+    kernel_options: dict | None = None,
     block_q: int | None = None,
     block_kv: int | None = None,
 ) -> None:
@@ -1370,6 +1364,18 @@ def main(
     # Convert dtype string to torch dtype
     import torch
 
+    if backend is None:
+        backend = ["efficient"]
+    if mods is None:
+        mods = ["noop", "causal", "alibi", "sliding_window"]
+    if d is None:
+        d = [64, 128]
+    if s is None:
+        s = [512, 1024, 4096]
+    if nh is None:
+        nh = ["16,16", "16,2"]
+    if b is None:
+        b = [2, 8, 16]
     dtype = getattr(torch, dtype)
 
     # Parse head configurations
@@ -1382,21 +1388,23 @@ def main(
     np.random.seed(seed)
     torch.manual_seed(seed)
     results = []
-    experiment_count = 0
-    for exp_config in tqdm(
-        generate_experiment_configs(
-            calculate_bwd,
-            dtype,
-            b,
-            nh_parsed,
-            s,
-            d,
-            mods,
-            decoding,
-            kv_size,
-            throughput,
-            backend,
-        )
+    for experiment_count, exp_config in enumerate(
+        tqdm(
+            generate_experiment_configs(
+                calculate_bwd,
+                dtype,
+                b,
+                nh_parsed,
+                s,
+                d,
+                mods,
+                decoding,
+                kv_size,
+                throughput,
+                backend,
+            )
+        ),
+        start=1,
     ):
         experiment_result = run_single_experiment(
             exp_config,
@@ -1408,7 +1416,6 @@ def main(
         )
         results.append(Experiment(exp_config, experiment_result))
 
-        experiment_count += 1
         # Periodic memory cleanup every 10 experiments
         if experiment_count % 10 == 0:
             cleanup_memory()

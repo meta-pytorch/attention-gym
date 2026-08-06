@@ -90,7 +90,7 @@ def main(device: str = "cpu"):
 
     for response_slice in response_slices:
         split_out = split_prefix_response_attention(q, k, v, prefix_slice, response_slice)
-        duplicated_indices = list(range(0, 3)) + list(
+        duplicated_indices = list(range(3)) + list(
             range(response_slice.start, response_slice.stop)
         )
         duplicated_out = duplicated_causal_attention(q, k, v, duplicated_indices)

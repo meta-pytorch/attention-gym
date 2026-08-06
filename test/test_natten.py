@@ -1,7 +1,8 @@
-import torch
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import pytest
-from attn_gym.masks import generate_natten, generate_tiled_natten, generate_morton_natten
+import torch
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+from attn_gym.masks import generate_morton_natten, generate_natten, generate_tiled_natten
 from attn_gym.masks.natten import morton_decode, morton_encode
 
 

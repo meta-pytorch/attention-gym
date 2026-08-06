@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
 
 from attn_gym.masks.causal import causal_mask

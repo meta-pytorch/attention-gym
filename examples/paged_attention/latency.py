@@ -6,13 +6,12 @@ Command:
 """
 
 import torch
+from torch._inductor.runtime.benchmarking import benchmarker
 from torch.nn.attention.flex_attention import (
     create_block_mask,
     noop_mask,
 )
-from torch._inductor.runtime.benchmarking import benchmarker
-
-from utils import random_init_paged_attention, gen_offset, generate_score_mod
+from utils import gen_offset, generate_score_mod, random_init_paged_attention
 
 dtype = torch.bfloat16
 

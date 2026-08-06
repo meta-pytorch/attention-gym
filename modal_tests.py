@@ -37,8 +37,10 @@ def format_pytest_summary(report_path: Path) -> str:
     lines = [
         "## B200 pytest summary",
         "",
-        f"**{passed} passed, {failures} failed, {errors} errors, {skipped} skipped** "
-        f"in {duration:.2f}s.",
+        (
+            f"**{passed} passed, {failures} failed, {errors} errors, {skipped} skipped** "
+            f"in {duration:.2f}s."
+        ),
     ]
 
     failed_tests = []
@@ -67,6 +69,7 @@ def run_pytest() -> tuple[int, str]:
     result = subprocess.run(
         ["python", "-m", "pytest", "test", "-ra", "--tb=short", f"--junitxml={report_path}"],
         cwd="/root",
+        check=False,
     )
     return result.returncode, format_pytest_summary(report_path)
 

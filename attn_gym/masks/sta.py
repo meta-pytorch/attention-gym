@@ -1,15 +1,14 @@
 """Generates a STA mask"""
 
 import torch
-from torch import IntTensor, BoolTensor
+from torch import BoolTensor, IntTensor
 from torch.nn.attention.flex_attention import _mask_mod_signature
-from typing import Tuple
 
 
 def generate_sta_mask_mod_2d(
-    canvas_hw: Tuple[int, int],
-    kernel_hw: Tuple[int, int],
-    tile_hw: Tuple[int, int],
+    canvas_hw: tuple[int, int],
+    kernel_hw: tuple[int, int],
+    tile_hw: tuple[int, int],
     text_seq_len: int = 0,
 ) -> _mask_mod_signature:
     """Generates a 2D STA mask with a given kernel size.
@@ -40,13 +39,13 @@ def generate_sta_mask_mod_2d(
     kernel_tile_h, kernel_tile_w = kernel_h // tile_h, kernel_w // tile_w
     vision_seq_len = canvas_h * canvas_w
 
-    def get_h_w_idx_tiled(idx: IntTensor) -> Tuple[IntTensor, IntTensor]:
+    def get_h_w_idx_tiled(idx: IntTensor) -> tuple[IntTensor, IntTensor]:
         tile_id = idx // tile_numel
         tile_h_idx = tile_id // canvas_tile_w
         tile_w_idx = tile_id % canvas_tile_w
         return tile_h_idx, tile_w_idx
 
-    def get_border(kernel_size: IntTensor) -> Tuple[IntTensor, IntTensor]:
+    def get_border(kernel_size: IntTensor) -> tuple[IntTensor, IntTensor]:
         left_border = kernel_size // 2
         right_border = kernel_size // 2 + (kernel_size % 2 - 1)
         return left_border, right_border
@@ -85,9 +84,9 @@ def generate_sta_mask_mod_2d(
 
 
 def generate_sta_mask_mod_3d(
-    canvas_twh: Tuple[int, int, int],
-    kernel_twh: Tuple[int, int, int],
-    tile_twh: Tuple[int, int, int],
+    canvas_twh: tuple[int, int, int],
+    kernel_twh: tuple[int, int, int],
+    tile_twh: tuple[int, int, int],
     text_seq_len: int = 0,
 ) -> _mask_mod_signature:
     """Generates a 3D STA mask with a given kernel size.
@@ -128,14 +127,14 @@ def generate_sta_mask_mod_3d(
     )
     vision_seq_len = canvas_t * canvas_h * canvas_w
 
-    def get_t_h_w_idx_tiled(idx: IntTensor) -> Tuple[IntTensor, IntTensor, IntTensor]:
+    def get_t_h_w_idx_tiled(idx: IntTensor) -> tuple[IntTensor, IntTensor, IntTensor]:
         tile_id = idx // tile_numel
         tile_t_idx = tile_id // (canvas_tile_h * canvas_tile_w)
         tile_h_idx = (tile_id % (canvas_tile_h * canvas_tile_w)) // canvas_tile_w
         tile_w_idx = tile_id % canvas_tile_w
         return tile_t_idx, tile_h_idx, tile_w_idx
 
-    def get_border(kernel_size: IntTensor) -> Tuple[IntTensor, IntTensor]:
+    def get_border(kernel_size: IntTensor) -> tuple[IntTensor, IntTensor]:
         left_border = kernel_size // 2
         right_border = kernel_size // 2 + (kernel_size % 2 - 1)
         return left_border, right_border
