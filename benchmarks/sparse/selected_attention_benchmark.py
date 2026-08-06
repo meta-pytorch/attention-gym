@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--share-kv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backend", nargs="+", default=["triton"], choices=["eager", "triton"])
-    parser.add_argument("--calculate-bwd", action="store_true")
+    parser.add_argument("--calculate-bwd", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=int, default=100, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=500, help="Measurement duration in ms")
     parser.add_argument("--seed", type=int, default=123)
@@ -104,16 +104,23 @@ def main() -> None:
             args, requires_grad=requires_grad
         )
 
-        def fwd():
+        def fwd(
+            _query=query,
+            _local_kv=local_kv,
+            _sparse_kv=sparse_kv,
+            _kv_indices=kv_indices,
+            _attention_sink=attention_sink,
+            _backend=backend,
+        ):
             return selected_attention(
-                query,
-                local_kv,
-                sparse_kv,
-                kv_indices,
-                attention_sink,
+                _query,
+                _local_kv,
+                _sparse_kv,
+                _kv_indices,
+                _attention_sink,
                 None,
                 args.window,
-                backend=backend,
+                backend=_backend,
             )
 
         out = fwd()
@@ -127,11 +134,18 @@ def main() -> None:
         if args.calculate_bwd:
             grad_output = torch.randn_like(out)
 
-            def bwd():
+            def bwd(
+                _out=out,
+                _query=query,
+                _local_kv=local_kv,
+                _sparse_kv=sparse_kv,
+                _attention_sink=attention_sink,
+                _grad_output=grad_output,
+            ):
                 return torch.autograd.grad(
-                    out,
-                    (query, local_kv, sparse_kv, attention_sink),
-                    grad_outputs=grad_output,
+                    _out,
+                    (_query, _local_kv, _sparse_kv, _attention_sink),
+                    grad_outputs=_grad_output,
                     retain_graph=True,
                 )
 
@@ -152,13 +166,20 @@ def main() -> None:
         for backend in args.backend:
             query, local_kv, sparse_kv, kv_indices, attention_sink = make_inputs(args)
 
-            def fwd(b=backend):
+            def fwd(
+                b=backend,
+                _query=query,
+                _local_kv=local_kv,
+                _sparse_kv=sparse_kv,
+                _kv_indices=kv_indices,
+                _attention_sink=attention_sink,
+            ):
                 return selected_attention(
-                    query,
-                    local_kv,
-                    sparse_kv,
-                    kv_indices,
-                    attention_sink,
+                    _query,
+                    _local_kv,
+                    _sparse_kv,
+                    _kv_indices,
+                    _attention_sink,
                     None,
                     args.window,
                     backend=b,
