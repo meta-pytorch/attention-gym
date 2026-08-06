@@ -196,6 +196,7 @@ attn_gym/
   _backends/                     # Private infrastructure shared across attention variants
     triton/
       autotune.py                # Reusable Triton tuning and configuration machinery
+      indexing.py                # Compile-time strided pointer indexing helpers
       tensor_checks.py           # Triton-specific device, dtype, layout, and shape checks
     cute/
       compilation.py             # Reusable CuTeDSL compilation and caching machinery

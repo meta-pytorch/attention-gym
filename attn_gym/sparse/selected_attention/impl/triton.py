@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.triton.indexing import ptr_offset
 from attn_gym._backends.triton.tensor_checks import can_use_tma
 
 
@@ -23,10 +24,10 @@ def _load_bhsd(
     """Load a tile from a tensor in batch-head-sequence-dimension order."""
     return tl.load(
         tensor_ptr
-        + batch * strides[0]
-        + head * strides[1]
-        + positions[:, None] * strides[2]
-        + offsets_d[None, :] * strides[3],
+        + ptr_offset(
+            (batch, head, positions[:, None], offsets_d[None, :]),
+            strides,
+        ),
         mask=mask,
         other=0.0,
     )
@@ -43,7 +44,7 @@ def _load_bs(
 ):
     """Load positions from a tensor in batch-sequence order."""
     return tl.load(
-        tensor_ptr + batch * strides[0] + positions * strides[1],
+        tensor_ptr + ptr_offset((batch, positions), strides),
         mask=mask,
         other=other,
     )
@@ -63,13 +64,26 @@ def _store_bhsd(
     """Store a tile to a tensor in batch-head-sequence-dimension order."""
     tl.store(
         tensor_ptr
-        + batch * strides[0]
-        + head * strides[1]
-        + positions[:, None] * strides[2]
-        + offsets_d[None, :] * strides[3],
+        + ptr_offset(
+            (batch, head, positions[:, None], offsets_d[None, :]),
+            strides,
+        ),
         value,
         mask=mask,
     )
+
+
+@triton.jit
+def _merge_attention_tile(accumulator, running_max, running_sum, logits, values):
+    """Merge a tile while keeping online-softmax state and accumulation in FP32."""
+    tile_max = tl.max(logits, axis=1)
+    new_max = tl.maximum(running_max, tile_max)
+    alpha = tl.exp(running_max - new_max)
+    probabilities = tl.exp(logits - new_max[:, None])
+    accumulator *= alpha[:, None]
+    accumulator += tl.dot(probabilities.to(values.dtype), values, input_precision="tf32x3")
+    running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
+    return accumulator, new_max, running_sum
 
 
 @triton.jit
@@ -188,16 +202,9 @@ def _selected_attention_fwd(
             causal_window_mask = causal_window_mask & doc_mask
 
         logits = tl.where(causal_window_mask, logits, -float("inf"))
-        tile_max = tl.max(logits, axis=1)
-        new_max = tl.maximum(running_max, tile_max)
-        alpha = tl.exp(running_max - new_max)
-        probabilities = tl.exp(logits - new_max[:, None])
-        accumulator *= alpha[:, None]
-        accumulator += tl.dot(
-            probabilities.to(local_values.dtype), local_values, input_precision="tf32x3"
+        accumulator, running_max, running_sum = _merge_attention_tile(
+            accumulator, running_max, running_sum, logits, local_values
         )
-        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
-        running_max = new_max
 
     output = accumulator / running_sum[:, None]
     _store_bhsd(
@@ -214,6 +221,141 @@ def _selected_attention_fwd(
         lse_ptr + batch * LSE_STRIDES[0] + head * LSE_STRIDES[1] + offsets_m * LSE_STRIDES[2],
         running_max + tl.log(running_sum),
         mask=query_mask,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
+        for block_n in (64, 128, 256)
+        for num_warps in (4, 8)
+    ],
+    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    cache_results=True,
+)
+@triton.jit
+def _selected_attention_fwd_shared(
+    query_ptr,
+    sparse_kv_ptr,
+    local_kv_ptr,
+    kv_indices_ptr,
+    doc_ids_ptr,
+    attention_sink_ptr,
+    output_ptr,
+    lse_ptr,
+    QUERY_STRIDES: tl.constexpr,
+    SPARSE_KV_STRIDES: tl.constexpr,
+    LOCAL_KV_STRIDES: tl.constexpr,
+    KV_INDICES_STRIDES: tl.constexpr,
+    DOC_IDS_STRIDES: tl.constexpr,
+    LSE_STRIDES: tl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    SPARSE_SEQ_LEN: tl.constexpr,
+    TOPK: tl.constexpr,
+    WINDOW: tl.constexpr,
+    SCALE: tl.constexpr,
+    HAS_DOC_IDS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Process one sequence position across heads to reuse shared KV tiles."""
+    sequence = tl.program_id(0)
+    batch = tl.program_id(1)
+    head_block = tl.program_id(2)
+
+    offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offsets_d = tl.arange(0, BLOCK_D)
+    head_mask = offsets_h < H
+    dimension_mask = offsets_d < D
+
+    query = tl.load(
+        query_ptr
+        + ptr_offset(
+            (batch, offsets_h[:, None], sequence, offsets_d[None, :]),
+            QUERY_STRIDES,
+        ),
+        mask=head_mask[:, None] & dimension_mask[None, :],
+        other=0.0,
+    )
+    sink = tl.load(attention_sink_ptr + offsets_h, mask=head_mask, other=0.0).to(tl.float32)
+    running_max = sink
+    running_sum = tl.full((BLOCK_H,), 1.0, tl.float32)
+    accumulator = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
+
+    if TOPK:
+        offsets_k = tl.arange(0, BLOCK_K)
+        selected_idx = tl.load(
+            kv_indices_ptr + ptr_offset((batch, sequence, offsets_k), KV_INDICES_STRIDES),
+            mask=offsets_k < TOPK,
+            other=-1,
+        )
+        selected_valid = (offsets_k < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+        selected_idx = tl.where(selected_valid, selected_idx, 0)
+        sparse_values = tl.load(
+            sparse_kv_ptr
+            + ptr_offset(
+                (batch, 0, selected_idx[:, None], offsets_d[None, :]),
+                SPARSE_KV_STRIDES,
+            ),
+            mask=selected_valid[:, None] & dimension_mask[None, :],
+            other=0.0,
+        )
+        logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
+        logits = tl.where(head_mask[:, None] & selected_valid[None, :], logits, -float("inf"))
+        accumulator, running_max, running_sum = _merge_attention_tile(
+            accumulator, running_max, running_sum, logits, sparse_values
+        )
+
+    if HAS_DOC_IDS:
+        query_doc_id = tl.load(doc_ids_ptr + ptr_offset((batch, sequence), DOC_IDS_STRIDES))
+
+    offsets_n_base = tl.arange(0, BLOCK_N)
+    first_local_position = sequence - WINDOW + 1
+    num_local_tiles: tl.constexpr = tl.cdiv(WINDOW, BLOCK_N)
+    for local_tile in tl.static_range(0, num_local_tiles):
+        offsets_n = first_local_position + local_tile * BLOCK_N + offsets_n_base
+        local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
+        local_values = tl.load(
+            local_kv_ptr
+            + ptr_offset(
+                (batch, 0, offsets_n[:, None], offsets_d[None, :]),
+                LOCAL_KV_STRIDES,
+            ),
+            mask=local_valid[:, None] & dimension_mask[None, :],
+            other=0.0,
+        )
+        if HAS_DOC_IDS:
+            key_doc_ids = tl.load(
+                doc_ids_ptr + ptr_offset((batch, offsets_n), DOC_IDS_STRIDES),
+                mask=local_valid,
+                other=-1,
+            )
+            local_valid &= key_doc_ids == query_doc_id
+
+        logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
+        logits = tl.where(head_mask[:, None] & local_valid[None, :], logits, -float("inf"))
+        accumulator, running_max, running_sum = _merge_attention_tile(
+            accumulator, running_max, running_sum, logits, local_values
+        )
+
+    tl.store(
+        output_ptr
+        + ptr_offset(
+            (batch, offsets_h[:, None], sequence, offsets_d[None, :]),
+            QUERY_STRIDES,
+        ),
+        accumulator / running_sum[:, None],
+        mask=head_mask[:, None] & dimension_mask[None, :],
+    )
+    tl.store(
+        lse_ptr + ptr_offset((batch, offsets_h, sequence), LSE_STRIDES),
+        running_max + tl.log(running_sum),
+        mask=head_mask,
     )
 
 
@@ -326,16 +468,9 @@ def _selected_attention_fwd_tma(
             valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
 
         logits = tl.where(valid, logits, -float("inf"))
-        tile_max = tl.max(logits, axis=1)
-        new_max = tl.maximum(running_max, tile_max)
-        alpha = tl.exp(running_max - new_max)
-        probabilities = tl.exp(logits - new_max[:, None])
-        accumulator *= alpha[:, None]
-        accumulator += tl.dot(
-            probabilities.to(local_values.dtype), local_values, input_precision="tf32x3"
+        accumulator, running_max, running_sum = _merge_attention_tile(
+            accumulator, running_max, running_sum, logits, local_values
         )
-        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
-        running_max = new_max
 
     output_desc.store(
         [batch, head, query_block * BLOCK_M, 0],
@@ -867,22 +1002,66 @@ def _launch_forward(
     batch, heads, seq_len, head_dim = query.shape
     topk = kv_indices.shape[-1]
     sparse_seq_len = sparse_kv.shape[2]
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    output = torch.empty_like(query)
+    lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
+    has_doc_ids = doc_ids is not None
+    doc_ids = query if doc_ids is None else doc_ids
+
+    # This head-major schedule is tuned for shared KV on Blackwell.
+    if (
+        torch.cuda.get_device_capability(query.device)[0] >= 10
+        and query.dtype == torch.bfloat16
+        and sparse_kv.stride(1) == 0
+        and local_kv.stride(1) == 0
+        and query.stride(-1) == 1
+        and sparse_kv.stride(-1) == 1
+        and local_kv.stride(-1) == 1
+        and 16 <= heads <= 128
+        and head_dim % 16 == 0
+        and head_dim <= 128
+        and topk <= 64
+        and sliding_window_size <= 2048
+    ):
+        block_h = max(16, triton.next_power_of_2(heads))
+        block_k = max(16, triton.next_power_of_2(topk)) if topk else 16
+        _selected_attention_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            doc_ids,
+            attention_sink,
+            output,
+            lse,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            LOCAL_KV_STRIDES=local_kv.stride(),
+            KV_INDICES_STRIDES=kv_indices.stride(),
+            DOC_IDS_STRIDES=doc_ids.stride(),
+            LSE_STRIDES=lse.stride(),
+            B=batch,
+            H=heads,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            WINDOW=sliding_window_size,
+            SCALE=1.0 / math.sqrt(head_dim),
+            HAS_DOC_IDS=has_doc_ids,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            BLOCK_D=block_d,
+        )
+        return output, lse
+
     block_m = 64
     block_n = 128
-    block_d = max(16, triton.next_power_of_2(head_dim))
     num_local_tiles = (
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
-
-    output = torch.empty_like(query)
-    lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
-
-    has_doc_ids = doc_ids is not None
-    doc_ids = query if doc_ids is None else doc_ids
-    use_tma = can_use_tma(query) and can_use_tma(local_kv)
-
     grid = (triton.cdiv(seq_len, block_m), batch * heads)
-    if use_tma:
+    if can_use_tma(query) and can_use_tma(local_kv):
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
         local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
