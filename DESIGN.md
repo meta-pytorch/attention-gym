@@ -196,8 +196,7 @@ attn_gym/
   _backends/                     # Private infrastructure shared across attention variants
     triton/
       autotune.py                # Reusable Triton tuning and configuration machinery
-      indexing.py                # Compile-time strided pointer indexing helpers
-      tensor_checks.py           # Triton-specific device, dtype, layout, and shape checks
+      utils.py                   # Small reusable Triton helpers; split as it grows
     cute/
       compilation.py             # Reusable CuTeDSL compilation and caching machinery
       tensor_checks.py           # CuTeDSL-specific device, dtype, layout, and shape checks
@@ -305,13 +304,13 @@ Use the narrowest ownership level that fits the behavior:
 - public types shared by multiple linear or sparse operations belong in a namespace-level module
   such as `attn_gym/linear/types.py`, not in an implementation package.
 
-The `_backends` package must remain private and dependency-oriented. Its modules should be named for
-specific responsibilities such as `autotune.py`, `compilation.py`, or `tensor_checks.py`; do not
-create a backend-wide `common.py` or `utils.py` drawer. As elsewhere, add shared modules only after
-at least two real callers establish the common contract. Variant implementation modules may import
-the corresponding shared backend package, but shared backend packages must not import variant APIs
-or encode variant-specific formulas, state layouts, or dispatch policy. Optional Triton and CuTeDSL
-dependencies must still be imported lazily.
+The `_backends` package must remain private and dependency-oriented. While a backend has only a few
+small reusable helpers, they may live together in `utils.py`; split them into responsibility-specific
+modules such as `autotune.py`, `compilation.py`, or `tensor_checks.py` once coherent groups emerge.
+Do not create a backend-wide `common.py`, and do not let `utils.py` absorb variant-specific behavior.
+Variant implementation modules may import the corresponding shared backend package, but shared
+backend packages must not import variant APIs or encode variant-specific formulas, state layouts, or
+dispatch policy. Optional Triton and CuTeDSL dependencies must still be imported lazily.
 
 ### Compilation and custom operator boundaries
 

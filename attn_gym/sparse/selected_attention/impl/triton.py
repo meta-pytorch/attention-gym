@@ -7,8 +7,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.indexing import ptr_offset
-from attn_gym._backends.triton.tensor_checks import can_use_tma
+from attn_gym._backends.triton.utils import can_use_tma, ptr_offset
 
 
 @triton.jit
