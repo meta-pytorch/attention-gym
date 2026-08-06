@@ -16,6 +16,7 @@ image = (
     )
     .add_local_python_source("attn_gym")
     .add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
+    .add_local_dir(ROOT_PATH / "examples", remote_path="/root/examples")
 )
 
 app = modal.App("attention-gym-modal-tests", image=image)
