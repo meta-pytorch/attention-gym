@@ -106,3 +106,4 @@ ignore = ['E231', 'E731']
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
+"attn_gym/linear/kda/utils.py" = ["BLE001"]

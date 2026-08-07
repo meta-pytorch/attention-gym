@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
+
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
 )
@@ -58,9 +59,8 @@ def chunk_kda_bwd_kernel_dAv(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        if HAS_NUM_CHUNKS:
-            if i_t >= tl.load(num_chunks):
-                return
+        if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
+            return
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
             tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
@@ -93,15 +93,9 @@ def chunk_kda_bwd_kernel_dAv(
 
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v, (V, T), (1, H * V), (i_v * BV, i_t * BT), (BV, BT), (0, 1)
-        )
-        p_do = tl.make_block_ptr(
-            do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        p_dv = tl.make_block_ptr(
-            dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
+        p_v = tl.make_block_ptr(v, (V, T), (1, H * V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
+        p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         # [BV, BT]
         b_v = tl.load(p_v, boundary_check=(0, 1))
         # [BT, BV]
@@ -115,4 +109,3 @@ def chunk_kda_bwd_kernel_dAv(
     p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.0)
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
-

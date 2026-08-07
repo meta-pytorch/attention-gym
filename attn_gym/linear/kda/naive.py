@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import torch
 import torch.nn.functional as F
 
@@ -124,4 +126,153 @@ def naive_chunk_kda(
     return o, (state.to(orig_dtype) if output_final_state else None)
 
 
-__all__ = ["naive_chunk_kda", "naive_recurrent_kda"]
+def l2norm_fwd_ref(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2 normalization over the last dim: ``y = x / sqrt(sum(x^2) + eps)``.
+
+    Naive counterpart of ``l2norm_fwd_kernel`` / ``l2norm_fwd_kernel1``. The reduction runs
+    in fp32 (or fp64 when ``x`` is already fp64) to mirror the kernels' fp32 accumulation,
+    then downcasts back to ``x.dtype``. Pass an fp64 ``x`` for a golden value or a
+    low-precision ``x`` to mimic the kernel.
+
+    Args:
+        x: input tensor, normalized over the last dim; shape ``(..., D)``.
+        eps: variance floor added before the reciprocal sqrt.
+    """
+    dtype = torch.promote_types(x.dtype, torch.float32)
+    xc = x.to(dtype)
+    rstd = torch.rsqrt((xc * xc).sum(-1, keepdim=True) + eps)
+    return (xc * rstd).to(x.dtype)
+
+
+def l2norm_bwd_ref(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    """Gradient of the L2 norm: ``dx = rstd * (dy - y * <dy, y>)``.
+
+    Naive counterpart of ``l2norm_bwd_kernel`` / ``l2norm_bwd_kernel1``. Runs in fp32 (or
+    fp64 when ``y`` is fp64) to match the kernels' accumulation, then downcasts to ``y.dtype``.
+
+    Args:
+        y: normalized forward output; shape ``(..., D)``.
+        rstd: reciprocal std saved by the forward pass, broadcastable over the last dim.
+        dy: upstream gradient w.r.t. ``y``; shape ``(..., D)``.
+    """
+    dtype = torch.promote_types(y.dtype, torch.float32)
+    yc, dyc, rc = y.to(dtype), dy.to(dtype), rstd.to(dtype)
+    dot = (dyc * yc).sum(-1, keepdim=True)
+    return (rc * (dyc - yc * dot)).to(y.dtype)
+
+
+def chunk_cumsum_ref(
+    x: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Chunk-local cumsum over the time axis (dim=1), optionally per document.
+
+    Naive counterpart of ``chunk_local_cumsum_scalar_kernel`` /
+    ``chunk_local_cumsum_vector_kernel``. The cumulative sum restarts at every
+    ``chunk_size`` boundary (and at every document boundary, in varlen mode).
+
+    Args:
+        x: input with time on dim=1, e.g. ``(B, T, H)`` (scalar) or ``(B, T, H, S)``
+            (vector); the cumsum runs over the time axis.
+        chunk_size: length of each chunk; the running sum resets at each multiple.
+        reverse: if True, accumulate from the end of each chunk toward the start.
+        scale: optional multiplier applied to the result.
+        cu_seqlens: optional int32 offsets (varlen mode); the sum also resets at each
+            document boundary ``x[:, cu_seqlens[i]:cu_seqlens[i + 1]]``.
+    """
+    if cu_seqlens is None:
+        spans = [x]
+    else:
+        offs = cu_seqlens.tolist()
+        spans = [x[:, bos:eos] for bos, eos in pairwise(offs)]
+
+    chunks = [c for span in spans for c in span.split(chunk_size, dim=1)]
+    out = torch.cat(
+        [c.flip(1).cumsum(1).flip(1) if reverse else c.cumsum(1) for c in chunks], dim=1
+    )
+    return out * scale if scale is not None else out
+
+
+def _gate_map(z: torch.Tensor, A: torch.Tensor, lower_bound: float | None) -> torch.Tensor:
+    """KDA gate ``-A*softplus(z)`` or lower-bounded ``lb*sigmoid(A*z)``; ``A = exp(A_log)``."""
+    if lower_bound is None:
+        return -A * F.softplus(z)
+    return lower_bound * torch.sigmoid(A * z)
+
+
+def gate_fwd_ref(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+    scale: float | None,
+    reverse: bool,
+    chunk_size: int,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Gate map, then chunk-local cumsum.
+
+    Naive counterpart of ``kda_gate_chunk_cumsum_vector_kernel`` (fused gate + chunk cumsum).
+    The gate map runs in fp32 (or fp64 when ``g`` is fp64) to match the kernel's fp32 math.
+
+    Args:
+        g: raw gate input; shape ``(B, T, H, S)``.
+        A_log: per-head log-magnitude, ``A = exp(A_log)``; shape ``(H,)``.
+        dt_bias: optional per-(head, channel) bias added to ``g``; shape ``(H, S)``.
+        lower_bound: if None, gate is ``-A*softplus(g)``; else ``lower_bound*sigmoid(A*g)``.
+        scale: optional multiplier applied to the cumsum output.
+        reverse: reverse the chunk-local cumsum.
+        chunk_size: cumsum chunk length.
+        cu_seqlens: optional int32 varlen document offsets.
+    """
+    dtype = torch.promote_types(g.dtype, torch.float32)
+    z = g.to(dtype)
+    if dt_bias is not None:
+        z = z + dt_bias.to(dtype)  # (H, S) broadcasts over (B, T, H, S)
+    gate = _gate_map(z, A_log.to(dtype).exp().view(1, 1, -1, 1), lower_bound)
+    return chunk_cumsum_ref(gate, chunk_size, reverse, scale, cu_seqlens)
+
+
+def gate_bwd_ref(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    dyg: torch.Tensor,
+    lower_bound: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Gradients of the pointwise gate map (no cumsum) w.r.t. ``g``, ``A_log``, ``dt_bias``.
+
+    Naive counterpart of ``kda_gate_bwd_kernel``, computed by autograd through the forward
+    map in fp32 (or fp64 when ``g`` is fp64) to match the kernel's fp32 math.
+
+    Args:
+        g: raw gate input; shape ``(B, T, H, S)``.
+        A_log: per-head log-magnitude, ``A = exp(A_log)``; shape ``(H,)``.
+        dt_bias: optional per-(head, channel) bias added to ``g``; shape ``(H, S)``.
+        dyg: upstream gradient w.r.t. the gate map output; shape ``(B, T, H, S)``.
+        lower_bound: selects the gate variant (see :func:`gate_fwd_ref`).
+
+    Returns:
+        Gradients ``(dg, dA_log, dt_bias)``; the last is None when ``dt_bias`` is None.
+    """
+    dtype = torch.promote_types(g.dtype, torch.float32)
+    gg = g.to(dtype).detach().requires_grad_()
+    aa = A_log.to(dtype).detach().requires_grad_()
+    bb = dt_bias.to(dtype).detach().requires_grad_() if dt_bias is not None else None
+    z = gg if bb is None else gg + bb
+    _gate_map(z, aa.exp().view(1, 1, -1, 1), lower_bound).backward(dyg.to(dtype))
+    return gg.grad, aa.grad, (bb.grad if bb is not None else None)
+
+
+__all__ = [
+    "chunk_cumsum_ref",
+    "gate_bwd_ref",
+    "gate_fwd_ref",
+    "l2norm_bwd_ref",
+    "l2norm_fwd_ref",
+    "naive_chunk_kda",
+    "naive_recurrent_kda",
+]

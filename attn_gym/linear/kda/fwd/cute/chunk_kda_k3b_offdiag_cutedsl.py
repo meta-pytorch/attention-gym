@@ -25,11 +25,9 @@ Single-kernel varlen (no is_partial split, no bulk+cleanup dispatch):
           values (0 for Q/K, g_ref for G) ensuring exp2(0)=1 and 0*1=0.
 """
 
-from typing import Optional, Type
-
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, warp
+from cutlass import cute
+from cutlass.cute.nvgpu import warp
 
 
 class ChunkKDAFwdK3bOffdiagCuteDSL:
@@ -57,10 +55,10 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         H: int,
         total_chunks: int,
         stream,
-        cu_seqlens: Optional[cute.Tensor] = None,
-        chunk_indices: Optional[cute.Tensor] = None,
+        cu_seqlens: cute.Tensor | None = None,
+        chunk_indices: cute.Tensor | None = None,
     ):
-        self._dtype: Type[cutlass.Numeric] = mQ.element_type
+        self._dtype: type[cutlass.Numeric] = mQ.element_type
 
         if cutlass.const_expr(cu_seqlens is not None):
             NT = cute.size(chunk_indices, mode=[0]) // 2
@@ -92,9 +90,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 cute.struct.MemRange[self._dtype, cute.cosize(sGated_layout)], 128
             ]
             sGref: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, self.D], 128]
-            sBeta: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.BC], 128
-            ]
+            sBeta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, self.BC], 128]
 
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, self.mma_inst_shape),
@@ -346,17 +342,13 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 if cutlass.const_expr(cu_seqlens is not None):
-                    if chunk_base + self.BT <= eos:
-                        mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = (
-                            out_dtype(acc_Aqk[i] * scale)
-                        )
-                    elif ti_row + row < eos:
-                        mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = (
-                            out_dtype(acc_Aqk[i] * scale)
+                    if chunk_base + self.BT <= eos or ti_row + row < eos:
+                        mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
+                            acc_Aqk[i] * scale
                         )
                 else:
-                    mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = (
-                        out_dtype(acc_Aqk[i] * scale)
+                    mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
+                        acc_Aqk[i] * scale
                     )
         elif warp_idx == 1:
             for i in cutlass.range_constexpr(cute.size(acc_Akk)):

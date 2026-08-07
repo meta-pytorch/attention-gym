@@ -18,17 +18,18 @@ import torch
 import triton
 from cuda.bindings import driver as cuda_drv
 from cutlass.cute.runtime import from_dlpack
-from attn_gym.linear.kda.utils import (
-    DEFAULT_CHUNK_SIZE,
-    prepare_chunk_indices,
-)
+from torch._subclasses.fake_tensor import FakeTensor
+
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k4b_inverse_cutedsl import (
     ChunkKDAFwdK4bInverseCuteDSL,
 )
-from torch._subclasses.fake_tensor import FakeTensor
+from attn_gym.linear.kda.utils import (
+    DEFAULT_CHUNK_SIZE,
+    prepare_chunk_indices,
+)
 
 
 def _to_cute_tensor(tensor: torch.Tensor, assumed_align: int = 16):

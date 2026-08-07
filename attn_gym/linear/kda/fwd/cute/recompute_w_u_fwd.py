@@ -54,21 +54,16 @@
 # requires eager-evaluated annotations.
 
 import enum
-from typing import Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass import Boolean, Float32, Int32
+from cutlass import Boolean, Float32, Int32, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Constexpr
 from torch._subclasses.fake_tensor import FakeTensor
-
 
 # ============================================================================
 # Constants
@@ -118,7 +113,7 @@ class MmaPrecision(enum.Enum):
         return self is MmaPrecision.TF32X3
 
 
-def _normalize_precision(precision: "Union[str, MmaPrecision]") -> MmaPrecision:
+def _normalize_precision(precision: "str | MmaPrecision") -> MmaPrecision:
     if isinstance(precision, MmaPrecision):
         return precision
     try:
@@ -669,56 +664,55 @@ def _kernel_varlen_b1_full_chunk(
         # The raw staging buffers are only needed through CVT/A packing. Once
         # those are complete, later iterations can reuse the same raw buffers
         # for the next work item while the current tile drains from TMEM.
-        if cutlass.const_expr(prefetch_next_tile):
-            if iters_per_cta_outer > 0:
-                prologue_work_idx = cta_idx
-                prologue_chunk_block = prologue_work_idx % num_chunks_runtime
-                prologue_value_head_idx = prologue_work_idx // num_chunks_runtime
-                prologue_key_head_idx = prologue_value_head_idx // head_group_size
-                prologue_seq_idx = mChunkIndices[prologue_chunk_block, 0].to(Int32)
-                prologue_chunk_idx = mChunkIndices[prologue_chunk_block, 1].to(Int32)
-                prologue_bos = mCuSeqlens[prologue_seq_idx].to(Int32)
-                prologue_eos = mCuSeqlens[prologue_seq_idx + 1].to(Int32)
-                prologue_time_base = prologue_bos + prologue_chunk_idx * BT
-                prologue_valid = cutlass.min(prologue_eos - prologue_time_base, Int32(BT))
+        if cutlass.const_expr(prefetch_next_tile) and iters_per_cta_outer > 0:
+            prologue_work_idx = cta_idx
+            prologue_chunk_block = prologue_work_idx % num_chunks_runtime
+            prologue_value_head_idx = prologue_work_idx // num_chunks_runtime
+            prologue_key_head_idx = prologue_value_head_idx // head_group_size
+            prologue_seq_idx = mChunkIndices[prologue_chunk_block, 0].to(Int32)
+            prologue_chunk_idx = mChunkIndices[prologue_chunk_block, 1].to(Int32)
+            prologue_bos = mCuSeqlens[prologue_seq_idx].to(Int32)
+            prologue_eos = mCuSeqlens[prologue_seq_idx + 1].to(Int32)
+            prologue_time_base = prologue_bos + prologue_chunk_idx * BT
+            prologue_valid = cutlass.min(prologue_eos - prologue_time_base, Int32(BT))
 
-                (
-                    prologue_gK_tile,
-                    prologue_gV_tile,
-                    prologue_gQ_tile,
-                    prologue_gG_tile,
-                    prologue_gA_tile,
-                ) = _make_input_tiles(
-                    mK,
-                    mV,
-                    mQ,
-                    mG,
-                    mA,
-                    prologue_time_base,
-                    prologue_key_head_idx,
-                    prologue_value_head_idx,
-                )
-                _copy_input_tiles(
-                    tiled_copy_bf16,
-                    tiled_copy_fp32_kv,
-                    tiled_copy_a,
-                    thr_copy_bf16,
-                    thr_copy_fp32_kv,
-                    thr_copy_a,
-                    prologue_gK_tile,
-                    prologue_gV_tile,
-                    prologue_gQ_tile,
-                    prologue_gG_tile,
-                    prologue_gA_tile,
-                    sK_stage,
-                    sV_stage,
-                    sQ_stage,
-                    sG_stage,
-                    sA_stage,
-                    prologue_valid,
-                    has_q,
-                    has_gk,
-                )
+            (
+                prologue_gK_tile,
+                prologue_gV_tile,
+                prologue_gQ_tile,
+                prologue_gG_tile,
+                prologue_gA_tile,
+            ) = _make_input_tiles(
+                mK,
+                mV,
+                mQ,
+                mG,
+                mA,
+                prologue_time_base,
+                prologue_key_head_idx,
+                prologue_value_head_idx,
+            )
+            _copy_input_tiles(
+                tiled_copy_bf16,
+                tiled_copy_fp32_kv,
+                tiled_copy_a,
+                thr_copy_bf16,
+                thr_copy_fp32_kv,
+                thr_copy_a,
+                prologue_gK_tile,
+                prologue_gV_tile,
+                prologue_gQ_tile,
+                prologue_gG_tile,
+                prologue_gA_tile,
+                sK_stage,
+                sV_stage,
+                sQ_stage,
+                sG_stage,
+                sA_stage,
+                prologue_valid,
+                has_q,
+                has_gk,
+            )
 
         # ---- Persistent loop over runtime (chunk, head) work items ----
         for persistent_iter in cutlass.range(iters_per_cta_outer, unroll=1):
@@ -894,26 +888,24 @@ def _kernel_varlen_b1_full_chunk(
 
                 # Inline QG/KG gmem stores (vectorized 128-bit). QG only when q and gk
                 # are both present; KG only when gk is present (matches triton semantics).
-                if cutlass.const_expr(has_q and has_gk):
-                    if row_in_range:
-                        gQG_slice = cute.make_tensor(
-                            mQG.iterator
-                            + (time_idx * mQG.layout.stride[1])
-                            + (value_head_idx * mQG.layout.stride[2])
-                            + col_start * mQG.layout.stride[3],
-                            cute.make_layout(CVT_VEC),
-                        )
-                        cute.autovec_copy(qg_frag, gQG_slice)
-                if cutlass.const_expr(has_gk):
-                    if row_in_range:
-                        gKG_slice = cute.make_tensor(
-                            mKG.iterator
-                            + (time_idx * mKG.layout.stride[1])
-                            + (value_head_idx * mKG.layout.stride[2])
-                            + col_start * mKG.layout.stride[3],
-                            cute.make_layout(CVT_VEC),
-                        )
-                        cute.autovec_copy(kg_frag, gKG_slice)
+                if cutlass.const_expr(has_q and has_gk) and row_in_range:
+                    gQG_slice = cute.make_tensor(
+                        mQG.iterator
+                        + (time_idx * mQG.layout.stride[1])
+                        + (value_head_idx * mQG.layout.stride[2])
+                        + col_start * mQG.layout.stride[3],
+                        cute.make_layout(CVT_VEC),
+                    )
+                    cute.autovec_copy(qg_frag, gQG_slice)
+                if cutlass.const_expr(has_gk) and row_in_range:
+                    gKG_slice = cute.make_tensor(
+                        mKG.iterator
+                        + (time_idx * mKG.layout.stride[1])
+                        + (value_head_idx * mKG.layout.stride[2])
+                        + col_start * mKG.layout.stride[3],
+                        cute.make_layout(CVT_VEC),
+                    )
+                    cute.autovec_copy(kg_frag, gKG_slice)
 
             # Wait for A cp.async (group 0) to complete — was allowed to overlap with KVQG CVT.
             cute.arch.cp_async_wait_group(0)
@@ -1502,21 +1494,21 @@ def recompute_w_u_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    q: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    chunk_indices: Optional[torch.Tensor] = None,
-    num_chunks: Optional[torch.Tensor] = None,
+    q: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    num_chunks: torch.Tensor | None = None,
     chunk_size: int = BT,
-    dot_precision: Union[str, MmaPrecision] = "bf16",
+    dot_precision: str | MmaPrecision = "bf16",
     experimental_prefetch: bool = True,
     # Back-compat alias: older callers may pass `g=` instead of `gk=`.
-    g: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
 ) -> tuple[
-    Optional[torch.Tensor],
+    torch.Tensor | None,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """
     Recompute KDA W/U intermediates on the native CuTe path.
@@ -1640,8 +1632,8 @@ def recompute_w_u_fwd(
     # Output allocation — only allocate the outputs we will actually produce.
     w = k.new_empty((B, T, H_V, KEY_DIM))
     u = torch.empty_like(v)
-    qg_out: Optional[torch.Tensor] = torch.empty_like(q) if has_q else None
-    kg_out: Optional[torch.Tensor] = k.new_empty((B, T, H_V, KEY_DIM)) if has_gk else None
+    qg_out: torch.Tensor | None = torch.empty_like(q) if has_q else None
+    kg_out: torch.Tensor | None = k.new_empty((B, T, H_V, KEY_DIM)) if has_gk else None
 
     if isinstance(k, FakeTensor):
         return w, u, qg_out, kg_out

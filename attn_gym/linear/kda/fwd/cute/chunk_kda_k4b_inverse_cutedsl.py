@@ -26,10 +26,8 @@ Optimizations:
   - Flat padded SMEM layout (no swizzle) for reduced address computation
 """
 
-from typing import Optional, Type
-
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 from cutlass.cute.nvgpu import warp
 
 
@@ -61,9 +59,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 row = linear_idx // self.BC
                 col = linear_idx % self.BC
                 if row < valid_rows:
-                    sAi[row, col] = self._sai_dtype(
-                        mAkkd[block_start + row, akkd_col_off + col]
-                    )
+                    sAi[row, col] = self._sai_dtype(mAkkd[block_start + row, akkd_col_off + col])
                 else:
                     sAi[row, col] = self._sai_dtype(0.0)
             cute.arch.sync_warp()
@@ -106,11 +102,11 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         H: int,
         total_chunks: int,
         stream,
-        cu_seqlens: Optional[cute.Tensor] = None,
-        chunk_indices: Optional[cute.Tensor] = None,
+        cu_seqlens: cute.Tensor | None = None,
+        chunk_indices: cute.Tensor | None = None,
     ):
-        self._dtype: Type[cutlass.Numeric] = mAkk.element_type
-        self._sai_dtype: Type[cutlass.Numeric] = cutlass.Float32
+        self._dtype: type[cutlass.Numeric] = mAkk.element_type
+        self._sai_dtype: type[cutlass.Numeric] = cutlass.Float32
         self._sai_stride = self.BC + 1
         if cutlass.const_expr(self.fwd_sub_mode == "preinverted"):
             self._sai_dtype = self._dtype
@@ -346,9 +342,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 2: Ai10 = -(tmp @ Ai00)  [loads B=sAi0_T]
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -362,9 +356,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
             acc_res1.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1
-            )
+            cute.gemm(tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1)
             for i in cutlass.range_constexpr(cute.size(acc_res1)):
                 acc_res1[i] = -acc_res1[i]
 
@@ -375,9 +367,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 6': tmp_2c = Akk30 @ Ai00  [REUSE B]
             for i in cutlass.range_constexpr(cute.size(acc_res3)):
@@ -386,9 +376,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             acc_res3.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3
-            )
+            cute.gemm(tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3)
 
             # GEMM 4: tmp += Akk21 @ Ai10  [loads B=Ai10, paired A stores]
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -401,9 +389,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 7: tmp_2c += Akk31 @ Ai10  [REUSE B]
             for i in cutlass.range_constexpr(cute.size(acc_res3)):
@@ -411,9 +397,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 sSchurA0[coord[0], coord[1]] = self._dtype(acc_od4[i])
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
-            cute.gemm(
-                tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3
-            )
+            cute.gemm(tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3)
 
             # GEMM 5: Ai20 = -(Ai22 @ tmp)
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -427,9 +411,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
             acc_res2.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res2, tCrA[None, None, 0], tCrB[None, None, 0], acc_res2
-            )
+            cute.gemm(tiled_mma, acc_res2, tCrA[None, None, 0], tCrB[None, None, 0], acc_res2)
             for i in cutlass.range_constexpr(cute.size(acc_res2)):
                 acc_res2[i] = -acc_res2[i]
 
@@ -444,9 +426,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
-            cute.gemm(
-                tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3
-            )
+            cute.gemm(tiled_mma, acc_res3, tCrA[None, None, 0], tCrB[None, None, 0], acc_res3)
 
             # GEMM 9: Ai30 = -(Ai33 @ tmp_2c)
             for k in cutlass.range_constexpr(cute.size(acc_res3) // 2):
@@ -460,9 +440,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA0[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB0[None, None, 0], tCrBc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
             for i in cutlass.range_constexpr(cute.size(acc_tmp)):
                 acc_tmp[i] = -acc_tmp[i]
 
@@ -471,17 +449,11 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 if i_tc1 + row < eos:
-                    mAkk[i_tc1 + row, h_akk_col + 0 * self.BC + col] = self._dtype(
-                        acc_res1[i]
-                    )
+                    mAkk[i_tc1 + row, h_akk_col + 0 * self.BC + col] = self._dtype(acc_res1[i])
                 if i_tc2 + row < eos:
-                    mAkk[i_tc2 + row, h_akk_col + 0 * self.BC + col] = self._dtype(
-                        acc_res2[i]
-                    )
+                    mAkk[i_tc2 + row, h_akk_col + 0 * self.BC + col] = self._dtype(acc_res2[i])
                 if i_tc3 + row < eos:
-                    mAkk[i_tc3 + row, h_akk_col + 0 * self.BC + col] = self._dtype(
-                        acc_tmp[i]
-                    )
+                    mAkk[i_tc3 + row, h_akk_col + 0 * self.BC + col] = self._dtype(acc_tmp[i])
 
         # ── WARP 1: 5 GEMMs with B-reuse on sAi1_T ──
         if warp_idx == 1:
@@ -497,9 +469,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA1[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB1[None, None, 0], tCrBc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 2: Ai21 = -(tmp @ Ai11)  [loads B=sAi1_T]
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -513,9 +483,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA1[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB1[None, None, 0], tCrBc[None, None, 0])
             acc_res1.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1
-            )
+            cute.gemm(tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1)
             for i in cutlass.range_constexpr(cute.size(acc_res1)):
                 acc_res1[i] = -acc_res1[i]
 
@@ -526,9 +494,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA1[None, None, 0], tCrAc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 4: tmp += Akk32 @ Ai21
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -541,9 +507,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.arch.sync_warp()
             cute.copy(smem_copy_A, tCsA1[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB1[None, None, 0], tCrBc[None, None, 0])
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 5: Ai31 = -(Ai33 @ tmp)
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -557,9 +521,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA1[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB1[None, None, 0], tCrBc[None, None, 0])
             acc_res2.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res2, tCrA[None, None, 0], tCrB[None, None, 0], acc_res2
-            )
+            cute.gemm(tiled_mma, acc_res2, tCrA[None, None, 0], tCrB[None, None, 0], acc_res2)
             for i in cutlass.range_constexpr(cute.size(acc_res2)):
                 acc_res2[i] = -acc_res2[i]
 
@@ -568,13 +530,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 if i_tc2 + row < eos:
-                    mAkk[i_tc2 + row, h_akk_col + 1 * self.BC + col] = self._dtype(
-                        acc_res1[i]
-                    )
+                    mAkk[i_tc2 + row, h_akk_col + 1 * self.BC + col] = self._dtype(acc_res1[i])
                 if i_tc3 + row < eos:
-                    mAkk[i_tc3 + row, h_akk_col + 1 * self.BC + col] = self._dtype(
-                        acc_res2[i]
-                    )
+                    mAkk[i_tc3 + row, h_akk_col + 1 * self.BC + col] = self._dtype(acc_res2[i])
 
         # ── WARP 2: 2 GEMMs + store Ai32 ──
         if warp_idx == 2:
@@ -590,9 +548,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA2[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB2[None, None, 0], tCrBc[None, None, 0])
             acc_tmp.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp
-            )
+            cute.gemm(tiled_mma, acc_tmp, tCrA[None, None, 0], tCrB[None, None, 0], acc_tmp)
 
             # GEMM 2: Ai32 = -(tmp @ Ai22)
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
@@ -606,9 +562,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             cute.copy(smem_copy_A, tCsA2[None, None, 0], tCrAc[None, None, 0])
             cute.copy(smem_copy_B, tCsB2[None, None, 0], tCrBc[None, None, 0])
             acc_res1.fill(0.0)
-            cute.gemm(
-                tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1
-            )
+            cute.gemm(tiled_mma, acc_res1, tCrA[None, None, 0], tCrB[None, None, 0], acc_res1)
             for i in cutlass.range_constexpr(cute.size(acc_res1)):
                 acc_res1[i] = -acc_res1[i]
 
@@ -617,9 +571,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 if i_tc3 + row < eos:
-                    mAkk[i_tc3 + row, h_akk_col + 2 * self.BC + col] = self._dtype(
-                        acc_res1[i]
-                    )
+                    mAkk[i_tc3 + row, h_akk_col + 2 * self.BC + col] = self._dtype(acc_res1[i])
 
         # ── WARP 3: Store all 4 diagonal blocks ──
         if warp_idx == 3:

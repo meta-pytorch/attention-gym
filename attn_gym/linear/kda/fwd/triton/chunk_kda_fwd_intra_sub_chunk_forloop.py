@@ -15,6 +15,7 @@
 
 import triton
 import triton.language as tl
+
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp2,
@@ -66,10 +67,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
         i_t_orig = i_t_start + _iter * GRID_NT
         _run = i_t_orig < MAX_NT
-        if IS_VARLEN:
-            if HAS_NUM_CHUNKS:
-                if _run:
-                    _run = i_t_orig < tl.load(num_chunks)
+        if IS_VARLEN and HAS_NUM_CHUNKS and _run:
+            _run = i_t_orig < tl.load(num_chunks)
         if _run:
             if IS_VARLEN:
                 i_n, i_t = (
@@ -108,9 +107,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                     g_off, (T_local, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0)
                 )
 
-                p_beta = tl.make_block_ptr(
-                    beta_off, (T_local,), (H,), (i_ti,), (BC,), (0,)
-                )
+                p_beta = tl.make_block_ptr(beta_off, (T_local,), (H,), (i_ti,), (BC,), (0,))
 
                 b_q = tl.load(p_q, boundary_check=(0, 1))
                 b_k = tl.load(p_k, boundary_check=(0, 1))
@@ -122,9 +119,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 else:
                     normref_idx = min(BC // 2, T_local - i_ti - 1)
                 if USE_GATHER:
-                    b_gn = gather(
-                        b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0
-                    )
+                    b_gn = gather(b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0)
                 else:
                     p_gn = g_off + (i_ti + normref_idx) * H * K + tl.arange(0, BK)
                     b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)

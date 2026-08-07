@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
+
 from attn_gym.linear.kda.utils import (
     exp,
     exp2,
@@ -57,9 +58,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        if HAS_NUM_SEQS:
-            if i_n >= tl.load(num_seqs):
-                return
+        if HAS_NUM_SEQS and i_n >= tl.load(num_seqs):
+            return
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
@@ -99,9 +99,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
+            p_h0_2 = tl.make_block_ptr(h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
             b_h2 += tl.load(  # pyrefly: ignore[unbound-name]
                 p_h0_2, boundary_check=(0, 1)
             ).to(  # pyrefly: ignore[unbound-name]
@@ -122,9 +120,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 tl.float32
             )  # pyrefly: ignore[unbound-name]
         if K > 192:  # pyrefly: ignore[unbound-name]
-            p_h0_4 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
+            p_h0_4 = tl.make_block_ptr(h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             b_h4 += tl.load(  # pyrefly: ignore[unbound-name]
                 p_h0_4, boundary_check=(0, 1)
             ).to(  # pyrefly: ignore[unbound-name]
@@ -169,26 +165,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_w = tl.load(p_w, boundary_check=(0, 1))
         b_v = tl.dot(b_w, b_h1.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
         if K > 64:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-            )
+            p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
             b_v += tl.dot(b_w, b_h2.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
         if K > 128:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
-            )
+            p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
             b_v += tl.dot(b_w, b_h3.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
         if K > 192:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
-            )
+            p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
             b_v += tl.dot(b_w, b_h4.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
-        p_v = tl.make_block_ptr(
-            v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
+        p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
 
         if SAVE_NEW_VALUE:
@@ -231,16 +219,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     :, None  # pyrefly: ignore[unbound-name,unsupported-operation]
                 ]  # pyrefly: ignore[unsupported-operation]
             else:
-                b_h1 *= exp(b_gk_last1)[
-                    :, None
-                ]  # pyrefly: ignore[unsupported-operation]
+                b_h1 *= exp(b_gk_last1)[:, None]  # pyrefly: ignore[unsupported-operation]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
-                    gk
-                    + (bos + last_idx) * H * K
-                    + i_h * K
-                    + o_k2,  # pyrefly: ignore[unbound-name,unsupported-operation]
+                    gk + (bos + last_idx) * H * K + i_h * K + o_k2,  # pyrefly: ignore[unbound-name,unsupported-operation]
                     mask=(o_k2 < K),
                     other=0.0,  # pyrefly: ignore[unbound-name,unsupported-operation]
                 )
@@ -270,10 +253,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
-                    gk
-                    + (bos + last_idx) * H * K
-                    + i_h * K
-                    + o_k4,  # pyrefly: ignore[unbound-name]
+                    gk + (bos + last_idx) * H * K + i_h * K + o_k4,  # pyrefly: ignore[unbound-name]
                     mask=(o_k4 < K),
                     other=0.0,
                 )
@@ -291,9 +271,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_k = tl.load(p_k, boundary_check=(0, 1))  # pyrefly: ignore[unbound-name]
         b_h1 += tl.dot(b_k, b_v)
         if K > 64:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1)
-            )  # pyrefly: ignore[unbound-name]
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1))  # pyrefly: ignore[unbound-name]
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h2 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
         if K > 128:
@@ -308,9 +286,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h3 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
         if K > 192:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1)
-            )
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
 
@@ -318,27 +294,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
+            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
             tl.store(
                 p_ht,
                 b_h2.to(p_ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
                 boundary_check=(0, 1),  # pyrefly: ignore[unbound-name]
             )  # pyrefly: ignore[unbound-name]
         if K > 128:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
+            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0))
             tl.store(
                 p_ht,
                 b_h3.to(p_ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
                 boundary_check=(0, 1),  # pyrefly: ignore[unbound-name]
             )  # pyrefly: ignore[unbound-name]
         if K > 192:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
+            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(
                 p_ht,
                 b_h4.to(p_ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
@@ -398,10 +368,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
     for _iter in range((MAX_N + GRID_N - 1) // GRID_N):
         i_n = i_n_start + _iter * GRID_N
         _run = i_n < MAX_N
-        if IS_VARLEN:
-            if HAS_NUM_SEQS:
-                if _run:
-                    _run = i_n < upper_limit  # pyrefly: ignore [unbound-name]
+        if IS_VARLEN and HAS_NUM_SEQS and _run:
+            _run = i_n < upper_limit  # pyrefly: ignore [unbound-name]
         if _run:
             if IS_VARLEN:
                 bos, eos = (
@@ -439,9 +407,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
             # load initial state
             if USE_INITIAL_STATE:
                 h0_off = h0 + i_nh_abs * K * V
-                p_h0_1 = tl.make_block_ptr(
-                    h0_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-                )
+                p_h0_1 = tl.make_block_ptr(h0_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
                 b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
                 if K > 64:
                     p_h0_2 = tl.make_block_ptr(
@@ -625,16 +591,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                             None,  # pyrefly: ignore[unbound-name,unsupported-operation]
                         ]  # pyrefly: ignore[unsupported-operation]
                     else:
-                        b_h1 *= exp(b_gk_last1)[
-                            :, None
-                        ]  # pyrefly: ignore[unsupported-operation]
+                        b_h1 *= exp(b_gk_last1)[:, None]  # pyrefly: ignore[unsupported-operation]
                     if K > 64:
                         o_k2 = 64 + o_k1
                         b_gk_last2 = tl.load(
-                            gk
-                            + (bos + last_idx) * H * K
-                            + i_h * K
-                            + o_k2,  # pyrefly: ignore[unbound-name,unsupported-operation]
+                            gk + (bos + last_idx) * H * K + i_h * K + o_k2,  # pyrefly: ignore[unbound-name,unsupported-operation]
                             mask=(o_k2 < K),
                             other=0.0,  # pyrefly: ignore[unbound-name,unsupported-operation]
                         )
@@ -647,9 +608,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                                 :, None
                             ]  # pyrefly: ignore[unbound-name,unsupported-operation]
                     if K > 128:
-                        o_k3 = (
-                            128 + o_k1
-                        )  # pyrefly: ignore[unbound-name,unsupported-operation]
+                        o_k3 = 128 + o_k1  # pyrefly: ignore[unbound-name,unsupported-operation]
                         b_gk_last3 = tl.load(
                             gk + (bos + last_idx) * H * K + i_h * K + o_k3,
                             mask=(o_k3 < K),
@@ -666,10 +625,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                     if K > 192:
                         o_k4 = 192 + o_k1
                         b_gk_last4 = tl.load(
-                            gk
-                            + (bos + last_idx) * H * K
-                            + i_h * K
-                            + o_k4,  # pyrefly: ignore[unbound-name]
+                            gk + (bos + last_idx) * H * K + i_h * K + o_k4,  # pyrefly: ignore[unbound-name]
                             mask=(o_k4 < K),
                             other=0.0,
                         )
@@ -686,9 +642,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                 p_k = tl.make_block_ptr(
                     k_off, (K, T_local), (1, H * K), (0, i_t * BT), (64, BT), (0, 1)
                 )
-                b_k = tl.load(
-                    p_k, boundary_check=(0, 1)
-                )  # pyrefly: ignore[unbound-name]
+                b_k = tl.load(p_k, boundary_check=(0, 1))  # pyrefly: ignore[unbound-name]
                 b_h1 += tl.dot(b_k, b_v)
                 if K > 64:
                     p_k = tl.make_block_ptr(
@@ -726,9 +680,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
 
             if STORE_FINAL_STATE:
                 ht_off = ht + i_nh_abs * K * V
-                p_ht = tl.make_block_ptr(
-                    ht_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-                )
+                p_ht = tl.make_block_ptr(ht_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
                 tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
                 if K > 64:
                     p_ht = tl.make_block_ptr(
@@ -763,4 +715,3 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                         b_h4.to(p_ht.dtype.element_ty),
                         boundary_check=(0, 1),
                     )
-

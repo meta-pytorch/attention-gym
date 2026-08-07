@@ -11,12 +11,11 @@
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
-from cutlass import Boolean, Float32, Int32
+from cutlass import Boolean, Float32, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import Constexpr, dsl_user_op, T
+from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -240,9 +239,7 @@ def _ld_shared_u32(smem_ptr: cute.Pointer, *, loc=None, ip=None):
 
 @dsl_user_op
 def _bitcast_i32_to_f32(x: Int32, *, loc=None, ip=None):
-    return cutlass.Float32(
-        llvm.bitcast(T.f32(), x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    )
+    return cutlass.Float32(llvm.bitcast(T.f32(), x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
 @dsl_user_op
@@ -683,9 +680,7 @@ def _st_global_f32_triton_shared_epilogue_16x32(
     load_base = (row_xor ^ (low3 << 4)) | (lane_bit4 << 3)
     v0, v1, v2, v3 = _ld_shared_u32x4(sEpi_tile.iterator + load_base // 2)
     v4, v5, v6, v7 = _ld_shared_u32x4(sEpi_tile.iterator + (load_base + 256) // 2)
-    v8, v9, v10, v11 = _ld_shared_u32x4(
-        sEpi_tile.iterator + ((load_base ^ Int32(64)) + 1024) // 2
-    )
+    v8, v9, v10, v11 = _ld_shared_u32x4(sEpi_tile.iterator + ((load_base ^ Int32(64)) + 1024) // 2)
     v12, v13, v14, v15 = _ld_shared_u32x4(
         sEpi_tile.iterator + ((load_base ^ Int32(64)) + 1280) // 2
     )
@@ -744,11 +739,7 @@ def _st_global_f32_b32_pred(
     llvm.inline_asm(
         None,
         [ptr_i64, a_bits, Int32(pred).ir_value(loc=loc, ip=ip)],
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, $2, 0;\n\t"
-        "@p st.global.b32 [$0], $1;\n\t"
-        "}\n",
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.global.b32 [$0], $1;\n\t}\n",
         "l,r,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -762,9 +753,7 @@ def _st_global_f32_b32_pred(
 def _hmma_load_b_groups_smem_ldmatrix(sB, row_base, k_outer, tidx):
     lane8 = tidx & 7
     group8 = tidx // 8
-    smem_ptr = (
-        sB.iterator + (row_base + k_outer * 8 + lane8) * KEY_DIM_PER_CTA + group8 * 8
-    )
+    smem_ptr = sB.iterator + (row_base + k_outer * 8 + lane8) * KEY_DIM_PER_CTA + group8 * 8
     r0, r1, r2, r3 = _ldmatrix_x4_trans_b16(smem_ptr)
     b00, b01 = _bf16x2_to_f32_pair(r0)
     b10, b11 = _bf16x2_to_f32_pair(r1)
@@ -826,9 +815,7 @@ def _hmma_load_da_pred(mdA, row_start, head_idx, row, col, valid, pred):
 
 
 @cute.jit
-def _hmma_load_da_pair(
-    mdA, row_start, head_idx, row, col, valid, row_stride, head_stride
-):
+def _hmma_load_da_pair(mdA, row_start, head_idx, row, col, valid, row_stride, head_stride):
     v0, v1 = _ld_global_f32x4_lo2_pred(
         mdA.iterator + (row_start + row) * row_stride + head_idx * head_stride + col,
         Boolean((row < valid) & (col < valid)),
@@ -924,7 +911,7 @@ def _copy_qkg_smem_cpasync(
 
 
 @cute.kernel
-def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
+def _chunk_kda_bwd_intra_hmma_grid_kernel(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mG: cute.Tensor,
@@ -1224,8 +1211,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
                     dakk_row_stride,
                     dakk_head_stride,
                 )
-                kb00, kb01, kb10, kb11, kb20, kb21, kb30, kb31 = (
-                    _hmma_load_b_groups_smem_ldmatrix(sK_tile, key_base, k_outer, tidx)
+                kb00, kb01, kb10, kb11, kb20, kb21, kb30, kb31 = _hmma_load_b_groups_smem_ldmatrix(
+                    sK_tile, key_base, k_outer, tidx
                 )
 
                 for group in cutlass.range_constexpr(4):
@@ -1343,8 +1330,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
                 keep10,
                 keep11,
             )
-            kb00, kb01, kb10, kb11, kb20, kb21, kb30, kb31 = (
-                _hmma_load_b_groups_smem_ldmatrix(sK_tile, key_base, k_outer, tidx)
+            kb00, kb01, kb10, kb11, kb20, kb21, kb30, kb31 = _hmma_load_b_groups_smem_ldmatrix(
+                sK_tile, key_base, k_outer, tidx
             )
 
             for group in cutlass.range_constexpr(4):
@@ -1421,11 +1408,11 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
                 ak3 = _hmma_load_da(mdAkk, row_start, head_idx, query1, row1, valid)
                 bq0 = sBeta_tile[query0]
                 bq1 = sBeta_tile[query1]
-                qq00, qq01, qq10, qq11, qq20, qq21, qq30, qq31 = (
-                    _hmma_load_b_groups_smem_ldmatrix(sQ_tile, q_base, k_outer, tidx)
+                qq00, qq01, qq10, qq11, qq20, qq21, qq30, qq31 = _hmma_load_b_groups_smem_ldmatrix(
+                    sQ_tile, q_base, k_outer, tidx
                 )
-                kk00, kk01, kk10, kk11, kk20, kk21, kk30, kk31 = (
-                    _hmma_load_b_groups_smem_ldmatrix(sK_tile, q_base, k_outer, tidx)
+                kk00, kk01, kk10, kk11, kk20, kk21, kk30, kk31 = _hmma_load_b_groups_smem_ldmatrix(
+                    sK_tile, q_base, k_outer, tidx
                 )
 
                 for group in cutlass.range_constexpr(4):
@@ -1505,37 +1492,21 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
             keep01 = gid <= (k_outer * 8 + 2 * tid + 1)
             keep10 = (gid + 8) <= (k_outer * 8 + 2 * tid)
             keep11 = (gid + 8) <= (k_outer * 8 + 2 * tid + 1)
-            aq0 = _hmma_load_da_pred(
-                mdAqk, row_start, head_idx, query0, row0, valid, keep00
-            )
-            aq1 = _hmma_load_da_pred(
-                mdAqk, row_start, head_idx, query0, row1, valid, keep10
-            )
-            aq2 = _hmma_load_da_pred(
-                mdAqk, row_start, head_idx, query1, row0, valid, keep01
-            )
-            aq3 = _hmma_load_da_pred(
-                mdAqk, row_start, head_idx, query1, row1, valid, keep11
-            )
-            ak0 = _hmma_load_da_pred(
-                mdAkk, row_start, head_idx, query0, row0, valid, keep00
-            )
-            ak1 = _hmma_load_da_pred(
-                mdAkk, row_start, head_idx, query0, row1, valid, keep10
-            )
-            ak2 = _hmma_load_da_pred(
-                mdAkk, row_start, head_idx, query1, row0, valid, keep01
-            )
-            ak3 = _hmma_load_da_pred(
-                mdAkk, row_start, head_idx, query1, row1, valid, keep11
-            )
+            aq0 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row0, valid, keep00)
+            aq1 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row1, valid, keep10)
+            aq2 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query1, row0, valid, keep01)
+            aq3 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query1, row1, valid, keep11)
+            ak0 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query0, row0, valid, keep00)
+            ak1 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query0, row1, valid, keep10)
+            ak2 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query1, row0, valid, keep01)
+            ak3 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query1, row1, valid, keep11)
             bq0 = sBeta_tile[query0]
             bq1 = sBeta_tile[query1]
-            qq00, qq01, qq10, qq11, qq20, qq21, qq30, qq31 = (
-                _hmma_load_b_groups_smem_ldmatrix(sQ_tile, row_base, k_outer, tidx)
+            qq00, qq01, qq10, qq11, qq20, qq21, qq30, qq31 = _hmma_load_b_groups_smem_ldmatrix(
+                sQ_tile, row_base, k_outer, tidx
             )
-            kk00, kk01, kk10, kk11, kk20, kk21, kk30, kk31 = (
-                _hmma_load_b_groups_smem_ldmatrix(sK_tile, row_base, k_outer, tidx)
+            kk00, kk01, kk10, kk11, kk20, kk21, kk30, kk31 = _hmma_load_b_groups_smem_ldmatrix(
+                sK_tile, row_base, k_outer, tidx
             )
 
             for group in cutlass.range_constexpr(4):
@@ -1741,24 +1712,15 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(  # noqa: C901
                 tscale0 = dscale0 * tref0
                 tscale1 = dscale1 * tref1
                 dq_in0, dq_in1 = _ld_global_f32x4_lo2_pred(
-                    mDq.iterator
-                    + out_row * dq_row_stride
-                    + head_idx * dq_head_stride
-                    + col0,
+                    mDq.iterator + out_row * dq_row_stride + head_idx * dq_head_stride + col0,
                     row_valid,
                 )
                 dk_in0, dk_in1 = _ld_global_f32x4_lo2_pred(
-                    mDk.iterator
-                    + out_row * dk_row_stride
-                    + head_idx * dk_head_stride
-                    + col0,
+                    mDk.iterator + out_row * dk_row_stride + head_idx * dk_head_stride + col0,
                     row_valid,
                 )
                 dg_in0, dg_in1 = _ld_global_f32x2_pred(
-                    mDg.iterator
-                    + out_row * dg_row_stride
-                    + head_idx * dg_head_stride
-                    + col0,
+                    mDg.iterator + out_row * dg_row_stride + head_idx * dg_head_stride + col0,
                     row_valid,
                 )
                 dq_add0 = q_acc0 * qscale_prev0 + q_diag0 * qscale_diag0
@@ -1971,9 +1933,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         mNumChunks: cute.Tensor,
         stream: cuda.CUstream = None,
     ):
-        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix(
-            "cutlass_dsl_chunk_kda_bwd_intra"
-        )
+        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix("cutlass_dsl_chunk_kda_bwd_intra")
         _chunk_kda_bwd_intra_hmma_grid_kernel(
             mQ,
             mK,
@@ -1998,4 +1958,3 @@ class ChunkKdaBwdIntraHmmaGrid:
             block=(32, 1, 1),
             stream=stream,
         )
-
