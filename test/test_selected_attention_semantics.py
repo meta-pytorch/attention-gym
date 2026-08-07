@@ -21,9 +21,9 @@ BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capabi
 
 @pytest.fixture
 def shared_kv_blackwell_inputs():
-    """Create a packed shared-KV case that exercises both attention branches."""
+    """Create a batched, partial-head-tile shared-KV case with a float32 sink."""
     torch.manual_seed(123)
-    batch, heads, seq_len, head_dim = 1, 24, 33, 32
+    batch, heads, seq_len, head_dim = 2, 17, 33, 32
     sparse_seq_len, topk = 79, 73
     query = torch.randn(
         batch,
@@ -55,8 +55,10 @@ def shared_kv_blackwell_inputs():
     kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
     kv_indices[:, ::3, -1] = -1
     kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
-    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    doc_ids = torch.tensor([[0] * 11 + [1] * 9 + [2] * 13], device="cuda", dtype=torch.int32)
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.float32, requires_grad=True)
+    doc_ids = torch.tensor(
+        [[0] * 11 + [1] * 9 + [2] * 13], device="cuda", dtype=torch.int32
+    ).expand(batch, -1)
     return query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids
 
 
@@ -530,13 +532,13 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
 
 # ---------------------------------------------------------------------------
-# 6. Shared-KV Blackwell forward
+# 6. Shared-KV Blackwell schedules
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
 def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
-    """The head-major shared-KV path matches eager forward and gradients."""
+    """The head-major shared-KV path matches eager and has deterministic gradients."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
@@ -562,51 +564,170 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
     )
     grad_output = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+    actual_grads = torch.autograd.grad(
+        actual, differentiable_inputs, grad_output, retain_graph=True
+    )
+    repeated_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
+
+    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+    for actual_grad, repeated_grad, expected_grad in zip(
+        actual_grads, repeated_grads, expected_grads, strict=True
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0.06, rtol=0.03)
+        torch.testing.assert_close(repeated_grad, actual_grad, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_zero_stride_unshared_kv_keeps_per_head_gradients():
+    """Zero-stride shape-H KV inputs retain distinct per-head gradient semantics."""
+    torch.manual_seed(456)
+    batch, heads, seq_len, head_dim = 1, 16, 8, 16
+    sparse_seq_len, topk, window = 6, 2, 3
+    query = torch.randn(
+        batch,
+        heads,
+        seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    local_kv = (
+        torch.randn(batch, 1, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+        .expand(-1, heads, -1, -1)
+        .detach()
+        .requires_grad_()
+    )
+    sparse_kv = (
+        torch.randn(batch, 1, sparse_seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+        .expand(-1, heads, -1, -1)
+        .detach()
+        .requires_grad_()
+    )
+    kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    differentiable_inputs = query, local_kv, sparse_kv, attention_sink
+
+    expected = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        None,
+        window,
+        backend="eager",
+    )
+    actual = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        None,
+        window,
+        backend="triton",
+    )
+    grad_output = torch.randn_like(expected)
+    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
     actual_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
 
     torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, atol=0.06, rtol=0.03)
 
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
-def test_shared_kv_blackwell_sparse_only():
-    """The full head tile handles the zero-window sparse-only specialization."""
+@pytest.mark.parametrize(
+    "heads,seq_len,head_dim,topk,window",
+    [(128, 17, 128, 16, 0), (16, 160, 64, 0, 136)],
+    ids=["max-head-sparse-only", "min-head-multi-tile-window-only"],
+)
+def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, window):
+    """Boundary head tiles handle either attention branch alone."""
     torch.manual_seed(321)
-    batch, heads, seq_len, head_dim = 1, 128, 17, 128
-    sparse_seq_len, topk = 19, 16
-    query = torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
-    local_kv = torch.randn(batch, 1, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    batch = 1
+    sparse_seq_len = 19
+    query = torch.randn(
+        batch,
+        heads,
+        seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    local_kv = torch.randn(
+        batch, 1, seq_len, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
     sparse_kv = torch.randn(
-        batch, 1, sparse_seq_len, head_dim, device="cuda", dtype=torch.bfloat16
+        batch,
+        1,
+        sparse_seq_len,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
     )
     kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
-    kv_indices[:, ::3, -1] = -1
-    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16)
+    if topk:
+        kv_indices[:, ::3, -1] = -1
+        kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
+    attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    differentiable_inputs = query, local_kv, sparse_kv, attention_sink
+    high_precision_inputs = tuple(
+        tensor.detach().double().requires_grad_(True) for tensor in differentiable_inputs
+    )
 
-    with torch.inference_mode():
-        expected = selected_attention(
-            query,
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            attention_sink,
-            None,
-            0,
-            backend="eager",
-        )
-        actual = selected_attention(
-            query,
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            attention_sink,
-            None,
-            0,
-            backend="triton",
-        )
+    high_precision_expected = selected_attention(
+        high_precision_inputs[0],
+        high_precision_inputs[1],
+        high_precision_inputs[2],
+        kv_indices,
+        high_precision_inputs[3],
+        None,
+        window,
+        backend="eager",
+    )
+    expected = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        None,
+        window,
+        backend="eager",
+    )
+    actual = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        None,
+        window,
+        backend="triton",
+    )
+    grad_output = torch.randn_like(expected)
+    high_precision_grads = torch.autograd.grad(
+        high_precision_expected, high_precision_inputs, grad_output.double()
+    )
+    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
 
     torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+    for actual_grad, expected_grad, high_precision_grad in zip(
+        actual_grads, expected_grads, high_precision_grads, strict=True
+    ):
+        assert_matches_low_precision_eager(
+            actual_grad,
+            expected_grad,
+            high_precision_grad,
+            reduction_sizes=(head_dim, topk + window, heads * seq_len),
+        )
+    if topk == 0:
+        assert actual_grads[2].count_nonzero().item() == 0
 
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
@@ -684,8 +805,9 @@ def test_shared_kv_blackwell_dsv4_forward():
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
 def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs):
-    """The shared-KV Triton path compiles without graph breaks."""
+    """The shared-KV Triton forward and backward compile without graph breaks."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
     def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids):
         return selected_attention(
@@ -700,11 +822,27 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
-    with torch.inference_mode():
-        expected = fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
-        actual = compiled_fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
+    compiled_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in differentiable_inputs
+    )
+    compiled_query, compiled_local_kv, compiled_sparse_kv, compiled_sink = compiled_inputs
+    expected = fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
+    actual = compiled_fn(
+        compiled_query,
+        compiled_local_kv,
+        compiled_sparse_kv,
+        kv_indices,
+        compiled_sink,
+        doc_ids,
+    )
+    grad_output = torch.randn_like(expected)
+    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, compiled_inputs, grad_output)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for actual_grad, expected_grad in zip(actual_grads[:-1], expected_grads[:-1], strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    torch.testing.assert_close(actual_grads[-1], expected_grads[-1], atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
