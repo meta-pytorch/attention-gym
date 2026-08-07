@@ -13,19 +13,20 @@ from __future__ import annotations
 
 import torch
 import triton
+from torch._subclasses.fake_tensor import FakeTensor
+
+from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
+    chunk_kda_fwd_inter_solve_cute,
+)
+from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
+    chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
+)
 from attn_gym.linear.kda.utils import (
     DEFAULT_CHUNK_SIZE,
     IS_GATHER_SUPPORTED,
     prepare_chunk_indices,
 )
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
-    chunk_kda_fwd_inter_solve_cute,
-)
-from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
-    chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
-)
-from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
-from torch._subclasses.fake_tensor import FakeTensor
 
 
 def chunk_kda_fwd_intra(

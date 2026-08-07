@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
+
 from attn_gym.linear.kda.utils import (
+    IS_NVIDIA,
     autotune_cache_kwargs,
     exp,
-    IS_NVIDIA,
 )
 
 
@@ -68,11 +69,7 @@ def _generate_softplus2(num_pack):
 
 
 def _generate_constraints(num_pack):
-    return (
-        ",".join("=r" for i in range(num_pack))
-        + ","
-        + ",".join("r" for i in range(num_pack))
-    )
+    return ",".join("=r" for i in range(num_pack)) + "," + ",".join("r" for i in range(num_pack))
 
 
 _NUM_REG = 1
@@ -183,9 +180,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
     i_t, i_bh, i_s = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        if HAS_NUM_CHUNKS:
-            if i_t >= tl.load(num_chunks):
-                return
+        if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
+            return
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
             tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
@@ -244,6 +240,9 @@ def kda_gate_chunk_cumsum_vector_kernel(
         b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
     else:
         b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
+
+    m_t = (i_t * BT + tl.arange(0, BT)) < T
+    b_gate = tl.where(m_t[:, None], b_gate, 0.0)
 
     # Apply chunk local cumsum
     if REVERSE:
@@ -310,10 +309,8 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
     for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
         i_t_orig = i_t_start + _iter * GRID_NT
         _run = i_t_orig < MAX_NT
-        if IS_VARLEN:
-            if HAS_NUM_CHUNKS:
-                if _run:
-                    _run = i_t_orig < tl.load(num_chunks)
+        if IS_VARLEN and HAS_NUM_CHUNKS and _run:
+            _run = i_t_orig < tl.load(num_chunks)
         if _run:
             if IS_VARLEN:
                 i_n, i_t = (
@@ -335,11 +332,7 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
                 b_in_cols = b_out_cols // F_REPEAT
 
                 b_t_offs = i_t * BT + tl.arange(0, BT)
-                b_s_ptrs = (
-                    s
-                    + ((bos + b_t_offs[:, None]) * H + i_h) * S_in
-                    + b_in_cols[None, :]
-                )
+                b_s_ptrs = s + ((bos + b_t_offs[:, None]) * H + i_h) * S_in + b_in_cols[None, :]
                 b_mask = (b_t_offs[:, None] < T_local) & (b_out_cols[None, :] < S)
                 b_s = tl.load(b_s_ptrs, mask=b_mask, other=0.0).to(tl.float32)
             else:
@@ -363,20 +356,19 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
             )
 
             if HAS_BIAS:
-                p_b = tl.make_block_ptr(
-                    dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,)
-                )
+                p_b = tl.make_block_ptr(dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,))
                 b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
                 b_s = b_s + b_bias[None, :]
 
             b_A = tl.load(A_log + i_h).to(tl.float32)
             if not USE_LOWER_BOUND:  # pyrefly: ignore[unsupported-operation]
                 # pyrefly: ignore [unsupported-operation]
-                b_gate = -exp(b_A) * softplus(
-                    b_s
-                )  # pyrefly: ignore[unsupported-operation]
+                b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
             else:
                 b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
+
+            m_t = (i_t * BT + tl.arange(0, BT)) < T_local
+            b_gate = tl.where(m_t[:, None], b_gate, 0.0)
 
             if REVERSE:
                 b_o = tl.cumsum(b_gate, axis=0, reverse=True)
@@ -386,4 +378,3 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
             if HAS_SCALE:
                 b_o *= scale
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-

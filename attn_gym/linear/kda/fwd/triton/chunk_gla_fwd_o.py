@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
+
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp,
@@ -60,9 +61,8 @@ def chunk_gla_fwd_kernel_o(
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        if HAS_NUM_CHUNKS:
-            if i_t >= tl.load(num_chunks):
-                return
+        if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
+            return
         i_tg = i_t
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -150,4 +150,3 @@ def chunk_gla_fwd_kernel_o(
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-

@@ -15,6 +15,7 @@
 import contextlib
 import functools
 import inspect
+import itertools
 import logging
 import os
 import sys
@@ -88,8 +89,6 @@ def check_environments():
             f"Current Python version {py_version} is below the recommended 3.11 version. "
             "It is recommended to upgrade to Python 3.11 or higher for the best experience.",
         )
-
-    return None
 
 
 check_environments()
@@ -244,10 +243,10 @@ def softplus(x):
 # Shared memory check / device context
 # ---------------------------------------------------------------------------
 class Backend(Enum):
-    ADA = 101376       # RTX 4090
-    AMPERE = 166912    # A100
-    HOPPER = 232448    # H100
-    DEFAULT = 102400   # Default
+    ADA = 101376  # RTX 4090
+    AMPERE = 166912  # A100
+    HOPPER = 232448  # H100
+    DEFAULT = 102400  # Default
 
     @classmethod
     def get_shared_memory(cls, arch: str) -> int:
@@ -394,11 +393,15 @@ def tensor_cache(
             if FLA_DISABLE_TENSOR_CACHE:
                 return fn(*args, **kwargs)
             for cached_args, cached_kwargs, cached_result in reversed(cache):
-                if len(args) == len(cached_args) and len(kwargs) == len(cached_kwargs):
-                    if all(a is b for a, b in zip(args, cached_args, strict=False)) and all(
+                if (
+                    len(args) == len(cached_args)
+                    and len(kwargs) == len(cached_kwargs)
+                    and all(a is b for a, b in zip(args, cached_args, strict=False))
+                    and all(
                         k in cached_kwargs and v is cached_kwargs[k] for k, v in kwargs.items()
-                    ):
-                        return cached_result
+                    )
+                ):
+                    return cached_result
             result = fn(*args, **kwargs)
             cache.append((args, kwargs, result))
             return result
@@ -464,7 +467,7 @@ def chunk_local_cumsum_reference(
             _fill_range(batch_idx, 0, g.shape[1])
     else:
         offsets = cu_seqlens.tolist()
-        for bos, eos in zip(offsets[:-1], offsets[1:], strict=False):
+        for bos, eos in itertools.pairwise(offsets):
             _fill_range(0, bos, eos)
     return out
 

@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
-
 
 import triton
 import triton.language as tl
@@ -64,4 +62,3 @@ def l2norm_fwd_kernel(
 
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))  # type: ignore
     tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))  # type: ignore
-

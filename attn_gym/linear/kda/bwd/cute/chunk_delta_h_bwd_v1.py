@@ -27,23 +27,22 @@ Architecture follows FMHA/MSLK Blackwell patterns:
 """
 
 import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 import torch.nn.functional as F
 import triton
+from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.utils.hardware_info import HardwareInfo
+from torch._guards import active_fake_mode
+
 from attn_gym.linear.kda.utils import (
     prepare_chunk_indices,
     prepare_lens,
     tensor_cache,
 )
-from torch._guards import active_fake_mode
 
 
 # Simple JIT cache (no external dependency)
@@ -55,9 +54,7 @@ def get_jit_cache(name):
 @tensor_cache
 def _cumulative_chunk_offsets(cu_seqlens, chunk_size):
     return (
-        F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0)
-        .cumsum(-1)
-        .int()
+        F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0).cumsum(-1).int()
     )
 
 
@@ -860,9 +857,7 @@ class BlackwellDeltaHBwdV1:
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.WARP_SZ * len(self.CUDA_WARP_IDS)
             ),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.WARP_SZ
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.WARP_SZ),
             barrier_storage=sm.bar_dh_epi.data_ptr(),
         ).make_participants()
 
@@ -872,9 +867,7 @@ class BlackwellDeltaHBwdV1:
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.WARP_SZ * len(self.CUDA_WARP_IDS)
             ),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.WARP_SZ
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.WARP_SZ),
             barrier_storage=sm.bar_dv2_epi.data_ptr(),
         ).make_participants()
 
@@ -890,9 +883,7 @@ class BlackwellDeltaHBwdV1:
         # gk ready → CUDA (Async, 2-stage)
         pgk_rdy_P, pgk_rdy_C = pipeline.PipelineAsync.create(
             num_stages=self.gk_depth,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.WARP_SZ
-            ),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.WARP_SZ),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.WARP_SZ * len(self.CUDA_WARP_IDS)
             ),
@@ -917,32 +908,20 @@ class BlackwellDeltaHBwdV1:
         #
         sK = sm.sK.get_tensor(s_k_staged.outer, swizzle=s_k_staged.inner)
         sDhb = sm.sDhb.get_tensor(s_dhb_staged.outer, swizzle=s_dhb_staged.inner)
-        sDhb_store = sm.sDhb.get_tensor(
-            s_dhb_store_staged.outer, swizzle=s_dhb_store_staged.inner
-        )
+        sDhb_store = sm.sDhb.get_tensor(s_dhb_store_staged.outer, swizzle=s_dhb_store_staged.inner)
         sQ = sm.sQ.get_tensor(s_q_staged.outer, swizzle=s_q_staged.inner)
         sDo = sm.sDo.get_tensor(s_do_staged.outer, swizzle=s_do_staged.inner)
-        sDo_store = sm.sDo.get_tensor(
-            s_do_store_staged.outer, swizzle=s_do_store_staged.inner
-        )
-        sDoEpi = sm.sDoEpi.get_tensor(
-            s_doepi_staged.outer, swizzle=s_doepi_staged.inner
-        )
+        sDo_store = sm.sDo.get_tensor(s_do_store_staged.outer, swizzle=s_do_store_staged.inner)
+        sDoEpi = sm.sDoEpi.get_tensor(s_doepi_staged.outer, swizzle=s_doepi_staged.inner)
         sW = sm.sW.get_tensor(s_w_staged.outer, swizzle=s_w_staged.inner)
         sDv2b = sm.sDv2b.get_tensor(s_dv2b_staged.outer, swizzle=s_dv2b_staged.inner)
         sDv2b_store = sm.sDv2b.get_tensor(
             s_dv2b_store_staged.outer, swizzle=s_dv2b_store_staged.inner
         )
         sDvIn = sm.sDvIn.get_tensor(s_dvin_staged.outer, swizzle=s_dvin_staged.inner)
-        sDhEpi = sm.sDhEpi.get_tensor(
-            s_dh_epi_staged.outer, swizzle=s_dh_epi_staged.inner
-        )
-        sDhEpi_store = sm.sDhEpi.get_tensor(
-            s_dh_r2s_staged.outer, swizzle=s_dh_r2s_staged.inner
-        )
-        sDv2Epi = sm.sDv2Epi.get_tensor(
-            s_dv2_epi_staged.outer, swizzle=s_dv2_epi_staged.inner
-        )
+        sDhEpi = sm.sDhEpi.get_tensor(s_dh_epi_staged.outer, swizzle=s_dh_epi_staged.inner)
+        sDhEpi_store = sm.sDhEpi.get_tensor(s_dh_r2s_staged.outer, swizzle=s_dh_r2s_staged.inner)
+        sDv2Epi = sm.sDv2Epi.get_tensor(s_dv2_epi_staged.outer, swizzle=s_dv2_epi_staged.inner)
         sDv2Epi_store = sm.sDv2Epi.get_tensor(
             s_dv2_r2s_staged.outer, swizzle=s_dv2_r2s_staged.inner
         )
@@ -975,7 +954,7 @@ class BlackwellDeltaHBwdV1:
         # #
         # Block indices
         #
-        B, T, H, K, V = problem_shape
+        B, T, H, _K, V = problem_shape
         BT = self.BT
 
         # Persistent 1D grid for both varlen and non-varlen (CUDA graph compatible)
@@ -1009,9 +988,7 @@ class BlackwellDeltaHBwdV1:
 
             # --- T2R setup: read MMA1 (dv) accumulator (BT,BV fp32) from TMEM ---
             t2r_dv_atom = cute.make_copy_atom(
-                tcgen05.Ld16x256bOp(
-                    tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE
-                ),
+                tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE),
                 self.acc_type,
             )
             dv_flat = t_dv_acc[((None, None), 0, 0, None)]
@@ -1026,9 +1003,7 @@ class BlackwellDeltaHBwdV1:
 
             # --- T2R setup: read MMA2 (qdo) accumulator (BK,BV fp32) from TMEM ---
             t2r_qdo_atom = cute.make_copy_atom(
-                tcgen05.Ld16x256bOp(
-                    tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE
-                ),
+                tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE),
                 self.acc_type,
             )
             qdo_flat = t_qdo_acc[((None, None), 0, 0, None)]
@@ -1043,9 +1018,7 @@ class BlackwellDeltaHBwdV1:
 
             # --- T2R setup: read MMA3 (wdv) accumulator (BK,BV fp32) from TMEM ---
             t2r_wdv_atom = cute.make_copy_atom(
-                tcgen05.Ld16x256bOp(
-                    tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE
-                ),
+                tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BV // 8), tcgen05.Pack.NONE),
                 self.acc_type,
             )
             wdv_flat = t_wdv_acc[((None, None), 0, 0, None)]
@@ -1158,9 +1131,7 @@ class BlackwellDeltaHBwdV1:
 
                     # R2S dh → sDhEpi (for Store warp TMA S2G)
                     r2s_src_dh = tc_r2s_dh_epi.retile(st_bf16)
-                    dst_dh = thr_r2s_dh_epi.partition_D(
-                        sDhEpi_store[(None, None, dh_epi_h.index)]
-                    )
+                    dst_dh = thr_r2s_dh_epi.partition_D(sDhEpi_store[(None, None, dh_epi_h.index)])
                     cute.copy(tc_r2s_dh_epi, r2s_src_dh, dst_dh)
                     cute.arch.fence_proxy("async.shared", space="cta")
                     dh_epi_h.commit()
@@ -1258,18 +1229,14 @@ class BlackwellDeltaHBwdV1:
                     # T2R qdo result from MMA2
                     qdoh = pqdo_C.wait_and_advance()
                     qdo_reg = cute.make_rmem_tensor(p_s_qdo.shape, self.acc_type)
-                    cute.copy(
-                        tc_t2r_qdo, p_t_qdo[(None, None, None, qdoh.index)], qdo_reg
-                    )
+                    cute.copy(tc_t2r_qdo, p_t_qdo[(None, None, None, qdoh.index)], qdo_reg)
                     cute.arch.fence_view_async_tmem_load()
                     qdoh.release()
 
                     # T2R wdv result from MMA3
                     wdvh = pwdv_C.wait_and_advance()
                     wdv_reg = cute.make_rmem_tensor(p_s_wdv.shape, self.acc_type)
-                    cute.copy(
-                        tc_t2r_wdv, p_t_wdv[(None, None, None, wdvh.index)], wdv_reg
-                    )
+                    cute.copy(tc_t2r_wdv, p_t_wdv[(None, None, None, wdvh.index)], wdv_reg)
                     cute.arch.fence_view_async_tmem_load()
                     wdvh.release()
 
@@ -1310,9 +1277,7 @@ class BlackwellDeltaHBwdV1:
                     dhbh = pdhb_C.wait_and_advance()
                     kh = pk_C.wait_and_advance()
                     dvd = pdv_P.acquire_and_advance()
-                    for kp in cutlass.range(
-                        cute.size(t_k_a, mode=[2]), unroll_full=True
-                    ):
+                    for kp in cutlass.range(cute.size(t_k_a, mode=[2]), unroll_full=True):
                         mma_dv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                         cute.gemm(
                             mma_dv,
@@ -1332,9 +1297,7 @@ class BlackwellDeltaHBwdV1:
                     qh = pq_C.wait_and_advance()
                     doh = pdob_C.wait_and_advance()
                     qdod = pqdo_P.acquire_and_advance()
-                    for kp in cutlass.range(
-                        cute.size(t_q_a, mode=[2]), unroll_full=True
-                    ):
+                    for kp in cutlass.range(cute.size(t_q_a, mode=[2]), unroll_full=True):
                         mma_qdo.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                         cute.gemm(
                             mma_qdo,
@@ -1351,9 +1314,7 @@ class BlackwellDeltaHBwdV1:
                     dv2bh = pdv2b_C.wait_and_advance()
                     wh = pw_C.wait_and_advance()
                     wdvd = pwdv_P.acquire_and_advance()
-                    for kp in cutlass.range(
-                        cute.size(t_w_a, mode=[2]), unroll_full=True
-                    ):
+                    for kp in cutlass.range(cute.size(t_w_a, mode=[2]), unroll_full=True):
                         mma_wdv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                         cute.gemm(
                             mma_wdv,
@@ -1409,9 +1370,7 @@ class BlackwellDeltaHBwdV1:
                     ddv2 = desc_dv2st
 
                 gDH_s = ddh[None, None, (None, h_idx, db)]
-                a_dhst, sDHst, gDHst = self._part_epi(
-                    atom_dhst, gDH_s, (self.BV, self.BK), sDhEpi
-                )
+                a_dhst, sDHst, gDHst = self._part_epi(atom_dhst, gDH_s, (self.BV, self.BK), sDhEpi)
 
                 gDV2_s = ddv2[None, None, (h_idx, db)]
                 a_dv2st, sDV2st, gDV2st = self._part_epi(
@@ -1423,9 +1382,7 @@ class BlackwellDeltaHBwdV1:
 
                     # Store dh snapshot via TMA S2G
                     dhh = pdh_epi_C.wait_and_advance()
-                    cute.copy(
-                        a_dhst, sDHst[None, dhh.index], gDHst[(None, v_tile, 0, rev_ct)]
-                    )
+                    cute.copy(a_dhst, sDHst[None, dhh.index], gDHst[(None, v_tile, 0, rev_ct)])
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                     dhh.release()
@@ -1470,9 +1427,7 @@ class BlackwellDeltaHBwdV1:
                             )
                             gVn_chunk = cute.make_tensor(
                                 vn_ptr,
-                                cute.make_layout(
-                                    (self.BV, self.BT), stride=(1, vn_stride)
-                                ),
+                                cute.make_layout((self.BV, self.BT), stride=(1, vn_stride)),
                             )
                             tOg = thr_cp.partition_D(gVn_chunk)
                             for rb in cutlass.range_constexpr(cute.size(tOr.shape[2])):
@@ -1540,21 +1495,13 @@ class BlackwellDeltaHBwdV1:
 
                 # Partition TMA operands
                 tKs, tKg = self._part_a(atom_k, dk, sK, self.dv_tile, mma_dv, db, h_idx)
-                tQs, tQg = self._part_a(
-                    atom_q, dq, sQ, self.qdo_tile, mma_qdo, db, h_idx
-                )
+                tQs, tQg = self._part_a(atom_q, dq, sQ, self.qdo_tile, mma_qdo, db, h_idx)
                 gDo_l = ddo[None, None, (h_idx, db)]
-                _, sSDoEpi, gSDoEpi = self._part_epi(
-                    atom_doepi, gDo_l, (self.BV, self.BT), sDoEpi
-                )
-                tWs, tWg = self._part_a(
-                    atom_w, dw_desc, sW, self.wdv_tile, mma_wdv, db, h_idx
-                )
+                _, sSDoEpi, gSDoEpi = self._part_epi(atom_doepi, gDo_l, (self.BV, self.BT), sDoEpi)
+                tWs, tWg = self._part_a(atom_w, dw_desc, sW, self.wdv_tile, mma_wdv, db, h_idx)
 
                 gDvIn_l = ddvin[None, None, (h_idx, db)]
-                _, sSDvIn, gSDvIn = self._part_epi(
-                    atom_dvin, gDvIn_l, (self.BV, self.BT), sDvIn
-                )
+                _, sSDvIn, gSDvIn = self._part_epi(atom_dvin, gDvIn_l, (self.BV, self.BT), sDvIn)
 
                 gGK_l = dgk[None, None, (h_idx, db)]
                 _, sSGK, gSGK = self._part_epi(atom_gk, gGK_l, (self.BK, 1), gk_3d)
@@ -1646,9 +1593,7 @@ class BlackwellDeltaHBwdV1:
                         gk_rdy = pgk_rdy_P.acquire_and_advance()
                         for i in cutlass.range(4, unroll_full=True):
                             idx = gk_tid * 4 + i
-                            gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(
-                                gk_buf[(idx, gkh.index)]
-                            )
+                            gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(gk_buf[(idx, gkh.index)])
                         gkh.release()
                         cute.arch.fence_proxy("async.shared", space="cta")
                         gk_rdy.commit()
@@ -1668,9 +1613,7 @@ class BlackwellDeltaHBwdV1:
     @cute.jit
     def _part_a(self, atom, desc, smem, tile, mma, batch, head):
         """Partition A-operand for TMA copy (SS-mode)."""
-        g = cute.local_tile(
-            desc, cute.slice_(tile, (None, 0, None)), (None, None, (head, batch))
-        )
+        g = cute.local_tile(desc, cute.slice_(tile, (None, 0, None)), (None, None, (head, batch)))
         thr = mma.get_slice(0)
         part = thr.partition_A(g)
         s, d = cpasync.tma_partition(
@@ -1685,9 +1628,7 @@ class BlackwellDeltaHBwdV1:
     @cute.jit
     def _part_b(self, atom, desc, smem, tile, mma, batch, head):
         """Partition B-operand for TMA copy."""
-        g = cute.local_tile(
-            desc, cute.slice_(tile, (0, None, None)), (None, None, (head, batch))
-        )
+        g = cute.local_tile(desc, cute.slice_(tile, (0, None, None)), (None, None, (head, batch)))
         thr = mma.get_slice(0)
         part = thr.partition_B(g)
         s, d = cpasync.tma_partition(
@@ -1994,20 +1935,12 @@ def blackwell_delta_h_bwd_dhu_v1(
     if is_vl:
         assert B == 1, "varlen requires B=1"
         cu_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
-        co_i32 = (
-            ch_offs.int()
-            if ch_offs is not None and ch_offs.dtype != torch.int32
-            else ch_offs
-        )
+        co_i32 = ch_offs.int() if ch_offs is not None and ch_offs.dtype != torch.int32 else ch_offs
         q_k, k_k, w_k = q[0], k[0], w[0]
         do_k, dv_k = do[0], dv[0]
         gk_k = gk[0] if gk is not None else _get_dummy((T, H, K), torch.float32, dev)
         dht_k = dht if dht is not None else _get_dummy((N, H, K, V), torch.float32, dev)
-        dh0_k = (
-            dh0_out
-            if dh0_out is not None
-            else _get_dummy((N, H, K, V), torch.float32, dev)
-        )
+        dh0_k = dh0_out if dh0_out is not None else _get_dummy((N, H, K, V), torch.float32, dev)
         dho = dh_out[0]  # (NT, H, K, V)
         dv2_k = dv2[0]
         if num_seqs is None:
@@ -2051,11 +1984,7 @@ def blackwell_delta_h_bwd_dhu_v1(
     else:
         gk_k = gk if gk is not None else _get_dummy((B, T, H, K), torch.float32, dev)
         dht_k = dht if dht is not None else _get_dummy((B, H, K, V), torch.float32, dev)
-        dh0_k = (
-            dh0_out
-            if dh0_out is not None
-            else _get_dummy((B, H, K, V), torch.float32, dev)
-        )
+        dh0_k = dh0_out if dh0_out is not None else _get_dummy((B, H, K, V), torch.float32, dev)
         cu_d = _get_dummy((2,), torch.int32, dev)
         co_d = _get_dummy((2,), torch.int32, dev)
         ns_d = _get_dummy((1,), torch.int32, dev)

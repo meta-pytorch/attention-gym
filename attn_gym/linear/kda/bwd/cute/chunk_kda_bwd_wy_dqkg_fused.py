@@ -12,11 +12,9 @@
 import os
 
 import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass import cute, pipeline, utils
 from cutlass.cute.arch import (
     elect_one,
     mbarrier_arrive,
@@ -29,7 +27,6 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import make_umma_smem_desc, smem_descriptor_to_int
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
-
 
 # ============================================================================
 # Inlined SM100 tcgen05 helper wrappers
@@ -127,39 +124,39 @@ Named convenience wrappers (pre-set masks, pass only MMA operands):
 """
 
 __all__ = [
+    # collector enums (re-exported for convenience)
+    "CollectorBBuffer",
+    "CollectorOp",
     # descriptor helpers
     "Tcgen05SmemDescriptor",
     "initialize_tcgen05_descriptor",
     # low-level primitives
     "tcgen05mma_ss",
-    "tcgen05mma_ts",
-    "tcgen05mma_ws_ss_tf32",
-    "tcgen05mma_ws_ts_tf32",
-    "tcgen05mma_ws_ss_f16",
-    "tcgen05mma_ws_ts_f16",
-    # SS named wrappers
-    "tcgen05mma_ss_no_mask",
     "tcgen05mma_ss_mask0",
     "tcgen05mma_ss_mask1",
     "tcgen05mma_ss_mask2",
     "tcgen05mma_ss_mask3",
-    # TS named wrappers
-    "tcgen05mma_ts_no_mask",
+    # SS named wrappers
+    "tcgen05mma_ss_no_mask",
+    "tcgen05mma_ts",
     "tcgen05mma_ts_mask0",
+    "tcgen05mma_ts_mask02",
     "tcgen05mma_ts_mask1",
     "tcgen05mma_ts_mask2",
     "tcgen05mma_ts_mask3",
-    "tcgen05mma_ts_mask02",
     "tcgen05mma_ts_mask13",
-    # collector enums (re-exported for convenience)
-    "CollectorBBuffer",
-    "CollectorOp",
+    # TS named wrappers
+    "tcgen05mma_ts_no_mask",
+    "tcgen05mma_ws_ss_f16",
+    "tcgen05mma_ws_ss_tf32",
+    "tcgen05mma_ws_ts_f16",
+    "tcgen05mma_ws_ts_tf32",
 ]
 
-import cutlass
-import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith, llvm, nvvm as _nvvm
+from cutlass._mlir.dialects import arith as _arith
+from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 # Re-export collector enums for caller convenience.
@@ -1212,28 +1209,24 @@ Usage inside a ``@cute.kernel`` or ``@cute.jit`` function::
 """
 
 __all__ = [
+    "reinterpret_cast",
+    "store_256b",
+    "subvec",
+    "tcgen05_cp_128x256b",
     "tcgen05_ld_32x32b",
     "tcgen05_st_32x32b",
-    "tcgen05_cp_128x256b",
-    "reinterpret_cast",
-    "subvec",
-    "store_256b",
     "umma_arrive",
     "umma_arrive_noelect",
 ]
 
-import cutlass.cute as cute
+from cutlass import cute
 from cutlass._mlir import ir as _ir_mod
 from cutlass._mlir.dialects import (
-    arith as _arith,
-    llvm,
     nvvm as _nvvm,
+)
+from cutlass._mlir.dialects import (
     vector as _vector,
 )
-from cutlass.cute.arch import elect_one
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.typing import Int32
-from cutlass.cutlass_dsl import dsl_user_op
 
 
 def _to_ir(val, loc=None, ip=None):
@@ -2724,7 +2717,7 @@ class ChunkKdaBwdWyDqkgFused:
         chunk_indices: cute.Tensor,
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],  # (B, T, H, HV, K, V)
     ):
-        B, T, H, HV, K, V = problem_size
+        _B, _T, H, HV, K, V = problem_size
         BT = self.BT
 
         # ===================== Persistent work decode =====================
@@ -4193,7 +4186,7 @@ class ChunkKdaBwdWyDqkgFused:
                     cute.arch.fence_proxy("async.shared", space="cta")
 
                 for v_iter in cutlass.range(self.num_v_tiles):
-                    is_accum = False if v_iter == 0 else True
+                    is_accum = v_iter != 0
                     mbarrier_wait(bar_tma_h_ptr + vloop_stage_idx, vloop_phase)
                     pipeline_load_do.consumer_wait(load_do_consumer_state)
                     sDo_raw_ptr = cute.make_ptr(
