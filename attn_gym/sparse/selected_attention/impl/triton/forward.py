@@ -9,7 +9,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset
 
-from .primitives import causal_window_mask, load_bhsd, load_bs, online_softmax_update, store_bhsd
+from .primitives import (
+    can_use_shared_kv_schedule,
+    causal_window_mask,
+    load_bhsd,
+    load_bs,
+    online_softmax_update,
+    store_bhsd,
+)
 
 
 @triton.jit
@@ -431,18 +438,8 @@ def _launch_forward(
     doc_ids = query if doc_ids is None else doc_ids
 
     # This head-major schedule is tuned for shared KV on Blackwell.
-    if (
-        torch.cuda.get_device_capability(query.device)[0] >= 10
-        and query.dtype == torch.bfloat16
-        and sparse_kv.stride(1) == 0
-        and local_kv.stride(1) == 0
-        and query.stride(-1) == 1
-        and sparse_kv.stride(-1) == 1
-        and local_kv.stride(-1) == 1
-        and 16 <= heads <= 128
-        and head_dim % 16 == 0
-        and (head_dim <= 128 or head_dim == 512)
-        and sliding_window_size <= 2048
+    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size) and (
+        head_dim <= 128 or head_dim == 512
     ):
         # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
         block_h = (
@@ -450,7 +447,7 @@ def _launch_forward(
             if head_dim <= 128
             else min(32, triton.next_power_of_2(heads))
         )
-        block_k = max(16, min(64, triton.next_power_of_2(topk))) if topk else 16
+        block_k = max(16, min(64, triton.next_power_of_2(topk)))
         _selected_attention_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,

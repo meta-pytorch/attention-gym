@@ -9,7 +9,17 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma
 
-from .primitives import causal_window_mask, load_bhsd, load_bs, store_bhsd
+from .primitives import (
+    can_use_shared_kv_schedule,
+    causal_window_mask,
+    load_bhsd,
+    load_bs,
+    store_bhsd,
+)
+from .shared_backward import (
+    _selected_attention_bwd_dq_shared,
+    _selected_attention_bwd_dsparse_kv_shared,
+)
 
 
 @triton.jit
@@ -531,6 +541,7 @@ def _launch_backward(
     lse: torch.Tensor,
     grad_output: torch.Tensor,
     sliding_window_size: int,
+    share_kv: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch backward kernels for selected attention."""
     batch, heads, seq_len, head_dim = query.shape
@@ -546,52 +557,98 @@ def _launch_backward(
     # Expanded shared KV has a zero head stride, but its per-head gradients
     # need distinct storage before ExpandBackward sums them.
     grad_local_kv = torch.empty(local_kv.shape, device=local_kv.device, dtype=local_kv.dtype)
-    grad_sink_fp32 = torch.zeros(heads, device=query.device, dtype=torch.float32)
 
     has_doc_ids = doc_ids is not None
     doc_ids = query if doc_ids is None else doc_ids
     use_tma = can_use_tma(query) and can_use_tma(local_kv) and can_use_tma(grad_output)
 
-    num_local_key_tiles = (
-        triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
-    )
     num_local_query_tiles = (
         triton.cdiv(sliding_window_size + block_n - 1, block_m) if sliding_window_size else 0
     )
 
-    _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
-        query,
-        sparse_kv,
-        local_kv,
-        kv_indices,
-        doc_ids,
-        output,
-        grad_output,
-        lse,
-        attention_sink,
-        grad_query,
-        grad_sink_fp32,
-        QUERY_STRIDES=query.stride(),
-        SPARSE_KV_STRIDES=sparse_kv.stride(),
-        LOCAL_KV_STRIDES=local_kv.stride(),
-        KV_INDICES_STRIDES=kv_indices.stride(),
-        DOC_IDS_STRIDES=doc_ids.stride(),
-        LSE_STRIDES=lse.stride(),
-        H=heads,
-        S=seq_len,
-        D=head_dim,
-        SPARSE_SEQ_LEN=sparse_seq_len,
-        TOPK=topk,
-        WINDOW=sliding_window_size,
-        SCALE=scale,
-        HAS_DOC_IDS=has_doc_ids,
-        NUM_LOCAL_TILES=num_local_key_tiles,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_D=block_d,
-        num_warps=8,
-        num_stages=3,
+    # Zero head strides share values; share_kv also guarantees autograd will sum dKV heads.
+    use_shared_schedule = (
+        share_kv
+        and can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size)
+        and head_dim <= 128
     )
+    if use_shared_schedule:
+        block_h = min(32, triton.next_power_of_2(heads))
+        block_k = max(16, min(64, triton.next_power_of_2(topk)))
+        grad_sink_partials = torch.empty(
+            batch, heads, seq_len, device=query.device, dtype=torch.float32
+        )
+        _selected_attention_bwd_dq_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            doc_ids,
+            output,
+            grad_output,
+            lse,
+            attention_sink,
+            grad_query,
+            grad_sink_partials,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            LOCAL_KV_STRIDES=local_kv.stride(),
+            KV_INDICES_STRIDES=kv_indices.stride(),
+            DOC_IDS_STRIDES=doc_ids.stride(),
+            LSE_STRIDES=lse.stride(),
+            GRAD_SINK_PARTIALS_STRIDES=grad_sink_partials.stride(),
+            B=batch,
+            H=heads,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            WINDOW=sliding_window_size,
+            SCALE=scale,
+            HAS_DOC_IDS=has_doc_ids,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            BLOCK_D=block_d,
+        )
+        grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
+    else:
+        num_local_key_tiles = (
+            triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
+        )
+        grad_sink_fp32 = torch.zeros(heads, device=query.device, dtype=torch.float32)
+        _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            doc_ids,
+            output,
+            grad_output,
+            lse,
+            attention_sink,
+            grad_query,
+            grad_sink_fp32,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            LOCAL_KV_STRIDES=local_kv.stride(),
+            KV_INDICES_STRIDES=kv_indices.stride(),
+            DOC_IDS_STRIDES=doc_ids.stride(),
+            LSE_STRIDES=lse.stride(),
+            H=heads,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            WINDOW=sliding_window_size,
+            SCALE=scale,
+            HAS_DOC_IDS=has_doc_ids,
+            NUM_LOCAL_TILES=num_local_key_tiles,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_d,
+            num_warps=8,
+            num_stages=3,
+        )
 
     local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
     if use_tma:
@@ -650,10 +707,25 @@ def _launch_backward(
         )
 
     if topk > 0:
-        grad_sparse_kv = torch.empty(
-            sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
-        )
-        _selected_attention_bwd_dsparse_kv[(sparse_seq_len, batch * heads)](
+        if use_shared_schedule:
+            # ExpandBackward sums every head slot, including slots no tile writes.
+            grad_sparse_kv = torch.zeros(
+                sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
+            )
+            sparse_kernel = _selected_attention_bwd_dsparse_kv_shared
+            sparse_grid = lambda meta: (
+                sparse_seq_len,
+                batch,
+                triton.cdiv(heads, meta["BLOCK_H"]),
+            )
+        else:
+            grad_sparse_kv = torch.empty(
+                sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
+            )
+            sparse_kernel = _selected_attention_bwd_dsparse_kv
+            sparse_grid = (sparse_seq_len, batch * heads)
+
+        sparse_kernel[sparse_grid](
             query,
             sparse_kv,
             selected_queries,

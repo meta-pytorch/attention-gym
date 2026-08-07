@@ -1,9 +1,35 @@
 """Triton primitives shared by selected-attention kernel schedules."""
 
+import torch
 import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
+
+
+def can_use_shared_kv_schedule(
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
+    local_kv: torch.Tensor,
+    sliding_window_size: int,
+) -> bool:
+    """Check Blackwell shared-KV constraints common to forward and backward.
+
+    Callers enforce the head-dimension limits supported by their kernel.
+    """
+    _, heads, _, head_dim = query.shape
+    return (
+        torch.cuda.get_device_capability(query.device)[0] >= 10
+        and query.dtype == torch.bfloat16
+        and sparse_kv.stride(1) == 0
+        and local_kv.stride(1) == 0
+        and query.stride(-1) == 1
+        and sparse_kv.stride(-1) == 1
+        and local_kv.stride(-1) == 1
+        and 16 <= heads <= 128
+        and head_dim % 16 == 0
+        and sliding_window_size <= 2048
+    )
 
 
 @triton.jit

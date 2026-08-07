@@ -19,6 +19,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         attention_sink: torch.Tensor,
         doc_ids: torch.Tensor | None,
         sliding_window_size: int,
+        share_kv: bool,
     ) -> torch.Tensor:
         output, lse = _launch_forward(
             query,
@@ -43,6 +44,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         )
         ctx.doc_ids = doc_ids
         ctx.sliding_window_size = sliding_window_size
+        ctx.share_kv = share_kv
         return output
 
     @staticmethod
@@ -71,8 +73,9 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             lse,
             grad_output,
             ctx.sliding_window_size,
+            ctx.share_kv,
         )
-        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None
+        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None, None
 
 
 def selected_attention(
@@ -83,7 +86,7 @@ def selected_attention(
     attention_sink: torch.Tensor,
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
-    share_kv: bool = True,
+    share_kv: bool,
 ) -> torch.Tensor:
     """Triton implementation of selected attention.
 
@@ -95,7 +98,7 @@ def selected_attention(
         attention_sink: (heads,) — learned per-head sink weight.
         doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
         sliding_window_size: size of the causal sliding window.
-        share_kv: if True, expand single-head KV to all heads.
+        share_kv: if True, expand single-head KV and sum its per-head gradients.
 
     Returns:
         Attention output with same shape as query.
@@ -125,7 +128,14 @@ def selected_attention(
         )
     if requires_grad:
         return _SelectedAttentionFunction.apply(
-            query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            sliding_window_size,
+            share_kv,
         )
     return _launch_forward(
         query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
