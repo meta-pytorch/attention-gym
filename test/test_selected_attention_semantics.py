@@ -538,10 +538,24 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
 def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
-    """The head-major shared-KV path matches eager and has deterministic gradients."""
+    """The default atomic shared-KV path matches eager forward and gradients."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    kv_indices = kv_indices.to(torch.int32)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
+    high_precision_inputs = tuple(
+        tensor.detach().double().requires_grad_(True) for tensor in differentiable_inputs
+    )
 
+    high_precision_expected = selected_attention(
+        high_precision_inputs[0],
+        high_precision_inputs[1],
+        high_precision_inputs[2],
+        kv_indices,
+        high_precision_inputs[3],
+        doc_ids,
+        19,
+        backend="eager",
+    )
     expected = selected_attention(
         query,
         local_kv,
@@ -563,13 +577,72 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         backend="triton",
     )
     grad_output = torch.randn_like(expected)
-    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
-    actual_grads = torch.autograd.grad(
-        actual, differentiable_inputs, grad_output, retain_graph=True
+    high_precision_grads = torch.autograd.grad(
+        high_precision_expected,
+        high_precision_inputs,
+        grad_output.double(),
     )
-    repeated_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
+    expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
 
-    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.02)
+    assert_matches_low_precision_eager(
+        actual,
+        expected,
+        high_precision_expected,
+        reduction_sizes=(query.shape[-1], kv_indices.shape[-1] + 19),
+    )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0.06, rtol=0.03)
+    assert_matches_low_precision_eager(
+        actual_grads[2],
+        expected_grads[2],
+        high_precision_grads[2],
+        reduction_sizes=(
+            query.shape[-1],
+            kv_indices.shape[-1] + 19,
+            query.shape[1] * query.shape[2],
+        ),
+    )
+
+
+@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
+    """Deterministic mode retains the output-owned shared-KV backward schedule."""
+    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    differentiable_inputs = query, local_kv, sparse_kv, attention_sink
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        expected = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            19,
+            backend="eager",
+        )
+        actual = selected_attention(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            19,
+            backend="triton",
+        )
+        grad_output = torch.randn_like(expected)
+        expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
+        actual_grads = torch.autograd.grad(
+            actual, differentiable_inputs, grad_output, retain_graph=True
+        )
+        repeated_grads = torch.autograd.grad(actual, differentiable_inputs, grad_output)
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
+
     for actual_grad, repeated_grad, expected_grad in zip(
         actual_grads, repeated_grads, expected_grads, strict=True
     ):
@@ -840,9 +913,11 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
     actual_grads = torch.autograd.grad(actual, compiled_inputs, grad_output)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    for actual_grad, expected_grad in zip(actual_grads[:-1], expected_grads[:-1], strict=True):
+    for actual_grad, expected_grad in zip(actual_grads[:2], expected_grads[:2], strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
-    torch.testing.assert_close(actual_grads[-1], expected_grads[-1], atol=1e-6, rtol=1e-6)
+    # Atomic sparse-dKV accumulation order may differ across compiled and eager launches.
+    torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
+    torch.testing.assert_close(actual_grads[3], expected_grads[3], atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")

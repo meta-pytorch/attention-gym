@@ -21,6 +21,10 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         sliding_window_size: int,
         share_kv: bool,
     ) -> torch.Tensor:
+        if share_kv:
+            sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
+            local_kv = local_kv.expand(-1, query.shape[1], -1, -1)
+
         output, lse = _launch_forward(
             query,
             sparse_kv,
@@ -30,6 +34,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             doc_ids,
             sliding_window_size,
         )
+        # Keep the output-owned fallback available if deterministic mode is enabled before backward.
         selected_queries, block_offsets = _build_index_query_map(kv_indices, sparse_kv.shape[2])
         ctx.save_for_backward(
             query,
@@ -98,7 +103,7 @@ def selected_attention(
         attention_sink: (heads,) — learned per-head sink weight.
         doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
         sliding_window_size: size of the causal sliding window.
-        share_kv: if True, expand single-head KV and sum its per-head gradients.
+        share_kv: if True, broadcast single-head KV and return single-head gradients.
 
     Returns:
         Attention output with same shape as query.
@@ -107,11 +112,6 @@ def selected_attention(
 
     if query.device.type != "cuda":
         raise ValueError("The Triton selected attention backend requires CUDA tensors.")
-
-    # Expand shared KV heads (stride-zero broadcast; no memory duplication)
-    if share_kv:
-        local_kv = local_kv.expand(-1, heads, -1, -1)
-        sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
 
     query = query.contiguous()
     kv_indices = kv_indices.contiguous()
@@ -137,6 +137,10 @@ def selected_attention(
             sliding_window_size,
             share_kv,
         )
+
+    if share_kv:
+        local_kv = local_kv.expand(-1, heads, -1, -1)
+        sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
     return _launch_forward(
         query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
     )[0]

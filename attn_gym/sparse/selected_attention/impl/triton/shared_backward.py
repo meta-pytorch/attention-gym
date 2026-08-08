@@ -1,8 +1,8 @@
 """Blackwell shared-KV schedules for selected-attention backward.
 
-Each dQ program owns its query and sink-partial outputs. Sparse dKV programs write one
-partial per head tile into the expanded head dimension, which autograd subsequently sums.
-This keeps repeated backward calls from one forward atomic-free and bitwise repeatable.
+The default sparse-dKV schedule forms query-owned top-k-by-dimension gradient tiles and
+atomically scatters them into one FP32 shared-KV gradient. Deterministic mode instead uses
+an inverted query map so each sparse-KV program exclusively owns its output.
 """
 
 import triton
@@ -189,6 +189,137 @@ def _selected_attention_bwd_dq_shared(
         + ptr_offset((batch, offsets_h, sequence), GRAD_SINK_PARTIALS_STRIDES),
         sink_gradient,
         mask=head_mask,
+    )
+
+
+# Atomic configs accumulate into the same FP32 output, so clear it between tuning trials.
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_H": block_h, "BLOCK_K": block_k},
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        for block_h, block_k, num_warps in (
+            (16, 16, 4),
+            (32, 16, 4),
+            (16, 32, 4),
+            (32, 32, 8),
+            (16, 64, 8),
+            (32, 64, 8),
+        )
+    ],
+    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    reset_to_zero=["grad_sparse_kv_ptr"],
+    cache_results=True,
+)
+@triton.jit
+def _selected_attention_bwd_dsparse_kv_shared_atomic(
+    query_ptr,
+    sparse_kv_ptr,
+    kv_indices_ptr,
+    output_ptr,
+    grad_output_ptr,
+    lse_ptr,
+    grad_sparse_kv_ptr,
+    QUERY_STRIDES: tl.constexpr,
+    SPARSE_KV_STRIDES: tl.constexpr,
+    KV_INDICES_STRIDES: tl.constexpr,
+    LSE_STRIDES: tl.constexpr,
+    GRAD_SPARSE_KV_STRIDES: tl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    SPARSE_SEQ_LEN: tl.constexpr,
+    TOPK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Atomically scatter one query's sparse-KV gradient tile into shared dKV."""
+    query_position = tl.program_id(0)
+    batch = tl.program_id(1)
+    tile = tl.program_id(2)
+    num_selected_tiles = tl.cdiv(TOPK, BLOCK_K)
+    head_block = tile // num_selected_tiles
+    selected_block = tile % num_selected_tiles
+
+    offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offsets_k = selected_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    offsets_d = tl.arange(0, BLOCK_D)
+    head_mask = offsets_h < H
+    selected_mask = offsets_k < TOPK
+    dimension_mask = offsets_d < D
+
+    selected_indices = tl.load(
+        kv_indices_ptr + ptr_offset((batch, query_position, offsets_k), KV_INDICES_STRIDES),
+        mask=selected_mask,
+        other=-1,
+    )
+    selected_valid = selected_mask & (selected_indices >= 0) & (selected_indices < SPARSE_SEQ_LEN)
+    selected_indices = tl.where(selected_valid, selected_indices, 0)
+
+    head_dimension_mask = head_mask[:, None] & dimension_mask[None, :]
+    query_offsets = ptr_offset(
+        (batch, offsets_h[:, None], query_position, offsets_d[None, :]),
+        QUERY_STRIDES,
+    )
+    query = tl.load(query_ptr + query_offsets, mask=head_dimension_mask, other=0.0)
+    output = tl.load(output_ptr + query_offsets, mask=head_dimension_mask, other=0.0)
+    grad_output = tl.load(
+        grad_output_ptr + query_offsets,
+        mask=head_dimension_mask,
+        other=0.0,
+    )
+    lse = tl.load(
+        lse_ptr + ptr_offset((batch, offsets_h, query_position), LSE_STRIDES),
+        mask=head_mask,
+        other=0.0,
+    )
+    sparse_values = tl.load(
+        sparse_kv_ptr
+        + ptr_offset(
+            (batch, 0, selected_indices[:, None], offsets_d[None, :]),
+            SPARSE_KV_STRIDES,
+        ),
+        mask=selected_valid[:, None] & dimension_mask[None, :],
+        other=0.0,
+    )
+
+    scores = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
+    probabilities = tl.where(
+        head_mask[:, None] & selected_valid[None, :],
+        tl.exp(scores - lse[:, None]),
+        0.0,
+    )
+    grad_probabilities = tl.dot(
+        grad_output,
+        tl.trans(sparse_values),
+        input_precision="tf32x3",
+    )
+    delta = tl.sum(grad_output * output, axis=1)
+    grad_scores = probabilities * (grad_probabilities - delta[:, None])
+    grad_values = tl.dot(
+        tl.trans(probabilities.to(grad_output.dtype)),
+        grad_output,
+        input_precision="tf32x3",
+    )
+    grad_values += tl.dot(
+        tl.trans((grad_scores * SCALE).to(query.dtype)),
+        query,
+        input_precision="tf32x3",
+    )
+
+    tl.atomic_add(
+        grad_sparse_kv_ptr
+        + ptr_offset(
+            (batch, 0, selected_indices[:, None], offsets_d[None, :]),
+            GRAD_SPARSE_KV_STRIDES,
+        ),
+        grad_values,
+        mask=selected_valid[:, None] & dimension_mask[None, :],
     )
 
 

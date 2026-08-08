@@ -19,6 +19,7 @@ from .primitives import (
 from .shared_backward import (
     _selected_attention_bwd_dq_shared,
     _selected_attention_bwd_dsparse_kv_shared,
+    _selected_attention_bwd_dsparse_kv_shared_atomic,
 )
 
 
@@ -706,11 +707,59 @@ def _launch_backward(
             num_stages=3,
         )
 
-    if topk > 0:
+    if topk == 0:
+        kv_heads = 1 if share_kv else heads
+        grad_sparse_kv = torch.zeros(
+            batch,
+            kv_heads,
+            sparse_seq_len,
+            head_dim,
+            device=sparse_kv.device,
+            dtype=sparse_kv.dtype,
+        )
+    elif use_shared_schedule and not torch.are_deterministic_algorithms_enabled():
+        grad_sparse_kv_fp32 = torch.zeros(
+            batch,
+            1,
+            sparse_seq_len,
+            head_dim,
+            device=sparse_kv.device,
+            dtype=torch.float32,
+        )
+        sparse_grid = lambda meta: (
+            seq_len,
+            batch,
+            triton.cdiv(heads, meta["BLOCK_H"]) * triton.cdiv(topk, meta["BLOCK_K"]),
+        )
+        _selected_attention_bwd_dsparse_kv_shared_atomic[sparse_grid](
+            query,
+            sparse_kv,
+            kv_indices,
+            output,
+            grad_output,
+            lse,
+            grad_sparse_kv_fp32,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            KV_INDICES_STRIDES=kv_indices.stride(),
+            LSE_STRIDES=lse.stride(),
+            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv_fp32.stride(),
+            B=batch,
+            H=heads,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            SCALE=scale,
+            BLOCK_D=block_d,
+        )
+        grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
+    else:
         if use_shared_schedule:
-            # ExpandBackward sums every head slot, including slots no tile writes.
-            grad_sparse_kv = torch.zeros(
-                sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
+            grad_sparse_kv_partials = torch.zeros(
+                sparse_kv.shape,
+                device=sparse_kv.device,
+                dtype=sparse_kv.dtype,
             )
             sparse_kernel = _selected_attention_bwd_dsparse_kv_shared
             sparse_grid = lambda meta: (
@@ -719,8 +768,10 @@ def _launch_backward(
                 triton.cdiv(heads, meta["BLOCK_H"]),
             )
         else:
-            grad_sparse_kv = torch.empty(
-                sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
+            grad_sparse_kv_partials = torch.empty(
+                sparse_kv.shape,
+                device=sparse_kv.device,
+                dtype=sparse_kv.dtype,
             )
             sparse_kernel = _selected_attention_bwd_dsparse_kv
             sparse_grid = (sparse_seq_len, batch * heads)
@@ -733,13 +784,13 @@ def _launch_backward(
             output,
             grad_output,
             lse,
-            grad_sparse_kv,
+            grad_sparse_kv_partials,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             SELECTED_QUERIES_STRIDES=selected_queries.stride(),
             BLOCK_OFFSETS_STRIDES=block_offsets.stride(),
             LSE_STRIDES=lse.stride(),
-            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv.stride(),
+            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv_partials.stride(),
             H=heads,
             S=seq_len,
             D=head_dim,
@@ -748,9 +799,13 @@ def _launch_backward(
             SCALE=scale,
             BLOCK_D=block_d,
         )
-    else:
-        grad_sparse_kv = torch.zeros(
-            sparse_kv.shape, device=sparse_kv.device, dtype=sparse_kv.dtype
+        grad_sparse_kv = (
+            grad_sparse_kv_partials.sum(dim=1, keepdim=True)
+            if share_kv
+            else grad_sparse_kv_partials
         )
+
+    if share_kv:
+        grad_local_kv = grad_local_kv.sum(dim=1, keepdim=True)
 
     return grad_query, grad_sparse_kv, grad_local_kv, grad_sink_fp32.to(attention_sink.dtype)
