@@ -22,6 +22,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 _WARPS = [1, 2, 4, 8, 16, 32]
@@ -41,21 +42,28 @@ def l2norm_bwd_kernel1(
     dx,
     eps,
     D,
+    Y_STRIDES: tl.constexpr,
+    RSTD_STRIDES: tl.constexpr,
+    DY_STRIDES: tl.constexpr,
+    DX_STRIDES: tl.constexpr,
     BD: tl.constexpr,
 ):
     # One program per row; the entire feature vector fits in a single [BD] tile.
     i_t = tl.program_id(0).to(tl.int64)
-    base = i_t * D
-    cols = tl.arange(0, BD)
-    mask = cols < D
+    o_d = tl.arange(0, BD)
+    mask = o_d < D
 
-    b_y = tl.load(y + base + cols, mask=mask, other=0.0).to(tl.float32)
-    b_dy = tl.load(dy + base + cols, mask=mask, other=0.0).to(tl.float32)
-    b_rstd = tl.load(rstd + i_t).to(tl.float32)
+    b_y = tl.load(y + ptr_offset((i_t, o_d), Y_STRIDES), mask=mask, other=0.0).to(tl.float32)
+    b_dy = tl.load(dy + ptr_offset((i_t, o_d), DY_STRIDES), mask=mask, other=0.0).to(tl.float32)
+    b_rstd = tl.load(rstd + ptr_offset((i_t,), RSTD_STRIDES)).to(tl.float32)
 
     b_dot = tl.sum(b_dy * b_y)
     b_dx = b_rstd * (b_dy - b_y * b_dot)
-    tl.store(dx + base + cols, b_dx, mask=mask)
+    tl.store(
+        dx + ptr_offset((i_t, o_d), DX_STRIDES),
+        b_dx.to(dx.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @triton.autotune(
@@ -71,6 +79,10 @@ def l2norm_bwd_kernel(
     dx,
     eps,
     T,
+    Y_STRIDES: tl.constexpr,
+    RSTD_STRIDES: tl.constexpr,
+    DY_STRIDES: tl.constexpr,
+    DX_STRIDES: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
@@ -82,12 +94,23 @@ def l2norm_bwd_kernel(
     o_d = tl.arange(0, BD)
     m_t = o_t < T
     m_x = m_t[:, None] & (o_d[None, :] < D)
-    off = o_t[:, None] * D + o_d[None, :]
 
-    b_y = tl.load(y + off, mask=m_x, other=0.0).to(tl.float32)
-    b_dy = tl.load(dy + off, mask=m_x, other=0.0).to(tl.float32)
-    b_rstd = tl.load(rstd + o_t, mask=m_t, other=0.0).to(tl.float32)
+    b_y = tl.load(
+        y + ptr_offset((o_t[:, None], o_d[None, :]), Y_STRIDES),
+        mask=m_x,
+        other=0.0,
+    ).to(tl.float32)
+    b_dy = tl.load(
+        dy + ptr_offset((o_t[:, None], o_d[None, :]), DY_STRIDES),
+        mask=m_x,
+        other=0.0,
+    ).to(tl.float32)
+    b_rstd = tl.load(rstd + ptr_offset((o_t,), RSTD_STRIDES), mask=m_t, other=0.0).to(tl.float32)
 
     b_dot = tl.sum(b_dy * b_y, 1)
     b_dx = b_rstd[:, None] * (b_dy - b_y * b_dot[:, None])
-    tl.store(dx + off, b_dx.to(dx.dtype.element_ty), mask=m_x)
+    tl.store(
+        dx + ptr_offset((o_t[:, None], o_d[None, :]), DX_STRIDES),
+        b_dx.to(dx.dtype.element_ty),
+        mask=m_x,
+    )
