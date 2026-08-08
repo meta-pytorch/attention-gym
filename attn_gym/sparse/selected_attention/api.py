@@ -185,7 +185,9 @@ def selected_attention(
 
         sliding_window_size: Integer, size of sliding window
 
-        backend: one of eager, triton, or cute, controls which backend executes this code
+        backend: one of eager, triton, or cute, controls which backend executes this code.
+            Triton shared-KV backward uses nondeterministic atomic accumulation unless deterministic
+            algorithms are enabled with torch.use_deterministic_algorithms.
 
         mode: Currently only chunked is supported; auto defaults to chunked
     Returns:
