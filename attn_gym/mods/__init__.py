@@ -9,3 +9,4 @@ from attn_gym.mods.graphormer import (
 from attn_gym.mods.latent_attention import generate_mla_rope_score_mod
 from attn_gym.mods.sandwich import generate_sandwich_bias
 from attn_gym.mods.softcapping import generate_tanh_softcap
+from attn_gym.mods.exclusive_sa import exclusive_output_mod
