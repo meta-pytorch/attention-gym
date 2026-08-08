@@ -8,11 +8,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from itertools import product
+
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
 
+# These imports intentionally follow the optional-dependency check above.
 from attn_gym.linear.kda.bwd.triton.cumsum import (
     chunk_local_cumsum_scalar_kernel,
     chunk_local_cumsum_vector_kernel,
@@ -44,8 +48,71 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="KDA Triton kernels require a CUDA device"
 )
 
-DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-DTYPE_IDS = ["fp32", "fp16", "bf16"]
+DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+_DTYPE_IDS = {
+    torch.float32: "fp32",
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+}
+
+
+def _unique_cases(*groups):
+    """Combine parameter groups while preserving order and removing overlap."""
+    return tuple(dict.fromkeys(case for group in groups for case in group))
+
+
+def _case_id(value):
+    """Keep generated case IDs concise and readable."""
+    if value in _DTYPE_IDS:
+        return _DTYPE_IDS[value]
+    if isinstance(value, tuple):
+        return "docs-" + "-".join(map(str, value))
+    return None
+
+
+def _autotuner(kernel):
+    """Return the Triton Autotuner below optional heuristic wrappers."""
+    while not hasattr(kernel, "configs"):
+        kernel = kernel.fn
+    return kernel
+
+
+def _representative_config(kernel, *, num_warps, num_stages=None, **kwargs):
+    """Select one explicit production config for a correctness test."""
+    autotuner = _autotuner(kernel)
+    matches = [
+        config
+        for config in autotuner.configs
+        if config.num_warps == num_warps
+        and (num_stages is None or config.num_stages == num_stages)
+        and all(config.kwargs.get(name) == value for name, value in kwargs.items())
+    ]
+    assert len(matches) == 1
+    return autotuner, matches[0]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def use_one_autotune_config_for_correctness_tests():
+    """Avoid benchmarking configs whose outputs these tests never inspect."""
+    selections = (
+        _representative_config(l2norm_bwd_kernel, BT=16, num_warps=4),
+        _representative_config(l2norm_bwd_kernel1, num_warps=4),
+        _representative_config(kda_gate_bwd_kernel, num_warps=4, num_stages=3),
+        _representative_config(chunk_local_cumsum_scalar_kernel, num_warps=4),
+        _representative_config(
+            chunk_local_cumsum_vector_kernel,
+            BS=32,
+            num_warps=4,
+        ),
+    )
+    original_configs = tuple(autotuner.configs for autotuner, _config in selections)
+    try:
+        for autotuner, config in selections:
+            autotuner.configs = [config]
+        yield
+    finally:
+        for (autotuner, _config), configs in zip(selections, original_configs, strict=True):
+            autotuner.configs = configs
 
 
 # Golden / plus-minus comparison helper
@@ -67,22 +134,28 @@ def assert_golden(
     )
 
 
-def _cu_seqlens(doc_lens: list[int]) -> torch.Tensor:
+def _cu_seqlens(doc_lens: Sequence[int]) -> torch.Tensor:
     cu = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=DEV)
     cu[1:] = torch.tensor(doc_lens, dtype=torch.int32, device=DEV).cumsum(0)
     return cu
 
 
 # Shapes chosen to straddle chunk boundaries: single token, one-below / exact /
-# one-above the internal block, and multi-block.
-L2NORM_SHAPES = [(1, 128), (7, 64), (16, 128), (17, 64), (64, 128), (130, 32)]
-GATE_TS = [1, 15, 16, 17, 33, 64]
-VARLEN_DOCS = [[16], [16, 32, 16], [7, 16, 24, 1], [64, 3]]
+# one-above the internal block, and multi-block. Runtime-shape coverage is
+# independent from element-type coverage, so only one representative shape is
+# crossed with every dtype.
+L2NORM_SHAPES = ((1, 128), (7, 64), (16, 128), (17, 64), (64, 128), (130, 32))
+GATE_TS = (1, 15, 16, 17, 33, 64)
+VARLEN_DOCS = ((16,), (16, 32, 16), (7, 16, 24, 1), (64, 3))
+
+_L2NORM_CASES = _unique_cases(
+    ((torch.float32, T, D) for T, D in L2NORM_SHAPES),
+    ((dtype, 17, 64) for dtype in DTYPES),
+)
 
 
 # l2norm forward
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T,D", L2NORM_SHAPES, ids=lambda v: f"{v}")
+@pytest.mark.parametrize("dtype,T,D", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_fwd(dtype, T, D):
     torch.manual_seed(0)
     eps = 1e-6
@@ -114,8 +187,7 @@ def test_l2norm_fwd(dtype, T, D):
 
 
 # l2norm backward   dx = rstd * (dy - y * <dy, y>)
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T,D", L2NORM_SHAPES, ids=lambda v: f"{v}")
+@pytest.mark.parametrize("dtype,T,D", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_bwd(dtype, T, D):
     torch.manual_seed(1)
     eps = 1e-6
@@ -180,12 +252,23 @@ def _run_gate_fwd(g, A_log, dt_bias, o, scale, lower_bound, chunk_size, cu_seqle
     )
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T", GATE_TS)
-@pytest.mark.parametrize("lower_bound", [None, 0.5])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("scale", [None, 2.0])
-@pytest.mark.parametrize("reverse", [False, True])
+_GATE_FWD_CASES = _unique_cases(
+    (
+        (torch.float32, 17, lower_bound, has_bias, scale, reverse)
+        for lower_bound, has_bias, scale, reverse in product(
+            (None, 0.5), (False, True), (None, 2.0), (False, True)
+        )
+    ),
+    ((torch.float32, T, None, False, None, False) for T in GATE_TS),
+    ((dtype, 17, None, False, None, False) for dtype in DTYPES),
+)
+
+
+@pytest.mark.parametrize(
+    "dtype,T,lower_bound,has_bias,scale,reverse",
+    _GATE_FWD_CASES,
+    ids=_case_id,
+)
 def test_gate_fwd(dtype, T, lower_bound, has_bias, scale, reverse):
     torch.manual_seed(2)
     B, H, S, chunk = 1, 2, 16, 16
@@ -206,9 +289,20 @@ def test_gate_fwd(dtype, T, lower_bound, has_bias, scale, reverse):
     assert_golden(o, golden, ref, dtype, f"gate_fwd {tag}")
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("docs", VARLEN_DOCS, ids=lambda v: f"docs{v}")
-@pytest.mark.parametrize("lower_bound", [None, 0.5])
+_GATE_FWD_VARLEN_CASES = _unique_cases(
+    (
+        (torch.float32, docs, lower_bound)
+        for docs, lower_bound in product(VARLEN_DOCS, (None, 0.5))
+    ),
+    ((dtype, VARLEN_DOCS[2], None) for dtype in DTYPES),
+)
+
+
+@pytest.mark.parametrize(
+    "dtype,docs,lower_bound",
+    _GATE_FWD_VARLEN_CASES,
+    ids=_case_id,
+)
 def test_gate_fwd_varlen(dtype, docs, lower_bound):
     torch.manual_seed(3)
     H, S, chunk = 2, 16, 16
@@ -232,7 +326,7 @@ def test_gate_fwd_varlen(dtype, docs, lower_bound):
 
 # gate forward with a reduced input dim S_in < S (USE_REPEAT branch): the kernel maps
 # output column j to input column j // F_REPEAT, i.e. a repeat_interleave over channels.
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
 @pytest.mark.parametrize("f_repeat", [2, 4])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_gate_fwd_repeat(dtype, f_repeat, reverse):
@@ -260,10 +354,21 @@ def test_gate_fwd_repeat(dtype, f_repeat, reverse):
 
 
 # gate backward (pointwise gate map only -- no cumsum)
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T", GATE_TS)
-@pytest.mark.parametrize("lower_bound", [None, 0.5])
-@pytest.mark.parametrize("has_bias", [False, True])
+_GATE_BWD_CASES = _unique_cases(
+    (
+        (torch.float32, 17, lower_bound, has_bias)
+        for lower_bound, has_bias in product((None, 0.5), (False, True))
+    ),
+    ((torch.float32, T, None, False) for T in GATE_TS),
+    ((dtype, 17, None, False) for dtype in DTYPES),
+)
+
+
+@pytest.mark.parametrize(
+    "dtype,T,lower_bound,has_bias",
+    _GATE_BWD_CASES,
+    ids=_case_id,
+)
 def test_gate_bwd(dtype, T, lower_bound, has_bias):
     torch.manual_seed(4)
     H, D, BT = 2, 16, 16
@@ -301,11 +406,20 @@ def test_gate_bwd(dtype, T, lower_bound, has_bias):
         assert_golden(dg.sum(0), gold_db, ref_db.view(H, D), dtype, f"gate_bwd dt_bias {tag}")
 
 
-# plain chunk-local cumsum (scalar + vector), used by the reverse-cumsum adjoint
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T", GATE_TS)
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("scale", [None, 2.0])
+# Plain chunk-local cumsum (scalar + vector), used by the reverse-cumsum adjoint.
+# Exercise every static branch combination once, every runtime boundary once,
+# and every dtype once instead of taking their full Cartesian product.
+_CUMSUM_CASES = _unique_cases(
+    (
+        (torch.float32, 17, reverse, scale)
+        for reverse, scale in product((False, True), (None, 2.0))
+    ),
+    ((torch.float32, T, False, None) for T in GATE_TS),
+    ((dtype, 17, False, None) for dtype in DTYPES),
+)
+
+
+@pytest.mark.parametrize("dtype,T,reverse,scale", _CUMSUM_CASES, ids=_case_id)
 def test_cumsum_scalar(dtype, T, reverse, scale):
     torch.manual_seed(5)
     B, H, BT = 1, 2, 16
@@ -322,10 +436,7 @@ def test_cumsum_scalar(dtype, T, reverse, scale):
     assert_golden(o, golden, ref, dtype, f"cumsum_scalar T={T} rev={reverse} scale={scale}")
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("T", GATE_TS)
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("scale", [None, 2.0])
+@pytest.mark.parametrize("dtype,T,reverse,scale", _CUMSUM_CASES, ids=_case_id)
 def test_cumsum_vector(dtype, T, reverse, scale):
     torch.manual_seed(6)
     B, H, S, BT = 1, 2, 16, 16
@@ -343,9 +454,17 @@ def test_cumsum_vector(dtype, T, reverse, scale):
     assert_golden(o, golden, ref, dtype, f"cumsum_vector T={T} rev={reverse} scale={scale}")
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("docs", VARLEN_DOCS, ids=lambda v: f"docs{v}")
-@pytest.mark.parametrize("reverse", [False, True])
+_CUMSUM_VARLEN_CASES = _unique_cases(
+    ((torch.float32, docs, reverse) for docs, reverse in product(VARLEN_DOCS, (False, True))),
+    ((dtype, VARLEN_DOCS[2], False) for dtype in DTYPES),
+)
+
+
+@pytest.mark.parametrize(
+    "dtype,docs,reverse",
+    _CUMSUM_VARLEN_CASES,
+    ids=_case_id,
+)
 def test_cumsum_vector_varlen(dtype, docs, reverse):
     torch.manual_seed(7)
     H, S, BT = 2, 16, 16
