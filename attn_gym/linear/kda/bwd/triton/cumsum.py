@@ -13,12 +13,19 @@
 #   * scalar gates  (B, T, H)      -> chunk_local_cumsum_scalar_kernel
 #   * vector gates  (B, T, H, S)   -> chunk_local_cumsum_vector_kernel
 # with optional variable-length packing via (cu_seqlens, chunk_indices) and an
-# optional output scale.
+# optional output scale. Token-major scalar gates reuse the vector kernel through
+# a zero-copy (B, T, 1, H) view after layout normalization.
 
+import torch
 import triton
 import triton.language as tl
 
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, check_shared_mem
+from attn_gym.linear.kda.utils import (
+    autotune_cache_kwargs,
+    check_shared_mem,
+    input_guard,
+    prepare_chunk_indices,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -86,7 +93,8 @@ def chunk_local_cumsum_scalar_kernel(
 )
 @triton.autotune(
     configs=[triton.Config({"BS": bs}, num_warps=w) for bs in BS_LIST for w in [2, 4, 8]],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    # Batch only scales the grid; sharing its tile keeps the result batch-invariant.
+    key=["H", "S", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -136,3 +144,79 @@ def chunk_local_cumsum_vector_kernel(
     if HAS_SCALE:
         b_o = b_o * scale
     tl.store(o + off, b_o.to(o.dtype.element_ty), mask=m)
+
+
+@input_guard
+def chunk_local_cumsum_scalar(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    head_first: bool = False,
+    output_dtype: torch.dtype | None = torch.float32,
+    chunk_indices: torch.LongTensor | None = None,
+) -> torch.Tensor:
+    """Compute chunk-local cumsums for scalar gates.
+
+    Token-major inputs use a zero-copy ``(B, T, 1, H)`` view of the vector
+    kernel after layout normalization. Head-first inputs retain the scalar
+    kernel. Packed variable-length inputs must be token-major with batch size one.
+    """
+    if g.ndim != 3:
+        raise ValueError(f"Expected a 3D scalar gate, got shape {tuple(g.shape)}")
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
+        raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
+    if cu_seqlens is not None and g.shape[0] != 1:
+        raise ValueError("Packed variable-length inputs must have batch size one")
+    if cu_seqlens is not None and head_first:
+        raise ValueError("Packed variable-length inputs require token-major layout")
+
+    use_vector = not head_first
+    if head_first:
+        batch, heads, tokens = g.shape
+    else:
+        batch, tokens, heads = g.shape
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    chunks = triton.cdiv(tokens, chunk_size) if cu_seqlens is None else len(chunk_indices)
+    output = torch.empty_like(
+        g,
+        dtype=output_dtype if output_dtype is not None else g.dtype,
+    )
+
+    if use_vector:
+
+        def grid(meta):
+            return (triton.cdiv(heads, meta["BS"]), chunks, batch)
+
+        chunk_local_cumsum_vector_kernel[grid](
+            g.view(batch, tokens, 1, heads),
+            output.view(batch, tokens, 1, heads),
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            tokens,
+            B=batch,
+            H=1,
+            S=heads,
+            BT=chunk_size,
+            REVERSE=reverse,
+            HEAD_FIRST=False,
+        )
+    else:
+        chunk_local_cumsum_scalar_kernel[(chunks, batch * heads)](
+            g,
+            output,
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            tokens,
+            B=batch,
+            H=heads,
+            BT=chunk_size,
+            REVERSE=reverse,
+            HEAD_FIRST=head_first,
+        )
+    return output
