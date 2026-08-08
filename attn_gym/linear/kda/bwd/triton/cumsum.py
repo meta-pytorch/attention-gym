@@ -13,15 +13,24 @@
 # head-first layouts. The leading batch stride is passed separately so Triton can
 # specialize on its alignment without treating its T-dependent value as constexpr;
 # inner strides remain constexpr for codegen. Variable-length packing and an
-# optional output scale are also supported.
+# optional output scale are also supported. Larger token-major scalar gates reuse
+# the vector kernel through a zero-copy (B, T, 1, H) view.
 
+import torch
 import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, check_shared_mem
+from attn_gym.linear.kda.utils import (
+    autotune_cache_kwargs,
+    check_shared_mem,
+    input_guard,
+    prepare_chunk_indices,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+# H=8 is near the scalar/vector crossover on GB300; K3's supported shapes start at H=16.
+_MIN_VECTOR_HEADS = 16
 
 
 @triton.heuristics(
@@ -98,7 +107,8 @@ def chunk_local_cumsum_scalar_kernel(
 )
 @triton.autotune(
     configs=[triton.Config({"BS": bs}, num_warps=w) for bs in BS_LIST for w in [2, 4, 8]],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    # BS changes the scan order; exclude grid-only B so batch changes reuse one tile.
+    key=["H", "S", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -167,3 +177,83 @@ def chunk_local_cumsum_vector_kernel(
         b_o.to(o.dtype.element_ty),
         mask=m,
     )
+
+
+@input_guard(no_guard_contiguous=("g",))
+def chunk_local_cumsum_scalar(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    head_first: bool = False,
+    output_dtype: torch.dtype | None = torch.float32,
+    chunk_indices: torch.LongTensor | None = None,
+) -> torch.Tensor:
+    """Compute chunk-local cumsums for scalar gates.
+
+    Token-major inputs with at least 16 heads use a zero-copy ``(B, T, 1, H)``
+    view of the vector kernel, including for strided tensors. Smaller and
+    head-first inputs retain the scalar kernel. Packed inputs require batch size one.
+    """
+    if g.ndim != 3:
+        raise ValueError(f"Expected a 3D scalar gate, got shape {tuple(g.shape)}")
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
+        raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
+    if cu_seqlens is not None and g.shape[0] != 1:
+        raise ValueError("Packed variable-length inputs must have batch size one")
+
+    output = torch.empty_like(
+        g,
+        dtype=output_dtype if output_dtype is not None else g.dtype,
+    )
+    source = g.transpose(1, 2) if head_first else g
+    destination = output.transpose(1, 2) if head_first else output
+    batch, tokens, heads = source.shape
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    chunks = triton.cdiv(tokens, chunk_size) if cu_seqlens is None else len(chunk_indices)
+
+    if not head_first and heads >= _MIN_VECTOR_HEADS:
+        source = source.unsqueeze(2)
+        destination = destination.unsqueeze(2)
+
+        def grid(meta):
+            return (triton.cdiv(heads, meta["BS"]), chunks, batch)
+
+        chunk_local_cumsum_vector_kernel[grid](
+            source,
+            destination,
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            tokens,
+            source.stride(0),
+            destination.stride(0),
+            S_STRIDES=source.stride()[1:],
+            O_STRIDES=destination.stride()[1:],
+            B=batch,
+            H=1,
+            S=heads,
+            BT=chunk_size,
+            REVERSE=reverse,
+        )
+    else:
+        chunk_local_cumsum_scalar_kernel[(chunks, batch * heads)](
+            source,
+            destination,
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            tokens,
+            source.stride(0),
+            destination.stride(0),
+            S_STRIDES=source.stride()[1:],
+            O_STRIDES=destination.stride()[1:],
+            B=batch,
+            H=heads,
+            BT=chunk_size,
+            REVERSE=reverse,
+        )
+    return output
