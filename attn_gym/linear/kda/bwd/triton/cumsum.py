@@ -9,15 +9,16 @@
 # adjoint of a forward prefix-sum is a reverse prefix-sum), so both directions
 # are supported.
 #
-# Two layouts are handled:
-#   * scalar gates  (B, T, H)      -> chunk_local_cumsum_scalar_kernel
-#   * vector gates  (B, T, H, S)   -> chunk_local_cumsum_vector_kernel
-# with optional variable-length packing via (cu_seqlens, chunk_indices) and an
-# optional output scale.
+# The kernels use logical (B, T, H[, S]) strides, including for physical
+# head-first layouts. The leading batch stride is passed separately so Triton can
+# specialize on its alignment without treating its T-dependent value as constexpr;
+# inner strides remain constexpr for codegen. Variable-length packing and an
+# optional output scale are also supported.
 
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, check_shared_mem
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -42,14 +43,18 @@ def chunk_local_cumsum_scalar_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    s_batch_stride,
+    o_batch_stride,
+    S_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
 ):
+    tl.static_assert(not IS_VARLEN or B == 1, "packed varlen requires B == 1")
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -62,20 +67,27 @@ def chunk_local_cumsum_scalar_kernel(
         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
-        bos = i_b * T
+        bos = 0
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
-    if HEAD_FIRST:
-        off = bos * H + i_h * T + o_t
-    else:
-        off = bos * H + i_h + o_t * H
+    token = bos + o_t if IS_VARLEN else o_t
 
-    b_s = tl.load(s + off, mask=m_t, other=0.0).to(tl.float32)
+    s_batch_offset = i_b * s_batch_stride if B > 1 else 0
+    b_s = tl.load(
+        s + s_batch_offset + ptr_offset((token, i_h), S_STRIDES),
+        mask=m_t,
+        other=0.0,
+    ).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0, reverse=REVERSE)
     if HAS_SCALE:
         b_o = b_o * scale
-    tl.store(o + off, b_o.to(o.dtype.element_ty), mask=m_t)
+    o_batch_offset = i_b * o_batch_stride if B > 1 else 0
+    tl.store(
+        o + o_batch_offset + ptr_offset((token, i_h), O_STRIDES),
+        b_o.to(o.dtype.element_ty),
+        mask=m_t,
+    )
 
 
 @triton.heuristics(
@@ -97,6 +109,10 @@ def chunk_local_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    s_batch_stride,
+    o_batch_stride,
+    S_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -105,9 +121,9 @@ def chunk_local_cumsum_vector_kernel(
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
 ):
-    i_s = tl.program_id(0)
+    tl.static_assert(not IS_VARLEN or B == 1, "packed varlen requires B == 1")
+    i_s = tl.program_id(0).to(tl.int64)
     i_t = tl.program_id(1).to(tl.int64)
     i_bh = tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -119,20 +135,35 @@ def chunk_local_cumsum_vector_kernel(
         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
-        bos = i_b * T
+        bos = 0
 
     o_t = i_t * BT + tl.arange(0, BT)
     o_s = i_s * BS + tl.arange(0, BS)
     m = (o_t[:, None] < T) & (o_s[None, :] < S)
-    # (B, T, H, S) row-major: token stride H*S, head offset i_h*S (or i_h*T*S
-    # when the head axis precedes time in a head-first packing).
-    if HEAD_FIRST:
-        off = (bos * H + i_h * T) * S + o_t[:, None] * S + o_s[None, :]
-    else:
-        off = (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
+    token = bos + o_t if IS_VARLEN else o_t
 
-    b_s = tl.load(s + off, mask=m, other=0.0).to(tl.float32)
+    s_batch_offset = i_b * s_batch_stride if B > 1 else 0
+    b_s = tl.load(
+        s
+        + s_batch_offset
+        + ptr_offset(
+            (token[:, None], i_h, o_s[None, :]),
+            S_STRIDES,
+        ),
+        mask=m,
+        other=0.0,
+    ).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0, reverse=REVERSE)
     if HAS_SCALE:
         b_o = b_o * scale
-    tl.store(o + off, b_o.to(o.dtype.element_ty), mask=m)
+    o_batch_offset = i_b * o_batch_stride if B > 1 else 0
+    tl.store(
+        o
+        + o_batch_offset
+        + ptr_offset(
+            (token[:, None], i_h, o_s[None, :]),
+            O_STRIDES,
+        ),
+        b_o.to(o.dtype.element_ty),
+        mask=m,
+    )

@@ -26,6 +26,7 @@
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 NUM_WARPS_AUTOTUNE = [4, 8, 16, 32]
@@ -60,6 +61,12 @@ def kda_gate_bwd_kernel(
     dA,
     lower_bound,
     T,
+    G_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    DYG_STRIDES: tl.constexpr,
+    DG_STRIDES: tl.constexpr,
+    DA_STRIDES: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
@@ -67,22 +74,31 @@ def kda_gate_bwd_kernel(
     HAS_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
 ):
-    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
 
     o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
     m_t = o_t < T
     m = m_t[:, None] & (o_d[None, :] < D)
-    # (B*T, H, D) row-major: token stride H*D, head offset i_h*D.
-    off = i_h * D + o_t[:, None] * (H * D) + o_d[None, :]
 
-    b_g = tl.load(g + off, mask=m, other=0.0).to(tl.float32)
-    b_dy = tl.load(dyg + off, mask=m, other=0.0).to(tl.float32)
+    b_g = tl.load(
+        g + ptr_offset((o_t[:, None], i_h, o_d[None, :]), G_STRIDES),
+        mask=m,
+        other=0.0,
+    ).to(tl.float32)
+    b_dy = tl.load(
+        dyg + ptr_offset((o_t[:, None], i_h, o_d[None, :]), DYG_STRIDES),
+        mask=m,
+        other=0.0,
+    ).to(tl.float32)
     if HAS_BIAS:
-        o_b = i_h * D + o_d
-        b_g = b_g + tl.load(dt_bias + o_b, mask=o_b < H * D, other=0.0).to(tl.float32)
+        b_g += tl.load(
+            dt_bias + ptr_offset((i_h, o_d), DT_BIAS_STRIDES),
+            mask=o_d < D,
+            other=0.0,
+        ).to(tl.float32)
 
-    b_alog = tl.load(A_log + i_h).to(tl.float32)
+    b_alog = tl.load(A_log + ptr_offset((i_h,), A_LOG_STRIDES)).to(tl.float32)
     if USE_LOWER_BOUND:
         b_a = tl.exp(b_alog)
         b_s = tl.sigmoid(b_a * b_g)
@@ -96,5 +112,9 @@ def kda_gate_bwd_kernel(
         # dyg/dA_log = yg; masked lanes carry b_dy == 0 and drop out of the sum.
         b_dalog = tl.sum(tl.sum(b_dy * b_yg, 1), 0)
 
-    tl.store(dg + off, b_dg.to(dg.dtype.element_ty), mask=m)
-    tl.store(dA + i_t * H + i_h, b_dalog)
+    tl.store(
+        dg + ptr_offset((o_t[:, None], i_h, o_d[None, :]), DG_STRIDES),
+        b_dg.to(dg.dtype.element_ty),
+        mask=m,
+    )
+    tl.store(dA + ptr_offset((i_t, i_h), DA_STRIDES), b_dalog)

@@ -4,18 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# FORWARD-ONLY KDA gate chunk-cumsum.
-# Ported faithfully (functions copied verbatim) from:
+# FORWARD-ONLY KDA gate chunk-cumsum, derived from:
 #   genai/llama4x/llama4x/ops/fla/ops/kda/gate.py
 #
-# Only imports were rewritten to ``attn_gym.linear.kda.utils``. The `softplus`
-# helper (originally `fla.ops.utils.softplus`) is inlined verbatim below.
+# The gate math and launch configuration follow the source implementation. The
+# indexing uses logical stride tuples so inputs and outputs need not be contiguous.
+# The `softplus` helper (originally `fla.ops.utils.softplus`) remains inlined below.
 
 from __future__ import annotations
 
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset, storage_cosize
 from attn_gym.linear.kda.utils import (
     IS_NVIDIA,
     autotune_cache_kwargs,
@@ -130,8 +131,26 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Chunk-cumsum forward path (copied verbatim from the source gate.py).
+# Chunk-cumsum forward kernels.
+# s_batch_stride + S_STRIDES describe s as logical (B, T, H, S_in), while
+# o_batch_stride + O_STRIDES describe o as logical (B, T, H, S). In varlen mode,
+# T is the total number of packed tokens.
 # ---------------------------------------------------------------------------
+def _requires_int64_offsets(args):
+    """Select 64-bit indexing when any tensor offset can exceed int32."""
+    input_cosize = storage_cosize(
+        (args["B"], args["T"], args["H"], args["S_in"]),
+        (args["s_batch_stride"], *args["S_STRIDES"]),
+    )
+    output_cosize = storage_cosize(
+        (args["B"], args["T"], args["H"], args["S"]),
+        (args["o_batch_stride"], *args["O_STRIDES"]),
+    )
+    bias_cosize = storage_cosize((args["H"], args["S"]), args["DT_BIAS_STRIDES"])
+    a_log_cosize = storage_cosize((args["H"],), args["A_LOG_STRIDES"])
+    return max(input_cosize, output_cosize, bias_cosize, a_log_cosize) > 1 << 31
+
+
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
@@ -140,6 +159,7 @@ else:
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
         "USE_REPEAT": lambda args: args["S_in"] != args["S"],
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
 )
 @triton.autotune(
@@ -162,6 +182,12 @@ def kda_gate_chunk_cumsum_vector_kernel(
     lower_bound,
     T,
     num_chunks,
+    s_batch_stride,
+    o_batch_stride,
+    S_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -176,8 +202,16 @@ def kda_gate_chunk_cumsum_vector_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     USE_REPEAT: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
-    i_t, i_bh, i_s = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    tl.static_assert(not IS_VARLEN or B == 1, "packed varlen requires B == 1")
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_s = tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        i_t = i_t.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
+        i_s = i_s.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
@@ -191,68 +225,64 @@ def kda_gate_chunk_cumsum_vector_kernel(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if USE_INT64_OFFSETS:
+            i_t = i_t.to(tl.int64)
+            bos = bos.to(tl.int64)
     else:
-        bos, eos = i_b * T, i_b * T + T
+        bos = 0
 
-    if USE_REPEAT:
-        # Input g has reduced dimension S_in = S / F_REPEAT
-        # We read from S_in and produce output of dimension S
-        # i_s indexes output blocks of size BS in the full dimension S
-        # Map output column indices to input column indices via integer division
-        b_out_cols = i_s * BS + tl.arange(0, BS)  # [BS] output column indices
-        b_in_cols = b_out_cols // F_REPEAT  # [BS] input column indices
-
-        # Load g from reduced dimension using gather
-        b_t_offs = i_t * BT + tl.arange(0, BT)  # [BT]
-        b_s_ptrs = s + ((bos + b_t_offs[:, None]) * H + i_h) * S_in + b_in_cols[None, :]
-        b_mask = (b_t_offs[:, None] < T) & (b_out_cols[None, :] < S)
-        b_s = tl.load(b_s_ptrs, mask=b_mask, other=0.0).to(tl.float32)
-    else:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        # [BT, BS]
-        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * S,
-        (T, S),
-        (H * S, 1),
-        (i_t * BT, i_s * BS),
-        (BT, BS),
-        (1, 0),
-    )
+    b_out_cols = i_s * BS + tl.arange(0, BS)
+    b_in_cols = b_out_cols // F_REPEAT if USE_REPEAT else b_out_cols
+    b_t_offs = i_t * BT + tl.arange(0, BT)
+    token = bos + b_t_offs if IS_VARLEN else b_t_offs
+    m_t = b_t_offs < T
+    b_mask = m_t[:, None] & (b_out_cols[None, :] < S)
+    s_batch_offset = i_b * s_batch_stride if B > 1 else 0
+    b_s = tl.load(
+        s
+        + s_batch_offset
+        + ptr_offset(
+            (token[:, None], i_h, b_in_cols[None, :]),
+            S_STRIDES,
+        ),
+        mask=b_mask,
+        other=0.0,
+    ).to(tl.float32)
 
     # Apply dt_bias if exists (dt_bias is always in full dimension S)
     if HAS_BIAS:
-        p_b = tl.make_block_ptr(dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,))
-        b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
+        b_bias = tl.load(
+            dt_bias + ptr_offset((i_h, b_out_cols), DT_BIAS_STRIDES),
+            mask=b_out_cols < S,
+            other=0.0,
+        ).to(tl.float32)
         b_s = b_s + b_bias[None, :]
 
-    b_A = tl.load(A_log + i_h).to(tl.float32)
+    b_A = tl.load(A_log + ptr_offset((i_h,), A_LOG_STRIDES)).to(tl.float32)
     if not USE_LOWER_BOUND:  # pyrefly: ignore[unsupported-operation]
         # Apply gate: -exp(A_log) * softplus(g + bias)
         b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
     else:
         b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
 
-    m_t = (i_t * BT + tl.arange(0, BT)) < T
     b_gate = tl.where(m_t[:, None], b_gate, 0.0)
 
     # Apply chunk local cumsum
-    if REVERSE:
-        b_o = tl.cumsum(b_gate, axis=0, reverse=True)
-    else:
-        b_o = tl.cumsum(b_gate, axis=0)
+    b_o = tl.cumsum(b_gate, axis=0, reverse=REVERSE)
 
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    o_batch_offset = i_b * o_batch_stride if B > 1 else 0
+    tl.store(
+        o
+        + o_batch_offset
+        + ptr_offset(
+            (token[:, None], i_h, b_out_cols[None, :]),
+            O_STRIDES,
+        ),
+        b_o.to(o.dtype.element_ty),
+        mask=b_mask,
+    )
 
 
 @triton.heuristics(
@@ -263,6 +293,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
         "USE_REPEAT": lambda args: args["S_in"] != args["S"],
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
 )
 @triton.autotune(
@@ -284,6 +315,12 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
     lower_bound,
     T,
     num_chunks,
+    s_batch_stride,
+    o_batch_stride,
+    S_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -298,13 +335,34 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
     USE_LOWER_BOUND: tl.constexpr,
     USE_REPEAT: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     # pyrefly: ignore [bad-function-definition]
     GRID_NT: tl.constexpr = 0,
     # pyrefly: ignore [bad-function-definition]
     MAX_NT: tl.constexpr = 0,
 ):
-    i_t_start, i_bh, i_s = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    tl.static_assert(not IS_VARLEN or B == 1, "packed varlen requires B == 1")
+    i_t_start = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_s = tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        i_t_start = i_t_start.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
+        i_s = i_s.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
+    b_out_cols = i_s * BS + tl.arange(0, BS)
+    b_in_cols = b_out_cols // F_REPEAT if USE_REPEAT else b_out_cols
+    s_batch_offset = i_b * s_batch_stride if B > 1 else 0
+    o_batch_offset = i_b * o_batch_stride if B > 1 else 0
+    p_s = s + s_batch_offset + ptr_offset((0, i_h, b_in_cols), S_STRIDES)
+    p_o = o + o_batch_offset + ptr_offset((0, i_h, b_out_cols), O_STRIDES)
+    if HAS_BIAS:
+        b_bias = tl.load(
+            dt_bias + ptr_offset((i_h, b_out_cols), DT_BIAS_STRIDES),
+            mask=b_out_cols < S,
+            other=0.0,
+        ).to(tl.float32)
+    b_A = tl.load(A_log + ptr_offset((i_h,), A_LOG_STRIDES)).to(tl.float32)
 
     for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
         i_t_orig = i_t_start + _iter * GRID_NT
@@ -322,59 +380,39 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
                     tl.load(cu_seqlens + i_n + 1).to(tl.int32),
                 )
                 T_local = eos - bos
+                if USE_INT64_OFFSETS:
+                    i_t = i_t.to(tl.int64)
+                    bos = bos.to(tl.int64)
             else:
                 i_t = i_t_orig
-                bos, eos = i_b * T, i_b * T + T
+                bos = 0
                 T_local = T
 
-            if USE_REPEAT:
-                b_out_cols = i_s * BS + tl.arange(0, BS)
-                b_in_cols = b_out_cols // F_REPEAT
-
-                b_t_offs = i_t * BT + tl.arange(0, BT)
-                b_s_ptrs = s + ((bos + b_t_offs[:, None]) * H + i_h) * S_in + b_in_cols[None, :]
-                b_mask = (b_t_offs[:, None] < T_local) & (b_out_cols[None, :] < S)
-                b_s = tl.load(b_s_ptrs, mask=b_mask, other=0.0).to(tl.float32)
-            else:
-                p_s = tl.make_block_ptr(
-                    s + (bos * H + i_h) * S,
-                    (T_local, S),
-                    (H * S, 1),
-                    (i_t * BT, i_s * BS),
-                    (BT, BS),
-                    (1, 0),
-                )
-                b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-
-            p_o = tl.make_block_ptr(
-                o + (bos * H + i_h) * S,
-                (T_local, S),
-                (H * S, 1),
-                (i_t * BT, i_s * BS),
-                (BT, BS),
-                (1, 0),
-            )
+            b_t_offs = i_t * BT + tl.arange(0, BT)
+            token = bos + b_t_offs if IS_VARLEN else b_t_offs
+            m_t = b_t_offs < T_local
+            b_mask = m_t[:, None] & (b_out_cols[None, :] < S)
+            b_s = tl.load(
+                p_s[None, :] + token[:, None] * S_STRIDES[0],
+                mask=b_mask,
+                other=0.0,
+            ).to(tl.float32)
 
             if HAS_BIAS:
-                p_b = tl.make_block_ptr(dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,))
-                b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
                 b_s = b_s + b_bias[None, :]
-
-            b_A = tl.load(A_log + i_h).to(tl.float32)
             if not USE_LOWER_BOUND:  # pyrefly: ignore[unsupported-operation]
                 # pyrefly: ignore [unsupported-operation]
                 b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
             else:
                 b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
 
-            m_t = (i_t * BT + tl.arange(0, BT)) < T_local
             b_gate = tl.where(m_t[:, None], b_gate, 0.0)
-
-            if REVERSE:
-                b_o = tl.cumsum(b_gate, axis=0, reverse=True)
-            else:
-                b_o = tl.cumsum(b_gate, axis=0)
+            b_o = tl.cumsum(b_gate, axis=0, reverse=REVERSE)
 
             if HAS_SCALE:
                 b_o *= scale
-            tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                p_o[None, :] + token[:, None] * O_STRIDES[0],
+                b_o.to(o.dtype.element_ty),
+                mask=b_mask,
+            )
