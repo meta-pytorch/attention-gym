@@ -33,22 +33,18 @@ import torch.nn.functional as F
 import triton
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
-from cutlass.utils.hardware_info import HardwareInfo
 from torch._guards import active_fake_mode
 
+from attn_gym._backends.cute.cache import jit_cache
+from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute.utils import compile_tvm_ffi
 from attn_gym.linear.kda.utils import (
     prepare_chunk_indices,
     prepare_lens,
     tensor_cache,
 )
-
-
-# Simple JIT cache (no external dependency)
-def get_jit_cache(name):
-    """In-memory compilation cache."""
-    return {}
 
 
 @tensor_cache
@@ -95,6 +91,7 @@ class BlackwellDeltaHBwdV1:
         acc_type=cutlass.Float32,
         io_type=cutlass.BFloat16,
         varlen: bool = False,
+        num_heads: int | None = None,
     ):
         assert head_k == 128 and head_v == 128, (
             f"Only head_k=head_v=128 supported, got {head_k},{head_v}"
@@ -106,6 +103,7 @@ class BlackwellDeltaHBwdV1:
         self.acc_type = acc_type
         self.io_type = io_type
         self.varlen = varlen
+        self.num_heads = num_heads
 
         # Tile dimensions
         self.BT = chunk_size  # 64
@@ -148,6 +146,14 @@ class BlackwellDeltaHBwdV1:
             num_threads=self.CTA_THREADS,
         )
         self.align = 1024
+
+    def get_name(self) -> str:
+        """Return a stable artifact and profiler name for this specialization."""
+        head_tag = f"_h{self.num_heads}" if self.num_heads is not None else ""
+        return (
+            f"kda_bwd_dhu_v1_vl{int(self.varlen)}{head_tag}"
+            f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}"
+        )
 
     # ------------------------------------------------------------------
     # Host-side setup (__call__): GMEM layouts → TMA → SMEM → launch
@@ -649,6 +655,7 @@ class BlackwellDeltaHBwdV1:
             use_gk,
             use_dht,
             use_dh0,
+            _name_prefix=self.get_name(),
         ).launch(
             grid=self.grid,
             block=[self.CTA_THREADS, 1, 1],
@@ -1686,8 +1693,10 @@ class BlackwellDeltaHBwdV1:
         return o_dv, o_qdo, o_wdv, total
 
     def _launch_grid(self, B, H, V):
-        # Fixed grid = SM_count for CUDA graph compatibility
-        sm_count = HardwareInfo().get_device_multiprocessor_count()
+        # Target metadata is inherited by forked compile workers; do not query CUDA here.
+        sm_count = get_compile_target().sm_count
+        if sm_count is None:
+            raise RuntimeError("KDA compilation requires a CUDA target with an SM count")
         return (sm_count, 1, 1)
 
 
@@ -1695,9 +1704,8 @@ class BlackwellDeltaHBwdV1:
 # Compile cache + TVM-FFI
 # ============================================================================
 
-_bwd_dhu_cache = get_jit_cache("kda_delta_h_bwd")
 
-
+@jit_cache
 def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
     """Compile one BlackwellDeltaHBwdV1 variant."""
     kern = BlackwellDeltaHBwdV1(
@@ -1706,6 +1714,7 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
         head_v=V,
         head_bv=bv,
         varlen=varlen,
+        num_heads=H,
     )
     sa, sb, snt, sn, sns = (cute.sym_int() for _ in range(5))
 
@@ -1814,9 +1823,8 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
     cuf = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=128)
     cof = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=128)
     nsf = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=128)
-    stf = make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    return cute.compile(
+    return compile_tvm_ffi(
         kern,
         qf,
         kf,
@@ -1837,21 +1845,12 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
         Int32(0),
         Int32(0),
         Int32(0),
-        stf,
-        options="--enable-tvm-ffi",
     )
 
 
 def _is_fake_mode() -> bool:
     """True when torch.compile is tracing (FakeTensorMode active)."""
     return active_fake_mode() is not None
-
-
-def _get_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
-    key = (varlen, H, K, V, chunk_size, bv)
-    if key not in _bwd_dhu_cache:
-        _bwd_dhu_cache[key] = _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv)
-    return _bwd_dhu_cache[key]
 
 
 # ============================================================================
@@ -1953,7 +1952,7 @@ def blackwell_delta_h_bwd_dhu_v1(
                 ns_tensor = ns_tensor.unsqueeze(0)
 
         ps = (Int32(N), Int32(T), Int32(H), Int32(K), Int32(V))
-        fn = _get_bwd_dhu(True, H, K, V, chunk_size, bv)
+        fn = _compile_bwd_dhu(True, H, K, V, chunk_size, bv)
         fn(
             q_k,
             k_k,
@@ -1990,7 +1989,7 @@ def blackwell_delta_h_bwd_dhu_v1(
         ns_d = _get_dummy((1,), torch.int32, dev)
 
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
-        fn = _get_bwd_dhu(False, H, K, V, chunk_size, bv)
+        fn = _compile_bwd_dhu(False, H, K, V, chunk_size, bv)
         fn(
             q,
             k,
