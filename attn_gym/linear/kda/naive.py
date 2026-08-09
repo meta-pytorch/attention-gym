@@ -236,6 +236,32 @@ def gate_fwd_ref(
     return chunk_cumsum_ref(gate, chunk_size, reverse, scale, cu_seqlens)
 
 
+def fused_gate_bwd_ref(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    d_cumulative: torch.Tensor,
+    lower_bound: float,
+    scale: float,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiate the bounded gate map and its chunk-local prefix sum.
+
+    This is the reference for the fused KDA backward helper. The adjoint of a
+    forward prefix sum is a reverse prefix sum, so ``d_cumulative`` is scanned
+    in reverse before applying the pointwise gate derivative.
+    """
+    d_gate = chunk_cumsum_ref(
+        d_cumulative,
+        chunk_size,
+        reverse=True,
+        scale=scale,
+    )
+    dg, dA_log, d_bias = gate_bwd_ref(g, A_log, dt_bias, d_gate, lower_bound)
+    assert d_bias is not None
+    return dg, dA_log, d_bias
+
+
 def gate_bwd_ref(
     g: torch.Tensor,
     A_log: torch.Tensor,
@@ -269,6 +295,7 @@ def gate_bwd_ref(
 
 __all__ = [
     "chunk_cumsum_ref",
+    "fused_gate_bwd_ref",
     "gate_bwd_ref",
     "gate_fwd_ref",
     "l2norm_bwd_ref",

@@ -39,7 +39,7 @@ class _CopyReadsOp:
         *_runtime_args: Any,
     ) -> tuple[ReadConfig, ...]:
         """Generate candidates that are sensible for this input shape."""
-        max_threads = max(64, min(256, source.numel()))
+        max_threads = min(256, max(64, source.numel()))
         reads_per_thread = (1,) if source.numel() < 4 else (1, 2, 4)
         return tuple(
             ReadConfig(threads, reads)
@@ -49,8 +49,8 @@ class _CopyReadsOp:
         )
 
     @staticmethod
-    def _name(num_elements: int, threads: int, reads: int) -> str:
-        return f"cute_playground_n{num_elements}_t{threads}_r{reads}"
+    def _name(threads: int, reads: int) -> str:
+        return f"cute_playground_t{threads}_r{reads}"
 
     @cute.kernel
     def _kernel(
@@ -76,18 +76,17 @@ class _CopyReadsOp:
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
-        num_elements: cutlass.Constexpr,
         threads: cutlass.Constexpr,
         reads: cutlass.Constexpr,
         stream,
     ):
-        blocks = (num_elements + threads * reads - 1) // (threads * reads)
+        blocks = cute.ceil_div(cute.size(source), threads * reads)
         self._kernel(
             source,
             destination,
             threads,
             reads,
-            _name_prefix=self._name(num_elements, threads, reads),
+            _name_prefix=self._name(threads, reads),
         ).launch(
             grid=(blocks, 1, 1),
             block=(threads, 1, 1),
@@ -96,8 +95,9 @@ class _CopyReadsOp:
 
     @staticmethod
     @jit_cache
-    def compile(num_elements: int, config: ReadConfig):
-        """Build the fake ABI internally when this specialization misses cache."""
+    def compile(config: ReadConfig):
+        """Build one symbolic-length fake ABI for this codegen config."""
+        num_elements = cute.sym_int()
         source = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
             (num_elements,),
@@ -115,19 +115,18 @@ class _CopyReadsOp:
             op._launch,
             source,
             destination,
-            num_elements,
             config.threads,
             config.reads,
-            name=op._name(num_elements, config.threads, config.reads),
+            name=op._name(config.threads, config.reads),
         )
 
     @staticmethod
     def compile_call(
         config: ReadConfig,
-        source: torch.Tensor,
+        _source: torch.Tensor,
         _destination: torch.Tensor,
-    ) -> tuple[int, ReadConfig]:
-        return source.numel(), config
+    ) -> tuple[ReadConfig]:
+        return (config,)
 
     @staticmethod
     def launch(
