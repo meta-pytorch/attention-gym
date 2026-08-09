@@ -105,9 +105,12 @@ def tune(
     Cold variants can be populated concurrently. Module-scope ``NamedTuple``
     and dataclass configs work directly. A warm invocation skips the compiler
     process, loads every requested artifact, and benchmarks again.
-    ``benchmark`` may replace the default timing policy; it receives a zero-arg
-    callable for one candidate launch. Kernels with destructive or stateful
-    inputs should use that hook to restore state between measurements.
+    Candidates are benchmarked in iteration order. ``benchmark`` may replace
+    the default timing policy; it receives a zero-arg callable for one candidate
+    launch. Destructive or stateful kernels must restore state in that callback.
+    Since this function only returns a config, callers can restore state again
+    before launching the winner; do not use :func:`run_tunable` for such kernels
+    because its winner launch is unconditional.
 
     Use ``compile_call`` when the compile function needs additional static
     arguments::
@@ -178,7 +181,10 @@ def run_tunable(
 
     The return value is ``(launch_result, selected_config)``. Autotuning still
     compiles candidates in parallel and benchmarks launches sequentially, then
-    performs one final launch with the winner.
+    performs one final launch with the winner. Therefore this convenience API
+    requires repeatable, non-destructive launches. An explicit ``target`` is
+    installed process-wide before candidate generation and remains active after
+    this function returns.
     """
     if autotune and config is not None:
         raise ValueError("pass either config= or autotune=True, not both")
@@ -188,6 +194,8 @@ def run_tunable(
     compile_fn = kernel.compile
     if not callable(getattr(compile_fn, "precompile", None)):
         raise TypeError("run_tunable() requires kernel.compile decorated with jit_cache")
+    if target is not None:
+        set_compile_target(target)
     if autotune:
         candidates = kernel.configs(*runtime_args) if configs is None else configs
 
@@ -207,8 +215,6 @@ def run_tunable(
         )
     else:
         selected = kernel.default_config if config is None else config
-        if target is not None:
-            set_compile_target(target)
 
     call_args = _materialize_calls((kernel.compile_call(selected, *runtime_args),))[0]
     compiled = compile_fn(*call_args)

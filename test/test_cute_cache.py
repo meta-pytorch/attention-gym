@@ -15,7 +15,7 @@ from attn_gym._backends.cute import cache as cute_cache
 from attn_gym._backends.cute import compile as cute_compile
 from attn_gym._backends.cute import target as cute_target
 from attn_gym._backends.cute.tune import benchmark_gpu, run_tunable, tune
-from attn_gym._backends.cute.utils import compile_tvm_ffi
+from attn_gym._backends.cute.utils import ceildiv, compile_tvm_ffi
 
 _DRIVER_LOG_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_LOG"
 _DRIVER_READY_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_READY"
@@ -23,7 +23,7 @@ _DRIVER_EXPECTED_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_EXPECTED"
 
 
 class CompileConfig(NamedTuple):
-    """Typed static config used across the JSON exec boundary."""
+    """Typed static config used across the compiler-process boundary."""
 
     variant: str
     timing: float
@@ -124,6 +124,12 @@ def test_cache_directory_can_be_overridden(tmp_path, monkeypatch):
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(configured_path))
 
     assert cute_cache.get_cache_path() == configured_path
+
+
+def test_ceildiv():
+    assert ceildiv(0, 3) == 0
+    assert ceildiv(1, 3) == 1
+    assert ceildiv(7, 3) == 3
 
 
 def test_compile_tvm_ffi_enforces_the_compile_contract():
@@ -378,6 +384,47 @@ def test_run_tunable_uses_kernel_convention(isolated_cache):
 
     with pytest.raises(TypeError, match="tuple of positional static arguments"):
         run_tunable(InvalidCompileCall, "toy", launches)
+
+
+def test_run_tunable_sets_target_before_candidate_generation(isolated_cache):
+    """Generate target-aware candidates from the explicitly requested device."""
+    config = CompileConfig("target-aware", 1.0)
+    target = cute_target.CompileTarget(device_type="cuda", capability=(10, 3))
+    observed_targets = []
+
+    class TargetAwareKernel:
+        default_config = config
+
+        @staticmethod
+        def configs():
+            observed_targets.append(cute_target.get_compile_target())
+            return (config,)
+
+        @staticmethod
+        @cute_cache.jit_cache
+        def compile(candidate: CompileConfig) -> FakeCompiled:
+            return FakeCompiled(candidate.variant)
+
+        @staticmethod
+        def compile_call(candidate: CompileConfig):
+            return (candidate,)
+
+        @staticmethod
+        def launch(compiled: FakeCompiled, candidate: CompileConfig) -> float:
+            assert compiled() == candidate.variant
+            return candidate.timing
+
+    result, selected = run_tunable(
+        TargetAwareKernel,
+        autotune=True,
+        benchmark=measure_return_value,
+        parallel_compile=False,
+        target=target,
+    )
+
+    assert selected is config
+    assert result == config.timing
+    assert observed_targets == [target]
 
 
 def test_same_key_compiles_once_across_threads(isolated_cache):

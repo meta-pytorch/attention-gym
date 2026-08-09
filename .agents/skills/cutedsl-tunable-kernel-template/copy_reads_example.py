@@ -20,7 +20,8 @@ from cutlass import cute
 from attn_gym._backends.cute import benchmark_gpu, compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.cache import get_cache_path
 
-NUM_ELEMENTS = 1 << 24
+# A 256 MiB source keeps the fixed-buffer benchmark larger than modern GPU L2 caches.
+NUM_ELEMENTS = 1 << 26
 
 
 class ReadConfig(NamedTuple):
@@ -31,7 +32,7 @@ class ReadConfig(NamedTuple):
 class _CopyReadsOp:
     """Internal tunable CuTeDSL op; users call :func:`copy_reads`."""
 
-    default_config = ReadConfig(128, 2)
+    default_config = ReadConfig(128, 4)
 
     @staticmethod
     def configs(
@@ -39,8 +40,8 @@ class _CopyReadsOp:
         *_runtime_args: Any,
     ) -> tuple[ReadConfig, ...]:
         """Generate candidates that are sensible for this input shape."""
-        max_threads = max(64, min(256, source.numel()))
-        reads_per_thread = (1,) if source.numel() < 4 else (1, 2, 4)
+        max_threads = min(256, max(64, source.numel()))
+        reads_per_thread = (4,) if source.numel() < 16 else (4, 8, 16)
         return tuple(
             ReadConfig(threads, reads)
             for threads in (64, 128, 256)
@@ -49,8 +50,8 @@ class _CopyReadsOp:
         )
 
     @staticmethod
-    def _name(num_elements: int, threads: int, reads: int) -> str:
-        return f"cute_playground_n{num_elements}_t{threads}_r{reads}"
+    def _name(threads: int, reads: int) -> str:
+        return f"cute_playground_t{threads}_r{reads}"
 
     @cute.kernel
     def _kernel(
@@ -60,34 +61,45 @@ class _CopyReadsOp:
         threads: cutlass.Constexpr,
         reads: cutlass.Constexpr,
     ):
-        """Have each thread copy several values; every iteration is coalesced."""
+        """Have each thread copy one contiguous vector."""
         tid = cute.arch.thread_idx()[0]
         block = cute.arch.block_idx()[0]
-        block_start = block * threads * reads
+        tile_size = threads * reads
 
-        # ``reads`` is static, so CuTeDSL unrolls this loop for each config.
-        for read in cutlass.range_constexpr(reads):
-            index = block_start + read * threads + tid
-            if index < cute.size(source):
-                destination[index] = source[index]
+        # Divide the global tensor into CTA tiles whose inner modes describe
+        # the thread and its contiguous values, then select this thread's slice.
+        thread_value_layout = cute.make_layout((threads, reads), stride=(reads, 1))
+        source_tiles = cute.zipped_divide(source, thread_value_layout)
+        destination_tiles = cute.zipped_divide(destination, thread_value_layout)
+        thread_source = source_tiles[((tid, None), block)]
+        thread_destination = destination_tiles[((tid, None), block)]
+
+        block_start = block * tile_size
+        if block_start + tile_size <= cute.size(source):
+            cute.autovec_copy(thread_source, thread_destination)
+        else:
+            # Only the final CTA needs elementwise predication.
+            for read in cutlass.range_constexpr(reads):
+                index = block_start + cute.crd2idx((tid, read), thread_value_layout)
+                if index < cute.size(source):
+                    destination[index] = source[index]
 
     @cute.jit
     def _launch(
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
-        num_elements: cutlass.Constexpr,
         threads: cutlass.Constexpr,
         reads: cutlass.Constexpr,
         stream,
     ):
-        blocks = (num_elements + threads * reads - 1) // (threads * reads)
+        blocks = cute.ceil_div(cute.size(source), threads * reads)
         self._kernel(
             source,
             destination,
             threads,
             reads,
-            _name_prefix=self._name(num_elements, threads, reads),
+            _name_prefix=self._name(threads, reads),
         ).launch(
             grid=(blocks, 1, 1),
             block=(threads, 1, 1),
@@ -96,8 +108,9 @@ class _CopyReadsOp:
 
     @staticmethod
     @jit_cache
-    def compile(num_elements: int, config: ReadConfig):
-        """Build the fake ABI internally when this specialization misses cache."""
+    def compile(config: ReadConfig):
+        """Build one symbolic-length fake ABI for this codegen config."""
+        num_elements = cute.sym_int()
         source = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
             (num_elements,),
@@ -115,19 +128,18 @@ class _CopyReadsOp:
             op._launch,
             source,
             destination,
-            num_elements,
             config.threads,
             config.reads,
-            name=op._name(num_elements, config.threads, config.reads),
+            name=op._name(config.threads, config.reads),
         )
 
     @staticmethod
     def compile_call(
         config: ReadConfig,
-        source: torch.Tensor,
+        _source: torch.Tensor,
         _destination: torch.Tensor,
-    ) -> tuple[int, ReadConfig]:
-        return source.numel(), config
+    ) -> tuple[ReadConfig]:
+        return (config,)
 
     @staticmethod
     def launch(
@@ -189,7 +201,8 @@ def main() -> None:
     def report(fn):
         config = next(remaining)  # tune benchmarks sequentially in config order
         timings[config] = benchmark_gpu(fn)
-        print(f"{config}: {timings[config]:.4f} ms")
+        effective_gbps = 2 * source.numel() * source.element_size() / timings[config] / 1e6
+        print(f"{config}: {timings[config]:.4f} ms ({effective_gbps:.1f} GB/s read+write)")
         return timings[config]
 
     started = time.perf_counter()
@@ -204,7 +217,8 @@ def main() -> None:
     torch.testing.assert_close(destination, source)
     best = min(timings, key=timings.__getitem__)
 
-    print(f"\nbest: {best} ({timings[best]:.4f} ms)")
+    effective_gbps = 2 * source.numel() * source.element_size() / timings[best] / 1e6
+    print(f"\nbest: {best} ({timings[best]:.4f} ms, {effective_gbps:.1f} GB/s read+write)")
     print(f"compile + benchmark wall time: {elapsed:.3f} s")
     print(f"cache: {get_cache_path()}")
     print("correctness: output matches input")
