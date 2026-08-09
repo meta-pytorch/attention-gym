@@ -16,7 +16,9 @@ import torch
 triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
+import attn_gym.linear.kda.bwd.triton.cumsum as cumsum_module
 from attn_gym.linear.kda.bwd.triton.cumsum import (
+    chunk_local_cumsum_scalar,
     chunk_local_cumsum_scalar_kernel,
     chunk_local_cumsum_vector_kernel,
 )
@@ -683,6 +685,91 @@ def test_cumsum_scalar(dtype, T, reverse, scale):
     assert_golden(o, golden, ref, dtype, f"cumsum_scalar T={T} rev={reverse} scale={scale}")
 
 
+class _KernelRecorder:
+    def __init__(self, name, calls):
+        self.name = name
+        self.calls = calls
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.calls.append((self.name, args, kwargs))
+
+        return launch
+
+
+def test_cumsum_vector_autotune_is_batch_invariant():
+    assert "B" not in _autotuner(chunk_local_cumsum_vector_kernel).keys
+
+
+def test_cumsum_scalar_dispatches_by_layout(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cumsum_module,
+        "chunk_local_cumsum_scalar_kernel",
+        _KernelRecorder("scalar", calls),
+    )
+    monkeypatch.setattr(
+        cumsum_module,
+        "chunk_local_cumsum_vector_kernel",
+        _KernelRecorder("vector", calls),
+    )
+
+    token_major = torch.randn(2, 65, 96, device=DEV)
+    output = chunk_local_cumsum_scalar(token_major, chunk_size=64)
+    name, args, kwargs = calls.pop()
+    assert name == "vector"
+    assert args[0].shape == (2, 65, 1, 96)
+    assert args[0].data_ptr() == token_major.data_ptr()
+    assert args[1].data_ptr() == output.data_ptr()
+    assert kwargs["S_STRIDES"] == args[0].stride()[1:]
+    assert kwargs["H"] == 1
+    assert kwargs["S"] == 96
+
+    strided = _strided_copy(token_major)
+    chunk_local_cumsum_scalar(strided, chunk_size=64)
+    name, args, kwargs = calls.pop()
+    assert name == "vector"
+    assert args[0].data_ptr() == strided.data_ptr()
+    assert args[0].stride(-1) == 2
+    assert kwargs["S_STRIDES"] == args[0].stride()[1:]
+
+    head_first = token_major.transpose(1, 2).contiguous()
+    chunk_local_cumsum_scalar(head_first, chunk_size=64, head_first=True)
+    assert calls.pop()[0] == "scalar"
+
+    small = torch.randn(2, 65, 15, device=DEV)
+    chunk_local_cumsum_scalar(small, chunk_size=64)
+    assert calls.pop()[0] == "scalar"
+
+
+@pytest.mark.parametrize(("reverse", "scale"), ((False, None), (True, 1.25)))
+def test_cumsum_scalar_vector_view_fixed(reverse, scale):
+    torch.manual_seed(51)
+    B, T, H, BT = 3, 129, 96, 64
+    source = torch.randn(B, T, H, device=DEV)
+    expected = chunk_cumsum_ref(source, BT, reverse=reverse, scale=scale)
+
+    actual = chunk_local_cumsum_scalar(source, BT, reverse=reverse, scale=scale)
+    torch.testing.assert_close(actual, expected)
+
+    strided = _strided_copy(source)
+    strided_actual = chunk_local_cumsum_scalar(strided, BT, reverse=reverse, scale=scale)
+    torch.testing.assert_close(strided_actual, expected)
+
+    single = chunk_local_cumsum_scalar(source[1:2], BT, reverse=reverse, scale=scale)
+    torch.testing.assert_close(actual[1], single[0], rtol=0, atol=0)
+
+    head_first = source.transpose(1, 2).contiguous()
+    head_first_actual = chunk_local_cumsum_scalar(
+        head_first,
+        BT,
+        reverse=reverse,
+        scale=scale,
+        head_first=True,
+    )
+    torch.testing.assert_close(head_first_actual, expected.transpose(1, 2))
+
+
 @pytest.mark.parametrize("dtype,T,reverse,scale", _CUMSUM_CASES, ids=_case_id)
 def test_cumsum_vector(dtype, T, reverse, scale):
     torch.manual_seed(6)
@@ -828,3 +915,42 @@ def test_cumsum_varlen_head_first():
         dtype,
         "cumsum_vector_varlen_head_first",
     )
+
+
+def test_cumsum_scalar_vector_view_varlen():
+    torch.manual_seed(52)
+    docs = (31, 65, 79)
+    H, BT = 96, 64
+    cu = _cu_seqlens(docs)
+    source = torch.randn(1, sum(docs), H, device=DEV)
+    expected = chunk_cumsum_ref(source, BT, reverse=True, scale=0.75, cu_seqlens=cu)
+
+    actual = chunk_local_cumsum_scalar(
+        source,
+        BT,
+        reverse=True,
+        scale=0.75,
+        cu_seqlens=cu,
+    )
+    torch.testing.assert_close(actual, expected)
+
+    head_first = source.transpose(1, 2).contiguous()
+    head_first_actual = chunk_local_cumsum_scalar(
+        head_first,
+        BT,
+        reverse=True,
+        scale=0.75,
+        cu_seqlens=cu,
+        head_first=True,
+    )
+    torch.testing.assert_close(head_first_actual, expected.transpose(1, 2))
+
+    start, end = docs[0], docs[0] + docs[1]
+    single = chunk_local_cumsum_scalar(
+        source[:, start:end],
+        BT,
+        reverse=True,
+        scale=0.75,
+        cu_seqlens=_cu_seqlens((docs[1],)),
+    )
+    torch.testing.assert_close(actual[:, start:end], single, rtol=0, atol=0)
