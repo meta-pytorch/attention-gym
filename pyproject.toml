@@ -27,6 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 tests = [
     "pytest",
+    "pytest-xdist",
     "jsonargparse",
     "docstring-parser",
     "numpy",

@@ -188,13 +188,12 @@ def test_fused_gate_bwd_matches_reference(tokens, head_dim, lower_bound, chunk_s
     torch.testing.assert_close(actual.dg.sum((0, 1)), expected_dt_bias, rtol=5e-5, atol=7e-4)
 
 
-@pytest.mark.parametrize("fastmath", (False, True))
-def test_fused_gate_bwd_fastmath_specializations_are_correct(fastmath):
-    """Keep both explicit exponential modes numerically valid."""
+def test_fused_gate_bwd_fastmath_specialization_is_correct():
+    """Keep the non-default exponential mode numerically valid."""
     inputs = _inputs(65, heads=17)
     expected, expected_dA, _expected_dt_bias = _expected_output(inputs, -4.75)
 
-    actual = fused_gate_bwd(*inputs, lower_bound=-4.75, fastmath=fastmath)
+    actual = fused_gate_bwd(*inputs, lower_bound=-4.75, fastmath=True)
 
     _assert_output_close(actual, expected)
     torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
