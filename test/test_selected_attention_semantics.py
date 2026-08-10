@@ -913,8 +913,9 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
     actual_grads = torch.autograd.grad(actual, compiled_inputs, grad_output)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    for actual_grad, expected_grad in zip(actual_grads[:2], expected_grads[:2], strict=True):
-        torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    torch.testing.assert_close(actual_grads[0], expected_grads[0], atol=0, rtol=0)
+    # Inductor and eager may use different reduction trees for the BF16 shared-local dKV sum.
+    torch.testing.assert_close(actual_grads[1], expected_grads[1], atol=0.01, rtol=0.01)
     # Atomic sparse-dKV accumulation order may differ across compiled and eager launches.
     torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
     torch.testing.assert_close(actual_grads[3], expected_grads[3], atol=1e-6, rtol=1e-6)
