@@ -38,6 +38,7 @@ dev = [
     "prek",
     "pytest",
     "ruff",
+    "typer",
     "jsonargparse",
     "docstring-parser",
     "numpy",

@@ -219,6 +219,19 @@ def test_chunk_kda_fullgraph_forward_and_backward(dtype, initial_state, output_f
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+def test_chunk_kda_reduce_overhead_backward():
+    """Keep CUDA Graph warmup allocations local to the compiled invocation."""
+    inputs = _inputs(heads=2)
+
+    def operation(*args):
+        output, _ = chunk_kda(*args)
+        return output.float().square().mean()
+
+    loss = torch.compile(operation, fullgraph=True, mode="reduce-overhead")(*inputs)
+    gradients = torch.autograd.grad(loss, inputs)
+    assert all(gradient.isfinite().all() for gradient in gradients)
+
+
 def test_chunk_kda_rejects_higher_order_autograd():
     """Keep the composed backward explicitly first-order."""
     q, k, v, cumulative_gate, beta = _inputs()

@@ -502,7 +502,7 @@ def _kernel_varlen_b1_full_chunk(
             num_threads=THREADS_PER_CTA,
         )
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
         )
         # W accumulator uses TMEM cols [0:128], U uses cols [128:256].
