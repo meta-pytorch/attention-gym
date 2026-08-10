@@ -61,9 +61,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Boolean, Float32, Int32, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cutlass_dsl import Constexpr
 from torch._subclasses.fake_tensor import FakeTensor
+
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.target import get_compile_target
 
 # ============================================================================
 # Constants
@@ -168,51 +171,6 @@ ACC_STAGE = 2
 # ============================================================================
 # Helpers
 # ============================================================================
-
-
-def _has_default_compact_strides(tensor: torch.Tensor) -> bool:
-    expected_stride = 1
-    for size, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
-        if size == 1:
-            continue
-        if stride != expected_stride:
-            return False
-        expected_stride *= size
-    return True
-
-
-def _as_cute_tensor(
-    tensor: torch.Tensor,
-    *,
-    assumed_align: int = DATA_ALIGN_BYTES,
-    mark_divisibility: bool = False,
-    enable_tvm_ffi: bool = False,
-) -> cute.Tensor:
-    """Convert a torch tensor into a CuTe tensor with dynamic layout metadata.
-
-    When mark_divisibility=True, marks the innermost mode's shape as divisible
-    by 128 bits / elem_width elements — required for vectorized cp.async gmem
-    loads to verify ptr alignment after tile slicing. The caller is responsible
-    for ensuring this is actually true (e.g., for 4-D [B,T,H,D] bf16 tensors
-    with D a multiple of 8).
-    """
-    leading_dim = tensor.ndim - 1 if tensor.ndim > 1 else 0
-    t = from_dlpack(
-        tensor.detach(),
-        assumed_align=assumed_align,
-        enable_tvm_ffi=enable_tvm_ffi,
-    ).mark_layout_dynamic(leading_dim=leading_dim)
-    # mark_compact_shape_dynamic is an annotation for compact-stride layouts.
-    # Outer-strided views still carry their strides through mark_layout_dynamic.
-    if mark_divisibility and tensor.ndim >= 2 and _has_default_compact_strides(tensor):
-        elem_bits = t.element_type.width
-        div = 128 // elem_bits if 128 % elem_bits == 0 else 1
-        if div > 1 and tensor.shape[leading_dim] % div == 0:
-            stride_order = tuple(range(tensor.ndim))
-            t = t.mark_compact_shape_dynamic(
-                mode=leading_dim, stride_order=stride_order, divisibility=div
-            )
-    return t
 
 
 @cute.jit
@@ -1450,12 +1408,152 @@ class RecomputeWUForwardVarlenB1FullChunk:
 # Entry point
 # ============================================================================
 
-# Cache of precompiled executables keyed by (chunk_size, shape/dtype signature).
-_COMPILED_CACHE: dict[tuple, object] = {}
 
+@jit_cache
+def _compile_recompute_w_u(
+    chunk_size: int,
+    key_heads: int,
+    value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    a_is_fp32: bool,
+    beta_is_fp32: bool,
+    has_q: bool,
+    has_gk: bool,
+    precision: MmaPrecision,
+    prefetch_next_tile: bool,
+    cu_seqlens_i32: bool,
+    chunk_indices_i32: bool,
+    num_chunks_i32: bool,
+):
+    """Compile one persistent recompute specialization from fake tensors."""
+    target = get_compile_target()
+    if (
+        target.device_type != "cuda"
+        or target.capability is None
+        or target.capability < (10, 0)
+        or target.sm_count is None
+    ):
+        raise ValueError(
+            "KDA recompute requires a CUDA capability >= 10.0 target with a known SM count; "
+            f"got target={target}"
+        )
+    assert chunk_size == BT, f"KDA recompute requires chunk_size={BT}, got {chunk_size}"
+    assert key_dim == KEY_DIM, f"KDA recompute requires key_dim={KEY_DIM}, got {key_dim}"
+    assert value_dim == VAL_DIM, f"KDA recompute requires value_dim={VAL_DIM}, got {value_dim}"
 
-def _compile_signature(t: torch.Tensor) -> tuple:
-    return (tuple(t.shape), t.dtype, t.device.index)
+    tokens = cute.sym_int(divisibility=chunk_size)
+    sequence_entries, chunks = cute.sym_int(), cute.sym_int()
+    tensor_shape = (1, tokens)
+    q = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    k = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, key_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    v = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, value_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    beta = make_fake_compact_tensor(
+        cutlass.Float32 if beta_is_fp32 else IO_DTYPE,
+        (*tensor_shape, value_heads),
+        stride_order=(2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    A = make_fake_compact_tensor(
+        cutlass.Float32 if a_is_fp32 else IO_DTYPE,
+        (*tensor_shape, value_heads, chunk_size),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    gk = make_fake_compact_tensor(
+        cutlass.Float32 if has_gk else IO_DTYPE,
+        (*tensor_shape, key_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    w = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    u = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, value_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    qg = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    kg = make_fake_compact_tensor(
+        IO_DTYPE,
+        (*tensor_shape, value_heads, key_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=DATA_ALIGN_BYTES,
+    )
+    cu_seqlens = make_fake_compact_tensor(
+        cutlass.Int32 if cu_seqlens_i32 else cutlass.Int64,
+        (sequence_entries,),
+        stride_order=(0,),
+        assumed_align=INDEX_ALIGN_BYTES if cu_seqlens_i32 else 8,
+    )
+    chunk_indices = make_fake_compact_tensor(
+        cutlass.Int32 if chunk_indices_i32 else cutlass.Int64,
+        (chunks, 2),
+        stride_order=(1, 0),
+        assumed_align=INDEX_ALIGN_BYTES if chunk_indices_i32 else 8,
+    )
+    num_chunks = make_fake_compact_tensor(
+        cutlass.Int32 if num_chunks_i32 else cutlass.Int64,
+        (1,),
+        stride_order=(0,),
+        assumed_align=INDEX_ALIGN_BYTES if num_chunks_i32 else 8,
+    )
+    op = RecomputeWUForwardVarlenB1FullChunk(
+        num_persistent_ctas=target.sm_count * 2,
+        chunk_size=chunk_size,
+        a_is_fp32=a_is_fp32,
+        has_q=has_q,
+        has_gk=has_gk,
+        precision=precision,
+        prefetch_next_tile=prefetch_next_tile,
+    )
+    return compile_tvm_ffi(
+        op,
+        q,
+        k,
+        v,
+        beta,
+        A,
+        gk,
+        w,
+        u,
+        qg,
+        kg,
+        cu_seqlens,
+        chunk_indices,
+        num_chunks,
+        name=(
+            f"kda_recompute_hk{key_heads}_hv{value_heads}_k{key_dim}_v{value_dim}_"
+            f"a{int(a_is_fp32)}_b{int(beta_is_fp32)}_q{int(has_q)}_g{int(has_gk)}_"
+            f"{precision.value}_p{int(prefetch_next_tile)}_i{int(cu_seqlens_i32)}"
+            f"{int(chunk_indices_i32)}{int(num_chunks_i32)}"
+        ),
+    )
 
 
 def _assert_tensor_contract(
@@ -1477,7 +1575,7 @@ def _assert_tensor_contract(
         f"got {tensor.dtype}"
     )
     assert tensor.device == device, f"{name} must be on {device}, got {tensor.device}"
-    assert tensor.stride(-1) == 1, f"{name} must have innermost stride 1, got {tensor.stride(-1)}"
+    assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
     assert tensor.data_ptr() % assumed_align == 0, (
         f"{name} data pointer must be {assumed_align}-byte aligned"
     )
@@ -1692,27 +1790,6 @@ def recompute_w_u_fwd(
     qg_in = qg_out if qg_out is not None else v
     kg_in = kg_out if kg_out is not None else v
 
-    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    # Both index tensors are passed through — kernel casts to int32 at load
-    # time, so int64 or int32 works identically.
-    cu_align = INDEX_ALIGN_BYTES if cu_seqlens.dtype == torch.int32 else 8
-    ci_align = INDEX_ALIGN_BYTES if chunk_indices.dtype == torch.int32 else 8
-    nc_align = INDEX_ALIGN_BYTES if num_chunks_i.dtype == torch.int32 else 8
-    mCuSeqlens = _as_cute_tensor(cu_seqlens, assumed_align=cu_align, enable_tvm_ffi=True)
-    mChunkIndices = _as_cute_tensor(chunk_indices, assumed_align=ci_align, enable_tvm_ffi=True)
-    mNumChunks = _as_cute_tensor(num_chunks_i, assumed_align=nc_align, enable_tvm_ffi=True)
-
-    mQ = _as_cute_tensor(q_in, mark_divisibility=True, enable_tvm_ffi=True)
-    mK = _as_cute_tensor(k, mark_divisibility=True, enable_tvm_ffi=True)
-    mV = _as_cute_tensor(v, mark_divisibility=True, enable_tvm_ffi=True)
-    mBeta = _as_cute_tensor(beta, enable_tvm_ffi=True)
-    mA = _as_cute_tensor(A, mark_divisibility=True, enable_tvm_ffi=True)
-    mG = _as_cute_tensor(gk_in, mark_divisibility=True, enable_tvm_ffi=True)
-    mW = _as_cute_tensor(w, mark_divisibility=True, enable_tvm_ffi=True)
-    mU = _as_cute_tensor(u, mark_divisibility=True, enable_tvm_ffi=True)
-    mQG = _as_cute_tensor(qg_in, mark_divisibility=True, enable_tvm_ffi=True)
-    mKG = _as_cute_tensor(kg_in, mark_divisibility=True, enable_tvm_ffi=True)
-
     a_is_fp32 = A.dtype == torch.float32
     # tf32x3 emulates fp32 by adding first-order residual products; once A is
     # bf16-rounded the residual is meaningless, so it is only valid for fp32 A.
@@ -1720,56 +1797,22 @@ def recompute_w_u_fwd(
         "recompute_w_u_fwd dot_precision='tf32x3' requires fp32 A "
         f"(got A.dtype={A.dtype}); use 'bf16' or 'tf32' for non-fp32 A."
     )
-    num_persistent_ctas = torch.cuda.get_device_properties(k.device).multi_processor_count * 2
-    sig = (
-        num_persistent_ctas,
+    compiled = _compile_recompute_w_u(
         BT,
-        _compile_signature(q_in),
-        _compile_signature(k),
-        _compile_signature(v),
-        _compile_signature(beta),
-        _compile_signature(A),
-        _compile_signature(gk_in),
-        _compile_signature(cu_seqlens),
-        _compile_signature(chunk_indices),
-        _compile_signature(num_chunks_i),
+        H_K,
+        H_V,
+        K,
+        V,
         a_is_fp32,
+        beta.dtype == torch.float32,
         has_q,
         has_gk,
         precision,
         experimental_prefetch,
+        cu_seqlens.dtype == torch.int32,
+        chunk_indices.dtype == torch.int32,
+        num_chunks_i.dtype == torch.int32,
     )
-    compiled = _COMPILED_CACHE.get(sig)
-    if compiled is None:
-        kernel = RecomputeWUForwardVarlenB1FullChunk(
-            num_persistent_ctas=num_persistent_ctas,
-            chunk_size=BT,
-            a_is_fp32=a_is_fp32,
-            has_q=has_q,
-            has_gk=has_gk,
-            precision=precision,
-            prefetch_next_tile=experimental_prefetch,
-        )
-        compiled = cute.compile(
-            kernel,
-            mQ,
-            mK,
-            mV,
-            mBeta,
-            mA,
-            mG,
-            mW,
-            mU,
-            mQG,
-            mKG,
-            mCuSeqlens,
-            mChunkIndices,
-            mNumChunks,
-            stream,
-            options="--enable-tvm-ffi",
-        )
-        _COMPILED_CACHE[sig] = compiled
-
     compiled(
         q_in.detach(),
         k.detach(),
