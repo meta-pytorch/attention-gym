@@ -8,6 +8,11 @@ from typing import Any
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
+def ceildiv(number: int, divisor: int) -> int:
+    """Return ``ceil(number / divisor)`` using integer arithmetic."""
+    return -(number // -divisor)
+
+
 def _contains_torch_tensor(value: Any) -> bool:
     import torch
 
@@ -62,4 +67,4 @@ def compile_tvm_ffi(
     )
 
 
-__all__ = ["compile_tvm_ffi"]
+__all__ = ["ceildiv", "compile_tvm_ffi"]
