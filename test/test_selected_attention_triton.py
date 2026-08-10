@@ -2,8 +2,14 @@
 To check reference bf16 vs triton bf16 diffs, run:
 python -m pytest test/test_selected_attention_triton.py::test_precision_vs_fp64 -v -s
 
+Inputs are generated in the target dtype first, then promoted to FP64 via .double()
+so that eager, Triton, and FP64 all see the same quantized values. This isolates
+arithmetic error from input-quantization noise.
+
 Triton max diff is between 0.59-1.23x the reference's max diff
 """
+
+import math
 
 import pytest
 import torch
@@ -19,6 +25,29 @@ RTOL_BWD = 1e-2
 def _skip_no_cuda():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for triton backend")
+
+
+def assert_matches_low_precision_eager(
+    actual,
+    low_precision_expected,
+    high_precision_expected,
+    reduction_sizes,
+):
+    """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
+    assert torch.isfinite(actual).all()
+    actual_difference = (actual.double() - high_precision_expected).abs()
+    eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
+    accumulation_eps = (
+        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
+    )
+    output_rounding_eps = torch.finfo(actual.dtype).eps
+    rounding_eps = accumulation_eps + output_rounding_eps
+    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
+    max_atol = (accumulation_eps + len(reduction_sizes) * output_rounding_eps) * (
+        high_precision_expected.abs().max().item()
+    )
+    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
+    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
 
 
 def _make_inputs(
@@ -257,12 +286,16 @@ def test_triton_larger_sequence():
 
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
 def test_precision_vs_fp64(share_kv, num_topk, dtype):
     """Report max forward/backward diffs between a lower-precision dtype and fp64.
 
     This characterizes the numerical error introduced by the given precision so that
     tolerance thresholds for kernel tests can be set with confidence.
+
+    Inputs are generated in the low-precision dtype first, then promoted to FP64 via
+    .double(). This ensures eager, Triton, and FP64 all see the same quantized values
+    so that the FP64 baseline isolates arithmetic error without input-quantization noise.
     """
     _skip_no_cuda()
     batch, heads, seq_len, head_dim = 2, 4, 32, 64
@@ -273,38 +306,40 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     device = torch.device("cuda")
     dtype_name = str(dtype).removeprefix("torch.")
 
-    # --- Generate inputs in fp64 (ground truth) ---
-    gen64 = torch.Generator(device=device).manual_seed(seed)
+    # --- Generate inputs in the low-precision dtype (the "quantized" source) ---
+    gen = torch.Generator(device=device).manual_seed(seed)
 
-    def randn64(*shape):
-        return torch.randn(
-            *shape, dtype=torch.float64, device=device, generator=gen64, requires_grad=True
-        )
+    def randn_lp(*shape):
+        return torch.randn(*shape, dtype=dtype, device=device, generator=gen)
 
-    query_64 = randn64(batch, heads, seq_len, head_dim)
-    local_kv_64 = randn64(batch, kv_heads, seq_len, head_dim)
-    sparse_kv_64 = randn64(batch, kv_heads, sparse_seq_len, head_dim)
-    scores_64 = torch.randn(
-        batch, seq_len, sparse_seq_len, dtype=torch.float64, device=device, generator=gen64
-    )
+    query_lp = randn_lp(batch, heads, seq_len, head_dim)
+    local_kv_lp = randn_lp(batch, kv_heads, seq_len, head_dim)
+    sparse_kv_lp = randn_lp(batch, kv_heads, sparse_seq_len, head_dim)
+
+    scores = torch.randn(batch, seq_len, sparse_seq_len, dtype=dtype, device=device, generator=gen)
     if num_topk > 0:
-        _, kv_indices = torch.topk(scores_64, k=min(num_topk, sparse_seq_len), dim=-1)
+        _, kv_indices = torch.topk(scores, k=min(num_topk, sparse_seq_len), dim=-1)
     else:
         kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
-    sink_64 = torch.randn(
-        heads, dtype=torch.float64, device=device, generator=gen64, requires_grad=True
-    )
 
-    # --- Lower-precision copies on CUDA (cast from the same fp64 values) ---
-    query_lp_ref = query_64.detach().to(dtype).requires_grad_(True)
-    local_kv_lp_ref = local_kv_64.detach().to(dtype).requires_grad_(True)
-    sparse_kv_lp_ref = sparse_kv_64.detach().to(dtype).requires_grad_(True)
-    sink_lp_ref = sink_64.detach().to(dtype).requires_grad_(True)
+    sink_lp = randn_lp(heads)
 
-    query_lp_tri = query_64.detach().to(dtype).requires_grad_(True)
-    local_kv_lp_tri = local_kv_64.detach().to(dtype).requires_grad_(True)
-    sparse_kv_lp_tri = sparse_kv_64.detach().to(dtype).requires_grad_(True)
-    sink_lp_tri = sink_64.detach().to(dtype).requires_grad_(True)
+    # --- Derive FP64 inputs from the same quantized values ---
+    query_64 = query_lp.double().requires_grad_(True)
+    local_kv_64 = local_kv_lp.double().requires_grad_(True)
+    sparse_kv_64 = sparse_kv_lp.double().requires_grad_(True)
+    sink_64 = sink_lp.double().requires_grad_(True)
+
+    # --- Lower-precision copies for eager and triton ---
+    query_lp_ref = query_lp.clone().requires_grad_(True)
+    local_kv_lp_ref = local_kv_lp.clone().requires_grad_(True)
+    sparse_kv_lp_ref = sparse_kv_lp.clone().requires_grad_(True)
+    sink_lp_ref = sink_lp.clone().requires_grad_(True)
+
+    query_lp_tri = query_lp.clone().requires_grad_(True)
+    local_kv_lp_tri = local_kv_lp.clone().requires_grad_(True)
+    sparse_kv_lp_tri = sparse_kv_lp.clone().requires_grad_(True)
+    sink_lp_tri = sink_lp.clone().requires_grad_(True)
 
     # --- Forward (fp64 reference as ground truth) ---
     out_64 = selected_attention(
@@ -338,29 +373,27 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         backend="triton",
     )
 
-    ref_fwd_diff = (out_64 - out_lp_ref).abs().max().item()
-    tri_fwd_diff = (out_64 - out_lp_tri).abs().max().item()
-
     # --- Backward ---
     grad_gen = torch.Generator(device=device).manual_seed(1234)
-    grad_64 = torch.randn(out_64.shape, dtype=torch.float64, device=device, generator=grad_gen)
-    grad_lp = grad_64.to(dtype)
+    grad_lp = torch.randn(out_lp_ref.shape, dtype=dtype, device=device, generator=grad_gen)
+    grad_64 = grad_lp.double()
 
     out_64.backward(grad_64)
     out_lp_ref.backward(grad_lp)
     out_lp_tri.backward(grad_lp)
 
-    ref_dq = (query_64.grad.double() - query_lp_ref.grad.double()).abs().max().item()
-    tri_dq = (query_64.grad.double() - query_lp_tri.grad.double()).abs().max().item()
-    ref_dkv = (local_kv_64.grad.double() - local_kv_lp_ref.grad.double()).abs().max().item()
-    tri_dkv = (local_kv_64.grad.double() - local_kv_lp_tri.grad.double()).abs().max().item()
-    ref_didx = (sparse_kv_64.grad.double() - sparse_kv_lp_ref.grad.double()).abs().max().item()
-    tri_didx = (sparse_kv_64.grad.double() - sparse_kv_lp_tri.grad.double()).abs().max().item()
-    ref_dsink = (sink_64.grad.double() - sink_lp_ref.grad.double()).abs().max().item()
-    tri_dsink = (sink_64.grad.double() - sink_lp_tri.grad.double()).abs().max().item()
+    # --- Report ratios (visible with pytest -s) ---
+    ref_fwd_diff = (out_64 - out_lp_ref.double()).abs().max().item()
+    tri_fwd_diff = (out_64 - out_lp_tri.double()).abs().max().item()
+    ref_dq = (query_64.grad - query_lp_ref.grad.double()).abs().max().item()
+    tri_dq = (query_64.grad - query_lp_tri.grad.double()).abs().max().item()
+    ref_dkv = (local_kv_64.grad - local_kv_lp_ref.grad.double()).abs().max().item()
+    tri_dkv = (local_kv_64.grad - local_kv_lp_tri.grad.double()).abs().max().item()
+    ref_didx = (sparse_kv_64.grad - sparse_kv_lp_ref.grad.double()).abs().max().item()
+    tri_didx = (sparse_kv_64.grad - sparse_kv_lp_tri.grad.double()).abs().max().item()
+    ref_dsink = (sink_64.grad - sink_lp_ref.grad.double()).abs().max().item()
+    tri_dsink = (sink_64.grad - sink_lp_tri.grad.double()).abs().max().item()
 
-    # Compute ratios (triton error / reference error). Ratio ~1 means triton
-    # adds no precision loss beyond the dtype itself. >1 means triton is worse.
     def _ratio(tri_val, ref_val):
         if ref_val == 0:
             return float("inf") if tri_val > 0 else 1.0
@@ -372,7 +405,6 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     r_didx = _ratio(tri_didx, ref_didx)
     r_dsink = _ratio(tri_dsink, ref_dsink)
 
-    # Print a report (visible with pytest -s)
     print(
         f"\n[{dtype_name}, share_kv={share_kv}, topk={num_topk}]"
         f"\n  {'':15s} {'fwd':>10s} {'dQ':>10s} {'dKV':>10s} {'dIdx':>10s} {'dSink':>10s}"
@@ -384,20 +416,60 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         f" {r_didx:10.2f}x {r_dsink:10.2f}x"
     )
 
-    # Sanity checks to make sure we don't get anything insane
-    # Not really meant for checking correctness
-    assert r_fwd < 5, (
-        f"Triton fwd diff too large, ratio of triton to ref {dtype_name} error is: {r_fwd}"
+    # The reduction dimension for QK is head_dim; for the softmax/PV step it is
+    # sliding_window_size + num_topk (local window tokens + selected sparse tokens).
+    fwd_reduction_sizes = (
+        head_dim,
+        sliding_window_size + num_topk,
+        sliding_window_size + num_topk,
     )
-    assert r_dq < 5, (
-        f"Triton dQ diff too large, ratio of triton to ref {dtype_name} error is: {r_dq}"
+
+    # We reduce over head dim, effective sequence length, and batch size for backward pass
+    dq_reduction_sizes = (
+        fwd_reduction_sizes + (head_dim,) + (sliding_window_size + num_topk,) + (batch, )
     )
-    assert r_dkv < 5, (
-        f"Triton dKV diff too large, ratio of triton to ref {dtype_name} error is: {r_dkv}"
+    # We reduce over head dim, probs @ grad, grad @ query, and batch
+    dkv_reduction_sizes = (
+        fwd_reduction_sizes
+        + (head_dim,)
+        + (
+            sliding_window_size,
+            sliding_window_size,
+        )
+         + (batch, )
     )
-    assert r_didx < 5, (
-        f"Triton dIdx diff too large, ratio of triton to ref {dtype_name} error is: {r_didx}"
+    dsparse_kv_reduction_sizes = fwd_reduction_sizes + (num_topk,) + (batch, )
+    # _bwd_dq (sink part): delta (head_dim) + atomic_add over seq_len query positions.
+    dsink_reduction_sizes = fwd_reduction_sizes + (head_dim, seq_len) + (batch, )
+
+    assert_matches_low_precision_eager(
+        out_lp_tri,
+        out_lp_ref,
+        out_64,
+        reduction_sizes=fwd_reduction_sizes,
     )
-    assert r_dsink < 5, (
-        f"Triton dSink diff too large, ratio of triton to ref {dtype_name} error is: {r_dsink}"
+
+    assert_matches_low_precision_eager(
+        query_lp_tri.grad,
+        query_lp_ref.grad,
+        query_64.grad,
+        reduction_sizes=dq_reduction_sizes,
+    )
+    assert_matches_low_precision_eager(
+        local_kv_lp_tri.grad,
+        local_kv_lp_ref.grad,
+        local_kv_64.grad,
+        reduction_sizes=dkv_reduction_sizes,
+    )
+    assert_matches_low_precision_eager(
+        sparse_kv_lp_tri.grad,
+        sparse_kv_lp_ref.grad,
+        sparse_kv_64.grad,
+        reduction_sizes=dsparse_kv_reduction_sizes,
+    )
+    assert_matches_low_precision_eager(
+        sink_lp_tri.grad,
+        sink_lp_ref.grad,
+        sink_64.grad,
+        reduction_sizes=dsink_reduction_sizes,
     )
