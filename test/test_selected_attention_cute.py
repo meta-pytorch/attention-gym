@@ -81,8 +81,7 @@ def _make_inputs(
     else:
         kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
 
-    # sink=0 since the CuTe backend does not fuse sink correction
-    attention_sink = torch.zeros(heads, device=device, dtype=dtype)
+    attention_sink = torch.full((heads,), -float('inf'), device=device, dtype=dtype)
 
     if doc_ids is not None:
         doc_ids = doc_ids.to(device)
@@ -272,7 +271,7 @@ def test_cute_precision_vs_fp64(num_topk):
         kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
 
     # sink=0 for CuTe
-    sink_lp = torch.zeros(heads, device=device, dtype=dtype)
+    sink_lp = torch.full((heads,), -float('inf'), device=device, dtype=dtype)
 
     # --- Derive FP64 inputs from the same quantized values ---
     query_64 = query_lp.double().requires_grad_(True)
