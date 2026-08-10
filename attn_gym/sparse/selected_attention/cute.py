@@ -301,7 +301,7 @@ LOG2E = math.log2(math.e)
 
 class _SelectedAttentionCuTe(torch.autograd.Function):
     @staticmethod
-    def forward(query, local_kv, sparse_kv, kv_indices, sliding_window_size, prebuilt_topk_idxs):
+    def forward(query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, prebuilt_topk_idxs):
         _b, _h, s, d = query.shape
         local_kv_len = local_kv.shape[2]
         device = query.device
@@ -331,7 +331,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        query, local_kv, sparse_kv, kv_indices, sliding_window_size, prebuilt_topk_idxs = inputs
+        query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, prebuilt_topk_idxs = inputs
         O, lse, P, RowMax, topk_idxs, unified_kv = output
         ctx.save_for_backward(query, O, lse, P, RowMax, topk_idxs, unified_kv)
         ctx.sliding_window_size = sliding_window_size
@@ -380,7 +380,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
         dKV = dV_bf16[:, :, :local_kv_len, :]
         d_ikv = dV_bf16[:, :, local_kv_len:, :]
 
-        return dQ, dKV, d_ikv, None, None, None
+        return dQ, dKV, d_ikv, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -432,18 +432,18 @@ def selected_attention(
 
     if doc_ids is not None:
         return _selected_attention_with_doc_ids(
-            query, local_kv, sparse_kv, kv_indices, doc_ids, sliding_window_size
+            query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
         )
 
     result = _SelectedAttentionCuTe.apply(
-        query, local_kv, sparse_kv, kv_indices, sliding_window_size, None
+        query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, None
     )
     O = result[0]
     return O
 
 
-def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc_ids,
-                                     sliding_window_size):
+def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, attention_sink,
+                                     doc_ids, sliding_window_size):
     """Handle doc_id masking then dispatch to the same kernel."""
     s = query.shape[2]
     device = query.device
@@ -481,15 +481,15 @@ def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc
         unified = torch.cat([unified, padding], dim=-1)
 
     return _selected_attention_with_prebuilt_indices(
-        query, local_kv, sparse_kv, kv_indices, unified, sliding_window_size
+        query, local_kv, sparse_kv, kv_indices, attention_sink, unified, sliding_window_size
     )
 
 
-def _selected_attention_with_prebuilt_indices(query, local_kv, sparse_kv, kv_indices, topk_idxs,
-                                              sliding_window_size):
+def _selected_attention_with_prebuilt_indices(query, local_kv, sparse_kv, kv_indices,
+                                              attention_sink, topk_idxs, sliding_window_size):
     """Forward+backward with pre-built indices (doc_ids path)."""
     result = _SelectedAttentionCuTe.apply(
-        query, local_kv, sparse_kv, kv_indices, sliding_window_size, topk_idxs
+        query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, topk_idxs
     )
     O = result[0]
     return O

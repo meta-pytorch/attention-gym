@@ -164,6 +164,7 @@ def main() -> None:
                     (_query, _local_kv, _sparse_kv, _attention_sink),
                     grad_outputs=_grad_output,
                     retain_graph=True,
+                    allow_unused=True,
                 )
 
             bwd()  # warmup autograd graph
