@@ -426,7 +426,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
 
     # We reduce over head dim, effective sequence length, and batch size for backward pass
     dq_reduction_sizes = (
-        fwd_reduction_sizes + (head_dim,) + (sliding_window_size + num_topk,) + (batch, )
+        fwd_reduction_sizes + (head_dim,) + (sliding_window_size + num_topk,) + (batch,)
     )
     # We reduce over head dim, probs @ grad, grad @ query, and batch
     dkv_reduction_sizes = (
@@ -436,11 +436,11 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
             sliding_window_size,
             sliding_window_size,
         )
-         + (batch, )
+        + (batch,)
     )
-    dsparse_kv_reduction_sizes = fwd_reduction_sizes + (num_topk,) + (batch, )
+    dsparse_kv_reduction_sizes = fwd_reduction_sizes + (num_topk,) + (batch,)
     # _bwd_dq (sink part): delta (head_dim) + atomic_add over seq_len query positions.
-    dsink_reduction_sizes = fwd_reduction_sizes + (head_dim, seq_len) + (batch, )
+    dsink_reduction_sizes = fwd_reduction_sizes + (head_dim, seq_len) + (batch,)
 
     assert_matches_low_precision_eager(
         out_lp_tri,
