@@ -15,9 +15,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_recompute_ignores_upper_triangle():
-    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monkeypatch):
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
+        _compile_recompute_w_u,
+        recompute_w_u_fwd,
+    )
 
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
+    _compile_recompute_w_u.cache_clear()
     torch.manual_seed(4)
     shape = (1, 64, 1, 128)
     k = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
@@ -29,15 +34,26 @@ def test_recompute_ignores_upper_triangle():
     chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
     num_chunks = torch.tensor(1, device="cuda", dtype=torch.int32)
 
-    w, u, _, _ = recompute_w_u_fwd(
-        k,
-        v,
-        beta,
-        A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        num_chunks=num_chunks,
-    )
+    def run_recompute():
+        return recompute_w_u_fwd(
+            k,
+            v,
+            beta,
+            A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            num_chunks=num_chunks,
+        )
+
+    w, u, _, _ = run_recompute()
+    first_cache_info = _compile_recompute_w_u.cache_info()
+    repeated_w, repeated_u, _, _ = run_recompute()
+    second_cache_info = _compile_recompute_w_u.cache_info()
+    assert second_cache_info.hits == first_cache_info.hits + 1
+    assert second_cache_info.currsize == first_cache_info.currsize
+    torch.testing.assert_close(repeated_w, w, rtol=0, atol=0)
+    torch.testing.assert_close(repeated_u, u, rtol=0, atol=0)
+
     A = A.nan_to_num().float().transpose(1, 2)
     beta = beta.transpose(1, 2)[..., None]
     expected_w = (A @ (k.transpose(1, 2).float() * beta)).transpose(1, 2)

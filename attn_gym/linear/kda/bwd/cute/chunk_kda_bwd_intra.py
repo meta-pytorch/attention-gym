@@ -14,7 +14,6 @@ import cutlass
 from cutlass import Boolean, Float32, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 BT = 64  # chunk_size
@@ -30,10 +29,6 @@ KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
 # 2. Launcher compiles the HMMA-grid CuTe kernel for the tensor signature.
 # 3. Kernel maps the grid to (k_phase, subchunk, chunk_block, head_idx).
 # 4. Kernel stages Q/K/G, runs the HMMA loops, then writes dq/dk/db/dg.
-
-
-def to_cute_tensor_plain(t, assumed_align=16) -> cute.Tensor:
-    return from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True)
 
 
 @dsl_user_op
