@@ -49,3 +49,55 @@ The earlier prototype functions were replaced by the variant-level API:
 ::: attn_gym.linear.gated_delta_rule
 
 ::: attn_gym.linear.GatedDeltaRuleOutput
+
+## Kimi Delta Attention
+
+The KDA references use token-major tensors: query, key, and per-channel gate are
+`[batch, sequence, heads, key_dimension]`; value is
+`[batch, sequence, heads, value_dimension]`; beta is
+`[batch, sequence, heads]`. Both recurrent and chunked forms support ordinary
+PyTorch autograd and an optional recurrent state.
+
+`examples/kda_training.py` builds these operations into a small trainable
+`[B, T, hidden_size] -> [B, T, hidden_size]` attention module. Its default path
+uses PyTorch autograd. On CUDA capability 9.0 or newer,
+`--gate-backward=cute` demonstrates using the fused CuTeDSL bounded-gate and
+reverse-cumsum backward leaf while keeping the rest of KDA as an inspectable
+reference implementation. The low-level CuTe leaf consumes the complete
+`[B, T, H, D]` gate tensor in one launch and emits per-batch, per-chunk
+partials for the shared parameter reduction. The example explicitly runs
+projections in BF16 while retaining FP32 parameters and gate reductions; no
+ambient autocast context is required.
+The CuTe path also requires a head dimension divisible by 32 in
+`[32, 1024]`. It is a first-order backward leaf and does not support
+higher-order autograd.
+
+The module can sit behind a transformer layer's attention slot while state is
+threaded explicitly:
+
+```python
+from examples.kda_training import KDAAttention
+
+attention = KDAAttention(hidden_size=512, num_heads=4, head_dim=128).cuda()
+result = attention(hidden_states, initial_state, return_final_state=True)
+hidden_states, recurrent_state = result
+```
+
+The example intentionally is not checkpoint-compatible with Kimi K3. A model
+adapter must still provide K3's short convolution, factorized projections,
+exact gated RMSNorm, checkpoint layout, and distributed execution policy.
+
+For integrations that fuse gate activation with its forward chunk prefix sum,
+`naive_chunk_kda_from_cumulative` exposes the matching reference boundary. Its
+cumulative log2 gate is inclusive and resets at the same `chunk_size` passed to
+KDA; the function does not perform a second cumulative sum. The existing
+`chunk_kda_fwd_intra` kernel consumes this same representation, but currently
+returns pipeline intermediates and is restricted to its production
+specialization. It is not yet composed with the state/output kernels and full
+backward into a public trainable operator.
+
+::: attn_gym.linear.naive_chunk_kda
+
+::: attn_gym.linear.naive_chunk_kda_from_cumulative
+
+::: attn_gym.linear.naive_recurrent_kda
