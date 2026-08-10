@@ -52,9 +52,7 @@ def make_inputs(args: argparse.Namespace, requires_grad: bool = False):
     query = randn(args.batch, args.heads, args.sequence_length, args.head_dim)
     local_kv = randn(args.batch, kv_heads, args.sequence_length, args.head_dim)
     sparse_kv = randn(args.batch, kv_heads, args.sparse_seq_len, args.head_dim)
-    attention_sink = torch.full(
-        (args.heads,), -float("inf"), device=device, dtype=dtype, requires_grad=True
-    )
+    attention_sink = randn(args.heads)
 
     scores = torch.randn(
         args.batch, args.sequence_length, args.sparse_seq_len, device=device, generator=generator
@@ -87,10 +85,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if "cute" in args.backend:
-        assert args.head_dim == 512, "cute backend requires 512 head dim"
-        assert args.dtype == "bfloat16", "cute backend requires bf16"
-        assert args.heads == 128, "cute backend requires 128 heads"
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 
@@ -107,6 +101,26 @@ def main() -> None:
     fwd_flops = useful_flops(args)
 
     for backend in args.backend:
+        if backend == "cute":
+            if (
+                args.head_dim != 512
+                or args.heads != 128
+                or not args.share_kv
+                or args.dtype != "bfloat16"
+            ):
+                import warnings
+
+                warnings.warn(
+                    "CuTe backend requires head_dim=512, heads=128, share_kv=True, "
+                    "dtype=bfloat16. Overriding these settings for the cute benchmark.",
+                    stacklevel=1,
+                )
+            args.head_dim = 512
+            args.heads = 128
+            args.share_kv = True
+            args.dtype = "bfloat16"
+            fwd_flops = useful_flops(args)
+
         # Benchmark forward without requires_grad so we measure pure forward compute
         # (no autograd graph construction overhead).
         query, local_kv, sparse_kv, kv_indices, attention_sink = make_inputs(
@@ -168,7 +182,6 @@ def main() -> None:
                     (_query, _local_kv, _sparse_kv, _attention_sink),
                     grad_outputs=_grad_output,
                     retain_graph=True,
-                    allow_unused=True,
                 )
 
             bwd()  # warmup autograd graph
