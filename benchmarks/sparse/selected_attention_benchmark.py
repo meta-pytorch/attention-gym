@@ -52,7 +52,9 @@ def make_inputs(args: argparse.Namespace, requires_grad: bool = False):
     query = randn(args.batch, args.heads, args.sequence_length, args.head_dim)
     local_kv = randn(args.batch, kv_heads, args.sequence_length, args.head_dim)
     sparse_kv = randn(args.batch, kv_heads, args.sparse_seq_len, args.head_dim)
-    attention_sink = randn(args.heads)
+    attention_sink = torch.full(
+        (args.heads,), -float("inf"), device=device, dtype=dtype, requires_grad=True
+    )
 
     scores = torch.randn(
         args.batch, args.sequence_length, args.sparse_seq_len, device=device, generator=generator

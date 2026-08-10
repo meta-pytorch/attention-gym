@@ -27,13 +27,20 @@ import cutlass
 import cutlass.cute as cute
 
 
+def _wrap_tensor(t, align=16):
+    """Wrap a torch tensor for CuTe kernel launch with dynamic layout."""
+    return from_dlpack(
+        t.detach() if t.requires_grad else t, assumed_align=align
+    ).mark_layout_dynamic(leading_dim=t.ndim - 1)
+
+
 # ---------------------------------------------------------------------------
 # Kernel compilation (cached)
 # ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=8)
-def _compile_fwd(topk_length: int, nheads: int, stream_ptr: int):
+def _compile_fwd(topk_length: int, nheads: int):
     batch_dummy, seqlen_q_dummy, seqlen_k_dummy = 1, 128, 1024
     hdimv = 512
 
@@ -45,7 +52,7 @@ def _compile_fwd(topk_length: int, nheads: int, stream_ptr: int):
     P = torch.empty(batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
     RowMax = torch.empty(batch_dummy, seqlen_q_dummy, topk_length // 128, nheads, dtype=torch.float32, device="cuda")
 
-    stream = cuda_drv.CUstream(stream_ptr)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
     return cute.compile(
         FlashAttentionMLAForwardSm100(
@@ -74,7 +81,7 @@ def _compile_fwd(topk_length: int, nheads: int, stream_ptr: int):
 
 
 @lru_cache(maxsize=8)
-def _compile_bwd(topk_length: int, nheads: int, stream_ptr: int):
+def _compile_bwd(topk_length: int, nheads: int):
     batch_dummy, seqlen_q_dummy = 1, 128
     hdimv = 512
     seqlen_k_dummy = 1024
@@ -89,7 +96,7 @@ def _compile_bwd(topk_length: int, nheads: int, stream_ptr: int):
     ScaleP = torch.empty(batch_dummy, seqlen_q_dummy, topk_length // 128, nheads, dtype=torch.float32, device="cuda")
     dPsum = torch.empty(batch_dummy, seqlen_q_dummy, nheads, dtype=torch.float32, device="cuda")
 
-    stream = cuda_drv.CUstream(stream_ptr)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def w(t, align=16):
         return from_dlpack(t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -114,14 +121,14 @@ def _compile_bwd(topk_length: int, nheads: int, stream_ptr: int):
 
 
 @lru_cache(maxsize=8)
-def _compile_dq(topk_length: int, nheads: int, hdimv: int,
-                batch: int, seq_len: int, total_kv: int, stream_ptr: int):
-    dS = torch.empty(batch, seq_len, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
-    V_3d = torch.empty(batch, total_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-    dQv = torch.empty(batch, seq_len, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-    idx = torch.empty(batch, seq_len, topk_length, dtype=torch.int32, device="cuda")
+def _compile_dq(topk_length: int, nheads: int, hdimv: int):
+    batch_dummy, seqlen_q_dummy, total_kv_dummy = 1, 128, 1024
+    dS = torch.empty(batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
+    V_3d = torch.empty(batch_dummy, total_kv_dummy, hdimv, dtype=torch.bfloat16, device="cuda")
+    dQv = torch.empty(batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+    idx = torch.empty(batch_dummy, seqlen_q_dummy, topk_length, dtype=torch.int32, device="cuda")
 
-    stream = cuda_drv.CUstream(stream_ptr)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def w(t, align=16):
         return from_dlpack(t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -153,7 +160,7 @@ def _build_unified_topk_indices(seq_len, sliding_window_size, indices, index_off
     window_idxs = window_idxs.unsqueeze(0).expand(batch, -1, -1)
 
     offset_indices = torch.where(
-        indices >= 0, (indices + index_offset).int(), torch.tensor(-1, device=device).int()
+        indices >= 0, (indices + index_offset).int(), -1
     )
 
     unified = torch.cat([window_idxs, offset_indices], dim=-1)
@@ -192,11 +199,9 @@ def _fwd_kernel_op(
 
     stream_ptr = torch.cuda.current_stream(device).cuda_stream
     stream = cuda_drv.CUstream(stream_ptr)
-    kernel = _compile_fwd(padded_topk_length, nheads, stream_ptr)
+    kernel = _compile_fwd(padded_topk_length, nheads)
 
-    def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
-
+    w = _wrap_tensor
     kernel(
         None, w(Qv), None, w(V), w(O), w(lse, 4), softmax_scale, w(P), w(RowMax, 4),
         mIndexTopk=w(topk_idxs), stream=stream,
@@ -237,11 +242,9 @@ def _bwd_kernel_op(
 
     stream_ptr = torch.cuda.current_stream(device).cuda_stream
     stream = cuda_drv.CUstream(stream_ptr)
-    kernel = _compile_bwd(padded_topk_length, nheads, stream_ptr)
+    kernel = _compile_bwd(padded_topk_length, nheads)
 
-    def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
-
+    w = _wrap_tensor
     kernel(
         w(dO), w(V), w(Qv), w(P), w(dV_accum), w(dS), w(topk_idxs),
         softmax_scale, w(ScaleP, 4), w(dPsum, 4), stream=stream,
@@ -276,11 +279,9 @@ def _dq_kernel_op(
 
     stream_ptr = torch.cuda.current_stream(device).cuda_stream
     stream = cuda_drv.CUstream(stream_ptr)
-    kernel = _compile_dq(padded_topk_length, nheads, hdimv, batch, seq_len, total_kv, stream_ptr)
+    kernel = _compile_dq(padded_topk_length, nheads, hdimv)
 
-    def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
-
+    w = _wrap_tensor
     kernel(w(dS), None, w(V_3d), None, w(dQv), w(topk_idxs), stream=stream)
 
     return dQv
@@ -333,17 +334,19 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
     def setup_context(ctx, inputs, output):
         query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, prebuilt_topk_idxs = inputs
         O, lse, P, RowMax, topk_idxs, unified_kv = output
-        ctx.save_for_backward(query, O, lse, P, RowMax, topk_idxs, unified_kv)
+        ctx.save_for_backward(query, O, lse, P, RowMax, topk_idxs, local_kv, sparse_kv)
         ctx.sliding_window_size = sliding_window_size
         ctx.local_kv_len = local_kv.shape[2]
 
     @staticmethod
     def backward(ctx, grad_O, grad_lse, grad_P, grad_RowMax, grad_topk, grad_ukv):
-        Q, O, lse, P, RowMax, topk_idxs, unified_kv = ctx.saved_tensors
+        Q, O, lse, P, RowMax, topk_idxs, local_kv, sparse_kv = ctx.saved_tensors
         local_kv_len = ctx.local_kv_len
         _b, _h, s, d = Q.shape
         nheads = Q.shape[1]
         device = Q.device
+
+        unified_kv = torch.cat([local_kv, sparse_kv], dim=2)
 
         Qv = Q.permute(0, 2, 1, 3)
         V = unified_kv.permute(0, 2, 1, 3)
@@ -388,7 +391,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 
-def _validate_cute_constraints(query, local_kv, sparse_kv, kv_indices, sliding_window_size, share_kv):
+def _validate_cute_constraints(query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv):
     if query.device.type != "cuda":
         raise ValueError("CuTe backend requires CUDA tensors.")
     if torch.cuda.get_device_capability(query.device) != (10, 0):
@@ -397,6 +400,12 @@ def _validate_cute_constraints(query, local_kv, sparse_kv, kv_indices, sliding_w
         raise TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
         raise ValueError("CuTe backend requires share_kv=True.")
+    
+    if (attention_sink > -float('inf')).any():
+        raise NotImplementedError(
+            "CuTe backend does not fuse sink correction; "
+            "attention_sink with any value > -inf is unsupported."
+        )
     _b, h, _s, d = query.shape
     if d != 512:
         raise ValueError(f"CuTe backend requires head_dim=512, got {d}.")
@@ -427,7 +436,7 @@ def selected_attention(
     """
     if not torch.compiler.is_compiling():
         _validate_cute_constraints(
-            query, local_kv, sparse_kv, kv_indices, sliding_window_size, share_kv
+            query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
         )
 
     if doc_ids is not None:
@@ -462,12 +471,12 @@ def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, att
     masked_window = torch.where(
         valid.unsqueeze(0) & same_doc,
         window_kv_pos.unsqueeze(0).expand_as(same_doc).int(),
-        torch.tensor(-1, device=device, dtype=torch.int32),
+        -1,
     )
 
     offset_indices = torch.where(
         kv_indices >= 0, (kv_indices + local_kv_len).int(),
-        torch.tensor(-1, device=device, dtype=torch.int32),
+        -1,
     )
 
     unified = torch.cat([masked_window, offset_indices], dim=-1)
