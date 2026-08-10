@@ -68,7 +68,18 @@ def run_pytest() -> tuple[int, str]:
     """Run the repository test suite and return its exit code and summary."""
     report_path = Path("/tmp/pytest-report.xml")
     result = subprocess.run(
-        ["python", "-m", "pytest", "test", "-ra", "--tb=short", f"--junitxml={report_path}"],
+        [
+            "python",
+            "-m",
+            "pytest",
+            "test",
+            "-n",
+            "4",
+            "--dist=worksteal",
+            "-ra",
+            "--tb=short",
+            f"--junitxml={report_path}",
+        ],
         cwd="/root",
         check=False,
     )

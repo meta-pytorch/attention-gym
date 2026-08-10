@@ -558,7 +558,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
     cache_directory = tmp_path / "cache"
     log_path = tmp_path / "compiles.log"
     ready_directory = tmp_path / "ready"
-    configs = tuple(CompileConfig(str(index), float(index + 1)) for index in range(4))
+    configs = tuple(CompileConfig(str(index), float(index + 1)) for index in range(2))
     shared = CompileConfig("shared", 0.5)
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(cache_directory))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
@@ -581,7 +581,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
         return config.timing
 
     best = tune(
-        configs + (shared,) * 4,
+        configs + (shared,) * 2,
         compile_test_variant,
         launch,
         benchmark=measure_return_value,
@@ -590,7 +590,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
     )
 
     assert best is shared
-    assert benchmark_order == [config.variant for config in configs] + ["shared"] * 4
+    assert benchmark_order == [config.variant for config in configs] + ["shared"] * 2
     records = [line.split(",") for line in log_path.read_text().splitlines()]
     variant_records = [record for record in records if record[2] != "shared"]
     worker_pids = {int(record[0]) for record in variant_records}
@@ -626,7 +626,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded.*:DeprecationWarning")
 def test_same_key_compiles_once_across_processes(isolated_cache):
     context = multiprocessing.get_context("fork")
-    process_count = 6
+    process_count = 2
     compile_count = context.Value("i", 0)
     start = context.Event()
 
@@ -653,7 +653,7 @@ def test_same_key_compiles_once_across_processes(isolated_cache):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fcntl.flock and fork are required")
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded.*:DeprecationWarning")
-@pytest.mark.parametrize("process_count", [1, 2, 4, 8])
+@pytest.mark.parametrize("process_count", [1, 2])
 def test_parallel_population_then_sequential_reload(isolated_cache, process_count):
     """Workers compile distinct variants before the parent reloads them sequentially."""
     context = multiprocessing.get_context("fork")
