@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=512)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--share-kv", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--backend", nargs="+", default=["triton"], choices=["eager", "triton"])
+    parser.add_argument("--backend", nargs="+", default=["triton"], choices=["eager", "triton", "cute"])
     parser.add_argument("--calculate-bwd", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=int, default=100, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=500, help="Measurement duration in ms")
@@ -83,6 +83,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if "cute" in args.backend:
+        assert args.head_dim == 512, "cute backend requires 512 head dim"
+        assert args.dtype == "bfloat16", "cute backend requires bf16"
+        assert args.heads == 128, "cute backend requires 128 heads"
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 

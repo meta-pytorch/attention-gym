@@ -349,3 +349,22 @@ def test_cute_precision_vs_fp64(num_topk):
         sparse_kv_64.grad,
         reduction_sizes=dsparse_kv_reduction_sizes,
     )
+
+
+# ---------------------------------------------------------------------------
+# torch.compile fullgraph compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_cute_compile_fullgraph():
+    """CuTe backend works under torch.compile(fullgraph=True)."""
+    _skip_no_sm100()
+    inputs = _make_inputs(num_topk=16, seed=123)
+
+    compiled = torch.compile(selected_attention, fullgraph=True)
+
+    with torch.inference_mode():
+        expected = selected_attention(**inputs, backend="cute")
+        actual = compiled(**inputs, backend="cute")
+
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
