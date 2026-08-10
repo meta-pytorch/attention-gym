@@ -56,6 +56,7 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
     chunk_indices = torch.tensor([[0, 0], [0, 1]], device="cuda", dtype=torch.int64)
 
     def run_inter_solve():
+        Akk = torch.full((1, 128, 1, 64), torch.nan, device="cuda", dtype=q.dtype)
         return chunk_kda_fwd_inter_solve_cute(
             q,
             k,
@@ -65,6 +66,7 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
             128**-0.5,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            Akk=Akk,
         )
 
     run_inter_solve()
@@ -75,6 +77,9 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
     second_info = (_compile_k3b.cache_info(), _compile_k4b.cache_info())
 
     assert tuple(output.shape for output in outputs) == ((1, 128, 1, 64),) * 2
+    Akk = outputs[1].view(1, 2, 64, 1, 64).permute(0, 1, 3, 2, 4)
+    upper = torch.ones(64, 64, dtype=torch.bool, device="cuda").triu(1)
+    assert torch.count_nonzero(Akk[..., upper]) == 0
     assert all(
         second.hits == first.hits + 1 and second.currsize == first.currsize
         for first, second in zip(first_info, second_info, strict=True)

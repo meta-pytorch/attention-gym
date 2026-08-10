@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import cutlass
 import torch
 import triton
@@ -219,13 +221,11 @@ def chunk_kda_fwd_inter_solve_cute(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_indices: torch.LongTensor | None = None,
-    num_chunks: int | torch.Tensor | None = None,
     Aqk: torch.Tensor | None = None,
     Akk: torch.Tensor | None = None,
     AkkOD: torch.Tensor | None = None,
+    profile_ranges: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del num_chunks
-
     assert Akkd.ndim == 4, f"Akkd must be 4D, got shape {tuple(Akkd.shape)}"
     B, T, H, K = k.shape
     BT = chunk_size
@@ -255,12 +255,13 @@ def chunk_kda_fwd_inter_solve_cute(
         Aqk_flat = Aqk.reshape(B * T, H * BT)
 
     if Akk is None:
-        Akk_flat = torch.empty(B * T, H * BT, device=k.device, dtype=k.dtype)
+        Akk_flat = torch.zeros(B * T, H * BT, device=k.device, dtype=k.dtype)
         Akk = Akk_flat.reshape(B, T, H, BT)
     else:
         assert Akk.shape == (B, T, H, BT), (
             f"Akk must have shape {(B, T, H, BT)}, got {tuple(Akk.shape)}"
         )
+        Akk.zero_()
         Akk_flat = Akk.reshape(B * T, H * BT)
 
     if isinstance(k, FakeTensor):
@@ -287,32 +288,38 @@ def chunk_kda_fwd_inter_solve_cute(
         chunk_indices_i32 = chunk_indices.to(torch.int32).flatten().contiguous()
     else:
         cu_seqlens_i32 = torch.empty(1, dtype=torch.int32, device=k.device)
-        chunk_indices_i32 = torch.empty(1, dtype=torch.int32, device=k.device)
+        chunk_indices_i32 = torch.empty(2, dtype=torch.int32, device=k.device)
 
-    k3b = _compile_k3b(H, K, BT, BC, varlen)
-    k3b(
-        q_flat,
-        k_flat,
-        g_flat,
-        beta_flat,
-        Aqk_flat,
-        akk_od,
-        cutlass.Float32(scale),
-        H,
-        NT,
-        cu_seqlens_i32,
-        chunk_indices_i32,
-    )
-    k4b = _compile_k4b(H, K, BT, BC, varlen)
-    k4b(
-        akk_od,
-        akkd_flat,
-        Akk_flat,
-        H,
-        NT,
-        cu_seqlens_i32,
-        chunk_indices_i32,
-    )
+    with (
+        torch.profiler.record_function("kda/cute/k3b_offdiag") if profile_ranges else nullcontext()
+    ):
+        k3b = _compile_k3b(H, K, BT, BC, varlen)
+        k3b(
+            q_flat,
+            k_flat,
+            g_flat,
+            beta_flat,
+            Aqk_flat,
+            akk_od,
+            cutlass.Float32(scale),
+            H,
+            NT,
+            cu_seqlens_i32,
+            chunk_indices_i32,
+        )
+    with (
+        torch.profiler.record_function("kda/cute/k4b_inverse") if profile_ranges else nullcontext()
+    ):
+        k4b = _compile_k4b(H, K, BT, BC, varlen)
+        k4b(
+            akk_od,
+            akkd_flat,
+            Akk_flat,
+            H,
+            NT,
+            cu_seqlens_i32,
+            chunk_indices_i32,
+        )
     return Aqk, Akk
 
 

@@ -588,19 +588,20 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 linear_idx = lane_idx + k * 32
                 row = linear_idx // self.BC
                 col_idx = linear_idx % self.BC
+                value0 = sAi0[row, col_idx]
+                value1 = sAi1[row, col_idx]
+                value2 = sAi2[row, col_idx]
+                value3 = sAi3[row, col_idx]
+                if col_idx > row:
+                    value0 = self._sai_dtype(0.0)
+                    value1 = self._sai_dtype(0.0)
+                    value2 = self._sai_dtype(0.0)
+                    value3 = self._sai_dtype(0.0)
                 if i_tc0 + row < eos:
-                    mAkk[i_tc0 + row, h_akk_col + 0 * self.BC + col_idx] = self._dtype(
-                        sAi0[row, col_idx]
-                    )
+                    mAkk[i_tc0 + row, h_akk_col + 0 * self.BC + col_idx] = self._dtype(value0)
                 if i_tc1 + row < eos:
-                    mAkk[i_tc1 + row, h_akk_col + 1 * self.BC + col_idx] = self._dtype(
-                        sAi1[row, col_idx]
-                    )
+                    mAkk[i_tc1 + row, h_akk_col + 1 * self.BC + col_idx] = self._dtype(value1)
                 if i_tc2 + row < eos:
-                    mAkk[i_tc2 + row, h_akk_col + 2 * self.BC + col_idx] = self._dtype(
-                        sAi2[row, col_idx]
-                    )
+                    mAkk[i_tc2 + row, h_akk_col + 2 * self.BC + col_idx] = self._dtype(value2)
                 if i_tc3 + row < eos:
-                    mAkk[i_tc3 + row, h_akk_col + 3 * self.BC + col_idx] = self._dtype(
-                        sAi3[row, col_idx]
-                    )
+                    mAkk[i_tc3 + row, h_akk_col + 3 * self.BC + col_idx] = self._dtype(value3)

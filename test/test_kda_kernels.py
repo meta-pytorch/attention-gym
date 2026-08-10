@@ -29,10 +29,12 @@ from attn_gym.linear.kda.bwd.triton.l2norm_bwd import (
 )
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _requires_int64_offsets,
+    kda_gate_chunk_cumsum,
     kda_gate_chunk_cumsum_vector_kernel,
     kda_gate_chunk_cumsum_vector_kernel_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
+    l2norm,
     l2norm_fwd_kernel,
     l2norm_fwd_kernel1,
 )
@@ -229,6 +231,38 @@ def test_l2norm_fwd(dtype, T, D, strided):
     assert_golden(rstd1, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel1 rstd T={T} D={D}")
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
+def test_l2norm_autograd_wrapper(dtype):
+    """Check every supported dtype at the fused-backend normalization boundary."""
+    torch.manual_seed(1)
+    x = torch.randn(2, 17, 3, 128, device=DEV, dtype=dtype, requires_grad=True)
+    d_output = torch.randn_like(x)
+
+    output = l2norm(x)
+    actual_gradient = torch.autograd.grad(output, x, d_output)[0]
+    expected = l2norm_fwd_ref(x.float())
+    expected_gradient = torch.autograd.grad(expected, x, d_output.float())[0]
+    rtol, atol = (2e-5, 2e-6) if dtype == torch.float32 else (2e-2, 2e-3)
+
+    assert output.dtype == dtype
+    torch.testing.assert_close(output.float(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        actual_gradient.float(), expected_gradient.float(), rtol=rtol, atol=atol
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int32], ids=["fp64", "int32"])
+def test_l2norm_rejects_unsupported_dtype(dtype):
+    x = torch.ones(2, 8, device=DEV, dtype=dtype)
+    with pytest.raises(TypeError, match="float16, bfloat16, or float32"):
+        l2norm(x)
+
+
+def test_l2norm_rejects_empty_outer_dimension():
+    with pytest.raises(ValueError, match="at least one row"):
+        l2norm(torch.empty(0, 128, device=DEV))
+
+
 # l2norm backward   dx = rstd * (dy - y * <dy, y>)
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_bwd(dtype, T, D, strided):
@@ -380,10 +414,29 @@ def test_gate_fwd(dtype, T, lower_bound, has_bias, scale, reverse):
     bias = bias64.to(dtype) if has_bias else None
     ref = gate_fwd_ref(g, A_log, bias, lower_bound, scale, reverse, chunk, None)
 
-    o = torch.empty_like(g)
-    _run_gate_fwd(g, A_log, bias, o, scale, lower_bound, chunk, None, reverse=reverse)
+    o = kda_gate_chunk_cumsum(
+        g,
+        A_log,
+        bias,
+        chunk_size=chunk,
+        lower_bound=lower_bound,
+        scale=scale,
+        reverse=reverse,
+    )
     tag = f"T={T} lb={lower_bound} bias={has_bias} scale={scale} rev={reverse}"
     assert_golden(o, golden, ref, dtype, f"gate_fwd {tag}")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(0, 17, 2, 32), (1, 0, 2, 32), (1, 17, 0, 32), (1, 17, 2, 0)],
+)
+def test_gate_fwd_wrapper_rejects_empty_dimensions(shape):
+    g = torch.empty(shape, device=DEV)
+    A_log = torch.empty(shape[2], device=DEV)
+    dt_bias = torch.empty(shape[2:], device=DEV)
+    with pytest.raises(ValueError, match="no empty dimensions"):
+        kda_gate_chunk_cumsum(g, A_log, dt_bias)
 
 
 _GATE_FWD_VARLEN_CASES = [
@@ -412,9 +465,28 @@ def test_gate_fwd_varlen(dtype, docs, lower_bound):
     bias = bias64.to(dtype)
     ref = gate_fwd_ref(g, A_log, bias, lower_bound, None, False, chunk, cu)
 
-    o = torch.empty_like(g)
-    _run_gate_fwd(g, A_log, bias, o, None, lower_bound, chunk, cu)
-    assert_golden(o, golden, ref, dtype, f"gate_fwd_varlen docs={docs} lb={lower_bound}")
+    generated = kda_gate_chunk_cumsum(
+        g,
+        A_log,
+        bias,
+        chunk_size=chunk,
+        lower_bound=lower_bound,
+        cu_seqlens=cu,
+    )
+    chunk_indices = prepare_chunk_indices(cu, chunk)
+    explicit = kda_gate_chunk_cumsum(
+        g,
+        A_log,
+        bias,
+        chunk_size=chunk,
+        lower_bound=lower_bound,
+        cu_seqlens=cu,
+        chunk_indices=chunk_indices,
+        num_chunks=torch.tensor(len(chunk_indices), dtype=torch.int32, device=DEV),
+    )
+    tag = f"gate_fwd_varlen docs={docs} lb={lower_bound}"
+    assert_golden(generated, golden, ref, dtype, f"{tag} generated")
+    assert_golden(explicit, golden, ref, dtype, f"{tag} explicit")
 
 
 # gate forward with a reduced input dim S_in < S (USE_REPEAT branch): the kernel maps

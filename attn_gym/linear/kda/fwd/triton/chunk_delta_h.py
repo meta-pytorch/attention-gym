@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
 
@@ -715,3 +716,72 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                         b_h4.to(p_ht.dtype.element_ty),
                         boundary_check=(0, 1),
                     )
+
+
+def chunk_gated_delta_rule_fwd_h(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    *,
+    chunk_size: int = 64,
+    output_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Run the fixed-length inter-chunk KDA state recurrence."""
+    batch, tokens, heads, key_dim = k.shape
+    value_dim = u.shape[-1]
+    if tokens % chunk_size:
+        raise ValueError(
+            f"the inter-chunk state recurrence requires complete chunks, got T={tokens}"
+        )
+    if key_dim > 256:
+        raise ValueError(f"the inter-chunk state recurrence requires K <= 256, got {key_dim}")
+    if w.shape != k.shape or gk.shape != k.shape:
+        raise ValueError("k, w, and gk must have the same shape")
+    if u.shape != (batch, tokens, heads, value_dim):
+        raise ValueError("u must have shape [B, T, H, V]")
+    expected_state_shape = (batch, heads, key_dim, value_dim)
+    if initial_state is not None:
+        if initial_state.shape != expected_state_shape:
+            raise ValueError(
+                f"initial_state must have shape {expected_state_shape}, "
+                f"got {tuple(initial_state.shape)}"
+            )
+        initial_state = initial_state.contiguous()
+
+    chunks = tokens // chunk_size
+    h = k.new_empty(batch, chunks, heads, key_dim, value_dim)
+    v_new = torch.empty_like(u)
+    final_state = (
+        torch.empty(expected_state_shape, dtype=torch.float32, device=k.device)
+        if output_final_state
+        else None
+    )
+    block_value_dim = 64
+    grid = (batch * heads, triton.cdiv(value_dim, block_value_dim))
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+        k=k,
+        v=u,
+        w=w,
+        v_new=v_new,
+        g=None,
+        gk=gk,
+        h=h,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=None,
+        chunk_offsets=None,
+        num_seqs=None,
+        T=tokens,
+        H=heads,
+        K=key_dim,
+        V=value_dim,
+        BT=chunk_size,
+        BV=block_value_dim,
+        USE_EXP2=True,
+    )
+    return h, v_new, final_state
+
+
+__all__ = ["chunk_gated_delta_rule_fwd_h"]

@@ -25,8 +25,12 @@ from cutlass.cute.arch import (
 )
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import make_umma_smem_desc, smem_descriptor_to_int
+from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
+
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.target import get_compile_target
 
 # ============================================================================
 # Inlined SM100 tcgen05 helper wrappers
@@ -1266,7 +1270,6 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
         return _nvvm.tcgen05_ld(
             res=vec_i32_ty,
             shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-            num=num,
             tmem_addr=tmem_ptr,
             loc=loc,
             ip=ip,
@@ -1303,9 +1306,8 @@ def tcgen05_st_32x32b(num: int, taddr: int, vec):
         tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
         _nvvm.tcgen05_st(
             shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-            num=num,
             tmem_addr=tmem_ptr,
-            r=_to_ir(vec_val, loc, ip),
+            val=_to_ir(vec_val, loc, ip),
             loc=loc,
             ip=ip,
         )
@@ -1431,7 +1433,7 @@ def store_256b(gmem_ptr, vec):
         i32_ty = _ir_mod.IntegerType.get_signless(32)
         ir_v = _to_ir(v, loc, ip)
         elems = [
-            _vector.extractelement(
+            llvm.extractelement(
                 ir_v,
                 position=_arith.constant(i32_ty, i, loc=loc, ip=ip),
                 loc=loc,
@@ -1998,8 +2000,10 @@ class ChunkKdaBwdWyDqkgFused:
 
         # Persistent scheduling
         self.persistent = True
-        hardware_info = cutlass.utils.HardwareInfo()
-        self.num_sm = hardware_info.get_device_multiprocessor_count()
+        sm_count = get_compile_target().sm_count
+        if sm_count is None:
+            raise RuntimeError("KDA compilation requires a CUDA target with an SM count")
+        self.num_sm = sm_count
 
     def _compute_grid(self, B, T, HV, total_nt=None):
         """Compute grid dimensions for persistent kernel launch.
@@ -4704,3 +4708,152 @@ class ChunkKdaBwdWyDqkgFused:
             gC_g,
         )
         return bSG_sC, bSG_gC
+
+
+@jit_cache
+def _compile_chunk_kda_bwd_wy_dqkg(
+    heads: int,
+    head_dim: int,
+    chunk_size: int,
+    fastmath: bool,
+):
+    """Compile one persistent fixed-length WY/dQKG backward specialization."""
+    op = ChunkKdaBwdWyDqkgFused(
+        chunk_size=chunk_size,
+        head_dim_k=head_dim,
+        head_dim_v=head_dim,
+        scale=head_dim**-0.5,
+        use_fast_math=fastmath,
+    )
+    tokens, chunks = cute.sym_int(), cute.sym_int()
+
+    def tensor(dtype, shape):
+        return make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=128,
+        )
+
+    q = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    k = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    v = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    v_new = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    g = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    beta = tensor(cutlass.Float32, (1, tokens, heads))
+    A = tensor(cutlass.BFloat16, (1, tokens, heads, chunk_size))
+    h = tensor(cutlass.BFloat16, (1, chunks, heads, head_dim, head_dim))
+    do = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    dh = tensor(cutlass.BFloat16, (1, chunks, heads, head_dim, head_dim))
+    dv = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    dq = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    dk = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    dv2 = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    dg = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    db = tensor(cutlass.Float32, (1, tokens, heads))
+    dA = tensor(cutlass.Float32, (1, tokens, heads, chunk_size))
+    cu_seqlens = tensor(cutlass.Int32, (2,))
+    chunk_indices = tensor(cutlass.Int32, (chunks, 2))
+    return compile_tvm_ffi(
+        op,
+        q,
+        k,
+        v,
+        v_new,
+        g,
+        beta,
+        A,
+        h,
+        do,
+        dh,
+        dv,
+        dq,
+        dk,
+        dv2,
+        dg,
+        db,
+        dA,
+        cu_seqlens,
+        chunk_indices,
+        (Int32(1), Int32(1), Int32(heads), Int32(heads), Int32(head_dim), Int32(head_dim)),
+        Int32(1),
+        name=(f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_fm{int(fastmath)}"),
+    )
+
+
+def chunk_kda_bwd_wy_dqkg(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    v_new: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    do: torch.Tensor,
+    dh: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+    fastmath: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run the fixed-length fused WY and dQ/K/V/gate/beta backward stage."""
+    batch, tokens, heads, head_dim = q.shape
+    if batch != 1 or head_dim != 128 or v.shape[-1] != 128:
+        raise ValueError("the fused WY backward requires B=1 and K=V=128")
+    if chunk_size != 64:
+        raise ValueError(f"the fused WY backward requires chunk_size=64, got {chunk_size}")
+    if tokens % chunk_size:
+        raise ValueError("the fused WY backward requires complete chunks")
+    chunks = tokens // chunk_size
+    expected_h = (batch, chunks, heads, head_dim, head_dim)
+    if h.shape != expected_h or dh.shape != expected_h:
+        raise ValueError(f"h and dh must have shape {expected_h}")
+
+    dq = torch.empty_like(g)
+    dk = torch.empty_like(g)
+    dv2 = torch.empty_like(v)
+    dg = torch.empty_like(g)
+    db = torch.empty_like(beta)
+    dA = torch.empty_like(A, dtype=torch.float32)
+    compiled = _compile_chunk_kda_bwd_wy_dqkg(heads, head_dim, chunk_size, fastmath)
+    compiled(
+        q,
+        k,
+        v,
+        v_new,
+        g,
+        beta,
+        A,
+        h,
+        do,
+        dh,
+        dv,
+        dq,
+        dk,
+        dv2,
+        dg,
+        db,
+        dA,
+        cu_seqlens,
+        chunk_indices,
+        (
+            Int32(batch),
+            Int32(tokens),
+            Int32(heads),
+            Int32(heads),
+            Int32(head_dim),
+            Int32(head_dim),
+        ),
+        Int32(chunks),
+    )
+    return dq, dk, dv2, dg, db, dA
