@@ -91,8 +91,9 @@ def main(device: str = "cpu", causal: bool = True):
     Args:
         device (str): Device to use for computation. Defaults to "cpu".
     """
-    from attn_gym import visualize_attention_scores
     import random
+
+    from attn_gym import visualize_attention_scores
 
     random.seed(0)
 

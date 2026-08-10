@@ -11,6 +11,7 @@ It provides ready-to-use **mask functions** and **score mods** that you can comp
 - **[Concepts](concepts.md)** — how `mask_mod`, `score_mod`, and `BlockMask` work together
 - **[Masks](masks.md)** — `mask_mod` functions for causal, sliding window, document-level, neighborhood attention, and more
 - **[Score Mods](mods.md)** — `score_mod` functions like ALiBi, soft-capping, and latent attention
+- **[Linear Attention](linear.md)** — gated-delta-rule reference implementations
 - **[Examples](examples.md)** — benchmarks, MLA, paged attention, determinism testing, and advanced patterns
 - **[Utilities](utilities.md)** — visualization, benchmarking, and profiling helpers
 

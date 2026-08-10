@@ -52,6 +52,7 @@ nav:
   - Determinism: determinism.md
   - Masks: masks.md
   - Score Mods: mods.md
+  - Linear Attention: linear.md
   - Examples: examples.md
   - Utilities: utilities.md
 

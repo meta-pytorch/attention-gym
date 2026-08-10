@@ -52,6 +52,7 @@ from torch.nn.attention.flex_attention import and_masks, or_masks
 # Sliding window + causal
 sliding_causal = and_masks(causal_mask, sliding_window_mask)
 
+
 # Or combine inline
 def my_mask(b, h, q_idx, kv_idx):
     return (q_idx >= kv_idx) & (q_idx - kv_idx <= window_size)
@@ -88,8 +89,8 @@ from attn_gym.masks import causal_mask
 
 block_mask = create_block_mask(causal_mask, B=1, H=1, Q_LEN=2048, KV_LEN=2048, device="cuda")
 
-print(block_mask)            # ASCII visualization of the sparsity pattern
-print(block_mask.sparsity()) # percentage of blocks that are empty
+print(block_mask)  # ASCII visualization of the sparsity pattern
+print(block_mask.sparsity())  # percentage of blocks that are empty
 ```
 
 The `print` output shows a grid where `██` = full block, `░░` = partial block, and blank = empty (skipped). For causal attention this is the lower triangle.
@@ -112,6 +113,7 @@ When debugging, use `torch._C._functorch.get_unwrapped` to inspect tensor values
 
 ```python
 unwrap = torch._C._functorch.get_unwrapped
+
 
 def my_score_mod(score, b, h, q_idx, kv_idx):
     distance = q_idx - kv_idx

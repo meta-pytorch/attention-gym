@@ -1,12 +1,15 @@
+from functools import partial
+
+import pytest
 import torch
 from torch.autograd import grad
 from torch.nn.attention.flex_attention import flex_attention
-import pytest
-from functools import partial
+
 from attn_gym.mods import generate_tanh_softcap
 
 
 def test_tanh_approx():
+    torch.compiler.reset()
     softcap_mod = generate_tanh_softcap(30, approx=False)
     softcap_mod_approx = generate_tanh_softcap(30, approx=True)
     make_tensor = partial(

@@ -1,11 +1,11 @@
 """Generates a document causal attention mask based on a document ID tensor"""
 
 import random
-from typing import List, Union
 
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import _mask_mod_signature, noop_mask
+
 from attn_gym.masks import causal_mask
 
 
@@ -17,7 +17,7 @@ def _offsets_to_doc_ids_tensor(offsets):
     )
 
 
-def length_to_offsets(lengths: List[int], device: Union[str, torch.device]) -> Tensor:
+def length_to_offsets(lengths: list[int], device: str | torch.device) -> Tensor:
     """Converts a list of lengths to a list of offsets.
 
     Args:

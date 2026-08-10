@@ -14,18 +14,20 @@ Usage:
     python flex_flash_attention.py --mode compare     # Just numerical comparison
 """
 
-import torch
 import warnings
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Optional, Literal
+from typing import Literal
 
-from tqdm import tqdm
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
-from torch._inductor.utils import do_bench_using_profiling
+import torch
 from tabulate import tabulate
+from torch._inductor.utils import do_bench_using_profiling
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from tqdm import tqdm
+
 from attn_gym.masks import causal_mask
 from attn_gym.mods import generate_alibi_bias, generate_tanh_softcap
-from attn_gym.utils import get_flash_block_size, calculate_tflops, cuda_kernel_profiler
+from attn_gym.utils import calculate_tflops, cuda_kernel_profiler, get_flash_block_size
 
 # Suppress noisy profiler warning
 warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
@@ -70,8 +72,8 @@ def compare_backends(
     *,
     flex_flash: Callable,
     flex_triton: Callable,
-    score_mod: Optional[Callable] = None,
-    block_mask: Optional[BlockMask] = None,
+    score_mod: Callable | None = None,
+    block_mask: BlockMask | None = None,
     backward: bool = False,
 ) -> tuple[float, float, float, float]:
     """Compare Flash vs Triton error against FP32 reference (forward and optionally backward)."""
@@ -232,7 +234,7 @@ def run_benchmark(
 
     print(f"Config: B={B}, H={H}, S={S}, D={D}, dtype={dtype}")
     if use_mask:
-        print(f"Mask: causal, sparsity={sparsity*100:.1f}%")
+        print(f"Mask: causal, sparsity={sparsity * 100:.1f}%")
 
     def make_qkv():
         q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)

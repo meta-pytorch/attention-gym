@@ -4,18 +4,19 @@ import torch
 from attn_gym.sparse.selected_attention import selected_attention
 
 
-def _run_selected_attention(Q, KV, index_kv, indices, attention_sink, doc_ids,
-                            sliding_window_size, share_kv):
+def _run_selected_attention(
+    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
+):
     """Helper that calls selected_attention and returns the output."""
     return selected_attention(
-        Q,
-        KV,
-        index_kv,
-        indices,
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
         attention_sink,
         doc_ids,
         sliding_window_size,
-        share_kv,
+        backend="eager",
     )
 
 
@@ -25,42 +26,41 @@ def test_batch_invariance(share_kv, num_topk_blocks):
     """Outputs should be identical regardless of batch position."""
     b, h, s, head_dim = 3, 5, 14, 17
     kv_heads = 1 if share_kv else h
-    index_seq_len = s // 2
+    sparse_seq_len = s // 2
 
     generator = torch.Generator().manual_seed(42)
 
-    Q = torch.randn(b, h, s, head_dim, generator=generator)
-    KV = torch.randn(b, kv_heads, s, head_dim, generator=generator)
-    idx_kv = torch.randn(b, kv_heads, index_seq_len, head_dim, generator=generator)
+    query = torch.randn(b, h, s, head_dim, generator=generator)
+    local_kv = torch.randn(b, kv_heads, s, head_dim, generator=generator)
+    sparse_kv = torch.randn(b, kv_heads, sparse_seq_len, head_dim, generator=generator)
 
     if num_topk_blocks > 0:
-        _, indices = torch.topk(
-            torch.randn(b, s, index_seq_len, generator=generator),
-            k=min(num_topk_blocks, index_seq_len),
+        _, kv_indices = torch.topk(
+            torch.randn(b, s, sparse_seq_len, generator=generator),
+            k=min(num_topk_blocks, sparse_seq_len),
             dim=-1,
         )
     else:
-        indices = torch.zeros(b, s, 0, dtype=torch.long)
+        kv_indices = torch.zeros(b, s, 0, dtype=torch.long)
 
     attention_sink = torch.randn(h, generator=generator)
     sliding_window_size = 3
 
     # Run full batch
     full_out = _run_selected_attention(
-        Q, KV, idx_kv, indices, attention_sink, None, sliding_window_size, share_kv
+        query, local_kv, sparse_kv, kv_indices, attention_sink, None, sliding_window_size
     )
 
     # Run each batch element independently and compare
     for i in range(b):
         single_out = _run_selected_attention(
-            Q[i : i + 1],
-            KV[i : i + 1],
-            idx_kv[i : i + 1],
-            indices[i : i + 1],
+            query[i : i + 1],
+            local_kv[i : i + 1],
+            sparse_kv[i : i + 1],
+            kv_indices[i : i + 1],
             attention_sink,
             None,
             sliding_window_size,
-            share_kv,
         )
         torch.testing.assert_close(
             full_out[i : i + 1],
@@ -89,54 +89,64 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     doc1_len = 6
     doc2_len = 8
     packed_len = doc1_len + doc2_len
-    index_seq_len = packed_len // 2
+    sparse_seq_len = packed_len // 2
 
     generator = torch.Generator().manual_seed(123)
 
     # ---------- Packed inputs (both docs in one sequence) ----------
-    Q_packed = torch.randn(1, h, packed_len, head_dim, generator=generator)
-    KV_packed = torch.randn(1, kv_heads, packed_len, head_dim, generator=generator)
-    idx_kv_packed = torch.randn(
-        1, kv_heads, index_seq_len, head_dim, generator=generator
-    )
+    query_packed = torch.randn(1, h, packed_len, head_dim, generator=generator)
+    local_kv_packed = torch.randn(1, kv_heads, packed_len, head_dim, generator=generator)
+    sparse_kv_packed = torch.randn(1, kv_heads, sparse_seq_len, head_dim, generator=generator)
 
     if num_topk_blocks > 0:
-        _, indices_packed = torch.topk(
-            torch.randn(1, packed_len, index_seq_len, generator=generator),
-            k=min(num_topk_blocks, index_seq_len),
+        _, kv_indices_packed = torch.topk(
+            torch.randn(1, packed_len, sparse_seq_len, generator=generator),
+            k=min(num_topk_blocks, sparse_seq_len),
             dim=-1,
         )
     else:
-        indices_packed = torch.zeros(1, packed_len, 0, dtype=torch.long)
+        kv_indices_packed = torch.zeros(1, packed_len, 0, dtype=torch.long)
 
     attention_sink = torch.randn(h, generator=generator)
 
     # doc_ids: [0,0,0,0,0,0, 1,1,1,1,1,1,1,1]
-    doc_ids = torch.cat([
-        torch.zeros(doc1_len, dtype=torch.long),
-        torch.ones(doc2_len, dtype=torch.long),
-    ]).unsqueeze(0)  # shape (1, packed_len)
+    doc_ids = torch.cat(
+        [
+            torch.zeros(doc1_len, dtype=torch.long),
+            torch.ones(doc2_len, dtype=torch.long),
+        ]
+    ).unsqueeze(0)  # shape (1, packed_len)
 
     out_packed = _run_selected_attention(
-        Q_packed, KV_packed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        query_packed,
+        local_kv_packed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # ---------- Perturb the other document's data ----------
     # If isolation is correct, changing doc2's tokens shouldn't affect doc1's output
-    Q_perturbed = Q_packed.clone()
-    KV_perturbed = KV_packed.clone()
+    query_perturbed = query_packed.clone()
+    local_kv_perturbed = local_kv_packed.clone()
     # Overwrite doc2's positions with different random data
-    Q_perturbed[:, :, doc1_len:, :] = torch.randn(
+    query_perturbed[:, :, doc1_len:, :] = torch.randn(
         1, h, doc2_len, head_dim, generator=generator
     )
-    KV_perturbed[:, :, doc1_len:, :] = torch.randn(
+    local_kv_perturbed[:, :, doc1_len:, :] = torch.randn(
         1, kv_heads, doc2_len, head_dim, generator=generator
     )
 
     out_perturbed = _run_selected_attention(
-        Q_perturbed, KV_perturbed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        query_perturbed,
+        local_kv_perturbed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # Doc1's output must be unchanged
@@ -149,18 +159,23 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
     )
 
     # Symmetrically, perturb doc1 and check doc2 is unchanged
-    Q_perturbed2 = Q_packed.clone()
-    KV_perturbed2 = KV_packed.clone()
-    Q_perturbed2[:, :, :doc1_len, :] = torch.randn(
+    query_perturbed2 = query_packed.clone()
+    local_kv_perturbed2 = local_kv_packed.clone()
+    query_perturbed2[:, :, :doc1_len, :] = torch.randn(
         1, h, doc1_len, head_dim, generator=generator
     )
-    KV_perturbed2[:, :, :doc1_len, :] = torch.randn(
+    local_kv_perturbed2[:, :, :doc1_len, :] = torch.randn(
         1, kv_heads, doc1_len, head_dim, generator=generator
     )
 
     out_perturbed2 = _run_selected_attention(
-        Q_perturbed2, KV_perturbed2, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        query_perturbed2,
+        local_kv_perturbed2,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     torch.testing.assert_close(
@@ -192,23 +207,23 @@ def test_doc_id_matches_separate_execution(share_kv):
     generator = torch.Generator().manual_seed(99)
 
     # Generate data for each document independently
-    Q1 = torch.randn(1, h, doc1_len, head_dim, generator=generator)
-    KV1 = torch.randn(1, kv_heads, doc1_len, head_dim, generator=generator)
-    idx_kv1_len = doc1_len // 2
-    idx_kv1 = torch.randn(1, kv_heads, idx_kv1_len, head_dim, generator=generator)
-    _, indices1 = torch.topk(
-        torch.randn(1, doc1_len, idx_kv1_len, generator=generator),
-        k=min(num_topk_blocks, idx_kv1_len),
+    query1 = torch.randn(1, h, doc1_len, head_dim, generator=generator)
+    local_kv1 = torch.randn(1, kv_heads, doc1_len, head_dim, generator=generator)
+    sparse_kv1_len = doc1_len // 2
+    sparse_kv1 = torch.randn(1, kv_heads, sparse_kv1_len, head_dim, generator=generator)
+    _, kv_indices1 = torch.topk(
+        torch.randn(1, doc1_len, sparse_kv1_len, generator=generator),
+        k=min(num_topk_blocks, sparse_kv1_len),
         dim=-1,
     )
 
-    Q2 = torch.randn(1, h, doc2_len, head_dim, generator=generator)
-    KV2 = torch.randn(1, kv_heads, doc2_len, head_dim, generator=generator)
-    idx_kv2_len = doc2_len // 2
-    idx_kv2 = torch.randn(1, kv_heads, idx_kv2_len, head_dim, generator=generator)
-    _, indices2 = torch.topk(
-        torch.randn(1, doc2_len, idx_kv2_len, generator=generator),
-        k=min(num_topk_blocks, idx_kv2_len),
+    query2 = torch.randn(1, h, doc2_len, head_dim, generator=generator)
+    local_kv2 = torch.randn(1, kv_heads, doc2_len, head_dim, generator=generator)
+    sparse_kv2_len = doc2_len // 2
+    sparse_kv2 = torch.randn(1, kv_heads, sparse_kv2_len, head_dim, generator=generator)
+    _, kv_indices2 = torch.topk(
+        torch.randn(1, doc2_len, sparse_kv2_len, generator=generator),
+        k=min(num_topk_blocks, sparse_kv2_len),
         dim=-1,
     )
 
@@ -216,46 +231,59 @@ def test_doc_id_matches_separate_execution(share_kv):
 
     # Run each document independently (no doc_ids needed — single doc)
     out1 = _run_selected_attention(
-        Q1, KV1, idx_kv1, indices1, attention_sink, None, sliding_window_size, share_kv,
+        query1,
+        local_kv1,
+        sparse_kv1,
+        kv_indices1,
+        attention_sink,
+        None,
+        sliding_window_size,
     )
     out2 = _run_selected_attention(
-        Q2, KV2, idx_kv2, indices2, attention_sink, None, sliding_window_size, share_kv,
+        query2,
+        local_kv2,
+        sparse_kv2,
+        kv_indices2,
+        attention_sink,
+        None,
+        sliding_window_size,
     )
 
     # ---------- Pack into one sequence ----------
-    Q_packed = torch.cat([Q1, Q2], dim=2)
-    KV_packed = torch.cat([KV1, KV2], dim=2)
+    query_packed = torch.cat([query1, query2], dim=2)
+    local_kv_packed = torch.cat([local_kv1, local_kv2], dim=2)
 
-    # For the index branch, pack both index KVs and adjust indices for doc2
-    idx_kv_packed = torch.cat([idx_kv1, idx_kv2], dim=2)
-    packed_idx_len = idx_kv1_len + idx_kv2_len
+    # For the sparse branch, pack both sparse KVs and adjust indices for doc2
+    sparse_kv_packed = torch.cat([sparse_kv1, sparse_kv2], dim=2)
 
     # Build packed indices: doc1 indices stay the same, doc2 indices offset
-    # by idx_kv1_len. Pad both to have `packed_len` query positions.
-    indices1_padded = torch.zeros(1, packed_len, min(num_topk_blocks, idx_kv1_len), dtype=torch.long)
-    indices1_padded[:, :doc1_len, :] = indices1
-    # doc2 indices should point into the second half of the packed index_kv
-    indices2_shifted = indices2 + idx_kv1_len
-    indices2_padded = torch.zeros(1, packed_len, min(num_topk_blocks, idx_kv2_len), dtype=torch.long)
-    indices2_padded[:, doc1_len:, :] = indices2_shifted
+    # by sparse_kv1_len.
+    indices2_shifted = kv_indices2 + sparse_kv1_len
 
     # We need a common topk width — use the max
     topk_width = max(
-        min(num_topk_blocks, idx_kv1_len),
-        min(num_topk_blocks, idx_kv2_len),
+        min(num_topk_blocks, sparse_kv1_len),
+        min(num_topk_blocks, sparse_kv2_len),
     )
-    indices_packed = torch.zeros(1, packed_len, topk_width, dtype=torch.long)
-    indices_packed[:, :doc1_len, :min(num_topk_blocks, idx_kv1_len)] = indices1
-    indices_packed[:, doc1_len:, :min(num_topk_blocks, idx_kv2_len)] = indices2_shifted
+    kv_indices_packed = torch.zeros(1, packed_len, topk_width, dtype=torch.long)
+    kv_indices_packed[:, :doc1_len, : min(num_topk_blocks, sparse_kv1_len)] = kv_indices1
+    kv_indices_packed[:, doc1_len:, : min(num_topk_blocks, sparse_kv2_len)] = indices2_shifted
 
-    doc_ids = torch.cat([
-        torch.zeros(doc1_len, dtype=torch.long),
-        torch.ones(doc2_len, dtype=torch.long),
-    ]).unsqueeze(0)
+    doc_ids = torch.cat(
+        [
+            torch.zeros(doc1_len, dtype=torch.long),
+            torch.ones(doc2_len, dtype=torch.long),
+        ]
+    ).unsqueeze(0)
 
     out_packed = _run_selected_attention(
-        Q_packed, KV_packed, idx_kv_packed, indices_packed,
-        attention_sink, doc_ids, sliding_window_size, share_kv,
+        query_packed,
+        local_kv_packed,
+        sparse_kv_packed,
+        kv_indices_packed,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
     )
 
     # Verify doc1 tokens match

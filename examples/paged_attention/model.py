@@ -1,8 +1,8 @@
-import torch
 import math
-from torch.nn.attention.flex_attention import BlockMask, flex_attention, _score_mod_signature
+
+import torch
 from torch import Tensor
-from typing import Dict, Optional
+from torch.nn.attention.flex_attention import BlockMask, _score_mod_signature, flex_attention
 
 
 class NonPagedAttentionLayer(torch.nn.Module):
@@ -135,7 +135,7 @@ class PagedAttentionLayer(torch.nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        q, k, v = (x.transpose(1, 2) for x in (q, k, v))
 
         # Comparing with NonPagedAttention, here is the only change for updating kv cache
         self.paged_attention.assign(
@@ -174,7 +174,7 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     return x_out2.type_as(x)
 
 
-def apply_rope_scaling(freqs: torch.Tensor, rope_scaling: Dict):
+def apply_rope_scaling(freqs: torch.Tensor, rope_scaling: dict):
     factor = rope_scaling["factor"]
     low_freq_factor = rope_scaling["low_freq_factor"]
     high_freq_factor = rope_scaling["high_freq_factor"]
@@ -203,7 +203,7 @@ def precompute_freqs_cis(
     n_elem: int,
     base: int = 10000,
     dtype: torch.dtype = torch.bfloat16,
-    rope_scaling: Optional[dict] = None,
+    rope_scaling: dict | None = None,
 ) -> Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
     if rope_scaling is not None:

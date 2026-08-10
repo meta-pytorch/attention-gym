@@ -1,7 +1,8 @@
-import torch
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import pytest
-from attn_gym.masks import generate_natten, generate_tiled_natten, generate_morton_natten
+import torch
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+from attn_gym.masks import generate_morton_natten, generate_natten, generate_tiled_natten
 from attn_gym.masks.natten import morton_decode, morton_encode
 
 
@@ -76,6 +77,10 @@ def test_natten_masks(
     T_W=8,
     print_mask=True,
 ):
+    if torch.cuda.get_device_capability()[0] == 10:
+        pytest.skip("SM100 ptxas miscompile: https://github.com/pytorch/pytorch/issues/190973")
+
+    torch.compiler.reset()
     query = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
     key = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)
     value = torch.randn(B, H, W, W, D, device="cuda", dtype=torch.float16, requires_grad=True)

@@ -3,7 +3,8 @@
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import _mask_mod_signature, noop_mask
-from attn_gym.masks import causal_mask
+
+from attn_gym.masks.causal import causal_mask
 
 
 def batchify_mask_mod(mask_mod: _mask_mod_signature, batchify_size: int) -> _mask_mod_signature:
@@ -37,8 +38,9 @@ def main(device: str = "cpu", causal: bool = False):
     Args:
         device (str): Device to use for computation. Defaults to "cpu".
     """
-    from attn_gym import visualize_attention_scores
     import random
+
+    from attn_gym import visualize_attention_scores
 
     random.seed(0)
 

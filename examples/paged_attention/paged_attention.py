@@ -1,16 +1,14 @@
-from typing import Optional, Union
-
 import torch
 from torch.nn.attention.flex_attention import (
+    BlockMask,
     _identity,
     _mask_mod_signature,
     _score_mod_signature,
-    BlockMask,
     noop_mask,
 )
 
 
-def _cdiv(x: Union[int, float, torch.Tensor], multiple: Union[int, float, torch.Tensor]):
+def _cdiv(x: float | torch.Tensor, multiple: float | torch.Tensor):
     return (x + multiple - 1) // multiple
 
 
@@ -182,7 +180,7 @@ class PagedAttention:
     def convert_logical_block_mask(
         self,
         block_mask: BlockMask,
-        batch_idx: Optional[torch.Tensor] = None,
+        batch_idx: torch.Tensor | None = None,
     ) -> BlockMask:
         """
         Converts a logical block mask by mapping its logical kv indices to the corresponding
@@ -256,7 +254,7 @@ class PagedAttention:
         )
 
     def get_mask_mod(
-        self, mask_mod: Optional[_mask_mod_signature], batch_idx: Optional[torch.Tensor] = None
+        self, mask_mod: _mask_mod_signature | None, batch_idx: torch.Tensor | None = None
     ) -> _mask_mod_signature:
         """
         Converts a mask_mod based on mapping from the physical block index to the logical
@@ -291,7 +289,7 @@ class PagedAttention:
         return new_mask_mod
 
     def get_score_mod(
-        self, score_mod: Optional[_score_mod_signature], batch_idx: Optional[torch.Tensor] = None
+        self, score_mod: _score_mod_signature | None, batch_idx: torch.Tensor | None = None
     ) -> _score_mod_signature:
         """
         Converts a score_mod based on mapping from the physical block index to the logical

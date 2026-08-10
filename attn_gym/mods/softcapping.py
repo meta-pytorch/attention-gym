@@ -1,13 +1,14 @@
 """Implementation of tanh softcapping score mod popularized in Gemma2 and Grok-1"""
 
+from functools import partial
+
 import torch
 from torch import Tensor
-from torch.nn.attention.flex_attention import _score_mod_signature
 from torch._inductor.lowering import make_pointwise, register_lowering
 
 # Some internal torch.compile details
 from torch._inductor.virtualized import ops
-from functools import partial
+from torch.nn.attention.flex_attention import _score_mod_signature
 
 
 @torch.library.custom_op("approx::tanh", mutates_args=())
@@ -35,7 +36,7 @@ class _TanhApprox(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        (x,) = inputs
+        (_x,) = inputs
         result = output
         ctx.save_for_backward(result)
 
@@ -80,6 +81,7 @@ def main(device: str = "cpu"):
         device (str): Device to use for computation. Defaults
     """
     import torch
+
     from attn_gym import visualize_attention_scores
 
     B, H, SEQ_LEN, HEAD_DIM = 1, 1, 12, 8

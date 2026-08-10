@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import warnings
 
-from tabulate import tabulate
-
 import torch
 import torch.nn.attention.flex_attention as fa
+from tabulate import tabulate
 
 Q_LEN = 128
 KV_LEN = 256

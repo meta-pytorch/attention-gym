@@ -10,9 +10,12 @@ authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
 description = "Helpful tools and examples for working with flex-attention"
 readme = "README.md"
 dynamic = ["version"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
 ]
@@ -22,15 +25,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tests = [
+    "pytest",
+    "pytest-xdist",
+    "jsonargparse",
+    "docstring-parser",
+    "numpy",
+    "flash-attn-4[cu13]~=4.0.0b23; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 dev = [
     "prek",
-    "bumpver",
-    "pip-tools",
     "pytest",
     "ruff",
     "jsonargparse",
     "docstring-parser",
-    "numpy"
+    "numpy",
 ]
 
 viz = [
@@ -52,6 +62,10 @@ docs = [
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]
 source = "vcs"
+
+# ---------- PYTEST ------------
+[tool.pytest.ini_options]
+testpaths = ["test"]
 
 # ---------- RUFF ------------
 [tool.ruff]
@@ -93,3 +107,5 @@ ignore = ['E231', 'E731']
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
+"attn_gym/linear/kda/utils.py" = ["BLE001"]
+"test/test_kda_kernels.py" = ["E402"]

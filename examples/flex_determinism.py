@@ -1,11 +1,13 @@
+import sys
+import warnings
+from dataclasses import asdict, dataclass
+
 import torch
-from torch.nn.attention import flex_attention
-from tabulate import tabulate
 import torch._inductor.config
 import torch._inductor.utils
-import warnings
+from tabulate import tabulate
+from torch.nn.attention import flex_attention
 from tqdm import tqdm
-from dataclasses import dataclass, asdict
 
 warnings.filterwarnings("ignore", message=".*dynamo_pgo force disabled.*")
 warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
@@ -263,4 +265,4 @@ def main():
 
 if __name__ == "__main__":
     success = main()
-    exit(0 if success else 1)
+    sys.exit(0 if success else 1)

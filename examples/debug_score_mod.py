@@ -24,7 +24,6 @@ def _(mo):
     actual tensor values!
     """
     )
-    return
 
 
 @app.cell
@@ -46,7 +45,6 @@ def _(mo):
     Let's start with a "broken" implementation that's hard to debug:
     """
     )
-    return
 
 
 @app.cell
@@ -93,7 +91,6 @@ def _(mo):
     It outputs a tensor, so probaly fine. But we can't see the actual attention scores or how they change with different inputs. Lets do the old way and look at the attention scores graph
     """
     )
-    return
 
 
 @app.cell
@@ -104,7 +101,7 @@ def _(broken_score_mod, k, q):
         query=q, key=k, score_mod=broken_score_mod, device="cpu", figsize=(8, 8)
     )
 
-    graph
+    graph  # noqa: B018
     return (plot_attention_scores,)
 
 
@@ -126,7 +123,6 @@ def _(mo):
     This was time-consuming and error-prone!
     """
     )
-    return
 
 
 @app.cell
@@ -148,7 +144,6 @@ def _(flex_attention, k, q, torch, v):
         flex_attention(q, k, v, score_mod=create_broken_mod_2(4))
 
     # The dreaded : It looks like you're calling .item() on a Tensor!!
-    return
 
 
 @app.cell(hide_code=True)
@@ -160,7 +155,6 @@ def _(mo):
     Now we can use FlexAttention's debug flag to set breakpoints and inspect values:
     """
     )
-    return
 
 
 @app.cell
@@ -190,8 +184,6 @@ def _(fa, flex_attention, k, q, torch, v):
     with torch.no_grad():
         flex_attention(q, k, v, score_mod=create_broken_mod_3)
 
-    return
-
 
 @app.cell
 def _(flex_attention, k, plot_attention_scores, q, torch, v):
@@ -215,8 +207,7 @@ def _(flex_attention, k, plot_attention_scores, q, torch, v):
     flex_viz = plot_attention_scores(
         query=q, key=k, score_mod=create_broken_mod_4, device="cpu", figsize=(8, 8)
     )
-    flex_viz
-    return
+    flex_viz  # noqa: B018
 
 
 @app.cell(hide_code=True)
@@ -254,7 +245,6 @@ def _(mo):
     So if you if you need to debug an expression involving score you will need 4 unwraps to get to the innner `tensor` and 1 for expressions on the indices.
     """
     )
-    return
 
 
 @app.cell(hide_code=True)
@@ -270,7 +260,6 @@ def _(mo):
     - **Requires PyTorch 2.9 nightly or later**
     """
     )
-    return
 
 
 if __name__ == "__main__":

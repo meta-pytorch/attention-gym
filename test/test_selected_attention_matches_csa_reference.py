@@ -96,19 +96,19 @@ def apply_rope(
 ) -> torch.Tensor:
     sequence_length = x.shape[-2]
     rotary_dim = x.shape[-1]
-
+    dtype = x.dtype
     if positions is None:
         positions = torch.arange(
             position_offset,
             position_offset + sequence_length,
             device=x.device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
     else:
-        positions = positions.to(device=x.device, dtype=torch.float32)
+        positions = positions.to(device=x.device, dtype=dtype)
 
     frequencies = 1.0 / (
-        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=torch.float32) / rotary_dim)
+        base ** (torch.arange(0, rotary_dim, 2, device=x.device, dtype=dtype) / rotary_dim)
     )
 
     if original_seq_len > 0:
@@ -125,9 +125,7 @@ def apply_rope(
         if low == high:
             high += 0.001
 
-        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=torch.float32) - low) / (
-            high - low
-        )
+        ramp = (torch.arange(rotary_dim // 2, device=x.device, dtype=dtype) - low) / (high - low)
         smooth = 1 - ramp.clamp(0, 1)
         frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
 
@@ -374,12 +372,12 @@ def test_selected_attention_matches_csa_reference_fp64(share_kv, num_topk_blocks
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selected_attention_matches_csa_reference_cuda_fp32():
+def test_selected_attention_matches_csa_reference_cuda_fp64():
     inputs = _make_inputs(
         True,
         1,
-        dtype=torch.float32,
-        device=torch.device("cuda"),
+        dtype=torch.float64,
+        device="cuda",
     )
 
     with torch.inference_mode():
@@ -387,5 +385,5 @@ def test_selected_attention_matches_csa_reference_cuda_fp32():
         actual = csa_example.CSA(*inputs)
 
     assert actual.device.type == expected.device.type == "cuda"
-    assert actual.dtype == expected.dtype == torch.float32
+    assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)

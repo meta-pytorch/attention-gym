@@ -1,6 +1,6 @@
 """
 Compose compressed sparse attention from the selected-attention primitive.
-Implementation of compressed sparse attention for here: https://arxiv.org/html/2606.19348v1
+Implementation of compressed sparse attention from here: https://arxiv.org/html/2606.19348v1
 """
 
 import math
@@ -27,7 +27,7 @@ def _split_blocks(x: torch.Tensor, compression_rate: int) -> torch.Tensor:
     Chunk the sequence into blocks as mentioned in the paper.
     Args:
         x: tensor in shape of (batch, heads, sequence_length, dim)
-        compression_rate: integer, size of each blog
+        compression_rate: integer, size of each block
     Returns:
         tensor in shape of (batch, heads, sequence_length/compression_rate, compression_rate, dim)
     """
@@ -47,7 +47,7 @@ def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
         C_a, C_b, Z_a, Z_b, B_a, B_b: Tensors from CSA inputs
         compression_rate: int, size of each block (and also how much they're compressed by)
     Returns:
-        Weighted, tensor in shape of (batch, num_heads, sequence_length, head_dim)
+        Weighted, tensor in shape of (batch, num_heads, sequence_length / compression_rate, head_dim)
     """
     # Pad everything to be evenly divisible by block size
     C_a = pad_to_block_size(C_a, compression_rate, 0.0)
@@ -76,10 +76,10 @@ def compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate):
 
 def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
     """
-    Masks out causally invalid blocks (queries can only attend to blocks created by KV values before it)
+    Masks out causally invalid blocks (queries can only attend to blocks created by KV values before them)
     Args:
         query_length: int, length of query
-        num_blocks: int, total numbers of blocks
+        num_blocks: int, total number of blocks
         compression_rate: int, size of each block
         device: device to create mask on
         dtype: dtype of mask
@@ -176,47 +176,35 @@ def apply_rope(
 
 
 def _selected_attention_with_causal_blocks(
-    Q,
-    KV,
-    compressed_kv,
+    query,
+    local_kv,
+    sparse_kv,
     topk_blocks,
     indexer_mask,
     attention_sink,
     sliding_window_size,
-    backend
 ):
     """Call selected_attention while preserving the completed-block constraint.
 
     Invalid (causally unavailable) selections are replaced with -1 sentinels.
     """
-    if topk_blocks.shape[-1] == 0:
-        return selected_attention(
-            Q,
-            KV,
-            compressed_kv,
-            topk_blocks,
-            attention_sink,
-            None,
-            sliding_window_size,
-            False,
-        )
 
-    valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(Q.shape[0], -1, -1)
+    valid_blocks = torch.isfinite(indexer_mask).unsqueeze(0).expand(query.shape[0], -1, -1)
     selected_is_valid = valid_blocks.gather(dim=-1, index=topk_blocks)
 
     # Replace causally invalid selections with -1 sentinel
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
+    backend = "triton" if query.device.type == "cuda" else "eager"
     return selected_attention(
-        Q,
-        KV,
-        compressed_kv,
+        query,
+        local_kv,
+        sparse_kv,
         causal_topk_blocks,
         attention_sink,
         None,
         sliding_window_size,
-        False,
-        backend=backend
+        backend=backend,
     )
 
 
@@ -246,10 +234,9 @@ def CSA(
     sliding_window_size,
     rope_dims: int,
     share_kv: bool,
-    backend="eager"
 ):
     """
-    Naming of args uses convention from Deepseek v4 paper
+    Naming of args uses convention from DeepSeek V4 paper
 
     Shape notation: B=batch size, H=attention heads, H_I=indexer heads, S=sequence length,
     D=attention dimension, D_I=index dimension, R=compression_rate,
@@ -271,7 +258,7 @@ def CSA(
 
     W_I: Projection from the residual stream, per-head weight on indexer scores (Batch, sequence, num_heads); expected shape: (B, S, H_I)
     K_Ia, K_Ib: Projections from the residual stream for computing indexing; each expected shape: (B, H_IKV, S, D_I)
-    Z_Ia, Z_Ib: Projections from the residual stream, performs similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
+    Z_Ia, Z_Ib: Projections from the residual stream, perform similar role to Z_a and Z_b for indexing; each expected shape: (B, H_IKV, S, D_I)
     B_Ia, B_Ib: Same role as B_a/B_b but for the indexing branch. Expected shape: any broadcastable
         to (B, H_IKV, num_blocks, R, D_I) — typically (R, D_I) or (1, 1, 1, R, D_I).
 
@@ -286,7 +273,7 @@ def CSA(
     num_topk_blocks: number of blocks to attend to per query
     sliding_window_size: size of sliding window for SWA
     rope_dims: number of dimensions to apply rope to
-    share_kv: True if all query heads attented to one kv head
+    share_kv: True if all query heads attend to one kv head
     """
 
     device = Q.device
@@ -309,44 +296,39 @@ def CSA(
     compressed_indices = compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
     num_total_blocks = compressed_kv.shape[-2]
 
+    Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
+    Q_I = torch.cat([Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1)
     KV = F.rms_norm(KV, (KV.shape[-1],), weight=KV_norm_weight)
+    KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
+
+    compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
     compressed_indices = F.rms_norm(
         compressed_indices, (compressed_indices.shape[-1],), weight=compressed_indices_norm_weight
+    )
+    # Apply rope to the last rope_dim dimensions
+    compressed_indices = torch.cat(
+        [
+            compressed_indices[..., :-rope_dims],
+            apply_rope(
+                compressed_indices[..., -rope_dims:],
+                positions=compressed_positions,
+            ),
+        ],
+        dim=-1,
     )
     compressed_kv = F.rms_norm(
         compressed_kv, (compressed_kv.shape[-1],), weight=compressed_kv_norm_weight
     )
-
-    if rope_dims != 0:
-        Q = torch.cat([Q[..., :-rope_dims], apply_rope(Q[..., -rope_dims:])], dim=-1)
-        Q_I = torch.cat(
-            [Q_I[..., :-rope_dims], apply_rope(Q_I[..., -rope_dims:])], dim=-1
-        )
-        KV = torch.cat([KV[..., :-rope_dims], apply_rope(KV[..., -rope_dims:])], dim=-1)
-
-        compressed_positions = (
-            torch.arange(num_total_blocks, device=device) * compression_rate
-        )
-        compressed_indices = torch.cat(
-            [
-                compressed_indices[..., :-rope_dims],
-                apply_rope(
-                    compressed_indices[..., -rope_dims:],
-                    positions=compressed_positions,
-                ),
-            ],
-            dim=-1,
-        )
-        compressed_kv = torch.cat(
-            [
-                compressed_kv[..., :-rope_dims],
-                apply_rope(
-                    compressed_kv[..., -rope_dims:],
-                    positions=compressed_positions,
-                ),
-            ],
-            dim=-1,
-        )
+    compressed_kv = torch.cat(
+        [
+            compressed_kv[..., :-rope_dims],
+            apply_rope(
+                compressed_kv[..., -rope_dims:],
+                positions=compressed_positions,
+            ),
+        ],
+        dim=-1,
+    )
 
     indexer_mask = make_block_mask(
         sequence_length,
@@ -374,18 +356,15 @@ def CSA(
         indexer_mask,
         attention_sink,
         sliding_window_size,
-        backend = backend
     )
 
-    if rope_dims != 0:
-        return torch.cat(
-            [
-                attention_output[..., :-rope_dims],
-                apply_rope(attention_output[..., -rope_dims:], inverse=True),
-            ],
-            dim=-1,
-        )
-    return attention_output
+    return torch.cat(
+        [
+            attention_output[..., :-rope_dims],
+            apply_rope(attention_output[..., -rope_dims:], inverse=True),
+        ],
+        dim=-1,
+    )
 
 
 def main() -> None:

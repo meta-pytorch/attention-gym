@@ -1,25 +1,26 @@
-import torch
-from typing import Optional
-from pathlib import Path
-from contextlib import contextmanager, nullcontext
-import numpy as np
 import math
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
 from torch.nn.attention.flex_attention import (
-    _score_mod_signature,
-    _mask_mod_signature,
-    _vmap_for_bhqkv,
-    _ModificationType,
     _DEFAULT_SPARSE_BLOCK_SIZE,
+    _mask_mod_signature,
+    _ModificationType,
+    _score_mod_signature,
+    _vmap_for_bhqkv,
 )
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
 
 # TODO This was moved on nightly, this enables 2.5 and 2.6 | we should remove this once 2.5 is no longer supported
 try:
     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
 except ImportError:
     from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
-from torch._inductor.utils import do_bench_using_profiling
 from collections.abc import Callable
+
+from torch._inductor.utils import do_bench_using_profiling
 
 Tensor = torch.Tensor
 
@@ -59,11 +60,11 @@ def merge_attention(
 def create_score_mod(
     query: torch.Tensor,
     key: torch.Tensor,
-    score_mod: Optional[_score_mod_signature],
-    mask_mod: Optional[_mask_mod_signature],
+    score_mod: _score_mod_signature | None,
+    mask_mod: _mask_mod_signature | None,
     device: str = "cuda",
     _compile: bool = False,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     batch_idx: int = 0,
     head_idx: int = 0,
 ) -> torch.Tensor:
@@ -108,14 +109,14 @@ def _name_to_title(name: str) -> str:
 def visualize_attention_scores(
     query: Tensor,
     key: Tensor,
-    score_mod: Optional[_score_mod_signature] = None,
-    mask_mod: Optional[_mask_mod_signature] = None,
+    score_mod: _score_mod_signature | None = None,
+    mask_mod: _mask_mod_signature | None = None,
     device: str = "cuda",
     name: str = "attention_scores",
-    path: Optional[Path] = None,
+    path: Path | None = None,
     batch_idx: int = 0,
     head_idx: int = 0,
-    scale: Optional[float] = None,
+    scale: float | None = None,
 ) -> None:
     """
     Generate and save a visualization of attention scores.
@@ -137,9 +138,9 @@ def visualize_attention_scores(
     """
     import matplotlib.pyplot as plt
 
-    assert (
-        score_mod is not None or mask_mod is not None
-    ), "Must provide either score_mod or mask_mod"
+    assert score_mod is not None or mask_mod is not None, (
+        "Must provide either score_mod or mask_mod"
+    )
     query = query[batch_idx, head_idx, :, :]
     key = key[batch_idx, head_idx, :, :]
     scores_viz = create_score_mod(
@@ -211,13 +212,13 @@ def visualize_attention_scores(
 def plot_attention_scores(
     query: Tensor,
     key: Tensor,
-    score_mod: Optional[_score_mod_signature] = None,
-    mask_mod: Optional[_mask_mod_signature] = None,
+    score_mod: _score_mod_signature | None = None,
+    mask_mod: _mask_mod_signature | None = None,
     device: str = "cuda",
     name: str = "attention_scores",
     batch_idx: int = 0,
     head_idx: int = 0,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     figsize: tuple = (12, 10),
 ):
     """
@@ -240,9 +241,9 @@ def plot_attention_scores(
     """
     import matplotlib.pyplot as plt
 
-    assert (
-        score_mod is not None or mask_mod is not None
-    ), "Must provide either score_mod or mask_mod"
+    assert score_mod is not None or mask_mod is not None, (
+        "Must provide either score_mod or mask_mod"
+    )
     query = query[batch_idx, head_idx, :, :]
     key = key[batch_idx, head_idx, :, :]
     scores_viz = create_score_mod(
