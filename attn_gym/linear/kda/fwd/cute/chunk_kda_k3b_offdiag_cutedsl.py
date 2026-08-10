@@ -31,13 +31,28 @@ from cutlass.cute.nvgpu import warp
 
 
 class ChunkKDAFwdK3bOffdiagCuteDSL:
-    NC = 4
     WARP_SIZE = 32
 
-    def __init__(self, BC: int = 16, D: int = 128):
+    def __init__(
+        self,
+        BC: int = 16,
+        D: int = 128,
+        chunk_size: int = 64,
+        num_subchunks: int = 4,
+        varlen: bool = False,
+    ):
+        assert num_subchunks == 4, (
+            f"ChunkKDAFwdK3bOffdiagCuteDSL only supports four subchunks, got {num_subchunks}"
+        )
+        assert chunk_size == num_subchunks * BC, (
+            f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
+            f"{num_subchunks} * {BC}"
+        )
         self.BC = BC
         self.D = D
-        self.BT = self.NC * BC
+        self.varlen = varlen
+        self.BT = chunk_size
+        self.num_offdiag_blocks = num_subchunks * (num_subchunks - 1) // 2
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
@@ -54,17 +69,17 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         scale: cutlass.Float32,
         H: int,
         total_chunks: int,
+        cu_seqlens: cute.Tensor,
+        chunk_indices: cute.Tensor,
         stream,
-        cu_seqlens: cute.Tensor | None = None,
-        chunk_indices: cute.Tensor | None = None,
     ):
         self._dtype: type[cutlass.Numeric] = mQ.element_type
 
-        if cutlass.const_expr(cu_seqlens is not None):
+        if cutlass.const_expr(self.varlen):
             NT = cute.size(chunk_indices, mode=[0]) // 2
-            num_pairs = NT * 6
+            num_pairs = NT * self.num_offdiag_blocks
         else:
-            num_pairs = total_chunks * 6
+            num_pairs = total_chunks * self.num_offdiag_blocks
         grid = (num_pairs, H, 1)
 
         smem_k_block_size = 64
@@ -160,8 +175,8 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         lane_idx = tidx % self.WARP_SIZE
 
         # ── Decompose block_idx into chunk and pair ──
-        chunk_idx = block_idx // 6
-        pair_idx = block_idx % 6
+        chunk_idx = block_idx // self.num_offdiag_blocks
+        pair_idx = block_idx % self.num_offdiag_blocks
 
         ri = 1
         if pair_idx >= 1:
@@ -171,7 +186,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         ci = pair_idx - (ri * (ri - 1)) // 2
 
         # ── Varlen resolution ──
-        if cutlass.const_expr(cu_seqlens is not None):
+        if cutlass.const_expr(self.varlen):
             i_n = chunk_indices[chunk_idx * 2]
             i_t = chunk_indices[chunk_idx * 2 + 1]
             bos = cu_seqlens[i_n]
@@ -197,7 +212,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         # ══════════════════════════════════════════════════════════
         # Phase 1: Gating into SMEM
         # ══════════════════════════════════════════════════════════
-        if cutlass.const_expr(cu_seqlens is not None):
+        if cutlass.const_expr(self.varlen):
             col = tidx
             h_col = h_offset + col
             if chunk_base + self.BT <= eos:
@@ -334,14 +349,14 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         cC = cute.make_identity_tensor((self.BC, self.BC))
         tCcC = thr_mma.partition_C(cC)
 
-        od_row = chunk_idx * 6 + pair_idx
+        od_row = chunk_idx * self.num_offdiag_blocks + pair_idx
 
         if warp_idx == 0:
             out_dtype = mAqk.element_type
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                if cutlass.const_expr(cu_seqlens is not None):
+                if cutlass.const_expr(self.varlen):
                     if chunk_base + self.BT <= eos or ti_row + row < eos:
                         mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
                             acc_Aqk[i] * scale
