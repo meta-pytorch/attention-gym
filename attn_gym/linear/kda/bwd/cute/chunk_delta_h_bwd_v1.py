@@ -1857,14 +1857,10 @@ def _is_fake_mode() -> bool:
 # Public API wrapper
 # ============================================================================
 
-_dummy_cache: dict[tuple, torch.Tensor] = {}
-
 
 def _get_dummy(shape, dtype, device) -> torch.Tensor:
-    key = (shape, dtype, device)
-    if key not in _dummy_cache:
-        _dummy_cache[key] = torch.empty(shape, dtype=dtype, device=device)
-    return _dummy_cache[key]
+    """Create an invocation-local placeholder for an unused kernel argument."""
+    return torch.empty(shape, dtype=dtype, device=device)
 
 
 def blackwell_delta_h_bwd_dhu_v1(
