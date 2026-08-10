@@ -13,14 +13,20 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
+import torch
 import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, storage_cosize
 from attn_gym.linear.kda.utils import (
     IS_NVIDIA,
+    RCP_LN2,
     autotune_cache_kwargs,
     exp,
+    input_guard,
+    prepare_chunk_indices,
 )
 
 
@@ -416,3 +422,177 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
                 b_o.to(o.dtype.element_ty),
                 mask=b_mask,
             )
+
+
+@input_guard(no_guard_contiguous=True)
+def kda_gate_chunk_cumsum(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    *,
+    chunk_size: int = 64,
+    lower_bound: float | None = None,
+    scale: float | None = None,
+    reverse: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    num_chunks: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Apply the KDA gate map and chunk-local cumulative sum in one launch."""
+    if g.ndim != 4:
+        raise ValueError(f"g must have shape [B, T, H, D], got {tuple(g.shape)}")
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
+        raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
+    batch, tokens, heads, head_dim = g.shape
+    if batch == 0 or tokens == 0 or heads == 0 or head_dim == 0:
+        raise ValueError(f"g must have no empty dimensions, got {tuple(g.shape)}")
+    if A_log.shape != (heads,):
+        raise ValueError(f"A_log must have shape {(heads,)}, got {tuple(A_log.shape)}")
+    if dt_bias is not None and dt_bias.shape != (heads, head_dim):
+        raise ValueError(
+            f"dt_bias must have shape {(heads, head_dim)}, got {tuple(dt_bias.shape)}"
+        )
+    if cu_seqlens is not None and batch != 1:
+        raise ValueError("packed variable-length inputs must have batch size one")
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    chunks = triton.cdiv(tokens, chunk_size) if cu_seqlens is None else len(chunk_indices)
+    output = torch.empty_like(g, dtype=output_dtype)
+
+    def grid(meta):
+        return (chunks, batch * heads, triton.cdiv(head_dim, meta["BS"]))
+
+    kda_gate_chunk_cumsum_vector_kernel[grid](
+        g,
+        A_log,
+        dt_bias,
+        output,
+        scale,
+        cu_seqlens,
+        chunk_indices,
+        lower_bound,
+        tokens,
+        num_chunks,
+        g.stride(0),
+        output.stride(0),
+        S_STRIDES=g.stride()[1:],
+        A_LOG_STRIDES=A_log.stride(),
+        DT_BIAS_STRIDES=(0, 0) if dt_bias is None else dt_bias.stride(),
+        O_STRIDES=output.stride()[1:],
+        B=batch,
+        H=heads,
+        S=head_dim,
+        S_in=head_dim,
+        F_REPEAT=1,
+        BT=chunk_size,
+        REVERSE=reverse,
+    )
+    return output
+
+
+class _BoundedGateCumsum(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        raw_gate: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        chunk_size: int,
+        lower_bound: float,
+        fastmath: bool,
+        profile_ranges: bool,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(raw_gate, A_log, dt_bias)
+        ctx.chunk_size = chunk_size
+        ctx.lower_bound = lower_bound
+        ctx.fastmath = fastmath
+        ctx.profile_ranges = profile_ranges
+        return kda_gate_chunk_cumsum(
+            raw_gate,
+            A_log,
+            dt_bias,
+            chunk_size=chunk_size,
+            lower_bound=lower_bound,
+            scale=RCP_LN2,
+        )
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, d_cumulative: torch.Tensor):
+        from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import fused_gate_bwd
+
+        raw_gate, A_log, dt_bias = ctx.saved_tensors
+        with (
+            torch.profiler.record_function("kda/cute/gate_backward_fused")
+            if ctx.profile_ranges
+            else nullcontext()
+        ):
+            result = fused_gate_bwd(
+                raw_gate,
+                A_log,
+                dt_bias,
+                d_cumulative.float().contiguous(),
+                chunk_size=ctx.chunk_size,
+                lower_bound=ctx.lower_bound,
+                fastmath=ctx.fastmath,
+            )
+        return (
+            result.dg.to(raw_gate.dtype),
+            result.dA_partial.sum((0, 1)),
+            result.dg.sum((0, 1)),
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def bounded_gate_cumsum(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+    lower_bound: float = -5.0,
+    fastmath: bool = False,
+    profile_ranges: bool = False,
+) -> torch.Tensor:
+    """Apply the bounded KDA gate with fused forward and first-order backward."""
+    if raw_gate.ndim != 4:
+        raise ValueError(f"raw_gate must have shape [B, T, H, D], got {tuple(raw_gate.shape)}")
+    batch, tokens, heads, head_dim = raw_gate.shape
+    if batch == 0 or tokens == 0 or heads == 0:
+        raise ValueError(f"raw_gate must have nonempty B, T, and H, got {tuple(raw_gate.shape)}")
+    if head_dim < 32 or head_dim > 1024 or head_dim % 32:
+        raise ValueError(
+            f"raw_gate head dimension must be a multiple of 32 in [32, 1024], got {head_dim}"
+        )
+    if not raw_gate.is_cuda or raw_gate.dtype != torch.bfloat16:
+        raise TypeError("bounded_gate_cumsum requires a CUDA bfloat16 raw gate")
+    if A_log.shape != (heads,) or A_log.dtype != torch.float32:
+        raise ValueError(
+            f"A_log must be float32 with shape {(heads,)}, "
+            f"got {tuple(A_log.shape)} and {A_log.dtype}"
+        )
+    if dt_bias.shape != (heads, head_dim) or dt_bias.dtype != torch.float32:
+        raise ValueError(
+            f"dt_bias must be float32 with shape {(heads, head_dim)}, "
+            f"got {tuple(dt_bias.shape)} and {dt_bias.dtype}"
+        )
+    if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
+        raise ValueError("bounded_gate_cumsum inputs must be on the same device")
+    if torch.cuda.get_device_capability(raw_gate.device) < (9, 0):
+        raise ValueError("bounded_gate_cumsum requires CUDA capability 9.0 or newer")
+    return _BoundedGateCumsum.apply(
+        raw_gate.contiguous(),
+        A_log.contiguous(),
+        dt_bias.contiguous(),
+        chunk_size,
+        lower_bound,
+        fastmath,
+        profile_ranges,
+    )
+
+
+__all__ = ["bounded_gate_cumsum", "kda_gate_chunk_cumsum"]

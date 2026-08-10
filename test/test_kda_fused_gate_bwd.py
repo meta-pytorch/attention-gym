@@ -27,6 +27,7 @@ from attn_gym.linear.kda.bwd.triton.cumsum import (
     chunk_local_cumsum_vector_kernel,
 )
 from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_kernel
+from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
 from attn_gym.linear.kda.naive import fused_gate_bwd_ref
 
 TMA_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (9, 0)
@@ -157,6 +158,52 @@ def test_fused_gate_bwd_reference_matches_forward_autograd(chunk_size):
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=2e-5, atol=3e-5)
     torch.testing.assert_close(actual[2], expected[2], rtol=2e-5, atol=3e-5)
+
+
+@pytest.mark.parametrize(
+    "shape,match",
+    [
+        ((1, 17, 2, 16), "multiple of 32"),
+        ((0, 17, 2, 32), "nonempty B, T, and H"),
+        ((1, 0, 2, 32), "nonempty B, T, and H"),
+        ((1, 17, 0, 32), "nonempty B, T, and H"),
+    ],
+)
+def test_bounded_gate_cumsum_rejects_backward_unsupported_shape(shape, match):
+    raw_gate = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.empty(shape[2], dtype=torch.float32, device="cuda")
+    dt_bias = torch.empty(shape[2:], dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match=match):
+        bounded_gate_cumsum(raw_gate, A_log, dt_bias)
+
+
+def test_bounded_gate_cumsum_autograd_boundary():
+    """Exercise the fused forward and backward through the public gate boundary."""
+    g, A_log, dt_bias, d_cumulative = _inputs(65, heads=2, batch=1)
+    g_storage = torch.empty(*g.shape[:-1], 2 * g.shape[-1], dtype=g.dtype, device="cuda")
+    A_storage = torch.empty(2 * A_log.shape[0], dtype=A_log.dtype, device="cuda")
+    bias_storage = torch.empty(
+        *dt_bias.shape[:-1], 2 * dt_bias.shape[-1], dtype=dt_bias.dtype, device="cuda"
+    )
+    g = g_storage[..., ::2].copy_(g).requires_grad_()
+    A_log = A_storage[::2].copy_(A_log).requires_grad_()
+    dt_bias = bias_storage[..., ::2].copy_(dt_bias).requires_grad_()
+    inputs = (g, A_log, dt_bias)
+    assert not all(tensor.is_contiguous() for tensor in inputs)
+    output = bounded_gate_cumsum(*inputs, chunk_size=64, lower_bound=-3.25)
+    actual = torch.autograd.grad(output, inputs, d_cumulative)
+    expected = _autograd_reference(
+        g,
+        A_log,
+        dt_bias,
+        d_cumulative,
+        lower_bound=-3.25,
+        chunk_size=64,
+    )
+
+    torch.testing.assert_close(actual[0].float(), expected[0], rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=5e-4)
+    torch.testing.assert_close(actual[2], expected[2], rtol=5e-5, atol=7e-4)
 
 
 @pytest.mark.parametrize(

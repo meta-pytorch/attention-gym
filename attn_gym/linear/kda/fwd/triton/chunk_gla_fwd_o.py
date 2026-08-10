@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
 
@@ -150,3 +151,60 @@ def chunk_gla_fwd_kernel_o(
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_gla_fwd_o_gk(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Compose fixed-length KDA intra- and inter-chunk output terms."""
+    batch, tokens, heads, key_dim = q.shape
+    value_dim = v.shape[-1]
+    if tokens % chunk_size:
+        raise ValueError(f"the KDA output kernel requires complete chunks, got T={tokens}")
+    chunks = tokens // chunk_size
+    if g.shape != q.shape:
+        raise ValueError("g must have the same shape as q")
+    if v.shape != (batch, tokens, heads, value_dim):
+        raise ValueError("v must have shape [B, T, H, V]")
+    if A.shape != (batch, tokens, heads, chunk_size):
+        raise ValueError(
+            f"A must have shape {(batch, tokens, heads, chunk_size)}, got {tuple(A.shape)}"
+        )
+    expected_h_shape = (batch, chunks, heads, key_dim, value_dim)
+    if h.shape != expected_h_shape:
+        raise ValueError(f"h must have shape {expected_h_shape}, got {tuple(h.shape)}")
+
+    output = torch.empty_like(v)
+
+    def grid(meta):
+        return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
+
+    chunk_gla_fwd_kernel_o[grid](
+        q=q,
+        v=v,
+        g=g,
+        h=h,
+        o=output,
+        A=A,
+        cu_seqlens=None,
+        chunk_indices=None,
+        num_chunks=None,
+        scale=scale,
+        T=tokens,
+        H=heads,
+        K=key_dim,
+        V=value_dim,
+        BT=chunk_size,
+        USE_EXP2=True,
+    )
+    return output
+
+
+__all__ = ["chunk_gla_fwd_o_gk"]

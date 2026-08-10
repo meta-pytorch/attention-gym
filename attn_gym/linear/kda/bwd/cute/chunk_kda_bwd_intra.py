@@ -11,10 +11,15 @@
 
 import cuda.bindings.driver as cuda
 import cutlass
+import torch
 from cutlass import Boolean, Float32, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
+
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.target import get_compile_target
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -1953,3 +1958,127 @@ class ChunkKdaBwdIntraHmmaGrid:
             block=(32, 1, 1),
             stream=stream,
         )
+
+
+@jit_cache
+def _compile_chunk_kda_bwd_intra(heads: int, chunks: int):
+    """Compile one persistent fixed-length intra-chunk backward specialization."""
+    sm_count = get_compile_target().sm_count
+    if sm_count is None:
+        raise RuntimeError("KDA compilation requires a CUDA target with an SM count")
+    op = ChunkKdaBwdIntraHmmaGrid(
+        use_i32_metadata=True,
+        grid_chunks=min(chunks, sm_count),
+    )
+    tokens = cute.sym_int()
+
+    def normal(dtype, shape):
+        return make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=128,
+        )
+
+    def column_token_head(dtype, columns: int):
+        return make_fake_compact_tensor(
+            dtype,
+            (columns, tokens, heads),
+            stride_order=(0, 2, 1),
+            assumed_align=128,
+        )
+
+    q = column_token_head(cutlass.BFloat16, KEY_DIM)
+    k = column_token_head(cutlass.BFloat16, KEY_DIM)
+    g = column_token_head(cutlass.Float32, KEY_DIM)
+    beta = normal(cutlass.Float32, (1, tokens, heads))
+    dAqk = column_token_head(cutlass.Float32, BT)
+    dAkk = column_token_head(cutlass.Float32, BT)
+    dq = column_token_head(cutlass.Float32, KEY_DIM)
+    dk = column_token_head(cutlass.Float32, KEY_DIM)
+    db_partial = normal(cutlass.Float32, (K_PHASES, tokens, heads))
+    dg = column_token_head(cutlass.Float32, KEY_DIM)
+    dq2 = column_token_head(cutlass.BFloat16, KEY_DIM)
+    dk2 = column_token_head(cutlass.BFloat16, KEY_DIM)
+    dg2 = column_token_head(cutlass.Float32, KEY_DIM)
+    cu_seqlens = normal(cutlass.Int32, (2,))
+    chunk_indices = normal(cutlass.Int32, (chunks, 2))
+    num_chunks = normal(cutlass.Int32, (1,))
+    return compile_tvm_ffi(
+        op,
+        q,
+        k,
+        g,
+        beta,
+        dAqk,
+        dAkk,
+        dq,
+        dk,
+        db_partial,
+        dg,
+        dq2,
+        dk2,
+        dg2,
+        cu_seqlens,
+        chunk_indices,
+        num_chunks,
+        name=f"kda_bwd_intra_h{heads}_c{chunks}",
+    )
+
+
+def chunk_kda_bwd_intra(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    num_chunks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the fixed-length intra-chunk Q/K/gate/beta backward stage."""
+    batch, tokens, heads, head_dim = q.shape
+    if batch != 1 or head_dim != KEY_DIM:
+        raise ValueError("the intra-chunk backward requires B=1 and K=128")
+    if tokens % BT:
+        raise ValueError("the intra-chunk backward requires complete 64-token chunks")
+    chunks = tokens // BT
+    dq2 = torch.empty_like(q)
+    dk2 = torch.empty_like(k)
+    dg2 = torch.empty_like(g)
+    db_partial = torch.empty(
+        K_PHASES,
+        tokens,
+        heads,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    compiled = _compile_chunk_kda_bwd_intra(heads, chunks)
+
+    def column_token_head(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[0].permute(2, 0, 1)
+
+    compiled(
+        column_token_head(q),
+        column_token_head(k),
+        column_token_head(g),
+        beta,
+        column_token_head(dAqk),
+        column_token_head(dAkk),
+        column_token_head(dq),
+        column_token_head(dk),
+        db_partial,
+        column_token_head(dg),
+        column_token_head(dq2),
+        column_token_head(dk2),
+        column_token_head(dg2),
+        cu_seqlens,
+        chunk_indices,
+        num_chunks.reshape(1),
+    )
+    return dq2, dk2, dg2, db + db_partial.sum(0).unsqueeze(0)
