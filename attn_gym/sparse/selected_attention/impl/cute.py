@@ -14,8 +14,6 @@ from functools import lru_cache
 
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
-from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 
 try:
@@ -24,8 +22,7 @@ except ImportError:
     from cuda import cuda as cuda_drv
 
 import cutlass
-import cutlass.cute as cute
-
+from cutlass import cute
 
 # ---------------------------------------------------------------------------
 # Kernel compilation (cached)
@@ -37,13 +34,26 @@ def _compile_fwd(topk_length: int, nheads: int, stream_ptr: int):
     batch_dummy, seqlen_q_dummy, seqlen_k_dummy = 1, 128, 1024
     hdimv = 512
 
-    Qv = torch.empty(batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+    Qv = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
+    )
     V = torch.empty(batch_dummy, seqlen_k_dummy, 1, hdimv, dtype=torch.bfloat16, device="cuda")
-    O = torch.empty(batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+    O = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
+    )
     lse = torch.empty(batch_dummy, seqlen_q_dummy, nheads, dtype=torch.float32, device="cuda")
     idx = torch.empty(batch_dummy, seqlen_q_dummy, topk_length, dtype=torch.int32, device="cuda")
-    P = torch.empty(batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
-    RowMax = torch.empty(batch_dummy, seqlen_q_dummy, topk_length // 128, nheads, dtype=torch.float32, device="cuda")
+    P = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda"
+    )
+    RowMax = torch.empty(
+        batch_dummy,
+        seqlen_q_dummy,
+        topk_length // 128,
+        nheads,
+        dtype=torch.float32,
+        device="cuda",
+    )
 
     stream = cuda_drv.CUstream(stream_ptr)
 
@@ -68,25 +78,44 @@ def _compile_fwd(topk_length: int, nheads: int, stream_ptr: int):
         1.0,
         from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1),
         from_dlpack(RowMax, assumed_align=4).mark_layout_dynamic(leading_dim=RowMax.ndim - 1),
-        mIndexTopk=from_dlpack(idx, assumed_align=16).mark_layout_dynamic(leading_dim=idx.ndim - 1),
+        mIndexTopk=from_dlpack(idx, assumed_align=16).mark_layout_dynamic(
+            leading_dim=idx.ndim - 1
+        ),
         stream=stream,
     )
 
 
 @lru_cache(maxsize=8)
 def _compile_bwd(topk_length: int, nheads: int, stream_ptr: int):
+    from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
+
     batch_dummy, seqlen_q_dummy = 1, 128
     hdimv = 512
     seqlen_k_dummy = 1024
 
-    dO = torch.empty(batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
+    dO = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
+    )
     V = torch.empty(batch_dummy, seqlen_k_dummy, 1, hdimv, dtype=torch.bfloat16, device="cuda")
-    Qv = torch.empty(batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-    P = torch.empty(batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
+    Qv = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda"
+    )
+    P = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda"
+    )
     dV = torch.empty(batch_dummy, seqlen_k_dummy, 1, hdimv, dtype=torch.float32, device="cuda")
-    dS = torch.empty(batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
+    dS = torch.empty(
+        batch_dummy, seqlen_q_dummy, nheads, topk_length, dtype=torch.bfloat16, device="cuda"
+    )
     idx = torch.empty(batch_dummy, seqlen_q_dummy, topk_length, dtype=torch.int32, device="cuda")
-    ScaleP = torch.empty(batch_dummy, seqlen_q_dummy, topk_length // 128, nheads, dtype=torch.float32, device="cuda")
+    ScaleP = torch.empty(
+        batch_dummy,
+        seqlen_q_dummy,
+        topk_length // 128,
+        nheads,
+        dtype=torch.float32,
+        device="cuda",
+    )
     dPsum = torch.empty(batch_dummy, seqlen_q_dummy, nheads, dtype=torch.float32, device="cuda")
 
     stream = cuda_drv.CUstream(stream_ptr)
@@ -106,16 +135,32 @@ def _compile_bwd(topk_length: int, nheads: int, stream_ptr: int):
             disable_bitmask=False,
             use_clc_scheduler=True,
         ),
-        w(dO), w(V), w(Qv), w(P), w(dV), w(dS), w(idx),
+        w(dO),
+        w(V),
+        w(Qv),
+        w(P),
+        w(dV),
+        w(dS),
+        w(idx),
         1.0,
-        w(ScaleP, 4), w(dPsum, 4),
+        w(ScaleP, 4),
+        w(dPsum, 4),
         stream=stream,
     )
 
 
 @lru_cache(maxsize=8)
-def _compile_dq(topk_length: int, nheads: int, hdimv: int,
-                batch: int, seq_len: int, total_kv: int, stream_ptr: int):
+def _compile_dq(
+    topk_length: int,
+    nheads: int,
+    hdimv: int,
+    batch: int,
+    seq_len: int,
+    total_kv: int,
+    stream_ptr: int,
+):
+    from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+
     dS = torch.empty(batch, seq_len, nheads, topk_length, dtype=torch.bfloat16, device="cuda")
     V_3d = torch.empty(batch, total_kv, hdimv, dtype=torch.bfloat16, device="cuda")
     dQv = torch.empty(batch, seq_len, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
@@ -134,7 +179,12 @@ def _compile_dq(topk_length: int, nheads: int, hdimv: int,
             head_dim_v=hdimv,
             top_k=topk_length,
         ),
-        w(dS), None, w(V_3d), None, w(dQv), w(idx),
+        w(dS),
+        None,
+        w(V_3d),
+        None,
+        w(dQv),
+        w(idx),
         stream=stream,
     )
 
@@ -160,8 +210,12 @@ def _build_unified_topk_indices(seq_len, sliding_window_size, indices, index_off
     raw_length = unified.shape[-1]
     padded_length = ((raw_length + 127) // 128) * 128
     if padded_length > raw_length:
-        padding = torch.full((batch, seq_len, padded_length - raw_length), -1,
-                             dtype=torch.int32, device=device)
+        padding = torch.full(
+            (batch, seq_len, padded_length - raw_length),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
         unified = torch.cat([unified, padding], dim=-1)
 
     return unified, padded_length
@@ -187,19 +241,34 @@ def _fwd_kernel_op(
 
     O = torch.empty(batch, seq_len, nheads, hdimv, dtype=torch.bfloat16, device=device)
     lse = torch.empty(batch, seq_len, nheads, dtype=torch.float32, device=device)
-    P = torch.empty(batch, seq_len, nheads, padded_topk_length, dtype=torch.bfloat16, device=device)
-    RowMax = torch.empty(batch, seq_len, padded_topk_length // 128, nheads, dtype=torch.float32, device=device)
+    P = torch.empty(
+        batch, seq_len, nheads, padded_topk_length, dtype=torch.bfloat16, device=device
+    )
+    RowMax = torch.empty(
+        batch, seq_len, padded_topk_length // 128, nheads, dtype=torch.float32, device=device
+    )
 
     stream_ptr = torch.cuda.current_stream(device).cuda_stream
     stream = cuda_drv.CUstream(stream_ptr)
     kernel = _compile_fwd(padded_topk_length, nheads, stream_ptr)
 
     def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        return from_dlpack(
+            t.detach() if t.requires_grad else t, assumed_align=align
+        ).mark_layout_dynamic(leading_dim=t.ndim - 1)
 
     kernel(
-        None, w(Qv), None, w(V), w(O), w(lse, 4), softmax_scale, w(P), w(RowMax, 4),
-        mIndexTopk=w(topk_idxs), stream=stream,
+        None,
+        w(Qv),
+        None,
+        w(V),
+        w(O),
+        w(lse, 4),
+        softmax_scale,
+        w(P),
+        w(RowMax, 4),
+        mIndexTopk=w(topk_idxs),
+        stream=stream,
     )
 
     return O, lse, P, RowMax
@@ -233,26 +302,50 @@ def _bwd_kernel_op(
     batch, seq_len = dO.shape[0], dO.shape[1]
     device = dO.device
 
-    dS = torch.empty(batch, seq_len, nheads, padded_topk_length, dtype=torch.bfloat16, device=device)
+    dS = torch.empty(
+        batch, seq_len, nheads, padded_topk_length, dtype=torch.bfloat16, device=device
+    )
 
     stream_ptr = torch.cuda.current_stream(device).cuda_stream
     stream = cuda_drv.CUstream(stream_ptr)
     kernel = _compile_bwd(padded_topk_length, nheads, stream_ptr)
 
     def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        return from_dlpack(
+            t.detach() if t.requires_grad else t, assumed_align=align
+        ).mark_layout_dynamic(leading_dim=t.ndim - 1)
 
     kernel(
-        w(dO), w(V), w(Qv), w(P), w(dV_accum), w(dS), w(topk_idxs),
-        softmax_scale, w(ScaleP, 4), w(dPsum, 4), stream=stream,
+        w(dO),
+        w(V),
+        w(Qv),
+        w(P),
+        w(dV_accum),
+        w(dS),
+        w(topk_idxs),
+        softmax_scale,
+        w(ScaleP, 4),
+        w(dPsum, 4),
+        stream=stream,
     )
 
     return dS
 
 
 @_bwd_kernel_op.register_fake
-def _bwd_kernel_op_fake(dO, V, Qv, P, dV_accum, topk_idxs, ScaleP, dPsum,
-                        padded_topk_length, nheads, softmax_scale):
+def _bwd_kernel_op_fake(
+    dO,
+    V,
+    Qv,
+    P,
+    dV_accum,
+    topk_idxs,
+    ScaleP,
+    dPsum,
+    padded_topk_length,
+    nheads,
+    softmax_scale,
+):
     batch, seq_len = dO.shape[0], dO.shape[1]
     return dO.new_empty((batch, seq_len, nheads, padded_topk_length))
 
@@ -279,7 +372,9 @@ def _dq_kernel_op(
     kernel = _compile_dq(padded_topk_length, nheads, hdimv, batch, seq_len, total_kv, stream_ptr)
 
     def w(t, align=16):
-        return from_dlpack(t.detach() if t.requires_grad else t, assumed_align=align).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        return from_dlpack(
+            t.detach() if t.requires_grad else t, assumed_align=align
+        ).mark_layout_dynamic(leading_dim=t.ndim - 1)
 
     kernel(w(dS), None, w(V_3d), None, w(dQv), w(topk_idxs), stream=stream)
 
@@ -287,8 +382,17 @@ def _dq_kernel_op(
 
 
 @_dq_kernel_op.register_fake
-def _dq_kernel_op_fake(dS, V_3d, topk_idxs, padded_topk_length, nheads, hdimv,
-                       batch, seq_len, total_kv):
+def _dq_kernel_op_fake(
+    dS,
+    V_3d,
+    topk_idxs,
+    padded_topk_length,
+    nheads,
+    hdimv,
+    batch,
+    seq_len,
+    total_kv,
+):
     return dS.new_empty((batch, seq_len, nheads, hdimv))
 
 
@@ -301,29 +405,34 @@ LOG2E = math.log2(math.e)
 
 class _SelectedAttentionCuTe(torch.autograd.Function):
     @staticmethod
-    def forward(query, local_kv, sparse_kv, kv_indices, sliding_window_size, prebuilt_topk_idxs):
-        _b, _h, s, d = query.shape
-        local_kv_len = local_kv.shape[2]
-        device = query.device
-        nheads = query.shape[1]
+    def forward(Q, KV, index_kv, indices, sliding_window_size, prebuilt_topk_idxs):
+        _b, _h, s, d = Q.shape
+        local_kv_len = KV.shape[2]
+        device = Q.device
+        nheads = Q.shape[1]
 
-        unified_kv = torch.cat([local_kv, sparse_kv], dim=2)
+        unified_kv = torch.cat([KV, index_kv], dim=2)
 
         if prebuilt_topk_idxs is not None:
             topk_idxs = prebuilt_topk_idxs.view_as(prebuilt_topk_idxs)
             padded_topk_length = topk_idxs.shape[-1]
         else:
             topk_idxs, padded_topk_length = _build_unified_topk_indices(
-                s, sliding_window_size, kv_indices, index_offset=local_kv_len, device=device
+                s, sliding_window_size, indices, index_offset=local_kv_len, device=device
             )
 
-        Qv = query.permute(0, 2, 1, 3)
+        Qv = Q.permute(0, 2, 1, 3)
         V = unified_kv.permute(0, 2, 1, 3)
 
         softmax_scale = 1.0 / math.sqrt(d)
 
         O_bshd, lse, P, RowMax = torch.ops.selected_attn.fwd_kernel(
-            Qv, V, topk_idxs, padded_topk_length, nheads, softmax_scale,
+            Qv,
+            V,
+            topk_idxs,
+            padded_topk_length,
+            nheads,
+            softmax_scale,
         )
 
         O = O_bshd.permute(0, 2, 1, 3)
@@ -331,17 +440,17 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        query, local_kv, sparse_kv, kv_indices, sliding_window_size, prebuilt_topk_idxs = inputs
+        Q, KV, _index_kv, _indices, sliding_window_size, _prebuilt_topk_idxs = inputs
         O, lse, P, RowMax, topk_idxs, unified_kv = output
-        ctx.save_for_backward(query, O, lse, P, RowMax, topk_idxs, unified_kv)
+        ctx.save_for_backward(Q, O, lse, P, RowMax, topk_idxs, unified_kv)
         ctx.sliding_window_size = sliding_window_size
-        ctx.local_kv_len = local_kv.shape[2]
+        ctx.local_kv_len = KV.shape[2]
 
     @staticmethod
     def backward(ctx, grad_O, grad_lse, grad_P, grad_RowMax, grad_topk, grad_ukv):
         Q, O, lse, P, RowMax, topk_idxs, unified_kv = ctx.saved_tensors
         local_kv_len = ctx.local_kv_len
-        _b, _h, s, d = Q.shape
+        _b, _h, _s, d = Q.shape
         nheads = Q.shape[1]
         device = Q.device
 
@@ -359,20 +468,38 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
         lse_log2 = lse * LOG2E
         ScaleP = torch.exp2(softmax_scale * LOG2E * RowMax - lse_log2.unsqueeze(2))
         ScaleP = torch.where(
-            (RowMax == -float('inf')) | (lse.unsqueeze(2) == -float('inf')),
-            0.0, ScaleP,
+            (RowMax == -float("inf")) | (lse.unsqueeze(2) == -float("inf")),
+            0.0,
+            ScaleP,
         )
 
         dV_accum = torch.zeros(batch, total_kv, 1, hdimv, dtype=torch.float32, device=device)
 
         dS = torch.ops.selected_attn.bwd_kernel(
-            dO, V, Qv, P, dV_accum, topk_idxs, ScaleP, dPsum,
-            padded, nheads, softmax_scale,
+            dO,
+            V,
+            Qv,
+            P,
+            dV_accum,
+            topk_idxs,
+            ScaleP,
+            dPsum,
+            padded,
+            nheads,
+            softmax_scale,
         )
 
         V_3d = unified_kv.squeeze(1)
         dQv = torch.ops.selected_attn.dq_kernel(
-            dS, V_3d, topk_idxs, padded, nheads, hdimv, batch, seq_len, total_kv,
+            dS,
+            V_3d,
+            topk_idxs,
+            padded,
+            nheads,
+            hdimv,
+            batch,
+            seq_len,
+            total_kv,
         )
 
         dQ = dQv.permute(0, 2, 1, 3)
@@ -388,7 +515,9 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 
-def _validate_cute_constraints(query, local_kv, sparse_kv, kv_indices, sliding_window_size, share_kv):
+def _validate_cute_constraints(
+    query, local_kv, sparse_kv, kv_indices, sliding_window_size, share_kv
+):
     if query.device.type != "cuda":
         raise ValueError("CuTe backend requires CUDA tensors.")
     if torch.cuda.get_device_capability(query.device) != (10, 0):
@@ -403,7 +532,7 @@ def _validate_cute_constraints(query, local_kv, sparse_kv, kv_indices, sliding_w
     if h != 128:
         raise ValueError(f"CuTe backend requires 128 query heads, got {h}.")
     if local_kv.shape[1] != 1:
-        raise ValueError("CuTe backend requires KV to have 1 head.")
+        raise ValueError("CuTe backend requires local_kv to have 1 head.")
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +550,7 @@ def selected_attention(
     sliding_window_size: int,
     share_kv: bool = True,
 ) -> torch.Tensor:
-    """CuTe DSL (SM100) forward for selected attention.
+    """CuTe DSL (SM100) forward+backward for selected attention.
 
     torch.compile(fullgraph=True) compatible. Sink correction not applied (assumes sink ≈ 0).
     """
@@ -442,8 +571,9 @@ def selected_attention(
     return O
 
 
-def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc_ids,
-                                     sliding_window_size):
+def _selected_attention_with_doc_ids(
+    query, local_kv, sparse_kv, kv_indices, doc_ids, sliding_window_size
+):
     """Handle doc_id masking then dispatch to the same kernel."""
     s = query.shape[2]
     device = query.device
@@ -466,7 +596,8 @@ def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc
     )
 
     offset_indices = torch.where(
-        kv_indices >= 0, (kv_indices + local_kv_len).int(),
+        kv_indices >= 0,
+        (kv_indices + local_kv_len).int(),
         torch.tensor(-1, device=device, dtype=torch.int32),
     )
 
@@ -475,8 +606,10 @@ def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc
     padded_length = ((raw_length + 127) // 128) * 128
     if padded_length > raw_length:
         padding = torch.full(
-            (unified.shape[0], s, padded_length - raw_length), -1,
-            dtype=torch.int32, device=device,
+            (unified.shape[0], s, padded_length - raw_length),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         unified = torch.cat([unified, padding], dim=-1)
 
@@ -485,8 +618,9 @@ def _selected_attention_with_doc_ids(query, local_kv, sparse_kv, kv_indices, doc
     )
 
 
-def _selected_attention_with_prebuilt_indices(query, local_kv, sparse_kv, kv_indices, topk_idxs,
-                                              sliding_window_size):
+def _selected_attention_with_prebuilt_indices(
+    query, local_kv, sparse_kv, kv_indices, topk_idxs, sliding_window_size
+):
     """Forward+backward with pre-built indices (doc_ids path)."""
     result = _SelectedAttentionCuTe.apply(
         query, local_kv, sparse_kv, kv_indices, sliding_window_size, topk_idxs

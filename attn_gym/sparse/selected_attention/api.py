@@ -196,6 +196,7 @@ def selected_attention(
     Returns:
         Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
     """
+    share_kv = sparse_kv.shape[1] == 1
     if not torch.compiler.is_compiling():
         _validate_inputs(
             query,
