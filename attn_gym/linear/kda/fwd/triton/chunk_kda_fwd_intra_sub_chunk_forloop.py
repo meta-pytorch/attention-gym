@@ -151,6 +151,22 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                     other=0.0,
                 )
 
+                # the kda gate is applied as a decay between 2 positions i, j
+                # and cumulative log gate is  2^{g[i] − g[j]}
+                # but you can do 2^{g[i]−g[j]}  =  2^{g[i]} * 2^{−g[j]} and this
+                # turns it into a matmul
+                # but then now you have g[i] and g[j] so what if they're really big
+                # and overflow?
+                # so the trick is you pick a rebase index and you do g[i] - rebase and
+                # rebase - g[j] so you always are within bounds because the number is
+                # smaller and also mathematically it cancels out
+                # when CAUSAL_NORMREF = True, we pick g[0] and when its False we pick
+                # the midpoint
+                # but the concern w/ the midpoint is that it breaks causality by whatever
+                # the rounding error is and also no BI because the midpoint changes
+                # so we are setting CAUSAL_NORMREF = True as default for now
+                # the only concern with doing topmost is what if the numbers are actually
+                # really big (but does this happen in practice? we will see)
                 if CAUSAL_NORMREF:
                     normref_idx = 0
                 else:
