@@ -32,23 +32,32 @@ from cutlass.cute.nvgpu import warp
 
 
 class ChunkKDAFwdK4bInverseCuteDSL:
-    NC = 4
     WARP_SIZE = 32
 
     def __init__(
         self,
         BC: int = 16,
-        BK: int = 64,
+        chunk_size: int = 64,
+        num_subchunks: int = 4,
         fwd_sub_mode: str = "cute_recurrence",
         skip_fwd_sub: bool = False,
+        varlen: bool = False,
     ):
+        assert num_subchunks == 4, (
+            f"ChunkKDAFwdK4bInverseCuteDSL only supports four subchunks, got {num_subchunks}"
+        )
+        assert chunk_size == num_subchunks * BC, (
+            f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
+            f"{num_subchunks} * {BC}"
+        )
         self.BC = BC
-        self.BK = BK
-        self.BT = self.NC * BC
+        self.BT = chunk_size
+        self.num_offdiag_blocks = num_subchunks * (num_subchunks - 1) // 2
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
         self.fwd_sub_mode = "skip" if skip_fwd_sub else fwd_sub_mode
+        self.varlen = varlen
 
     @cute.jit
     def _fwd_sub_block(self, mAkkd, sAi, block_start, tidx, akkd_col_off, valid_rows):
@@ -101,9 +110,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         mAkk: cute.Tensor,
         H: int,
         total_chunks: int,
+        cu_seqlens: cute.Tensor,
+        chunk_indices: cute.Tensor,
         stream,
-        cu_seqlens: cute.Tensor | None = None,
-        chunk_indices: cute.Tensor | None = None,
     ):
         self._dtype: type[cutlass.Numeric] = mAkk.element_type
         self._sai_dtype: type[cutlass.Numeric] = cutlass.Float32
@@ -112,7 +121,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             self._sai_dtype = self._dtype
             self._sai_stride = self.BC
 
-        if cutlass.const_expr(cu_seqlens is not None):
+        if cutlass.const_expr(self.varlen):
             NT = cute.size(chunk_indices, mode=[0]) // 2
             grid = (NT, H, 1)
         else:
@@ -214,7 +223,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         warp_idx = tidx // self.WARP_SIZE
         lane_idx = tidx % self.WARP_SIZE
 
-        if cutlass.const_expr(cu_seqlens is not None):
+        if cutlass.const_expr(self.varlen):
             i_n = chunk_indices[chunk_idx * 2]
             i_t = chunk_indices[chunk_idx * 2 + 1]
             bos = cu_seqlens[i_n]
@@ -286,7 +295,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         # ══════════════════════════════════════════════════════════
         # PHASE 1: Per-warp OD loading + parallel forward substitution
         # ══════════════════════════════════════════════════════════
-        od_base_row = chunk_idx * 6
+        od_base_row = chunk_idx * self.num_offdiag_blocks
 
         if warp_idx == 0:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
