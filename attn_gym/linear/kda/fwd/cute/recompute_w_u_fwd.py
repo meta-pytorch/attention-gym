@@ -223,7 +223,7 @@ def _predicate_valid(tCoord: cute.Tensor, valid: Int32, check_cols: Constexpr) -
     # rest_m — broadcasting one row's predicate across all repeats would load
     # rows >= valid and over-read past the packed-token boundary. check_cols also
     # masks the column coord (for the square A tile, which is valid x valid).
-    pred = cute.make_fragment(
+    pred = cute.make_rmem_tensor(
         cute.make_layout(
             (
                 cute.size(tCoord, mode=[0, 1]),
@@ -783,7 +783,7 @@ def _kernel_varlen_b1_full_chunk(
 
             # Hoist g_last[col_start:col_start+CVT_VEC] once via vectorized SMEM
             # read. Only meaningful when gating is active.
-            g_last_vals = cute.make_fragment(CVT_VEC, Float32)
+            g_last_vals = cute.make_rmem_tensor(CVT_VEC, Float32)
             if cutlass.const_expr(has_gk):
                 # gk_last is the gate at the chunk's LAST VALID row. For a partial
                 # (varlen) chunk the valid length is < BT, so the fixed row BT-1
@@ -804,19 +804,19 @@ def _kernel_varlen_b1_full_chunk(
                 sBeta_stage.iterator + tr * CVT_ROWSTEPS,
                 cute.make_layout(CVT_ROWSTEPS),
             )
-            beta_frag = cute.make_fragment(CVT_ROWSTEPS, Float32)
+            beta_frag = cute.make_rmem_tensor(CVT_ROWSTEPS, Float32)
             cute.autovec_copy(sBeta_tr_slice, beta_frag)
 
             # Per-iter register fragments — CVT_VEC elements (one scatter phase).
-            k_frag = cute.make_fragment(CVT_VEC, IO_DTYPE)
-            v_frag = cute.make_fragment(CVT_VEC, IO_DTYPE)
-            q_frag = cute.make_fragment(CVT_VEC, IO_DTYPE)
-            g_frag = cute.make_fragment(CVT_VEC, Float32)
-            qg_frag = cute.make_fragment(CVT_VEC, IO_DTYPE)
-            kg_frag = cute.make_fragment(CVT_VEC, IO_DTYPE)
+            k_frag = cute.make_rmem_tensor(CVT_VEC, IO_DTYPE)
+            v_frag = cute.make_rmem_tensor(CVT_VEC, IO_DTYPE)
+            q_frag = cute.make_rmem_tensor(CVT_VEC, IO_DTYPE)
+            g_frag = cute.make_rmem_tensor(CVT_VEC, Float32)
+            qg_frag = cute.make_rmem_tensor(CVT_VEC, IO_DTYPE)
+            kg_frag = cute.make_rmem_tensor(CVT_VEC, IO_DTYPE)
             # kb/vb feed the MMA B operand → mma_dtype.
-            kb_frag = cute.make_fragment(CVT_VEC, mma_dtype)
-            vb_frag = cute.make_fragment(CVT_VEC, mma_dtype)
+            kb_frag = cute.make_rmem_tensor(CVT_VEC, mma_dtype)
+            vb_frag = cute.make_rmem_tensor(CVT_VEC, mma_dtype)
 
             for row_step in cutlass.range(CVT_ROWSTEPS, unroll_full=True):
                 row = tr + row_step * CVT_NROW
@@ -923,7 +923,7 @@ def _kernel_varlen_b1_full_chunk(
             col_start_a = tc_a * A_VEC
             a_k_outer_t = col_start_a // mma_k_inst
             a_tile_in_outer = (col_start_a % mma_k_inst) // A_VEC
-            a_mma_frag = cute.make_fragment(A_VEC, mma_dtype)
+            a_mma_frag = cute.make_rmem_tensor(A_VEC, mma_dtype)
             for a_row_step in cutlass.range(A_ROWSTEPS, unroll_full=True):
                 a_row = tr_a + a_row_step * A_NROW
                 a_row_in_range = a_row < valid
@@ -932,19 +932,19 @@ def _kernel_varlen_b1_full_chunk(
                     cute.make_layout(A_VEC),
                 )
                 if cutlass.const_expr(a_is_fp32):
-                    a_frag = cute.make_fragment(A_VEC, Float32)
+                    a_frag = cute.make_rmem_tensor(A_VEC, Float32)
                     cute.autovec_copy(sA_slice, a_frag)
                     for a_c_off in cutlass.range_constexpr(A_VEC):
                         a_col = col_start_a + a_c_off
-                        keep_a = a_row_in_range & (a_col < valid)
+                        keep_a = a_row_in_range & (a_col <= a_row) & (a_col < valid)
                         a_val = a_frag[a_c_off] if keep_a else Float32(0.0)
                         a_mma_frag[a_c_off] = a_val.to(mma_dtype)
                 else:
-                    a_bf16_frag = cute.make_fragment(A_VEC, IO_DTYPE)
+                    a_bf16_frag = cute.make_rmem_tensor(A_VEC, IO_DTYPE)
                     cute.autovec_copy(sA_slice, a_bf16_frag)
                     for a_c_off in cutlass.range_constexpr(A_VEC):
                         a_col = col_start_a + a_c_off
-                        keep_a = a_row_in_range & (a_col < valid)
+                        keep_a = a_row_in_range & (a_col <= a_row) & (a_col < valid)
                         a_val = a_bf16_frag[a_c_off].to(Float32) if keep_a else Float32(0.0)
                         a_mma_frag[a_c_off] = a_val.to(mma_dtype)
                 # Rank-1 view over a_k_inst at fixed (a_row, a_k_outer); tile into
@@ -954,9 +954,7 @@ def _kernel_varlen_b1_full_chunk(
                 cute.autovec_copy(a_mma_frag, sA_vec[None, a_tile_in_outer])
 
             # Signal AB ready (fills both A and B SMEM tiles).
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_proxy("async.shared", space="cta")
             cvt_mma_barrier.arrive_and_wait()
 
             # ---- 4. MMA ----
@@ -1157,7 +1155,7 @@ def _kernel_varlen_b1_full_chunk(
                 acc_full_u_hi.release()
                 cute.arch.barrier()
 
-                vb_res_frag = cute.make_fragment(4, mma_dtype)
+                vb_res_frag = cute.make_rmem_tensor(4, mma_dtype)
                 for row_step_res in cutlass.range(8, unroll_full=True):
                     row_res = tr + row_step_res * 8
                     safe_row_res = cutlass.min(row_res, valid - 1)
@@ -1177,10 +1175,7 @@ def _kernel_varlen_b1_full_chunk(
                     sVb_res_4 = cute.tiled_divide(sVb_res_col, (4,))
                     cute.autovec_copy(vb_res_frag, sVb_res_4[None, tc])
 
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cvt_mma_barrier.arrive_and_wait()
 
                 if warp_idx == 0:
@@ -1201,7 +1196,7 @@ def _kernel_varlen_b1_full_chunk(
                 acc_full_u_v_res.release()
                 cute.arch.barrier()
 
-                a_res_pack_frag = cute.make_fragment(4, mma_dtype)
+                a_res_pack_frag = cute.make_rmem_tensor(4, mma_dtype)
                 for a_res_row_step in cutlass.range(4, unroll_full=True):
                     a_res_row = tr_a + a_res_row_step * 16
                     a_res_row_in_range = a_res_row < valid
@@ -1209,11 +1204,13 @@ def _kernel_varlen_b1_full_chunk(
                         sA_stage.iterator + a_res_row * BT + col_start_a,
                         cute.make_layout(4),
                     )
-                    a_res_load_frag = cute.make_fragment(4, Float32)
+                    a_res_load_frag = cute.make_rmem_tensor(4, Float32)
                     cute.autovec_copy(sA_res_slice, a_res_load_frag)
                     for a_res_c_off in cutlass.range_constexpr(4):
                         a_res_col = col_start_a + a_res_c_off
-                        keep_a_res = a_res_row_in_range & (a_res_col < valid)
+                        keep_a_res = (
+                            a_res_row_in_range & (a_res_col <= a_res_row) & (a_res_col < valid)
+                        )
                         a_res_val = a_res_load_frag[a_res_c_off] if keep_a_res else Float32(0.0)
                         a_hi = a_res_val.to(mma_dtype)
                         a_res_pack_frag[a_res_c_off] = (a_res_val - a_hi.to(Float32)).to(mma_dtype)
@@ -1221,7 +1218,7 @@ def _kernel_varlen_b1_full_chunk(
                     sA_res_4 = cute.tiled_divide(sA_res_row, (4,))
                     cute.autovec_copy(a_res_pack_frag, sA_res_4[None, a_tile_in_outer])
 
-                vb_hi_frag = cute.make_fragment(4, mma_dtype)
+                vb_hi_frag = cute.make_rmem_tensor(4, mma_dtype)
                 for row_step_hi in cutlass.range(8, unroll_full=True):
                     row_hi = tr + row_step_hi * 8
                     safe_row_hi = cutlass.min(row_hi, valid - 1)
@@ -1241,10 +1238,7 @@ def _kernel_varlen_b1_full_chunk(
                     sVb_hi_4 = cute.tiled_divide(sVb_hi_col, (4,))
                     cute.autovec_copy(vb_hi_frag, sVb_hi_4[None, tc])
 
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cvt_mma_barrier.arrive_and_wait()
 
                 if warp_idx == 0:
