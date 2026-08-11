@@ -11,6 +11,8 @@ from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
 
 _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# TODO: Revisit model-approved chunk sizes: this is a major performance lever,
+# but it changes the KDA decomposition and rounding order, so it can affect numerics.
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
 

@@ -9,6 +9,9 @@
 # requires eager-evaluated annotations.
 
 
+from collections.abc import Iterable
+from typing import NamedTuple
+
 import cuda.bindings.driver as cuda
 import cutlass
 import torch
@@ -18,8 +21,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
+from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -1933,7 +1936,6 @@ class ChunkKdaBwdIntraHmmaGrid:
         mNumChunks: cute.Tensor,
         stream: cuda.CUstream = None,
     ):
-        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix("cutlass_dsl_chunk_kda_bwd_intra")
         _chunk_kda_bwd_intra_hmma_grid_kernel(
             mQ,
             mK,
@@ -1953,6 +1955,7 @@ class ChunkKdaBwdIntraHmmaGrid:
             mNumChunks,
             self.use_i32_metadata,
             self.grid_chunks,
+            _name_prefix="cutlass_dsl_chunk_kda_bwd_intra",
         ).launch(
             grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),
@@ -1960,15 +1963,20 @@ class ChunkKdaBwdIntraHmmaGrid:
         )
 
 
+class ChunkKdaBwdIntraConfig(NamedTuple):
+    """Compile-time persistent-grid choice for intra-chunk backward."""
+
+    grid_chunks: int
+
+
 @jit_cache
-def _compile_chunk_kda_bwd_intra(heads: int, chunks: int):
+def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
     """Compile one persistent fixed-length intra-chunk backward specialization."""
-    sm_count = get_compile_target().sm_count
-    if sm_count is None:
-        raise RuntimeError("KDA compilation requires a CUDA target with an SM count")
+    if not 1 <= grid_chunks <= chunks:
+        raise ValueError(f"grid_chunks must be in [1, {chunks}], got {grid_chunks}")
     op = ChunkKdaBwdIntraHmmaGrid(
         use_i32_metadata=True,
-        grid_chunks=min(chunks, sm_count),
+        grid_chunks=grid_chunks,
     )
     tokens = cute.sym_int()
 
@@ -2022,8 +2030,97 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int):
         cu_seqlens,
         chunk_indices,
         num_chunks,
-        name=f"kda_bwd_intra_h{heads}_c{chunks}",
+        name=f"kda_bwd_intra_h{heads}_c{chunks}_gc{grid_chunks}",
     )
+
+
+def _column_token_head(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor[0].permute(2, 0, 1)
+
+
+class ChunkKdaBwdIntraTunable:
+    class Args(NamedTuple):
+        q: torch.Tensor
+        k: torch.Tensor
+        g: torch.Tensor
+        beta: torch.Tensor
+        dAqk: torch.Tensor
+        dAkk: torch.Tensor
+        dq: torch.Tensor
+        dk: torch.Tensor
+        db: torch.Tensor
+        dg: torch.Tensor
+        dq2: torch.Tensor
+        dk2: torch.Tensor
+        dg2: torch.Tensor
+        db_partial: torch.Tensor
+        cu_seqlens: torch.Tensor
+        chunk_indices: torch.Tensor
+        num_chunks: torch.Tensor
+
+    # The public wrapper replaces this universal fallback with a target-aware default.
+    default_config = ChunkKdaBwdIntraConfig(1)
+
+    @staticmethod
+    def default_for(chunks: int, sm_count: int) -> ChunkKdaBwdIntraConfig:
+        """Prefer a smaller power-of-two grid when it evenly partitions the chunks."""
+        grid_limit = min(chunks, 1 << (sm_count.bit_length() - 1))
+        amortized_grid = max(1, grid_limit // 2)
+        grid_chunks = amortized_grid if chunks % amortized_grid == 0 else min(chunks, sm_count)
+        return ChunkKdaBwdIntraConfig(grid_chunks)
+
+    @classmethod
+    def configs(cls, args: Args) -> tuple[ChunkKdaBwdIntraConfig, ...]:
+        """Generate persistent-grid candidates from sequence length and target size."""
+        chunks = args.q.shape[1] // BT
+        sm_count = get_compile_target().sm_count
+        if sm_count is None:
+            raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
+        grid_limit = min(chunks, 1 << (sm_count.bit_length() - 1))
+        values = (
+            cls.default_for(chunks, sm_count).grid_chunks,
+            max(1, grid_limit // 4),
+            grid_limit,
+            min(chunks, sm_count),
+            min(chunks, grid_limit * 2),
+        )
+        return tuple(ChunkKdaBwdIntraConfig(value) for value in dict.fromkeys(values))
+
+    @staticmethod
+    def compile_call(config: ChunkKdaBwdIntraConfig, args: Args) -> tuple[int, int, int]:
+        return args.q.shape[2], args.q.shape[1] // BT, config.grid_chunks
+
+    compile = staticmethod(_compile_chunk_kda_bwd_intra)
+
+    @staticmethod
+    def launch(
+        compiled, config: ChunkKdaBwdIntraConfig, args: Args
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del config
+        compiled(
+            _column_token_head(args.q),
+            _column_token_head(args.k),
+            _column_token_head(args.g),
+            args.beta,
+            _column_token_head(args.dAqk),
+            _column_token_head(args.dAkk),
+            _column_token_head(args.dq),
+            _column_token_head(args.dk),
+            args.db_partial,
+            _column_token_head(args.dg),
+            _column_token_head(args.dq2),
+            _column_token_head(args.dk2),
+            _column_token_head(args.dg2),
+            args.cu_seqlens,
+            args.chunk_indices,
+            args.num_chunks.reshape(1),
+        )
+        return (
+            args.dq2,
+            args.dk2,
+            args.dg2,
+            args.db + args.db_partial.sum(0).unsqueeze(0),
+        )
 
 
 def chunk_kda_bwd_intra(
@@ -2040,14 +2137,21 @@ def chunk_kda_bwd_intra(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
     num_chunks: torch.Tensor,
+    *,
+    config: ChunkKdaBwdIntraConfig | None = None,
+    tune: bool = False,
+    configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the fixed-length intra-chunk Q/K/gate/beta backward stage."""
+    """Run or tune the fixed-length intra-chunk Q/K/gate/beta backward stage."""
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != KEY_DIM:
         raise ValueError("the intra-chunk backward requires B=1 and K=128")
     if tokens % BT:
         raise ValueError("the intra-chunk backward requires complete 64-token chunks")
-    chunks = tokens // BT
+
+    # The kernel combines the incoming gradients with its intra-chunk contribution into
+    # new output buffers. Beta is different: four K-phase CTAs contribute to every token,
+    # so they write FP32 partials to global workspace for a race-free post-launch reduction.
     dq2 = torch.empty_like(q)
     dk2 = torch.empty_like(k)
     dg2 = torch.empty_like(g)
@@ -2058,27 +2162,40 @@ def chunk_kda_bwd_intra(
         dtype=torch.float32,
         device=q.device,
     )
-    compiled = _compile_chunk_kda_bwd_intra(heads, chunks)
-
-    def column_token_head(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor[0].permute(2, 0, 1)
-
-    compiled(
-        column_token_head(q),
-        column_token_head(k),
-        column_token_head(g),
-        beta,
-        column_token_head(dAqk),
-        column_token_head(dAkk),
-        column_token_head(dq),
-        column_token_head(dk),
-        db_partial,
-        column_token_head(dg),
-        column_token_head(dq2),
-        column_token_head(dk2),
-        column_token_head(dg2),
-        cu_seqlens,
-        chunk_indices,
-        num_chunks.reshape(1),
+    args = ChunkKdaBwdIntraTunable.Args(
+        q=q,
+        k=k,
+        g=g,
+        beta=beta,
+        dAqk=dAqk,
+        dAkk=dAkk,
+        dq=dq,
+        dk=dk,
+        db=db,
+        dg=dg,
+        dq2=dq2,
+        dk2=dk2,
+        dg2=dg2,
+        db_partial=db_partial,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        num_chunks=num_chunks,
     )
-    return dq2, dk2, dg2, db + db_partial.sum(0).unsqueeze(0)
+    target = detect_compile_target(q.device.index)
+    if not tune and config is None:
+        if target.sm_count is None:
+            raise RuntimeError("KDA launch requires a CUDA target with an SM count")
+        config = ChunkKdaBwdIntraTunable.default_for(tokens // BT, target.sm_count)
+    result, _ = run_tunable(
+        ChunkKdaBwdIntraTunable,
+        args,
+        config=config,
+        autotune=tune,
+        configs=configs,
+        parallel_compile=_compile_chunk_kda_bwd_intra.disk_cache_enabled(),
+        target=target,
+    )
+    return result
+
+
+__all__ = ["ChunkKdaBwdIntraConfig", "chunk_kda_bwd_intra"]

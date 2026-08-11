@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import gc
 import importlib
 
@@ -14,6 +15,15 @@ from attn_gym.linear.kda.naive import chunk_cumsum_ref
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd as _chunk_kda_bwd_module
+from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
+    ChunkKdaBwdIntraConfig,
+    chunk_kda_bwd_intra,
+)
+from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
+    ChunkKdaBwdWyDqkgConfig,
+    chunk_kda_bwd_wy_dqkg,
+)
 from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_custom_op,
@@ -26,8 +36,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inputs(*, heads: int = 1, initial_state: bool = False, dtype: torch.dtype = torch.bfloat16):
-    batch, tokens, head_dim = 1, 128, 128
+def _inputs(
+    *,
+    tokens: int = 128,
+    heads: int = 1,
+    initial_state: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    batch, head_dim = 1, 128
     shape = (batch, tokens, heads, head_dim)
     q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
@@ -176,6 +192,38 @@ def test_kda_offset_width_specializations_match(monkeypatch):
     torch.testing.assert_close(output64, output32, rtol=0, atol=0)
     for gradient64, gradient32 in zip(gradients64, gradients32, strict=True):
         torch.testing.assert_close(gradient64, gradient32, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "kernel", "config_type"),
+    (
+        ("chunk_kda_bwd_intra", chunk_kda_bwd_intra, ChunkKdaBwdIntraConfig),
+        ("chunk_kda_bwd_wy_dqkg", chunk_kda_bwd_wy_dqkg, ChunkKdaBwdWyDqkgConfig),
+    ),
+)
+def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
+    """Keep each explicit and tuned schedule equivalent to its default."""
+    torch.manual_seed(5)
+    inputs = _inputs(tokens=320, heads=2)
+    d_output = torch.randn_like(inputs[0])
+    candidates = tuple(config_type(value) for value in (1, 2))
+    launches = (
+        kernel,
+        *(functools.partial(kernel, config=config) for config in candidates),
+        functools.partial(kernel, tune=True),
+        functools.partial(kernel, tune=True, configs=candidates),
+    )
+
+    gradients = []
+    for launch in launches:
+        monkeypatch.setattr(_chunk_kda_bwd_module, attribute, launch)
+        cloned_inputs = _clone_inputs(inputs)
+        output, _ = chunk_kda(*cloned_inputs)
+        gradients.append(torch.autograd.grad(output, cloned_inputs, d_output))
+
+    for result in gradients[1:]:
+        for candidate, expected in zip(result, gradients[0], strict=True):
+            torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
 
 
 def test_chunk_kda_custom_op_registration():

@@ -29,17 +29,15 @@ class ReadConfig(NamedTuple):
     reads: int
 
 
-class _CopyReadsOp:
-    """Internal tunable CuTeDSL op; users call :func:`copy_reads`."""
+class CopyReadsTunable:
+    """Compile, tune, and launch the copy kernel."""
 
     default_config = ReadConfig(128, 4)
 
     @staticmethod
-    def configs(
-        source: torch.Tensor,
-        *_runtime_args: Any,
-    ) -> tuple[ReadConfig, ...]:
+    def configs(source: torch.Tensor, destination: torch.Tensor) -> tuple[ReadConfig, ...]:
         """Generate candidates that are sensible for this input shape."""
+        del destination
         max_threads = min(256, max(64, source.numel()))
         reads_per_thread = (4,) if source.numel() < 16 else (4, 8, 16)
         return tuple(
@@ -50,11 +48,11 @@ class _CopyReadsOp:
         )
 
     @staticmethod
-    def _name(threads: int, reads: int) -> str:
+    def kernel_name(threads: int, reads: int) -> str:
         return f"cute_playground_t{threads}_r{reads}"
 
     @cute.kernel
-    def _kernel(
+    def kernel(
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
@@ -85,7 +83,7 @@ class _CopyReadsOp:
                     destination[index] = source[index]
 
     @cute.jit
-    def _launch(
+    def execute(
         self,
         source: cute.Tensor,
         destination: cute.Tensor,
@@ -94,12 +92,12 @@ class _CopyReadsOp:
         stream,
     ):
         blocks = cute.ceil_div(cute.size(source), threads * reads)
-        self._kernel(
+        self.kernel(
             source,
             destination,
             threads,
             reads,
-            _name_prefix=self._name(threads, reads),
+            _name_prefix=self.kernel_name(threads, reads),
         ).launch(
             grid=(blocks, 1, 1),
             block=(threads, 1, 1),
@@ -123,31 +121,33 @@ class _CopyReadsOp:
             stride_order=(0,),
             assumed_align=16,
         )
-        op = _CopyReadsOp()
+        op = CopyReadsTunable()
         return compile_tvm_ffi(
-            op._launch,
+            op.execute,
             source,
             destination,
             config.threads,
             config.reads,
-            name=op._name(config.threads, config.reads),
+            name=op.kernel_name(config.threads, config.reads),
         )
 
     @staticmethod
     def compile_call(
         config: ReadConfig,
-        _source: torch.Tensor,
-        _destination: torch.Tensor,
+        source: torch.Tensor,
+        destination: torch.Tensor,
     ) -> tuple[ReadConfig]:
+        del source, destination
         return (config,)
 
     @staticmethod
     def launch(
         compiled,
-        _config: ReadConfig,
+        config: ReadConfig,
         source: torch.Tensor,
         destination: torch.Tensor,
     ) -> torch.Tensor:
+        del config
         compiled(source, destination)
         return destination
 
@@ -173,8 +173,8 @@ def copy_reads(
         raise ValueError("copy_reads expects nonempty, contiguous, 16-byte-aligned storage")
 
     destination = torch.empty_like(source)
-    output, _selected = run_tunable(
-        _CopyReadsOp,
+    return run_tunable(
+        CopyReadsTunable,
         source,
         destination,
         config=config,
@@ -182,8 +182,7 @@ def copy_reads(
         configs=configs,
         workers=workers,
         benchmark=benchmark,
-    )
-    return output
+    )[0]
 
 
 def main() -> None:
@@ -194,7 +193,7 @@ def main() -> None:
 
     # This wrapper is optional: without benchmark=report, tune() uses the same
     # Inductor benchmark_gpu helper but only returns the winning configuration.
-    candidates = _CopyReadsOp.configs(source)
+    candidates = CopyReadsTunable.configs(source, torch.empty_like(source))
     remaining = iter(candidates)
     timings = {}
 
