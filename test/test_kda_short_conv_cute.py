@@ -9,6 +9,7 @@ pytest.importorskip("cutlass")
 from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     _backward_custom_op,
+    _candidate_configs,
     _forward_custom_op,
     cute_causal_conv1d_silu,
     tune_causal_conv1d_silu,
@@ -46,6 +47,31 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize("channels", [5, 6])
+def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
+    """Select a compatible packed channel width without requiring an explicit config."""
+    torch.manual_seed(1)
+    x, weight = _inputs(tokens=19, channels=channels)
+    grad_output = torch.randn_like(x)
+
+    actual = cute_causal_conv1d_silu(x, weight)
+    expected = _reference(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+
+    compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
+    torch.testing.assert_close(compiled(x, weight), expected, rtol=2e-2, atol=2e-2)
+
+    for kind in ("forward", "input_gradient", "weight_gradient"):
+        candidates = _candidate_configs(kind, channels)
+        assert candidates
+        assert all(channels % config.channels_per_thread == 0 for config in candidates)
 
 
 @pytest.mark.parametrize("width", [3, 4])
