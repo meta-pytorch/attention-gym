@@ -12,6 +12,7 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
+    autotune_cache_kwargs,
     exp,
     exp2,
 )
@@ -45,6 +46,15 @@ def _requires_int64_offsets(args):
         "HAS_NUM_SEQS": lambda args: args["num_seqs"] is not None,
         "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BV": 16}, num_warps=4, num_stages=3),
+        triton.Config({"BV": 64}, num_warps=4, num_stages=3),
+    ],
+    key=["H", "K", "V", "BT"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "num_seqs"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
@@ -817,8 +827,10 @@ def chunk_gated_delta_rule_fwd_h(
         if output_final_state
         else None
     )
-    block_value_dim = 64
-    grid = (batch * heads, triton.cdiv(value_dim, block_value_dim))
+
+    def grid(meta):
+        return (batch * heads, triton.cdiv(value_dim, meta["BV"]))
+
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -837,7 +849,6 @@ def chunk_gated_delta_rule_fwd_h(
         K=key_dim,
         V=value_dim,
         BT=chunk_size,
-        BV=block_value_dim,
         USE_EXP2=True,
     )
     return h, v_new, final_state

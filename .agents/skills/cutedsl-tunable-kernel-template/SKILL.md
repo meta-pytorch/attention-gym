@@ -62,14 +62,21 @@ class MyConfig(NamedTuple):
     tile_size: int
 ```
 
-A tunable adapter supplies five distinct responsibilities:
+A tunable adapter supplies five distinct responsibilities. When its launch ABI has several values,
+make that ABI an `Args` type owned by the adapter rather than a separate module-level private type:
 
 ```python
-class _MyOp:
+class MyOp:
+    class Args(NamedTuple):
+        q: torch.Tensor
+        k: torch.Tensor
+        output: torch.Tensor
+        workspace: torch.Tensor
+
     default_config = MyConfig(threads=128, tile_size=256)
 
     @staticmethod
-    def configs(*runtime_args) -> tuple[MyConfig, ...]:
+    def configs(args: Args) -> tuple[MyConfig, ...]:
         """Return valid candidates derived from actual runtime inputs."""
         ...
 
@@ -80,12 +87,12 @@ class _MyOp:
         ...
 
     @staticmethod
-    def compile_call(config: MyConfig, *runtime_args) -> tuple:
-        """Project runtime inputs to static arguments for compile(...)."""
+    def compile_call(config: MyConfig, args: Args) -> tuple:
+        """Project launch arguments to static arguments for compile(...)."""
         ...
 
     @staticmethod
-    def launch(compiled, config: MyConfig, *runtime_args):
+    def launch(compiled, config: MyConfig, args: Args):
         """Launch in the parent with real tensors and return the public result."""
         ...
 ```
@@ -95,17 +102,30 @@ constructor-heavy DSL op may stay focused on layouts and device code while a sma
 five static/class methods above.
 
 - `default_config` is a conservative fallback and must be valid for every runtime input accepted by
-  the adapter. If the normal choice depends on inputs or target metadata, resolve it in the parent
-  wrapper and pass it as `config=`. Name canonical mode configs after the mode rather than calling an
-  architecture-specific config the default.
+  the adapter. If the normal choice depends on inputs or target metadata, keep that selection method
+  on the adapter (for example, `default_for(...)`), call it from the parent wrapper, and pass its
+  result as `config=`. Do not leave an adapter-specific default heuristic as an unrelated module-level
+  helper. Name canonical mode configs after the mode rather than calling an architecture-specific
+  config the default.
 - `configs(...)` may inspect runtime shape, stride, dtype, alignment, or device facts.
 - `compile(...)` owns fake tensors and the cached artifact boundary.
 - `compile_call(...)` prevents runtime tensors from leaking into cache keys or subprocess payloads.
 - `launch(...)` binds the compiled callable to real tensors for correctness checks and timing.
 
-The protocol accepts `*runtime_args`, but do not grow a positional list of inputs, outputs, and static
-semantics indefinitely. Pass one parent-only runtime bundle once the arguments form one launch ABI;
-`compile_call(...)` then projects that bundle to static values, while `launch(...)` unwraps it.
+The protocol accepts positional runtime arguments for small ABIs. Keep one or two naturally named
+values positional; wrapping them in `Args` would add ceremony without clarifying ownership. Do not,
+however, grow a positional list of inputs, outputs, and static semantics indefinitely. Once several
+values form one launch ABI, pass one parent-only `Args` value. Nest `Args` in its adapter when no
+other component owns that ABI; use a descriptive top-level type when multiple components genuinely
+share it. Do not create a module-level `_Runtime` or `_Args` type merely to signal privacy. Reserve
+“runtime” for an execution environment or lifecycle-bearing object, not a passive argument tuple.
+`compile_call(...)` projects `Args` to static values, while `launch(...)` binds its real tensors to
+the compiled callable.
+
+Nesting communicates ownership, not public API status. If an adapter has a normal class name but is
+an implementation detail, define the module's `__all__` explicitly and list only the supported
+wrapper and configuration types. Do not use leading underscores as a substitute for deciding and
+documenting the module's actual public surface.
 
 ## Public Wrapper
 
@@ -113,31 +133,35 @@ Users call one ordinary PyTorch function; they do not construct op objects or co
 
 ```python
 def my_op(
-    x: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     *,
     config: MyConfig | None = None,
     tune: bool = False,
     configs: Iterable[MyConfig] | None = None,
 ) -> torch.Tensor:
-    y = torch.empty_like(x)
-    result, _selected = run_tunable(
-        _MyOp,
-        x,
-        y,
+    args = MyOp.Args(
+        q,
+        k,
+        torch.empty_like(q),
+        torch.empty_like(q, dtype=torch.float32),
+    )
+    return run_tunable(
+        MyOp,
+        args,
         config=config,
         autotune=tune,
         configs=configs,
-    )
-    return result
+    )[0]
 ```
 
 This gives three intentional modes:
 
 ```python
-my_op(x)                                      # conservative default
-my_op(x, config=MyConfig(64, 128))            # force one specialization
-my_op(x, tune=True)                           # input-aware candidate method
-my_op(x, tune=True, configs=(cfg_a, cfg_b))   # explicit candidate override
+my_op(q, k)                                      # conservative default
+my_op(q, k, config=MyConfig(64, 128))            # force one specialization
+my_op(q, k, tune=True)                           # input-aware candidate method
+my_op(q, k, tune=True, configs=(cfg_a, cfg_b))   # explicit candidate override
 ```
 
 Reject `config=` with tuning and reject `configs=` without tuning rather than silently ignoring either argument.

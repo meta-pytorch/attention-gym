@@ -42,9 +42,14 @@ from attn_gym.linear.kda.utils import (
 )
 @triton.autotune(
     configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
         triton.Config({"BK": 32, "BV": 64}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
     ],
-    key=["BT"],
+    key=["H", "K", "V", "T", "BT"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "num_chunks"])

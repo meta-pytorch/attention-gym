@@ -10,6 +10,8 @@
 # pyre-ignore-all-errors
 
 import os
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -29,8 +31,8 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
+from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
 
 # ============================================================================
 # Inlined SM100 tcgen05 helper wrappers
@@ -1584,14 +1586,12 @@ _torch_to_cutlass_dtype = {
 }
 
 
-def assert_blackwell(device: torch.device | str | int | None = None) -> None:
-    if device is None:
-        device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    if not (props.major == 10 and props.minor in (0, 3)):
+def require_blackwell_target() -> None:
+    """Reject compilation targets that cannot execute this SM100/SM103 kernel."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or target.capability not in ((10, 0), (10, 3)):
         raise RuntimeError(
-            "chunk_kda_bwd_wy_dqkg_fused requires Blackwell "
-            f"(SM100/SM103), got sm_{props.major}{props.minor}"
+            f"chunk_kda_bwd_wy_dqkg_fused requires Blackwell (SM100/SM103), got target={target}"
         )
 
 
@@ -1911,14 +1911,14 @@ class ChunkKdaBwdWyDqkgFused:
         g_dtype: type[cutlass.Numeric] = cutlass.Float32,
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
-        min_occupancy: int = 1,
+        grid_waves: int = 1,
         use_fast_math: bool = True,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
         assert head_dim_k == 128 and head_dim_v == 128, (
             f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
         )
-        assert_blackwell()
+        require_blackwell_target()
 
         self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
@@ -1946,7 +1946,9 @@ class ChunkKdaBwdWyDqkgFused:
 
         self.num_regs_cuda = 208
         self.num_regs_others = 88
-        self.min_occupancy = min_occupancy
+        if grid_waves < 1:
+            raise ValueError(f"grid_waves must be positive, got {grid_waves}")
+        self.grid_waves = grid_waves
 
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
@@ -2008,12 +2010,12 @@ class ChunkKdaBwdWyDqkgFused:
     def _compute_grid(self, B, T, HV, total_nt=None):
         """Compute grid dimensions for persistent kernel launch.
 
-        Grid: (min(num_sm * min_occupancy, total_tiles), 1, 1)
+        Grid: (min(num_sm * grid_waves, total_tiles), 1, 1)
         Each CTA handles multiple tiles via stride-by-gridDim.x loop.
         """
         assert total_nt is not None
         total_tiles = total_nt * HV
-        grid_x = cutlass.min(Int32(self.num_sm * self.min_occupancy), total_tiles)
+        grid_x = cutlass.min(Int32(self.num_sm * self.grid_waves), total_tiles)
         return (grid_x, Int32(1), Int32(1))
 
     @cute.jit
@@ -2654,7 +2656,7 @@ class ChunkKdaBwdWyDqkgFused:
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
-            min_blocks_per_mp=self.min_occupancy,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -2725,7 +2727,7 @@ class ChunkKdaBwdWyDqkgFused:
         BT = self.BT
 
         # ===================== Persistent work decode =====================
-        # Grid: (min(num_sm * occ, total_tiles), 1, 1) — persistent
+        # Grid: (min(num_sm * grid_waves, total_tiles), 1, 1) — persistent
         block_idx_x = cute.arch.block_idx()[0]
         grid_dim_x = cute.arch.grid_dim()[0]
         thread_idx = cute.arch.thread_idx()[0]
@@ -4710,12 +4712,19 @@ class ChunkKdaBwdWyDqkgFused:
         return bSG_sC, bSG_gC
 
 
+class ChunkKdaBwdWyDqkgConfig(NamedTuple):
+    """Persistent-grid schedule for fused WY/dQKG backward."""
+
+    grid_waves: int
+
+
 @jit_cache
 def _compile_chunk_kda_bwd_wy_dqkg(
     heads: int,
     head_dim: int,
     chunk_size: int,
     fastmath: bool,
+    grid_waves: int,
 ):
     """Compile one persistent fixed-length WY/dQKG backward specialization."""
     op = ChunkKdaBwdWyDqkgFused(
@@ -4723,6 +4732,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         head_dim_k=head_dim,
         head_dim_v=head_dim,
         scale=head_dim**-0.5,
+        grid_waves=grid_waves,
         use_fast_math=fastmath,
     )
     tokens, chunks = cute.sym_int(), cute.sym_int()
@@ -4777,8 +4787,106 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         chunk_indices,
         (Int32(1), Int32(1), Int32(heads), Int32(heads), Int32(head_dim), Int32(head_dim)),
         Int32(1),
-        name=(f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_fm{int(fastmath)}"),
+        name=(
+            f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_fm{int(fastmath)}_gw{grid_waves}"
+        ),
     )
+
+
+class ChunkKdaBwdWyDqkgTunable:
+    class Args(NamedTuple):
+        q: torch.Tensor
+        k: torch.Tensor
+        v: torch.Tensor
+        v_new: torch.Tensor
+        g: torch.Tensor
+        beta: torch.Tensor
+        A: torch.Tensor
+        h: torch.Tensor
+        do: torch.Tensor
+        dh: torch.Tensor
+        dv: torch.Tensor
+        dq: torch.Tensor
+        dk: torch.Tensor
+        dv2: torch.Tensor
+        dg: torch.Tensor
+        db: torch.Tensor
+        dA: torch.Tensor
+        cu_seqlens: torch.Tensor
+        chunk_indices: torch.Tensor
+        chunk_size: int
+        fastmath: bool
+
+    default_config = ChunkKdaBwdWyDqkgConfig(grid_waves=1)
+
+    @staticmethod
+    def configs(
+        args: Args,
+    ) -> tuple[ChunkKdaBwdWyDqkgConfig, ...]:
+        del args
+        return tuple(ChunkKdaBwdWyDqkgConfig(waves) for waves in (1, 2))
+
+    @staticmethod
+    def compile_call(
+        config: ChunkKdaBwdWyDqkgConfig,
+        args: Args,
+    ) -> tuple[int, int, int, bool, int]:
+        return (
+            args.q.shape[2],
+            args.q.shape[3],
+            args.chunk_size,
+            args.fastmath,
+            config.grid_waves,
+        )
+
+    compile = staticmethod(_compile_chunk_kda_bwd_wy_dqkg)
+
+    @staticmethod
+    def launch(
+        compiled,
+        config: ChunkKdaBwdWyDqkgConfig,
+        args: Args,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        del config
+        batch, tokens, heads, head_dim = args.q.shape
+        compiled(
+            args.q,
+            args.k,
+            args.v,
+            args.v_new,
+            args.g,
+            args.beta,
+            args.A,
+            args.h,
+            args.do,
+            args.dh,
+            args.dv,
+            args.dq,
+            args.dk,
+            args.dv2,
+            args.dg,
+            args.db,
+            args.dA,
+            args.cu_seqlens,
+            args.chunk_indices,
+            (
+                Int32(batch),
+                Int32(tokens),
+                Int32(heads),
+                Int32(heads),
+                Int32(head_dim),
+                Int32(head_dim),
+            ),
+            Int32(tokens // args.chunk_size),
+        )
+        return args.dq, args.dk, args.dv2, args.dg, args.db, args.dA
 
 
 def chunk_kda_bwd_wy_dqkg(
@@ -4798,6 +4906,9 @@ def chunk_kda_bwd_wy_dqkg(
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
+    config: ChunkKdaBwdWyDqkgConfig | None = None,
+    tune: bool = False,
+    configs: Iterable[ChunkKdaBwdWyDqkgConfig] | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -4806,7 +4917,7 @@ def chunk_kda_bwd_wy_dqkg(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run the fixed-length fused WY and dQ/K/V/gate/beta backward stage."""
+    """Run or tune the fixed-length fused WY/dQKG backward stage."""
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != 128 or v.shape[-1] != 128:
         raise ValueError("the fused WY backward requires B=1 and K=V=128")
@@ -4819,41 +4930,39 @@ def chunk_kda_bwd_wy_dqkg(
     if h.shape != expected_h or dh.shape != expected_h:
         raise ValueError(f"h and dh must have shape {expected_h}")
 
-    dq = torch.empty_like(g)
-    dk = torch.empty_like(g)
-    dv2 = torch.empty_like(v)
-    dg = torch.empty_like(g)
-    db = torch.empty_like(beta)
-    dA = torch.empty_like(A, dtype=torch.float32)
-    compiled = _compile_chunk_kda_bwd_wy_dqkg(heads, head_dim, chunk_size, fastmath)
-    compiled(
-        q,
-        k,
-        v,
-        v_new,
-        g,
-        beta,
-        A,
-        h,
-        do,
-        dh,
-        dv,
-        dq,
-        dk,
-        dv2,
-        dg,
-        db,
-        dA,
-        cu_seqlens,
-        chunk_indices,
-        (
-            Int32(batch),
-            Int32(tokens),
-            Int32(heads),
-            Int32(heads),
-            Int32(head_dim),
-            Int32(head_dim),
-        ),
-        Int32(chunks),
+    args = ChunkKdaBwdWyDqkgTunable.Args(
+        q=q,
+        k=k,
+        v=v,
+        v_new=v_new,
+        g=g,
+        beta=beta,
+        A=A,
+        h=h,
+        do=do,
+        dh=dh,
+        dv=dv,
+        dq=torch.empty_like(g),
+        dk=torch.empty_like(g),
+        dv2=torch.empty_like(v),
+        dg=torch.empty_like(g),
+        db=torch.empty_like(beta),
+        dA=torch.empty_like(A, dtype=torch.float32),
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        fastmath=fastmath,
     )
-    return dq, dk, dv2, dg, db, dA
+    result, _ = run_tunable(
+        ChunkKdaBwdWyDqkgTunable,
+        args,
+        config=config,
+        autotune=tune,
+        configs=configs,
+        parallel_compile=_compile_chunk_kda_bwd_wy_dqkg.disk_cache_enabled(),
+        target=detect_compile_target(q.device.index),
+    )
+    return result
+
+
+__all__ = ["ChunkKdaBwdWyDqkgConfig", "chunk_kda_bwd_wy_dqkg"]
