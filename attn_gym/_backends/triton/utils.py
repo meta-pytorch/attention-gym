@@ -9,11 +9,11 @@ import triton.language as tl
 
 @triton.jit
 def ptr_offset(indices, strides: tl.constexpr):
-    """Compute a broadcasted signed 64-bit offset from index and stride tuples."""
+    """Compute a broadcasted linear offset from index and stride tuples."""
     tl.static_assert(len(indices) == len(strides), "indices and strides must have equal length")
     offset = 0
     for axis in tl.static_range(len(strides)):
-        offset += tl.cast(indices[axis], tl.int64) * strides[axis]
+        offset += indices[axis] * strides[axis]
     return offset
 
 
@@ -38,6 +38,14 @@ def storage_cosize(shape: Sequence[int], strides: Sequence[int]) -> int:
         if size > 0:
             cosize += (size - 1) * stride
     return 0 if is_empty else cosize
+
+
+def requires_int64_offsets(*tensors: torch.Tensor | None) -> bool:
+    """Return whether any tensor's relative storage extent exceeds signed int32."""
+    return any(
+        tensor is not None and storage_cosize(tensor.shape, tensor.stride()) > 2**31
+        for tensor in tensors
+    )
 
 
 def can_use_tma(tensor: torch.Tensor) -> bool:

@@ -10,11 +10,28 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     exp,
     exp2,
 )
+
+
+def _requires_int64_offsets(args):
+    return requires_int64_offsets(
+        args["k"],
+        args["v"],
+        args["w"],
+        args["v_new"],
+        args["g"],
+        args["gk"],
+        args["h"],
+        args["h0"],
+        args["ht"],
+        args["cu_seqlens"],
+        args["chunk_offsets"],
+        args["num_seqs"],
+    )
 
 
 @triton.heuristics(
@@ -26,6 +43,7 @@ from attn_gym.linear.kda.utils import (
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_SEQS": lambda args: args["num_seqs"] is not None,
+        "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
 )
 @triton.jit(do_not_specialize=["T", "num_seqs"])
@@ -56,8 +74,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_SEQS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
+    if USE_INT64_OFFSETS:
+        i_nh = i_nh.to(tl.int64)
+        i_v = i_v.to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         if HAS_NUM_SEQS and i_n >= tl.load(num_seqs):
@@ -66,14 +88,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int32),
             tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int32),
         )
+        boh = tl.load(chunk_offsets + ptr_offset((i_n,), (1,))).to(tl.int32)
+        if USE_INT64_OFFSETS:
+            bos = bos.to(tl.int64)
+            eos = eos.to(tl.int64)
+            boh = boh.to(tl.int64)
         T = eos - bos
         NT = tl.cdiv(T, BT)
-        boh = tl.load(chunk_offsets + ptr_offset((i_n,), (1,))).to(tl.int32)
     else:
-        bos = tl.cast(i_n, tl.int64) * T
+        bos = i_n * T
         eos = bos + T
         NT = tl.cdiv(T, BT)
-        boh = tl.cast(i_n, tl.int64) * NT
+        boh = i_n * NT
 
     # [BK, BV]
     b_h1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -139,7 +165,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
-        h_t = h + ptr_offset((i_t,), (H * K * V,))
+        i_t_offset = i_t
+        if USE_INT64_OFFSETS:
+            i_t_offset = i_t_offset.to(tl.int64)
+        h_t = h + ptr_offset((i_t_offset,), (H * K * V,))
         m_h = (o_k1[:, None] < K) & m_v[None, :]
         tl.store(
             h_t + ptr_offset((o_k1[:, None], o_v[None, :]), (V, 1)),
@@ -168,7 +197,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=m_h,
             )
 
-        o_t = ptr_offset((i_t,), (BT,)) + tl.arange(0, BT)
+        o_t = ptr_offset((i_t_offset,), (BT,)) + tl.arange(0, BT)
         m_t = o_t < T
         m_w = m_t[:, None] & (o_k1[None, :] < K)
         b_w = tl.load(
@@ -213,7 +242,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=m_v_block,
             )
 
-        last_idx = min(ptr_offset((i_t,), (BT,)) + BT, T) - 1
+        last_idx = min(ptr_offset((i_t_offset,), (BT,)) + BT, T) - 1
         if USE_G:
             b_g_last = tl.load(g + ptr_offset((bos, last_idx, i_h), (H, H, 1)))
             b_g = tl.load(
@@ -374,6 +403,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_SEQS": lambda args: args["num_seqs"] is not None,
+        "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
 )
 @triton.jit(do_not_specialize=["T", "num_seqs"])
@@ -404,10 +434,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_SEQS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     GRID_N: tl.constexpr,
     MAX_N: tl.constexpr,
 ):
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
+    if USE_INT64_OFFSETS:
+        i_nh = i_nh.to(tl.int64)
+        i_v = i_v.to(tl.int64)
     i_h = i_nh % H
     i_n_start = i_nh // H
 
@@ -425,7 +459,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
         o_k4 = 192 + o_k1
 
     for _iter in range((MAX_N + GRID_N - 1) // GRID_N):
-        i_n = tl.cast(i_n_start, tl.int64) + _iter * GRID_N
+        i_n = i_n_start + _iter * GRID_N
         _run = i_n < MAX_N
         if IS_VARLEN and HAS_NUM_SEQS and _run:
             _run = i_n < upper_limit  # pyrefly: ignore [unbound-name]
@@ -435,15 +469,19 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                     tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int32),
                     tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int32),
                 )
+                boh = tl.load(chunk_offsets + ptr_offset((i_n,), (1,))).to(tl.int32)
+                if USE_INT64_OFFSETS:
+                    bos = bos.to(tl.int64)
+                    eos = eos.to(tl.int64)
+                    boh = boh.to(tl.int64)
                 T_local = eos - bos
                 NT = tl.cdiv(T_local, BT)
-                boh = tl.load(chunk_offsets + ptr_offset((i_n,), (1,))).to(tl.int32)
             else:
-                bos = tl.cast(i_n, tl.int64) * T
+                bos = i_n * T
                 eos = bos + T
                 T_local = T
                 NT = tl.cdiv(T_local, BT)
-                boh = tl.cast(i_n, tl.int64) * NT
+                boh = i_n * NT
 
             # [BK, BV]
             b_h1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -495,7 +533,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
 
             # main recurrence
             for i_t in range(NT):
-                h_t = h_off + ptr_offset((i_t,), (H * K * V,))
+                i_t_offset = i_t
+                if USE_INT64_OFFSETS:
+                    i_t_offset = i_t_offset.to(tl.int64)
+                h_t = h_off + ptr_offset((i_t_offset,), (H * K * V,))
                 m_h = (o_k1[:, None] < K) & m_v[None, :]
                 tl.store(
                     h_t + ptr_offset((o_k1[:, None], o_v[None, :]), (V, 1)),
@@ -524,7 +565,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                         mask=m_h,
                     )
 
-                o_t = ptr_offset((i_t,), (BT,)) + tl.arange(0, BT)
+                o_t = ptr_offset((i_t_offset,), (BT,)) + tl.arange(0, BT)
                 m_t = o_t < T_local
                 m_w = m_t[:, None] & (o_k1[None, :] < K)
                 b_w = tl.load(
@@ -578,7 +619,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop(
                         mask=m_v_block,
                     )
 
-                last_idx = min(ptr_offset((i_t,), (BT,)) + BT, T_local) - 1
+                last_idx = min(ptr_offset((i_t_offset,), (BT,)) + BT, T_local) - 1
                 if USE_G:
                     b_g_last = tl.load(g + ptr_offset((bos, last_idx, i_h), (H, H, 1)))
                     b_g = tl.load(

@@ -15,7 +15,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
 )
@@ -25,6 +25,18 @@ from attn_gym.linear.kda.utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+            args["q"],
+            args["k"],
+            args["v"],
+            args["A"],
+            args["do"],
+            args["dv"],
+            args["dA"],
+            args["cu_seqlens"],
+            args["chunk_indices"],
+            args["num_chunks"],
+        ),
     }
 )
 @triton.autotune(
@@ -56,20 +68,30 @@ def chunk_kda_bwd_kernel_dAv(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    if USE_INT64_OFFSETS:
+        i_t = i_t.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
             return
         i_n, i_t = (
-            tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int64),
-            tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int64),
+            tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
+            tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            i_n = i_n.to(tl.int64)
+            i_t = i_t.to(tl.int64)
         bos, eos = (
-            tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int64),
-            tl.load(cu_seqlens + ptr_offset((i_n + 1,), (1,))).to(tl.int64),
+            tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int32),
+            tl.load(cu_seqlens + ptr_offset((i_n + 1,), (1,))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            bos = bos.to(tl.int64)
+            eos = eos.to(tl.int64)
         T = eos - bos
     else:
         bos = i_b * T

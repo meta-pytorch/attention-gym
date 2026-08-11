@@ -16,7 +16,7 @@
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp2,
@@ -28,6 +28,17 @@ from attn_gym.linear.kda.utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+            args["q"],
+            args["k"],
+            args["g"],
+            args["beta"],
+            args["Aqk"],
+            args["Akk"],
+            args["cu_seqlens"],
+            args["chunk_indices"],
+            args["num_chunks"],
+        ),
     }
 )
 @triton.autotune(
@@ -57,12 +68,16 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     USE_GATHER: tl.constexpr,
     CAUSAL_NORMREF: tl.constexpr = True,
     GRID_NT: tl.constexpr = 0,
     MAX_NT: tl.constexpr = 0,
 ):
     i_t_start, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        i_t_start = i_t_start.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
     for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
@@ -77,15 +92,21 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                     tl.load(chunk_indices + chunk_offset).to(tl.int32),
                     tl.load(chunk_indices + chunk_offset + 1).to(tl.int32),
                 )
+                if USE_INT64_OFFSETS:
+                    i_n = i_n.to(tl.int64)
+                    i_t = i_t.to(tl.int64)
                 cu_seqlens_offset = ptr_offset((i_n,), (1,))
                 bos, eos = (
                     tl.load(cu_seqlens + cu_seqlens_offset).to(tl.int32),
                     tl.load(cu_seqlens + cu_seqlens_offset + 1).to(tl.int32),
                 )
+                if USE_INT64_OFFSETS:
+                    bos = bos.to(tl.int64)
+                    eos = eos.to(tl.int64)
                 T_local = eos - bos
             else:
                 i_t = i_t_orig
-                bos = tl.cast(i_b, tl.int64) * T
+                bos = i_b * T
                 T_local = T
 
             i_ti = ptr_offset((i_t, i_i), (BT, BC))

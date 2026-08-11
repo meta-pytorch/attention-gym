@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp,
@@ -27,6 +27,17 @@ from attn_gym.linear.kda.utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+            args["q"],
+            args["v"],
+            args["g"],
+            args["h"],
+            args["o"],
+            args["A"],
+            args["cu_seqlens"],
+            args["chunk_indices"],
+            args["num_chunks"],
+        ),
     }
 )
 @triton.autotune(
@@ -58,31 +69,42 @@ def chunk_gla_fwd_kernel_o(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        i_v = i_v.to(tl.int64)
+        i_t = i_t.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
             return
-        i_tg = i_t.to(tl.int64)
+        i_tg = i_t
         i_n, i_t = (
             tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
             tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            i_n = i_n.to(tl.int64)
+            i_t = i_t.to(tl.int64)
         bos, eos = (
             tl.load(cu_seqlens + ptr_offset((i_n, 0), (1, 1))).to(tl.int32),
             tl.load(cu_seqlens + ptr_offset((i_n, 1), (1, 1))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            bos = bos.to(tl.int64)
+            eos = eos.to(tl.int64)
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
-        i_tg = i_b.to(tl.int64) * NT + i_t
-        bos = i_b.to(tl.int64) * T
+        i_tg = i_b * NT + i_t
+        bos = i_b * T
 
     o_i = tl.arange(0, BT)
-    o_t = i_t.to(tl.int64) * BT + o_i
-    o_v = i_v.to(tl.int64) * BV + tl.arange(0, BV)
+    o_t = i_t * BT + o_i
+    o_v = i_v * BV + tl.arange(0, BV)
     m_t = o_t < T
     m_v = o_v < V
     m_tv = m_t[:, None] & m_v[None, :]
