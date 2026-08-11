@@ -1,0 +1,21 @@
+# Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Optimized KDA short-convolution operations."""
+
+from attn_gym.linear.kda.short_conv.cute import (
+    ShortConvConfig,
+    ShortConvTunedConfig,
+    cute_causal_conv1d_silu,
+    tune_causal_conv1d_silu,
+)
+
+__all__ = [
+    "ShortConvConfig",
+    "ShortConvTunedConfig",
+    "cute_causal_conv1d_silu",
+    "tune_causal_conv1d_silu",
+]
