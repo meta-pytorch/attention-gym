@@ -44,6 +44,7 @@ from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref
+from attn_gym.linear.kda.short_conv import cute_causal_conv1d_silu
 
 Backend = Literal["reference", "fused"]
 
@@ -231,6 +232,20 @@ class KDAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, tokens, channels = qkv.shape
         expected_state = (batch, self.qkv_conv1d.kernel_size[0] - 1, channels)
+        if (
+            self.backend == "fused"
+            and initial_state is None
+            and batch == 1
+            and self.qkv_conv1d.kernel_size[0] == 4
+        ):
+            weight = self.qkv_conv1d.weight[:, 0].to(self.compute_dtype).contiguous()
+            final_state = (
+                F.pad(qkv, (0, 0, max(0, 3 - tokens), 0))[:, -3:].clone()
+                if return_final_state
+                else None
+            )
+            return cute_causal_conv1d_silu(qkv.contiguous(), weight), final_state
+
         if initial_state is None:
             initial_state = qkv.new_zeros(expected_state)
         elif initial_state.shape != expected_state:
