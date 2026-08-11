@@ -111,11 +111,49 @@ def test_optimized_chunk_kda_autograd_without_initial_state():
         assert error <= tolerance
 
 
+def test_kda_tensor_descriptor_and_pointer_paths_match(monkeypatch):
+    """Keep the Blackwell TMA path bitwise equivalent to its pointer fallback."""
+    torch.manual_seed(41)
+    descriptor_inputs = _inputs(heads=2)
+    d_output = torch.randn_like(descriptor_inputs[0])
+
+    descriptor_output, state = chunk_kda(*descriptor_inputs)
+    assert state is None
+    descriptor_gradients = torch.autograd.grad(descriptor_output, descriptor_inputs, d_output)
+
+    for module_name in (
+        "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
+        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+    ):
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, "_can_use_tensor_descriptors", lambda *_tensors: False)
+
+    pointer_inputs = _clone_inputs(descriptor_inputs)
+    pointer_output, state = chunk_kda(*pointer_inputs)
+    assert state is None
+    pointer_gradients = torch.autograd.grad(pointer_output, pointer_inputs, d_output)
+
+    torch.testing.assert_close(pointer_output, descriptor_output, rtol=0, atol=0)
+    for pointer_gradient, descriptor_gradient in zip(
+        pointer_gradients,
+        descriptor_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(pointer_gradient, descriptor_gradient, rtol=0, atol=0)
+
+
 def test_kda_offset_width_specializations_match(monkeypatch):
     """Keep the normal int32 and large-storage int64 specializations equivalent."""
     torch.manual_seed(40)
     inputs = _inputs(heads=2)
     d_output = torch.randn_like(inputs[0])
+
+    for module_name in (
+        "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
+        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+    ):
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, "_can_use_tensor_descriptors", lambda *_tensors: False)
 
     output32, state = chunk_kda(*inputs)
     assert state is None
