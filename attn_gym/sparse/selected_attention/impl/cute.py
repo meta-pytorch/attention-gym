@@ -506,9 +506,7 @@ def _validate_cute_constraints(
         raise ValueError("CuTe backend requires share_kv=True.")
 
     if attention_sink is not None:
-        raise NotImplementedError(
-            "CuTe backend does not support attention sinks for now"
-        )
+        raise NotImplementedError("CuTe backend does not support attention sinks for now")
     _b, h, _s, d = query.shape
     if d != 512:
         raise ValueError(f"CuTe backend requires head_dim=512, got {d}.")

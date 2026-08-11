@@ -36,7 +36,6 @@ def _validate_inputs(
         raise ValueError(
             f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
         )
-    
 
     if local_kv.device != query.device:
         raise ValueError(
@@ -213,8 +212,11 @@ def selected_attention(
     match backend:
         case "eager":
             from .impl import reference
+
             if attention_sink is None:
-                attention_sink = torch.full((query.shape[1], ), float("-inf"), dtype = query.dtype, device = query.device)
+                attention_sink = torch.full(
+                    (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
+                )
             return reference.selected_attention(
                 query,
                 local_kv,
@@ -227,8 +229,11 @@ def selected_attention(
             )
         case "triton":
             from .impl import triton as triton_backend
+
             if attention_sink is None:
-                attention_sink = torch.full((query.shape[1], ), float("-inf"), dtype = query.dtype, device = query.device)
+                attention_sink = torch.full(
+                    (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
+                )
             return triton_backend.selected_attention(
                 query,
                 local_kv,

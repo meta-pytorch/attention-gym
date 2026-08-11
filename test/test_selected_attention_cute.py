@@ -13,6 +13,7 @@ import torch
 
 from attn_gym.sparse.selected_attention import selected_attention
 
+
 def _skip_no_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
@@ -89,7 +90,6 @@ def _make_inputs(
         "doc_ids": doc_ids,
         "sliding_window_size": sliding_window_size,
     }
-
 
 
 # ---------------------------------------------------------------------------
