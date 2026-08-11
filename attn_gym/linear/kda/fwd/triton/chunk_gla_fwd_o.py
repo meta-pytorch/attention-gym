@@ -14,8 +14,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp,
@@ -154,6 +155,57 @@ def chunk_gla_fwd_kernel_o(
     tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
+@triton.jit
+def chunk_gla_fwd_kernel_o_tma(
+    q_desc,
+    v_desc,
+    g_desc,
+    h_desc,
+    o_desc,
+    A_desc,
+    scale,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Compose fixed KDA output tiles with TMA-backed tensor descriptors."""
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        b_q = q_desc.load([i_b, i_t * BT, i_h, i_k * BK])
+        b_q = tl.reshape(b_q, [BT, BK])
+        b_g = g_desc.load([i_b, i_t * BT, i_h, i_k * BK])
+        b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+
+        b_h = h_desc.load([i_b, i_t, i_h, i_k * BK, i_v * BV])
+        b_h = tl.reshape(b_h, [BK, BV]).to(b_qg.dtype)
+        b_o += tl.dot(b_qg, b_h)
+
+    b_o *= scale
+    b_A = A_desc.load([i_b, i_t * BT, i_h, 0])
+    b_A = tl.reshape(b_A, [BT, BT])
+    o_i = tl.arange(0, BT)
+    b_A = tl.where(o_i[:, None] >= o_i[None, :], b_A, 0.0)
+    b_v = v_desc.load([i_b, i_t * BT, i_h, i_v * BV])
+    b_v = tl.reshape(b_v, [BT, BV])
+    b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+    o_desc.store(
+        [i_b, i_t * BT, i_h, i_v * BV],
+        tl.reshape(b_o.to(b_v.dtype), [1, BT, 1, BV]),
+    )
+
+
+def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
+    """Return whether all fixed KDA tensors satisfy host TMA requirements."""
+    return all(can_use_tma(tensor) for tensor in tensors)
+
+
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -183,28 +235,57 @@ def chunk_gla_fwd_o_gk(
         raise ValueError(f"h must have shape {expected_h_shape}, got {tuple(h.shape)}")
 
     output = torch.empty_like(v)
+    if (key_dim, value_dim, chunk_size) == (128, 128, 64) and _can_use_tensor_descriptors(
+        q, v, g, h, output, A
+    ):
+        block_key_dim = 32
+        block_value_dim = 64
+        chunk_gla_fwd_kernel_o_tma[
+            (
+                triton.cdiv(value_dim, block_value_dim),
+                chunks,
+                batch * heads,
+            )
+        ](
+            TensorDescriptor.from_tensor(q, [1, chunk_size, 1, block_key_dim]),
+            TensorDescriptor.from_tensor(v, [1, chunk_size, 1, block_value_dim]),
+            TensorDescriptor.from_tensor(g, [1, chunk_size, 1, block_key_dim]),
+            TensorDescriptor.from_tensor(h, [1, 1, 1, block_key_dim, block_value_dim]),
+            TensorDescriptor.from_tensor(output, [1, chunk_size, 1, block_value_dim]),
+            TensorDescriptor.from_tensor(A, [1, chunk_size, 1, chunk_size]),
+            scale,
+            H=heads,
+            K=key_dim,
+            V=value_dim,
+            BT=chunk_size,
+            BK=block_key_dim,
+            BV=block_value_dim,
+            num_warps=2,
+            num_stages=3,
+        )
+    else:
 
-    def grid(meta):
-        return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
+        def grid(meta):
+            return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
 
-    chunk_gla_fwd_kernel_o[grid](
-        q=q,
-        v=v,
-        g=g,
-        h=h,
-        o=output,
-        A=A,
-        cu_seqlens=None,
-        chunk_indices=None,
-        num_chunks=None,
-        scale=scale,
-        T=tokens,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BT=chunk_size,
-        USE_EXP2=True,
-    )
+        chunk_gla_fwd_kernel_o[grid](
+            q=q,
+            v=v,
+            g=g,
+            h=h,
+            o=output,
+            A=A,
+            cu_seqlens=None,
+            chunk_indices=None,
+            num_chunks=None,
+            scale=scale,
+            T=tokens,
+            H=heads,
+            K=key_dim,
+            V=value_dim,
+            BT=chunk_size,
+            USE_EXP2=True,
+        )
     return output
 
 

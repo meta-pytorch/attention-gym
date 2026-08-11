@@ -14,7 +14,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import chunk_kda_bwd_intra
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
-from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_kernel_dAv
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
@@ -46,7 +46,7 @@ def chunk_kda_bwd(
     torch.Tensor | None,
 ]:
     """Differentiate the optimized fixed-length KDA core pipeline."""
-    batch, tokens, heads, head_dim = q.shape
+    batch, tokens, _heads, head_dim = q.shape
     value_dim = v.shape[-1]
     if batch != 1 or head_dim != 128 or value_dim != 128:
         raise ValueError("the composed KDA backward requires B=1 and K=V=128")
@@ -54,7 +54,6 @@ def chunk_kda_bwd(
         raise ValueError(f"the composed KDA backward requires chunk_size=64, got {chunk_size}")
     if tokens % chunk_size:
         raise ValueError("the composed KDA backward requires complete chunks")
-    chunks = tokens // chunk_size
     if initial_state is not None:
         initial_state = initial_state.contiguous()
 
@@ -90,28 +89,13 @@ def chunk_kda_bwd(
         )
     del u
 
-    dv_intra = torch.empty_like(v_new)
-    dAqk = torch.empty_like(Aqk, dtype=torch.float32)
     with record("kda/triton/backward_dav"):
-        chunk_kda_bwd_kernel_dAv[(chunks, batch * heads)](
-            q=q,
-            k=k,
-            v=v_new,
-            A=Aqk,
-            do=do,
-            dv=dv_intra,
-            dA=dAqk,
-            cu_seqlens=None,
-            chunk_indices=None,
-            num_chunks=None,
-            scale=head_dim**-0.5,
-            T=tokens,
-            H=heads,
-            K=head_dim,
-            V=value_dim,
-            BT=chunk_size,
-            BK=head_dim,
-            BV=64,
+        dv_intra, dAqk = chunk_kda_bwd_dav(
+            v_new,
+            Aqk,
+            do,
+            head_dim**-0.5,
+            chunk_size=chunk_size,
         )
     with record("kda/cute/backward_delta_h"):
         dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dispatch(
