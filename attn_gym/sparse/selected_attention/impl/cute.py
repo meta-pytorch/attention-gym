@@ -402,7 +402,7 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
         )
 
         O = O_bshd.permute(0, 2, 1, 3)
-        return O, lse, P, RowMax, topk_idxs, unified_kv
+        return O, lse, P, RowMax, topk_idxs
 
     @staticmethod
     def setup_context(ctx, inputs, output):
@@ -415,13 +415,15 @@ class _SelectedAttentionCuTe(torch.autograd.Function):
             sliding_window_size,
             _prebuilt_topk_idxs,
         ) = inputs
-        O, lse, P, RowMax, topk_idxs, _unified_kv = output
+        O, lse, P, RowMax, topk_idxs = output
+        ctx.set_materialize_grads(False)
+        ctx.mark_non_differentiable(lse, P, RowMax, topk_idxs)
         ctx.save_for_backward(query, O, lse, P, RowMax, topk_idxs, local_kv, sparse_kv)
         ctx.sliding_window_size = sliding_window_size
         ctx.local_kv_len = local_kv.shape[2]
 
     @staticmethod
-    def backward(ctx, grad_O, grad_lse, grad_P, grad_RowMax, grad_topk, grad_ukv):
+    def backward(ctx, grad_O, _grad_lse, _grad_P, _grad_RowMax, _grad_topk):
         Q, O, lse, P, RowMax, topk_idxs, local_kv, sparse_kv = ctx.saved_tensors
         local_kv_len = ctx.local_kv_len
         _b, _h, _s, d = Q.shape
