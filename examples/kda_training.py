@@ -235,7 +235,6 @@ class KDAAttention(nn.Module):
         if (
             self.backend == "fused"
             and initial_state is None
-            and batch == 1
             and self.qkv_conv1d.kernel_size[0] == 4
         ):
             weight = self.qkv_conv1d.weight[:, 0].to(self.compute_dtype).contiguous()

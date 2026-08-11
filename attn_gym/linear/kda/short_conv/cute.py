@@ -6,10 +6,11 @@
 
 """CuTeDSL causal depthwise convolution with a first-order backward.
 
-The implementation is specialized for contiguous BF16 ``[1, T, C]`` tensors.
-Each thread owns a compile-time number of adjacent channels. Forward stages its input window in
-packed BF16 registers, while backward computes BF16 input gradients and FP32
-weight-gradient partials followed by a Torch reduction.
+The implementation accepts contiguous BF16 ``[B, T, C]`` tensors and treats every
+batch row as an independent sequence. Each thread owns a compile-time number of
+adjacent channels. Forward stages its input window in packed BF16 registers, while
+backward computes BF16 input gradients and FP32 weight-gradient partials followed
+by a Torch reduction.
 """
 
 from collections.abc import Iterable
@@ -50,11 +51,13 @@ class CausalConv1dSiluForward:
 
     def __init__(
         self,
+        batches: int,
         tokens: int,
         channels: int,
         width: int,
         config: ShortConvConfig,
     ):
+        self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
@@ -65,7 +68,7 @@ class CausalConv1dSiluForward:
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
         return (
-            f"short_conv_fwd_bf16_t{self.tokens}_c{self.channels}_w{self.width}"
+            f"short_conv_fwd_bf16_b{self.batches}_t{self.tokens}_c{self.channels}_w{self.width}"
             f"_th{self.threads}_bt{self.times_per_block}_v{self.channels_per_thread}"
         )
 
@@ -73,7 +76,7 @@ class CausalConv1dSiluForward:
     def kernel(self, x: cute.Tensor, weight: cute.Tensor, output: cute.Tensor):
         """Compute one packed channel group and eight output tokens."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, _ = cute.arch.block_idx()
+        channel_block, time_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -95,7 +98,9 @@ class CausalConv1dSiluForward:
                 input_time = time_start + input_offset - (self.width - 1)
                 if input_time >= 0 and input_time < self.tokens:
                     inputs[(None, input_offset)].store(
-                        x_groups[((0, None), (input_time, channel_group))].load()
+                        x_groups[
+                            ((0, None), (batch * self.tokens + input_time, channel_group))
+                        ].load()
                     )
 
             for time_offset in cutlass.range_constexpr(self.times_per_block):
@@ -130,7 +135,7 @@ class CausalConv1dSiluForward:
                             reduction_profile=(None, 1),
                         )
                     half = value * 0.5
-                    output_groups[((0, None), (time, channel_group))].store(
+                    output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
                         (half * cute.math.tanh(half, fastmath=True) + half).to(BFloat16)
                     )
 
@@ -147,7 +152,7 @@ class CausalConv1dSiluForward:
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
-                1,
+                self.batches,
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -161,11 +166,13 @@ class CausalConv1dSiluInputGradient:
 
     def __init__(
         self,
+        batches: int,
         tokens: int,
         channels: int,
         width: int,
         config: ShortConvConfig,
     ):
+        self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
@@ -176,7 +183,7 @@ class CausalConv1dSiluInputGradient:
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
         return (
-            f"short_conv_dx_bf16_t{self.tokens}_c{self.channels}_w{self.width}"
+            f"short_conv_dx_bf16_b{self.batches}_t{self.tokens}_c{self.channels}_w{self.width}"
             f"_th{self.threads}_bt{self.times_per_block}_v{self.channels_per_thread}"
         )
 
@@ -190,7 +197,7 @@ class CausalConv1dSiluInputGradient:
     ):
         """Compute one packed channel group and ten input-gradient tokens."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, _ = cute.arch.block_idx()
+        channel_block, time_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -215,7 +222,9 @@ class CausalConv1dSiluInputGradient:
                 input_time = time_start + input_offset - (self.width - 1)
                 if input_time >= 0 and input_time < self.tokens:
                     inputs[(None, input_offset)].store(
-                        x_groups[((0, None), (input_time, channel_group))].load()
+                        x_groups[
+                            ((0, None), (batch * self.tokens + input_time, channel_group))
+                        ].load()
                     )
 
             grad_z = cute.make_rmem_tensor(
@@ -245,7 +254,9 @@ class CausalConv1dSiluInputGradient:
                         1.0 - tanh_half * tanh_half
                     ) * 0.5
                     incoming = (
-                        dy_groups[((0, None), (output_time, channel_group))].load().to(Float32)
+                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                        .load()
+                        .to(Float32)
                     )
                     grad_z[(None, output_offset)].store(incoming * derivative)
 
@@ -265,7 +276,9 @@ class CausalConv1dSiluInputGradient:
                         Float32(0.0),
                         reduction_profile=(None, 1),
                     )
-                    dx_groups[((0, None), (time, channel_group))].store(value.to(BFloat16))
+                    dx_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
+                        value.to(BFloat16)
+                    )
 
     @cute.jit
     def __call__(
@@ -287,7 +300,7 @@ class CausalConv1dSiluInputGradient:
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
-                1,
+                self.batches,
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -295,17 +308,19 @@ class CausalConv1dSiluInputGradient:
 
 
 class CausalConv1dSiluWeightGradientPartials:
-    """Compute FP32 time-tile partial sums for the weight gradient."""
+    """Compute FP32 batch/time-tile partial sums for the weight gradient."""
 
     default_config = ShortConvConfig(threads=128, channels_per_thread=4, times_per_block=128)
 
     def __init__(
         self,
+        batches: int,
         tokens: int,
         channels: int,
         width: int,
         config: ShortConvConfig,
     ):
+        self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
@@ -316,7 +331,7 @@ class CausalConv1dSiluWeightGradientPartials:
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
         return (
-            f"short_conv_dw_bf16_t{self.tokens}_c{self.channels}_w{self.width}"
+            f"short_conv_dw_bf16_b{self.batches}_t{self.tokens}_c{self.channels}_w{self.width}"
             f"_th{self.threads}_bt{self.times_per_block}_v{self.channels_per_thread}"
         )
 
@@ -330,7 +345,7 @@ class CausalConv1dSiluWeightGradientPartials:
     ):
         """Compute one FP32 weight-gradient partial per tap and owned channel."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, _ = cute.arch.block_idx()
+        channel_block, time_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -356,7 +371,12 @@ class CausalConv1dSiluWeightGradientPartials:
                         input_time = time + tap - (self.width - 1)
                         if input_time >= 0:
                             input_taps[(None, tap)].store(
-                                x_groups[((0, None), (input_time, channel_group))]
+                                x_groups[
+                                    (
+                                        (0, None),
+                                        (batch * self.tokens + input_time, channel_group),
+                                    )
+                                ]
                                 .load()
                                 .to(Float32)
                             )
@@ -371,7 +391,11 @@ class CausalConv1dSiluWeightGradientPartials:
                     derivative = (tanh_half + 1.0) * 0.5 + half * (
                         1.0 - tanh_half * tanh_half
                     ) * 0.5
-                    incoming = dy_groups[((0, None), (time, channel_group))].load().to(Float32)
+                    incoming = (
+                        dy_groups[((0, None), (batch * self.tokens + time, channel_group))]
+                        .load()
+                        .to(Float32)
+                    )
                     grad_z = incoming * derivative
                     for tap in cutlass.range_constexpr(self.width):
                         accumulators[(None, tap)].store(
@@ -381,7 +405,7 @@ class CausalConv1dSiluWeightGradientPartials:
 
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
-                    partials[time_block, channel + channel_offset, tap] = accumulators[
+                    partials[batch, time_block, channel + channel_offset, tap] = accumulators[
                         channel_offset, tap
                     ]
 
@@ -405,7 +429,7 @@ class CausalConv1dSiluWeightGradientPartials:
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
-                1,
+                self.batches,
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -427,37 +451,45 @@ def _fake_bf16_matrix(rows: int, columns: int):
 
 
 @jit_cache
-def _compile_forward(tokens: int, channels: int, width: int, config: ShortConvConfig):
+def _compile_forward(
+    batches: int,
+    tokens: int,
+    channels: int,
+    width: int,
+    config: ShortConvConfig,
+):
     """Compile one static forward specialization."""
-    operation = CausalConv1dSiluForward(tokens, channels, width, config)
+    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config)
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
         _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
     )
 
 
 @jit_cache
 def _compile_input_gradient(
+    batches: int,
     tokens: int,
     channels: int,
     width: int,
     config: ShortConvConfig,
 ):
     """Compile one static input-gradient specialization."""
-    operation = CausalConv1dSiluInputGradient(tokens, channels, width, config)
+    operation = CausalConv1dSiluInputGradient(batches, tokens, channels, width, config)
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
         _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(tokens, channels),
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
     )
 
 
 @jit_cache
 def _compile_weight_gradient(
+    batches: int,
     tokens: int,
     channels: int,
     width: int,
@@ -467,26 +499,26 @@ def _compile_weight_gradient(
     num_time_blocks = ceildiv(tokens, config.times_per_block)
     partials = cute.runtime.make_fake_compact_tensor(
         Float32,
-        (num_time_blocks, channels, width),
-        stride_order=(2, 1, 0),
+        (batches, num_time_blocks, channels, width),
+        stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    operation = CausalConv1dSiluWeightGradientPartials(tokens, channels, width, config)
+    operation = CausalConv1dSiluWeightGradientPartials(batches, tokens, channels, width, config)
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
         _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(tokens, channels),
+        _fake_bf16_matrix(batches * tokens, channels),
         partials,
     )
 
 
 def _validate_inputs(x: torch.Tensor, weight: torch.Tensor) -> None:
     """Validate the public compile-time-width CuTeDSL tensor contract."""
-    if x.ndim != 3 or x.shape[0] != 1:
-        raise ValueError(f"x must have shape [1, T, C], got {tuple(x.shape)}")
-    if x.shape[1] < 1 or x.shape[2] < 1:
-        raise ValueError(f"x must have positive T and C dimensions, got {tuple(x.shape)}")
+    if x.ndim != 3:
+        raise ValueError(f"x must have shape [B, T, C], got {tuple(x.shape)}")
+    if x.shape[0] < 1 or x.shape[1] < 1 or x.shape[2] < 1:
+        raise ValueError(f"x must have positive B, T, and C dimensions, got {tuple(x.shape)}")
     if x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
         raise ValueError("x must be a contiguous CUDA BF16 tensor")
     if weight.ndim != 2 or weight.shape[0] != x.shape[2] or weight.shape[1] < 1:
@@ -509,16 +541,17 @@ def _launch_forward(
 ) -> torch.Tensor:
     """Allocate and launch the compiled forward specialization."""
     x, weight = _aligned(x), _aligned(weight)
-    tokens, channels = x.shape[1:]
+    batches, tokens, channels = x.shape
     width = weight.shape[1]
     output = torch.empty_like(x)
     compiled = _compile_forward(
+        batches,
         tokens,
         channels,
         width,
         config,
     )
-    compiled(x.view(tokens, channels), weight, output.view(tokens, channels))
+    compiled(x.view(batches * tokens, channels), weight, output.view(batches * tokens, channels))
     return output
 
 
@@ -531,35 +564,36 @@ def _launch_backward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch configured gradient kernels and reduce FP32 partials."""
     x, weight = _aligned(x), _aligned(weight)
-    tokens, channels = x.shape[1:]
+    batches, tokens, channels = x.shape
     width = weight.shape[1]
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
     _compile_input_gradient(
+        batches,
         tokens,
         channels,
         width,
         input_config,
     )(
-        x.view(tokens, channels),
+        x.view(batches * tokens, channels),
         weight,
-        grad_output.view(tokens, channels),
-        grad_x.view(tokens, channels),
+        grad_output.view(batches * tokens, channels),
+        grad_x.view(batches * tokens, channels),
     )
 
     num_time_blocks = ceildiv(tokens, weight_config.times_per_block)
     partials = torch.empty(
-        (num_time_blocks, channels, width),
+        (batches, num_time_blocks, channels, width),
         dtype=torch.float32,
         device=x.device,
     )
-    _compile_weight_gradient(tokens, channels, width, weight_config)(
-        x.view(tokens, channels),
+    _compile_weight_gradient(batches, tokens, channels, width, weight_config)(
+        x.view(batches * tokens, channels),
         weight,
-        grad_output.view(tokens, channels),
+        grad_output.view(batches * tokens, channels),
         partials,
     )
-    return grad_x, partials.sum(dim=0).to(torch.bfloat16)
+    return grad_x, partials.sum(dim=(0, 1)).to(torch.bfloat16)
 
 
 def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
@@ -620,22 +654,22 @@ def tune_causal_conv1d_silu(
         raise ValueError("grad_output must be contiguous on x.device")
 
     x, weight, grad_output = _aligned(x), _aligned(weight), _aligned(grad_output)
-    tokens, channels = x.shape[1:]
+    batches, tokens, channels = x.shape
     width = weight.shape[1]
-    x_matrix = x.view(tokens, channels)
-    grad_matrix = grad_output.view(tokens, channels)
+    x_matrix = x.view(batches * tokens, channels)
+    grad_matrix = grad_output.view(batches * tokens, channels)
 
     forward_candidates = tuple(
         _candidate_configs("forward", channels) if forward_configs is None else forward_configs
     )
     for config in forward_candidates:
         _validate_config(config, channels, "forward_configs")
-    forward_output = torch.empty_like(x).view(tokens, channels)
+    forward_output = torch.empty_like(x).view(batches * tokens, channels)
     forward = tune(
         forward_candidates,
         _compile_forward,
         lambda compiled, _config: compiled(x_matrix, weight, forward_output),
-        compile_call=lambda config: (tokens, channels, width, config),
+        compile_call=lambda config: (batches, tokens, channels, width, config),
         parallel_compile=parallel_compile,
     )
 
@@ -646,12 +680,12 @@ def tune_causal_conv1d_silu(
     )
     for config in input_candidates:
         _validate_config(config, channels, "input_grad_configs")
-    grad_x = torch.empty_like(x).view(tokens, channels)
+    grad_x = torch.empty_like(x).view(batches * tokens, channels)
     input_gradient = tune(
         input_candidates,
         _compile_input_gradient,
         lambda compiled, _config: compiled(x_matrix, weight, grad_matrix, grad_x),
-        compile_call=lambda config: (tokens, channels, width, config),
+        compile_call=lambda config: (batches, tokens, channels, width, config),
         parallel_compile=parallel_compile,
     )
 
@@ -664,6 +698,7 @@ def tune_causal_conv1d_silu(
         _validate_config(config, channels, "weight_grad_configs")
     partials = {
         config: torch.empty(
+            batches,
             ceildiv(tokens, config.times_per_block),
             channels,
             width,
@@ -681,7 +716,7 @@ def tune_causal_conv1d_silu(
             grad_matrix,
             partials[config],
         ),
-        compile_call=lambda config: (tokens, channels, width, config),
+        compile_call=lambda config: (batches, tokens, channels, width, config),
         parallel_compile=parallel_compile,
     )
     return ShortConvTunedConfig(forward, input_gradient, weight_gradient)
@@ -912,7 +947,8 @@ def cute_causal_conv1d_silu(
     and block mapping, so changing one compiles and caches a distinct kernel.
 
     Args:
-        x: Contiguous CUDA BF16 input with shape ``[1, T, C]``.
+        x: Contiguous CUDA BF16 input with shape ``[B, T, C]``. Each batch row
+            is convolved as an independent sequence.
         weight: Contiguous CUDA BF16 depthwise weights with shape ``[C, W]``.
         forward_config: Optional forward schedule specialization.
         input_grad_config: Optional input-gradient schedule specialization.

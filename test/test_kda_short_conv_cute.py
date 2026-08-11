@@ -20,8 +20,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inputs(tokens: int = 17, channels: int = 12, width: int = 4):
-    x = torch.randn(1, tokens, channels, device="cuda", dtype=torch.bfloat16)
+def _inputs(tokens: int = 17, channels: int = 12, width: int = 4, batch: int = 1):
+    x = torch.randn(batch, tokens, channels, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
     return x.requires_grad_(), weight.requires_grad_()
 
@@ -46,6 +46,24 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize("width", [3, 4])
+def test_short_conv_batched_forward_and_backward_match_pytorch(width: int):
+    """Keep batches independent across generic and optimized convolution widths."""
+    torch.manual_seed(1)
+    x, weight = _inputs(tokens=19, channels=12, width=width, batch=3)
+    grad_output = torch.randn_like(x)
+    weight_config = ShortConvConfig(128, 4, 8)
+
+    actual = cute_causal_conv1d_silu(x, weight, weight_grad_config=weight_config)
+    expected = _reference(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
 
 
 def test_short_conv_accepts_misaligned_contiguous_storage():
@@ -107,7 +125,7 @@ def test_short_conv_explicit_config_and_tuning_flow():
 
 def test_short_conv_custom_op_registration():
     """Exercise schemas, fake implementations, and registered autograd."""
-    x, weight = _inputs()
+    x, weight = _inputs(batch=2)
     grad_output = torch.randn_like(x)
     torch.library.opcheck(_forward_custom_op, (x, weight))
     torch.library.opcheck(
@@ -118,8 +136,8 @@ def test_short_conv_custom_op_registration():
 
 
 def test_short_conv_fullgraph_forward_and_backward():
-    """Keep both opaque operators inside a strict compiled graph."""
-    x, weight = _inputs()
+    """Keep batched opaque operators inside a strict compiled graph."""
+    x, weight = _inputs(batch=2)
     grad_output = torch.randn_like(x)
 
     expected_output = cute_causal_conv1d_silu(x, weight)
