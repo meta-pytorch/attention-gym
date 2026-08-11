@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 
 import pytest
 import torch
@@ -108,6 +109,35 @@ def test_optimized_chunk_kda_autograd_without_initial_state():
         error = (actual_gradient.float() - expected_gradient).abs().max()
         tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
         assert error <= tolerance
+
+
+def test_kda_offset_width_specializations_match(monkeypatch):
+    """Keep the normal int32 and large-storage int64 specializations equivalent."""
+    torch.manual_seed(40)
+    inputs = _inputs(heads=2)
+    d_output = torch.randn_like(inputs[0])
+
+    output32, state = chunk_kda(*inputs)
+    assert state is None
+    gradients32 = torch.autograd.grad(output32, inputs, d_output)
+
+    for module_name in (
+        "attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop",
+        "attn_gym.linear.kda.fwd.triton.chunk_delta_h",
+        "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
+        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+    ):
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, "requires_int64_offsets", lambda *_tensors: True)
+
+    inputs64 = _clone_inputs(inputs)
+    output64, state = chunk_kda(*inputs64)
+    assert state is None
+    gradients64 = torch.autograd.grad(output64, inputs64, d_output)
+
+    torch.testing.assert_close(output64, output32, rtol=0, atol=0)
+    for gradient64, gradient32 in zip(gradients64, gradients32, strict=True):
+        torch.testing.assert_close(gradient64, gradient32, rtol=0, atol=0)
 
 
 def test_chunk_kda_custom_op_registration():

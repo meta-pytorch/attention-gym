@@ -40,6 +40,14 @@ def storage_cosize(shape: Sequence[int], strides: Sequence[int]) -> int:
     return 0 if is_empty else cosize
 
 
+def requires_int64_offsets(*tensors: torch.Tensor | None) -> bool:
+    """Return whether any tensor's relative storage extent exceeds signed int32."""
+    return any(
+        tensor is not None and storage_cosize(tensor.shape, tensor.stride()) > 2**31
+        for tensor in tensors
+    )
+
+
 def can_use_tma(tensor: torch.Tensor) -> bool:
     """Return whether a tensor can be accessed with a TMA tensor descriptor."""
     if not tensor.is_cuda or torch.cuda.get_device_capability(tensor.device)[0] < 9:

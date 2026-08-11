@@ -6,9 +6,8 @@
 #
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 #
-# Forward-only GLA output-projection, ported verbatim from
+# Forward-only GLA output projection, based on
 # genai/llama4x/llama4x/ops/fla/ops/gla/chunk.py.
-# Only the imports were rewritten to point at the standalone mslk common utils.
 
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp,
@@ -27,6 +27,17 @@ from attn_gym.linear.kda.utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+            args["q"],
+            args["v"],
+            args["g"],
+            args["h"],
+            args["o"],
+            args["A"],
+            args["cu_seqlens"],
+            args["chunk_indices"],
+            args["num_chunks"],
+        ),
     }
 )
 @triton.autotune(
@@ -58,99 +69,89 @@ def chunk_gla_fwd_kernel_o(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        i_v = i_v.to(tl.int64)
+        i_t = i_t.to(tl.int64)
+        i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
             return
         i_tg = i_t
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
+            tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            i_n = i_n.to(tl.int64)
+            i_t = i_t.to(tl.int64)
         bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+            tl.load(cu_seqlens + ptr_offset((i_n, 0), (1, 1))).to(tl.int32),
+            tl.load(cu_seqlens + ptr_offset((i_n, 1), (1, 1))).to(tl.int32),
         )
+        if USE_INT64_OFFSETS:
+            bos = bos.to(tl.int64)
+            eos = eos.to(tl.int64)
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
-        bos, eos = i_b * T, i_b * T + T
+        bos = i_b * T
 
-    m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
+    o_i = tl.arange(0, BT)
+    o_t = i_t * BT + o_i
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_t = o_t < T
+    m_v = o_v < V
+    m_tv = m_t[:, None] & m_v[None, :]
+    m_s = o_i[:, None] >= o_i[None, :]
+
+    q += ptr_offset((bos, i_h), (H * K, K))
+    g += ptr_offset((bos, i_h), (H * K, K))
+    h += ptr_offset((i_tg, i_h), (H * K * V, K * V))
+    v += ptr_offset((bos, i_h), (H * V, V))
+    o += ptr_offset((bos, i_h), (H * V, V))
+    A += ptr_offset((bos, i_h), (H * BT, BT))
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_g = tl.make_block_ptr(
-            g + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
-            (K, V),
-            (V, 1),
-            (i_k * BK, i_v * BV),
-            (BK, BV),
-            (1, 0),
-        )
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        m_qg = m_t[:, None] & m_k[None, :]
+        p_q = q + ptr_offset((o_t[:, None], o_k[None, :]), (H * K, 1))
+        p_g = g + ptr_offset((o_t[:, None], o_k[None, :]), (H * K, 1))
+        p_h = h + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1))
 
         # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_q = tl.load(p_q, mask=m_qg, other=0.0)
         # [BT, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+        b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
         # [BT, BK]
         if USE_EXP2:
             b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         else:
             b_qg = (b_q * exp(b_g)).to(b_q.dtype)
         # [BK, BV]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        b_h = tl.load(p_h, mask=m_k[:, None] & m_v[None, :], other=0.0)
         # works but dkw, owing to divine benevolence
         # [BT, BV]
         if i_k >= 0:
             b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
     b_o *= scale
-    p_v = tl.make_block_ptr(
-        v + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
+    p_v = v + ptr_offset((o_t[:, None], o_v[None, :]), (H * V, 1))
+    p_o = o + ptr_offset((o_t[:, None], o_v[None, :]), (H * V, 1))
+    p_A = A + ptr_offset((o_t[:, None], o_i[None, :]), (H * BT, 1))
     # [BT, BV]
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    b_v = tl.load(p_v, mask=m_tv, other=0.0)
     # [BT, BT]
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    b_A = tl.load(p_A, mask=m_t[:, None], other=0.0)
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
 def chunk_gla_fwd_o_gk(
