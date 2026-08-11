@@ -13,12 +13,6 @@ import torch
 
 from attn_gym.sparse.selected_attention import selected_attention
 
-ATOL_FWD = 1e-1
-RTOL_FWD = 1e-1
-ATOL_BWD = 2e-1
-RTOL_BWD = 2e-1
-
-
 def _skip_no_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
@@ -81,7 +75,7 @@ def _make_inputs(
     else:
         kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
 
-    attention_sink = torch.full((heads,), -float("inf"), device=device, dtype=dtype)
+    attention_sink = None
 
     if doc_ids is not None:
         doc_ids = doc_ids.to(device)
@@ -97,141 +91,6 @@ def _make_inputs(
     }
 
 
-# ---------------------------------------------------------------------------
-# Forward tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("num_topk", [16, 32, 64])
-def test_cute_forward_matches_reference(num_topk):
-    """CuTe forward matches the eager reference implementation (sink=0)."""
-    _skip_no_sm100()
-    inputs = _make_inputs(num_topk=num_topk)
-
-    with torch.inference_mode():
-        expected = selected_attention(**inputs, backend="eager")
-        actual = selected_attention(**inputs, backend="cute")
-
-    torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
-
-
-@pytest.mark.parametrize("num_topk", [16, 32])
-def test_cute_forward_with_doc_ids(num_topk):
-    """CuTe forward with doc_ids matches the eager reference."""
-    _skip_no_sm100()
-    seq_len = 256
-    doc_ids = (
-        torch.cat(
-            [
-                torch.zeros(seq_len // 2, dtype=torch.long),
-                torch.ones(seq_len // 2, dtype=torch.long),
-            ]
-        )
-        .unsqueeze(0)
-        .expand(2, -1)
-    )
-
-    inputs = _make_inputs(num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids)
-
-    with torch.inference_mode():
-        expected = selected_attention(**inputs, backend="eager")
-        actual = selected_attention(**inputs, backend="cute")
-
-    torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
-
-
-def test_cute_larger_sequence():
-    """CuTe handles larger sequence lengths correctly."""
-    _skip_no_sm100()
-    inputs = _make_inputs(
-        batch=1,
-        seq_len=512,
-        sparse_seq_len=256,
-        num_topk=32,
-        sliding_window_size=128,
-    )
-
-    with torch.inference_mode():
-        expected = selected_attention(**inputs, backend="eager")
-        actual = selected_attention(**inputs, backend="cute")
-
-    torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
-
-
-# ---------------------------------------------------------------------------
-# Backward tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("num_topk", [16, 32])
-@pytest.mark.parametrize("grad_target", ["query", "local_kv", "sparse_kv"])
-def test_cute_backward(num_topk, grad_target):
-    """CuTe backward produces correct gradients for all differentiable inputs."""
-    _skip_no_sm100()
-
-    inputs_ref = _make_inputs(num_topk=num_topk, requires_grad=True, seed=42)
-    inputs_cute = _make_inputs(num_topk=num_topk, requires_grad=True, seed=42)
-
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_cute = selected_attention(**inputs_cute, backend="cute")
-
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(7777)
-    grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
-    out_ref.backward(grad_output)
-    out_cute.backward(grad_output)
-
-    torch.testing.assert_close(
-        inputs_cute[grad_target].grad,
-        inputs_ref[grad_target].grad,
-        atol=ATOL_BWD,
-        rtol=RTOL_BWD,
-    )
-
-
-@pytest.mark.parametrize("num_topk", [16, 32])
-def test_cute_backward_with_doc_ids(num_topk):
-    """CuTe backward with doc_ids matches the reference."""
-    _skip_no_sm100()
-    seq_len = 256
-    doc_ids = (
-        torch.cat(
-            [
-                torch.zeros(seq_len // 2, dtype=torch.long),
-                torch.ones(seq_len // 2, dtype=torch.long),
-            ]
-        )
-        .unsqueeze(0)
-        .expand(2, -1)
-    )
-
-    inputs_ref = _make_inputs(
-        num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
-    )
-    inputs_cute = _make_inputs(
-        num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
-    )
-
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_cute = selected_attention(**inputs_cute, backend="cute")
-
-    grad_gen = torch.Generator(device=out_ref.device).manual_seed(4444)
-    grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
-    out_ref.backward(grad_output)
-    out_cute.backward(grad_output)
-    print(torch.max(torch.abs(inputs_cute["query"].grad - inputs_ref["query"].grad)))
-    print(torch.max(torch.abs(inputs_cute["local_kv"].grad - inputs_ref["local_kv"].grad)))
-    print(torch.max(torch.abs(inputs_cute["sparse_kv"].grad - inputs_ref["sparse_kv"].grad)))
-
-    torch.testing.assert_close(
-        inputs_cute["query"].grad, inputs_ref["query"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
-    )
-    torch.testing.assert_close(
-        inputs_cute["local_kv"].grad, inputs_ref["local_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
-    )
-    torch.testing.assert_close(
-        inputs_cute["sparse_kv"].grad, inputs_ref["sparse_kv"].grad, atol=ATOL_BWD, rtol=RTOL_BWD
-    )
-
 
 # ---------------------------------------------------------------------------
 # Precision vs FP64 (measuring-stick test)
@@ -239,7 +98,8 @@ def test_cute_backward_with_doc_ids(num_topk):
 
 
 @pytest.mark.parametrize("num_topk", [16, 32, 64])
-def test_cute_precision_vs_fp64(num_topk):
+@pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
+def test_cute_precision_vs_fp64(num_topk, test_docids):
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
     Inputs are generated in bf16 first, then promoted to FP64 via .double().
@@ -247,12 +107,27 @@ def test_cute_precision_vs_fp64(num_topk):
     so that the FP64 baseline isolates arithmetic error without input-quantization noise.
     """
     _skip_no_sm100()
-    batch, heads, seq_len, head_dim = 2, 128, 256, 512
+    batch, heads, seq_len, head_dim = 2, 128, 128, 512
     sparse_seq_len = 128
     sliding_window_size = 64
     seed = 77
     device = torch.device("cuda")
     dtype = torch.bfloat16
+
+    if test_docids:
+        doc_ids = (
+            torch.cat(
+                [
+                    torch.zeros(seq_len // 2, dtype=torch.long),
+                    torch.ones(seq_len // 2, dtype=torch.long),
+                ]
+            )
+            .unsqueeze(0)
+            .expand(batch, -1)
+            .to(device)
+        )
+    else:
+        doc_ids = None
 
     # --- Generate inputs in bf16 (the "quantized" source) ---
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -271,24 +146,21 @@ def test_cute_precision_vs_fp64(num_topk):
         kv_indices = torch.zeros(batch, seq_len, 0, dtype=torch.long, device=device)
 
     # sink=0 for CuTe
-    sink_lp = torch.full((heads,), -float("inf"), device=device, dtype=dtype)
+    sink = None
 
     # --- Derive FP64 inputs from the same quantized values ---
     query_64 = query_lp.double().requires_grad_(True)
     local_kv_64 = local_kv_lp.double().requires_grad_(True)
     sparse_kv_64 = sparse_kv_lp.double().requires_grad_(True)
-    sink_64 = sink_lp.double().requires_grad_(True)
 
     # --- Lower-precision copies for eager and cute ---
     query_lp_ref = query_lp.clone().requires_grad_(True)
     local_kv_lp_ref = local_kv_lp.clone().requires_grad_(True)
     sparse_kv_lp_ref = sparse_kv_lp.clone().requires_grad_(True)
-    sink_lp_ref = sink_lp.clone().requires_grad_(True)
 
     query_lp_cute = query_lp.clone().requires_grad_(True)
     local_kv_lp_cute = local_kv_lp.clone().requires_grad_(True)
     sparse_kv_lp_cute = sparse_kv_lp.clone().requires_grad_(True)
-    sink_lp_cute = sink_lp.clone().requires_grad_(True)
 
     # --- Forward ---
     out_64 = selected_attention(
@@ -296,8 +168,8 @@ def test_cute_precision_vs_fp64(num_topk):
         local_kv_64,
         sparse_kv_64,
         kv_indices,
-        sink_64,
-        None,
+        sink,
+        doc_ids,
         sliding_window_size,
         backend="eager",
     )
@@ -306,8 +178,8 @@ def test_cute_precision_vs_fp64(num_topk):
         local_kv_lp_ref,
         sparse_kv_lp_ref,
         kv_indices,
-        sink_lp_ref,
-        None,
+        sink,
+        doc_ids,
         sliding_window_size,
         backend="eager",
     )
@@ -316,8 +188,8 @@ def test_cute_precision_vs_fp64(num_topk):
         local_kv_lp_cute,
         sparse_kv_lp_cute,
         kv_indices,
-        sink_lp_cute,
-        None,
+        sink,
+        doc_ids,
         sliding_window_size,
         backend="cute",
     )

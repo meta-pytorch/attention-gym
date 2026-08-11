@@ -52,9 +52,8 @@ def make_inputs(args: argparse.Namespace, requires_grad: bool = False):
     query = randn(args.batch, args.heads, args.sequence_length, args.head_dim)
     local_kv = randn(args.batch, kv_heads, args.sequence_length, args.head_dim)
     sparse_kv = randn(args.batch, kv_heads, args.sparse_seq_len, args.head_dim)
-    attention_sink = torch.full(
-        (args.heads,), -float("inf"), device=device, dtype=dtype, requires_grad=True
-    )
+
+    attention_sink = None
 
     scores = torch.randn(
         args.batch, args.sequence_length, args.sparse_seq_len, device=device, generator=generator
@@ -165,7 +164,8 @@ def main() -> None:
             ):
                 return torch.autograd.grad(
                     _out,
-                    (_query, _local_kv, _sparse_kv, _attention_sink),
+                    (_query, _local_kv, _sparse_kv)
+                    + ((_attention_sink,) if _attention_sink is not None else ()),
                     grad_outputs=_grad_output,
                     retain_graph=True,
                     allow_unused=True,

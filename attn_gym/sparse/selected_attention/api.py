@@ -22,7 +22,6 @@ def _validate_inputs(
         "local_kv": local_kv,
         "sparse_kv": sparse_kv,
         "kv_indices": kv_indices,
-        "attention_sink": attention_sink,
     }
 
     for name, tensor in tensors.items():
@@ -37,11 +36,7 @@ def _validate_inputs(
         raise ValueError(
             f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
         )
-    if attention_sink.dtype not in (query.dtype, torch.float32):
-        raise ValueError(
-            "attention_sink must have the same dtype as query or use torch.float32, "
-            f"but got {attention_sink.dtype} and {query.dtype}."
-        )
+    
 
     if local_kv.device != query.device:
         raise ValueError(
@@ -50,10 +45,6 @@ def _validate_inputs(
     if sparse_kv.device != query.device:
         raise ValueError(
             f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
-        )
-    if attention_sink.device != query.device:
-        raise ValueError(
-            f"attention_sink must be on the same device as query, but got {attention_sink.device} and {query.device}."
         )
     if doc_ids is not None and doc_ids.device != query.device:
         raise ValueError(
@@ -120,10 +111,22 @@ def _validate_inputs(
             f"sparse_kv sequence length ({sparse_seq_len})."
         )
 
-    if attention_sink.shape != (heads,):
-        raise ValueError(
-            f"attention_sink must have shape [{heads}], got {list(attention_sink.shape)}."
-        )
+    if attention_sink is not None:
+        if not isinstance(attention_sink, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
+        if attention_sink.dtype not in (query.dtype, torch.float32):
+            raise ValueError(
+                "attention_sink must have the same dtype as query or use torch.float32, "
+                f"but got {attention_sink.dtype} and {query.dtype}."
+            )
+        if attention_sink.device != query.device:
+            raise ValueError(
+                f"attention_sink must be on the same device as query, but got {attention_sink.device} and {query.device}."
+            )
+        if attention_sink.shape != (heads,):
+            raise ValueError(
+                f"attention_sink must have shape [{heads}], got {list(attention_sink.shape)}."
+            )
 
     # --- doc_ids (optional) ---
     if doc_ids is not None:
@@ -142,7 +145,7 @@ def selected_attention(
     local_kv: Tensor,
     sparse_kv: Tensor,
     kv_indices: Tensor,
-    attention_sink: Tensor,
+    attention_sink: Tensor | None,
     doc_ids: Tensor | None = None,
     sliding_window_size: int = 512,
     backend: str = "triton",
@@ -171,6 +174,7 @@ def selected_attention(
 
         attention_sink: tensor in shape of (num_heads, ), learnable per-head weight that occupies
             the denominator of softmax. It may use the query dtype or torch.float32.
+            If None, no attention sink will be applied
 
         doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
             Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where tokens with the same id
@@ -209,7 +213,8 @@ def selected_attention(
     match backend:
         case "eager":
             from .impl import reference
-
+            if attention_sink is None:
+                attention_sink = torch.full((query.shape[1], ), float("-inf"), dtype = query.dtype, device = query.device)
             return reference.selected_attention(
                 query,
                 local_kv,
@@ -222,7 +227,8 @@ def selected_attention(
             )
         case "triton":
             from .impl import triton as triton_backend
-
+            if attention_sink is None:
+                attention_sink = torch.full((query.shape[1], ), float("-inf"), dtype = query.dtype, device = query.device)
             return triton_backend.selected_attention(
                 query,
                 local_kv,
