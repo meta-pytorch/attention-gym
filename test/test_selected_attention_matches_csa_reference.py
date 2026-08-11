@@ -16,6 +16,8 @@ import torch.nn.functional as F
 ATOL = 1e-8
 RTOL = 1e-5
 
+pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+
 
 # ---------------------------------------------------------------------------
 # Load the CSA example module (composition path via selected_attention).

@@ -21,6 +21,8 @@ RTOL_FWD = 1e-2
 ATOL_BWD = 1e-2
 RTOL_BWD = 1e-2
 
+pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+
 
 def _skip_no_cuda():
     if not torch.cuda.is_available():
@@ -146,9 +148,8 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
 
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 1, 2, 3])
-@pytest.mark.parametrize("grad_target", ["query", "local_kv", "sparse_kv", "attention_sink"])
 @pytest.mark.parametrize("sliding_window_size", [0, 8])
-def test_triton_backward(share_kv, num_topk, grad_target, sliding_window_size):
+def test_triton_backward(share_kv, num_topk, sliding_window_size):
     """Triton backward produces correct gradients for all differentiable inputs."""
     _skip_no_cuda()
 
@@ -175,12 +176,13 @@ def test_triton_backward(share_kv, num_topk, grad_target, sliding_window_size):
     out_ref.backward(grad_output)
     out_tri.backward(grad_output)
 
-    torch.testing.assert_close(
-        inputs_tri[grad_target].grad,
-        inputs_ref[grad_target].grad,
-        atol=ATOL_BWD,
-        rtol=RTOL_BWD,
-    )
+    for name in ("query", "local_kv", "sparse_kv", "attention_sink"):
+        torch.testing.assert_close(
+            inputs_tri[name].grad,
+            inputs_ref[name].grad,
+            atol=ATOL_BWD,
+            rtol=RTOL_BWD,
+        )
 
 
 @pytest.mark.parametrize("num_topk", [0, 2])
