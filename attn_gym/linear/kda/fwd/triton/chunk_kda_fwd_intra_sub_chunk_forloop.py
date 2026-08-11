@@ -16,6 +16,7 @@
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     exp2,
@@ -71,48 +72,49 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
             _run = i_t_orig < tl.load(num_chunks)
         if _run:
             if IS_VARLEN:
+                chunk_offset = ptr_offset((i_t_orig,), (2,))
                 i_n, i_t = (
-                    tl.load(chunk_indices + i_t_orig * 2).to(tl.int32),
-                    tl.load(chunk_indices + i_t_orig * 2 + 1).to(tl.int32),
+                    tl.load(chunk_indices + chunk_offset).to(tl.int32),
+                    tl.load(chunk_indices + chunk_offset + 1).to(tl.int32),
                 )
+                cu_seqlens_offset = ptr_offset((i_n,), (1,))
                 bos, eos = (
-                    tl.load(cu_seqlens + i_n).to(tl.int32),
-                    tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+                    tl.load(cu_seqlens + cu_seqlens_offset).to(tl.int32),
+                    tl.load(cu_seqlens + cu_seqlens_offset + 1).to(tl.int32),
                 )
                 T_local = eos - bos
             else:
                 i_t = i_t_orig
-                bos, eos = i_b * T, i_b * T + T
+                bos = tl.cast(i_b, tl.int64) * T
                 T_local = T
 
-            i_ti = i_t * BT + i_i * BC
+            i_ti = ptr_offset((i_t, i_i), (BT, BC))
             if i_ti < T_local:
                 o_c = i_ti + tl.arange(0, BC)
                 m_c = o_c < T_local
 
-                q_off = q + (bos * H + i_h) * K
-                k_off = k + (bos * H + i_h) * K
-                g_off = g + (bos * H + i_h) * K
-                beta_off = beta + bos * H + i_h
-                Aqk_off = Aqk + (bos * H + i_h) * BT
-                Akk_off = Akk + (bos * H + i_h) * BC
+                qkg_base_offset = ptr_offset((bos, i_h), (H * K, K))
+                q_off = q + qkg_base_offset
+                k_off = k + qkg_base_offset
+                g_off = g + qkg_base_offset
+                beta_off = beta + ptr_offset((bos, i_h), (H, 1))
+                Aqk_off = Aqk + ptr_offset((bos, i_h), (H * BT, BT))
+                Akk_off = Akk + ptr_offset((bos, i_h), (H * BC, BC))
 
-                p_q = tl.make_block_ptr(
-                    q_off, (T_local, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0)
+                o_k = tl.arange(0, BK)
+                m_qkg = m_c[:, None] & (o_k[None, :] < K)
+                qkg_offsets = ptr_offset(
+                    (o_c[:, None], o_k[None, :]),
+                    (H * K, 1),
                 )
-                p_k = tl.make_block_ptr(
-                    k_off, (T_local, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0)
+                b_q = tl.load(q_off + qkg_offsets, mask=m_qkg, other=0.0)
+                b_k = tl.load(k_off + qkg_offsets, mask=m_qkg, other=0.0)
+                b_g = tl.load(g_off + qkg_offsets, mask=m_qkg, other=0.0)
+                b_beta = tl.load(
+                    beta_off + ptr_offset((o_c,), (H,)),
+                    mask=m_c,
+                    other=0.0,
                 )
-                p_g = tl.make_block_ptr(
-                    g_off, (T_local, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0)
-                )
-
-                p_beta = tl.make_block_ptr(beta_off, (T_local,), (H,), (i_ti,), (BC,), (0,))
-
-                b_q = tl.load(p_q, boundary_check=(0, 1))
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_g = tl.load(p_g, boundary_check=(0, 1))
-                b_beta = tl.load(p_beta, boundary_check=(0,))
 
                 if CAUSAL_NORMREF:
                     normref_idx = 0
@@ -121,8 +123,11 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 if USE_GATHER:
                     b_gn = gather(b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0)
                 else:
-                    p_gn = g_off + (i_ti + normref_idx) * H * K + tl.arange(0, BK)
-                    b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
+                    p_gn = g_off + ptr_offset(
+                        (i_ti + normref_idx, o_k),
+                        (H * K, 1),
+                    )
+                    b_gn = tl.load(p_gn, mask=o_k < K, other=0.0)
                     b_gn = b_gn[None, :]
 
                 b_gm = (b_g - b_gn).to(tl.float32)
@@ -143,31 +148,31 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 b_Aqk = tl.where(m_Aqk, b_Aqk, 0.0)
                 b_Akk = tl.where(m_Akk, b_Akk, 0.0)
 
-                p_Aqk = tl.make_block_ptr(
-                    Aqk_off,
-                    (T_local, BT),
+                o_Aqk = ptr_offset((i_i, o_i), (BC, 1))
+                p_Aqk = Aqk_off + ptr_offset(
+                    (o_c[:, None], o_Aqk[None, :]),
                     (H * BT, 1),
-                    (i_ti, i_i * BC),
-                    (BC, BC),
-                    (1, 0),
                 )
-                p_Akk = tl.make_block_ptr(
-                    Akk_off, (T_local, BC), (H * BC, 1), (i_ti, 0), (BC, BC), (1, 0)
+                p_Akk = Akk_off + ptr_offset(
+                    (o_c[:, None], o_i[None, :]),
+                    (H * BC, 1),
                 )
-                tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-                tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+                m_Aqk_store = m_c[:, None] & (o_Aqk[None, :] < BT)
+                m_Akk_store = m_c[:, None] & (o_i[None, :] < BC)
+                tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), mask=m_Aqk_store)
+                tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
                 tl.debug_barrier()
 
                 # forward substitution
                 b_Ai = -b_Akk
                 for i in range(2, min(BC, T_local - i_ti)):
-                    b_a = -tl.load(Akk_off + (i_ti + i) * H * BC + o_i)
+                    b_a = -tl.load(Akk_off + ptr_offset((i_ti + i, o_i), (H * BC, 1)))
                     b_a = tl.where(o_i < i, b_a, 0.0)
                     b_a += tl.sum(b_a[:, None] * b_Ai, 0)
                     b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
                 b_Ai += m_I
-                tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
 
 __all__ = ["chunk_kda_fwd_kernel_intra_sub_chunk_forloop"]

@@ -6,7 +6,7 @@
 #
 # Triton dAv backward for KDA (the intra-chunk ``Aqk @ v_new`` path). This is
 # the one KDA backward compute stage with no CuTe implementation, so it ships as
-# Triton. Ported verbatim; only the header and utility imports were rewritten.
+# Triton. Ported from the original source with local utility-based pointer access.
 #
 # Original source: genai/llama4x/llama4x/ops/fla/ops/kda/chunk_bwd.py
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
 )
@@ -56,56 +57,74 @@ def chunk_kda_bwd_kernel_dAv(
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
             return
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int64),
+            tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int64),
         )
         bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+            tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int64),
+            tl.load(cu_seqlens + ptr_offset((i_n + 1,), (1,))).to(tl.int64),
         )
         T = eos - bos
     else:
-        bos, eos = i_b * T, i_b * T + T
+        bos = i_b * T
 
-    # offset calculation
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    do += (bos * H + i_h) * V
-    dv += (bos * H + i_h) * V
-    dA += (bos * H + i_h) * BT
+    q += ptr_offset((bos, i_h), (H * K, K))
+    k += ptr_offset((bos, i_h), (H * K, K))
+    v += ptr_offset((bos, i_h), (H * V, V))
+    A += ptr_offset((bos, i_h), (H * BT, BT))
+    do += ptr_offset((bos, i_h), (H * V, V))
+    dv += ptr_offset((bos, i_h), (H * V, V))
+    dA += ptr_offset((bos, i_h), (H * BT, BT))
 
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1)
-    )
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-
-    o_t = i_t * BT + tl.arange(0, BT)
+    o_i = tl.arange(0, BT)
+    o_t = i_t * BT + o_i
     m_t = o_t < T
-    m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
+    m_tt = m_t[:, None] & m_t[None, :]
+    # The leading BT feature axis is always in bounds; only token columns can be ragged.
+    b_A = tl.load(
+        A + ptr_offset((o_i[:, None], o_t[None, :]), (1, H * BT)),
+        mask=m_t[None, :],
+        other=0.0,
+    )
+    m_A = (o_t[:, None] <= o_t[None, :]) & m_tt
     b_A = tl.where(m_A, b_A, 0).to(do.dtype.element_ty)
 
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v, (V, T), (1, H * V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
-        p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = (o_v[:, None] < V) & m_t[None, :]
+        m_do = m_t[:, None] & (o_v[None, :] < V)
         # [BV, BT]
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_v = tl.load(
+            v + ptr_offset((o_v[:, None], o_t[None, :]), (1, H * V)),
+            mask=m_v,
+            other=0.0,
+        )
         # [BT, BV]
-        b_do = tl.load(p_do, boundary_check=(0, 1))
+        b_do = tl.load(
+            do + ptr_offset((o_t[:, None], o_v[None, :]), (H * V, 1)),
+            mask=m_do,
+            other=0.0,
+        )
         # [BT, BT]
         b_dA += tl.dot(b_do, b_v)
         # [BT, BV]
         b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
-        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            dv + ptr_offset((o_t[:, None], o_v[None, :]), (H * V, 1)),
+            b_dv.to(dv.dtype.element_ty),
+            mask=m_do,
+        )
 
-    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.0)
-    tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
+    b_dA = tl.where(o_t[:, None] >= o_t[None, :], b_dA * scale, 0.0)
+    tl.store(
+        dA + ptr_offset((o_t[:, None], o_i[None, :]), (H * BT, 1)),
+        b_dA.to(dA.dtype.element_ty),
+        mask=m_t[:, None],
+    )

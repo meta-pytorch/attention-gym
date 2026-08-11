@@ -7,9 +7,18 @@
 """Tests for utilities shared by hand-written Triton kernels."""
 
 import pytest
+import torch
 
+triton = pytest.importorskip("triton")
+tl = pytest.importorskip("triton.language")
 triton_utils = pytest.importorskip("attn_gym._backends.triton.utils")
+ptr_offset = triton_utils.ptr_offset
 storage_cosize = triton_utils.storage_cosize
+
+
+@triton.jit
+def _store_ptr_offset(output, index, stride: tl.constexpr):
+    tl.store(output, ptr_offset((index,), (stride,)))
 
 
 def test_storage_cosize():
@@ -26,3 +35,22 @@ def test_storage_cosize():
         storage_cosize((-1,), (1,))
     with pytest.raises(ValueError, match="nonnegative"):
         storage_cosize((1,), (-1,))
+
+
+def test_ptr_offset_uses_signed_64_bit_arithmetic():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Triton kernels")
+
+    index = 700_001
+    stride = 4096
+    output = torch.empty((), device="cuda", dtype=torch.int64)
+    _store_ptr_offset[(1,)](output, index, stride=stride)
+
+    assert output.item() == index * stride
+    assert output.item() > 2**31
+
+    negative_index = -index
+    _store_ptr_offset[(1,)](output, negative_index, stride=stride)
+
+    assert output.item() == negative_index * stride
+    assert output.item() < -(2**31)
