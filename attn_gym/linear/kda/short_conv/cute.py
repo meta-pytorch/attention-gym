@@ -41,8 +41,23 @@ class ShortConvTunedConfig:
     weight_gradient: ShortConvConfig
 
 
+@cute.jit
+def _silu(value):
+    """Apply SiLU to an FP32 register tensor."""
+    half = value * 0.5
+    return half * cute.math.tanh(half, fastmath=True) + half
+
+
+@cute.jit
+def _silu_derivative(value):
+    """Evaluate the SiLU derivative from its preactivation."""
+    half = value * 0.5
+    tanh_half = cute.math.tanh(half, fastmath=True)
+    return (tanh_half + 1.0) * 0.5 + half * (1.0 - tanh_half * tanh_half) * 0.5
+
+
 class CausalConv1dSiluForward:
-    """Compute causal depthwise convolution followed by SiLU."""
+    """Compute causal depthwise convolution followed by a compile-time activation."""
 
     # These schedule values are kernel specialization parameters. Register-tensor
     # shapes, vector partitioning, unrolled loops, and the block mapping all need
@@ -56,11 +71,13 @@ class CausalConv1dSiluForward:
         channels: int,
         width: int,
         config: ShortConvConfig,
+        activation,
     ):
         self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
+        self.activation = activation
         self.threads = config.threads
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
@@ -134,9 +151,8 @@ class CausalConv1dSiluForward:
                             Float32(0.0),
                             reduction_profile=(None, 1),
                         )
-                    half = value * 0.5
                     output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        (half * cute.math.tanh(half, fastmath=True) + half).to(BFloat16)
+                        self.activation(value).to(BFloat16)
                     )
 
     @cute.jit
@@ -160,7 +176,7 @@ class CausalConv1dSiluForward:
 
 
 class CausalConv1dSiluInputGradient:
-    """Recompute the preactivation and compute the SiLU input gradient."""
+    """Recompute the preactivation and apply a compile-time activation derivative."""
 
     default_config = ShortConvConfig(threads=128, channels_per_thread=4, times_per_block=10)
 
@@ -171,11 +187,13 @@ class CausalConv1dSiluInputGradient:
         channels: int,
         width: int,
         config: ShortConvConfig,
+        d_activation,
     ):
         self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
+        self.d_activation = d_activation
         self.threads = config.threads
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
@@ -248,11 +266,7 @@ class CausalConv1dSiluInputGradient:
                         Float32(0.0),
                         reduction_profile=(None, 1),
                     )
-                    half = value * 0.5
-                    tanh_half = cute.math.tanh(half, fastmath=True)
-                    derivative = (tanh_half + 1.0) * 0.5 + half * (
-                        1.0 - tanh_half * tanh_half
-                    ) * 0.5
+                    derivative = self.d_activation(value)
                     incoming = (
                         dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
                         .load()
@@ -319,11 +333,13 @@ class CausalConv1dSiluWeightGradientPartials:
         channels: int,
         width: int,
         config: ShortConvConfig,
+        d_activation,
     ):
         self.batches = batches
         self.tokens = tokens
         self.channels = channels
         self.width = width
+        self.d_activation = d_activation
         self.threads = config.threads
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
@@ -386,11 +402,7 @@ class CausalConv1dSiluWeightGradientPartials:
                         Float32(0.0),
                         reduction_profile=(None, 1),
                     )
-                    half = value * 0.5
-                    tanh_half = cute.math.tanh(half, fastmath=True)
-                    derivative = (tanh_half + 1.0) * 0.5 + half * (
-                        1.0 - tanh_half * tanh_half
-                    ) * 0.5
+                    derivative = self.d_activation(value)
                     incoming = (
                         dy_groups[((0, None), (batch * self.tokens + time, channel_group))]
                         .load()
@@ -459,7 +471,7 @@ def _compile_forward(
     config: ShortConvConfig,
 ):
     """Compile one static forward specialization."""
-    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config)
+    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config, _silu)
     return compile_tvm_ffi(
         operation,
         _fake_bf16_matrix(batches * tokens, channels),
@@ -477,7 +489,9 @@ def _compile_input_gradient(
     config: ShortConvConfig,
 ):
     """Compile one static input-gradient specialization."""
-    operation = CausalConv1dSiluInputGradient(batches, tokens, channels, width, config)
+    operation = CausalConv1dSiluInputGradient(
+        batches, tokens, channels, width, config, _silu_derivative
+    )
     return compile_tvm_ffi(
         operation,
         _fake_bf16_matrix(batches * tokens, channels),
@@ -503,7 +517,9 @@ def _compile_weight_gradient(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    operation = CausalConv1dSiluWeightGradientPartials(batches, tokens, channels, width, config)
+    operation = CausalConv1dSiluWeightGradientPartials(
+        batches, tokens, channels, width, config, _silu_derivative
+    )
     return compile_tvm_ffi(
         operation,
         _fake_bf16_matrix(batches * tokens, channels),
