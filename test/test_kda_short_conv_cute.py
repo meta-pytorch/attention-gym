@@ -317,8 +317,9 @@ def test_short_conv_packed_tma_backward_matches_fallback():
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
-    torch.testing.assert_close(actual_gradients[0], fallback_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], fallback_gradients[1], rtol=3e-2, atol=2e-1)
+    # The staged and generic kernels differ only in their FP32 addition order.
+    torch.testing.assert_close(actual_gradients[0], fallback_gradients[0], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(actual_gradients[1], fallback_gradients[1], rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("width", [3, 4])
