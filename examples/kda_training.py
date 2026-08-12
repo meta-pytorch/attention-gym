@@ -231,30 +231,27 @@ class KDAAttention(nn.Module):
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, tokens, channels = qkv.shape
-        expected_state = (batch, self.qkv_conv1d.kernel_size[0] - 1, channels)
-        if (
-            self.backend == "fused"
-            and initial_state is None
-            and self.qkv_conv1d.kernel_size[0] == 4
-        ):
-            weight = self.qkv_conv1d.weight[:, 0].to(self.compute_dtype).contiguous()
-            final_state = (
-                F.pad(qkv, (0, 0, max(0, 3 - tokens), 0))[:, -3:].clone()
-                if return_final_state
-                else None
+        state_length = self.qkv_conv1d.kernel_size[0] - 1
+        expected_state = (batch, state_length, channels)
+        if initial_state is not None:
+            if initial_state.shape != expected_state:
+                raise ValueError(
+                    f"initial_conv_state must have shape {expected_state}, "
+                    f"got {tuple(initial_state.shape)}"
+                )
+            initial_state = initial_state.to(device=qkv.device, dtype=qkv.dtype).contiguous()
+
+        if self.backend == "fused":
+            result = cute_causal_conv1d_silu(
+                qkv,
+                self.qkv_conv1d.weight[:, 0].to(self.compute_dtype),
+                initial_state=initial_state,
+                return_final_state=return_final_state,
             )
-            return cute_causal_conv1d_silu(qkv.contiguous(), weight), final_state
+            return result if return_final_state else (result, None)
 
         if initial_state is None:
             initial_state = qkv.new_zeros(expected_state)
-        elif initial_state.shape != expected_state:
-            raise ValueError(
-                f"initial_conv_state must have shape {expected_state}, "
-                f"got {tuple(initial_state.shape)}"
-            )
-        else:
-            initial_state = initial_state.to(device=qkv.device, dtype=qkv.dtype)
-
         conv_input = torch.cat((initial_state, qkv), dim=1)
         qkv = F.conv1d(
             conv_input.transpose(1, 2),
