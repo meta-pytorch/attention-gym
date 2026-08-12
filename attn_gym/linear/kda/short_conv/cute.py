@@ -55,6 +55,18 @@ class ShortConvConfig:
     times_per_block: int
 
 
+TMA_INPUT_GRADIENT_CONFIGS = {
+    "fp16": ShortConvConfig(128, 2, 32),
+    "bf16": ShortConvConfig(128, 2, 32),
+}
+
+TMA_WEIGHT_GRADIENT_CONFIGS = {
+    "fp16": ShortConvConfig(128, 2, 64),
+    "bf16": ShortConvConfig(128, 2, 64),
+    "fp32": ShortConvConfig(128, 2, 160),
+}
+
+
 @dataclass(frozen=True)
 class ShortConvTunedConfig:
     """Selected specializations for forward and both first-order gradients."""
@@ -73,16 +85,27 @@ class ShortConvTunedConfig:
     ) -> ShortConvTunedConfig:
         """Return measured GB300 defaults for one storage dtype and layout mode."""
         if dtype == torch.float16:
+            if packed:
+                input_gradient = ShortConvConfig(128, 4, 6)
+                weight_gradient = ShortConvConfig(128, 4, 128)
+            elif stateful:
+                input_gradient = ShortConvConfig(128, 1, 28)
+                weight_gradient = ShortConvConfig(128, 4, 128)
+            else:
+                input_gradient = TMA_INPUT_GRADIENT_CONFIGS["fp16"]
+                weight_gradient = TMA_WEIGHT_GRADIENT_CONFIGS["fp16"]
             return cls(
                 ShortConvConfig(128, 4, 16),
-                ShortConvConfig(128, 4, 6) if packed else ShortConvConfig(128, 1, 28),
-                ShortConvConfig(128, 4, 128),
+                input_gradient,
+                weight_gradient,
             )
         if dtype == torch.float32:
             return cls(
                 ShortConvConfig(128, 4, 4),
                 ShortConvConfig(128, 2, 12),
-                ShortConvConfig(128, 4, 32),
+                ShortConvConfig(128, 4, 32)
+                if packed or stateful
+                else TMA_WEIGHT_GRADIENT_CONFIGS["fp32"],
             )
         if dtype != torch.bfloat16:
             raise ValueError(f"unsupported short-convolution dtype {dtype}")
@@ -93,8 +116,8 @@ class ShortConvTunedConfig:
             input_gradient = ShortConvConfig(128, 1, 28)
             weight_gradient = ShortConvConfig(128, 4, 128)
         else:
-            input_gradient = ShortConvConfig(128, 2, 32)
-            weight_gradient = ShortConvConfig(128, 2, 64)
+            input_gradient = TMA_INPUT_GRADIENT_CONFIGS["bf16"]
+            weight_gradient = TMA_WEIGHT_GRADIENT_CONFIGS["bf16"]
         return cls(
             ShortConvConfig(128, 4, 16),
             input_gradient,
@@ -811,6 +834,105 @@ class ShortConvTmaKernel:
         )
 
     @cute.jit
+    def make_pipeline(
+        self,
+        tidx: Int32,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tma_tensor_dy: cute.Tensor,
+    ):
+        """Allocate and partition the shared two-input TMA pipeline."""
+        channels_per_block = self.threads * self.channels_per_thread
+        smem = cutlass.utils.SmemAllocator()
+        barriers = smem.allocate_array(Int64, self.stages * 2)
+        sX = smem.allocate_tensor(
+            self.dtype.cute_type,
+            self.staged_layout(),
+            byte_alignment=128,
+        )
+        sD = smem.allocate_tensor(
+            self.dtype.cute_type,
+            self.staged_layout(),
+            byte_alignment=128,
+        )
+        tile = cute.make_layout(
+            (self.tma_stage_tokens, channels_per_block),
+            stride=(channels_per_block, 1),
+        )
+        tile_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads // 32,
+            ),
+            tx_count=2 * cute.size_in_bytes(self.dtype.cute_type, tile),
+            barrier_storage=barriers,
+            tidx=tidx,
+        )
+
+        cta_tiler = (self.tma_stage_tokens, channels_per_block)
+        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None))
+        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None))
+        tXsX, tXgX = cpasync.tma_partition(
+            tma_atom_x,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sX, 0, 2),
+            cute.group_modes(gX_tiles, 0, 2),
+        )
+        tDsD, tDgD = cpasync.tma_partition(
+            tma_atom_dy,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sD, 0, 2),
+            cute.group_modes(gD_tiles, 0, 2),
+        )
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.stages,
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.stages,
+        )
+        return (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        )
+
+    @cute.jit
+    def make_tma_atoms(self, x: cute.Tensor, grad_output: cute.Tensor):
+        """Build matching TMA load atoms for input and output-gradient tiles."""
+        staged = self.staged_layout()
+        cta_tiler = (
+            self.tma_stage_tokens,
+            self.threads * self.channels_per_thread,
+        )
+        load_op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
+            load_op,
+            x,
+            staged,
+            cta_tiler,
+        )
+        tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
+            load_op,
+            grad_output,
+            staged,
+            cta_tiler,
+        )
+        return tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy
+
+    @cute.jit
     def issue_stage(
         self,
         tile_pipeline: pipeline.PipelineTmaAsync,
@@ -866,61 +988,24 @@ class CausalConv1dSiluInputGradientTma(
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
         stage_tokens = self.tma_stage_tokens
-        channels_per_block = self.threads * self.channels_per_thread
         subtiles = self.times_per_block // stage_tokens
 
-        smem = cutlass.utils.SmemAllocator()
-        barriers = smem.allocate_array(Int64, self.stages * 2)
-        sX = smem.allocate_tensor(
-            self.dtype.cute_type,
-            self.staged_layout(),
-            byte_alignment=128,
-        )
-        sD = smem.allocate_tensor(
-            self.dtype.cute_type,
-            self.staged_layout(),
-            byte_alignment=128,
-        )
-        tile = cute.make_layout(
-            (stage_tokens, channels_per_block),
-            stride=(channels_per_block, 1),
-        )
-        tile_pipeline = pipeline.PipelineTmaAsync.create(
-            num_stages=self.stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.threads // 32,
-            ),
-            tx_count=2 * cute.size_in_bytes(self.dtype.cute_type, tile),
-            barrier_storage=barriers,
-            tidx=tidx,
-        )
-
-        cta_tiler = (stage_tokens, channels_per_block)
-        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None))
-        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None))
-        tXsX, tXgX = cpasync.tma_partition(
+        (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        ) = self.make_pipeline(
+            tidx,
             tma_atom_x,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sX, 0, 2),
-            cute.group_modes(gX_tiles, 0, 2),
-        )
-        tDsD, tDgD = cpasync.tma_partition(
+            tma_tensor_x,
             tma_atom_dy,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sD, 0, 2),
-            cute.group_modes(gD_tiles, 0, 2),
-        )
-        producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer,
-            self.stages,
-        )
-        consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer,
-            self.stages,
+            tma_tensor_dy,
         )
         first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
         if warp_idx == 0:
@@ -1142,23 +1227,9 @@ class CausalConv1dSiluInputGradientTma(
         """Build dense TMA descriptors and launch the streaming specialization."""
         assert cutlass.const_expr(cu_seqlens is None)
         assert cutlass.const_expr(initial_state is None)
-        staged = self.staged_layout()
-        cta_tiler = (
-            self.tma_stage_tokens,
-            self.threads * self.channels_per_thread,
-        )
-        load_op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
-            load_op,
+        tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy = self.make_tma_atoms(
             x,
-            staged,
-            cta_tiler,
-        )
-        tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
-            load_op,
             grad_output,
-            staged,
-            cta_tiler,
         )
         self.tma_kernel(
             x,
@@ -1207,61 +1278,24 @@ class CausalConv1dSiluWeightGradientPartialsTma(
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
         stage_tokens = self.tma_stage_tokens
-        channels_per_block = self.threads * self.channels_per_thread
         subtiles = self.times_per_block // stage_tokens
 
-        smem = cutlass.utils.SmemAllocator()
-        barriers = smem.allocate_array(Int64, self.stages * 2)
-        sX = smem.allocate_tensor(
-            self.dtype.cute_type,
-            self.staged_layout(),
-            byte_alignment=128,
-        )
-        sD = smem.allocate_tensor(
-            self.dtype.cute_type,
-            self.staged_layout(),
-            byte_alignment=128,
-        )
-        tile = cute.make_layout(
-            (stage_tokens, channels_per_block),
-            stride=(channels_per_block, 1),
-        )
-        tile_pipeline = pipeline.PipelineTmaAsync.create(
-            num_stages=self.stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.threads // 32,
-            ),
-            tx_count=2 * cute.size_in_bytes(self.dtype.cute_type, tile),
-            barrier_storage=barriers,
-            tidx=tidx,
-        )
-
-        cta_tiler = (stage_tokens, channels_per_block)
-        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None))
-        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None))
-        tXsX, tXgX = cpasync.tma_partition(
+        (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        ) = self.make_pipeline(
+            tidx,
             tma_atom_x,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sX, 0, 2),
-            cute.group_modes(gX_tiles, 0, 2),
-        )
-        tDsD, tDgD = cpasync.tma_partition(
+            tma_tensor_x,
             tma_atom_dy,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sD, 0, 2),
-            cute.group_modes(gD_tiles, 0, 2),
-        )
-        producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer,
-            self.stages,
-        )
-        consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer,
-            self.stages,
+            tma_tensor_dy,
         )
         first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
 
@@ -1389,23 +1423,9 @@ class CausalConv1dSiluWeightGradientPartialsTma(
         """Build dense TMA descriptors and launch the staged specialization."""
         assert cutlass.const_expr(cu_seqlens is None)
         assert cutlass.const_expr(initial_state is None)
-        staged = self.staged_layout()
-        cta_tiler = (
-            self.tma_stage_tokens,
-            self.threads * self.channels_per_thread,
-        )
-        load_op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
-            load_op,
+        tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy = self.make_tma_atoms(
             x,
-            staged,
-            cta_tiler,
-        )
-        tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
-            load_op,
             grad_output,
-            staged,
-            cta_tiler,
         )
         self.tma_kernel(
             x,
@@ -1651,6 +1671,27 @@ def _compile_forward(
     )
 
 
+def supports_tma(
+    operation_type: type[ShortConvTmaKernel],
+    config: ShortConvConfig,
+    selected_config: ShortConvConfig | None,
+    tokens: int,
+    channels: int,
+    width: int,
+    num_sequences: int | None,
+    has_initial_state: bool,
+) -> bool:
+    """Return whether a measured TMA specialization supports this static problem."""
+    return (
+        config == selected_config
+        and width > 1
+        and channels % (config.threads * config.channels_per_thread) == 0
+        and tokens % operation_type.tma_stage_tokens == 0
+        and num_sequences is None
+        and not has_initial_state
+    )
+
+
 @jit_cache
 def _compile_input_gradient(
     batches: int,
@@ -1663,14 +1704,15 @@ def _compile_input_gradient(
     has_initial_state: bool = False,
 ):
     """Compile one static input-gradient specialization."""
-    use_tma = (
-        dtype.name == "bf16"
-        and width > 1
-        and config == ShortConvConfig(128, 2, 32)
-        and channels % (config.threads * config.channels_per_thread) == 0
-        and tokens % CausalConv1dSiluInputGradientTma.tma_stage_tokens == 0
-        and num_sequences is None
-        and not has_initial_state
+    use_tma = supports_tma(
+        CausalConv1dSiluInputGradientTma,
+        config,
+        TMA_INPUT_GRADIENT_CONFIGS.get(dtype.name),
+        tokens,
+        channels,
+        width,
+        num_sequences,
+        has_initial_state,
     )
     operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
     operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
@@ -1710,14 +1752,15 @@ def _compile_weight_gradient(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    use_tma = (
-        dtype.name == "bf16"
-        and width > 1
-        and config == ShortConvConfig(128, 2, 64)
-        and channels % (config.threads * config.channels_per_thread) == 0
-        and tokens % CausalConv1dSiluWeightGradientPartialsTma.tma_stage_tokens == 0
-        and num_sequences is None
-        and not has_initial_state
+    use_tma = supports_tma(
+        CausalConv1dSiluWeightGradientPartialsTma,
+        config,
+        TMA_WEIGHT_GRADIENT_CONFIGS.get(dtype.name),
+        tokens,
+        channels,
+        width,
+        num_sequences,
+        has_initial_state,
     )
     operation_type = (
         CausalConv1dSiluWeightGradientPartialsTma
