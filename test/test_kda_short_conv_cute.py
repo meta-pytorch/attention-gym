@@ -20,7 +20,7 @@ from attn_gym.linear.kda.short_conv.cute import (
     cute_causal_conv1d_silu,
     tune_causal_conv1d_silu,
 )
-from examples.kda_training import KDAAttention
+from examples.kda_training import KDAAttention, packed_sequence_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -708,6 +708,49 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
         strict=True,
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-1)
+
+
+def test_kda_example_builds_packed_sequence_metadata():
+    """Keep Zipf-sampled logical lengths aligned, bounded, and cumulative."""
+    torch.manual_seed(0)
+    lengths, offsets = packed_sequence_metadata(4, 256, 64)
+    assert len(lengths) == 4
+    assert all(length % 64 == 0 and 0 < length <= 256 for length in lengths)
+    assert offsets[0] == 0
+    assert tuple(end - start for start, end in pairwise(offsets)) == lengths
+
+    with pytest.raises(ValueError, match="divisible"):
+        packed_sequence_metadata(2, 96, 64)
+    with pytest.raises(ValueError, match="at least one"):
+        packed_sequence_metadata(3, 0, 64)
+
+
+def test_kda_example_packed_matches_sequence_for_loop():
+    """Match one packed block against explicit independent-sequence execution."""
+    torch.manual_seed(19)
+    model = KDAAttention(
+        hidden_size=32,
+        num_heads=1,
+        head_dim=128,
+        backend="fused",
+        device="cuda",
+    )
+    offsets = (0, 64, 128, 192, 256)
+    packed_hidden = torch.randn(1, offsets[-1], 32, device="cuda", requires_grad=True)
+    loop_hidden = packed_hidden.detach().clone().requires_grad_()
+    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+
+    actual = model(packed_hidden, cu_seqlens=cu_seqlens).hidden_states
+    loop_outputs = []
+    for start, end in pairwise(offsets):
+        loop_outputs.append(model(loop_hidden[:, start:end]).hidden_states)
+    expected = torch.cat(loop_outputs, dim=1)
+    torch.testing.assert_close(actual, expected)
+
+    cotangent = torch.randn_like(actual)
+    actual_gradient = torch.autograd.grad(actual, packed_hidden, cotangent)[0]
+    expected_gradient = torch.autograd.grad(expected, loop_hidden, cotangent)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
 
 
 def test_short_conv_accepts_misaligned_contiguous_storage():

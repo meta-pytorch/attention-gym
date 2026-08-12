@@ -17,7 +17,13 @@ On a Blackwell GPU, exercise the fused backend with::
 
     python examples/kda_training.py --backend=fused
 
-Add ``--profile`` to export a backend- and shape-named Chrome trace. The trace
+Pack Zipf-distributed sequence lengths into one physical batch with::
+
+    python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256
+
+In packed mode, ``batch-size`` is the number of logical sequences and ``tokens``
+is the longest sequence. Add ``--profile`` to export a backend- and shape-named
+Chrome trace. The trace
 contains explicit ``forward`` and ``backward`` record-function ranges. Add
 ``--compile`` to compile the complete module with
 ``torch.compile(fullgraph=True)`` and fuse the PyTorch work around the custom
@@ -31,6 +37,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from enum import Enum
 from functools import wraps
+from itertools import accumulate
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
@@ -83,6 +90,23 @@ class KDAAttentionOutput(NamedTuple):
     hidden_states: torch.Tensor
     final_state: torch.Tensor | None
     final_conv_state: torch.Tensor | None
+
+
+def packed_sequence_metadata(
+    num_sequences: int,
+    max_tokens: int,
+    chunk_size: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Sample aligned sequence lengths from a truncated Zipf distribution."""
+    if max_tokens % chunk_size:
+        raise ValueError("packed tokens must be divisible by chunk_size")
+    if max_tokens < chunk_size:
+        raise ValueError("packed tokens must include at least one full chunk")
+    max_chunks = max_tokens // chunk_size
+    weights = torch.arange(1, max_chunks + 1, dtype=torch.float64).reciprocal()
+    chunk_counts = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
+    lengths = tuple(count * chunk_size for count in chunk_counts)
+    return lengths, (0, *accumulate(lengths))
 
 
 class KDAAttention(nn.Module):
@@ -168,6 +192,7 @@ class KDAAttention(nn.Module):
         initial_state: torch.Tensor | None = None,
         *,
         initial_conv_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool = False,
     ) -> KDAAttentionOutput:
         """Apply KDA and optionally return recurrent and short-convolution states."""
@@ -179,7 +204,10 @@ class KDAAttention(nn.Module):
         batch, tokens, _ = hidden_states.shape
         if batch == 0 or tokens == 0:
             raise ValueError("batch size and sequence length must be greater than zero")
-        expected_state = (batch, self.num_heads, self.head_dim, self.head_dim)
+        if cu_seqlens is not None and self.backend != "fused":
+            raise ValueError("packed cu_seqlens currently require backend='fused'")
+        state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+        expected_state = (state_batch, self.num_heads, self.head_dim, self.head_dim)
         if initial_state is not None:
             if initial_state.shape != expected_state:
                 raise ValueError(
@@ -191,6 +219,7 @@ class KDAAttention(nn.Module):
         qkv, final_conv_state = self.short_convolution(
             qkv,
             initial_conv_state,
+            cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
         )
         q, k, v = qkv.view(batch, tokens, 3, self.num_heads, self.head_dim).unbind(2)
@@ -204,6 +233,7 @@ class KDAAttention(nn.Module):
             cumulative_gate,
             beta,
             initial_state,
+            cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
         )
         output = self.output_normalization(output)
@@ -228,11 +258,13 @@ class KDAAttention(nn.Module):
         qkv: torch.Tensor,
         initial_state: torch.Tensor | None,
         *,
+        cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, tokens, channels = qkv.shape
         state_length = self.qkv_conv1d.kernel_size[0] - 1
-        expected_state = (batch, state_length, channels)
+        state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+        expected_state = (state_batch, state_length, channels)
         if initial_state is not None:
             if initial_state.shape != expected_state:
                 raise ValueError(
@@ -246,6 +278,7 @@ class KDAAttention(nn.Module):
                 qkv,
                 self.qkv_conv1d.weight[:, 0].to(self.compute_dtype),
                 initial_state=initial_state,
+                cu_seqlens=cu_seqlens,
                 return_final_state=return_final_state,
             )
             return result if return_final_state else (result, None)
@@ -327,6 +360,7 @@ class KDAAttention(nn.Module):
         beta: torch.Tensor,
         initial_state: torch.Tensor | None,
         *,
+        cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.backend == "reference":
@@ -348,6 +382,7 @@ class KDAAttention(nn.Module):
             cumulative_gate,
             beta,
             initial_state,
+            cu_seqlens=cu_seqlens,
             output_final_state=return_final_state,
             fastmath=self.fastmath,
             profile_ranges=self.profile_ranges,
@@ -391,8 +426,14 @@ def main(
         typer.Option(help="Use the reference or the best integrated fused kernels."),
     ] = BackendOption.REFERENCE,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
-    batch_size: Annotated[int, typer.Option(min=1, help="Training batch size.")] = 1,
-    tokens: Annotated[int, typer.Option(min=1, help="Tokens per sequence.")] = 16384,
+    batch_size: Annotated[
+        int,
+        typer.Option(min=1, help="Training batch size, or packed logical sequence count."),
+    ] = 1,
+    tokens: Annotated[
+        int,
+        typer.Option(min=1, help="Tokens per sequence, or longest packed sequence."),
+    ] = 16384,
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 2304,
     num_heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 32,
     head_dim: Annotated[int, typer.Option(min=1, help="Channels per KDA head.")] = 128,
@@ -412,9 +453,17 @@ def main(
         bool,
         typer.Option("--compile", help="Compile the complete module as one full graph."),
     ] = False,
+    packed: Annotated[
+        bool,
+        typer.Option(
+            help="Pack batch-size Zipf-distributed full-chunk sequences bounded by tokens."
+        ),
+    ] = False,
 ) -> None:
     """Train the single-device KDA example."""
     torch.manual_seed(0)
+    if packed and backend != BackendOption.FUSED:
+        raise ValueError("--packed requires --backend=fused")
     model = KDAAttention(
         hidden_size,
         num_heads,
@@ -428,18 +477,27 @@ def main(
     if compile_model:
         model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    hidden_states = torch.randn(batch_size, tokens, hidden_size, device=device)
+    cu_seqlens = None
+    input_shape = (batch_size, tokens, hidden_size)
+    layout_name = ""
+    if packed:
+        sequence_lengths, offsets = packed_sequence_metadata(batch_size, tokens, chunk_size)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+        input_shape = (1, offsets[-1], hidden_size)
+        layout_name = "_packed"
+        print(f"packed_sequence_lengths={sequence_lengths} cu_seqlens={offsets}")
+    hidden_states = torch.randn(input_shape, device=device)
     target = torch.randn_like(hidden_states)
     execution_name = "_compiled" if compile_model else ""
     profile_name = (
-        f"kda_training_backend-{backend.value}{execution_name}"
+        f"kda_training_backend-{backend.value}{layout_name}{execution_name}"
         f"_b{batch_size}_t{tokens}_c{hidden_size}_h{num_heads}_d{head_dim}"
     )
 
     def train_step() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
         with _record_function(profile, f"{profile_name}/forward"):
-            output = model(hidden_states).hidden_states
+            output = model(hidden_states, cu_seqlens=cu_seqlens).hidden_states
         with _record_function(profile, f"{profile_name}/loss"):
             loss = F.mse_loss(output.float(), target)
         with _record_function(profile, f"{profile_name}/backward"):

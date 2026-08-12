@@ -75,9 +75,16 @@ partials for the shared parameter reduction. The example explicitly runs
 projections in BF16 while retaining FP32 parameters and gate reductions; no
 ambient autocast context is required.
 The CuTe gate path requires a head dimension divisible by 32 in `[32, 1024]`.
-The optimized core requires Blackwell, batch size one, BF16 kernel inputs,
-`head_dim=128`, and complete 64-token chunks. The optimized boundaries are
-first-order and do not support higher-order autograd. The complete composed
+The optimized core requires Blackwell, physical batch size one, BF16 kernel inputs,
+`head_dim=128`, and complete 64-token chunks. `chunk_kda(..., cu_seqlens=offsets)` treats
+`[1, T, H, D]` inputs as packed logical sequences and carries those boundaries through the
+forward, backward, and recurrent states; each logical sequence must currently contain an integer
+number of 64-token chunks. `KDAAttention.forward` threads the same offsets through its short
+convolution and KDA core; the gate prefix sum already resets at every aligned chunk boundary. The
+optimized boundaries are first-order and do not support higher-order autograd. Run
+`python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`
+to sample chunk-aligned lengths from a truncated Zipf distribution, pack them into one physical
+batch, print their `cu_seqlens`, and pass those offsets through the complete training step. The complete composed
 core forward and backward use private custom operators with fake-tensor and
 autograd registrations, so the public `chunk_kda` operation supports strict
 `torch.compile(fullgraph=True)` and CUDA Graph capture. Pass `--compile` to the
@@ -110,7 +117,7 @@ second = attention(
 
 The example intentionally is not checkpoint-compatible with Kimi K3. A model
 adapter must still provide exact checkpoint parameter names and initialization,
-packed-sequence metadata, cache layout, and distributed execution policy. The
+the model's packed-sequence metadata, cache layout, and distributed execution policy. The
 short convolution, factorized gates, and learned gated RMS normalization match
 the production structure but remain ordinary PyTorch teaching implementations.
 
@@ -118,9 +125,9 @@ For integrations that fuse gate activation with its forward chunk prefix sum,
 `naive_chunk_kda_from_cumulative` exposes the matching reference boundary. Its
 cumulative log2 gate is inclusive and resets at the same `chunk_size` passed to
 KDA; the function does not perform a second cumulative sum. The composed `chunk_kda` backend consumes this same representation. That
-trainable operator remains intentionally narrow: fixed-length complete chunks,
-batch size one, BF16 kernel operands, `head_dim=128`, `chunk_size=64`, and
-Blackwell.
+trainable operator remains intentionally narrow: physical batch size one, complete
+64-token chunks within every fixed or packed sequence, BF16 kernel operands,
+`head_dim=128`, `chunk_size=64`, and Blackwell.
 
 ::: attn_gym.linear.naive_chunk_kda
 
