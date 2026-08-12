@@ -1,5 +1,7 @@
 """Correctness and integration tests for the CuTeDSL KDA short convolution."""
 
+from itertools import pairwise
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,8 @@ from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     _backward_custom_op,
     _candidate_configs,
+    _configured_backward_custom_op,
+    _configured_forward_custom_op,
     _forward_custom_op,
     cute_causal_conv1d_silu,
     tune_causal_conv1d_silu,
@@ -30,6 +34,19 @@ def _inputs(tokens: int = 17, channels: int = 12, width: int = 4, batch: int = 1
 def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     padded = F.pad(x.transpose(1, 2), (weight.shape[1] - 1, 0))
     return F.silu(F.conv1d(padded, weight[:, None], groups=x.shape[-1])).transpose(1, 2)
+
+
+def _packed_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate independent convolutions for every nonempty packed sequence."""
+    offsets = cu_seqlens.cpu().tolist()
+    return torch.cat(
+        [_reference(x[:, start:end], weight) for start, end in pairwise(offsets) if start != end],
+        dim=1,
+    )
 
 
 @pytest.mark.parametrize("width", [1, 3, 4, 5])
@@ -84,6 +101,28 @@ def test_short_conv_batched_forward_and_backward_match_pytorch(width: int):
 
     actual = cute_causal_conv1d_silu(x, weight, weight_grad_config=weight_config)
     expected = _reference(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+
+
+@pytest.mark.parametrize("width", [1, 3, 4, 5])
+def test_short_conv_packed_forward_and_backward_match_independent_sequences(width: int):
+    """Reset convolution and gradient dependencies at every packed boundary."""
+    torch.manual_seed(2)
+    x, weight = _inputs(tokens=67, channels=12, width=width)
+    cu_seqlens = torch.tensor(
+        [0, 1, 3, 8, 8, 17, 31, 67],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    grad_output = torch.randn_like(x)
+
+    actual = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+    expected = _packed_reference(x, weight, cu_seqlens)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
@@ -149,16 +188,29 @@ def test_short_conv_explicit_config_and_tuning_flow():
     torch.testing.assert_close(compiled(x, weight), expected, rtol=2e-2, atol=2e-2)
 
 
-def test_short_conv_custom_op_registration():
-    """Exercise schemas, fake implementations, and registered autograd."""
-    x, weight = _inputs(batch=2)
+@pytest.mark.parametrize("packed", [False, True])
+def test_short_conv_custom_op_registration(packed: bool):
+    """Exercise dense and packed schemas, fake implementations, and autograd."""
+    x, weight = _inputs(batch=1 if packed else 2)
     grad_output = torch.randn_like(x)
-    torch.library.opcheck(_forward_custom_op, (x, weight))
+    cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32) if packed else None
+    torch.library.opcheck(_forward_custom_op, (x, weight, cu_seqlens))
     torch.library.opcheck(
         _backward_custom_op,
-        (x, weight, grad_output),
+        (x, weight, grad_output, cu_seqlens),
         test_utils=("test_schema", "test_faketensor"),
     )
+    if packed:
+        configs = (128, 4, 8, 128, 4, 10, 128, 4, 128)
+        torch.library.opcheck(
+            _configured_forward_custom_op,
+            (x, weight, cu_seqlens, *configs),
+        )
+        torch.library.opcheck(
+            _configured_backward_custom_op,
+            (x, weight, grad_output, cu_seqlens, *configs[3:]),
+            test_utils=("test_schema", "test_faketensor"),
+        )
 
 
 def test_short_conv_fullgraph_forward_and_backward():
@@ -173,6 +225,38 @@ def test_short_conv_fullgraph_forward_and_backward():
     actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
     torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
+
+
+def test_short_conv_packed_fullgraph_forward_and_backward():
+    """Keep the configured packed operation inside a strict compiled graph."""
+    x, weight = _inputs(tokens=31)
+    cu_seqlens = torch.tensor([0, 2, 9, 17, 31], device="cuda", dtype=torch.int32)
+    grad_output = torch.randn_like(x)
+    configs = {
+        "forward_config": ShortConvConfig(128, 4, 8),
+        "input_grad_config": ShortConvConfig(128, 4, 10),
+        "weight_grad_config": ShortConvConfig(128, 4, 128),
+    }
+
+    expected_output = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens, **configs)
+    expected = torch.autograd.grad(expected_output, (x, weight), grad_output)
+    compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
+    actual_output = compiled(x, weight, cu_seqlens=cu_seqlens, **configs)
+    actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
+    torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
+
+
+def test_short_conv_packed_offsets_obey_autograd_versioning():
+    """Reject sequence-boundary mutation between forward and backward."""
+    x, weight = _inputs(tokens=31)
+    cu_seqlens = torch.tensor([0, 3, 11, 31], device="cuda", dtype=torch.int32)
+    output = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+
+    with torch.no_grad():
+        cu_seqlens[1] = 4
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        torch.autograd.grad(output, (x, weight), torch.randn_like(output))
 
 
 def test_short_conv_cuda_graph_replay():
@@ -200,6 +284,35 @@ def test_short_conv_cuda_graph_replay():
     assert not torch.equal(captured_gradients[0], first_gradients[0])
     expected_output = _forward_custom_op(x, weight)
     expected_gradients = _backward_custom_op(x, weight, grad_output)
+    torch.testing.assert_close(captured_output, expected_output)
+    torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
+    torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
+
+
+def test_short_conv_packed_cuda_graph_replays_changed_boundaries():
+    """Read packed boundaries from device memory again on every graph replay."""
+    x, weight = _inputs(tokens=31)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, 0, 11, 31, 31], device="cuda", dtype=torch.int32)
+    _forward_custom_op(x, weight, cu_seqlens)
+    _backward_custom_op(x, weight, grad_output, cu_seqlens)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = _forward_custom_op(x, weight, cu_seqlens)
+        captured_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
+
+    graph.replay()
+    first_output = captured_output.clone()
+    with torch.no_grad():
+        cu_seqlens.copy_(torch.tensor([0, 0, 8, 31, 31], device="cuda", dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert not torch.equal(captured_output, first_output)
+    expected_output = _forward_custom_op(x, weight, cu_seqlens)
+    expected_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
     torch.testing.assert_close(captured_output, expected_output)
     torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
