@@ -612,9 +612,20 @@ def _launch_backward(
     return grad_x, partials.sum(dim=(0, 1)).to(torch.bfloat16)
 
 
+def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfig:
+    """Adapt the packed channel width while preserving the tuned schedule."""
+    channels_per_thread = 1
+    for divisor in range(config.channels_per_thread, 1, -1):
+        if config.channels_per_thread % divisor == 0 and channels % divisor == 0:
+            channels_per_thread = divisor
+            break
+    return ShortConvConfig(config.threads, channels_per_thread, config.times_per_block)
+
+
 def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
     """Return the focused schedule space used by the explicit tuning flow."""
     if kind == "forward":
+        default = CausalConv1dSiluForward.default_config
         candidates = (
             ShortConvConfig(64, 4, 8),
             ShortConvConfig(128, 2, 8),
@@ -624,6 +635,7 @@ def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
             ShortConvConfig(256, 4, 8),
         )
     elif kind == "input_gradient":
+        default = CausalConv1dSiluInputGradient.default_config
         candidates = (
             ShortConvConfig(64, 4, 8),
             ShortConvConfig(128, 2, 8),
@@ -633,6 +645,7 @@ def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
             ShortConvConfig(256, 4, 8),
         )
     elif kind == "weight_gradient":
+        default = CausalConv1dSiluWeightGradientPartials.default_config
         candidates = (
             ShortConvConfig(64, 4, 128),
             ShortConvConfig(128, 2, 64),
@@ -643,7 +656,12 @@ def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
         )
     else:  # pragma: no cover - internal callers use the literals above.
         raise ValueError(f"unknown short-convolution kernel kind {kind!r}")
-    return tuple(config for config in candidates if channels % config.channels_per_thread == 0)
+    candidates = (*candidates, _compatible_config(default, channels))
+    return tuple(
+        dict.fromkeys(
+            config for config in candidates if channels % config.channels_per_thread == 0
+        )
+    )
 
 
 def tune_causal_conv1d_silu(
@@ -974,24 +992,28 @@ def cute_causal_conv1d_silu(
         A contiguous CUDA BF16 tensor with the same shape as ``x``.
     """
     _validate_inputs(x, weight)
-    if forward_config is None and input_grad_config is None and weight_grad_config is None:
-        for name, config in (
-            ("forward_config", CausalConv1dSiluForward.default_config),
-            ("input_grad_config", CausalConv1dSiluInputGradient.default_config),
-            ("weight_grad_config", CausalConv1dSiluWeightGradientPartials.default_config),
-        ):
-            _validate_config(config, x.shape[2], name)
-        return _forward_custom_op(x, weight)
-
-    forward = forward_config or CausalConv1dSiluForward.default_config
-    input_grad = input_grad_config or CausalConv1dSiluInputGradient.default_config
-    weight_grad = weight_grad_config or CausalConv1dSiluWeightGradientPartials.default_config
+    channels = x.shape[2]
+    default_forward = CausalConv1dSiluForward.default_config
+    default_input_grad = CausalConv1dSiluInputGradient.default_config
+    default_weight_grad = CausalConv1dSiluWeightGradientPartials.default_config
+    forward = forward_config or _compatible_config(default_forward, channels)
+    input_grad = input_grad_config or _compatible_config(default_input_grad, channels)
+    weight_grad = weight_grad_config or _compatible_config(default_weight_grad, channels)
     for name, config in (
         ("forward_config", forward),
         ("input_grad_config", input_grad),
         ("weight_grad_config", weight_grad),
     ):
-        _validate_config(config, x.shape[2], name)
+        _validate_config(config, channels, name)
+    if (
+        forward_config is None
+        and input_grad_config is None
+        and weight_grad_config is None
+        and forward == default_forward
+        and input_grad == default_input_grad
+        and weight_grad == default_weight_grad
+    ):
+        return _forward_custom_op(x, weight)
     return _configured_forward_custom_op(
         x,
         weight,
