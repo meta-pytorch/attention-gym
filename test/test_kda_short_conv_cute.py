@@ -99,14 +99,15 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
 
 
 def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
-    """Use narrower FP32 input-gradient vectors without perturbing BF16 defaults."""
+    """Use the measured dtype- and layout-specific input-gradient schedules."""
     fp16 = ShortConvTunedConfig.default(torch.float16)
     bf16 = ShortConvTunedConfig.default()
     fp32 = ShortConvTunedConfig.default(torch.float32)
 
     assert fp16.forward == ShortConvConfig(128, 4, 16)
-    assert fp16.input_gradient == ShortConvConfig(128, 4, 6)
-    assert bf16.input_gradient == ShortConvConfig(128, 4, 10)
+    assert fp16.input_gradient == ShortConvConfig(128, 1, 28)
+    assert bf16.input_gradient == ShortConvConfig(128, 1, 28)
+    assert ShortConvTunedConfig.default(packed=True).input_gradient == ShortConvConfig(128, 4, 10)
     assert fp32.forward == ShortConvConfig(128, 4, 4)
     assert fp32.input_gradient == ShortConvConfig(128, 2, 12)
     assert fp32.weight_gradient == ShortConvConfig(128, 4, 32)

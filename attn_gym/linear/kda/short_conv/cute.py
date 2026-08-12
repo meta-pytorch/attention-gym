@@ -63,12 +63,17 @@ class ShortConvTunedConfig:
     weight_gradient: ShortConvConfig
 
     @classmethod
-    def default(cls, dtype: torch.dtype = torch.bfloat16) -> ShortConvTunedConfig:
-        """Return measured GB300 defaults for one storage dtype."""
+    def default(
+        cls,
+        dtype: torch.dtype = torch.bfloat16,
+        *,
+        packed: bool = False,
+    ) -> ShortConvTunedConfig:
+        """Return measured GB300 defaults for one storage dtype and layout mode."""
         if dtype == torch.float16:
             return cls(
                 ShortConvConfig(128, 4, 16),
-                ShortConvConfig(128, 4, 6),
+                ShortConvConfig(128, 4, 6) if packed else ShortConvConfig(128, 1, 28),
                 ShortConvConfig(128, 4, 128),
             )
         if dtype == torch.float32:
@@ -81,7 +86,7 @@ class ShortConvTunedConfig:
             raise ValueError(f"unsupported short-convolution dtype {dtype}")
         return cls(
             ShortConvConfig(128, 4, 16),
-            ShortConvConfig(128, 4, 10),
+            ShortConvConfig(128, 4, 10) if packed else ShortConvConfig(128, 1, 28),
             ShortConvConfig(128, 4, 128),
         )
 
@@ -1507,7 +1512,7 @@ def _backward_custom_op(
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the tuned K3 backward defaults through the lean schema."""
-    defaults = ShortConvTunedConfig.default(x.dtype)
+    defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
     grad_x, grad_weight, _ = _launch_backward(
         x,
         weight,
@@ -1542,7 +1547,7 @@ def _default_backward(ctx, grad_output: torch.Tensor):
         grad_x, grad_weight = _backward_custom_op(x, weight, grad_output, cu_seqlens)
         grad_initial_state = None
     else:
-        defaults = ShortConvTunedConfig.default(x.dtype)
+        defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
         input_config = defaults.input_gradient
         weight_config = defaults.weight_gradient
         grad_x, grad_weight, grad_initial_state = _configured_backward_custom_op(
@@ -1867,7 +1872,7 @@ def cute_causal_conv1d_silu(
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
     kernel_initial_state = None if weight.shape[1] == 1 else initial_state
-    defaults = ShortConvTunedConfig.default(x.dtype)
+    defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
     default_forward = defaults.forward
     default_input_grad = defaults.input_gradient
     default_weight_grad = defaults.weight_gradient
