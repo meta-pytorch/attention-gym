@@ -6,15 +6,17 @@
 
 """CuTeDSL causal depthwise convolution with a first-order backward.
 
-The implementation accepts contiguous BF16 ``[B, T, C]`` tensors and treats every
-batch row as an independent sequence. Dense inputs may supply their preceding
-``W - 1`` input positions as functional state. An optional CUDA ``cu_seqlens`` tensor
-instead delimits independent sequences packed into ``[1, T, C]`` without requiring a
-maximum sequence length or auxiliary schedule. Each thread owns a compile-time number
-of adjacent channels. Forward stages its input window in packed BF16 registers, while
-backward computes BF16 input gradients and FP32 weight-gradient partials followed by
+The implementation accepts contiguous FP16, BF16, or FP32 ``[B, T, C]`` tensors and
+treats every batch row as an independent sequence. Dense inputs may supply their
+preceding ``W - 1`` input positions as functional state. An optional CUDA
+``cu_seqlens`` tensor instead delimits independent sequences packed into ``[1, T, C]``
+without requiring a maximum sequence length or auxiliary schedule. Each thread owns a
+compile-time number of adjacent channels. Forward stages its input window in registers,
+while backward computes input gradients and FP32 weight-gradient partials followed by
 a Torch reduction.
 """
+
+from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -22,10 +24,25 @@ from typing import ClassVar
 
 import cutlass
 import torch
-from cutlass import BFloat16, Float32, Int32, cute
+from cutlass import BFloat16, Float16, Float32, Int32, cute
 
 from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
 from attn_gym._backends.cute.device import upper_bound
+
+
+@dataclass(frozen=True)
+class ShortConvDType:
+    """Map a Torch storage dtype to its compile-time CuTeDSL type and artifact tag."""
+
+    cute_type: type[cutlass.Numeric]
+    name: str
+
+
+SHORT_CONV_DTYPES = {
+    torch.float16: ShortConvDType(Float16, "fp16"),
+    torch.bfloat16: ShortConvDType(BFloat16, "bf16"),
+    torch.float32: ShortConvDType(Float32, "fp32"),
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +61,29 @@ class ShortConvTunedConfig:
     forward: ShortConvConfig
     input_gradient: ShortConvConfig
     weight_gradient: ShortConvConfig
+
+    @classmethod
+    def default(cls, dtype: torch.dtype = torch.bfloat16) -> ShortConvTunedConfig:
+        """Return measured GB300 defaults for one storage dtype."""
+        if dtype == torch.float16:
+            return cls(
+                ShortConvConfig(128, 4, 16),
+                ShortConvConfig(128, 4, 6),
+                ShortConvConfig(128, 4, 128),
+            )
+        if dtype == torch.float32:
+            return cls(
+                ShortConvConfig(128, 4, 4),
+                ShortConvConfig(128, 2, 12),
+                ShortConvConfig(128, 4, 32),
+            )
+        if dtype != torch.bfloat16:
+            raise ValueError(f"unsupported short-convolution dtype {dtype}")
+        return cls(
+            ShortConvConfig(128, 4, 16),
+            ShortConvConfig(128, 4, 10),
+            ShortConvConfig(128, 4, 128),
+        )
 
 
 @cute.jit
@@ -205,6 +245,7 @@ class ShortConvKernel:
         channels: int,
         width: int,
         config: ShortConvConfig,
+        dtype: ShortConvDType,
     ):
         self.sequences = sequences
         self.tokens = tokens
@@ -213,11 +254,12 @@ class ShortConvKernel:
         self.threads = config.threads
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
+        self.dtype = dtype
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
         name = (
-            f"short_conv_{self.kernel_kind}_bf16_{self.sequence_axis}{self.sequences}"
+            f"short_conv_{self.kernel_kind}_{self.dtype.name}_{self.sequence_axis}{self.sequences}"
             f"_t{self.tokens}_c{self.channels}_w{self.width}_th{self.threads}"
         )
         if self.time_tiled:
@@ -230,11 +272,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
 
     kernel_kind = "fwd"
 
-    # These schedule values are kernel specialization parameters. Register-tensor
-    # shapes, vector partitioning, unrolled loops, and the block mapping all need
-    # them while CuTeDSL compiles this kernel; they are not runtime operator state.
-    default_config = ShortConvConfig(threads=128, channels_per_thread=4, times_per_block=8)
-
     def __init__(
         self,
         batches: int,
@@ -242,9 +279,10 @@ class CausalConv1dSiluForward(ShortConvKernel):
         channels: int,
         width: int,
         config: ShortConvConfig,
+        dtype: ShortConvDType,
         activation,
     ):
-        super().__init__(batches, tokens, channels, width, config)
+        super().__init__(batches, tokens, channels, width, config, dtype)
         self.batches = batches
         self.activation = activation
 
@@ -276,9 +314,9 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             inputs = cute.make_rmem_tensor(
                 (self.channels_per_thread, self.times_per_block + self.width - 1),
-                BFloat16,
+                self.dtype.cute_type,
             )
-            inputs.fill(BFloat16(0.0))
+            inputs.fill(self.dtype.cute_type(0.0))
             for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
                 input_time = time_start + input_offset - (self.width - 1)
                 if input_time >= 0 and input_time < self.tokens:
@@ -346,7 +384,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                                         * weights[(None, tap)].load()
                                     )
                     output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        self.activation(value).to(BFloat16)
+                        self.activation(value).to(self.dtype.cute_type)
                     )
 
     @cute.jit
@@ -382,7 +420,6 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
     """Recompute the preactivation and apply a compile-time activation derivative."""
 
     kernel_kind = "dx"
-    default_config = ShortConvConfig(threads=128, channels_per_thread=4, times_per_block=10)
 
     def __init__(
         self,
@@ -391,9 +428,10 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         channels: int,
         width: int,
         config: ShortConvConfig,
+        dtype: ShortConvDType,
         d_activation,
     ):
-        super().__init__(batches, tokens, channels, width, config)
+        super().__init__(batches, tokens, channels, width, config, dtype)
         self.batches = batches
         self.d_activation = d_activation
 
@@ -427,9 +465,9 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
 
             inputs = cute.make_rmem_tensor(
                 (self.channels_per_thread, self.times_per_block + 2 * (self.width - 1)),
-                BFloat16,
+                self.dtype.cute_type,
             )
-            inputs.fill(BFloat16(0.0))
+            inputs.fill(self.dtype.cute_type(0.0))
             for input_offset in cutlass.range_constexpr(
                 self.times_per_block + 2 * (self.width - 1)
             ):
@@ -553,7 +591,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                         reduction_profile=(None, 1),
                     )
                     dx_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        value.to(BFloat16)
+                        value.to(self.dtype.cute_type)
                     )
 
     @cute.jit
@@ -591,7 +629,6 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
     """Compute FP32 batch/time-tile partial sums for the weight gradient."""
 
     kernel_kind = "dw"
-    default_config = ShortConvConfig(threads=128, channels_per_thread=4, times_per_block=128)
 
     def __init__(
         self,
@@ -600,9 +637,10 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         channels: int,
         width: int,
         config: ShortConvConfig,
+        dtype: ShortConvDType,
         d_activation,
     ):
-        super().__init__(batches, tokens, channels, width, config)
+        super().__init__(batches, tokens, channels, width, config, dtype)
         self.batches = batches
         self.d_activation = d_activation
 
@@ -754,9 +792,10 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
         channels: int,
         width: int,
         config: ShortConvConfig,
+        dtype: ShortConvDType,
         d_activation,
     ):
-        super().__init__(num_sequences, tokens, channels, width, config)
+        super().__init__(num_sequences, tokens, channels, width, config, dtype)
         self.num_sequences = num_sequences
         self.d_activation = d_activation
 
@@ -856,7 +895,7 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                     (0, None),
                     (sequence * (self.width - 1) + history_offset, channel_group),
                 )
-            ].store(gradient.load().to(BFloat16))
+            ].store(gradient.load().to(self.dtype.cute_type))
 
     @cute.jit
     def __call__(
@@ -893,10 +932,10 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
 # fake shapes. The kernel's bounds arithmetic does not otherwise require them
 # to be constexpr; a future dynamic-shape launcher could pass those extents at
 # runtime without relaxing the schedule parameters above.
-def _fake_bf16_matrix(rows: int, columns: int):
-    """Create a row-major BF16 fake tensor for compilation."""
+def _fake_matrix(dtype: ShortConvDType, rows: int, columns: int):
+    """Create a row-major fake tensor for one storage-dtype specialization."""
     return cute.runtime.make_fake_compact_tensor(
-        BFloat16,
+        dtype.cute_type,
         (rows, columns),
         stride_order=(1, 0),
         assumed_align=16,
@@ -916,6 +955,7 @@ def _fake_cu_seqlens(num_sequences: int | None):
 
 
 def _fake_initial_state(
+    dtype: ShortConvDType,
     num_sequences: int,
     channels: int,
     width: int,
@@ -924,7 +964,7 @@ def _fake_initial_state(
     """Create per-sequence history storage or preserve the zero-history specialization."""
     if not has_initial_state:
         return None
-    return _fake_bf16_matrix(num_sequences * (width - 1), channels)
+    return _fake_matrix(dtype, num_sequences * (width - 1), channels)
 
 
 @jit_cache
@@ -933,19 +973,21 @@ def _compile_forward(
     tokens: int,
     channels: int,
     width: int,
+    dtype: ShortConvDType,
     config: ShortConvConfig,
     num_sequences: int | None = None,
     has_initial_state: bool = False,
 ):
     """Compile one static forward specialization."""
-    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config, _silu)
+    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config, dtype, _silu)
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(batches * tokens, channels),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_matrix(dtype, batches * tokens, channels),
         _fake_cu_seqlens(num_sequences),
         _fake_initial_state(
+            dtype,
             batches if num_sequences is None else num_sequences,
             channels,
             width,
@@ -960,22 +1002,24 @@ def _compile_input_gradient(
     tokens: int,
     channels: int,
     width: int,
+    dtype: ShortConvDType,
     config: ShortConvConfig,
     num_sequences: int | None = None,
     has_initial_state: bool = False,
 ):
     """Compile one static input-gradient specialization."""
     operation = CausalConv1dSiluInputGradient(
-        batches, tokens, channels, width, config, _silu_derivative
+        batches, tokens, channels, width, config, dtype, _silu_derivative
     )
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(batches * tokens, channels),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, batches * tokens, channels),
         _fake_cu_seqlens(num_sequences),
         _fake_initial_state(
+            dtype,
             batches if num_sequences is None else num_sequences,
             channels,
             width,
@@ -990,6 +1034,7 @@ def _compile_weight_gradient(
     tokens: int,
     channels: int,
     width: int,
+    dtype: ShortConvDType,
     config: ShortConvConfig,
     num_sequences: int | None = None,
     has_initial_state: bool = False,
@@ -1003,16 +1048,17 @@ def _compile_weight_gradient(
         assumed_align=16,
     )
     operation = CausalConv1dSiluWeightGradientPartials(
-        batches, tokens, channels, width, config, _silu_derivative
+        batches, tokens, channels, width, config, dtype, _silu_derivative
     )
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(batches * tokens, channels),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_matrix(dtype, batches * tokens, channels),
         partials,
         _fake_cu_seqlens(num_sequences),
         _fake_initial_state(
+            dtype,
             batches if num_sequences is None else num_sequences,
             channels,
             width,
@@ -1027,6 +1073,7 @@ def _compile_initial_state_gradient(
     tokens: int,
     channels: int,
     width: int,
+    dtype: ShortConvDType,
     threads: int,
     channels_per_thread: int,
     num_sequences: int | None = None,
@@ -1035,15 +1082,15 @@ def _compile_initial_state_gradient(
     state_sequences = batches if num_sequences is None else num_sequences
     config = ShortConvConfig(threads, channels_per_thread, times_per_block=1)
     operation = CausalConv1dSiluInitialStateGradient(
-        state_sequences, tokens, channels, width, config, _silu_derivative
+        state_sequences, tokens, channels, width, config, dtype, _silu_derivative
     )
     return compile_tvm_ffi(
         operation,
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(channels, width),
-        _fake_bf16_matrix(state_sequences * (width - 1), channels),
-        _fake_bf16_matrix(batches * tokens, channels),
-        _fake_bf16_matrix(state_sequences * (width - 1), channels),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_matrix(dtype, state_sequences * (width - 1), channels),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, state_sequences * (width - 1), channels),
         _fake_cu_seqlens(num_sequences),
     )
 
@@ -1059,14 +1106,14 @@ def _validate_inputs(
         raise ValueError(f"x must have shape [B, T, C], got {tuple(x.shape)}")
     if x.shape[0] < 1 or x.shape[1] < 1 or x.shape[2] < 1:
         raise ValueError(f"x must have positive B, T, and C dimensions, got {tuple(x.shape)}")
-    if x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
-        raise ValueError("x must be a contiguous CUDA BF16 tensor")
+    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or not x.is_contiguous():
+        raise ValueError("x must be a contiguous CUDA FP16, BF16, or FP32 tensor")
     if weight.ndim != 2 or weight.shape[0] != x.shape[2] or weight.shape[1] < 1:
         raise ValueError(
             f"weight must have shape [C, W] with W positive, got {tuple(weight.shape)}"
         )
-    if weight.dtype != torch.bfloat16 or weight.device != x.device or not weight.is_contiguous():
-        raise ValueError("weight must be contiguous CUDA BF16 on x.device")
+    if weight.dtype != x.dtype or weight.device != x.device or not weight.is_contiguous():
+        raise ValueError("weight must match x dtype and be contiguous on x.device")
     if cu_seqlens is not None:
         if x.shape[0] != 1:
             raise ValueError("packed cu_seqlens require x to have batch size 1")
@@ -1086,11 +1133,11 @@ def _validate_inputs(
                 f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"
             )
         if (
-            initial_state.dtype != torch.bfloat16
+            initial_state.dtype != x.dtype
             or initial_state.device != x.device
             or not initial_state.is_contiguous()
         ):
-            raise ValueError("initial_state must be contiguous CUDA BF16 on x.device")
+            raise ValueError("initial_state must match x dtype and be contiguous on x.device")
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -1111,12 +1158,14 @@ def _launch_forward(
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
     width = weight.shape[1]
+    dtype = SHORT_CONV_DTYPES[x.dtype]
     output = torch.empty_like(x)
     compiled = _compile_forward(
         batches,
         tokens,
         channels,
         width,
+        dtype,
         config,
         None if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         initial_state is not None,
@@ -1147,6 +1196,7 @@ def _launch_backward(
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
     width = weight.shape[1]
+    dtype = SHORT_CONV_DTYPES[x.dtype]
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
@@ -1155,6 +1205,7 @@ def _launch_backward(
         tokens,
         channels,
         width,
+        dtype,
         input_config,
         num_sequences,
         initial_state is not None,
@@ -1184,6 +1235,7 @@ def _launch_backward(
         tokens,
         channels,
         width,
+        dtype,
         weight_config,
         num_sequences,
         initial_state is not None,
@@ -1201,6 +1253,7 @@ def _launch_backward(
             tokens,
             channels,
             width,
+            dtype,
             input_config.threads,
             input_config.channels_per_thread,
             num_sequences,
@@ -1212,7 +1265,7 @@ def _launch_backward(
             grad_initial_state.flatten(0, 1),
             cu_seqlens,
         )
-    return grad_x, partials.sum(dim=(0, 1)).to(torch.bfloat16), grad_initial_state
+    return grad_x, partials.sum(dim=(0, 1)).to(x.dtype), grad_initial_state
 
 
 def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfig:
@@ -1225,10 +1278,15 @@ def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfi
     return ShortConvConfig(config.threads, channels_per_thread, config.times_per_block)
 
 
-def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
+def _candidate_configs(
+    kind: str,
+    channels: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[ShortConvConfig, ...]:
     """Return the focused schedule space used by the explicit tuning flow."""
+    defaults = ShortConvTunedConfig.default(dtype)
     if kind == "forward":
-        default = CausalConv1dSiluForward.default_config
+        default = defaults.forward
         candidates = (
             ShortConvConfig(64, 4, 8),
             ShortConvConfig(128, 2, 8),
@@ -1238,17 +1296,18 @@ def _candidate_configs(kind: str, channels: int) -> tuple[ShortConvConfig, ...]:
             ShortConvConfig(256, 4, 8),
         )
     elif kind == "input_gradient":
-        default = CausalConv1dSiluInputGradient.default_config
+        default = defaults.input_gradient
         candidates = (
             ShortConvConfig(64, 4, 8),
             ShortConvConfig(128, 2, 8),
+            ShortConvConfig(128, 4, 6),
             ShortConvConfig(128, 4, 8),
             ShortConvConfig(128, 4, 10),
             ShortConvConfig(128, 4, 12),
             ShortConvConfig(256, 4, 8),
         )
     elif kind == "weight_gradient":
-        default = CausalConv1dSiluWeightGradientPartials.default_config
+        default = defaults.weight_gradient
         candidates = (
             ShortConvConfig(64, 4, 128),
             ShortConvConfig(128, 2, 64),
@@ -1298,6 +1357,7 @@ def tune_causal_conv1d_silu(
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
     width = weight.shape[1]
+    dtype = SHORT_CONV_DTYPES[x.dtype]
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     x_matrix = x.view(batches * tokens, channels)
     grad_matrix = grad_output.view(batches * tokens, channels)
@@ -1305,7 +1365,9 @@ def tune_causal_conv1d_silu(
     state_matrix = None if kernel_initial_state is None else kernel_initial_state.flatten(0, 1)
 
     forward_candidates = tuple(
-        _candidate_configs("forward", channels) if forward_configs is None else forward_configs
+        _candidate_configs("forward", channels, x.dtype)
+        if forward_configs is None
+        else forward_configs
     )
     for config in forward_candidates:
         _validate_config(config, channels, "forward_configs")
@@ -1325,6 +1387,7 @@ def tune_causal_conv1d_silu(
             tokens,
             channels,
             width,
+            dtype,
             config,
             num_sequences,
             kernel_initial_state is not None,
@@ -1333,7 +1396,7 @@ def tune_causal_conv1d_silu(
     )
 
     input_candidates = tuple(
-        _candidate_configs("input_gradient", channels)
+        _candidate_configs("input_gradient", channels, x.dtype)
         if input_grad_configs is None
         else input_grad_configs
     )
@@ -1351,6 +1414,7 @@ def tune_causal_conv1d_silu(
             tokens,
             channels,
             width,
+            dtype,
             config,
             num_sequences,
             kernel_initial_state is not None,
@@ -1359,7 +1423,7 @@ def tune_causal_conv1d_silu(
     )
 
     weight_candidates = tuple(
-        _candidate_configs("weight_gradient", channels)
+        _candidate_configs("weight_gradient", channels, x.dtype)
         if weight_grad_configs is None
         else weight_grad_configs
     )
@@ -1392,6 +1456,7 @@ def tune_causal_conv1d_silu(
             tokens,
             channels,
             width,
+            dtype,
             config,
             num_sequences,
             kernel_initial_state is not None,
@@ -1417,7 +1482,7 @@ def _forward_custom_op(
     return _launch_forward(
         x,
         weight,
-        CausalConv1dSiluForward.default_config,
+        ShortConvTunedConfig.default(x.dtype).forward,
         cu_seqlens,
         initial_state,
     )
@@ -1442,12 +1507,13 @@ def _backward_custom_op(
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the tuned K3 backward defaults through the lean schema."""
+    defaults = ShortConvTunedConfig.default(x.dtype)
     grad_x, grad_weight, _ = _launch_backward(
         x,
         weight,
         grad_output,
-        CausalConv1dSiluInputGradient.default_config,
-        CausalConv1dSiluWeightGradientPartials.default_config,
+        defaults.input_gradient,
+        defaults.weight_gradient,
         cu_seqlens,
     )
     return grad_x, grad_weight
@@ -1476,8 +1542,9 @@ def _default_backward(ctx, grad_output: torch.Tensor):
         grad_x, grad_weight = _backward_custom_op(x, weight, grad_output, cu_seqlens)
         grad_initial_state = None
     else:
-        input_config = CausalConv1dSiluInputGradient.default_config
-        weight_config = CausalConv1dSiluWeightGradientPartials.default_config
+        defaults = ShortConvTunedConfig.default(x.dtype)
+        input_config = defaults.input_gradient
+        weight_config = defaults.weight_gradient
         grad_x, grad_weight, grad_initial_state = _configured_backward_custom_op(
             x,
             weight,
@@ -1777,9 +1844,10 @@ def cute_causal_conv1d_silu(
     and block mapping, so changing one compiles and caches a distinct kernel.
 
     Args:
-        x: Contiguous CUDA BF16 input with shape ``[B, T, C]``. Each batch row
-            is convolved as an independent sequence.
-        weight: Contiguous CUDA BF16 depthwise weights with shape ``[C, W]``.
+        x: Contiguous CUDA FP16, BF16, or FP32 input with shape ``[B, T, C]``.
+            Each batch row is convolved as an independent sequence.
+        weight: Contiguous depthwise weights with shape ``[C, W]`` matching
+            ``x`` dtype and device.
         cu_seqlens: Optional contiguous CUDA int32 offsets delimiting independent
             sequences in a packed ``[1, T, C]`` input. Offsets must be nondecreasing,
             begin at zero, and end at ``T``; repeated offsets represent empty padding
@@ -1793,15 +1861,16 @@ def cute_causal_conv1d_silu(
         weight_grad_config: Optional weight-gradient schedule specialization.
 
     Returns:
-        A contiguous CUDA BF16 tensor with the same shape as ``x``. When
-        ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
+        A contiguous tensor with the same shape, dtype, and device as ``x``.
+        When ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
     """
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
     kernel_initial_state = None if weight.shape[1] == 1 else initial_state
-    default_forward = CausalConv1dSiluForward.default_config
-    default_input_grad = CausalConv1dSiluInputGradient.default_config
-    default_weight_grad = CausalConv1dSiluWeightGradientPartials.default_config
+    defaults = ShortConvTunedConfig.default(x.dtype)
+    default_forward = defaults.forward
+    default_input_grad = defaults.input_gradient
+    default_weight_grad = defaults.weight_gradient
     forward = forward_config or _compatible_config(default_forward, channels)
     input_grad = input_grad_config or _compatible_config(default_input_grad, channels)
     weight_grad = weight_grad_config or _compatible_config(default_weight_grad, channels)

@@ -11,6 +11,7 @@ pytest.importorskip("cutlass")
 import attn_gym.linear.kda.short_conv.cute as cute_backend
 from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
+    ShortConvTunedConfig,
     _backward_custom_op,
     _candidate_configs,
     _configured_backward_custom_op,
@@ -27,9 +28,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inputs(tokens: int = 17, channels: int = 12, width: int = 4, batch: int = 1):
-    x = torch.randn(batch, tokens, channels, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+def _inputs(
+    tokens: int = 17,
+    channels: int = 12,
+    width: int = 4,
+    batch: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    x = torch.randn(batch, tokens, channels, device="cuda", dtype=dtype)
+    weight = torch.randn(channels, width, device="cuda", dtype=dtype)
     return x.requires_grad_(), weight.requires_grad_()
 
 
@@ -89,6 +96,96 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
+def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
+    """Use narrower FP32 input-gradient vectors without perturbing BF16 defaults."""
+    fp16 = ShortConvTunedConfig.default(torch.float16)
+    bf16 = ShortConvTunedConfig.default()
+    fp32 = ShortConvTunedConfig.default(torch.float32)
+
+    assert fp16.forward == ShortConvConfig(128, 4, 16)
+    assert fp16.input_gradient == ShortConvConfig(128, 4, 6)
+    assert bf16.input_gradient == ShortConvConfig(128, 4, 10)
+    assert fp32.forward == ShortConvConfig(128, 4, 4)
+    assert fp32.input_gradient == ShortConvConfig(128, 2, 12)
+    assert fp32.weight_gradient == ShortConvConfig(128, 4, 32)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "rounding_allowance", "rtol", "atol"),
+    [
+        (torch.float16, 1e-3, 3e-3, 4e-3),
+        (torch.bfloat16, 8e-3, 3e-2, 3e-2),
+        (torch.float32, 5e-6, 2e-5, 2e-5),
+    ],
+)
+def test_short_conv_supported_dtypes_match_high_precision_reference(
+    dtype: torch.dtype,
+    rounding_allowance: float,
+    rtol: float,
+    atol: float,
+):
+    """Specialize storage while retaining FP32 convolution accumulation."""
+    torch.manual_seed(5)
+    x, weight = _inputs(tokens=17, channels=12, width=4, batch=2, dtype=dtype)
+    initial_state = torch.randn(
+        2,
+        3,
+        12,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    grad_output = torch.randn_like(x)
+
+    actual = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    reference_input = torch.cat((initial_state, x), dim=1)
+    expected = F.silu(
+        F.conv1d(reference_input.transpose(1, 2), weight[:, None], groups=12)
+    ).transpose(1, 2)
+
+    high_x = x.detach().double().requires_grad_()
+    high_weight = weight.detach().double().requires_grad_()
+    high_state = initial_state.detach().double().requires_grad_()
+    high_input = torch.cat((high_state, high_x), dim=1)
+    high_precision = F.silu(
+        F.conv1d(high_input.transpose(1, 2), high_weight[:, None], groups=12)
+    ).transpose(1, 2)
+
+    actual_gradients = torch.autograd.grad(
+        actual,
+        (x, weight, initial_state),
+        grad_output,
+    )
+    expected_gradients = torch.autograd.grad(
+        expected,
+        (x, weight, initial_state),
+        grad_output,
+    )
+    high_gradients = torch.autograd.grad(
+        high_precision,
+        (high_x, high_weight, high_state),
+        grad_output.double(),
+    )
+
+    def relative_l2(value: torch.Tensor, reference: torch.Tensor) -> float:
+        return ((value.double() - reference).norm() / reference.norm()).item()
+
+    actual_error = relative_l2(actual, high_precision)
+    expected_error = relative_l2(expected, high_precision)
+    assert actual_error <= expected_error + rounding_allowance
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    for actual_gradient, expected_gradient, high_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        high_gradients,
+        strict=True,
+    ):
+        actual_error = relative_l2(actual_gradient, high_gradient)
+        expected_error = relative_l2(expected_gradient, high_gradient)
+        assert actual_error <= expected_error + rounding_allowance
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("channels", [5, 6])
@@ -472,15 +569,16 @@ def test_short_conv_fullgraph_forward_and_backward():
     torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
 
 
-def test_short_conv_stateful_fullgraph_forward_and_backward():
-    """Compile the public initial- and final-state contract as one full graph."""
-    x, weight = _inputs(tokens=2, width=5, batch=2)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_short_conv_stateful_fullgraph_forward_and_backward(dtype: torch.dtype):
+    """Compile every storage dtype's initial- and final-state contract as one graph."""
+    x, weight = _inputs(tokens=2, width=5, batch=2, dtype=dtype)
     initial_state = torch.randn(
         2,
         4,
         x.shape[2],
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
         requires_grad=True,
     )
     grad_output = torch.randn_like(x)
