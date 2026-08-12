@@ -54,7 +54,7 @@ from attn_gym.linear.kda.utils import (
     key=["H", "K", "V", "T", "BT"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T", "num_chunks"])
+@triton.jit(do_not_specialize=["T", "num_chunks", "q_stride_t", "q_stride_h"])
 def chunk_gla_fwd_kernel_o(
     q,
     v,
@@ -67,6 +67,8 @@ def chunk_gla_fwd_kernel_o(
     num_chunks,
     scale,
     T,
+    q_stride_t,
+    q_stride_h,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -117,7 +119,7 @@ def chunk_gla_fwd_kernel_o(
     m_tv = m_t[:, None] & m_v[None, :]
     m_s = o_i[:, None] >= o_i[None, :]
 
-    q += ptr_offset((bos, i_h), (H * K, K))
+    q += bos * q_stride_t + i_h * q_stride_h
     g += ptr_offset((bos, i_h), (H * K, K))
     h += ptr_offset((i_tg, i_h), (H * K * V, K * V))
     v += ptr_offset((bos, i_h), (H * V, V))
@@ -129,7 +131,7 @@ def chunk_gla_fwd_kernel_o(
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         m_qg = m_t[:, None] & m_k[None, :]
-        p_q = q + ptr_offset((o_t[:, None], o_k[None, :]), (H * K, 1))
+        p_q = q + o_t[:, None] * q_stride_t + o_k[None, :]
         p_g = g + ptr_offset((o_t[:, None], o_k[None, :]), (H * K, 1))
         p_h = h + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1))
 
@@ -241,7 +243,7 @@ def chunk_gla_fwd_o_gk(
     if h.shape != expected_h_shape:
         raise ValueError(f"h must have shape {expected_h_shape}, got {tuple(h.shape)}")
 
-    output = torch.empty_like(v)
+    output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     if (
         metadata is None
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
@@ -289,6 +291,8 @@ def chunk_gla_fwd_o_gk(
             num_chunks=None if metadata is None else metadata.num_chunks,
             scale=scale,
             T=tokens,
+            q_stride_t=q.stride(1),
+            q_stride_h=q.stride(2),
             H=heads,
             K=key_dim,
             V=value_dim,

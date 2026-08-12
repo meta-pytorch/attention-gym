@@ -18,7 +18,7 @@ import torch
 from cutlass import Boolean, Float32, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
@@ -32,6 +32,11 @@ KEY_DIM = 128  # full head_dim
 KEY_DIM_PER_CTA = 32  # head_dim per K phase
 K_PHASES = KEY_DIM // KEY_DIM_PER_CTA  # four 32-wide head-dim phases
 KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
+# q and k may arrive as unbound QKV views: only their innermost dimension is
+# contiguous, and the 16-byte cp.async stages need every outer stride and the
+# base pointer to be 16-byte (8 bf16 element) aligned.
+_MIN_ALIGN_BYTES = 16
+_MIN_ALIGN_ELEMENTS_BF16 = _MIN_ALIGN_BYTES // 2
 
 # Kernel phase map:
 # 1. Host wrapper validates tensors and prepares caller-owned varlen metadata.
@@ -1997,8 +2002,21 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
             assumed_align=128,
         )
 
-    q = column_token_head(cutlass.BFloat16, KEY_DIM)
-    k = column_token_head(cutlass.BFloat16, KEY_DIM)
+    def strided_column_token_head(dtype, columns: int):
+        """Transposed view of a [1, T, H, columns] input with runtime token/head strides."""
+        return make_fake_tensor(
+            dtype,
+            (columns, tokens, heads),
+            stride=(
+                1,
+                cute.sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                cute.sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+            ),
+            assumed_align=_MIN_ALIGN_BYTES,
+        )
+
+    q = strided_column_token_head(cutlass.BFloat16, KEY_DIM)
+    k = strided_column_token_head(cutlass.BFloat16, KEY_DIM)
     g = column_token_head(cutlass.Float32, KEY_DIM)
     beta = normal(cutlass.Float32, (1, tokens, heads))
     dAqk = column_token_head(cutlass.Float32, BT)
@@ -2151,9 +2169,9 @@ def chunk_kda_bwd_intra(
     # The kernel combines the incoming gradients with its intra-chunk contribution into
     # new output buffers. Beta is different: four K-phase CTAs contribute to every token,
     # so they write FP32 partials to global workspace for a race-free post-launch reduction.
-    dq2 = torch.empty_like(q)
-    dk2 = torch.empty_like(k)
-    dg2 = torch.empty_like(g)
+    dq2 = torch.empty_like(q, memory_format=torch.contiguous_format)
+    dk2 = torch.empty_like(k, memory_format=torch.contiguous_format)
+    dg2 = torch.empty_like(g, memory_format=torch.contiguous_format)
     db_partial = torch.empty(
         K_PHASES,
         tokens,

@@ -48,7 +48,16 @@ from attn_gym.linear.kda.utils import (
     key=["BT", "BC"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T", "num_chunks"])
+@triton.jit(
+    do_not_specialize=[
+        "T",
+        "num_chunks",
+        "q_stride_t",
+        "q_stride_h",
+        "k_stride_t",
+        "k_stride_h",
+    ]
+)
 def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     q,
     k,
@@ -61,6 +70,10 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     chunk_indices,
     num_chunks,
     T,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -114,23 +127,24 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 o_c = i_ti + tl.arange(0, BC)
                 m_c = o_c < T_local
 
-                qkg_base_offset = ptr_offset((bos, i_h), (H * K, K))
-                q_off = q + qkg_base_offset
-                k_off = k + qkg_base_offset
-                g_off = g + qkg_base_offset
+                q_off = q + bos * q_stride_t + i_h * q_stride_h
+                k_off = k + bos * k_stride_t + i_h * k_stride_h
+                g_off = g + ptr_offset((bos, i_h), (H * K, K))
                 beta_off = beta + ptr_offset((bos, i_h), (H, 1))
                 Aqk_off = Aqk + ptr_offset((bos, i_h), (H * BT, BT))
                 Akk_off = Akk + ptr_offset((bos, i_h), (H * BC, BC))
 
                 o_k = tl.arange(0, BK)
                 m_qkg = m_c[:, None] & (o_k[None, :] < K)
-                qkg_offsets = ptr_offset(
+                q_offsets = o_c[:, None] * q_stride_t + o_k[None, :]
+                k_offsets = o_c[:, None] * k_stride_t + o_k[None, :]
+                g_offsets = ptr_offset(
                     (o_c[:, None], o_k[None, :]),
                     (H * K, 1),
                 )
-                b_q = tl.load(q_off + qkg_offsets, mask=m_qkg, other=0.0)
-                b_k = tl.load(k_off + qkg_offsets, mask=m_qkg, other=0.0)
-                b_g = tl.load(g_off + qkg_offsets, mask=m_qkg, other=0.0)
+                b_q = tl.load(q_off + q_offsets, mask=m_qkg, other=0.0)
+                b_k = tl.load(k_off + k_offsets, mask=m_qkg, other=0.0)
+                b_g = tl.load(g_off + g_offsets, mask=m_qkg, other=0.0)
                 b_beta = tl.load(
                     beta_off + ptr_offset((o_c,), (H,)),
                     mask=m_c,

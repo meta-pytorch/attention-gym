@@ -27,7 +27,7 @@ from cutlass.cute.arch import (
 )
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import make_umma_smem_desc, smem_descriptor_to_int
-from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
@@ -2077,20 +2077,27 @@ class ChunkKdaBwdWyDqkgFused:
 
         # ===================== GMEM layouts =====================
         # Token-indexed tensors: (T, dim, (H, data_B))
-        # q, k: (T, K, (H, data_B)) bf16
-        qk_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
-        )
-        q = cute.make_tensor(q_ptr, qk_layout)
-        k = cute.make_tensor(k_ptr, qk_layout)
+        def strided_token_layout(tensor: cute.Tensor, dim: Int32, head_count: Int32):
+            """Rebuild a [B, T, H, D] input as (T, D, (H, data_B)) from its own strides."""
+            return cute.make_layout(
+                (T, dim, (head_count, data_B)),
+                stride=(
+                    tensor.layout.stride[1],
+                    tensor.layout.stride[3],
+                    (tensor.layout.stride[2], tensor.layout.stride[0]),
+                ),
+            )
 
-        # v, v_new, do, dv, dv2: (T, V, (HV, data_B)) bf16
+        # q, k, and v may be unbound QKV views, so each keeps its own runtime
+        # strides; every other token-indexed tensor is compact.
+        q = cute.make_tensor(q_ptr, strided_token_layout(q_in, K, H))
+        k = cute.make_tensor(k_ptr, strided_token_layout(k_in, K, H))
+        v = cute.make_tensor(v_ptr, strided_token_layout(v_in, V, HV))
+
         tv_layout = cute.make_layout(
             (T, V, (HV, data_B)),
             stride=(HV * V, 1, (V, T * HV * V)),
         )
-        v = cute.make_tensor(v_ptr, tv_layout)
         v_new = cute.make_tensor(v_new_ptr, tv_layout)
         do = cute.make_tensor(do_ptr, tv_layout)
         dv = cute.make_tensor(dv_ptr, tv_layout)
@@ -4713,6 +4720,13 @@ class ChunkKdaBwdWyDqkgFused:
         return bSG_sC, bSG_gC
 
 
+# q, k, and v may arrive as unbound QKV views: only their innermost dimension is
+# contiguous, and TMA needs every outer stride and the base pointer to be 16-byte
+# (8 bf16 element) aligned.
+_MIN_ALIGN_BYTES = 16
+_MIN_ALIGN_ELEMENTS_BF16 = _MIN_ALIGN_BYTES // 2
+
+
 class ChunkKdaBwdWyDqkgConfig(NamedTuple):
     """Persistent-grid schedule for fused WY/dQKG backward."""
 
@@ -4746,9 +4760,18 @@ def _compile_chunk_kda_bwd_wy_dqkg(
             assumed_align=128,
         )
 
-    q = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
-    k = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
-    v = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
+    def strided_bf16_tensor(shape):
+        return make_fake_tensor(
+            cutlass.BFloat16,
+            shape,
+            stride=tuple(cute.sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16) for _ in shape[:-1])
+            + (1,),
+            assumed_align=_MIN_ALIGN_BYTES,
+        )
+
+    q = strided_bf16_tensor((1, tokens, heads, head_dim))
+    k = strided_bf16_tensor((1, tokens, heads, head_dim))
+    v = strided_bf16_tensor((1, tokens, heads, head_dim))
     v_new = tensor(cutlass.BFloat16, (1, tokens, heads, head_dim))
     g = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
     beta = tensor(cutlass.Float32, (1, tokens, heads))
@@ -4943,12 +4966,13 @@ def chunk_kda_bwd_wy_dqkg(
         do=do,
         dh=dh,
         dv=dv,
-        dq=torch.empty_like(g),
-        dk=torch.empty_like(g),
-        dv2=torch.empty_like(v),
-        dg=torch.empty_like(g),
-        db=torch.empty_like(beta),
-        dA=torch.empty_like(A, dtype=torch.float32),
+        # Every generated output is compact even when v is a strided QKV view.
+        dq=torch.empty_like(g, memory_format=torch.contiguous_format),
+        dk=torch.empty_like(g, memory_format=torch.contiguous_format),
+        dv2=torch.empty_like(v, memory_format=torch.contiguous_format),
+        dg=torch.empty_like(g, memory_format=torch.contiguous_format),
+        db=torch.empty_like(beta, memory_format=torch.contiguous_format),
+        dA=torch.empty_like(A, dtype=torch.float32, memory_format=torch.contiguous_format),
         cu_seqlens=metadata.cu_seqlens,
         chunk_indices=metadata.chunk_indices,
         chunk_size=chunk_size,

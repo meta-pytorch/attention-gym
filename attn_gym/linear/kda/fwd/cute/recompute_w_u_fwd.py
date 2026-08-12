@@ -61,7 +61,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Boolean, Float32, Int32, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr
 from torch._subclasses.fake_tensor import FakeTensor
 
@@ -1446,22 +1446,22 @@ def _compile_recompute_w_u(
     tokens = cute.sym_int(divisibility=chunk_size)
     sequence_entries, chunks = cute.sym_int(), cute.sym_int()
     tensor_shape = (1, tokens)
-    q = make_fake_compact_tensor(
+    q = make_fake_tensor(
         IO_DTYPE,
         (*tensor_shape, value_heads, key_dim),
-        stride_order=(3, 2, 1, 0),
+        stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
         assumed_align=DATA_ALIGN_BYTES,
     )
-    k = make_fake_compact_tensor(
+    k = make_fake_tensor(
         IO_DTYPE,
         (*tensor_shape, key_heads, key_dim),
-        stride_order=(3, 2, 1, 0),
+        stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
         assumed_align=DATA_ALIGN_BYTES,
     )
-    v = make_fake_compact_tensor(
+    v = make_fake_tensor(
         IO_DTYPE,
         (*tensor_shape, value_heads, value_dim),
-        stride_order=(3, 2, 1, 0),
+        stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
         assumed_align=DATA_ALIGN_BYTES,
     )
     beta = make_fake_compact_tensor(
@@ -1565,6 +1565,7 @@ def _assert_tensor_contract(
     dtype: torch.dtype | tuple[torch.dtype, ...],
     device: torch.device,
     assumed_align: int = DATA_ALIGN_BYTES,
+    require_contiguous: bool = True,
 ) -> None:
     assert tuple(tensor.shape) == shape, (
         f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
@@ -1576,7 +1577,12 @@ def _assert_tensor_contract(
         f"got {tensor.dtype}"
     )
     assert tensor.device == device, f"{name} must be on {device}, got {tensor.device}"
-    assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
+    if require_contiguous:
+        assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
+    else:
+        assert tensor.stride(-1) == 1 and all(
+            stride % 8 == 0 for stride in tensor.stride()[:-1]
+        ), f"{name} must have aligned contiguous rows, got strides {tensor.stride()}"
     assert tensor.data_ptr() % assumed_align == 0, (
         f"{name} data pointer must be {assumed_align}-byte aligned"
     )
@@ -1683,6 +1689,7 @@ def recompute_w_u_fwd(
             shape=(B, T, H_K, KEY_DIM),
             dtype=torch.bfloat16,
             device=device,
+            require_contiguous=False,
         )
         _assert_tensor_contract(
             "v",
@@ -1690,6 +1697,7 @@ def recompute_w_u_fwd(
             shape=(B, T, H_V, VAL_DIM),
             dtype=torch.bfloat16,
             device=device,
+            require_contiguous=False,
         )
         _assert_tensor_contract(
             "beta",
@@ -1712,6 +1720,7 @@ def recompute_w_u_fwd(
                 shape=(B, T, H_V, KEY_DIM),
                 dtype=torch.bfloat16,
                 device=device,
+                require_contiguous=False,
             )
         if gk is not None:
             _assert_tensor_contract(
@@ -1722,10 +1731,10 @@ def recompute_w_u_fwd(
                 device=device,
             )
 
-    # Output allocation — only allocate the outputs we will actually produce.
+    # Generated tensors have a compact ABI independent of the input layouts.
     w = k.new_empty((B, T, H_V, KEY_DIM))
-    u = torch.empty_like(v)
-    qg_out: torch.Tensor | None = torch.empty_like(q) if has_q else None
+    u = v.new_empty((B, T, H_V, VAL_DIM))
+    qg_out: torch.Tensor | None = q.new_empty(q.shape) if has_q and q is not None else None
     kg_out: torch.Tensor | None = k.new_empty((B, T, H_V, KEY_DIM)) if has_gk else None
 
     if isinstance(k, FakeTensor):
@@ -1779,17 +1788,17 @@ def recompute_w_u_fwd(
 
     num_chunks_i = num_chunks.reshape(1)
 
-    # Stubs for optional inputs/outputs — kernel's constexpr branches fully
-    # remove the corresponding loads/stores, but every mX param still needs a
-    # valid tensor with compatible shape (kernel derives tile shapes from them).
-    q_in = q if has_q else v
+    # TVM-FFI validates even constexpr-dead arguments. Reuse compatible compact
+    # generated tensors as allocation-free placeholders when an option is absent;
+    # K=V=128 makes U a valid Q-shaped placeholder.
+    q_in = q if has_q else u
     # gG_full uses mG[*, *, *, K=128]. k has this shape, but its fp32-vs-bf16
     # dtype mismatch is fine because the cp.async and SMEM reads are dead code
     # when has_gk=False. Reusing k avoids a hidden CUDA allocation on the hot
     # optional no-gate path and keeps graph capture allocation-free.
     gk_in = gk if has_gk else k
-    qg_in = qg_out if qg_out is not None else v
-    kg_in = kg_out if kg_out is not None else v
+    qg_in = qg_out if qg_out is not None else w
+    kg_in = kg_out if kg_out is not None else w
 
     a_is_fp32 = A.dtype == torch.float32
     # tf32x3 emulates fp32 by adding first-order residual products; once A is
