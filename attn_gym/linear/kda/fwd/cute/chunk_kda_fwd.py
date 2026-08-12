@@ -9,7 +9,7 @@ import torch
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
-from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_indices
+from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_metadata
 
 _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
@@ -105,14 +105,13 @@ def _chunk_metadata(
     """Construct the internal work map while preserving the caller's layout mode."""
     tokens = q.shape[1]
     chunks = tokens // _CHUNK_SIZE
-    num_chunks = torch.full((), chunks, dtype=torch.int32, device=q.device)
     if cu_seqlens is not None:
-        return ChunkMetadata(
-            cu_seqlens,
-            prepare_complete_chunk_indices(cu_seqlens, tokens, _CHUNK_SIZE),
-            num_chunks,
+        chunk_indices, num_chunks = prepare_complete_chunk_metadata(
+            cu_seqlens, tokens, _CHUNK_SIZE
         )
+        return ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
 
+    num_chunks = torch.full((), chunks, dtype=torch.int32, device=q.device)
     fixed_cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * tokens
     chunk_indices = torch.stack(
         (
@@ -489,6 +488,8 @@ def chunk_kda(
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
+    # TODO: Accept the QKV view's strided token dimension in the forward and
+    # backward CuTe ABIs; only V's innermost dimension needs to be contiguous.
     q, k, v = (tensor.to(torch.bfloat16).contiguous() for tensor in (q, k, v))
     cumulative_gate = cumulative_gate.float().contiguous()
     beta = beta.float().contiguous()

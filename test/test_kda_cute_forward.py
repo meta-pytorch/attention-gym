@@ -29,6 +29,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_custom_op,
     _chunk_kda_fwd_custom_op,
 )
+from attn_gym.linear.kda.utils import prepare_complete_chunk_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -570,6 +571,25 @@ def test_chunk_kda_cuda_graph_replay():
     torch.testing.assert_close(state, expected_state)
     for actual_gradient, expected_gradient in zip(gradients, expected_gradients, strict=True):
         torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_prepare_complete_chunk_metadata_handles_more_sequences_than_threads():
+    """Let each metadata-kernel lane emit multiple logical sequence spans."""
+    num_sequences = 300
+    chunk_counts = torch.arange(num_sequences, device="cuda", dtype=torch.int32) % 4 + 1
+    chunk_offsets = torch.cat((chunk_counts.new_zeros(1), chunk_counts.cumsum(0)))
+    cu_seqlens = chunk_offsets * 64
+    total_chunks = int(chunk_offsets[-1])
+    chunk_indices, num_chunks = prepare_complete_chunk_metadata(cu_seqlens, 64 * total_chunks, 64)
+
+    sequence_indices = torch.arange(
+        num_sequences, device="cuda", dtype=torch.int32
+    ).repeat_interleave(chunk_counts)
+    local_chunks = torch.arange(total_chunks, device="cuda", dtype=torch.int32)
+    local_chunks -= chunk_offsets[:-1].repeat_interleave(chunk_counts)
+    expected = torch.stack((sequence_indices, local_chunks), dim=1)
+    torch.testing.assert_close(chunk_indices, expected)
+    assert num_chunks.item() == total_chunks
 
 
 def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():
