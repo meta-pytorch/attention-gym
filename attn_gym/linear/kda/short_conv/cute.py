@@ -1246,17 +1246,13 @@ class CausalConv1dSiluInputGradientTma(
                     current.fill(self.dtype.cute_type(0.0))
                     incoming.fill(Float32(0.0))
                     if output_time < self.tokens:
-                        if cutlass.const_expr(cu_seqlens is not None):
-                            previous_sequence = sequence
-                            previous_sequence_start = sequence_start
-                            sequence, sequence_start, sequence_end = advance_sequence_bounds(
-                                cu_seqlens,
-                                sequence,
-                                sequence_start,
-                                sequence_end,
-                                Int32(output_time),
-                            )
-                            if sequence != previous_sequence:
+                        if cutlass.const_expr(cu_seqlens is not None):  # noqa: SIM102
+                            if output_time >= sequence_end:
+                                previous_sequence_start = sequence_start
+                                sequence, sequence_start, sequence_end = sequence_bounds(
+                                    cu_seqlens,
+                                    Int32(output_time),
+                                )
                                 self.flush_mainloop_sequence(
                                     grad_z,
                                     weights,
@@ -1321,7 +1317,6 @@ class CausalConv1dSiluInputGradientTma(
 
         if channel < self.channels:
             # A boundary in the lookahead belongs to the next CTA; zero-fill this CTA's tail.
-            tail_finished = Int32(0)
             for tail in cutlass.range_constexpr(self.width - 1):
                 output_offset = self.times_per_block + tail
                 output_time = time_start + output_offset
@@ -1335,36 +1330,20 @@ class CausalConv1dSiluInputGradientTma(
                 )
                 current.fill(self.dtype.cute_type(0.0))
                 incoming.fill(Float32(0.0))
-                if output_time < self.tokens and tail_finished == 0:
-                    if cutlass.const_expr(cu_seqlens is not None):
-                        next_sequence, next_start, next_end = advance_sequence_bounds(
-                            cu_seqlens,
-                            sequence,
-                            sequence_start,
-                            sequence_end,
-                            Int32(output_time),
-                        )
-                        if next_sequence != sequence:
-                            tail_finished = Int32(1)
-                        else:
-                            sequence, sequence_start, sequence_end = (
-                                next_sequence,
-                                next_start,
-                                next_end,
-                            )
-                    if tail_finished == 0:
-                        current.store(
-                            x_groups[
-                                ((0, None), (batch * self.tokens + output_time, channel_group))
-                            ].load()
-                        )
-                        incoming.store(
-                            dy_groups[
-                                ((0, None), (batch * self.tokens + output_time, channel_group))
-                            ]
-                            .load()
-                            .to(Float32)
-                        )
+                has_input = output_time < self.tokens
+                if cutlass.const_expr(cu_seqlens is not None):
+                    has_input = has_input and output_time < sequence_end
+                if has_input:
+                    current.store(
+                        x_groups[
+                            ((0, None), (batch * self.tokens + output_time, channel_group))
+                        ].load()
+                    )
+                    incoming.store(
+                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                        .load()
+                        .to(Float32)
+                    )
                 self.advance_token(
                     current,
                     incoming,
@@ -1549,16 +1528,12 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                 for slot in cutlass.range_constexpr(stage_tokens):
                     time = time_start + subtile * stage_tokens + slot
                     if time < self.tokens:
-                        if cutlass.const_expr(cu_seqlens is not None):
-                            previous_sequence = sequence
-                            sequence, sequence_start, sequence_end = advance_sequence_bounds(
-                                cu_seqlens,
-                                sequence,
-                                sequence_start,
-                                sequence_end,
-                                Int32(time),
-                            )
-                            if sequence != previous_sequence:
+                        if cutlass.const_expr(cu_seqlens is not None):  # noqa: SIM102
+                            if time >= sequence_end:
+                                sequence, sequence_start, sequence_end = sequence_bounds(
+                                    cu_seqlens,
+                                    Int32(time),
+                                )
                                 if cutlass.const_expr(initial_state is None):
                                     history.fill(self.dtype.cute_type(0.0))
                                 else:
