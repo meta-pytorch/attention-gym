@@ -235,13 +235,29 @@ def test_short_conv_tma_backward_matches_batched_reference(
 ):
     """Exercise aligned dense batches through the selected TMA schedules."""
     torch.manual_seed(7)
-    x, weight = _inputs(tokens=32, channels=256, width=width, batch=2, dtype=dtype)
+    x, weight = _inputs(tokens=384, channels=256, width=width, batch=2, dtype=dtype)
     grad_output = torch.randn_like(x)
 
     actual = cute_causal_conv1d_silu(x, weight)
     expected = _reference(x, weight)
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    match dtype:
+        case torch.float16 | torch.bfloat16:
+            fallback_input = ShortConvConfig(128, 1, 28)
+            fallback_weight = ShortConvConfig(128, 4, 128)
+        case torch.float32:
+            fallback_input = ShortConvConfig(128, 2, 12)
+            fallback_weight = ShortConvConfig(128, 4, 32)
+        case _:
+            raise AssertionError(f"unexpected dtype {dtype}")
+    fallback_gradients = cute_backend._launch_backward(
+        x,
+        weight,
+        grad_output,
+        fallback_input,
+        fallback_weight,
+    )
 
     tolerance = 1e-4 if dtype == torch.float32 else 3e-2
     weight_atol = 2e-4 if dtype == torch.float32 else 2e-1
@@ -255,6 +271,15 @@ def test_short_conv_tma_backward_matches_batched_reference(
     torch.testing.assert_close(
         actual_gradients[1],
         expected_gradients[1],
+        rtol=tolerance,
+        atol=weight_atol,
+    )
+    # dx keeps the same per-token reduction tree. dw changes partial boundaries and therefore
+    # follows the dtype tolerance rather than a bitwise contract.
+    assert torch.equal(actual_gradients[0], fallback_gradients[0])
+    torch.testing.assert_close(
+        actual_gradients[1],
+        fallback_gradients[1],
         rtol=tolerance,
         atol=weight_atol,
     )

@@ -55,18 +55,6 @@ class ShortConvConfig:
     times_per_block: int
 
 
-TMA_INPUT_GRADIENT_CONFIGS = {
-    "fp16": ShortConvConfig(128, 2, 32),
-    "bf16": ShortConvConfig(128, 2, 32),
-}
-
-TMA_WEIGHT_GRADIENT_CONFIGS = {
-    "fp16": ShortConvConfig(128, 2, 64),
-    "bf16": ShortConvConfig(128, 2, 64),
-    "fp32": ShortConvConfig(128, 2, 160),
-}
-
-
 @dataclass(frozen=True)
 class ShortConvTunedConfig:
     """Selected specializations for forward and both first-order gradients."""
@@ -84,45 +72,36 @@ class ShortConvTunedConfig:
         stateful: bool = False,
     ) -> ShortConvTunedConfig:
         """Return measured GB300 defaults for one storage dtype and layout mode."""
-        if dtype == torch.float16:
-            if packed:
-                input_gradient = ShortConvConfig(128, 4, 6)
-                weight_gradient = ShortConvConfig(128, 4, 128)
-            elif stateful:
-                input_gradient = ShortConvConfig(128, 1, 28)
-                weight_gradient = ShortConvConfig(128, 4, 128)
-            else:
-                input_gradient = TMA_INPUT_GRADIENT_CONFIGS["fp16"]
-                weight_gradient = TMA_WEIGHT_GRADIENT_CONFIGS["fp16"]
-            return cls(
-                ShortConvConfig(128, 4, 16),
-                input_gradient,
-                weight_gradient,
-            )
-        if dtype == torch.float32:
-            return cls(
-                ShortConvConfig(128, 4, 4),
-                ShortConvConfig(128, 2, 12),
-                ShortConvConfig(128, 4, 32)
-                if packed or stateful
-                else TMA_WEIGHT_GRADIENT_CONFIGS["fp32"],
-            )
-        if dtype != torch.bfloat16:
-            raise ValueError(f"unsupported short-convolution dtype {dtype}")
-        if packed:
-            input_gradient = ShortConvConfig(128, 4, 10)
-            weight_gradient = ShortConvConfig(128, 4, 128)
-        elif stateful:
-            input_gradient = ShortConvConfig(128, 1, 28)
-            weight_gradient = ShortConvConfig(128, 4, 128)
-        else:
-            input_gradient = TMA_INPUT_GRADIENT_CONFIGS["bf16"]
-            weight_gradient = TMA_WEIGHT_GRADIENT_CONFIGS["bf16"]
-        return cls(
-            ShortConvConfig(128, 4, 16),
-            input_gradient,
-            weight_gradient,
-        )
+        match dtype:
+            case torch.float16:
+                forward = ShortConvConfig(128, 4, 16)
+                match packed, stateful:
+                    case True, _:
+                        gradients = ShortConvConfig(128, 4, 6), ShortConvConfig(128, 4, 128)
+                    case False, True:
+                        gradients = ShortConvConfig(128, 1, 28), ShortConvConfig(128, 4, 128)
+                    case False, False:
+                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
+            case torch.bfloat16:
+                forward = ShortConvConfig(128, 4, 16)
+                match packed, stateful:
+                    case True, _:
+                        gradients = ShortConvConfig(128, 4, 10), ShortConvConfig(128, 4, 128)
+                    case False, True:
+                        gradients = ShortConvConfig(128, 1, 28), ShortConvConfig(128, 4, 128)
+                    case False, False:
+                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
+            case torch.float32:
+                forward = ShortConvConfig(128, 4, 4)
+                gradients = (
+                    ShortConvConfig(128, 2, 12),
+                    ShortConvConfig(128, 4, 32)
+                    if packed or stateful
+                    else ShortConvConfig(128, 2, 160),
+                )
+            case _:
+                raise ValueError(f"unsupported short-convolution dtype {dtype}")
+        return cls(forward, *gradients)
 
 
 @cute.jit
@@ -834,6 +813,37 @@ class ShortConvTmaKernel:
         )
 
     @cute.jit
+    def load_input_taps(self, history: cute.Tensor, current: cute.Tensor):
+        """Append the current per-channel fragment to the FP32 convolution window."""
+        input_taps = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.width),
+            Float32,
+        )
+        if cutlass.const_expr(self.dtype.name == "fp32"):
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width - 1):
+                    input_taps[channel_offset, tap] = history[channel_offset, tap].to(Float32)
+                input_taps[channel_offset, self.width - 1] = current[channel_offset].to(Float32)
+        else:
+            for tap in cutlass.range_constexpr(self.width - 1):
+                input_taps[(None, tap)].store(history[(None, tap)].load().to(Float32))
+            input_taps[(None, self.width - 1)].store(current.load().to(Float32))
+        return input_taps
+
+    @cute.jit
+    def advance_history(self, history: cute.Tensor, current: cute.Tensor):
+        """Shift a raw-input register window and append one channel fragment."""
+        if cutlass.const_expr(self.dtype.name == "fp32"):
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width - 2):
+                    history[channel_offset, tap] = history[channel_offset, tap + 1]
+                history[channel_offset, self.width - 2] = current[channel_offset]
+        else:
+            for tap in cutlass.range_constexpr(self.width - 2):
+                history[(None, tap)].store(history[(None, tap + 1)].load())
+            history[(None, self.width - 2)].store(current.load())
+
+    @cute.jit
     def make_pipeline(
         self,
         tidx: Int32,
@@ -968,6 +978,54 @@ class CausalConv1dSiluInputGradientTma(
 ):
     """Stream dense input gradients from TMA-staged input and output-gradient tiles."""
 
+    @cute.jit
+    def advance_token(
+        self,
+        current: cute.Tensor,
+        incoming: cute.Tensor,
+        weights: cute.Tensor,
+        history: cute.Tensor,
+        grad_z: cute.Tensor,
+        grad_x_groups: cute.Tensor,
+        batch: Int32,
+        channel_group: Int32,
+        output_time: Int32,
+        emit_gradient: cutlass.Constexpr,
+    ):
+        """Advance one convolution window and optionally emit its completed input gradient."""
+        input_taps = self.load_input_taps(history, current)
+        value = (input_taps.load() * weights.load()).reduce(
+            cute.ReductionOp.ADD,
+            Float32(0.0),
+            reduction_profile=(None, 1),
+        )
+        for tap in cutlass.range_constexpr(self.width - 1):
+            grad_z[(None, tap)].store(grad_z[(None, tap + 1)].load())
+        grad_z[(None, self.width - 1)].store(incoming.load() * self.d_activation(value))
+
+        if cutlass.const_expr(emit_gradient):
+            products = cute.make_rmem_tensor(
+                (self.channels_per_thread, self.width),
+                Float32,
+            )
+            for future_offset in cutlass.range_constexpr(self.width):
+                products[(None, future_offset)].store(
+                    grad_z[(None, future_offset)].load()
+                    * weights[(None, self.width - 1 - future_offset)].load()
+                )
+            dx_value = products.load().reduce(
+                cute.ReductionOp.ADD,
+                Float32(0.0),
+                reduction_profile=(None, 1),
+            )
+            input_time = output_time - (self.width - 1)
+            if input_time < self.tokens:
+                grad_x_groups[
+                    ((0, None), (batch * self.tokens + input_time, channel_group))
+                ].store(dx_value.to(self.dtype.cute_type))
+
+        self.advance_history(history, current)
+
     @cute.kernel
     def tma_kernel(
         self,
@@ -1026,6 +1084,11 @@ class CausalConv1dSiluInputGradientTma(
                 )
                 producer_state.advance()
 
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
+        dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
+        sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
+        sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
         weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
         history = cute.make_rmem_tensor(
             (self.channels_per_thread, self.width - 1),
@@ -1038,18 +1101,18 @@ class CausalConv1dSiluInputGradientTma(
         weights.fill(Float32(0.0))
         history.fill(self.dtype.cute_type(0.0))
         grad_z.fill(Float32(0.0))
-        local_channel = tidx * self.channels_per_thread
         if channel < self.channels:
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
                     weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
-                for history_offset in cutlass.range_constexpr(self.width - 1):
-                    history_time = time_start + history_offset - (self.width - 1)
-                    if history_time >= 0:
-                        history[channel_offset, history_offset] = x[
-                            batch * self.tokens + history_time,
-                            channel + channel_offset,
-                        ]
+            for history_offset in cutlass.range_constexpr(self.width - 1):
+                history_time = time_start + history_offset - (self.width - 1)
+                if history_time >= 0:
+                    history[(None, history_offset)].store(
+                        x_groups[
+                            ((0, None), (batch * self.tokens + history_time, channel_group))
+                        ].load()
+                    )
 
         for subtile in cutlass.range_constexpr(subtiles):
             tile_pipeline.consumer_wait(consumer_state)
@@ -1069,63 +1132,22 @@ class CausalConv1dSiluInputGradientTma(
                     current.fill(self.dtype.cute_type(0.0))
                     incoming.fill(Float32(0.0))
                     if output_time < self.tokens:
-                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                            current[channel_offset] = sX[
-                                slot, local_channel + channel_offset, stage
-                            ]
-                            incoming[channel_offset] = sD[
-                                slot, local_channel + channel_offset, stage
-                            ].to(Float32)
-                    input_taps = cute.make_rmem_tensor(
-                        (self.channels_per_thread, self.width),
-                        Float32,
-                    )
-                    for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                        for tap in cutlass.range_constexpr(self.width - 1):
-                            input_taps[channel_offset, tap] = history[channel_offset, tap].to(
-                                Float32
-                            )
-                        input_taps[channel_offset, self.width - 1] = current[channel_offset].to(
-                            Float32
+                        current.store(sX_groups[((0, None, 0), (slot, tidx, stage))].load())
+                        incoming.store(
+                            sD_groups[((0, None, 0), (slot, tidx, stage))].load().to(Float32)
                         )
-                    value = (input_taps.load() * weights.load()).reduce(
-                        cute.ReductionOp.ADD,
-                        Float32(0.0),
-                        reduction_profile=(None, 1),
+                    self.advance_token(
+                        current,
+                        incoming,
+                        weights,
+                        history,
+                        grad_z,
+                        dx_groups,
+                        batch,
+                        channel_group,
+                        output_time,
+                        output_offset >= self.width - 1,
                     )
-                    for tap in cutlass.range_constexpr(self.width - 1):
-                        grad_z[(None, tap)].store(grad_z[(None, tap + 1)].load())
-                    grad_z[(None, self.width - 1)].store(
-                        incoming.load() * self.d_activation(value)
-                    )
-                    if cutlass.const_expr(output_offset >= self.width - 1):
-                        products = cute.make_rmem_tensor(
-                            (self.channels_per_thread, self.width),
-                            Float32,
-                        )
-                        for future_offset in cutlass.range_constexpr(self.width):
-                            products[(None, future_offset)].store(
-                                grad_z[(None, future_offset)].load()
-                                * weights[(None, self.width - 1 - future_offset)].load()
-                            )
-                        dx_value = products.load().reduce(
-                            cute.ReductionOp.ADD,
-                            Float32(0.0),
-                            reduction_profile=(None, 1),
-                        )
-                        input_time = output_time - (self.width - 1)
-                        if input_time < self.tokens:
-                            for channel_offset in cutlass.range_constexpr(
-                                self.channels_per_thread
-                            ):
-                                grad_x[
-                                    batch * self.tokens + input_time,
-                                    channel + channel_offset,
-                                ] = dx_value[channel_offset].to(self.dtype.cute_type)
-                    for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                        for tap in cutlass.range_constexpr(self.width - 2):
-                            history[channel_offset, tap] = history[channel_offset, tap + 1]
-                        history[channel_offset, self.width - 2] = current[channel_offset]
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
             tile_pipeline.consumer_release(consumer_state)
@@ -1160,58 +1182,28 @@ class CausalConv1dSiluInputGradientTma(
                 current.fill(self.dtype.cute_type(0.0))
                 incoming.fill(Float32(0.0))
                 if output_time < self.tokens:
-                    for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                        current[channel_offset] = x[
-                            batch * self.tokens + output_time,
-                            channel + channel_offset,
-                        ]
-                        incoming[channel_offset] = grad_output[
-                            batch * self.tokens + output_time,
-                            channel + channel_offset,
-                        ].to(Float32)
-                input_taps = cute.make_rmem_tensor(
-                    (self.channels_per_thread, self.width),
-                    Float32,
-                )
-                for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                    for tap in cutlass.range_constexpr(self.width - 1):
-                        input_taps[channel_offset, tap] = history[channel_offset, tap].to(Float32)
-                    input_taps[channel_offset, self.width - 1] = current[channel_offset].to(
-                        Float32
+                    current.store(
+                        x_groups[
+                            ((0, None), (batch * self.tokens + output_time, channel_group))
+                        ].load()
                     )
-                value = (input_taps.load() * weights.load()).reduce(
-                    cute.ReductionOp.ADD,
-                    Float32(0.0),
-                    reduction_profile=(None, 1),
-                )
-                for tap in cutlass.range_constexpr(self.width - 1):
-                    grad_z[(None, tap)].store(grad_z[(None, tap + 1)].load())
-                grad_z[(None, self.width - 1)].store(incoming.load() * self.d_activation(value))
-                products = cute.make_rmem_tensor(
-                    (self.channels_per_thread, self.width),
-                    Float32,
-                )
-                for future_offset in cutlass.range_constexpr(self.width):
-                    products[(None, future_offset)].store(
-                        grad_z[(None, future_offset)].load()
-                        * weights[(None, self.width - 1 - future_offset)].load()
+                    incoming.store(
+                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                        .load()
+                        .to(Float32)
                     )
-                dx_value = products.load().reduce(
-                    cute.ReductionOp.ADD,
-                    Float32(0.0),
-                    reduction_profile=(None, 1),
+                self.advance_token(
+                    current,
+                    incoming,
+                    weights,
+                    history,
+                    grad_z,
+                    dx_groups,
+                    batch,
+                    channel_group,
+                    output_time,
+                    True,
                 )
-                input_time = output_time - (self.width - 1)
-                if input_time < self.tokens:
-                    for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                        grad_x[
-                            batch * self.tokens + input_time,
-                            channel + channel_offset,
-                        ] = dx_value[channel_offset].to(self.dtype.cute_type)
-                for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                    for tap in cutlass.range_constexpr(self.width - 2):
-                        history[channel_offset, tap] = history[channel_offset, tap + 1]
-                    history[channel_offset, self.width - 2] = current[channel_offset]
 
     @cute.jit
     def __call__(
@@ -1317,6 +1309,9 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                 )
                 producer_state.advance()
 
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
+        sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
         weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
         accumulators = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
         history = cute.make_rmem_tensor(
@@ -1326,18 +1321,25 @@ class CausalConv1dSiluWeightGradientPartialsTma(
         weights.fill(Float32(0.0))
         accumulators.fill(Float32(0.0))
         history.fill(self.dtype.cute_type(0.0))
-        local_channel = tidx * self.channels_per_thread
         if channel < self.channels:
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
                     weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
-                for history_offset in cutlass.range_constexpr(self.width - 1):
-                    history_time = time_start + history_offset - (self.width - 1)
-                    if history_time >= 0:
-                        history[channel_offset, history_offset] = x[
-                            batch * self.tokens + history_time,
-                            channel + channel_offset,
-                        ]
+            for history_offset in cutlass.range_constexpr(self.width - 1):
+                history_time = time_start + history_offset - (self.width - 1)
+                if history_time >= 0:
+                    if cutlass.const_expr(self.dtype.name == "fp32"):
+                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                            history[channel_offset, history_offset] = x[
+                                batch * self.tokens + history_time,
+                                channel + channel_offset,
+                            ]
+                    else:
+                        history[(None, history_offset)].store(
+                            x_groups[
+                                ((0, None), (batch * self.tokens + history_time, channel_group))
+                            ].load()
+                        )
 
         for subtile in cutlass.range_constexpr(subtiles):
             tile_pipeline.consumer_wait(consumer_state)
@@ -1346,17 +1348,22 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                 for slot in cutlass.range_constexpr(stage_tokens):
                     time = time_start + subtile * stage_tokens + slot
                     if time < self.tokens:
-                        input_taps = cute.make_rmem_tensor(
-                            (self.channels_per_thread, self.width),
-                            Float32,
+                        current = cute.make_rmem_tensor(
+                            (self.channels_per_thread,),
+                            self.dtype.cute_type,
                         )
-                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                            for tap in cutlass.range_constexpr(self.width - 1):
-                                input_taps[channel_offset, tap] = history[channel_offset, tap].to(
-                                    Float32
-                                )
-                            current = sX[slot, local_channel + channel_offset, stage]
-                            input_taps[channel_offset, self.width - 1] = current.to(Float32)
+                        if cutlass.const_expr(self.dtype.name == "fp32"):
+                            for channel_offset in cutlass.range_constexpr(
+                                self.channels_per_thread
+                            ):
+                                current[channel_offset] = sX[
+                                    slot,
+                                    tidx * self.channels_per_thread + channel_offset,
+                                    stage,
+                                ]
+                        else:
+                            current.store(sX_groups[((0, None, 0), (slot, tidx, stage))].load())
+                        input_taps = self.load_input_taps(history, current)
                         value = (input_taps.load() * weights.load()).reduce(
                             cute.ReductionOp.ADD,
                             Float32(0.0),
@@ -1366,22 +1373,26 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                             (self.channels_per_thread,),
                             Float32,
                         )
-                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                            incoming[channel_offset] = sD[
-                                slot, local_channel + channel_offset, stage
-                            ].to(Float32)
+                        if cutlass.const_expr(self.dtype.name == "fp32"):
+                            for channel_offset in cutlass.range_constexpr(
+                                self.channels_per_thread
+                            ):
+                                incoming[channel_offset] = sD[
+                                    slot,
+                                    tidx * self.channels_per_thread + channel_offset,
+                                    stage,
+                                ].to(Float32)
+                        else:
+                            incoming.store(
+                                sD_groups[((0, None, 0), (slot, tidx, stage))].load().to(Float32)
+                            )
                         grad_z = incoming.load() * self.d_activation(value)
                         for tap in cutlass.range_constexpr(self.width):
                             accumulators[(None, tap)].store(
                                 accumulators[(None, tap)].load()
                                 + grad_z * input_taps[(None, tap)].load()
                             )
-                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                            for tap in cutlass.range_constexpr(self.width - 2):
-                                history[channel_offset, tap] = history[channel_offset, tap + 1]
-                            history[channel_offset, self.width - 2] = sX[
-                                slot, local_channel + channel_offset, stage
-                            ]
+                        self.advance_history(history, current)
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
             tile_pipeline.consumer_release(consumer_state)
@@ -1671,6 +1682,19 @@ def _compile_forward(
     )
 
 
+def tuned_config(dtype: ShortConvDType) -> ShortConvTunedConfig:
+    """Resolve measured dense defaults from a compile-time storage descriptor."""
+    match dtype.name:
+        case "fp16":
+            return ShortConvTunedConfig.default(torch.float16)
+        case "bf16":
+            return ShortConvTunedConfig.default(torch.bfloat16)
+        case "fp32":
+            return ShortConvTunedConfig.default(torch.float32)
+        case _:
+            raise ValueError(f"unsupported short-convolution dtype {dtype.name}")
+
+
 def supports_tma(
     operation_type: type[ShortConvTmaKernel],
     config: ShortConvConfig,
@@ -1707,7 +1731,7 @@ def _compile_input_gradient(
     use_tma = supports_tma(
         CausalConv1dSiluInputGradientTma,
         config,
-        TMA_INPUT_GRADIENT_CONFIGS.get(dtype.name),
+        None if dtype.name == "fp32" else tuned_config(dtype).input_gradient,
         tokens,
         channels,
         width,
@@ -1755,7 +1779,7 @@ def _compile_weight_gradient(
     use_tma = supports_tma(
         CausalConv1dSiluWeightGradientPartialsTma,
         config,
-        TMA_WEIGHT_GRADIENT_CONFIGS.get(dtype.name),
+        tuned_config(dtype).weight_gradient,
         tokens,
         channels,
         width,
