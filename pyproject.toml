@@ -67,6 +67,7 @@ source = "vcs"
 # ---------- PYTEST ------------
 [tool.pytest.ini_options]
 testpaths = ["test"]
+markers = ["full_autotune: exercise every production Triton autotuning candidate"]
 
 # ---------- RUFF ------------
 [tool.ruff]

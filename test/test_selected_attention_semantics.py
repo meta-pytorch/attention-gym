@@ -18,6 +18,8 @@ if torch.cuda.is_available():
 
 BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
+pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+
 
 @pytest.fixture
 def shared_kv_blackwell_inputs():
@@ -452,8 +454,10 @@ def test_eager_bfloat16_mixed_precision_schedule():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
 @pytest.mark.parametrize(
     "num_repeats,sliding_window_size",
-    [(2, 0), (3, 4)],
-    ids=["sparse-only", "joint"],
+    [
+        pytest.param(2, 0, id="sparse-only"),
+        pytest.param(3, 4, id="joint", marks=pytest.mark.full_autotune),
+    ],
 )
 def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     """Repeated indices should produce identical results in eager and triton."""
@@ -537,6 +541,7 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.full_autotune
 def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
     """The default atomic shared-KV path matches eager forward and gradients."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
@@ -606,6 +611,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
 
 
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.full_autotune
 def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
     """Deterministic mode retains the output-owned shared-KV backward schedule."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
