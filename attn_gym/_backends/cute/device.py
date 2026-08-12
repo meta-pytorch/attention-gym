@@ -8,7 +8,26 @@
 
 from __future__ import annotations
 
-from cutlass import Float32, cute
+from cutlass import Float32, Int32, cute
+
+
+@cute.jit
+def upper_bound(
+    values: cute.Tensor,
+    query: Int32,
+    begin: Int32,
+    end: Int32,
+) -> Int32:
+    """Return the first index in ``[begin, end)`` whose value exceeds ``query``."""
+    low = begin
+    high = end
+    while low < high:
+        middle = (low + high) // 2
+        if Int32(values[middle]) <= query:
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 @cute.jit
@@ -38,4 +57,4 @@ def cta_reduce_sum(value: Float32, warp_partials: cute.Tensor) -> Float32:
     return cta_sum
 
 
-__all__ = ["cta_reduce_sum"]
+__all__ = ["cta_reduce_sum", "upper_bound"]
