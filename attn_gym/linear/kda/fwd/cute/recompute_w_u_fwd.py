@@ -67,6 +67,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
+from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
 # Constants
@@ -1586,11 +1587,9 @@ def recompute_w_u_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
+    metadata: ChunkMetadata,
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    chunk_indices: torch.Tensor | None = None,
-    num_chunks: torch.Tensor | None = None,
     chunk_size: int = BT,
     dot_precision: str | MmaPrecision = "bf16",
     experimental_prefetch: bool = True,
@@ -1606,8 +1605,8 @@ def recompute_w_u_fwd(
     Recompute KDA W/U intermediates on the native CuTe path.
 
     Supported scope: varlen B=1, full chunks, chunk_size=64, K=V=128. The
-    caller must provide cu_seqlens, chunk_indices, and num_chunks. num_chunks is
-    a CUDA scalar tensor read by the kernel at runtime, not specialized by
+    caller must provide chunk metadata. Its num_chunks field is a CUDA scalar
+    tensor read by the kernel at runtime, not specialized by
     value, which keeps padded CUDA graph replay from recompiling when the active
     chunk count changes.
 
@@ -1650,7 +1649,9 @@ def recompute_w_u_fwd(
     V = v.shape[3]
     device = k.device
     assert B == 1, f"recompute_w_u_fwd requires B=1, got B={B}"
-    assert cu_seqlens is not None, "recompute_w_u_fwd requires cu_seqlens (varlen path only)"
+    cu_seqlens = metadata.cu_seqlens
+    chunk_indices = metadata.chunk_indices
+    num_chunks = metadata.num_chunks
     assert T % BT == 0, f"recompute_w_u_fwd requires T % BT == 0 (T={T}, BT={BT})"
     assert K == KEY_DIM, f"recompute_w_u_fwd requires head_dim K={KEY_DIM}, got {K}"
     assert V == VAL_DIM, f"recompute_w_u_fwd requires head_dim V={VAL_DIM}, got {V}"

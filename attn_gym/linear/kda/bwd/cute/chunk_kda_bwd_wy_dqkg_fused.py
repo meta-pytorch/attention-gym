@@ -33,6 +33,7 @@ from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
 # Inlined SM100 tcgen05 helper wrappers
@@ -4735,7 +4736,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         grid_waves=grid_waves,
         use_fast_math=fastmath,
     )
-    tokens, chunks = cute.sym_int(), cute.sym_int()
+    tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
 
     def tensor(dtype, shape):
         return make_fake_compact_tensor(
@@ -4762,7 +4763,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     dg = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
     db = tensor(cutlass.Float32, (1, tokens, heads))
     dA = tensor(cutlass.Float32, (1, tokens, heads, chunk_size))
-    cu_seqlens = tensor(cutlass.Int32, (2,))
+    cu_seqlens = tensor(cutlass.Int32, (sequences,))
     chunk_indices = tensor(cutlass.Int32, (chunks, 2))
     return compile_tvm_ffi(
         op,
@@ -4855,7 +4856,8 @@ class ChunkKdaBwdWyDqkgTunable:
         torch.Tensor,
     ]:
         del config
-        batch, tokens, heads, head_dim = args.q.shape
+        _batch, tokens, heads, head_dim = args.q.shape
+        sequences = args.cu_seqlens.shape[0] - 1
         compiled(
             args.q,
             args.k,
@@ -4877,7 +4879,7 @@ class ChunkKdaBwdWyDqkgTunable:
             args.cu_seqlens,
             args.chunk_indices,
             (
-                Int32(batch),
+                Int32(sequences),
                 Int32(tokens),
                 Int32(heads),
                 Int32(heads),
@@ -4901,8 +4903,7 @@ def chunk_kda_bwd_wy_dqkg(
     do: torch.Tensor,
     dh: torch.Tensor,
     dv: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    chunk_indices: torch.Tensor,
+    metadata: ChunkMetadata,
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
@@ -4917,7 +4918,7 @@ def chunk_kda_bwd_wy_dqkg(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run or tune the fixed-length fused WY/dQKG backward stage."""
+    """Run or tune the metadata-driven fused WY/dQKG backward stage."""
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != 128 or v.shape[-1] != 128:
         raise ValueError("the fused WY backward requires B=1 and K=V=128")
@@ -4948,8 +4949,8 @@ def chunk_kda_bwd_wy_dqkg(
         dg=torch.empty_like(g),
         db=torch.empty_like(beta),
         dA=torch.empty_like(A, dtype=torch.float32),
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        cu_seqlens=metadata.cu_seqlens,
+        chunk_indices=metadata.chunk_indices,
         chunk_size=chunk_size,
         fastmath=fastmath,
     )

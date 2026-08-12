@@ -1,4 +1,4 @@
-"""Composed fixed-length Blackwell KDA core backward."""
+"""Composed fixed-length and packed Blackwell KDA core backward."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from attn_gym.linear.kda.utils import ChunkMetadata
 
 
 def chunk_kda_bwd(
@@ -30,9 +31,7 @@ def chunk_kda_bwd(
     do: torch.Tensor,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    chunk_indices: torch.Tensor,
-    num_chunks: torch.Tensor,
+    metadata: ChunkMetadata,
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
@@ -45,7 +44,7 @@ def chunk_kda_bwd(
     torch.Tensor,
     torch.Tensor | None,
 ]:
-    """Differentiate the optimized fixed-length KDA core pipeline."""
+    """Differentiate the optimized fixed-length or packed KDA core pipeline."""
     batch, tokens, _heads, head_dim = q.shape
     value_dim = v.shape[-1]
     if batch != 1 or head_dim != 128 or value_dim != 128:
@@ -71,9 +70,7 @@ def chunk_kda_bwd(
             beta=beta,
             A=Akk,
             gk=g,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            num_chunks=num_chunks,
+            metadata=metadata,
             chunk_size=chunk_size,
         )
     assert w is not None and qg is not None and kg is not None
@@ -86,6 +83,7 @@ def chunk_kda_bwd(
             initial_state,
             chunk_size=chunk_size,
             output_final_state=False,
+            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
         )
     del u
 
@@ -96,6 +94,7 @@ def chunk_kda_bwd(
             do,
             head_dim**-0.5,
             chunk_size=chunk_size,
+            metadata=metadata if metadata.has_multiple_sequences else None,
         )
     with record("kda/cute/backward_delta_h"):
         dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dispatch(
@@ -108,7 +107,19 @@ def chunk_kda_bwd(
             h0=initial_state,
             dht=d_final_state,
             scale=head_dim**-0.5,
+            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
             chunk_size=chunk_size,
+            chunk_offsets=(
+                metadata.cu_seqlens // chunk_size if metadata.has_multiple_sequences else None
+            ),
+            num_seqs=(
+                metadata.cu_seqlens.new_full((1,), metadata.cu_seqlens.shape[0] - 1)
+                if metadata.has_multiple_sequences
+                else None
+            ),
+            num_chunks=metadata.chunk_indices.shape[0]
+            if metadata.has_multiple_sequences
+            else None,
         )
     del w, qg, kg, dv_intra
     with record("kda/cute/backward_wy_dqkg"):
@@ -124,8 +135,7 @@ def chunk_kda_bwd(
             do,
             dh,
             dv,
-            cu_seqlens,
-            chunk_indices,
+            metadata,
             chunk_size=chunk_size,
             fastmath=fastmath,
         )
@@ -142,9 +152,7 @@ def chunk_kda_bwd(
             dk,
             db,
             dg,
-            cu_seqlens,
-            chunk_indices,
-            num_chunks,
+            metadata,
         )
     # The imported kernels accumulate derivatives with respect to their exp2
     # exponent as though it were a natural exponent. Convert to d/d(log2 gate).

@@ -19,6 +19,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
+    ChunkMetadata,
     autotune_cache_kwargs,
 )
 
@@ -198,8 +199,9 @@ def chunk_kda_bwd_dav(
     scale: float,
     *,
     chunk_size: int = 64,
+    metadata: ChunkMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Differentiate the fixed-length KDA intra-chunk value term."""
+    """Differentiate the fixed-length or packed KDA intra-chunk value term."""
     batch, tokens, heads, value_dim = v.shape
     if tokens % chunk_size:
         raise ValueError(f"the KDA dAv kernel requires complete chunks, got T={tokens}")
@@ -212,7 +214,11 @@ def chunk_kda_bwd_dav(
     dA = torch.empty_like(A, dtype=torch.float32)
     chunks = tokens // chunk_size
     block_value_dim = 64
-    if (value_dim, chunk_size) == (128, 64) and _can_use_tensor_descriptors(v, A, do, dv, dA):
+    if (
+        metadata is None
+        and (value_dim, chunk_size) == (128, 64)
+        and _can_use_tensor_descriptors(v, A, do, dv, dA)
+    ):
         chunk_kda_bwd_kernel_dAv[(chunks, batch * heads)](
             v=TensorDescriptor.from_tensor(v, [1, chunk_size, 1, block_value_dim]),
             A=TensorDescriptor.from_tensor(A, [1, chunk_size, 1, chunk_size]),
@@ -236,9 +242,9 @@ def chunk_kda_bwd_dav(
             do=do,
             dv=dv,
             dA=dA,
-            cu_seqlens=None,
-            chunk_indices=None,
-            num_chunks=None,
+            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
+            chunk_indices=None if metadata is None else metadata.chunk_indices,
+            num_chunks=None if metadata is None else metadata.num_chunks,
             scale=scale,
             T=tokens,
             H=heads,

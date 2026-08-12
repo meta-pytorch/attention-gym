@@ -796,8 +796,9 @@ def chunk_gated_delta_rule_fwd_h(
     *,
     chunk_size: int = 64,
     output_final_state: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Run the fixed-length inter-chunk KDA state recurrence."""
+    """Run the fixed-length or packed inter-chunk KDA state recurrence."""
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     if tokens % chunk_size:
@@ -810,7 +811,10 @@ def chunk_gated_delta_rule_fwd_h(
         raise ValueError("k, w, and gk must have the same shape")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
-    expected_state_shape = (batch, heads, key_dim, value_dim)
+    if cu_seqlens is not None and batch != 1:
+        raise ValueError("packed cu_seqlens require batch size one")
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    expected_state_shape = (state_batch, heads, key_dim, value_dim)
     if initial_state is not None:
         if initial_state.shape != expected_state_shape:
             raise ValueError(
@@ -829,7 +833,7 @@ def chunk_gated_delta_rule_fwd_h(
     )
 
     def grid(meta):
-        return (batch * heads, triton.cdiv(value_dim, meta["BV"]))
+        return (state_batch * heads, triton.cdiv(value_dim, meta["BV"]))
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -841,8 +845,8 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
-        cu_seqlens=None,
-        chunk_offsets=None,
+        cu_seqlens=cu_seqlens,
+        chunk_offsets=None if cu_seqlens is None else cu_seqlens // chunk_size,
         num_seqs=None,
         T=tokens,
         H=heads,

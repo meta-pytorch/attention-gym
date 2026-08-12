@@ -60,6 +60,50 @@ def _clone_inputs(inputs):
     return tuple(tensor.detach().clone().requires_grad_(tensor.requires_grad) for tensor in inputs)
 
 
+def _assert_golden(
+    actual: torch.Tensor,
+    golden: torch.Tensor,
+    reference: torch.Tensor,
+    dtype: torch.dtype,
+    name: str,
+) -> None:
+    """Bound kernel error by the reference error and operand precision."""
+    golden64 = golden.to(torch.float64)
+    band = torch.finfo(dtype).eps * golden64.abs().max().item()
+    actual_error = (actual.to(torch.float64) - golden64).abs().max().item()
+    reference_error = (reference.to(torch.float64) - golden64).abs().max().item()
+    budget = 2.0 * reference_error + 2.0 * band
+    assert actual_error <= budget, (
+        f"{name}: kernel error {actual_error:.3e} exceeds budget {budget:.3e} "
+        f"(reference error {reference_error:.3e}, band {band:.3e}, dtype {dtype})"
+    )
+
+
+def _packed_reference(
+    inputs: tuple[torch.Tensor, ...],
+    spans: tuple[tuple[int, int], ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate packed sequences independently with the naive implementation."""
+    q, k, v, cumulative_gate, beta, initial_state = inputs
+    outputs = []
+    states = []
+    for sequence, (start, end) in enumerate(spans):
+        output, state = naive_chunk_kda_from_cumulative(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            cumulative_gate[:, start:end],
+            beta[:, start:end],
+            initial_state=initial_state[sequence : sequence + 1],
+            output_final_state=True,
+            chunk_size=64,
+        )
+        outputs.append(output)
+        assert state is not None
+        states.append(state)
+    return torch.cat(outputs, dim=1), torch.cat(states)
+
+
 def test_optimized_chunk_kda_matches_reference():
     """Check forward values and the isolated final-state cotangent path."""
     torch.manual_seed(3)
@@ -96,6 +140,83 @@ def test_optimized_chunk_kda_matches_reference():
         error = (actual_gradient.float() - expected_gradient).abs().max()
         tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
         assert error <= tolerance
+
+
+def test_optimized_chunk_kda_packed_matches_independent_sequences():
+    """Keep packed sequence boundaries first-class through forward and backward."""
+    torch.manual_seed(13)
+    inputs = _inputs(tokens=192, heads=2, initial_state=True)
+    q, k, v, cumulative_gate, beta, _initial_state = inputs
+    initial_state = torch.randn(2, 2, 128, 128, device="cuda", requires_grad=True) * 0.01
+    inputs = (q, k, v, cumulative_gate, beta, initial_state)
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+
+    output, state = chunk_kda(
+        *inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    assert state is not None and state.shape == (2, 2, 128, 128)
+
+    spans = ((0, 64), (64, 192))
+    reference_inputs = (q.float(), k.float(), v.float(), cumulative_gate, beta, initial_state)
+    expected_output, expected_state = _packed_reference(reference_inputs, spans)
+    golden_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
+    golden_output, golden_state = _packed_reference(golden_inputs, spans)
+
+    _assert_golden(output, golden_output, expected_output, torch.bfloat16, "packed output")
+    _assert_golden(state, golden_state, expected_state, torch.bfloat16, "packed state")
+    d_output = torch.randn_like(output)
+    d_state = torch.randn_like(state)
+    actual_gradients = torch.autograd.grad((output, state), inputs, (d_output, d_state))
+    expected_gradients = torch.autograd.grad(
+        (expected_output, expected_state),
+        inputs,
+        (d_output.float(), d_state),
+    )
+    golden_gradients = torch.autograd.grad(
+        (golden_output, golden_state),
+        golden_inputs,
+        (d_output.double(), d_state.double()),
+    )
+    for index, (actual_gradient, golden_gradient, expected_gradient) in enumerate(
+        zip(actual_gradients, golden_gradients, expected_gradients, strict=True)
+    ):
+        _assert_golden(
+            actual_gradient,
+            golden_gradient,
+            expected_gradient,
+            torch.bfloat16,
+            f"packed input gradient {index}",
+        )
+
+
+def test_chunk_kda_single_sequence_metadata_matches_dense_path():
+    """Treat caller-provided ``[0, T]`` metadata as the dense degenerate case."""
+    torch.manual_seed(17)
+    dense_inputs = _inputs(tokens=128, heads=2, initial_state=True)
+    explicit_inputs = _clone_inputs(dense_inputs)
+
+    dense_output, dense_state = chunk_kda(*dense_inputs, output_final_state=True)
+    explicit_output, explicit_state = chunk_kda(
+        *explicit_inputs,
+        cu_seqlens=torch.tensor([0, 128], device="cuda", dtype=torch.int32),
+        output_final_state=True,
+    )
+    assert dense_state is not None and explicit_state is not None
+    torch.testing.assert_close(explicit_output, dense_output, rtol=0, atol=0)
+    torch.testing.assert_close(explicit_state, dense_state, rtol=0, atol=0)
+
+    d_output = torch.randn_like(dense_output)
+    d_state = torch.randn_like(dense_state)
+    dense_gradients = torch.autograd.grad(
+        (dense_output, dense_state), dense_inputs, (d_output, d_state)
+    )
+    explicit_gradients = torch.autograd.grad(
+        (explicit_output, explicit_state), explicit_inputs, (d_output, d_state)
+    )
+    for explicit_gradient, dense_gradient in zip(explicit_gradients, dense_gradients, strict=True):
+        torch.testing.assert_close(explicit_gradient, dense_gradient, rtol=0, atol=0)
 
 
 def test_optimized_chunk_kda_autograd_without_initial_state():
@@ -226,6 +347,38 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
             torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
 
 
+def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
+    """Choose BV from logical rather than physical packed batch size."""
+    dispatch = importlib.import_module(
+        "attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1_dispatch"
+    )
+    captured = {}
+    result = tuple(torch.empty(0, device="cuda") for _ in range(3))
+
+    def fake_delta_h(**kwargs):
+        captured["bv"] = kwargs["bv"]
+        return result
+
+    class DeviceProperties:
+        multi_processor_count = 100
+
+    monkeypatch.setattr(dispatch, "blackwell_delta_h_bwd_dhu_v1", fake_delta_h)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: DeviceProperties())
+    tensor = torch.empty(1, 1, 2, 128, device="cuda")
+    cu_seqlens = torch.arange(8, dtype=torch.int32, device="cuda")
+    actual = dispatch.blackwell_delta_h_bwd_dhu_dispatch(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert actual is result
+    assert captured["bv"] == 32
+
+
 def test_chunk_kda_custom_op_registration():
     """Validate schema, fake tensors, autograd registration, and AOT dispatch."""
     torch.manual_seed(5)
@@ -239,6 +392,7 @@ def test_chunk_kda_custom_op_registration():
             cumulative_gate,
             beta,
             initial_state,
+            None,
             True,
             False,
             False,
@@ -260,6 +414,7 @@ def test_chunk_kda_backward_custom_op_registration():
             cumulative_gate,
             beta,
             initial_state,
+            None,
             True,
             False,
             False,
@@ -335,6 +490,30 @@ def test_chunk_kda_fullgraph_forward_and_backward(dtype, initial_state, output_f
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+def test_chunk_kda_packed_fullgraph_forward_and_backward():
+    """Keep packed metadata inside the strict compiled forward and backward graph."""
+    torch.manual_seed(17)
+    eager_inputs = _inputs(tokens=128, heads=2)
+    compiled_inputs = _clone_inputs(eager_inputs)
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+
+    def operation(*args):
+        return chunk_kda(*args, cu_seqlens=cu_seqlens)[0]
+
+    expected = operation(*eager_inputs)
+    actual = torch.compile(operation, fullgraph=True)(*compiled_inputs)
+    torch.testing.assert_close(actual, expected)
+    d_output = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(expected, eager_inputs, d_output)
+    actual_gradients = torch.autograd.grad(actual, compiled_inputs, d_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
 def test_chunk_kda_reduce_overhead_backward():
     """Keep CUDA Graph warmup allocations local to the compiled invocation."""
     inputs = _inputs(heads=2)
@@ -389,6 +568,36 @@ def test_chunk_kda_cuda_graph_replay():
     assert not torch.equal(state, captured_state)
     torch.testing.assert_close(output, expected_output)
     torch.testing.assert_close(state, expected_state)
+    for actual_gradient, expected_gradient in zip(gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():
+    """Replay packed metadata and gradients without capture-time host transfers."""
+    torch.manual_seed(23)
+    inputs = _inputs(tokens=192, heads=2)
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+    warm_output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens)
+    warm_gradients = torch.autograd.grad(warm_output.float().sum(), inputs)
+    del warm_output, warm_gradients
+    gc.collect()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens)
+        gradients = torch.autograd.grad(output.float().sum(), inputs)
+
+    with torch.no_grad():
+        inputs[2].mul_(0.5)
+        cu_seqlens.copy_(torch.tensor([0, 128, 192], device="cuda", dtype=torch.int32))
+    expected_inputs = _clone_inputs(inputs)
+    expected_output, _ = chunk_kda(*expected_inputs, cu_seqlens=cu_seqlens)
+    expected_gradients = torch.autograd.grad(expected_output.float().sum(), expected_inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected_output)
     for actual_gradient, expected_gradient in zip(gradients, expected_gradients, strict=True):
         torch.testing.assert_close(actual_gradient, expected_gradient)
 

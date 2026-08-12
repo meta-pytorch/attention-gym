@@ -24,7 +24,7 @@ from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
 )
-from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE, IS_GATHER_SUPPORTED
+from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE, IS_GATHER_SUPPORTED, ChunkMetadata
 
 
 def chunk_kda_fwd_intra(
@@ -34,9 +34,7 @@ def chunk_kda_fwd_intra(
     gk: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    recompute_cu_seqlens: torch.LongTensor,
-    recompute_chunk_indices: torch.LongTensor,
-    recompute_num_chunks: torch.Tensor,
+    metadata: ChunkMetadata,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
 ) -> tuple[
@@ -82,9 +80,9 @@ def chunk_kda_fwd_intra(
                 Aqk=Aqk,
                 Akk=Akkd,
                 scale=scale,
-                cu_seqlens=None,
-                chunk_indices=None,
-                num_chunks=None,
+                cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+                chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
+                num_chunks=metadata.num_chunks if metadata.has_multiple_sequences else None,
                 T=T,
                 H=H,
                 K=K,
@@ -107,9 +105,9 @@ def chunk_kda_fwd_intra(
             beta=beta,
             Akkd=Akkd,
             scale=scale,
-            cu_seqlens=None,
+            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
             chunk_size=BT,
-            chunk_indices=None,
+            chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
             Aqk=Aqk,
             profile_ranges=profile_ranges,
         )
@@ -125,9 +123,7 @@ def chunk_kda_fwd_intra(
             beta=beta,
             A=Akk,
             gk=gk,
-            cu_seqlens=recompute_cu_seqlens,
-            chunk_indices=recompute_chunk_indices,
-            num_chunks=recompute_num_chunks,
+            metadata=metadata,
         )
     assert w is not None and kg is not None
     return w, u, kg, Aqk, Akk
