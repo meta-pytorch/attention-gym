@@ -99,7 +99,7 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
 
 
 def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
-    """Use the measured dtype- and layout-specific input-gradient schedules."""
+    """Use the measured dtype- and layout-specific gradient schedules."""
     fp16 = ShortConvTunedConfig.default(torch.float16)
     bf16 = ShortConvTunedConfig.default()
     fp32 = ShortConvTunedConfig.default(torch.float32)
@@ -116,7 +116,12 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
         torch.float16,
         stateful=True,
     ).input_gradient == ShortConvConfig(128, 1, 28)
-    assert ShortConvTunedConfig.default(packed=True).input_gradient == ShortConvConfig(128, 4, 10)
+    packed = ShortConvTunedConfig.default(packed=True)
+    assert packed.input_gradient == ShortConvConfig(128, 4, 16)
+    assert packed.weight_gradient == ShortConvConfig(128, 2, 32)
+    assert ShortConvTunedConfig.default(
+        packed=True, stateful=True
+    ).input_gradient == ShortConvConfig(128, 4, 10)
     assert fp32.forward == ShortConvConfig(128, 4, 4)
     assert fp32.input_gradient == ShortConvConfig(128, 2, 12)
     assert fp32.weight_gradient == ShortConvConfig(128, 2, 160)
@@ -283,6 +288,38 @@ def test_short_conv_tma_backward_matches_batched_reference(
         rtol=tolerance,
         atol=weight_atol,
     )
+
+
+def test_short_conv_packed_tma_backward_matches_fallback():
+    """Stage physical tiles while resetting both gradients at arbitrary boundaries."""
+    torch.manual_seed(8)
+    x, weight = _inputs(tokens=384, channels=512, width=4)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor(
+        [0, 0, 3, 17, 18, 129, 257, 384],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    actual = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+    expected = _packed_reference(x, weight, cu_seqlens)
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    fallback_gradients = cute_backend._launch_backward(
+        x,
+        weight,
+        grad_output,
+        ShortConvConfig(128, 4, 10),
+        ShortConvConfig(64, 4, 128),
+        cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+    # The staged and generic kernels differ only in their FP32 addition order.
+    torch.testing.assert_close(actual_gradients[0], fallback_gradients[0], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(actual_gradients[1], fallback_gradients[1], rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("width", [3, 4])
@@ -1022,5 +1059,33 @@ def test_short_conv_packed_cuda_graph_replays_changed_boundaries():
     expected_output = _forward_custom_op(x, weight, cu_seqlens)
     expected_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
     torch.testing.assert_close(captured_output, expected_output)
+    torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
+    torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
+
+
+def test_short_conv_packed_tma_cuda_graph_replays_changed_boundaries():
+    """Reread arbitrary packed boundaries in TMA backward during graph replay."""
+    x, weight = _inputs(tokens=384, channels=512)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor(
+        [0, 0, 3, 17, 129, 257, 384],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    _backward_custom_op(x, weight, grad_output, cu_seqlens)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
+
+    with torch.no_grad():
+        cu_seqlens.copy_(
+            torch.tensor([0, 1, 8, 31, 130, 300, 384], device="cuda", dtype=torch.int32)
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
     torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
