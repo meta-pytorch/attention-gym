@@ -109,7 +109,8 @@ def naive_chunk_kda_from_cumulative(
     ``beta: [B,T,H]``. ``cumulative_g`` must reset at each ``chunk_size``
     boundary and use the same chunk size passed here. Unlike
     :func:`naive_chunk_kda`, this function does not apply another cumulative
-    sum. Internal math runs in FP32 and outputs use ``q.dtype``. Gradient-enabled
+    sum. Internal math runs in FP32, or FP64 when ``q`` is FP64, and outputs use
+    ``q.dtype``. Gradient-enabled
     execution checkpoints each chunk so the stable pairwise decay does not retain
     ``[B, H, chunks, chunk_size, chunk_size, K]`` intermediates.
     """
@@ -135,9 +136,12 @@ def naive_chunk_kda_from_cumulative(
         raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
 
     output_dtype = q.dtype
+    compute_dtype = torch.promote_types(q.dtype, torch.float32)
     scale = key_dim**-0.5 if scale is None else scale
-    q, k, v, cumulative_g = (tensor.transpose(1, 2).float() for tensor in (q, k, v, cumulative_g))
-    beta = beta.transpose(1, 2).float()
+    q, k, v, cumulative_g = (
+        tensor.transpose(1, 2).to(compute_dtype) for tensor in (q, k, v, cumulative_g)
+    )
+    beta = beta.transpose(1, 2).to(compute_dtype)
     pad = (-tokens) % chunk_size
     if pad:
         q, k, v = (F.pad(tensor, (0, 0, 0, pad)) for tensor in (q, k, v))
@@ -156,12 +160,12 @@ def naive_chunk_kda_from_cumulative(
     strict_upper = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), 1
     )
-    eye = torch.eye(chunk_size, dtype=torch.float, device=q.device)
+    eye = torch.eye(chunk_size, dtype=compute_dtype, device=q.device)
     value_dim = v.shape[-1]
     state = (
         q.new_zeros(batch, heads, key_dim, value_dim)
         if initial_state is None
-        else initial_state.float()
+        else initial_state.to(compute_dtype)
     )
     outputs = []
     for index in range(chunks):

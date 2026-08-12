@@ -23,6 +23,7 @@ Crossover point: w_tiles_bv16 = SM_count ≈ 132 on GH200.
 
 import torch
 
+from attn_gym._backends.cute import ceildiv
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import (
     blackwell_delta_h_bwd_dhu_v1,
 )
@@ -43,16 +44,18 @@ def blackwell_delta_h_bwd_dhu_dispatch(
     dv2_out: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     num_seqs: torch.Tensor | int | None = None,
+    num_chunks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     BlackwellDeltaHBwd backward dhu — auto-dispatches BV=16 or BV=32.
 
     Returns (dh, dh0, dv2).
     """
-    B, _T, H, _K = q.shape
-    V = do.shape[-1]
+    batch, _tokens, heads, _head_dim = q.shape
+    value_dim = do.shape[-1]
+    logical_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
 
-    w_tiles_bv16 = ((V + 15) // 16) * H * B
+    w_tiles_bv16 = ceildiv(value_dim, 16) * heads * logical_batch
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
 
     bv = 32 if w_tiles_bv16 > sm_count else 16
@@ -73,4 +76,5 @@ def blackwell_delta_h_bwd_dhu_dispatch(
         chunk_offsets=chunk_offsets,
         num_seqs=num_seqs,
         bv=bv,
+        NT=num_chunks,
     )

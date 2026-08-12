@@ -23,6 +23,7 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym.linear.kda.utils import ChunkMetadata
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -1978,7 +1979,7 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
         use_i32_metadata=True,
         grid_chunks=grid_chunks,
     )
-    tokens = cute.sym_int()
+    tokens, sequences = cute.sym_int(), cute.sym_int()
 
     def normal(dtype, shape):
         return make_fake_compact_tensor(
@@ -2009,7 +2010,7 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
     dq2 = column_token_head(cutlass.BFloat16, KEY_DIM)
     dk2 = column_token_head(cutlass.BFloat16, KEY_DIM)
     dg2 = column_token_head(cutlass.Float32, KEY_DIM)
-    cu_seqlens = normal(cutlass.Int32, (2,))
+    cu_seqlens = normal(cutlass.Int32, (sequences,))
     chunk_indices = normal(cutlass.Int32, (chunks, 2))
     num_chunks = normal(cutlass.Int32, (1,))
     return compile_tvm_ffi(
@@ -2134,15 +2135,13 @@ def chunk_kda_bwd_intra(
     dk: torch.Tensor,
     db: torch.Tensor,
     dg: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    chunk_indices: torch.Tensor,
-    num_chunks: torch.Tensor,
+    metadata: ChunkMetadata,
     *,
     config: ChunkKdaBwdIntraConfig | None = None,
     tune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run or tune the fixed-length intra-chunk Q/K/gate/beta backward stage."""
+    """Run or tune the metadata-driven intra-chunk Q/K/gate/beta backward stage."""
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != KEY_DIM:
         raise ValueError("the intra-chunk backward requires B=1 and K=128")
@@ -2177,9 +2176,9 @@ def chunk_kda_bwd_intra(
         dk2=dk2,
         dg2=dg2,
         db_partial=db_partial,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        num_chunks=num_chunks,
+        cu_seqlens=metadata.cu_seqlens,
+        chunk_indices=metadata.chunk_indices,
+        num_chunks=metadata.num_chunks,
     )
     target = detect_compile_target(q.device.index)
     if not tune and config is None:

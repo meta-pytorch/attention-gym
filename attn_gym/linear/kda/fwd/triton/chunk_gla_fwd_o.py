@@ -18,6 +18,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.utils import (
+    ChunkMetadata,
     autotune_cache_kwargs,
     exp,
     exp2,
@@ -220,8 +221,9 @@ def chunk_gla_fwd_o_gk(
     scale: float,
     *,
     chunk_size: int = 64,
+    metadata: ChunkMetadata | None = None,
 ) -> torch.Tensor:
-    """Compose fixed-length KDA intra- and inter-chunk output terms."""
+    """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     if tokens % chunk_size:
@@ -240,8 +242,10 @@ def chunk_gla_fwd_o_gk(
         raise ValueError(f"h must have shape {expected_h_shape}, got {tuple(h.shape)}")
 
     output = torch.empty_like(v)
-    if (key_dim, value_dim, chunk_size) == (128, 128, 64) and _can_use_tensor_descriptors(
-        q, v, g, h, output, A
+    if (
+        metadata is None
+        and (key_dim, value_dim, chunk_size) == (128, 128, 64)
+        and _can_use_tensor_descriptors(q, v, g, h, output, A)
     ):
         block_key_dim = 32
         block_value_dim = 64
@@ -280,9 +284,9 @@ def chunk_gla_fwd_o_gk(
             h=h,
             o=output,
             A=A,
-            cu_seqlens=None,
-            chunk_indices=None,
-            num_chunks=None,
+            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
+            chunk_indices=None if metadata is None else metadata.chunk_indices,
+            num_chunks=None if metadata is None else metadata.num_chunks,
             scale=scale,
             T=tokens,
             H=heads,

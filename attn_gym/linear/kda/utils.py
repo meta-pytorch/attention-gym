@@ -24,7 +24,7 @@ from collections import deque
 from collections.abc import Callable
 from enum import Enum
 from functools import cache, lru_cache
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -475,6 +475,57 @@ def chunk_local_cumsum_reference(
 # ---------------------------------------------------------------------------
 # Varlen chunk indexing
 # ---------------------------------------------------------------------------
+class ChunkMetadata(NamedTuple):
+    """Internal launch metadata; public callers provide only ``cu_seqlens``.
+
+    ``chunk_indices`` maps global work IDs to sequence-local chunks, while the device
+    ``num_chunks`` scalar lets persistent kernels replay without a host transfer.
+    """
+
+    cu_seqlens: torch.Tensor
+    chunk_indices: torch.Tensor
+    num_chunks: torch.Tensor
+
+    @property
+    def has_multiple_sequences(self) -> bool:
+        """Return whether kernels must honor an internal sequence boundary."""
+        return self.cu_seqlens.shape[0] > 2
+
+
+def prepare_complete_chunk_indices(
+    cu_seqlens: torch.Tensor,
+    tokens: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Validate and map complete physical chunks to packed sequence-local indices."""
+    torch._assert_async(cu_seqlens[0] == 0, "cu_seqlens must start at zero")
+    torch._assert_async(cu_seqlens[-1] == tokens, "cu_seqlens must end at T")
+    torch._assert_async(
+        torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]),
+        "cu_seqlens must be nondecreasing",
+    )
+    torch._assert_async(
+        torch.all(torch.remainder(cu_seqlens, chunk_size) == 0),
+        "each packed sequence must contain complete chunks",
+    )
+    chunk_starts = (
+        torch.arange(
+            tokens // chunk_size,
+            dtype=torch.int32,
+            device=cu_seqlens.device,
+        )
+        * chunk_size
+    )
+    sequence_indices = torch.searchsorted(cu_seqlens[1:], chunk_starts, right=True).to(torch.int32)
+    return torch.stack(
+        (
+            sequence_indices,
+            (chunk_starts - cu_seqlens[sequence_indices]) // chunk_size,
+        ),
+        dim=1,
+    )
+
+
 @tensor_cache(maxsize=10)
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return torch.diff(cu_seqlens)

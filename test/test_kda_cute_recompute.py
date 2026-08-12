@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.utils import prepare_chunk_indices
+from attn_gym.linear.kda.utils import ChunkMetadata, prepare_chunk_indices
 
 pytest.importorskip("cutlass")
 
@@ -32,7 +32,11 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
     A = A.tril().masked_fill(torch.ones_like(A, dtype=torch.bool).triu(1), torch.nan).unsqueeze(2)
     cu_seqlens = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
     chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
-    num_chunks = torch.tensor(1, device="cuda", dtype=torch.int32)
+    metadata = ChunkMetadata(
+        cu_seqlens,
+        chunk_indices,
+        torch.tensor(1, device="cuda", dtype=torch.int32),
+    )
 
     def run_recompute():
         return recompute_w_u_fwd(
@@ -40,9 +44,7 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
             v,
             beta,
             A,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            num_chunks=num_chunks,
+            metadata=metadata,
         )
 
     w, u, _, _ = run_recompute()

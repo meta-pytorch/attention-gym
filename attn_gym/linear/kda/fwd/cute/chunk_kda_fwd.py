@@ -1,4 +1,4 @@
-"""Composed fixed-length Blackwell KDA core forward."""
+"""Composed fixed-length and packed Blackwell KDA core forward."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
+from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_indices
 
 _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
@@ -24,6 +25,7 @@ def _validate_chunk_kda_inputs(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
 ) -> None:
     """Validate the exported operation's contract before normalizing inputs."""
     if q.ndim != 4:
@@ -43,17 +45,26 @@ def _validate_chunk_kda_inputs(
         )
     if beta.shape != (batch, tokens, heads):
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
-    expected_state = (batch, heads, head_dim, v.shape[-1])
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed cu_seqlens require q to have batch size one")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
+        if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
+            raise ValueError("cu_seqlens must be contiguous CUDA int32")
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    expected_state = (state_batch, heads, head_dim, v.shape[-1])
     if initial_state is not None and initial_state.shape != expected_state:
         raise ValueError(
             f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"
         )
-    tensors = (q, k, v, cumulative_gate, beta)
+    data_tensors = (q, k, v, cumulative_gate, beta)
     if initial_state is not None:
-        tensors += (initial_state,)
+        data_tensors += (initial_state,)
+    tensors = data_tensors if cu_seqlens is None else (*data_tensors, cu_seqlens)
     if not all(tensor.is_cuda and tensor.device == q.device for tensor in tensors):
         raise ValueError("all chunk_kda inputs must be CUDA tensors on the same device")
-    if any(tensor.dtype not in _SUPPORTED_INPUT_DTYPES for tensor in tensors):
+    if any(tensor.dtype not in _SUPPORTED_INPUT_DTYPES for tensor in data_tensors):
         supported = ", ".join(str(dtype) for dtype in _SUPPORTED_INPUT_DTYPES)
         raise TypeError(f"chunk_kda inputs must use one of {supported}")
     if batch != 1 or head_dim != _HEAD_DIM:
@@ -87,11 +98,22 @@ def _validate_private_abi(
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
 
-def _fixed_chunk_metadata(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Construct the fixed-length metadata required by legacy recompute kernels."""
+def _chunk_metadata(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> ChunkMetadata:
+    """Construct the internal work map while preserving the caller's layout mode."""
     tokens = q.shape[1]
     chunks = tokens // _CHUNK_SIZE
-    cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * tokens
+    num_chunks = torch.full((), chunks, dtype=torch.int32, device=q.device)
+    if cu_seqlens is not None:
+        return ChunkMetadata(
+            cu_seqlens,
+            prepare_complete_chunk_indices(cu_seqlens, tokens, _CHUNK_SIZE),
+            num_chunks,
+        )
+
+    fixed_cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * tokens
     chunk_indices = torch.stack(
         (
             torch.zeros(chunks, dtype=torch.int32, device=q.device),
@@ -99,7 +121,7 @@ def _fixed_chunk_metadata(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, 
         ),
         dim=1,
     )
-    return cu_seqlens, chunk_indices, torch.full((), chunks, dtype=torch.int32, device=q.device)
+    return ChunkMetadata(fixed_cu_seqlens, chunk_indices, num_chunks)
 
 
 def _chunk_kda_fwd(
@@ -109,6 +131,7 @@ def _chunk_kda_fwd(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     *,
     output_final_state: bool,
     profile_ranges: bool,
@@ -121,8 +144,8 @@ def _chunk_kda_fwd(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run the optimized fixed-length KDA core and return its minimal backward tape."""
-    cu_seqlens, chunk_indices, num_chunks = _fixed_chunk_metadata(q)
+    """Run the optimized KDA core and return its minimal backward tape."""
+    metadata = _chunk_metadata(q, cu_seqlens)
     scale = _HEAD_DIM**-0.5
 
     def record(name: str):
@@ -136,9 +159,7 @@ def _chunk_kda_fwd(
             cumulative_gate,
             beta,
             scale,
-            cu_seqlens,
-            chunk_indices,
-            num_chunks,
+            metadata,
             chunk_size=_CHUNK_SIZE,
             profile_ranges=profile_ranges,
         )
@@ -151,6 +172,7 @@ def _chunk_kda_fwd(
             initial_state,
             chunk_size=_CHUNK_SIZE,
             output_final_state=output_final_state,
+            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
         )
     with record("kda/triton/output_composition"):
         output = chunk_gla_fwd_o_gk(
@@ -161,8 +183,20 @@ def _chunk_kda_fwd(
             h,
             scale,
             chunk_size=_CHUNK_SIZE,
+            metadata=metadata if metadata.has_multiple_sequences else None,
         )
-    return output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks
+    backward_cu_seqlens = (
+        metadata.cu_seqlens.new_empty(0) if cu_seqlens is not None else metadata.cu_seqlens
+    )
+    return (
+        output,
+        final_state,
+        Aqk,
+        Akk,
+        backward_cu_seqlens,
+        metadata.chunk_indices,
+        metadata.num_chunks,
+    )
 
 
 @torch.library.custom_op("attn_gym::kda_chunk_fwd", mutates_args=())
@@ -173,6 +207,7 @@ def _chunk_kda_fwd_custom_op(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     output_final_state: bool,
     fastmath: bool,
     profile_ranges: bool,
@@ -187,7 +222,6 @@ def _chunk_kda_fwd_custom_op(
 ]:
     """Keep the complete composed forward behind one compiler-opaque boundary."""
     del fastmath  # This static option configures the registered backward.
-    _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state)
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd(
         q,
@@ -196,6 +230,7 @@ def _chunk_kda_fwd_custom_op(
         cumulative_gate,
         beta,
         initial_state,
+        cu_seqlens,
         output_final_state=output_final_state,
         profile_ranges=profile_ranges,
     )
@@ -211,6 +246,7 @@ def _chunk_kda_fwd_fake(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     output_final_state: bool,
     fastmath: bool,
     profile_ranges: bool,
@@ -226,8 +262,9 @@ def _chunk_kda_fwd_fake(
     """Describe the composed forward outputs without invoking a launcher."""
     del k, cumulative_gate, beta, initial_state, fastmath, profile_ranges
     batch, tokens, heads, head_dim = q.shape
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     state = (
-        q.new_empty((batch, heads, head_dim, v.shape[-1]), dtype=torch.float32)
+        q.new_empty((state_batch, heads, head_dim, v.shape[-1]), dtype=torch.float32)
         if output_final_state
         else q.new_empty((0,), dtype=torch.float32)
     )
@@ -238,7 +275,7 @@ def _chunk_kda_fwd_fake(
         state,
         q.new_empty(tape_shape),
         q.new_empty(tape_shape),
-        q.new_empty((2,), dtype=torch.int32),
+        q.new_empty((0 if cu_seqlens is not None else 2,), dtype=torch.int32),
         q.new_empty((chunks, 2), dtype=torch.int32),
         q.new_empty((), dtype=torch.int32),
     )
@@ -278,9 +315,7 @@ def _chunk_kda_bwd_custom_op(
         d_output.contiguous(),
         None if d_final_state is None else d_final_state.float().contiguous(),
         initial_state,
-        cu_seqlens,
-        chunk_indices,
-        num_chunks,
+        ChunkMetadata(cu_seqlens, chunk_indices, num_chunks),
         fastmath=fastmath,
         profile_ranges=profile_ranges,
     )
@@ -343,11 +378,13 @@ def _setup_chunk_kda_context(ctx, inputs, output) -> None:
         cumulative_gate,
         beta,
         initial_state,
+        _input_cu_seqlens,
         output_final_state,
         fastmath,
         profile_ranges,
     ) = inputs
     _output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = output
+    backward_cu_seqlens = cu_seqlens if _input_cu_seqlens is None else _input_cu_seqlens
     ctx.save_for_backward(
         q,
         k,
@@ -357,7 +394,7 @@ def _setup_chunk_kda_context(ctx, inputs, output) -> None:
         Aqk,
         Akk,
         initial_state,
-        cu_seqlens,
+        backward_cu_seqlens,
         chunk_indices,
         num_chunks,
     )
@@ -421,6 +458,7 @@ def _chunk_kda_backward(
         None,
         None,
         None,
+        None,
     )
 
 
@@ -438,16 +476,18 @@ def chunk_kda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None = None,
     *,
+    cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
     fastmath: bool = False,
     profile_ranges: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Apply the graph-capturable, first-order, fixed-length Blackwell KDA core.
+    """Apply the graph-capturable, first-order Blackwell KDA core.
 
-    The output uses ``q.dtype``. The recurrent state remains FP32 so streamed
-    execution does not repeatedly quantize the accumulated state.
+    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Every packed
+    sequence must contain complete 64-token chunks. The output uses ``q.dtype``;
+    recurrent states remain FP32 and have one leading entry per logical sequence.
     """
-    _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state)
+    _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
     q, k, v = (tensor.to(torch.bfloat16).contiguous() for tensor in (q, k, v))
     cumulative_gate = cumulative_gate.float().contiguous()
@@ -461,6 +501,7 @@ def chunk_kda(
         cumulative_gate,
         beta,
         initial_state,
+        cu_seqlens,
         output_final_state,
         fastmath,
         profile_ranges,
