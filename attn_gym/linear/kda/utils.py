@@ -492,38 +492,71 @@ class ChunkMetadata(NamedTuple):
         return self.cu_seqlens.shape[0] > 2
 
 
-def prepare_complete_chunk_indices(
+@triton.jit(debug=True)
+def _prepare_complete_chunk_metadata_kernel(
+    cu_seqlens,
+    chunk_indices,
+    num_chunks,
+    num_sequences,
+    tokens: tl.constexpr,
+    chunk_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    lanes = tl.arange(0, BLOCK)
+    sequence_base = 0
+    while sequence_base < num_sequences:
+        sequence = sequence_base + lanes
+        sequence_mask = sequence < num_sequences
+        begin = tl.load(cu_seqlens + sequence, mask=sequence_mask, other=0)
+        end = tl.load(cu_seqlens + sequence + 1, mask=sequence_mask, other=0)
+        valid = (
+            (begin >= 0)
+            & (begin <= end)
+            & (end <= tokens)
+            & (begin % chunk_size == 0)
+            & (end % chunk_size == 0)
+            & ((sequence != 0) | (begin == 0))
+            & ((sequence != num_sequences - 1) | (end == tokens))
+        )
+        tl.device_assert(valid, "invalid packed cu_seqlens", mask=sequence_mask)
+
+        first_chunk = begin // chunk_size
+        chunks = (end - begin) // chunk_size
+        local_chunk = 0
+        while local_chunk < tl.max(tl.where(sequence_mask & valid, chunks, 0)):
+            store_mask = sequence_mask & valid & (local_chunk < chunks)
+            output = (first_chunk + local_chunk) * 2
+            tl.store(chunk_indices + output, sequence, mask=store_mask)
+            tl.store(chunk_indices + output + 1, local_chunk, mask=store_mask)
+            local_chunk += 1
+        sequence_base += BLOCK
+
+    tl.store(num_chunks + lanes, tokens // chunk_size, mask=lanes == 0)
+
+
+def prepare_complete_chunk_metadata(
     cu_seqlens: torch.Tensor,
     tokens: int,
     chunk_size: int,
-) -> torch.Tensor:
-    """Validate and map complete physical chunks to packed sequence-local indices."""
-    torch._assert_async(cu_seqlens[0] == 0, "cu_seqlens must start at zero")
-    torch._assert_async(cu_seqlens[-1] == tokens, "cu_seqlens must end at T")
-    torch._assert_async(
-        torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]),
-        "cu_seqlens must be nondecreasing",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate packed boundaries and construct their complete-chunk work map."""
+    chunk_indices = torch.empty(
+        (tokens // chunk_size, 2),
+        dtype=torch.int32,
+        device=cu_seqlens.device,
     )
-    torch._assert_async(
-        torch.all(torch.remainder(cu_seqlens, chunk_size) == 0),
-        "each packed sequence must contain complete chunks",
+    num_chunks = torch.empty((), dtype=torch.int32, device=cu_seqlens.device)
+    _prepare_complete_chunk_metadata_kernel[(1,)](
+        cu_seqlens,
+        chunk_indices,
+        num_chunks,
+        num_sequences=cu_seqlens.shape[0] - 1,
+        tokens=tokens,
+        chunk_size=chunk_size,
+        BLOCK=256,
+        num_warps=8,
     )
-    chunk_starts = (
-        torch.arange(
-            tokens // chunk_size,
-            dtype=torch.int32,
-            device=cu_seqlens.device,
-        )
-        * chunk_size
-    )
-    sequence_indices = torch.searchsorted(cu_seqlens[1:], chunk_starts, right=True).to(torch.int32)
-    return torch.stack(
-        (
-            sequence_indices,
-            (chunk_starts - cu_seqlens[sequence_indices]) // chunk_size,
-        ),
-        dim=1,
-    )
+    return chunk_indices, num_chunks
 
 
 @tensor_cache(maxsize=10)
