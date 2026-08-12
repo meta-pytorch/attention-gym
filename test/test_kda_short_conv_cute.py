@@ -171,6 +171,21 @@ def test_short_conv_packed_defaults_select_tma(dtype: torch.dtype):
     )
 
 
+def test_short_conv_tma_rejects_partial_channel_tiles():
+    """Make full channel tiles an explicit invariant of direct TMA construction."""
+    config = ShortConvTunedConfig.default(torch.bfloat16, packed=True).input_gradient
+    with pytest.raises(AssertionError, match="must be divisible by the channel tile"):
+        cute_backend.CausalConv1dSiluInputGradientTma(
+            1,
+            384,
+            513,
+            4,
+            config,
+            cute_backend.SHORT_CONV_DTYPES[torch.bfloat16],
+            cute_backend._silu_derivative,
+        )
+
+
 @pytest.mark.parametrize(
     ("dtype", "rounding_allowance", "rtol", "atol"),
     [
