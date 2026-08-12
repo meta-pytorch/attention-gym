@@ -24,7 +24,8 @@ from typing import ClassVar
 
 import cutlass
 import torch
-from cutlass import BFloat16, Float16, Float32, Int32, cute
+from cutlass import BFloat16, Float16, Float32, Int32, Int64, cute, pipeline
+from cutlass.cute.nvgpu import cpasync
 
 from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
 from attn_gym._backends.cute.device import upper_bound
@@ -68,27 +69,39 @@ class ShortConvTunedConfig:
         dtype: torch.dtype = torch.bfloat16,
         *,
         packed: bool = False,
+        stateful: bool = False,
     ) -> ShortConvTunedConfig:
         """Return measured GB300 defaults for one storage dtype and layout mode."""
-        if dtype == torch.float16:
-            return cls(
-                ShortConvConfig(128, 4, 16),
-                ShortConvConfig(128, 4, 6) if packed else ShortConvConfig(128, 1, 28),
-                ShortConvConfig(128, 4, 128),
-            )
-        if dtype == torch.float32:
-            return cls(
-                ShortConvConfig(128, 4, 4),
-                ShortConvConfig(128, 2, 12),
-                ShortConvConfig(128, 4, 32),
-            )
-        if dtype != torch.bfloat16:
-            raise ValueError(f"unsupported short-convolution dtype {dtype}")
-        return cls(
-            ShortConvConfig(128, 4, 16),
-            ShortConvConfig(128, 4, 10) if packed else ShortConvConfig(128, 1, 28),
-            ShortConvConfig(128, 4, 128),
-        )
+        match dtype:
+            case torch.float16:
+                forward = ShortConvConfig(128, 4, 16)
+                match packed, stateful:
+                    case True, _:
+                        gradients = ShortConvConfig(128, 4, 6), ShortConvConfig(128, 4, 128)
+                    case False, True:
+                        gradients = ShortConvConfig(128, 1, 28), ShortConvConfig(128, 4, 128)
+                    case False, False:
+                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
+            case torch.bfloat16:
+                forward = ShortConvConfig(128, 4, 16)
+                match packed, stateful:
+                    case True, _:
+                        gradients = ShortConvConfig(128, 4, 10), ShortConvConfig(128, 4, 128)
+                    case False, True:
+                        gradients = ShortConvConfig(128, 1, 28), ShortConvConfig(128, 4, 128)
+                    case False, False:
+                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
+            case torch.float32:
+                forward = ShortConvConfig(128, 4, 4)
+                gradients = (
+                    ShortConvConfig(128, 2, 12),
+                    ShortConvConfig(128, 4, 32)
+                    if packed or stateful
+                    else ShortConvConfig(128, 2, 160),
+                )
+            case _:
+                raise ValueError(f"unsupported short-convolution dtype {dtype}")
+        return cls(forward, *gradients)
 
 
 @cute.jit
@@ -242,6 +255,7 @@ class ShortConvKernel:
     kernel_kind: ClassVar[str]
     sequence_axis: ClassVar[str] = "b"
     time_tiled: ClassVar[bool] = True
+    tma_stage_tokens: ClassVar[int] = 0
 
     def __init__(
         self,
@@ -269,7 +283,10 @@ class ShortConvKernel:
         )
         if self.time_tiled:
             name += f"_bt{self.times_per_block}"
-        return f"{name}_v{self.channels_per_thread}"
+        name += f"_v{self.channels_per_thread}"
+        if self.tma_stage_tokens:
+            name += f"_tma{self.tma_stage_tokens}"
+        return name
 
 
 class CausalConv1dSiluForward(ShortConvKernel):
@@ -778,6 +795,670 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         )
 
 
+class ShortConvTmaKernel:
+    """Share the dense two-input TMA stage layout and issue protocol."""
+
+    stages = 2
+    tma_stage_tokens = 8
+
+    def staged_layout(self):
+        channels_per_block = self.threads * self.channels_per_thread
+        return cute.make_layout(
+            (self.tma_stage_tokens, channels_per_block, self.stages),
+            stride=(
+                channels_per_block,
+                1,
+                self.tma_stage_tokens * channels_per_block,
+            ),
+        )
+
+    @cute.jit
+    def load_input_taps(self, history: cute.Tensor, current: cute.Tensor):
+        """Append the current per-channel fragment to the FP32 convolution window."""
+        input_taps = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.width),
+            Float32,
+        )
+        if cutlass.const_expr(self.dtype.name == "fp32"):
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width - 1):
+                    input_taps[channel_offset, tap] = history[channel_offset, tap].to(Float32)
+                input_taps[channel_offset, self.width - 1] = current[channel_offset].to(Float32)
+        else:
+            for tap in cutlass.range_constexpr(self.width - 1):
+                input_taps[(None, tap)].store(history[(None, tap)].load().to(Float32))
+            input_taps[(None, self.width - 1)].store(current.load().to(Float32))
+        return input_taps
+
+    @cute.jit
+    def advance_history(self, history: cute.Tensor, current: cute.Tensor):
+        """Shift a raw-input register window and append one channel fragment."""
+        if cutlass.const_expr(self.dtype.name == "fp32"):
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width - 2):
+                    history[channel_offset, tap] = history[channel_offset, tap + 1]
+                history[channel_offset, self.width - 2] = current[channel_offset]
+        else:
+            for tap in cutlass.range_constexpr(self.width - 2):
+                history[(None, tap)].store(history[(None, tap + 1)].load())
+            history[(None, self.width - 2)].store(current.load())
+
+    @cute.jit
+    def make_pipeline(
+        self,
+        tidx: Int32,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tma_tensor_dy: cute.Tensor,
+    ):
+        """Allocate and partition the shared two-input TMA pipeline."""
+        channels_per_block = self.threads * self.channels_per_thread
+        smem = cutlass.utils.SmemAllocator()
+        barriers = smem.allocate_array(Int64, self.stages * 2)
+        sX = smem.allocate_tensor(
+            self.dtype.cute_type,
+            self.staged_layout(),
+            byte_alignment=128,
+        )
+        sD = smem.allocate_tensor(
+            self.dtype.cute_type,
+            self.staged_layout(),
+            byte_alignment=128,
+        )
+        tile = cute.make_layout(
+            (self.tma_stage_tokens, channels_per_block),
+            stride=(channels_per_block, 1),
+        )
+        tile_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads // 32,
+            ),
+            tx_count=2 * cute.size_in_bytes(self.dtype.cute_type, tile),
+            barrier_storage=barriers,
+            tidx=tidx,
+        )
+
+        cta_tiler = (self.tma_stage_tokens, channels_per_block)
+        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None))
+        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None))
+        tXsX, tXgX = cpasync.tma_partition(
+            tma_atom_x,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sX, 0, 2),
+            cute.group_modes(gX_tiles, 0, 2),
+        )
+        tDsD, tDgD = cpasync.tma_partition(
+            tma_atom_dy,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sD, 0, 2),
+            cute.group_modes(gD_tiles, 0, 2),
+        )
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.stages,
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.stages,
+        )
+        return (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        )
+
+    @cute.jit
+    def make_tma_atoms(self, x: cute.Tensor, grad_output: cute.Tensor):
+        """Build matching TMA load atoms for input and output-gradient tiles."""
+        staged = self.staged_layout()
+        cta_tiler = (
+            self.tma_stage_tokens,
+            self.threads * self.channels_per_thread,
+        )
+        load_op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
+            load_op,
+            x,
+            staged,
+            cta_tiler,
+        )
+        tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
+            load_op,
+            grad_output,
+            staged,
+            cta_tiler,
+        )
+        return tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy
+
+    @cute.jit
+    def issue_stage(
+        self,
+        tile_pipeline: pipeline.PipelineTmaAsync,
+        producer_state: pipeline.PipelineState,
+        tma_atom_x: cute.CopyAtom,
+        tXgX: cute.Tensor,
+        tXsX: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tDgD: cute.Tensor,
+        tDsD: cute.Tensor,
+        time_tile: Int32,
+        channel_tile: Int32,
+    ):
+        tile_pipeline.producer_acquire(producer_state)
+        barrier = tile_pipeline.producer_get_barrier(producer_state)
+        cute.copy(
+            tma_atom_x,
+            tXgX[(None, time_tile, channel_tile)],
+            tXsX[(None, producer_state.index)],
+            tma_bar_ptr=barrier,
+        )
+        cute.copy(
+            tma_atom_dy,
+            tDgD[(None, time_tile, channel_tile)],
+            tDsD[(None, producer_state.index)],
+            tma_bar_ptr=barrier,
+        )
+
+
+class CausalConv1dSiluInputGradientTma(
+    ShortConvTmaKernel,
+    CausalConv1dSiluInputGradient,
+):
+    """Stream dense input gradients from TMA-staged input and output-gradient tiles."""
+
+    @cute.jit
+    def advance_token(
+        self,
+        current: cute.Tensor,
+        incoming: cute.Tensor,
+        weights: cute.Tensor,
+        history: cute.Tensor,
+        grad_z: cute.Tensor,
+        grad_x_groups: cute.Tensor,
+        batch: Int32,
+        channel_group: Int32,
+        output_time: Int32,
+        emit_gradient: cutlass.Constexpr,
+    ):
+        """Advance one convolution window and optionally emit its completed input gradient."""
+        input_taps = self.load_input_taps(history, current)
+        value = (input_taps.load() * weights.load()).reduce(
+            cute.ReductionOp.ADD,
+            Float32(0.0),
+            reduction_profile=(None, 1),
+        )
+        for tap in cutlass.range_constexpr(self.width - 1):
+            grad_z[(None, tap)].store(grad_z[(None, tap + 1)].load())
+        grad_z[(None, self.width - 1)].store(incoming.load() * self.d_activation(value))
+
+        if cutlass.const_expr(emit_gradient):
+            products = cute.make_rmem_tensor(
+                (self.channels_per_thread, self.width),
+                Float32,
+            )
+            for future_offset in cutlass.range_constexpr(self.width):
+                products[(None, future_offset)].store(
+                    grad_z[(None, future_offset)].load()
+                    * weights[(None, self.width - 1 - future_offset)].load()
+                )
+            dx_value = products.load().reduce(
+                cute.ReductionOp.ADD,
+                Float32(0.0),
+                reduction_profile=(None, 1),
+            )
+            input_time = output_time - (self.width - 1)
+            if input_time < self.tokens:
+                grad_x_groups[
+                    ((0, None), (batch * self.tokens + input_time, channel_group))
+                ].store(dx_value.to(self.dtype.cute_type))
+
+        self.advance_history(history, current)
+
+    @cute.kernel
+    def tma_kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        grad_x: cute.Tensor,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tma_tensor_dy: cute.Tensor,
+    ):
+        """Compute dense input gradients while retaining only one convolution window."""
+        tidx, _, _ = cute.arch.thread_idx()
+        channel_block, time_block, batch = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        channel_group = channel_block * self.threads + tidx
+        channel = channel_group * self.channels_per_thread
+        time_start = time_block * self.times_per_block
+        stage_tokens = self.tma_stage_tokens
+        subtiles = self.times_per_block // stage_tokens
+
+        (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        ) = self.make_pipeline(
+            tidx,
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+        )
+        first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_x)
+            cpasync.prefetch_descriptor(tma_atom_dy)
+            for issued in cutlass.range_constexpr(self.stages):
+                self.issue_stage(
+                    tile_pipeline,
+                    producer_state,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_dy,
+                    tDgD,
+                    tDsD,
+                    first_time_tile + Int32(issued),
+                    Int32(channel_block),
+                )
+                producer_state.advance()
+
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
+        dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
+        sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
+        sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        history = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.width - 1),
+            self.dtype.cute_type,
+        )
+        grad_z = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.width),
+            Float32,
+        )
+        weights.fill(Float32(0.0))
+        history.fill(self.dtype.cute_type(0.0))
+        grad_z.fill(Float32(0.0))
+        if channel < self.channels:
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width):
+                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+            for history_offset in cutlass.range_constexpr(self.width - 1):
+                history_time = time_start + history_offset - (self.width - 1)
+                if history_time >= 0:
+                    history[(None, history_offset)].store(
+                        x_groups[
+                            ((0, None), (batch * self.tokens + history_time, channel_group))
+                        ].load()
+                    )
+
+        for subtile in cutlass.range_constexpr(subtiles):
+            tile_pipeline.consumer_wait(consumer_state)
+            stage = consumer_state.index
+            if channel < self.channels:
+                for slot in cutlass.range_constexpr(stage_tokens):
+                    output_offset = subtile * stage_tokens + slot
+                    output_time = time_start + output_offset
+                    current = cute.make_rmem_tensor(
+                        (self.channels_per_thread,),
+                        self.dtype.cute_type,
+                    )
+                    incoming = cute.make_rmem_tensor(
+                        (self.channels_per_thread,),
+                        Float32,
+                    )
+                    current.fill(self.dtype.cute_type(0.0))
+                    incoming.fill(Float32(0.0))
+                    if output_time < self.tokens:
+                        current.store(sX_groups[((0, None, 0), (slot, tidx, stage))].load())
+                        incoming.store(
+                            sD_groups[((0, None, 0), (slot, tidx, stage))].load().to(Float32)
+                        )
+                    self.advance_token(
+                        current,
+                        incoming,
+                        weights,
+                        history,
+                        grad_z,
+                        dx_groups,
+                        batch,
+                        channel_group,
+                        output_time,
+                        output_offset >= self.width - 1,
+                    )
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            tile_pipeline.consumer_release(consumer_state)
+            consumer_state.advance()
+            if cutlass.const_expr(subtile + self.stages < subtiles) and warp_idx == 0:
+                self.issue_stage(
+                    tile_pipeline,
+                    producer_state,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_dy,
+                    tDgD,
+                    tDsD,
+                    first_time_tile + Int32(subtile + self.stages),
+                    Int32(channel_block),
+                )
+                producer_state.advance()
+
+        if channel < self.channels:
+            for tail in cutlass.range_constexpr(self.width - 1):
+                output_offset = self.times_per_block + tail
+                output_time = time_start + output_offset
+                current = cute.make_rmem_tensor(
+                    (self.channels_per_thread,),
+                    self.dtype.cute_type,
+                )
+                incoming = cute.make_rmem_tensor(
+                    (self.channels_per_thread,),
+                    Float32,
+                )
+                current.fill(self.dtype.cute_type(0.0))
+                incoming.fill(Float32(0.0))
+                if output_time < self.tokens:
+                    current.store(
+                        x_groups[
+                            ((0, None), (batch * self.tokens + output_time, channel_group))
+                        ].load()
+                    )
+                    incoming.store(
+                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                        .load()
+                        .to(Float32)
+                    )
+                self.advance_token(
+                    current,
+                    incoming,
+                    weights,
+                    history,
+                    grad_z,
+                    dx_groups,
+                    batch,
+                    channel_group,
+                    output_time,
+                    True,
+                )
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        grad_x: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+        stream,
+    ):
+        """Build dense TMA descriptors and launch the streaming specialization."""
+        assert cutlass.const_expr(cu_seqlens is None)
+        assert cutlass.const_expr(initial_state is None)
+        tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy = self.make_tma_atoms(
+            x,
+            grad_output,
+        )
+        self.tma_kernel(
+            x,
+            weight,
+            grad_output,
+            grad_x,
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+            _name_prefix=self.get_name(),
+        ).launch(
+            grid=(
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+                cute.ceil_div(self.tokens, self.times_per_block),
+                self.batches,
+            ),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+
+class CausalConv1dSiluWeightGradientPartialsTma(
+    ShortConvTmaKernel,
+    CausalConv1dSiluWeightGradientPartials,
+):
+    """Stage dense input and output-gradient tiles through a two-stage TMA pipeline."""
+
+    @cute.kernel
+    def tma_kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        partials: cute.Tensor,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tma_tensor_dy: cute.Tensor,
+    ):
+        """Compute dense weight-gradient partials from asynchronously staged tiles."""
+        tidx, _, _ = cute.arch.thread_idx()
+        channel_block, time_block, batch = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        channel_group = channel_block * self.threads + tidx
+        channel = channel_group * self.channels_per_thread
+        time_start = time_block * self.times_per_block
+        stage_tokens = self.tma_stage_tokens
+        subtiles = self.times_per_block // stage_tokens
+
+        (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        ) = self.make_pipeline(
+            tidx,
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+        )
+        first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_x)
+            cpasync.prefetch_descriptor(tma_atom_dy)
+            for issued in cutlass.range_constexpr(self.stages):
+                self.issue_stage(
+                    tile_pipeline,
+                    producer_state,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_dy,
+                    tDgD,
+                    tDsD,
+                    first_time_tile + Int32(issued),
+                    Int32(channel_block),
+                )
+                producer_state.advance()
+
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
+        sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        accumulators = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        history = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.width - 1),
+            self.dtype.cute_type,
+        )
+        weights.fill(Float32(0.0))
+        accumulators.fill(Float32(0.0))
+        history.fill(self.dtype.cute_type(0.0))
+        if channel < self.channels:
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width):
+                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+            for history_offset in cutlass.range_constexpr(self.width - 1):
+                history_time = time_start + history_offset - (self.width - 1)
+                if history_time >= 0:
+                    if cutlass.const_expr(self.dtype.name == "fp32"):
+                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                            history[channel_offset, history_offset] = x[
+                                batch * self.tokens + history_time,
+                                channel + channel_offset,
+                            ]
+                    else:
+                        history[(None, history_offset)].store(
+                            x_groups[
+                                ((0, None), (batch * self.tokens + history_time, channel_group))
+                            ].load()
+                        )
+
+        for subtile in cutlass.range_constexpr(subtiles):
+            tile_pipeline.consumer_wait(consumer_state)
+            stage = consumer_state.index
+            if channel < self.channels:
+                for slot in cutlass.range_constexpr(stage_tokens):
+                    time = time_start + subtile * stage_tokens + slot
+                    if time < self.tokens:
+                        current = cute.make_rmem_tensor(
+                            (self.channels_per_thread,),
+                            self.dtype.cute_type,
+                        )
+                        if cutlass.const_expr(self.dtype.name == "fp32"):
+                            for channel_offset in cutlass.range_constexpr(
+                                self.channels_per_thread
+                            ):
+                                current[channel_offset] = sX[
+                                    slot,
+                                    tidx * self.channels_per_thread + channel_offset,
+                                    stage,
+                                ]
+                        else:
+                            current.store(sX_groups[((0, None, 0), (slot, tidx, stage))].load())
+                        input_taps = self.load_input_taps(history, current)
+                        value = (input_taps.load() * weights.load()).reduce(
+                            cute.ReductionOp.ADD,
+                            Float32(0.0),
+                            reduction_profile=(None, 1),
+                        )
+                        incoming = cute.make_rmem_tensor(
+                            (self.channels_per_thread,),
+                            Float32,
+                        )
+                        if cutlass.const_expr(self.dtype.name == "fp32"):
+                            for channel_offset in cutlass.range_constexpr(
+                                self.channels_per_thread
+                            ):
+                                incoming[channel_offset] = sD[
+                                    slot,
+                                    tidx * self.channels_per_thread + channel_offset,
+                                    stage,
+                                ].to(Float32)
+                        else:
+                            incoming.store(
+                                sD_groups[((0, None, 0), (slot, tidx, stage))].load().to(Float32)
+                            )
+                        grad_z = incoming.load() * self.d_activation(value)
+                        for tap in cutlass.range_constexpr(self.width):
+                            accumulators[(None, tap)].store(
+                                accumulators[(None, tap)].load()
+                                + grad_z * input_taps[(None, tap)].load()
+                            )
+                        self.advance_history(history, current)
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            tile_pipeline.consumer_release(consumer_state)
+            consumer_state.advance()
+
+            if cutlass.const_expr(subtile + self.stages < subtiles) and warp_idx == 0:
+                self.issue_stage(
+                    tile_pipeline,
+                    producer_state,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_dy,
+                    tDgD,
+                    tDsD,
+                    first_time_tile + Int32(subtile + self.stages),
+                    Int32(channel_block),
+                )
+                producer_state.advance()
+
+        if channel < self.channels:
+            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                for tap in cutlass.range_constexpr(self.width):
+                    partials[batch, time_block, channel + channel_offset, tap] = accumulators[
+                        channel_offset, tap
+                    ]
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        partials: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+        stream,
+    ):
+        """Build dense TMA descriptors and launch the staged specialization."""
+        assert cutlass.const_expr(cu_seqlens is None)
+        assert cutlass.const_expr(initial_state is None)
+        tma_atom_x, tma_tensor_x, tma_atom_dy, tma_tensor_dy = self.make_tma_atoms(
+            x,
+            grad_output,
+        )
+        self.tma_kernel(
+            x,
+            weight,
+            grad_output,
+            partials,
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+            _name_prefix=self.get_name(),
+        ).launch(
+            grid=(
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+                cute.ceil_div(self.tokens, self.times_per_block),
+                self.batches,
+            ),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+
 class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
     """Differentiate causal history using its triangular output dependency.
 
@@ -1001,6 +1682,40 @@ def _compile_forward(
     )
 
 
+def tuned_config(dtype: ShortConvDType) -> ShortConvTunedConfig:
+    """Resolve measured dense defaults from a compile-time storage descriptor."""
+    match dtype.name:
+        case "fp16":
+            return ShortConvTunedConfig.default(torch.float16)
+        case "bf16":
+            return ShortConvTunedConfig.default(torch.bfloat16)
+        case "fp32":
+            return ShortConvTunedConfig.default(torch.float32)
+        case _:
+            raise ValueError(f"unsupported short-convolution dtype {dtype.name}")
+
+
+def supports_tma(
+    operation_type: type[ShortConvTmaKernel],
+    config: ShortConvConfig,
+    selected_config: ShortConvConfig | None,
+    tokens: int,
+    channels: int,
+    width: int,
+    num_sequences: int | None,
+    has_initial_state: bool,
+) -> bool:
+    """Return whether a measured TMA specialization supports this static problem."""
+    return (
+        config == selected_config
+        and width > 1
+        and channels % (config.threads * config.channels_per_thread) == 0
+        and tokens % operation_type.tma_stage_tokens == 0
+        and num_sequences is None
+        and not has_initial_state
+    )
+
+
 @jit_cache
 def _compile_input_gradient(
     batches: int,
@@ -1013,9 +1728,18 @@ def _compile_input_gradient(
     has_initial_state: bool = False,
 ):
     """Compile one static input-gradient specialization."""
-    operation = CausalConv1dSiluInputGradient(
-        batches, tokens, channels, width, config, dtype, _silu_derivative
+    use_tma = supports_tma(
+        CausalConv1dSiluInputGradientTma,
+        config,
+        None if dtype.name == "fp32" else tuned_config(dtype).input_gradient,
+        tokens,
+        channels,
+        width,
+        num_sequences,
+        has_initial_state,
     )
+    operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
+    operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -1052,9 +1776,22 @@ def _compile_weight_gradient(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    operation = CausalConv1dSiluWeightGradientPartials(
-        batches, tokens, channels, width, config, dtype, _silu_derivative
+    use_tma = supports_tma(
+        CausalConv1dSiluWeightGradientPartialsTma,
+        config,
+        tuned_config(dtype).weight_gradient,
+        tokens,
+        channels,
+        width,
+        num_sequences,
+        has_initial_state,
     )
+    operation_type = (
+        CausalConv1dSiluWeightGradientPartialsTma
+        if use_tma
+        else CausalConv1dSiluWeightGradientPartials
+    )
+    operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -1547,7 +2284,11 @@ def _default_backward(ctx, grad_output: torch.Tensor):
         grad_x, grad_weight = _backward_custom_op(x, weight, grad_output, cu_seqlens)
         grad_initial_state = None
     else:
-        defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
+        defaults = ShortConvTunedConfig.default(
+            x.dtype,
+            packed=cu_seqlens is not None,
+            stateful=True,
+        )
         input_config = defaults.input_gradient
         weight_config = defaults.weight_gradient
         grad_x, grad_weight, grad_initial_state = _configured_backward_custom_op(
@@ -1872,7 +2613,11 @@ def cute_causal_conv1d_silu(
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
     kernel_initial_state = None if weight.shape[1] == 1 else initial_state
-    defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
+    defaults = ShortConvTunedConfig.default(
+        x.dtype,
+        packed=cu_seqlens is not None,
+        stateful=kernel_initial_state is not None,
+    )
     default_forward = defaults.forward
     default_input_grad = defaults.input_gradient
     default_weight_grad = defaults.weight_gradient

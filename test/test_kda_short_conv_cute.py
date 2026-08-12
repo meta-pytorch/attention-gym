@@ -105,12 +105,25 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
     fp32 = ShortConvTunedConfig.default(torch.float32)
 
     assert fp16.forward == ShortConvConfig(128, 4, 16)
-    assert fp16.input_gradient == ShortConvConfig(128, 1, 28)
-    assert bf16.input_gradient == ShortConvConfig(128, 1, 28)
+    assert fp16.input_gradient == ShortConvConfig(128, 2, 32)
+    assert fp16.weight_gradient == ShortConvConfig(128, 2, 64)
+    assert bf16.input_gradient == ShortConvConfig(128, 2, 32)
+    assert bf16.weight_gradient == ShortConvConfig(128, 2, 64)
+    assert ShortConvTunedConfig.default(stateful=True).input_gradient == ShortConvConfig(
+        128, 1, 28
+    )
+    assert ShortConvTunedConfig.default(
+        torch.float16,
+        stateful=True,
+    ).input_gradient == ShortConvConfig(128, 1, 28)
     assert ShortConvTunedConfig.default(packed=True).input_gradient == ShortConvConfig(128, 4, 10)
     assert fp32.forward == ShortConvConfig(128, 4, 4)
     assert fp32.input_gradient == ShortConvConfig(128, 2, 12)
-    assert fp32.weight_gradient == ShortConvConfig(128, 4, 32)
+    assert fp32.weight_gradient == ShortConvConfig(128, 2, 160)
+    assert ShortConvTunedConfig.default(
+        torch.float32,
+        stateful=True,
+    ).weight_gradient == ShortConvConfig(128, 4, 32)
 
 
 @pytest.mark.parametrize(
@@ -212,6 +225,64 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
         candidates = _candidate_configs(kind, channels)
         assert candidates
         assert all(channels % config.channels_per_thread == 0 for config in candidates)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("width", [3, 4, 5])
+def test_short_conv_tma_backward_matches_batched_reference(
+    width: int,
+    dtype: torch.dtype,
+):
+    """Exercise aligned dense batches through the selected TMA schedules."""
+    torch.manual_seed(7)
+    x, weight = _inputs(tokens=384, channels=256, width=width, batch=2, dtype=dtype)
+    grad_output = torch.randn_like(x)
+
+    actual = cute_causal_conv1d_silu(x, weight)
+    expected = _reference(x, weight)
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    match dtype:
+        case torch.float16 | torch.bfloat16:
+            fallback_input = ShortConvConfig(128, 1, 28)
+            fallback_weight = ShortConvConfig(128, 4, 128)
+        case torch.float32:
+            fallback_input = ShortConvConfig(128, 2, 12)
+            fallback_weight = ShortConvConfig(128, 4, 32)
+        case _:
+            raise AssertionError(f"unexpected dtype {dtype}")
+    fallback_gradients = cute_backend._launch_backward(
+        x,
+        weight,
+        grad_output,
+        fallback_input,
+        fallback_weight,
+    )
+
+    tolerance = 1e-4 if dtype == torch.float32 else 3e-2
+    weight_atol = 2e-4 if dtype == torch.float32 else 2e-1
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(
+        actual_gradients[0],
+        expected_gradients[0],
+        rtol=tolerance,
+        atol=tolerance,
+    )
+    torch.testing.assert_close(
+        actual_gradients[1],
+        expected_gradients[1],
+        rtol=tolerance,
+        atol=weight_atol,
+    )
+    # dx keeps the same per-token reduction tree. dw changes partial boundaries and therefore
+    # follows the dtype tolerance rather than a bitwise contract.
+    assert torch.equal(actual_gradients[0], fallback_gradients[0])
+    torch.testing.assert_close(
+        actual_gradients[1],
+        fallback_gradients[1],
+        rtol=tolerance,
+        atol=weight_atol,
+    )
 
 
 @pytest.mark.parametrize("width", [3, 4])
