@@ -106,7 +106,11 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
 
     assert fp16.forward == ShortConvConfig(128, 4, 16)
     assert fp16.input_gradient == ShortConvConfig(128, 1, 28)
-    assert bf16.input_gradient == ShortConvConfig(128, 1, 28)
+    assert bf16.input_gradient == ShortConvConfig(128, 2, 32)
+    assert bf16.weight_gradient == ShortConvConfig(128, 2, 64)
+    assert ShortConvTunedConfig.default(stateful=True).input_gradient == ShortConvConfig(
+        128, 1, 28
+    )
     assert ShortConvTunedConfig.default(packed=True).input_gradient == ShortConvConfig(128, 4, 10)
     assert fp32.forward == ShortConvConfig(128, 4, 4)
     assert fp32.input_gradient == ShortConvConfig(128, 2, 12)
@@ -212,6 +216,23 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
         candidates = _candidate_configs(kind, channels)
         assert candidates
         assert all(channels % config.channels_per_thread == 0 for config in candidates)
+
+
+@pytest.mark.parametrize("width", [3, 4, 5])
+def test_short_conv_tma_backward_matches_batched_reference(width: int):
+    """Exercise aligned dense batches through the selected TMA schedules."""
+    torch.manual_seed(7)
+    x, weight = _inputs(tokens=32, channels=256, width=width, batch=2)
+    grad_output = torch.randn_like(x)
+
+    actual = cute_causal_conv1d_silu(x, weight)
+    expected = _reference(x, weight)
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
 
 
 @pytest.mark.parametrize("width", [3, 4])
