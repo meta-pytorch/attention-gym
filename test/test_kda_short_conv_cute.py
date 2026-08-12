@@ -384,11 +384,22 @@ def test_short_conv_packed_tma_backward_matches_fallback(dtype: torch.dtype):
     torch.testing.assert_close(
         actual_gradients[1], expected_gradients[1], rtol=tolerance, atol=weight_atol
     )
+
+    # TMA changes only the FP32 addition order relative to the generic kernels.
+    match dtype:
+        case torch.float16:
+            fallback_rtol, input_atol, weight_atol = 1e-4, 2e-3, 8e-3
+        case torch.bfloat16:
+            fallback_rtol, input_atol, weight_atol = 1e-4, 1e-4, 1e-4
+        case torch.float32:
+            fallback_rtol, input_atol, weight_atol = 1e-6, 5e-6, 2e-5
+        case _:
+            raise AssertionError(f"unexpected dtype {dtype}")
     torch.testing.assert_close(
-        actual_gradients[0], fallback_gradients[0], rtol=tolerance, atol=tolerance
+        actual_gradients[0], fallback_gradients[0], rtol=fallback_rtol, atol=input_atol
     )
     torch.testing.assert_close(
-        actual_gradients[1], fallback_gradients[1], rtol=tolerance, atol=weight_atol
+        actual_gradients[1], fallback_gradients[1], rtol=fallback_rtol, atol=weight_atol
     )
 
 
