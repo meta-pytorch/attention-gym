@@ -1040,11 +1040,10 @@ class CausalConv1dSiluInputGradientTma(
             reduction_profile=(None, 1),
         )
         input_time = output_time - (self.width - 1)
-        if (
-            input_time >= time_start
-            and input_time < self.tokens
-            and (cutlass.const_expr(not packed) or input_time >= sequence_start)
-        ):
+        owns_input = input_time >= time_start and input_time < self.tokens
+        if cutlass.const_expr(packed):
+            owns_input = owns_input and input_time >= sequence_start
+        if owns_input:
             grad_x_groups[((0, None), (batch * self.tokens + input_time, channel_group))].store(
                 dx_value.to(self.dtype.cute_type)
             )
