@@ -75,11 +75,12 @@ partials for the shared parameter reduction. The example explicitly runs
 projections in BF16 while retaining FP32 parameters and gate reductions; no
 ambient autocast context is required.
 The CuTe gate path requires a head dimension divisible by 32 in `[32, 1024]`.
-The optimized core requires Blackwell, physical batch size one, BF16 kernel inputs,
-`head_dim=128`, and complete 64-token chunks. `chunk_kda(..., cu_seqlens=offsets)` treats
-`[1, T, H, D]` inputs as packed logical sequences and carries those boundaries through the
-forward, backward, and recurrent states; each logical sequence must currently contain an integer
-number of 64-token chunks. `KDAAttention.forward` threads the same offsets through its short
+The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and complete
+64-token chunks. Dense `[B, T, H, D]` inputs are lowered internally to equal-length packed
+sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts explicitly packed
+`[1, T, H, D]` inputs. Both forms carry sequence boundaries through the forward, backward, and
+recurrent states; each logical sequence must currently contain an integer number of 64-token
+chunks. `KDAAttention.forward` threads explicit offsets through its short
 convolution and KDA core; the gate prefix sum already resets at every aligned chunk boundary. The
 optimized boundaries are first-order and do not support higher-order autograd. Run
 `python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`

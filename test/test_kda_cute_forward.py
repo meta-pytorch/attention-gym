@@ -39,12 +39,13 @@ pytestmark = pytest.mark.skipif(
 
 def _inputs(
     *,
+    batch: int = 1,
     tokens: int = 128,
     heads: int = 1,
     initial_state: bool = False,
     dtype: torch.dtype = torch.bfloat16,
 ):
-    batch, head_dim = 1, 128
+    head_dim = 128
     shape = (batch, tokens, heads, head_dim)
     q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
@@ -318,6 +319,51 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
             expected_gradient,
             torch.bfloat16,
             f"packed input gradient {index}",
+        )
+
+
+def test_optimized_chunk_kda_dense_batch_matches_equal_length_packing():
+    """Lower a dense batch to independent equal-length packed sequences."""
+    torch.manual_seed(43)
+    dense_inputs = _inputs(batch=2, tokens=128, heads=2, initial_state=True)
+    packed_inputs = _clone_inputs(dense_inputs)
+    q, k, v, cumulative_gate, beta, initial_state = packed_inputs
+    packed_shape = (1, 256, 2, 128)
+    packed_inputs = (
+        q.reshape(packed_shape),
+        k.reshape(packed_shape),
+        v.reshape(packed_shape),
+        cumulative_gate.reshape(packed_shape),
+        beta.reshape(1, 256, 2),
+        initial_state,
+    )
+    cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+
+    dense_output, dense_state = chunk_kda(*dense_inputs, output_final_state=True)
+    packed_output, packed_state = chunk_kda(
+        *packed_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    assert dense_state is not None and packed_state is not None
+    torch.testing.assert_close(
+        dense_output.reshape_as(packed_output), packed_output, rtol=0, atol=0
+    )
+    torch.testing.assert_close(dense_state, packed_state, rtol=0, atol=0)
+
+    d_output = torch.randn_like(dense_output)
+    d_state = torch.randn_like(dense_state)
+    dense_gradients = torch.autograd.grad(
+        (dense_output, dense_state), dense_inputs, (d_output, d_state)
+    )
+    packed_gradients = torch.autograd.grad(
+        (packed_output, packed_state),
+        packed_inputs,
+        (d_output.reshape_as(packed_output), d_state),
+    )
+    for dense_gradient, packed_gradient in zip(dense_gradients, packed_gradients, strict=True):
+        torch.testing.assert_close(
+            dense_gradient.reshape_as(packed_gradient), packed_gradient, rtol=0, atol=0
         )
 
 
