@@ -78,6 +78,7 @@ def run_pytest() -> tuple[int, str]:
             "--dist=worksteal",
             "-ra",
             "--tb=short",
+            "--durations=50",
             f"--junitxml={report_path}",
         ],
         cwd="/root",

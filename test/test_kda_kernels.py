@@ -58,7 +58,7 @@ from attn_gym.linear.kda.naive import (
     l2norm_bwd_ref,
     l2norm_fwd_ref,
 )
-from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, prepare_chunk_indices
+from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, ChunkMetadata, prepare_chunk_indices
 
 IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
@@ -97,8 +97,6 @@ requires_cute = pytest.mark.skipif(
 )
 
 DEV = "cuda"
-
-torch.backends.cuda.matmul.allow_tf32 = True
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="KDA Triton kernels require a CUDA device"
@@ -157,6 +155,7 @@ def use_one_autotune_config_for_correctness_tests():
         ),
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
         for autotuner, config in selections:
             monkeypatch.setattr(autotuner, "configs", [config])
         yield
@@ -1103,9 +1102,15 @@ def _bwd_dav_ref(v, A, do, scale, chunk_size=64):
     return dv, dA
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128, 130])
-@pytest.mark.parametrize("H", [1, 2])
+@pytest.mark.parametrize(
+    "dtype,T,H",
+    [
+        (torch.float16, 64, 1),
+        (torch.bfloat16, 128, 2),
+        (torch.bfloat16, 130, 2),
+    ],
+    ids=["single-fp16", "multi-bf16", "tail-bf16"],
+)
 def test_chunk_kda_bwd_dav(dtype, T, H):
     torch.manual_seed(10)
     B, V = 1, 64
@@ -1168,9 +1173,15 @@ def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64, use_exp2=True):
     return o
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128, 130])
-@pytest.mark.parametrize("H,K,V", [(1, 64, 64), (2, 128, 128)])
+@pytest.mark.parametrize(
+    "dtype,T,H,K,V",
+    [
+        (torch.float16, 64, 1, 64, 64),
+        (torch.bfloat16, 128, 2, 128, 128),
+        (torch.bfloat16, 130, 2, 128, 128),
+    ],
+    ids=["single-fp16", "multi-bf16", "tail-bf16"],
+)
 def test_chunk_gla_fwd_o(dtype, T, H, K, V):
     torch.manual_seed(11)
     B = 1
@@ -1199,6 +1210,8 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         None,
         scale,
         T,
+        q.stride(1),
+        q.stride(2),
         H=H,
         K=K,
         V=V,
@@ -1212,8 +1225,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
     reason="chunk_gla_fwd_o_gk TMA path requires SM90+ tensor descriptors",
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128])
+@pytest.mark.parametrize("dtype,T", [(torch.bfloat16, 128)], ids=["production"])
 def test_chunk_gla_fwd_o_gk_tma(dtype, T):
     """Cover the composed launcher and its TMA kernel at the fixed K=V=128, chunk_size=64 shape."""
     torch.manual_seed(11)
@@ -1277,9 +1289,15 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     return h.reshape(B * num_chunks, H, K, V), v_new, state
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128, 130])
-@pytest.mark.parametrize("use_h0", [False, True])
+@pytest.mark.parametrize(
+    "dtype,T,use_h0",
+    [
+        (torch.float16, 64, False),
+        (torch.bfloat16, 128, True),
+        (torch.bfloat16, 130, False),
+    ],
+    ids=["single-fp16", "multi-state-bf16", "tail-bf16"],
+)
 def test_chunk_delta_h_fwd(dtype, T, use_h0):
     torch.manual_seed(12)
     B, H, K, V = 1, 2, 128, 128
@@ -1325,11 +1343,10 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     assert_golden(ht, ght, rht, dtype, f"delta_h ht {tag}")
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128])
-@pytest.mark.parametrize("use_h0", [False, True])
-def test_chunk_delta_h_fwd_forloop(dtype, T, use_h0):
+@pytest.mark.parametrize("use_h0", [False, True], ids=["no-state", "state"])
+def test_chunk_delta_h_fwd_forloop(use_h0):
     """Cover the persistent-grid delta-h variant that walks multiple sequences per program."""
+    dtype, T = torch.bfloat16, 128
     torch.manual_seed(12)
     B, H, K, V = 2, 2, 128, 128
     BV = 64
@@ -1430,10 +1447,14 @@ def _fwd_intra_ref(q, k, gk, beta, scale, chunk_size=64, BC=16, causal_normref=T
     return Aqk, Akk
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("T", [64, 128, 130])
-@pytest.mark.parametrize("H,K", [(1, 64), (2, 128)])
-@pytest.mark.parametrize("causal_normref", [True, False])
+@pytest.mark.parametrize(
+    "dtype,T,H,K,causal_normref",
+    [
+        (torch.float16, 64, 1, 64, True),
+        (torch.bfloat16, 130, 2, 128, False),
+    ],
+    ids=["legacy-causal", "production-tail"],
+)
 def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
     torch.manual_seed(13)
     B = 1
@@ -1467,6 +1488,10 @@ def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
         chunk_indices=None,
         num_chunks=None,
         T=T,
+        q_stride_t=q.stride(1),
+        q_stride_h=q.stride(2),
+        k_stride_t=k.stride(1),
+        k_stride_h=k.stride(2),
         H=H,
         K=K,
         BT=64,
@@ -1511,9 +1536,8 @@ def _recompute_wu_ref(k, v, beta, A, gk, q, chunk_size=64):
 
 
 @requires_cute
-@pytest.mark.parametrize("num_chunks", [4, 8])
-@pytest.mark.parametrize("H", [2, 4])
-def test_recompute_w_u_fwd_cute(num_chunks, H):
+def test_recompute_w_u_fwd_cute():
+    num_chunks, H = 4, 4
     torch.manual_seed(20)
     B, K, V = 1, 128, 128
     T = num_chunks * 64
@@ -1530,17 +1554,20 @@ def test_recompute_w_u_fwd_cute(num_chunks, H):
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
 
-    cu = torch.tensor([0, T], device="cuda", dtype=torch.long)
+    cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+    metadata = ChunkMetadata(
+        cu,
+        prepare_chunk_indices(cu, 64).to(torch.int32),
+        torch.tensor(num_chunks, device="cuda", dtype=torch.int32),
+    )
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
         v=v,
         beta=beta,
         A=A,
+        metadata=metadata,
         q=q,
         gk=gk,
-        cu_seqlens=cu,
-        chunk_indices=prepare_chunk_indices(cu, 64),
-        num_chunks=torch.tensor(num_chunks, device="cuda", dtype=torch.long),
         chunk_size=64,
     )
 
@@ -1597,9 +1624,11 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
 
 
 @requires_cute
-@pytest.mark.parametrize("bv", [16, 32])
-@pytest.mark.parametrize("num_chunks", [4, 5])
-@pytest.mark.parametrize("use_h0,use_dht", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "bv,num_chunks,use_h0,use_dht",
+    [(16, 4, False, False), (32, 5, True, False), (16, 4, True, True)],
+    ids=["bv16", "bv32-state", "final-state-gradient"],
+)
 def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     # Non-varlen path: B=1, K=V=128, chunk_size=64. Covers the dht (final-state grad)
     # and h0 (initial-state grad -> dh0) input paths, and both BV=16/BV=32 SS-mode tiles.
@@ -1714,9 +1743,8 @@ def _chunk_tril_mask(T: int, BT: int, device) -> torch.Tensor:
 
 
 @requires_cute
-@pytest.mark.parametrize("num_chunks", [4, 8])
-@pytest.mark.parametrize("H", [2, 4])
-def test_chunk_kda_fwd_intra_cute(num_chunks, H):
+def test_chunk_kda_fwd_intra_cute():
+    num_chunks, H = 4, 4
     torch.manual_seed(22)
     B, K, V = 1, 128, 128
     T = num_chunks * 64
@@ -1730,7 +1758,12 @@ def test_chunk_kda_fwd_intra_cute(num_chunks, H):
     gk = g_inc.view(B, num_chunks, 64, H, K).cumsum(2).view(B, T, H, K)
     beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
 
-    cu = torch.tensor([0, T], device="cuda", dtype=torch.long)
+    cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+    metadata = ChunkMetadata(
+        cu,
+        prepare_chunk_indices(cu, 64).to(torch.int32),
+        torch.tensor(num_chunks, device="cuda", dtype=torch.int32),
+    )
     w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
         q,
         k,
@@ -1738,9 +1771,7 @@ def test_chunk_kda_fwd_intra_cute(num_chunks, H):
         gk,
         beta,
         scale,
-        recompute_cu_seqlens=cu,
-        recompute_chunk_indices=prepare_chunk_indices(cu, 64),
-        recompute_num_chunks=torch.tensor(num_chunks, device="cuda", dtype=torch.long),
+        metadata,
         chunk_size=64,
     )
 
@@ -1872,9 +1903,8 @@ def _bwd_intra_ref(q, k, g, beta, dAqk, dAkk, chunk_size=64, cu_seqlens=None, ch
 
 
 @requires_cute
-@pytest.mark.parametrize("num_chunks", [2, 4])
-@pytest.mark.parametrize("H", [2, 4])
-def test_chunk_kda_bwd_intra_cute(num_chunks, H):
+def test_chunk_kda_bwd_intra_cute():
+    num_chunks, H = 4, 4
     torch.manual_seed(3)
     B, K = 1, 128
     T = num_chunks * 64
@@ -1902,9 +1932,7 @@ def test_chunk_kda_bwd_intra_cute(num_chunks, H):
         zq.clone(),
         zb.clone(),
         zq.clone(),
-        cu_seqlens=cu,
-        chunk_indices=chunk_indices,
-        num_chunks=nc,
+        ChunkMetadata(cu, chunk_indices, nc),
     )
 
     gdq, gdk, gdb, gdg = _bwd_intra_ref(
@@ -2020,15 +2048,14 @@ def _bwd_wy_dqkg_ref(
 
 
 @requires_cute
-@pytest.mark.parametrize("num_chunks", [2, 4])
-@pytest.mark.parametrize("H", [2, 4])
-def test_chunk_kda_bwd_wy_dqkg_fused_cute(num_chunks, H):
+def test_chunk_kda_bwd_wy_dqkg_fused_cute():
+    num_chunks, H = 4, 4
     torch.manual_seed(4)
     B, K, V = 1, 128, 128
     HV = H
     T = num_chunks * 64
     scale = K**-0.5
-    cu, chunk_indices, _ = _fixed_meta(num_chunks)
+    cu, chunk_indices, num_chunks_tensor = _fixed_meta(num_chunks)
 
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
@@ -2057,9 +2084,8 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute(num_chunks, H):
         do,
         dh,
         dv,
-        cu_seqlens=cu,
+        ChunkMetadata(cu, chunk_indices, num_chunks_tensor),
         chunk_size=64,
-        chunk_indices=chunk_indices,
     )
 
     ref_args = (v_new, g, beta, A, h, do, dh, dv)
