@@ -14,18 +14,16 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 import torch
-import triton
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
 )
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
-    chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
+    chunk_kda_fwd_intra_diagonal,
 )
-from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE, IS_GATHER_SUPPORTED, ChunkMetadata
+from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE, ChunkMetadata
 
 
 def chunk_kda_fwd_intra(
@@ -47,57 +45,31 @@ def chunk_kda_fwd_intra(
 ]:
     assert chunk_size == 64, "chunk_kda_fwd_intra CuTe path requires chunk_size=64"
 
-    max_num_grid = get_device_properties(k.device).multi_processor_count
-
     B, T, H, K = k.shape
     _, _, _, V = v.shape
     BT = chunk_size
     BC = 16
-    BK = triton.next_power_of_2(K)
-    NC = triton.cdiv(BT, BC)
     assert B == 1, f"chunk_kda_fwd_intra CuTe path requires B=1, got B={B}"
     assert K == 128, f"chunk_kda_fwd_intra CuTe path requires K=128, got K={K}"
     assert V == 128, f"chunk_kda_fwd_intra CuTe path requires V=128, got V={V}"
 
-    NT = triton.cdiv(T, BT)
-    grid_NT = min(max_num_grid, NT)
-
-    Aqk_flat = torch.empty(B * T, H * BT, device=k.device, dtype=k.dtype)
-    Aqk = Aqk_flat.reshape(B, T, H, BT)
-    Akkd_flat = torch.empty(B * T, H * BC, device=k.device, dtype=torch.float32)
-    Akkd = Akkd_flat.reshape(B, T, H, BC)
-
-    if not isinstance(k, FakeTensor):
+    if isinstance(k, FakeTensor):
+        Aqk = torch.empty((B, T, H, BT), device=k.device, dtype=k.dtype)
+        Akkd = torch.empty((B, T, H, BC), device=k.device, dtype=torch.float32)
+    else:
         with (
             torch.profiler.record_function("kda/triton/intra_subchunk")
             if profile_ranges
             else nullcontext()
         ):
-            chunk_kda_fwd_kernel_intra_sub_chunk_forloop[(grid_NT, NC, B * H)](
+            Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
                 q=q,
                 k=k,
                 g=gk,
                 beta=beta,
-                Aqk=Aqk,
-                Akk=Akkd,
                 scale=scale,
-                cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
-                chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
-                num_chunks=metadata.num_chunks if metadata.has_multiple_sequences else None,
-                T=T,
-                q_stride_t=q.stride(1),
-                q_stride_h=q.stride(2),
-                k_stride_t=k.stride(1),
-                k_stride_h=k.stride(2),
-                H=H,
-                K=K,
-                BT=BT,
-                BC=BC,
-                BK=BK,
-                USE_GATHER=IS_GATHER_SUPPORTED,
-                CAUSAL_NORMREF=False,
-                GRID_NT=grid_NT,
-                MAX_NT=NT,
+                metadata=metadata,
+                chunk_size=BT,
             )
 
     with (
