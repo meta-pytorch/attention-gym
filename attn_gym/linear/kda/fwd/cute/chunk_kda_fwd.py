@@ -9,6 +9,7 @@ import torch
 from attn_gym._backends.cute import get_device_properties, tensor_supports_tma
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
+    chunk_capacity,
     prepare_ragged_chunk_metadata,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
@@ -332,12 +333,20 @@ def _chunk_kda_fwd_ragged_custom_op(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     output_final_state: bool,
+    fastmath: bool,
     profile_ranges: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run inference-only ragged forward with a stable two-output schema."""
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run ragged forward and return its fixed-schema backward tape."""
     q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
-    output, final_state, *_ = _chunk_kda_fwd(
+    del fastmath  # This static option configures the registered backward.
+    output, final_state, Aqk, Akk, _, chunk_offsets, _ = _chunk_kda_fwd(
         q,
         k,
         v,
@@ -350,7 +359,7 @@ def _chunk_kda_fwd_ragged_custom_op(
         ragged_metadata=True,
     )
     state = final_state if final_state is not None else q.new_empty((0,), dtype=torch.float32)
-    return output, state
+    return output, state, Aqk, Akk, chunk_offsets
 
 
 @_chunk_kda_fwd_ragged_custom_op.register_fake
@@ -363,10 +372,17 @@ def _chunk_kda_fwd_ragged_fake(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     output_final_state: bool,
+    fastmath: bool,
     profile_ranges: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Describe inference-only ragged forward outputs."""
-    del k, cumulative_gate, beta, initial_state, profile_ranges
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Describe ragged forward and backward-tape outputs."""
+    del k, cumulative_gate, beta, initial_state, fastmath, profile_ranges
     state = (
         q.new_empty(
             (cu_seqlens.shape[0] - 1, q.shape[2], q.shape[3], v.shape[-1]),
@@ -375,7 +391,14 @@ def _chunk_kda_fwd_ragged_fake(
         if output_final_state
         else q.new_empty((0,), dtype=torch.float32)
     )
-    return v.new_empty(v.shape), state
+    tape_shape = (q.shape[0], q.shape[1], q.shape[2], _CHUNK_SIZE)
+    return (
+        v.new_empty(v.shape),
+        state,
+        q.new_empty(tape_shape),
+        q.new_empty(tape_shape),
+        q.new_empty(cu_seqlens.shape, dtype=torch.int32),
+    )
 
 
 @torch.library.custom_op("attn_gym::kda_chunk_bwd", mutates_args=())
@@ -393,6 +416,7 @@ def _chunk_kda_bwd_custom_op(
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
+    ragged: bool,
     fastmath: bool,
     profile_ranges: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -403,7 +427,15 @@ def _chunk_kda_bwd_custom_op(
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     if d_output is None:
         d_output = v.new_zeros(v.shape)
-    metadata = ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
+    metadata = (
+        RaggedChunkMetadata(
+            cu_seqlens,
+            chunk_indices,
+            chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
+        )
+        if ragged
+        else ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
+    )
     dq, dk, dv, dg, db, d_initial_state = chunk_kda_bwd(
         q,
         k,
@@ -440,6 +472,7 @@ def _chunk_kda_bwd_fake(
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
+    ragged: bool,
     fastmath: bool,
     profile_ranges: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -452,6 +485,7 @@ def _chunk_kda_bwd_fake(
         num_chunks,
         d_output,
         d_final_state,
+        ragged,
         fastmath,
         profile_ranges,
     )
@@ -545,6 +579,7 @@ def _chunk_kda_backward(
         d_output,
         d_final_state,
         initial_state,
+        False,
         ctx.fastmath,
         ctx.profile_ranges,
     )
@@ -565,6 +600,101 @@ def _chunk_kda_backward(
 _chunk_kda_fwd_custom_op.register_autograd(
     _chunk_kda_backward,
     setup_context=_setup_chunk_kda_context,
+)
+
+
+def _setup_chunk_kda_ragged_context(ctx, inputs, output) -> None:
+    (
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        output_final_state,
+        fastmath,
+        profile_ranges,
+    ) = inputs
+    _output, state, Aqk, Akk, chunk_offsets = output
+    ctx.save_for_backward(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        Aqk,
+        Akk,
+        initial_state,
+        cu_seqlens,
+        chunk_offsets,
+    )
+    ctx.has_initial_state = initial_state is not None
+    ctx.fastmath = fastmath
+    ctx.profile_ranges = profile_ranges
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(Aqk, Akk, chunk_offsets)
+    if not output_final_state:
+        ctx.mark_non_differentiable(state)
+
+
+@torch.autograd.function.once_differentiable
+def _chunk_kda_ragged_backward(
+    ctx,
+    d_output,
+    d_final_state,
+    _dAqk,
+    _dAkk,
+    _d_chunk_offsets,
+):
+    (
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        Aqk,
+        Akk,
+        initial_state,
+        cu_seqlens,
+        chunk_offsets,
+    ) = ctx.saved_tensors
+    unused_num_chunks = chunk_offsets.new_empty(())
+    dq, dk, dv, dg, db, d_initial_state = _chunk_kda_bwd_custom_op(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        Aqk,
+        Akk,
+        cu_seqlens,
+        chunk_offsets,
+        unused_num_chunks,
+        d_output,
+        d_final_state,
+        initial_state,
+        True,
+        ctx.fastmath,
+        ctx.profile_ranges,
+    )
+    return (
+        dq,
+        dk,
+        dv,
+        dg,
+        db,
+        d_initial_state if ctx.has_initial_state else None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+_chunk_kda_fwd_ragged_custom_op.register_autograd(
+    _chunk_kda_ragged_backward,
+    setup_context=_setup_chunk_kda_ragged_context,
 )
 
 
