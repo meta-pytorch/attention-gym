@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from itertools import product
 
 import pytest
@@ -47,6 +48,8 @@ from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     kda_gate_chunk_cumsum_vector_kernel_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
+    _l2norm_bwd_custom_op,
+    _l2norm_fwd_custom_op,
     l2norm,
     l2norm_fwd_kernel,
     l2norm_fwd_kernel1,
@@ -253,9 +256,11 @@ def test_l2norm_fwd(dtype, T, D, strided):
         rstd,
         eps,
         T,
-        X_STRIDES=x.stride(),
+        X_STRIDES=(0, x.stride(0), 0, x.stride(1)),
         Y_STRIDES=y.stride(),
         RSTD_STRIDES=rstd.stride(),
+        T=T,
+        H=1,
         D=D,
         BD=BD,
         NB=triton.cdiv(T, 16),
@@ -271,9 +276,11 @@ def test_l2norm_fwd(dtype, T, D, strided):
         y1,
         rstd1,
         eps,
-        X_STRIDES=x.stride(),
+        X_STRIDES=(0, x.stride(0), 0, x.stride(1)),
         Y_STRIDES=y1.stride(),
         RSTD_STRIDES=rstd1.stride(),
+        T=T,
+        H=1,
         D=D,
         BD=BD,
     )
@@ -301,6 +308,55 @@ def test_l2norm_autograd_wrapper(dtype):
     )
 
 
+def test_l2norm_custom_op_registration():
+    x = torch.randn(1, 17, 3, 128, device=DEV, dtype=torch.bfloat16)
+    torch.library.opcheck(_l2norm_fwd_custom_op, (x, 1e-6))
+
+    output, rstd = _l2norm_fwd_custom_op(x, 1e-6)
+    d_output = torch.randn_like(output)
+    torch.library.opcheck(
+        _l2norm_bwd_custom_op,
+        (output.view(-1, output.shape[-1]), rstd, d_output),
+    )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    (
+        "compact",
+        "packed-qkv-view",
+        "arbitrary-head-inner-strides",
+        "arbitrary-batch-token-strides",
+    ),
+)
+def test_l2norm_compile_matches_eager(layout):
+    """Keep compiled normalization equivalent across direct and fallback layouts."""
+    torch.manual_seed(2)
+    if layout == "packed-qkv-view":
+        x = torch.randn(1, 1024, 3, 2, 128, device=DEV, dtype=torch.bfloat16)[:, :, 0]
+        assert x.stride() == (1024 * 3 * 2 * 128, 3 * 2 * 128, 128, 1)
+    elif layout == "arbitrary-head-inner-strides":
+        x = torch.randn(1, 1024, 128, 2, device=DEV, dtype=torch.bfloat16).transpose(-1, -2)
+        assert x.stride() == (1024 * 2 * 128, 2 * 128, 1, 2)
+    elif layout == "arbitrary-batch-token-strides":
+        x = torch.randn(128, 2, 2, 128, device=DEV, dtype=torch.bfloat16).transpose(0, 1)
+        assert x.stride() == (2 * 128, 2 * 2 * 128, 128, 1)
+    else:
+        x = torch.randn(1, 1024, 2, 128, device=DEV, dtype=torch.bfloat16)
+
+    x.requires_grad_()
+    d_output = torch.randn_like(x)
+    expected = l2norm(x)
+    actual = torch.compile(l2norm, fullgraph=True, dynamic=True)(x)
+    expected_gradient = torch.autograd.grad(expected, x, d_output)[0]
+    actual_gradient = torch.autograd.grad(actual, x, d_output)[0]
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    lower = torch.nextafter(expected_gradient, torch.full_like(expected_gradient, -torch.inf))
+    upper = torch.nextafter(expected_gradient, torch.full_like(expected_gradient, torch.inf))
+    assert ((actual_gradient >= lower) & (actual_gradient <= upper)).all()
+
+
 @pytest.mark.parametrize("dtype", [torch.float64, torch.int32], ids=["fp64", "int32"])
 def test_l2norm_rejects_unsupported_dtype(dtype):
     x = torch.ones(2, 8, device=DEV, dtype=dtype)
@@ -308,9 +364,14 @@ def test_l2norm_rejects_unsupported_dtype(dtype):
         l2norm(x)
 
 
+def test_l2norm_rejects_non_kda_shape():
+    with pytest.raises(ValueError, match=r"shape \[B, T, H, D\]"):
+        l2norm(torch.empty(2, 128, device=DEV))
+
+
 def test_l2norm_rejects_empty_outer_dimension():
     with pytest.raises(ValueError, match="at least one row"):
-        l2norm(torch.empty(0, 128, device=DEV))
+        l2norm(torch.empty(1, 0, 2, 128, device=DEV))
 
 
 # l2norm backward   dx = rstd * (dy - y * <dy, y>)
@@ -338,17 +399,20 @@ def test_l2norm_bwd(dtype, T, D, strided):
 
     dx = _empty_strided_like(y) if strided else torch.empty_like(y)
     grid = lambda meta: (triton.cdiv(T, meta["BT"]),)
+    # Present physical [T, D] storage to the kernel as logical [1, T, 1, D].
+    dy_strides = (0, dy.stride(0), 0, dy.stride(1))
     l2norm_bwd_kernel[grid](
         y,
         rstd,
         dy,
         dx,
-        eps,
         T,
         Y_STRIDES=y.stride(),
         RSTD_STRIDES=rstd.stride(),
-        DY_STRIDES=dy.stride(),
+        DY_STRIDES=dy_strides,
         DX_STRIDES=dx.stride(),
+        TOKENS=T,
+        HEADS=1,
         D=D,
         BD=BD,
         NB=triton.cdiv(T, 16),
@@ -361,12 +425,13 @@ def test_l2norm_bwd(dtype, T, D, strided):
         rstd,
         dy,
         dx1,
-        eps,
         D,
         Y_STRIDES=y.stride(),
         RSTD_STRIDES=rstd.stride(),
-        DY_STRIDES=dy.stride(),
+        DY_STRIDES=dy_strides,
         DX_STRIDES=dx1.stride(),
+        TOKENS=T,
+        HEADS=1,
         BD=BD,
     )
     assert_golden(dx1, golden, ref, dtype, f"l2norm_bwd_kernel1 T={T} D={D}")
@@ -1696,7 +1761,7 @@ def test_delta_h_bwd_dhu_dispatch_selects_bv(monkeypatch, sm_count, expected_bv)
     class _Props:
         multi_processor_count = sm_count
 
-    monkeypatch.setattr(dispatch_mod.torch.cuda, "get_device_properties", lambda device: _Props())
+    monkeypatch.setattr(dispatch_mod, "get_device_properties", lambda device: _Props())
     monkeypatch.setattr(dispatch_mod, "blackwell_delta_h_bwd_dhu_v1", fake_v1)
 
     dispatch_mod.blackwell_delta_h_bwd_dhu_dispatch(q, q, q, zeros, zeros)
@@ -1858,8 +1923,8 @@ def _bwd_intra_ref(q, k, g, beta, dAqk, dAkk, chunk_size=64, cu_seqlens=None, ch
                    dg += sum_j dAkk*exp2*beta_i*k_i*k_j - sum_i (same)
 
     Both dAqk and dAkk are masked with a NON-strict causal mask (i>=j, incl. diagonal) to
-    match fla upstream. No ``scale`` (folded upstream into dAqk) and no ``ln2`` in dg (the
-    kernel differentiates 2^g directly without the chain-rule factor, by convention).
+    match fla upstream. There is no ``scale`` because it is folded upstream into dAqk.
+    The final ``dg`` writer applies ``ln(2)`` for the derivative of ``2**g``.
     """
     B, T, H, Kd = q.shape
     device = q.device
@@ -1899,7 +1964,7 @@ def _bwd_intra_ref(q, k, g, beta, dAqk, dAkk, chunk_size=64, cu_seqlens=None, ch
             dk[b, s] += (akk * k_j).sum(1) + (akk * k_i).sum(0)
             db[b, s] = (ak * (exp2 * k_i * k_j).sum(-1)).sum(1)
             dg[b, s] += t_akk.sum(1) - t_akk.sum(0)
-    return dq, dk, db, dg
+    return dq, dk, db, dg * math.log(2.0)
 
 
 @requires_cute

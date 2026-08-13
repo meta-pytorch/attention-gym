@@ -476,7 +476,7 @@ def main(
     )
     if compile_model:
         model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
     cu_seqlens = None
     input_shape = (batch_size, tokens, hidden_size)
     layout_name = ""

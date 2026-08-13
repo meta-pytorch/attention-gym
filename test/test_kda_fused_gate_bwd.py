@@ -16,6 +16,7 @@ import torch
 pytest.importorskip("cutlass")
 triton = pytest.importorskip("triton")
 
+from attn_gym._backends.cute import tensor_supports_tma
 from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import (
     FusedGateBwdOp,
     FusedGateBwdOutput,
@@ -88,10 +89,10 @@ def _fused_reference(inputs, lower_bound=-5.0, chunk_size=64):
 
 
 def _expected_output(inputs, lower_bound=-5.0, chunk_size=64):
-    """Build the partial-output ABI from the canonical backward reference."""
+    """Build the kernel output ABI and the final dA_log from the canonical reference."""
     dg, dA_log, d_dt_bias = _fused_reference(inputs, lower_bound, chunk_size)
     z = inputs[0].float() + inputs[2]
-    partials = torch.stack(
+    dA_partial = torch.stack(
         [
             (dg_chunk * z_chunk).sum((1, 3))
             for dg_chunk, z_chunk in zip(
@@ -102,18 +103,29 @@ def _expected_output(inputs, lower_bound=-5.0, chunk_size=64):
         ],
         dim=1,
     )
-    return FusedGateBwdOutput(dg, partials), dA_log, d_dt_bias
+    return FusedGateBwdOutput(dg, dA_partial, d_dt_bias), dA_log
+
+
+def _assert_bf16_within_one_ulp(actual, expected):
+    """Require BF16 ``actual`` to be the rounded FP32 reference or an adjacent BF16 value."""
+    assert actual.dtype == torch.bfloat16
+    rounded = expected.to(torch.bfloat16)
+    assert actual.isfinite().all() and rounded.isfinite().all()
+    lower = torch.nextafter(rounded, torch.full_like(rounded, -torch.inf))
+    upper = torch.nextafter(rounded, torch.full_like(rounded, torch.inf))
+    assert ((actual >= lower) & (actual <= upper)).all()
 
 
 def _assert_output_close(actual, expected):
-    """Compare the two tensors produced by the partial-output ABI."""
-    torch.testing.assert_close(actual.dg, expected.dg, rtol=3e-5, atol=4e-5)
+    """Compare the gate gradient and both parameter gradients."""
+    _assert_bf16_within_one_ulp(actual.dg, expected.dg)
     torch.testing.assert_close(
         actual.dA_partial,
         expected.dA_partial,
         rtol=5e-5,
         atol=5e-4,
     )
+    torch.testing.assert_close(actual.d_dt_bias, expected.d_dt_bias, rtol=5e-5, atol=7e-4)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -201,9 +213,33 @@ def test_bounded_gate_cumsum_autograd_boundary():
         chunk_size=64,
     )
 
-    torch.testing.assert_close(actual[0].float(), expected[0], rtol=2e-2, atol=2e-3)
+    _assert_bf16_within_one_ulp(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=5e-4)
     torch.testing.assert_close(actual[2], expected[2], rtol=5e-5, atol=7e-4)
+
+
+def test_bounded_gate_cumsum_compile_matches_eager():
+    """Keep compiled gate forward and backward equivalent to eager execution."""
+    g, A_log, dt_bias, d_cumulative = _inputs(1024, heads=2, batch=1)
+    expected_inputs = tuple(tensor.detach().requires_grad_() for tensor in (g, A_log, dt_bias))
+    actual_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in expected_inputs)
+
+    def operation(g, A_log, dt_bias):
+        return bounded_gate_cumsum(g, A_log, dt_bias, lower_bound=-3.25)
+
+    expected = operation(*expected_inputs)
+    actual = torch.compile(operation, fullgraph=True)(*actual_inputs)
+    expected_gradients = torch.autograd.grad(expected, expected_inputs, d_cumulative)
+    actual_gradients = torch.autograd.grad(actual, actual_inputs, d_cumulative)
+
+    # The gate gradient leaves the kernel unchanged, while Inductor may reduce the
+    # parameter gradients in a different order than eager.
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=0, atol=0)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients[1:], expected_gradients[1:], strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=5e-5, atol=7e-4)
 
 
 @pytest.mark.parametrize(
@@ -222,23 +258,18 @@ def test_bounded_gate_cumsum_autograd_boundary():
 def test_fused_gate_bwd_matches_reference(tokens, head_dim, lower_bound, chunk_size):
     """Cover TMA tails and independent static semantic specializations."""
     inputs = _inputs(tokens, head_dim=head_dim)
-    expected, expected_dA, expected_dt_bias = _expected_output(
-        inputs,
-        lower_bound,
-        chunk_size,
-    )
+    expected, expected_dA = _expected_output(inputs, lower_bound, chunk_size)
 
     actual = fused_gate_bwd(*inputs, lower_bound=lower_bound, chunk_size=chunk_size)
 
     _assert_output_close(actual, expected)
     torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
-    torch.testing.assert_close(actual.dg.sum((0, 1)), expected_dt_bias, rtol=5e-5, atol=7e-4)
 
 
 def test_fused_gate_bwd_fastmath_specialization_is_correct():
     """Keep the non-default exponential mode numerically valid."""
     inputs = _inputs(65, heads=17)
-    expected, expected_dA, _expected_dt_bias = _expected_output(inputs, -4.75)
+    expected, expected_dA = _expected_output(inputs, -4.75)
 
     actual = fused_gate_bwd(*inputs, lower_bound=-4.75, fastmath=True)
 
@@ -308,10 +339,21 @@ def test_fused_gate_bwd_matches_triton_composition():
     )
 
     actual = fused_gate_bwd(*inputs)
-    torch.testing.assert_close(actual.dg[0], triton_dg, rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(
+        actual.dg[0].float(),
+        triton_dg,
+        rtol=torch.finfo(torch.bfloat16).eps,
+        atol=1e-3,
+    )
     torch.testing.assert_close(
         actual.dA_partial.sum((0, 1)),
         triton_dA_partial.sum(0),
+        rtol=2e-4,
+        atol=2e-2,
+    )
+    torch.testing.assert_close(
+        actual.d_dt_bias,
+        triton_dg.sum(0),
         rtol=2e-4,
         atol=2e-2,
     )
@@ -333,20 +375,44 @@ def test_fused_gate_bwd_requires_batch_dimension():
         fused_gate_bwd(g[0], A_log, dt_bias, d_cumulative[0])
 
 
-def test_fused_gate_bwd_custom_op_rejects_noncontiguous_input():
-    """Enforce the compact fake ABI at the private operator boundary."""
+def test_fused_gate_bwd_reads_aligned_strided_rows_directly():
+    """Avoid compacting packed projections whose trailing rows satisfy TMA alignment."""
+    batch, tokens, heads, head_dim = 2, 17, 16, 64
+    torch.manual_seed(10)
+    g = torch.randn(batch, tokens, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)[
+        :, :, 0
+    ]
+    d_cumulative = torch.randn(
+        batch, tokens, 2, heads, head_dim, device="cuda", dtype=torch.float32
+    )[:, :, 0]
+    A_log = torch.randn(2 * heads, device="cuda", dtype=torch.float32)[::2]
+    dt_bias = torch.randn(heads, 2 * head_dim, device="cuda", dtype=torch.float32)[:, ::2]
+    inputs = (g, A_log, dt_bias, d_cumulative)
+    assert tensor_supports_tma(g)
+    assert tensor_supports_tma(d_cumulative)
+    assert not A_log.is_contiguous()
+    assert not dt_bias.is_contiguous()
+
+    expected_dg, expected_dA, expected_dt_bias = _fused_reference(inputs, -3.25, 7)
+    compiled = torch.compile(fused_gate_bwd, fullgraph=True, dynamic=True)
+    actual = compiled(*inputs, lower_bound=-3.25, chunk_size=7)
+    _assert_bf16_within_one_ulp(actual.dg, expected_dg)
+    torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
+    torch.testing.assert_close(actual.d_dt_bias, expected_dt_bias, rtol=5e-5, atol=7e-4)
+
+
+def test_fused_gate_bwd_compacts_unsupported_inner_stride():
+    """Retain a safe fallback when the feature dimension is not contiguous."""
     _g, A_log, dt_bias, d_cumulative = _inputs(17, head_dim=64)
-    strided_g = torch.empty(2, 17, 16, 128, device="cuda", dtype=torch.bfloat16)[..., ::2]
-    with pytest.raises(ValueError, match="requires contiguous"):
-        _fused_gate_bwd_custom_op(
-            strided_g,
-            A_log,
-            dt_bias,
-            d_cumulative,
-            32,
-            -3.25,
-            False,
-        )
+    g = torch.randn(2, 17, 16, 128, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    assert not tensor_supports_tma(g)
+
+    inputs = (g, A_log, dt_bias, d_cumulative)
+    expected_dg, expected_dA, expected_dt_bias = _fused_reference(inputs, -3.25, 7)
+    actual = fused_gate_bwd(*inputs, lower_bound=-3.25, chunk_size=7)
+    _assert_bf16_within_one_ulp(actual.dg, expected_dg)
+    torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
+    torch.testing.assert_close(actual.d_dt_bias, expected_dt_bias, rtol=5e-5, atol=7e-4)
 
 
 def test_fused_gate_bwd_fullgraph_dynamic():
@@ -354,17 +420,18 @@ def test_fused_gate_bwd_fullgraph_dynamic():
     compiled = torch.compile(fused_gate_bwd, fullgraph=True, dynamic=True)
     for batch, tokens in ((1, 63), (3, 65)):
         inputs = _inputs(tokens, head_dim=64, batch=batch)
-        expected_dg, expected_dA, _expected_dt_bias = _fused_reference(inputs, -3.25, 7)
+        expected_dg, expected_dA, expected_dt_bias = _fused_reference(inputs, -3.25, 7)
         actual = compiled(
             *inputs,
             lower_bound=-3.25,
             chunk_size=7,
             fastmath=False,
         )
-        torch.testing.assert_close(actual.dg, expected_dg, rtol=3e-5, atol=4e-5)
+        _assert_bf16_within_one_ulp(actual.dg, expected_dg)
         torch.testing.assert_close(
             actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4
         )
+        torch.testing.assert_close(actual.d_dt_bias, expected_dt_bias, rtol=5e-5, atol=7e-4)
 
 
 def test_fused_gate_bwd_cuda_graph_replay():
@@ -379,13 +446,14 @@ def test_fused_gate_bwd_cuda_graph_replay():
     captured_dg = actual.dg.clone()
 
     inputs[-1].mul_(-0.5).add_(0.25)
-    expected_dg, expected_dA, _expected_dt_bias = _fused_reference(inputs, -3.25, 7)
+    expected_dg, expected_dA, expected_dt_bias = _fused_reference(inputs, -3.25, 7)
     graph.replay()
     torch.cuda.synchronize()
 
     assert not torch.equal(actual.dg, captured_dg)
-    torch.testing.assert_close(actual.dg, expected_dg, rtol=3e-5, atol=4e-5)
+    _assert_bf16_within_one_ulp(actual.dg, expected_dg)
     torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
+    torch.testing.assert_close(actual.d_dt_bias, expected_dt_bias, rtol=5e-5, atol=7e-4)
 
 
 def test_fused_gate_bwd_rejects_invalid_static_scalars():

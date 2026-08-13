@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any
 
+import torch
+
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+TMA_ALIGNMENT_BYTES = 16
 
 
 def ceildiv(number: int, divisor: int) -> int:
@@ -14,8 +18,6 @@ def ceildiv(number: int, divisor: int) -> int:
 
 
 def _contains_torch_tensor(value: Any) -> bool:
-    import torch
-
     if isinstance(value, torch.Tensor):
         return True
     if isinstance(value, (tuple, list)):
@@ -26,6 +28,31 @@ def _contains_torch_tensor(value: Any) -> bool:
             for key, item in value.items()
         )
     return False
+
+
+@lru_cache(maxsize=8)
+def get_device_properties(device: torch.device) -> Any:
+    """Return cached CUDA properties for a device."""
+    return torch.cuda.get_device_properties(device)
+
+
+def tensor_supports_tma(tensor: torch.Tensor) -> bool:
+    """Return whether a CUDA tensor has a TMA-compatible aligned strided layout.
+
+    The innermost dimension must be contiguous. The base pointer and every outer stride,
+    measured in bytes, must satisfy ``TMA_ALIGNMENT_BYTES``.
+    """
+    if not tensor.is_cuda:
+        return False
+    element_size = tensor.element_size()
+    return (
+        tensor.ndim > 0
+        and tensor.stride(-1) == 1
+        and tensor.data_ptr() % TMA_ALIGNMENT_BYTES == 0
+        and all(
+            stride * element_size % TMA_ALIGNMENT_BYTES == 0 for stride in tensor.stride()[:-1]
+        )
+    )
 
 
 def compile_tvm_ffi(
@@ -67,4 +94,10 @@ def compile_tvm_ffi(
     )
 
 
-__all__ = ["ceildiv", "compile_tvm_ffi"]
+__all__ = [
+    "TMA_ALIGNMENT_BYTES",
+    "ceildiv",
+    "compile_tvm_ffi",
+    "get_device_properties",
+    "tensor_supports_tma",
+]

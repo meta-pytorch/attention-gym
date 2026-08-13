@@ -23,7 +23,7 @@ Crossover point: w_tiles_bv16 = SM_count ≈ 132 on GH200.
 
 import torch
 
-from attn_gym._backends.cute import ceildiv
+from attn_gym._backends.cute import ceildiv, get_device_properties
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import (
     blackwell_delta_h_bwd_dhu_v1,
 )
@@ -56,7 +56,7 @@ def blackwell_delta_h_bwd_dhu_dispatch(
     logical_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
 
     w_tiles_bv16 = ceildiv(value_dim, 16) * heads * logical_batch
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sm_count = get_device_properties(q.device).multi_processor_count
 
     bv = 32 if w_tiles_bv16 > sm_count else 16
 

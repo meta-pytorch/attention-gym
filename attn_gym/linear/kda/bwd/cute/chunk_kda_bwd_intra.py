@@ -32,6 +32,9 @@ KEY_DIM = 128  # full head_dim
 KEY_DIM_PER_CTA = 32  # head_dim per K phase
 K_PHASES = KEY_DIM // KEY_DIM_PER_CTA  # four 32-wide head-dim phases
 KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
+# The gate algebra accumulates d/d(natural exponent); this kernel owns the last dg
+# write, so it converts the complete gradient to d/d(log2 gate).
+LN2 = 0.6931471805599453
 # q and k may arrive as unbound QKV views: only their innermost dimension is
 # contiguous, and the 16-byte cp.async stages need every outer stride and the
 # base pointer to be 16-byte (8 bf16 element) aligned.
@@ -1752,8 +1755,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     dk_word0 = _cvt_bf16x2_f32(dk_out0, dk_out1)
                 else:
                     dk_word1 = _cvt_bf16x2_f32(dk_out0, dk_out1)
-                dg_out0 = dg_in0 + dq_add0 * qval0 + (dk_beta0 - dkt0) * kval0
-                dg_out1 = dg_in1 + dq_add1 * qval1 + (dk_beta1 - dkt1) * kval1
+                dg_out0 = (dg_in0 + dq_add0 * qval0 + (dk_beta0 - dkt0) * kval0) * Float32(LN2)
+                dg_out1 = (dg_in1 + dq_add1 * qval1 + (dk_beta1 - dkt1) * kval1) * Float32(LN2)
                 if lane_row == 0:
                     dg_top0 = dg_out0
                     dg_top1 = dg_out1
@@ -2159,7 +2162,11 @@ def chunk_kda_bwd_intra(
     tune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run or tune the metadata-driven intra-chunk Q/K/gate/beta backward stage."""
+    """Run the final intra-chunk backward stage.
+
+    The returned gate gradient includes the ``ln(2)`` factor for differentiating ``2**g``;
+    the incoming ``dg`` and this stage's contribution are both scaled at the final writer.
+    """
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != KEY_DIM:
         raise ValueError("the intra-chunk backward requires B=1 and K=128")
