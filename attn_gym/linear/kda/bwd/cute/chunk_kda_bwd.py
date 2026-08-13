@@ -14,6 +14,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.utils import ChunkMetadata
@@ -30,7 +31,7 @@ def chunk_kda_bwd(
     do: torch.Tensor,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
-    metadata: ChunkMetadata,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
@@ -50,7 +51,8 @@ def chunk_kda_bwd(
         raise ValueError("the composed KDA backward requires B=1 and K=V=128")
     if chunk_size != 64:
         raise ValueError(f"the composed KDA backward requires chunk_size=64, got {chunk_size}")
-    if tokens % chunk_size:
+    ragged = isinstance(metadata, RaggedChunkMetadata)
+    if tokens % chunk_size and not ragged:
         raise ValueError("the composed KDA backward requires complete chunks")
 
     def record(name: str):
@@ -80,7 +82,12 @@ def chunk_kda_bwd(
             initial_state,
             chunk_size=chunk_size,
             output_final_state=False,
-            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+            cu_seqlens=(
+                metadata.cu_seqlens
+                if isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences
+                else None
+            ),
+            metadata=metadata if ragged else None,
         )
     del u
 
@@ -91,7 +98,12 @@ def chunk_kda_bwd(
             do,
             head_dim**-0.5,
             chunk_size=chunk_size,
-            metadata=metadata if metadata.has_multiple_sequences else None,
+            metadata=(
+                metadata
+                if ragged
+                or (isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences)
+                else None
+            ),
         )
     with record("kda/cute/backward_delta_h"):
         dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dispatch(
@@ -104,19 +116,28 @@ def chunk_kda_bwd(
             h0=initial_state,
             dht=d_final_state,
             scale=head_dim**-0.5,
-            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+            cu_seqlens=(
+                metadata.cu_seqlens
+                if isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences
+                else None
+            ),
             chunk_size=chunk_size,
             chunk_offsets=(
-                metadata.cu_seqlens // chunk_size if metadata.has_multiple_sequences else None
+                metadata.cu_seqlens // chunk_size
+                if isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences
+                else None
             ),
             num_seqs=(
                 metadata.cu_seqlens.new_full((1,), metadata.cu_seqlens.shape[0] - 1)
-                if metadata.has_multiple_sequences
+                if isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences
                 else None
             ),
-            num_chunks=metadata.chunk_indices.shape[0]
-            if metadata.has_multiple_sequences
-            else None,
+            num_chunks=(
+                metadata.chunk_indices.shape[0]
+                if isinstance(metadata, ChunkMetadata) and metadata.has_multiple_sequences
+                else None
+            ),
+            metadata=metadata if ragged else None,
         )
     del w, qg, kg, dv_intra
     with record("kda/cute/backward_wy_dqkg"):
