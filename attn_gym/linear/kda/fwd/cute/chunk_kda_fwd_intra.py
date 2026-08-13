@@ -16,8 +16,10 @@ from contextlib import nullcontext
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
+    chunk_kda_fwd_inter_solve_ragged_cute,
 )
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
@@ -33,7 +35,7 @@ def chunk_kda_fwd_intra(
     gk: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    metadata: ChunkMetadata,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
 ) -> tuple[
@@ -75,19 +77,31 @@ def chunk_kda_fwd_intra(
     with (
         torch.profiler.record_function("kda/cute/inter_solve") if profile_ranges else nullcontext()
     ):
-        Aqk, Akk = chunk_kda_fwd_inter_solve_cute(
-            q=q,
-            k=k,
-            gk=gk,
-            beta=beta,
-            Akkd=Akkd,
-            scale=scale,
-            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
-            chunk_size=BT,
-            chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
-            Aqk=Aqk,
-            profile_ranges=profile_ranges,
-        )
+        if isinstance(metadata, RaggedChunkMetadata):
+            Aqk, Akk = chunk_kda_fwd_inter_solve_ragged_cute(
+                q=q,
+                k=k,
+                gk=gk,
+                beta=beta,
+                Akkd=Akkd,
+                Aqk=Aqk,
+                scale=scale,
+                metadata=metadata,
+            )
+        else:
+            Aqk, Akk = chunk_kda_fwd_inter_solve_cute(
+                q=q,
+                k=k,
+                gk=gk,
+                beta=beta,
+                Akkd=Akkd,
+                scale=scale,
+                cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+                chunk_size=BT,
+                chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
+                Aqk=Aqk,
+                profile_ranges=profile_ranges,
+            )
 
     with (
         torch.profiler.record_function("kda/cute/recompute_w_u")
