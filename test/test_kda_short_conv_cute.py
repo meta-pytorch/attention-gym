@@ -711,16 +711,20 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
 
 
 def test_kda_example_builds_packed_sequence_metadata():
-    """Keep Zipf-sampled logical lengths aligned, bounded, and cumulative."""
+    """Keep Zipf-sampled logical lengths bounded and cumulative."""
     torch.manual_seed(0)
-    lengths, offsets = packed_sequence_metadata(4, 256, 64)
+    lengths, offsets = packed_sequence_metadata(4, 63, 64)
     assert len(lengths) == 4
-    assert all(length % 64 == 0 and 0 < length <= 256 for length in lengths)
+    assert all(0 < length <= 63 and length % 64 != 0 for length in lengths)
     assert offsets[0] == 0
     assert tuple(end - start for start, end in pairwise(offsets)) == lengths
 
+    padded_lengths, padded_offsets = packed_sequence_metadata(4, 256, 64, padded=True)
+    assert all(length % 64 == 0 and 0 < length <= 256 for length in padded_lengths)
+    assert tuple(end - start for start, end in pairwise(padded_offsets)) == padded_lengths
+
     with pytest.raises(ValueError, match="divisible"):
-        packed_sequence_metadata(2, 96, 64)
+        packed_sequence_metadata(2, 96, 64, padded=True)
     with pytest.raises(ValueError, match="at least one"):
         packed_sequence_metadata(3, 0, 64)
 

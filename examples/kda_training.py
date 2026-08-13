@@ -96,16 +96,20 @@ def packed_sequence_metadata(
     num_sequences: int,
     max_tokens: int,
     chunk_size: int,
+    padded: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Sample aligned sequence lengths from a truncated Zipf distribution."""
-    if max_tokens % chunk_size:
-        raise ValueError("packed tokens must be divisible by chunk_size")
-    if max_tokens < chunk_size:
-        raise ValueError("packed tokens must include at least one full chunk")
-    max_chunks = max_tokens // chunk_size
-    weights = torch.arange(1, max_chunks + 1, dtype=torch.float64).reciprocal()
-    chunk_counts = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
-    lengths = tuple(count * chunk_size for count in chunk_counts)
+    """Sample sequence lengths from a truncated Zipf distribution."""
+    if max_tokens < 1:
+        raise ValueError("packed tokens must include at least one token")
+    if padded:
+        if max_tokens % chunk_size:
+            raise ValueError("packed tokens must be divisible by chunk_size when padded")
+        max_length = max_tokens // chunk_size
+    else:
+        max_length = max_tokens
+    weights = torch.arange(1, max_length + 1, dtype=torch.float64).reciprocal()
+    sampled_lengths = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
+    lengths = tuple(length * chunk_size if padded else length for length in sampled_lengths)
     return lengths, (0, *accumulate(lengths))
 
 
@@ -455,9 +459,7 @@ def main(
     ] = False,
     packed: Annotated[
         bool,
-        typer.Option(
-            help="Pack batch-size Zipf-distributed full-chunk sequences bounded by tokens."
-        ),
+        typer.Option(help="Pack batch-size Zipf-distributed sequences bounded by tokens."),
     ] = False,
 ) -> None:
     """Train the single-device KDA example."""

@@ -75,8 +75,6 @@ def _validate_chunk_kda_inputs(
         raise TypeError(f"chunk_kda inputs must use one of {supported}")
     if head_dim != _HEAD_DIM:
         raise ValueError("the CuTe KDA core requires K=V=128")
-    if tokens % _CHUNK_SIZE:
-        raise ValueError("the CuTe KDA core requires complete 64-token chunks")
     if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 10:
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
@@ -659,7 +657,7 @@ def _chunk_kda_ragged_backward(
         cu_seqlens,
         chunk_offsets,
     ) = ctx.saved_tensors
-    unused_num_chunks = chunk_offsets.new_empty(())
+    active_chunks = chunk_offsets[-1:]
     dq, dk, dv, dg, db, d_initial_state = _chunk_kda_bwd_custom_op(
         q,
         k,
@@ -670,7 +668,7 @@ def _chunk_kda_ragged_backward(
         Akk,
         cu_seqlens,
         chunk_offsets,
-        unused_num_chunks,
+        active_chunks,
         d_output,
         d_final_state,
         initial_state,
@@ -713,12 +711,13 @@ def chunk_kda(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply the graph-capturable, first-order Blackwell KDA core.
 
-    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches are
-    lowered to the same packed representation with equal-length sequences. Every
-    sequence must contain complete 64-token chunks. The optimized core computes Q/K/V in
-    BF16 and gates, beta, and recurrent states in FP32. FP16 or FP32 Q/K/V inputs are cast
-    to BF16 for the core, and the output is cast back to ``q.dtype``. Recurrent states remain
-    FP32 and have one leading entry per logical sequence.
+    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches and
+    dense tails are lowered to the same packed representation with equal-length
+    sequences. Logical sequences may end in a partial 64-token chunk. The optimized
+    core computes Q/K/V in BF16 and gates, beta, and recurrent states in FP32. FP16
+    or FP32 Q/K/V inputs are cast to BF16 for the core, and the output is cast back
+    to ``q.dtype``. Recurrent states remain FP32 and have one leading entry per
+    logical sequence.
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
@@ -728,25 +727,39 @@ def chunk_kda(
     beta = beta.float().contiguous()
     if initial_state is not None:
         initial_state = initial_state.float().contiguous()
-    if batch > 1:
+    if batch > 1 or (cu_seqlens is None and tokens % _CHUNK_SIZE):
         packed_shape = (1, batch * tokens, heads, head_dim)
         q, k, v, cumulative_gate = (
             tensor.reshape(packed_shape) for tensor in (q, k, v, cumulative_gate)
         )
         beta = beta.reshape(1, batch * tokens, heads)
         cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
-    output, state, _Aqk, _Akk, _cu_seqlens, _chunk_indices, _num_chunks = _chunk_kda_fwd_custom_op(
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        initial_state,
-        cu_seqlens,
-        output_final_state,
-        fastmath,
-        profile_ranges,
-    )
+    if cu_seqlens is not None:
+        output, state, *_ = _chunk_kda_fwd_ragged_custom_op(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            output_final_state,
+            fastmath,
+            profile_ranges,
+        )
+    else:
+        output, state, *_ = _chunk_kda_fwd_custom_op(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            output_final_state,
+            fastmath,
+            profile_ranges,
+        )
     return output.reshape(batch, tokens, heads, head_dim).to(output_dtype), (
         state if output_final_state else None
     )

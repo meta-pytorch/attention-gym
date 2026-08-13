@@ -612,6 +612,7 @@ def test_chunk_kda_backward_custom_op_registration():
             None,
             torch.randn_like(state),
             initial_state.detach(),
+            False,  # ragged
             False,
             False,
         ),
