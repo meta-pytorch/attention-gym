@@ -608,7 +608,6 @@ def test_chunk_kda_op_registration():
         beta.detach(),
         initial_state.detach(),
         None,
-        False,
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
@@ -628,7 +627,6 @@ def test_chunk_kda_backward_op_registration():
                 beta,
                 initial_state,
                 None,
-                False,
             )
         )
     torch.library.opcheck(
@@ -647,7 +645,7 @@ def test_chunk_kda_backward_op_registration():
             None,
             torch.randn_like(state),
             None,
-            False,
+            False,  # ragged
             False,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
@@ -670,7 +668,7 @@ def test_chunk_kda_backward_op_registration():
             None,
             torch.randn_like(state),
             initial_state.detach(),
-            False,
+            False,  # ragged
             False,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
