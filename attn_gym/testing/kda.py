@@ -20,6 +20,50 @@ def cumulative_sequence_offsets(
     return torch.tensor(offsets, device=device, dtype=torch.int32)
 
 
+def make_kda_test_inputs(
+    tokens: int,
+    *,
+    batch: int = 1,
+    seed: int = 41,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Create deterministic public KDA inputs with the production dtypes."""
+    torch.manual_seed(seed)
+    shape = (batch, tokens, 1, 128)
+    values = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
+        -torch.rand(shape, device="cuda"),
+        torch.rand(batch, tokens, 1, device="cuda"),
+    )
+    return tuple(value.requires_grad_(requires_grad) for value in values)
+
+
+def clone_kda_inputs(inputs: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    """Clone KDA inputs into independent autograd leaves."""
+    return tuple(value.detach().clone().requires_grad_(value.requires_grad) for value in inputs)
+
+
+def assert_matches_low_precision_reference(
+    actual: torch.Tensor,
+    high_precision: torch.Tensor,
+    low_precision: torch.Tensor,
+    name: str,
+) -> None:
+    """Bound kernel error by an independent low-precision reference's FP64 error."""
+    high_precision = high_precision.double()
+    rounding_band = torch.finfo(torch.bfloat16).eps * high_precision.abs().max().item()
+    actual_error = (actual.double() - high_precision).abs().max().item()
+    reference_error = (low_precision.double() - high_precision).abs().max().item()
+    budget = 2 * (reference_error + rounding_band)
+    assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
+    assert actual_error <= budget, (
+        f"{name}: kernel error {actual_error:.3e} exceeds {budget:.3e} "
+        f"(reference error {reference_error:.3e})"
+    )
+
+
 def bwd_intra_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -197,7 +241,10 @@ def bwd_wy_dqkg_reference(
 
 
 __all__ = [
+    "assert_matches_low_precision_reference",
     "bwd_intra_reference",
     "bwd_wy_dqkg_reference",
+    "clone_kda_inputs",
     "cumulative_sequence_offsets",
+    "make_kda_test_inputs",
 ]

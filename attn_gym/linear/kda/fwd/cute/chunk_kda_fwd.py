@@ -93,8 +93,6 @@ def _validate_chunk_kda_inputs(
         raise TypeError(f"chunk_kda inputs must use one of {supported}")
     if head_dim != _HEAD_DIM:
         raise ValueError("the CuTe KDA core requires K=V=128")
-    if tokens % _CHUNK_SIZE:
-        raise ValueError("the CuTe KDA core requires complete 64-token chunks")
     if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 10:
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
@@ -901,12 +899,13 @@ def chunk_kda(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply the graph-capturable, first-order Blackwell KDA core.
 
-    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches are
-    lowered to the same packed representation with equal-length sequences. Every
-    sequence must contain complete 64-token chunks. The optimized core computes Q/K/V in
-    BF16 and gates, beta, and recurrent states in FP32. FP16 or FP32 Q/K/V inputs are cast
-    to BF16 for the core, and the output is cast back to ``q.dtype``. Recurrent states remain
-    FP32 and have one leading entry per logical sequence.
+    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches and
+    dense tails are lowered to the same packed representation with equal-length
+    sequences. Logical sequences may end in a partial 64-token chunk. The optimized
+    core computes Q/K/V in BF16 and gates, beta, and recurrent states in FP32. FP16
+    or FP32 Q/K/V inputs are cast to BF16 for the core, and the output is cast back
+    to ``q.dtype``. Recurrent states remain FP32 and have one leading entry per
+    logical sequence.
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
@@ -922,8 +921,9 @@ def chunk_kda(
     if initial_state is not None:
         initial_state = initial_state.float().contiguous()
     cu_seqlens = sequence_metadata.cu_seqlens
+    implementation = _ChunkKDA if sequence_metadata.mode is SequenceMode.DENSE else _ChunkKDARagged
     if output_final_state:
-        output, state = _ChunkKDA.apply(
+        output, state = implementation.apply(
             q,
             k,
             v,
@@ -935,7 +935,7 @@ def chunk_kda(
             fastmath,
         )
     else:
-        output = _ChunkKDA.apply(
+        output = implementation.apply(
             q,
             k,
             v,

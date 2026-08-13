@@ -13,7 +13,11 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
 )
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_metadata
-from attn_gym.testing.kda import bwd_intra_reference, cumulative_sequence_offsets
+from attn_gym.testing.kda import (
+    assert_matches_low_precision_reference,
+    bwd_intra_reference,
+    cumulative_sequence_offsets,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -72,23 +76,6 @@ def _sequence_local_reference(
     return tuple(torch.cat(parts, dim=1) for parts in output_parts)
 
 
-def _assert_matches_measuring_stick(
-    actual: torch.Tensor,
-    golden: torch.Tensor,
-    reference: torch.Tensor,
-    name: str,
-) -> None:
-    golden64 = golden.double()
-    band = torch.finfo(torch.bfloat16).eps * golden64.abs().max().item()
-    actual_error = (actual.double() - golden64).abs().max().item()
-    reference_error = (reference.double() - golden64).abs().max().item()
-    budget = 2 * (reference_error + band)
-    assert actual_error <= budget, (
-        f"{name}: kernel error {actual_error:.3e} exceeds {budget:.3e} "
-        f"(reference error {reference_error:.3e})"
-    )
-
-
 def test_ragged_bwd_intra_matches_independent_numerical_reference():
     lengths = [65, 0, 63]
     inputs = list(_inputs(sum(lengths)))
@@ -144,7 +131,7 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference():
         ("dq", "dk", "dg", "db"), actual, golden, reference, strict=True
     ):
         assert torch.isfinite(output).all()
-        _assert_matches_measuring_stick(output, golden_output, reference_output, name)
+        assert_matches_low_precision_reference(output, golden_output, reference_output, name)
 
 
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
