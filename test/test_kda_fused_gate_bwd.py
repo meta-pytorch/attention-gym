@@ -21,7 +21,7 @@ from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import (
     FusedGateBwdOp,
     FusedGateBwdOutput,
     _compile_fused_gate_bwd,
-    _fused_gate_bwd_custom_op,
+    _fused_gate_bwd_op,
     fused_gate_bwd,
 )
 from attn_gym.linear.kda.bwd.triton.cumsum import (
@@ -359,11 +359,11 @@ def test_fused_gate_bwd_matches_triton_composition():
     )
 
 
-def test_fused_gate_bwd_custom_op_registration():
+def test_fused_gate_bwd_op_registration():
     """Exercise a non-default TMA schedule through the private operator schema."""
     inputs = _inputs(65, head_dim=64)
     torch.library.opcheck(
-        _fused_gate_bwd_custom_op,
+        _fused_gate_bwd_op,
         (*inputs, 7, -3.25, False),
     )
 

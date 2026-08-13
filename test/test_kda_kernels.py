@@ -48,8 +48,8 @@ from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     kda_gate_chunk_cumsum_vector_kernel_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
-    _l2norm_bwd_custom_op,
-    _l2norm_fwd_custom_op,
+    _l2norm_bwd_op,
+    _l2norm_fwd_op,
     l2norm,
     l2norm_fwd_kernel,
     l2norm_fwd_kernel1,
@@ -308,14 +308,14 @@ def test_l2norm_autograd_wrapper(dtype):
     )
 
 
-def test_l2norm_custom_op_registration():
+def test_l2norm_op_registration():
     x = torch.randn(1, 17, 3, 128, device=DEV, dtype=torch.bfloat16)
-    torch.library.opcheck(_l2norm_fwd_custom_op, (x, 1e-6))
+    torch.library.opcheck(_l2norm_fwd_op, (x, 1e-6))
 
-    output, rstd = _l2norm_fwd_custom_op(x, 1e-6)
+    output, rstd = _l2norm_fwd_op(x, 1e-6)
     d_output = torch.randn_like(output)
     torch.library.opcheck(
-        _l2norm_bwd_custom_op,
+        _l2norm_bwd_op,
         (output.view(-1, output.shape[-1]), rstd, d_output),
     )
 

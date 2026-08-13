@@ -483,8 +483,14 @@ def _validate_inputs(
     return FusedGateBwdOp(heads, head_dim, chunk_size, lower_bound, fastmath)
 
 
-@torch.library.custom_op("attn_gym::kda_fused_gate_bwd", mutates_args=())
-def _fused_gate_bwd_custom_op(
+torch.library.define(
+    "attn_gym::kda_fused_gate_bwd",
+    "(Tensor g, Tensor A_log, Tensor dt_bias, Tensor d_cumulative, int chunk_size, "
+    "float lower_bound, bool fastmath) -> (Tensor, Tensor, Tensor)",
+)
+
+
+def _fused_gate_bwd_cuda(
     g: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -527,7 +533,10 @@ def _fused_gate_bwd_custom_op(
     return dg, dA_partial, d_dt_bias_partial.sum((0, 1))
 
 
-@_fused_gate_bwd_custom_op.register_fake
+torch.library.impl("attn_gym::kda_fused_gate_bwd", "CUDA", _fused_gate_bwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::kda_fused_gate_bwd")
 def _fused_gate_bwd_fake(
     g: torch.Tensor,
     A_log: torch.Tensor,
@@ -545,6 +554,9 @@ def _fused_gate_bwd_fake(
         d_cumulative.new_empty(partial_shape),
         dt_bias.new_empty(dt_bias.shape),
     )
+
+
+_fused_gate_bwd_op = torch.ops.attn_gym.kda_fused_gate_bwd.default
 
 
 def fused_gate_bwd(
@@ -579,7 +591,7 @@ def fused_gate_bwd(
     ):
         raise RuntimeError("fused_gate_bwd does not support higher-order autograd")
 
-    dg, dA_partial, d_dt_bias = _fused_gate_bwd_custom_op(
+    dg, dA_partial, d_dt_bias = _fused_gate_bwd_op(
         g,
         A_log,
         dt_bias,

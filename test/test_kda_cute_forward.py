@@ -26,8 +26,10 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    _chunk_kda_bwd_custom_op,
-    _chunk_kda_fwd_custom_op,
+    _chunk_kda_bwd_op,
+    _chunk_kda_bwd_with_state_grad_op,
+    _chunk_kda_fwd_op,
+    _chunk_kda_fwd_with_state_op,
 )
 from attn_gym.linear.kda.utils import prepare_complete_chunk_metadata
 
@@ -555,49 +557,69 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
     assert captured["bv"] == 32
 
 
-def test_chunk_kda_custom_op_registration():
-    """Validate schema, fake tensors, autograd registration, and AOT dispatch."""
+def test_chunk_kda_op_registration():
+    """Validate schema, fake tensors, and AOT dispatch for both raw forward operators."""
     torch.manual_seed(5)
     q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
     q, k, v = _strided_qkv_views(q, k, v)
-    torch.library.opcheck(
-        _chunk_kda_fwd_custom_op,
-        (
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            initial_state,
-            None,
-            True,
-            False,
-            False,
-        ),
-        rtol=2e-2,
-        atol=2e-3,
+    # The raw operators are intentionally not differentiable; autograd lives in the
+    # _ChunkKDA autograd.Function, covered by the gradient tests above.
+    args = (
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        cumulative_gate.detach(),
+        beta.detach(),
+        initial_state.detach(),
+        None,
+        False,
     )
+    torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
+    torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
 
 
-def test_chunk_kda_backward_custom_op_registration():
-    """Validate the intentionally first-order backward operator registration."""
+def test_chunk_kda_backward_op_registration():
+    """Validate the intentionally first-order backward operator registrations."""
     torch.manual_seed(6)
     q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
     with torch.no_grad():
-        _output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd_custom_op(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            initial_state,
-            None,
-            True,
-            False,
-            False,
+        _output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = (
+            _chunk_kda_fwd_with_state_op(
+                q,
+                k,
+                v,
+                cumulative_gate,
+                beta,
+                initial_state,
+                None,
+                False,
+            )
         )
     torch.library.opcheck(
-        _chunk_kda_bwd_custom_op,
+        _chunk_kda_bwd_op,
+        (
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            cumulative_gate.detach(),
+            beta.detach(),
+            Aqk,
+            Akk,
+            cu_seqlens,
+            chunk_indices,
+            num_chunks,
+            None,
+            torch.randn_like(state),
+            None,
+            False,
+            False,
+        ),
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+        rtol=2e-2,
+        atol=2e-3,
+    )
+    torch.library.opcheck(
+        _chunk_kda_bwd_with_state_grad_op,
         (
             q.detach(),
             k.detach(),
