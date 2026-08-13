@@ -33,6 +33,8 @@ from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
@@ -1607,6 +1609,31 @@ def _exclusive_cumsum(a: list[int]):
     return r
 
 
+@cute.jit
+def _resolve_chunk_route(
+    cu_seqlens: cute.Tensor,
+    chunk_routing: cute.Tensor,
+    global_chunk: Int32,
+    ragged: cutlass.Constexpr,
+):
+    """Resolve one legacy-map or device-scheduled chunk into token coordinates."""
+    if cutlass.const_expr(ragged):
+        _, _, token_start, valid_tokens = load_ragged_chunk_work(
+            cu_seqlens,
+            chunk_routing,
+            global_chunk,
+            Int32(64),
+        )
+        return token_start, Int32(0), valid_tokens
+
+    sequence = Int32(chunk_routing[global_chunk, 0])
+    local_chunk = Int32(chunk_routing[global_chunk, 1])
+    token_offset = Int32(cu_seqlens[sequence])
+    sequence_length = Int32(cu_seqlens[sequence + 1]) - token_offset
+    valid_tokens = cutlass.min(Int32(64), sequence_length - local_chunk * Int32(64))
+    return token_offset, local_chunk, valid_tokens
+
+
 # ── TMEM column offset constants (cta_group::1, M=64, .ws Layout E) ──
 TMEM_DA_ACC_OFF = 0  # [0,32)   32 cols  dA fp32 acc; Phase 3: [0,16) overwritten by dA_bf16
 TMEM_DQ_ACC_OFF = 32  # [32,96)  64 cols  dq fp32 acc; Phase 3: step2/step3 result [32,64)
@@ -1914,6 +1941,7 @@ class ChunkKdaBwdWyDqkgFused:
         scale: float = 1.0,
         grid_waves: int = 1,
         use_fast_math: bool = True,
+        ragged: bool = False,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
         assert head_dim_k == 128 and head_dim_v == 128, (
@@ -1922,6 +1950,7 @@ class ChunkKdaBwdWyDqkgFused:
         require_blackwell_target()
 
         self.use_fast_math = use_fast_math
+        self.ragged = ragged
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v
@@ -2043,7 +2072,7 @@ class ChunkKdaBwdWyDqkgFused:
         dA_in: cute.Tensor,  # [B, T, HV, BT] fp32
         # ── Metadata ──
         cu_seqlens_in: cute.Tensor,  # [N+1] int32
-        chunk_indices_in: cute.Tensor,  # [NT, 2] int32
+        chunk_routing_in: cute.Tensor,  # legacy [NT, 2] map or ragged [N+1] offsets
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],  # (B, T, H, HV, K, V)
         total_nt: Int32,
         stream,
@@ -2067,7 +2096,7 @@ class ChunkKdaBwdWyDqkgFused:
         db_ptr = db_in.iterator
         dA_ptr = dA_in.iterator
         cu_seqlens_ptr = cu_seqlens_in.iterator
-        chunk_indices_ptr = chunk_indices_in.iterator
+        chunk_routing_ptr = chunk_routing_in.iterator
 
         B, T, H, HV, K, V = problem_size
         BT = self.BT
@@ -2588,11 +2617,18 @@ class ChunkKdaBwdWyDqkgFused:
 
         self.shared_storage = SharedStorage
 
-        # ===================== cu_seqlens / chunk_indices tensors =====================
+        # ===================== Chunk routing tensors =====================
         cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((B + 1,)))
-        chunk_indices = cute.make_tensor(
-            chunk_indices_ptr, cute.make_layout((total_nt, 2), stride=(2, 1))
-        )
+        if cutlass.const_expr(self.ragged):
+            chunk_routing = cute.make_tensor(
+                chunk_routing_ptr,
+                cute.make_layout((B + 1,)),
+            )
+        else:
+            chunk_routing = cute.make_tensor(
+                chunk_routing_ptr,
+                cute.make_layout((total_nt, 2), stride=(2, 1)),
+            )
 
         # ===================== Grid =====================
         grid = self._compute_grid(B, T, HV, total_nt=total_nt)
@@ -2657,8 +2693,9 @@ class ChunkKdaBwdWyDqkgFused:
             dA_out,
             # Metadata
             cu_seqlens,
-            chunk_indices,
+            chunk_routing,
             problem_size,
+            total_nt,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -2728,8 +2765,9 @@ class ChunkKdaBwdWyDqkgFused:
         dA_gmem: cute.Tensor,
         # Metadata
         cu_seqlens: cute.Tensor,
-        chunk_indices: cute.Tensor,
+        chunk_routing: cute.Tensor,
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],  # (B, T, H, HV, K, V)
+        capacity: Int32,
     ):
         _B, _T, H, HV, K, V = problem_size
         BT = self.BT
@@ -2741,7 +2779,12 @@ class ChunkKdaBwdWyDqkgFused:
         thread_idx = cute.arch.thread_idx()[0]
         lane_idx = thread_idx % 32
 
-        total_work_units = chunk_indices.layout.shape[0] * HV
+        if cutlass.const_expr(self.ragged):
+            num_sequences = Int32(cute.size(chunk_routing)) - 1
+            active_chunks = Int32(chunk_routing[num_sequences])
+        else:
+            active_chunks = capacity
+        total_work_units = active_chunks * HV
         num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
 
         num_cuda_warps_total = len(self.cuda_warp_ids) + len(self.cuda2_warp_ids)
@@ -3312,12 +3355,12 @@ class ChunkKdaBwdWyDqkgFused:
                 i_t = work_idx // HV  # chunk index (global)
                 i_hv = work_idx % HV  # value-head index
                 i_h = i_hv // G  # q/k head index
-                # Decode chunk_indices
-                batch_idx = chunk_indices[(i_t, 0)]
-                tile_idx = chunk_indices[(i_t, 1)]
-                tok_offset = cu_seqlens[(batch_idx,)]
-                seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
-                sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
+                tok_offset, tile_idx, sub_seq_len = _resolve_chunk_route(
+                    cu_seqlens,
+                    chunk_routing,
+                    Int32(i_t),
+                    self.ragged,
+                )
 
                 # NOTE: must sync before next wu_iter's `sDgk[local_tidx] = 0`
                 # init, otherwise WG0 of next iter may overwrite sDgk while
@@ -3892,12 +3935,12 @@ class ChunkKdaBwdWyDqkgFused:
                 i_hv = work_idx % HV  # value-head index
                 i_h = i_hv // G  # q/k head index
 
-                # Decode chunk_indices
-                batch_idx = chunk_indices[(i_t, 0)]
-                tile_idx = chunk_indices[(i_t, 1)]
-                tok_offset = cu_seqlens[(batch_idx,)]
-                seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
-                sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
+                tok_offset, tile_idx, sub_seq_len = _resolve_chunk_route(
+                    cu_seqlens,
+                    chunk_routing,
+                    Int32(i_t),
+                    self.ragged,
+                )
 
                 # Load A
                 tma_A_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_A)
@@ -4172,12 +4215,12 @@ class ChunkKdaBwdWyDqkgFused:
                 i_hv = work_idx % HV  # value-head index (unused in MMA warp)
                 i_h = i_hv // G  # q/k head index (unused in MMA warp)
 
-                # Decode chunk_indices
-                batch_idx = chunk_indices[(i_t, 0)]
-                tile_idx = chunk_indices[(i_t, 1)]
-                tok_offset = cu_seqlens[(batch_idx,)]
-                seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
-                sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
+                tok_offset, tile_idx, sub_seq_len = _resolve_chunk_route(
+                    cu_seqlens,
+                    chunk_routing,
+                    Int32(i_t),
+                    self.ragged,
+                )
 
                 zeros8 = cute.make_rmem_tensor((8,), dtype=self.io_dtype)
                 zeros8.fill(BFloat16(0.0))
@@ -4561,12 +4604,12 @@ class ChunkKdaBwdWyDqkgFused:
                 i_hv = work_idx % HV  # value-head index
                 i_h = i_hv // G  # q/k head index (unused in aux warp)
 
-                # Decode chunk_indices
-                batch_idx = chunk_indices[(i_t, 0)]
-                tile_idx = chunk_indices[(i_t, 1)]
-                tok_offset = cu_seqlens[(batch_idx,)]
-                seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
-                sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
+                tok_offset, tile_idx, sub_seq_len = _resolve_chunk_route(
+                    cu_seqlens,
+                    chunk_routing,
+                    Int32(i_t),
+                    self.ragged,
+                )
 
                 pipeline_load_beta.producer_acquire(load_beta_producer_state)
                 beta_f32 = Float32(0.0)
@@ -4740,8 +4783,9 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     chunk_size: int,
     fastmath: bool,
     grid_waves: int,
+    ragged: bool,
 ):
-    """Compile one persistent fixed-length WY/dQKG backward specialization."""
+    """Compile one persistent map-backed or ragged WY/dQKG specialization."""
     op = ChunkKdaBwdWyDqkgFused(
         chunk_size=chunk_size,
         head_dim_k=head_dim,
@@ -4749,6 +4793,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         scale=head_dim**-0.5,
         grid_waves=grid_waves,
         use_fast_math=fastmath,
+        ragged=ragged,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
 
@@ -4787,7 +4832,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     db = tensor(cutlass.Float32, (1, tokens, heads))
     dA = tensor(cutlass.Float32, (1, tokens, heads, chunk_size))
     cu_seqlens = tensor(cutlass.Int32, (sequences,))
-    chunk_indices = tensor(cutlass.Int32, (chunks, 2))
+    chunk_routing = tensor(cutlass.Int32, (sequences,) if ragged else (chunks, 2))
     return compile_tvm_ffi(
         op,
         q,
@@ -4808,11 +4853,12 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         db,
         dA,
         cu_seqlens,
-        chunk_indices,
+        chunk_routing,
         (Int32(1), Int32(1), Int32(heads), Int32(heads), Int32(head_dim), Int32(head_dim)),
         Int32(1),
         name=(
-            f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_fm{int(fastmath)}_gw{grid_waves}"
+            f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_fm{int(fastmath)}_"
+            f"gw{grid_waves}_rg{int(ragged)}"
         ),
     )
 
@@ -4837,9 +4883,10 @@ class ChunkKdaBwdWyDqkgTunable:
         db: torch.Tensor
         dA: torch.Tensor
         cu_seqlens: torch.Tensor
-        chunk_indices: torch.Tensor
+        chunk_routing: torch.Tensor
         chunk_size: int
         fastmath: bool
+        ragged: bool
 
     default_config = ChunkKdaBwdWyDqkgConfig(grid_waves=1)
 
@@ -4854,13 +4901,14 @@ class ChunkKdaBwdWyDqkgTunable:
     def compile_call(
         config: ChunkKdaBwdWyDqkgConfig,
         args: Args,
-    ) -> tuple[int, int, int, bool, int]:
+    ) -> tuple[int, int, int, bool, int, bool]:
         return (
             args.q.shape[2],
             args.q.shape[3],
             args.chunk_size,
             args.fastmath,
             config.grid_waves,
+            args.ragged,
         )
 
     compile = staticmethod(_compile_chunk_kda_bwd_wy_dqkg)
@@ -4900,7 +4948,7 @@ class ChunkKdaBwdWyDqkgTunable:
             args.db,
             args.dA,
             args.cu_seqlens,
-            args.chunk_indices,
+            args.chunk_routing,
             (
                 Int32(sequences),
                 Int32(tokens),
@@ -4909,9 +4957,101 @@ class ChunkKdaBwdWyDqkgTunable:
                 Int32(head_dim),
                 Int32(head_dim),
             ),
-            Int32(tokens // args.chunk_size),
+            Int32(args.h.shape[1]),
         )
         return args.dq, args.dk, args.dv2, args.dg, args.db, args.dA
+
+
+@torch.library.custom_op("attn_gym::kda_bwd_wy_dqkg", mutates_args=())
+def _chunk_kda_bwd_wy_dqkg_custom_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    v_new: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    do: torch.Tensor,
+    dh: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_routing: torch.Tensor,
+    chunk_size: int,
+    fastmath: bool,
+    grid_waves: int,
+    ragged: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Keep compiled direct-stage calls outside Dynamo's launch-cache machinery."""
+    metadata = (
+        RaggedChunkMetadata(cu_seqlens, chunk_routing, h.shape[1])
+        if ragged
+        else ChunkMetadata(cu_seqlens, chunk_routing, cu_seqlens[:1])
+    )
+    return chunk_kda_bwd_wy_dqkg(
+        q,
+        k,
+        v,
+        v_new,
+        g,
+        beta,
+        A,
+        h,
+        do,
+        dh,
+        dv,
+        metadata,
+        chunk_size=chunk_size,
+        fastmath=fastmath,
+        config=ChunkKdaBwdWyDqkgConfig(grid_waves),
+    )
+
+
+@_chunk_kda_bwd_wy_dqkg_custom_op.register_fake
+def _chunk_kda_bwd_wy_dqkg_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    v_new: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    do: torch.Tensor,
+    dh: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_routing: torch.Tensor,
+    chunk_size: int,
+    fastmath: bool,
+    grid_waves: int,
+    ragged: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Describe the direct-stage output metadata without compiling the kernel."""
+    del q, k, v_new, h, do, dh, dv, cu_seqlens, chunk_routing
+    del chunk_size, fastmath, grid_waves, ragged
+    return (
+        torch.empty_like(g, memory_format=torch.contiguous_format),
+        torch.empty_like(g, memory_format=torch.contiguous_format),
+        torch.empty_like(v, memory_format=torch.contiguous_format),
+        torch.empty_like(g, memory_format=torch.contiguous_format),
+        torch.empty_like(beta, memory_format=torch.contiguous_format),
+        torch.empty_like(A, dtype=torch.float32, memory_format=torch.contiguous_format),
+    )
 
 
 def chunk_kda_bwd_wy_dqkg(
@@ -4926,7 +5066,7 @@ def chunk_kda_bwd_wy_dqkg(
     do: torch.Tensor,
     dh: torch.Tensor,
     dv: torch.Tensor,
-    metadata: ChunkMetadata,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
@@ -4947,12 +5087,37 @@ def chunk_kda_bwd_wy_dqkg(
         raise ValueError("the fused WY backward requires B=1 and K=V=128")
     if chunk_size != 64:
         raise ValueError(f"the fused WY backward requires chunk_size=64, got {chunk_size}")
-    if tokens % chunk_size:
+    ragged = isinstance(metadata, RaggedChunkMetadata)
+    if tokens % chunk_size and not ragged:
         raise ValueError("the fused WY backward requires complete chunks")
-    chunks = tokens // chunk_size
+    chunks = metadata.capacity if ragged else tokens // chunk_size
     expected_h = (batch, chunks, heads, head_dim, head_dim)
     if h.shape != expected_h or dh.shape != expected_h:
         raise ValueError(f"h and dh must have shape {expected_h}")
+
+    if torch.compiler.is_compiling():
+        if tune or configs is not None:
+            raise ValueError("autotuning the fused WY backward is unsupported under torch.compile")
+        selected = ChunkKdaBwdWyDqkgTunable.default_config if config is None else config
+        return _chunk_kda_bwd_wy_dqkg_custom_op(
+            q,
+            k,
+            v,
+            v_new,
+            g,
+            beta,
+            A,
+            h,
+            do,
+            dh,
+            dv,
+            metadata.cu_seqlens,
+            metadata.chunk_offsets if ragged else metadata.chunk_indices,
+            chunk_size,
+            fastmath,
+            selected.grid_waves,
+            ragged,
+        )
 
     args = ChunkKdaBwdWyDqkgTunable.Args(
         q=q,
@@ -4974,9 +5139,10 @@ def chunk_kda_bwd_wy_dqkg(
         db=torch.empty_like(beta, memory_format=torch.contiguous_format),
         dA=torch.empty_like(A, dtype=torch.float32, memory_format=torch.contiguous_format),
         cu_seqlens=metadata.cu_seqlens,
-        chunk_indices=metadata.chunk_indices,
+        chunk_routing=metadata.chunk_offsets if ragged else metadata.chunk_indices,
         chunk_size=chunk_size,
         fastmath=fastmath,
+        ragged=ragged,
     )
     result, _ = run_tunable(
         ChunkKdaBwdWyDqkgTunable,
@@ -4985,7 +5151,7 @@ def chunk_kda_bwd_wy_dqkg(
         autotune=tune,
         configs=configs,
         parallel_compile=_compile_chunk_kda_bwd_wy_dqkg.disk_cache_enabled(),
-        target=detect_compile_target(q.device.index),
+        target=(None if torch.compiler.is_compiling() else detect_compile_target(q.device.index)),
     )
     return result
 
