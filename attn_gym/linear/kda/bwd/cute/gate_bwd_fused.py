@@ -30,7 +30,13 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute import (
+    TMA_ALIGNMENT_BYTES,
+    ceildiv,
+    compile_tvm_ffi,
+    jit_cache,
+    tensor_supports_tma,
+)
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
 
@@ -42,14 +48,14 @@ class WarpRole(IntEnum):
 
 
 class FusedGateBwdOutput(NamedTuple):
-    """Partial-producing backward output matching the Triton composition.
+    """BF16 raw-gate gradient plus the FP32 parameter gradients.
 
-    Final gradients are ``dA_log = dA_partial.sum((0, 1))`` and
-    ``d_dt_bias = dg.sum((0, 1))``.
+    ``d_dt_bias`` is final; the A-log gradient is ``dA_partial.sum((0, 1))``.
     """
 
     dg: torch.Tensor
     dA_partial: torch.Tensor
+    d_dt_bias: torch.Tensor
 
 
 class FusedGateBwdOp:
@@ -148,6 +154,7 @@ class FusedGateBwdOp:
         mDtBias: cute.Tensor,
         mDg: cute.Tensor,
         mDA_partial: cute.Tensor,
+        mDDtBias_partial: cute.Tensor,
         tma_atom_g: cute.CopyAtom,
         tma_tensor_g: cute.Tensor,
         tma_atom_d: cute.CopyAtom,
@@ -247,6 +254,7 @@ class FusedGateBwdOp:
 
         reverse_sum = Float32(0.0)
         dA_log = Float32(0.0)
+        d_dt_bias = Float32(0.0)
         dg = Float32(0.0)
         gate_scale = cute.math.exp(
             mA_log[head].to(Float32),
@@ -271,7 +279,10 @@ class FusedGateBwdOp:
                     sigmoid_derivative = sigmoid + (-sigmoid) * sigmoid
                     dg = reverse_sum * (gradient_scale * sigmoid_derivative)
                     dA_log = dA_log + dg * z
-                    mDg[batch, tile_start + Int64(local_token), head, tidx] = dg
+                    d_dt_bias = d_dt_bias + dg
+                    mDg[batch, tile_start + Int64(local_token), head, tidx] = dg.to(
+                        cutlass.BFloat16
+                    )
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
             tile_pipeline.consumer_release(consumer_state)
@@ -294,6 +305,7 @@ class FusedGateBwdOp:
         cta_sum = cta_reduce_sum(dA_log, warp_partials)
         if tidx == 0:
             mDA_partial[batch, chunk, head] = cta_sum
+        mDDtBias_partial[batch, chunk, head, tidx] = d_dt_bias
 
     @cute.jit
     def __call__(
@@ -304,6 +316,7 @@ class FusedGateBwdOp:
         mD_cumulative: cute.Tensor,
         mDg: cute.Tensor,
         mDA_partial: cute.Tensor,
+        mDDtBias_partial: cute.Tensor,
         stream: cuda.CUstream,
     ):
         """Build TMA descriptors and launch one CTA per batch, chunk, and head."""
@@ -334,6 +347,7 @@ class FusedGateBwdOp:
             mDtBias,
             mDg,
             mDA_partial,
+            mDDtBias_partial,
             tma_atom_g,
             tma_tensor_g,
             tma_atom_d,
@@ -365,31 +379,50 @@ def _compile_fused_gate_bwd(
     batch = cute.sym_int()
     tokens = cute.sym_int()
     chunks = cute.sym_int()
-    g, d_cumulative, dg = (
-        cute.runtime.make_fake_compact_tensor(
+
+    def strided_rows(dtype, alignment_elements: int):
+        return cute.runtime.make_fake_tensor(
             dtype,
             (batch, tokens, heads, head_dim),
-            stride_order=(3, 2, 1, 0),
-            assumed_align=16,
+            stride=(
+                cute.sym_int(divisibility=alignment_elements),
+                cute.sym_int(divisibility=alignment_elements),
+                cute.sym_int(divisibility=alignment_elements),
+                1,
+            ),
+            assumed_align=TMA_ALIGNMENT_BYTES,
         )
-        for dtype in (cutlass.BFloat16, cutlass.Float32, cutlass.Float32)
+
+    g = strided_rows(cutlass.BFloat16, TMA_ALIGNMENT_BYTES // 2)
+    d_cumulative = strided_rows(cutlass.Float32, TMA_ALIGNMENT_BYTES // 4)
+    dg = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (batch, tokens, heads, head_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=TMA_ALIGNMENT_BYTES,
     )
-    A_log = cute.runtime.make_fake_compact_tensor(
+    A_log = cute.runtime.make_fake_tensor(
         cutlass.Float32,
         (heads,),
-        stride_order=(0,),
-        assumed_align=16,
+        stride=(cute.sym_int(),),
+        assumed_align=4,
     )
-    dt_bias = cute.runtime.make_fake_compact_tensor(
+    dt_bias = cute.runtime.make_fake_tensor(
         cutlass.Float32,
         (heads, head_dim),
-        stride_order=(1, 0),
-        assumed_align=16,
+        stride=(cute.sym_int(), cute.sym_int()),
+        assumed_align=4,
     )
     dA_partial = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (batch, chunks, heads),
         stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    d_dt_bias_partial = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (batch, chunks, heads, head_dim),
+        stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     return compile_tvm_ffi(
@@ -400,6 +433,7 @@ def _compile_fused_gate_bwd(
         d_cumulative,
         dg,
         dA_partial,
+        d_dt_bias_partial,
     )
 
 
@@ -442,12 +476,10 @@ def _validate_inputs(
     tensors = (g, A_log, dt_bias, d_cumulative)
     if not all(tensor.is_cuda and tensor.device == g.device for tensor in tensors):
         raise ValueError("all inputs must be CUDA tensors on the same device")
-    if not all(tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("fused_gate_bwd requires contiguous tensors")
-    if not all(tensor.data_ptr() % 16 == 0 for tensor in tensors):
-        raise ValueError("fused_gate_bwd requires 16-byte-aligned tensors")
-    if torch.cuda.get_device_capability(g.device) < (9, 0):
-        raise ValueError("fused_gate_bwd requires TMA on CUDA capability >= 9.0")
+    if not all(tensor_supports_tma(tensor) for tensor in (g, d_cumulative)):
+        raise ValueError(
+            "fused_gate_bwd requires contiguous trailing dimensions and aligned outer strides"
+        )
     return FusedGateBwdOp(heads, head_dim, chunk_size, lower_bound, fastmath)
 
 
@@ -460,8 +492,14 @@ def _fused_gate_bwd_custom_op(
     chunk_size: int,
     lower_bound: float,
     fastmath: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Keep compilation and the CuTeDSL launcher behind an opaque operator."""
+    g, d_cumulative = (
+        tensor
+        if tensor_supports_tma(tensor)
+        else tensor.clone(memory_format=torch.contiguous_format)
+        for tensor in (g, d_cumulative)
+    )
     op = _validate_inputs(
         g,
         A_log,
@@ -471,11 +509,11 @@ def _fused_gate_bwd_custom_op(
         lower_bound,
         fastmath,
     )
-    dg = torch.empty_like(d_cumulative)
-    dA_partial = torch.empty(
-        (g.shape[0], ceildiv(g.shape[1], op.chunk_size), g.shape[2]),
-        device=g.device,
-        dtype=torch.float32,
+    dg = torch.empty(g.shape, dtype=g.dtype, device=g.device)
+    partial_shape = (g.shape[0], ceildiv(g.shape[1], op.chunk_size), g.shape[2])
+    dA_partial = torch.empty(partial_shape, device=g.device, dtype=torch.float32)
+    d_dt_bias_partial = torch.empty(
+        (*partial_shape, g.shape[3]), device=g.device, dtype=torch.float32
     )
     compiled = _compile_fused_gate_bwd(
         g.shape[2],
@@ -484,8 +522,9 @@ def _fused_gate_bwd_custom_op(
         op.lower_bound,
         op.fastmath,
     )
-    compiled(g, A_log, dt_bias, d_cumulative, dg, dA_partial)
-    return dg, dA_partial
+    compiled(g, A_log, dt_bias, d_cumulative, dg, dA_partial, d_dt_bias_partial)
+    # Reducing the per-chunk partials keeps the post-pass off the full [B, T, H, D] tensors.
+    return dg, dA_partial, d_dt_bias_partial.sum((0, 1))
 
 
 @_fused_gate_bwd_custom_op.register_fake
@@ -497,11 +536,14 @@ def _fused_gate_bwd_fake(
     chunk_size: int,
     lower_bound: float,
     fastmath: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Describe symbolic output metadata without invoking the compiler."""
-    del A_log, dt_bias, lower_bound, fastmath
-    return torch.empty_like(d_cumulative), d_cumulative.new_empty(
-        (g.shape[0], ceildiv(g.shape[1], chunk_size), g.shape[2])
+    del A_log, lower_bound, fastmath
+    partial_shape = (g.shape[0], ceildiv(g.shape[1], chunk_size), g.shape[2])
+    return (
+        g.new_empty(g.shape),
+        d_cumulative.new_empty(partial_shape),
+        dt_bias.new_empty(dt_bias.shape),
     )
 
 
@@ -517,12 +559,12 @@ def fused_gate_bwd(
 ) -> FusedGateBwdOutput:
     """Run fused reverse-cumsum and bounded gate backward with TMA staging.
 
-    ``g`` is the contiguous BF16 raw gate with shape ``[B, T, H, D]`` and
-    ``d_cumulative`` is the matching contiguous FP32 gradient of the forward
-    chunk-local cumulative gate. The result contains FP32 ``dg`` and one
-    ``dA_log`` partial per batch, static chunk, and head. Callers obtain final
-    gradients with ``dA_log = dA_partial.sum((0, 1))`` and
-    ``d_dt_bias = dg.sum((0, 1))``.
+    ``g`` is the BF16 raw gate with shape ``[B, T, H, D]`` and ``d_cumulative`` is
+    the matching FP32 gradient. Their aligned contiguous trailing dimensions are consumed
+    directly; unsupported layouts use a compact fallback. Parameter tensors may have arbitrary
+    strides. The result contains
+    BF16 ``dg``, the final FP32 ``d_dt_bias``, and one FP32 ``dA_log`` partial per batch,
+    static chunk, and head.
 
     ``chunk_size``, ``lower_bound``, and ``fastmath`` are compile-time
     specializations. ``fastmath`` defaults to ``False``. The operation requires
@@ -537,7 +579,7 @@ def fused_gate_bwd(
     ):
         raise RuntimeError("fused_gate_bwd does not support higher-order autograd")
 
-    dg, dA_partial = _fused_gate_bwd_custom_op(
+    dg, dA_partial, d_dt_bias = _fused_gate_bwd_custom_op(
         g,
         A_log,
         dt_bias,
@@ -546,7 +588,7 @@ def fused_gate_bwd(
         lower_bound,
         fastmath,
     )
-    return FusedGateBwdOutput(dg, dA_partial)
+    return FusedGateBwdOutput(dg, dA_partial, d_dt_bias)
 
 
 __all__ = [

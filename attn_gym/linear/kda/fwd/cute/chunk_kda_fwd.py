@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 import torch
 
+from attn_gym._backends.cute import get_device_properties, tensor_supports_tma
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
@@ -16,8 +17,6 @@ _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
-_QKV_ALIGNMENT_BYTES = 16
-_QKV_ALIGNMENT_ELEMENTS = _QKV_ALIGNMENT_BYTES // 2
 
 
 def _validate_chunk_kda_inputs(
@@ -73,26 +72,19 @@ def _validate_chunk_kda_inputs(
         raise ValueError("the CuTe KDA core requires K=V=128")
     if tokens % _CHUNK_SIZE:
         raise ValueError("the CuTe KDA core requires complete 64-token chunks")
-    if not torch.compiler.is_compiling() and torch.cuda.get_device_capability(q.device) < (10, 0):
+    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 10:
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
 
 def _has_supported_qkv_layout(tensor: torch.Tensor) -> bool:
     """Return whether QKV rows satisfy the vectorized kernel input contract."""
-    return (
-        tensor.storage_offset() == 0
-        and tensor.stride(-1) == 1
-        and tensor.stride(-2) == tensor.shape[-1]
-        and all(stride % _QKV_ALIGNMENT_ELEMENTS == 0 for stride in tensor.stride()[:-1])
-        and tensor.data_ptr() % _QKV_ALIGNMENT_BYTES == 0
-    )
+    return tensor.stride(-2) == tensor.shape[-1] and tensor_supports_tma(tensor)
 
 
 def _normalize_qkv_layout(tensor: torch.Tensor) -> torch.Tensor:
     """Copy only layouts unsupported by one or more composed KDA stages."""
     if _has_supported_qkv_layout(tensor):
         return tensor
-    # contiguous() may return an unaligned, nonzero-offset tensor unchanged.
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
@@ -120,7 +112,7 @@ def _validate_private_abi(
             "the private chunk_kda ABI requires QKV to have contiguous heads and "
             "16-byte-aligned token rows"
         )
-    if torch.cuda.get_device_capability(q.device) < (10, 0):
+    if get_device_properties(q.device).major < 10:
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
 
@@ -513,8 +505,10 @@ def chunk_kda(
 
     ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches are
     lowered to the same packed representation with equal-length sequences. Every
-    sequence must contain complete 64-token chunks. The output uses ``q.dtype``;
-    recurrent states remain FP32 and have one leading entry per logical sequence.
+    sequence must contain complete 64-token chunks. The optimized core computes Q/K/V in
+    BF16 and gates, beta, and recurrent states in FP32. FP16 or FP32 Q/K/V inputs are cast
+    to BF16 for the core, and the output is cast back to ``q.dtype``. Recurrent states remain
+    FP32 and have one leading entry per logical sequence.
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype

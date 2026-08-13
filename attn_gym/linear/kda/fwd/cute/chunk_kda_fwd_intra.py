@@ -17,6 +17,7 @@ import torch
 import triton
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
 )
@@ -46,7 +47,7 @@ def chunk_kda_fwd_intra(
 ]:
     assert chunk_size == 64, "chunk_kda_fwd_intra CuTe path requires chunk_size=64"
 
-    max_num_grid = torch.cuda.get_device_properties(k.device).multi_processor_count
+    max_num_grid = get_device_properties(k.device).multi_processor_count
 
     B, T, H, K = k.shape
     _, _, _, V = v.shape

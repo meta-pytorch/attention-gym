@@ -269,7 +269,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
         # Apply gate: -exp(A_log) * softplus(g + bias)
         b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
     else:
-        b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
+        # Inductor passes Python floats as fp64; keep the gate math in fp32.
+        b_gate = lower_bound.to(tl.float32) * tl.sigmoid(exp(b_A) * b_s)
 
     b_gate = tl.where(m_t[:, None], b_gate, 0.0)
 
@@ -277,7 +278,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     b_o = tl.cumsum(b_gate, axis=0, reverse=REVERSE)
 
     if HAS_SCALE:
-        b_o *= scale
+        b_o *= scale.to(tl.float32)
     o_batch_offset = i_b * o_batch_stride if B > 1 else 0
     tl.store(
         o
@@ -410,13 +411,14 @@ def kda_gate_chunk_cumsum_vector_kernel_forloop(
                 # pyrefly: ignore [unsupported-operation]
                 b_gate = -exp(b_A) * softplus(b_s)  # pyrefly: ignore[unsupported-operation]
             else:
-                b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
+                # Inductor passes Python floats as fp64; keep the gate math in fp32.
+                b_gate = lower_bound.to(tl.float32) * tl.sigmoid(exp(b_A) * b_s)
 
             b_gate = tl.where(m_t[:, None], b_gate, 0.0)
             b_o = tl.cumsum(b_gate, axis=0, reverse=REVERSE)
 
             if HAS_SCALE:
-                b_o *= scale
+                b_o *= scale.to(tl.float32)
             tl.store(
                 p_o[None, :] + token[:, None] * O_STRIDES[0],
                 b_o.to(o.dtype.element_ty),
@@ -455,6 +457,12 @@ def kda_gate_chunk_cumsum(
         )
     if cu_seqlens is not None and batch != 1:
         raise ValueError("packed variable-length inputs must have batch size one")
+    for name, metadata in (
+        ("cu_seqlens", cu_seqlens),
+        ("chunk_indices", chunk_indices),
+    ):
+        if metadata is not None and not metadata.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     chunks = triton.cdiv(tokens, chunk_size) if cu_seqlens is None else len(chunk_indices)
@@ -532,15 +540,15 @@ class _BoundedGateCumsum(torch.autograd.Function):
                 raw_gate,
                 A_log,
                 dt_bias,
-                d_cumulative.float().contiguous(),
+                d_cumulative.float(),
                 chunk_size=ctx.chunk_size,
                 lower_bound=ctx.lower_bound,
                 fastmath=ctx.fastmath,
             )
         return (
-            result.dg.to(raw_gate.dtype),
+            result.dg,
             result.dA_partial.sum((0, 1)),
-            result.dg.sum((0, 1)),
+            result.d_dt_bias,
             None,
             None,
             None,
@@ -582,12 +590,10 @@ def bounded_gate_cumsum(
         )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")
-    if torch.cuda.get_device_capability(raw_gate.device) < (9, 0):
-        raise ValueError("bounded_gate_cumsum requires CUDA capability 9.0 or newer")
     return _BoundedGateCumsum.apply(
-        raw_gate.contiguous(),
-        A_log.contiguous(),
-        dt_bias.contiguous(),
+        raw_gate,
+        A_log,
+        dt_bias,
         chunk_size,
         lower_bound,
         fastmath,

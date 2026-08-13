@@ -40,27 +40,37 @@ def l2norm_bwd_kernel1(
     rstd,
     dy,
     dx,
-    eps,
     D,
     Y_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
     DY_STRIDES: tl.constexpr,
     DX_STRIDES: tl.constexpr,
+    TOKENS: tl.constexpr,
+    HEADS: tl.constexpr,
     BD: tl.constexpr,
 ):
     # One program per row; the entire feature vector fits in a single [BD] tile.
-    i_t = tl.program_id(0).to(tl.int64)
-    o_d = tl.arange(0, BD)
+    i_row = tl.program_id(0).to(tl.int64)
+    i_bt = i_row // HEADS
+    o_d = tl.arange(0, BD).to(tl.int64)
     mask = o_d < D
 
-    b_y = tl.load(y + ptr_offset((i_t, o_d), Y_STRIDES), mask=mask, other=0.0).to(tl.float32)
-    b_dy = tl.load(dy + ptr_offset((i_t, o_d), DY_STRIDES), mask=mask, other=0.0).to(tl.float32)
-    b_rstd = tl.load(rstd + ptr_offset((i_t,), RSTD_STRIDES)).to(tl.float32)
+    b_y = tl.load(y + ptr_offset((i_row, o_d), Y_STRIDES), mask=mask, other=0.0).to(tl.float32)
+    b_dy = tl.load(
+        dy
+        + ptr_offset(
+            (i_bt // TOKENS, i_bt % TOKENS, i_row % HEADS, o_d),
+            DY_STRIDES,
+        ),
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    b_rstd = tl.load(rstd + ptr_offset((i_row,), RSTD_STRIDES)).to(tl.float32)
 
     b_dot = tl.sum(b_dy * b_y)
     b_dx = b_rstd * (b_dy - b_y * b_dot)
     tl.store(
-        dx + ptr_offset((i_t, o_d), DX_STRIDES),
+        dx + ptr_offset((i_row, o_d), DX_STRIDES),
         b_dx.to(dx.dtype.element_ty),
         mask=mask,
     )
@@ -71,46 +81,59 @@ def l2norm_bwd_kernel1(
     key=["D", "NB"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["N_ROWS"])
 def l2norm_bwd_kernel(
     y,
     rstd,
     dy,
     dx,
-    eps,
-    T,
+    N_ROWS,
     Y_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
     DY_STRIDES: tl.constexpr,
     DX_STRIDES: tl.constexpr,
+    TOKENS: tl.constexpr,
+    HEADS: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
     BT: tl.constexpr,
 ):
     # One program per [BT] block of rows; each row is normalized over [BD].
-    i_t = tl.program_id(0).to(tl.int64)
-    o_t = i_t * BT + tl.arange(0, BT)
-    o_d = tl.arange(0, BD)
-    m_t = o_t < T
-    m_x = m_t[:, None] & (o_d[None, :] < D)
+    i_row = tl.program_id(0).to(tl.int64)
+    o_row = i_row * BT + tl.arange(0, BT)
+    o_bt = o_row // HEADS
+    o_d = tl.arange(0, BD).to(tl.int64)
+    m_row = o_row < N_ROWS
+    mask = m_row[:, None] & (o_d[None, :] < D)
 
     b_y = tl.load(
-        y + ptr_offset((o_t[:, None], o_d[None, :]), Y_STRIDES),
-        mask=m_x,
+        y + ptr_offset((o_row[:, None], o_d[None, :]), Y_STRIDES),
+        mask=mask,
         other=0.0,
     ).to(tl.float32)
     b_dy = tl.load(
-        dy + ptr_offset((o_t[:, None], o_d[None, :]), DY_STRIDES),
-        mask=m_x,
+        dy
+        + ptr_offset(
+            (
+                (o_bt // TOKENS)[:, None],
+                (o_bt % TOKENS)[:, None],
+                (o_row % HEADS)[:, None],
+                o_d[None, :],
+            ),
+            DY_STRIDES,
+        ),
+        mask=mask,
         other=0.0,
     ).to(tl.float32)
-    b_rstd = tl.load(rstd + ptr_offset((o_t,), RSTD_STRIDES), mask=m_t, other=0.0).to(tl.float32)
+    b_rstd = tl.load(rstd + ptr_offset((o_row,), RSTD_STRIDES), mask=m_row, other=0.0).to(
+        tl.float32
+    )
 
     b_dot = tl.sum(b_dy * b_y, 1)
     b_dx = b_rstd[:, None] * (b_dy - b_y * b_dot[:, None])
     tl.store(
-        dx + ptr_offset((o_t[:, None], o_d[None, :]), DX_STRIDES),
+        dx + ptr_offset((o_row[:, None], o_d[None, :]), DX_STRIDES),
         b_dx.to(dx.dtype.element_ty),
-        mask=m_x,
+        mask=mask,
     )

@@ -2,14 +2,23 @@
 
 from .cache import jit_cache
 from .tune import TunableKernel, benchmark_gpu, run_tunable, tune
-from .utils import ceildiv, compile_tvm_ffi
+from .utils import (
+    TMA_ALIGNMENT_BYTES,
+    ceildiv,
+    compile_tvm_ffi,
+    get_device_properties,
+    tensor_supports_tma,
+)
 
 __all__ = [
+    "TMA_ALIGNMENT_BYTES",
     "TunableKernel",
     "benchmark_gpu",
     "ceildiv",
     "compile_tvm_ffi",
+    "get_device_properties",
     "jit_cache",
     "run_tunable",
+    "tensor_supports_tma",
     "tune",
 ]

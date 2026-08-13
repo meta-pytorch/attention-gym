@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from contextlib import nullcontext
 
 import torch
@@ -53,8 +52,6 @@ def chunk_kda_bwd(
         raise ValueError(f"the composed KDA backward requires chunk_size=64, got {chunk_size}")
     if tokens % chunk_size:
         raise ValueError("the composed KDA backward requires complete chunks")
-    if initial_state is not None:
-        initial_state = initial_state.contiguous()
 
     def record(name: str):
         return torch.profiler.record_function(name) if profile_ranges else nullcontext()
@@ -154,9 +151,6 @@ def chunk_kda_bwd(
             dg,
             metadata,
         )
-    # The imported kernels accumulate derivatives with respect to their exp2
-    # exponent as though it were a natural exponent. Convert to d/d(log2 gate).
-    dg.mul_(math.log(2.0))
     return dq, dk, dv, dg, db, d_initial_state
 
 

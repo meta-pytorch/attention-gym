@@ -539,7 +539,7 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
         multi_processor_count = 100
 
     monkeypatch.setattr(dispatch, "blackwell_delta_h_bwd_dhu_v1", fake_delta_h)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: DeviceProperties())
+    monkeypatch.setattr(dispatch, "get_device_properties", lambda _device: DeviceProperties())
     tensor = torch.empty(1, 1, 2, 128, device="cuda")
     cu_seqlens = torch.arange(8, dtype=torch.int32, device="cuda")
     actual = dispatch.blackwell_delta_h_bwd_dhu_dispatch(
