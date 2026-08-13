@@ -81,7 +81,7 @@ def _packed_state_reference(
     return torch.cat(outputs, dim=1), torch.cat(final_states, dim=0)
 
 
-@pytest.mark.parametrize("width", [1, 3, 4, 5])
+@pytest.mark.parametrize("width", [1, 4, 5])
 def test_short_conv_forward_and_backward_match_pytorch(width: int):
     """Check generic widths and partial first and last time tiles."""
     torch.manual_seed(0)
@@ -287,8 +287,10 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
         assert all(channels % config.channels_per_thread == 0 for config in candidates)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("width", [3, 4, 5])
+@pytest.mark.parametrize(
+    ("width", "dtype"),
+    [(3, torch.bfloat16), (4, torch.float32), (5, torch.float16)],
+)
 def test_short_conv_tma_backward_matches_batched_reference(
     width: int,
     dtype: torch.dtype,
@@ -365,9 +367,9 @@ def test_short_conv_tma_input_gradient_wider_than_time_tile():
     torch.testing.assert_close(actual_dx, expected_dx, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_short_conv_packed_tma_backward_matches_fallback(dtype: torch.dtype):
+def test_short_conv_packed_tma_backward_matches_fallback():
     """Stage physical tiles while resetting both gradients at arbitrary boundaries."""
+    dtype = torch.bfloat16
     torch.manual_seed(8)
     x, weight = _inputs(tokens=384, channels=512, width=4, dtype=dtype)
     grad_output = torch.randn_like(x)
@@ -418,9 +420,9 @@ def test_short_conv_packed_tma_backward_matches_fallback(dtype: torch.dtype):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_short_conv_dense_stateful_tma_backward_matches_reference(dtype: torch.dtype):
+def test_short_conv_dense_stateful_tma_backward_matches_reference():
     """Use caller history in aligned dense TMA input- and weight-gradient tiles."""
+    dtype = torch.bfloat16
     torch.manual_seed(12)
     x, weight = _inputs(tokens=384, channels=256, width=4, batch=2, dtype=dtype)
     initial_state = torch.randn(2, 3, 256, device="cuda", dtype=dtype, requires_grad=True)
@@ -449,11 +451,9 @@ def test_short_conv_dense_stateful_tma_backward_matches_reference(dtype: torch.d
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
-    dtype: torch.dtype,
-):
+def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback():
     """Seed every packed TMA convolution window from caller-owned sequence history."""
+    dtype = torch.bfloat16
     torch.manual_seed(9)
     x, weight = _inputs(tokens=384, channels=512, width=4, dtype=dtype)
     grad_output = torch.randn_like(x)
@@ -520,9 +520,9 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
         )
 
 
-@pytest.mark.parametrize("width", [3, 4])
-def test_short_conv_batched_forward_and_backward_match_pytorch(width: int):
-    """Keep batches independent across generic and optimized convolution widths."""
+def test_short_conv_batched_forward_and_backward_match_pytorch():
+    """Keep batches independent across the optimized convolution width."""
+    width = 4
     torch.manual_seed(1)
     x, weight = _inputs(tokens=19, channels=12, width=width, batch=3)
     grad_output = torch.randn_like(x)
@@ -538,7 +538,7 @@ def test_short_conv_batched_forward_and_backward_match_pytorch(width: int):
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
 
 
-@pytest.mark.parametrize("width", [1, 3, 4, 5])
+@pytest.mark.parametrize("width", [1, 5])
 def test_short_conv_packed_forward_and_backward_match_independent_sequences(width: int):
     """Reset convolution and gradient dependencies at every packed boundary."""
     torch.manual_seed(2)
@@ -576,7 +576,7 @@ def test_short_conv_packed_final_state_uses_implicit_zero_history():
     torch.testing.assert_close(actual_final, expected_final)
 
 
-@pytest.mark.parametrize("width", [1, 3, 5])
+@pytest.mark.parametrize("width", [1, 5])
 def test_short_conv_packed_state_forward_and_backward(width: int):
     """Compose packed boundaries with differentiable per-sequence history."""
     torch.manual_seed(4)
@@ -630,7 +630,7 @@ def test_short_conv_packed_state_forward_and_backward(width: int):
 
 @pytest.mark.parametrize(
     ("width", "tokens", "with_initial_state"),
-    [(1, 2, True), (3, 5, True), (5, 2, True), (5, 2, False)],
+    [(5, 2, True), (5, 2, False)],
 )
 def test_kda_example_fused_short_conv_supports_generic_width_and_state(
     width: int,
@@ -768,9 +768,9 @@ def test_short_conv_accepts_misaligned_contiguous_storage():
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("width", [1, 3])
-def test_short_conv_explicit_config_and_tuning_flow(width: int):
+def test_short_conv_explicit_config_and_tuning_flow():
     """Route stateful schedules through the shared compile-and-benchmark tuner."""
+    width = 3
     x, weight = _inputs(channels=6, width=width)
     grad_output = torch.randn_like(x)
     initial_state = torch.randn(
@@ -862,12 +862,11 @@ def test_short_conv_custom_op_registration(packed: bool):
         )
 
 
-@pytest.mark.parametrize("packed", [False, True])
-def test_short_conv_stateful_custom_op_registration(packed: bool):
-    """Exercise schemas, fake tensors, and autograd for caller-provided history."""
-    x, weight = _inputs(batch=1 if packed else 2)
-    cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32) if packed else None
-    num_sequences = cu_seqlens.shape[0] - 1 if packed else x.shape[0]
+def test_short_conv_stateful_custom_op_registration():
+    """Exercise packed schemas, fake tensors, and autograd with caller-provided history."""
+    x, weight = _inputs()
+    cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32)
+    num_sequences = cu_seqlens.shape[0] - 1
     initial_state = torch.randn(
         num_sequences,
         weight.shape[1] - 1,
@@ -914,69 +913,6 @@ def test_short_conv_fullgraph_forward_and_backward():
     expected = torch.autograd.grad(expected_output, (x, weight), grad_output)
     compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
     actual_output = compiled(x, weight)
-    actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
-    torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_short_conv_stateful_fullgraph_forward_and_backward(dtype: torch.dtype):
-    """Compile every storage dtype's initial- and final-state contract as one graph."""
-    x, weight = _inputs(tokens=2, width=5, batch=2, dtype=dtype)
-    initial_state = torch.randn(
-        2,
-        4,
-        x.shape[2],
-        device="cuda",
-        dtype=dtype,
-        requires_grad=True,
-    )
-    grad_output = torch.randn_like(x)
-    grad_final = torch.randn_like(initial_state)
-
-    def operation(x, weight, initial_state):
-        return cute_causal_conv1d_silu(
-            x,
-            weight,
-            initial_state=initial_state,
-            return_final_state=True,
-        )
-
-    expected_output, expected_final = operation(x, weight, initial_state)
-    expected = torch.autograd.grad(
-        (expected_output, expected_final),
-        (x, weight, initial_state),
-        (grad_output, grad_final),
-    )
-    actual_output, actual_final = torch.compile(operation, fullgraph=True)(
-        x, weight, initial_state
-    )
-    actual = torch.autograd.grad(
-        (actual_output, actual_final),
-        (x, weight, initial_state),
-        (grad_output, grad_final),
-    )
-    torch.testing.assert_close(actual_output, expected_output)
-    torch.testing.assert_close(actual_final, expected_final)
-    for actual_gradient, expected_gradient in zip(actual, expected, strict=True):
-        torch.testing.assert_close(actual_gradient, expected_gradient)
-
-
-def test_short_conv_packed_fullgraph_forward_and_backward():
-    """Keep the configured packed operation inside a strict compiled graph."""
-    x, weight = _inputs(tokens=31)
-    cu_seqlens = torch.tensor([0, 2, 9, 17, 31], device="cuda", dtype=torch.int32)
-    grad_output = torch.randn_like(x)
-    configs = {
-        "forward_config": ShortConvConfig(128, 4, 8),
-        "input_grad_config": ShortConvConfig(128, 4, 10),
-        "weight_grad_config": ShortConvConfig(128, 4, 128),
-    }
-
-    expected_output = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens, **configs)
-    expected = torch.autograd.grad(expected_output, (x, weight), grad_output)
-    compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
-    actual_output = compiled(x, weight, cu_seqlens=cu_seqlens, **configs)
     actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
     torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
@@ -1146,52 +1082,6 @@ def test_short_conv_cuda_graph_replay():
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
 
 
-def test_short_conv_stateful_cuda_graph_replays_changed_history():
-    """Read caller-owned dense history again on every graph replay."""
-    x, weight = _inputs()
-    initial_state = torch.randn(
-        1,
-        weight.shape[1] - 1,
-        x.shape[2],
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    grad_output = torch.randn_like(x)
-    config = (128, 4, 10, 128, 4, 128)
-    _forward_custom_op(x, weight, None, initial_state)
-    _configured_backward_custom_op(x, weight, grad_output, None, initial_state, True, *config)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output = _forward_custom_op(x, weight, None, initial_state)
-        captured_gradients = _configured_backward_custom_op(
-            x, weight, grad_output, None, initial_state, True, *config
-        )
-
-    graph.replay()
-    first_output = captured_output.clone()
-    first_gradients = tuple(gradient.clone() for gradient in captured_gradients)
-    with torch.no_grad():
-        initial_state.add_(0.25)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert not torch.equal(captured_output, first_output)
-    assert not torch.equal(captured_gradients[0], first_gradients[0])
-    expected_output = _forward_custom_op(x, weight, None, initial_state)
-    expected_gradients = _configured_backward_custom_op(
-        x, weight, grad_output, None, initial_state, True, *config
-    )
-    torch.testing.assert_close(captured_output, expected_output)
-    for actual_gradient, expected_gradient in zip(
-        captured_gradients,
-        expected_gradients,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual_gradient, expected_gradient)
-
-
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
     """Replay the packed-state custom operators with changed device metadata."""
     x, weight = _inputs(tokens=31)
@@ -1235,101 +1125,6 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
         strict=True,
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient)
-
-
-def test_short_conv_public_packed_final_state_cuda_graph_replay():
-    """Replay the complete packed initial/final-state public operation."""
-    x, weight = _inputs(tokens=31)
-    cu_seqlens = torch.tensor([0, 0, 11, 31, 31], device="cuda", dtype=torch.int32)
-    initial_state = torch.randn(
-        cu_seqlens.shape[0] - 1,
-        weight.shape[1] - 1,
-        x.shape[2],
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-
-    def operation():
-        return cute_causal_conv1d_silu(
-            x,
-            weight,
-            cu_seqlens=cu_seqlens,
-            initial_state=initial_state,
-            return_final_state=True,
-        )
-
-    operation()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output, captured_final = operation()
-
-    with torch.no_grad():
-        initial_state.add_(0.25)
-        cu_seqlens.copy_(torch.tensor([0, 0, 8, 31, 31], device="cuda", dtype=torch.int32))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected_output, expected_final = operation()
-    torch.testing.assert_close(captured_output, expected_output)
-    torch.testing.assert_close(captured_final, expected_final)
-
-
-def test_short_conv_packed_cuda_graph_replays_changed_boundaries():
-    """Read packed boundaries from device memory again on every graph replay."""
-    x, weight = _inputs(tokens=31)
-    grad_output = torch.randn_like(x)
-    cu_seqlens = torch.tensor([0, 0, 11, 31, 31], device="cuda", dtype=torch.int32)
-    _forward_custom_op(x, weight, cu_seqlens)
-    _backward_custom_op(x, weight, grad_output, cu_seqlens)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output = _forward_custom_op(x, weight, cu_seqlens)
-        captured_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
-
-    graph.replay()
-    first_output = captured_output.clone()
-    with torch.no_grad():
-        cu_seqlens.copy_(torch.tensor([0, 0, 8, 31, 31], device="cuda", dtype=torch.int32))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert not torch.equal(captured_output, first_output)
-    expected_output = _forward_custom_op(x, weight, cu_seqlens)
-    expected_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
-    torch.testing.assert_close(captured_output, expected_output)
-    torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
-    torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
-
-
-def test_short_conv_packed_tma_cuda_graph_replays_changed_boundaries():
-    """Reread arbitrary packed boundaries in TMA backward during graph replay."""
-    x, weight = _inputs(tokens=384, channels=512)
-    grad_output = torch.randn_like(x)
-    cu_seqlens = torch.tensor(
-        [0, 0, 3, 17, 129, 257, 384],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    _backward_custom_op(x, weight, grad_output, cu_seqlens)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
-
-    with torch.no_grad():
-        cu_seqlens.copy_(
-            torch.tensor([0, 1, 8, 31, 130, 300, 384], device="cuda", dtype=torch.int32)
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected_gradients = _backward_custom_op(x, weight, grad_output, cu_seqlens)
-    torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
-    torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
 
 
 def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_history():

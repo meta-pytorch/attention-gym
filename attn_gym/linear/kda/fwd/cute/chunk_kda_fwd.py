@@ -80,7 +80,8 @@ def _validate_chunk_kda_inputs(
 def _has_supported_qkv_layout(tensor: torch.Tensor) -> bool:
     """Return whether QKV rows satisfy the vectorized kernel input contract."""
     return (
-        tensor.stride(-1) == 1
+        tensor.storage_offset() == 0
+        and tensor.stride(-1) == 1
         and tensor.stride(-2) == tensor.shape[-1]
         and all(stride % _QKV_ALIGNMENT_ELEMENTS == 0 for stride in tensor.stride()[:-1])
         and tensor.data_ptr() % _QKV_ALIGNMENT_BYTES == 0
