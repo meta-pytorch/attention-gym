@@ -1,16 +1,20 @@
 import os
 import subprocess
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from pathlib import Path
 
 import modal
 
 ROOT_PATH = Path(__file__).parent
 PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+# Rebuild once per UTC day without disabling Modal's cache for every commit.
+NIGHTLY_CACHE_DATE = datetime.now(UTC).date().isoformat()
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("torch", pre=True, index_url=PYTORCH_NIGHTLY_INDEX, force_build=True)
+    .env({"PYTORCH_NIGHTLY_CACHE_DATE": NIGHTLY_CACHE_DATE})
+    .pip_install("torch", pre=True, index_url=PYTORCH_NIGHTLY_INDEX)
     .pip_install_from_pyproject(
         str(ROOT_PATH / "pyproject.toml"), optional_dependencies=["tests"], pre=True
     )
