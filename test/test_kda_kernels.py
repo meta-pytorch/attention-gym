@@ -17,6 +17,8 @@ triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
 import attn_gym.linear.kda.bwd.triton.cumsum as cumsum_module
+from attn_gym._backends.triton.utils import can_use_tma
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_kernel_dAv
 from attn_gym.linear.kda.bwd.triton.cumsum import (
     chunk_local_cumsum_scalar,
     chunk_local_cumsum_scalar_kernel,
@@ -26,6 +28,17 @@ from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_kernel
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import (
     l2norm_bwd_kernel,
     l2norm_bwd_kernel1,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
+    chunk_gla_fwd_kernel_o,
+    chunk_gla_fwd_o_gk,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
+    chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _requires_int64_offsets,
@@ -45,9 +58,47 @@ from attn_gym.linear.kda.naive import (
     l2norm_bwd_ref,
     l2norm_fwd_ref,
 )
-from attn_gym.linear.kda.utils import prepare_chunk_indices
+from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, prepare_chunk_indices
+
+IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+try:
+    from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd_v1_dispatch as dispatch_mod
+    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import blackwell_delta_h_bwd_dhu_v1
+    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
+        chunk_kda_bwd_intra as chunk_kda_bwd_intra_cute,
+    )
+    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
+        chunk_kda_bwd_wy_dqkg as chunk_kda_bwd_wy_dqkg_fused_cute,
+    )
+    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import (
+        chunk_kda_fwd_intra as chunk_kda_fwd_intra_cute,
+    )
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+
+    HAS_CUTE = True
+    CUTE_IMPORT_ERR = ""
+except Exception as e:
+    optional_dep_missing = isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] in {
+        "cutlass",
+        "cuda",
+    }
+    if IS_SM100 and not optional_dep_missing:
+        raise
+    HAS_CUTE = False
+    CUTE_IMPORT_ERR = f"{type(e).__name__}: {e}"
+
+requires_cute = pytest.mark.skipif(
+    not (IS_SM100 and HAS_CUTE),
+    reason=(
+        "CuTe DSL kernels require SM100 (Blackwell) and an importable cutlass"
+        + (f"; import failed with {CUTE_IMPORT_ERR}" if IS_SM100 and not HAS_CUTE else "")
+    ),
+)
 
 DEV = "cuda"
+
+torch.backends.cuda.matmul.allow_tf32 = True
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="KDA Triton kernels require a CUDA device"
@@ -1026,3 +1077,1009 @@ def test_cumsum_scalar_vector_view_varlen():
         cu_seqlens=_cu_seqlens((docs[1],)),
     )
     torch.testing.assert_close(actual[:, start:end], single, rtol=0, atol=0)
+
+
+def _bwd_dav_ref(v, A, do, scale, chunk_size=64):
+    """Reference for ``chunk_kda_bwd_kernel_dAv``.
+
+    The forward adds ``o += tril(A) @ v_new`` per chunk (``A`` lower-triangular incl. diag),
+    so the adjoints are ``dv = tril(A)^T @ do`` and ``dA = tril(do @ v^T) * scale``.
+    """
+    B, T, H, V = v.shape
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    acc = torch.float64 if v.dtype == torch.float64 else torch.float32
+    vc, Ac, doc = v.to(acc), A.to(acc), do.to(acc)
+    dv = torch.zeros(B, T, H, V, dtype=acc, device=v.device)
+    dA = torch.zeros(B, T, H, chunk_size, dtype=acc, device=v.device)
+    full_tril = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=v.device))
+    for it in range(num_chunks):
+        s = it * chunk_size
+        e = min(s + chunk_size, T)
+        L = e - s
+        tril = full_tril[:L, :L][None, :, None, :]  # (1, l, 1, m), l >= m
+        dob = doc[:, s:e]  # (b, l, h, v)
+        dv[:, s:e] = torch.einsum("blhm,blhv->bmhv", Ac[:, s:e, :, :L] * tril, dob)
+        dA[:, s:e, :, :L] = torch.einsum("blhv,bmhv->blhm", dob, vc[:, s:e]) * scale * tril
+    return dv, dA
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128, 130])
+@pytest.mark.parametrize("H", [1, 2])
+def test_chunk_kda_bwd_dav(dtype, T, H):
+    torch.manual_seed(10)
+    B, V = 1, 64
+    scale = 0.5
+    # Build the low-precision inputs first, then upcast the *same* values for the fp64 measuring
+    # stick so the reference error reflects only compute precision, not input quantization.
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+    do = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+    A = torch.randn(B, T, H, 64, device="cuda", dtype=dtype)
+
+    gdv, gdA = _bwd_dav_ref(v.double(), A.double(), do.double(), scale)
+    rdv, rdA = _bwd_dav_ref(v, A, do, scale)
+
+    dv = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
+    dA = torch.zeros(B, T, H, 64, device="cuda", dtype=dtype)
+    chunk_kda_bwd_kernel_dAv[(triton.cdiv(T, 64), B * H)](
+        v,
+        A,
+        do,
+        dv,
+        dA,
+        None,
+        None,
+        None,
+        scale,
+        T,
+        H=H,
+        V=V,
+        BT=64,
+        BV=V,
+    )
+    tag = f"T={T} H={H}"
+    assert_golden(dv, gdv, rdv, dtype, f"bwd_dav dv {tag}")
+    assert_golden(dA, gdA, rdA, dtype, f"bwd_dav dA {tag}")
+
+
+def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64, use_exp2=True):
+    """Reference for ``chunk_gla_fwd_kernel_o``: ``o = scale*(q*2^g) @ h + tril(A) @ v``.
+
+    ``h`` is the per-chunk state stack ``(B*num_chunks, H, K, V)``; ``A`` is the causal intra-chunk
+    matrix (lower-triangular incl. diag); ``v`` carries the intra-chunk pseudo-values.
+    """
+    B, T, H, _ = q.shape
+    V = v.shape[-1]
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    qc, gc, vc, Ac, hc = q.to(acc), g.to(acc), v.to(acc), A.to(acc), h.to(acc)
+    decay = gc.exp2() if use_exp2 else gc.exp()
+    qg = qc * decay
+    o = torch.zeros(B, T, H, V, dtype=acc, device=q.device)
+    hcr = hc.reshape(B, num_chunks, H, hc.shape[-2], V)  # (b, chunk, h, k, v)
+    full_tril = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device))
+    for it in range(num_chunks):
+        s = it * chunk_size
+        e = min(s + chunk_size, T)
+        L = e - s
+        inter = torch.einsum("blhk,bhkv->blhv", qg[:, s:e], hcr[:, it]) * scale  # q@h
+        Ablk = Ac[:, s:e, :, :L] * full_tril[:L, :L][None, :, None, :]  # (b, l, h, m)
+        o[:, s:e] = inter + torch.einsum("blhm,bmhv->blhv", Ablk, vc[:, s:e])  # + tril(A)@v
+    return o
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128, 130])
+@pytest.mark.parametrize("H,K,V", [(1, 64, 64), (2, 128, 128)])
+def test_chunk_gla_fwd_o(dtype, T, H, K, V):
+    torch.manual_seed(11)
+    B = 1
+    num_chunks = triton.cdiv(T, 64)
+    scale = K**-0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    g = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1  # small so 2^g is scaled
+    h = torch.randn(B * num_chunks, H, K, V, device="cuda", dtype=dtype)
+    A = torch.randn(B, T, H, 64, device="cuda", dtype=dtype)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+
+    golden = _fwd_o_ref(q.double(), g.double(), h.double(), A.double(), v.double(), scale)
+    ref = _fwd_o_ref(q, g, h, A, v, scale)
+
+    o = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
+    grid = lambda meta: (triton.cdiv(V, meta["BV"]), num_chunks, B * H)
+    chunk_gla_fwd_kernel_o[grid](
+        q,
+        v,
+        g,
+        h,
+        o,
+        A,
+        None,
+        None,
+        None,
+        scale,
+        T,
+        H=H,
+        K=K,
+        V=V,
+        BT=64,
+        USE_EXP2=True,
+    )
+    assert_golden(o, golden, ref, dtype, f"gla_fwd_o T={T} H={H} K={K} V={V}")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="chunk_gla_fwd_o_gk TMA path requires SM90+ tensor descriptors",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128])
+def test_chunk_gla_fwd_o_gk_tma(dtype, T):
+    """Cover the composed launcher and its TMA kernel at the fixed K=V=128, chunk_size=64 shape."""
+    torch.manual_seed(11)
+    B, H, K, V = 1, 2, 128, 128
+    num_chunks = T // 64
+    scale = K**-0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    # g stays fp32 to match the production gate ABI (see test_chunk_gla_fwd_o).
+    g = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    h = torch.randn(B, num_chunks, H, K, V, device="cuda", dtype=dtype)
+    A = torch.randn(B, T, H, 64, device="cuda", dtype=dtype)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+
+    # _fwd_o_ref indexes h as (B*num_chunks, H, K, V); the launcher takes (B, chunks, H, K, V).
+    golden = _fwd_o_ref(
+        q.double(),
+        g.double(),
+        h.double().reshape(B * num_chunks, H, K, V),
+        A.double(),
+        v.double(),
+        scale,
+    )
+    ref = _fwd_o_ref(q, g, h.reshape(B * num_chunks, H, K, V), A, v, scale)
+
+    assert can_use_tma(v), "expected TMA-eligible tensors so the launcher takes its TMA path"
+    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale)
+    assert_golden(o, golden, ref, dtype, f"gla_fwd_o_gk_tma T={T}")
+
+
+def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
+    """Reference for ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` (USE_GK + USE_EXP2).
+
+    Per chunk, with state ``S`` in ``[K, V]``::
+
+        h[chunk] = S
+        v_new    = v_chunk - w_chunk @ S       (saved *ungated*)
+        S        = S * 2^{gk_last}             (per key channel; gk_last is the chunk's last row)
+        S        = S + k_chunk^T @ v_new
+    """
+    B, T, H, K = k.shape
+    V = v.shape[-1]
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    acc = torch.float64 if k.dtype == torch.float64 else torch.float32
+    kc, wc, vc, gkc = k.to(acc), w.to(acc), v.to(acc), gk.to(acc)
+    h = torch.zeros(B, num_chunks, H, K, V, dtype=acc, device=k.device)
+    v_new = torch.zeros(B, T, H, V, dtype=acc, device=k.device)
+    # State recurrence is sequential across chunks; batch (B, H) into the matmuls.
+    state = torch.zeros(B, H, K, V, dtype=acc, device=k.device) if h0 is None else h0.to(acc)
+    for it in range(num_chunks):
+        s = it * chunk_size
+        e = min(s + chunk_size, T)
+        h[:, it] = state
+        # The kernel casts the corrected v_new back to the input dtype before storing it and
+        # feeding it into the k^T @ v_new state update, so quantize here to match.
+        vn = (vc[:, s:e] - torch.einsum("blhk,bhkv->blhv", wc[:, s:e], state)).to(
+            k.dtype
+        )  # (B, L, H, V)
+        v_new[:, s:e] = vn
+        state = state * gkc[:, e - 1].exp2()[..., None]
+        state = state + torch.einsum("blhk,blhv->bhkv", kc[:, s:e], vn.to(acc))
+    return h.reshape(B * num_chunks, H, K, V), v_new, state
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128, 130])
+@pytest.mark.parametrize("use_h0", [False, True])
+def test_chunk_delta_h_fwd(dtype, T, use_h0):
+    torch.manual_seed(12)
+    B, H, K, V = 1, 2, 128, 128
+    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    w = torch.randn(B, T, H, K, device="cuda", dtype=dtype) * 0.1
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+    # Since prod keeps initial and final state in fp32, do that here to match.
+    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
+
+    gh, gvn, ght = _fwd_h_ref(
+        k.double(), w.double(), v.double(), gk.double(), h0.double() if use_h0 else None
+    )
+    rh, rvn, rht = _fwd_h_ref(k, w, v, gk, h0)
+
+    h = torch.empty(B * triton.cdiv(T, 64), H, K, V, device="cuda", dtype=dtype)
+    v_new = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
+    ht = torch.empty(B, H, K, V, device="cuda", dtype=torch.float32)
+    grid = lambda meta: (B * H, triton.cdiv(V, meta["BV"]))
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+        k,
+        v,
+        w,
+        v_new,
+        None,
+        gk,
+        h,
+        h0,
+        ht,
+        None,
+        None,
+        None,
+        T,
+        H=H,
+        K=K,
+        V=V,
+        BT=64,
+        USE_EXP2=True,
+    )
+    tag = f"T={T} h0={use_h0}"
+    assert_golden(h, gh, rh, dtype, f"delta_h h {tag}")
+    assert_golden(v_new, gvn, rvn, dtype, f"delta_h v_new {tag}")
+    assert_golden(ht, ght, rht, dtype, f"delta_h ht {tag}")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128])
+@pytest.mark.parametrize("use_h0", [False, True])
+def test_chunk_delta_h_fwd_forloop(dtype, T, use_h0):
+    """Cover the persistent-grid delta-h variant that walks multiple sequences per program."""
+    torch.manual_seed(12)
+    B, H, K, V = 2, 2, 128, 128
+    BV = 64
+    num_chunks = triton.cdiv(T, 64)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    w = torch.randn(B, T, H, K, device="cuda", dtype=dtype) * 0.1
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
+    # gk is the fused gate/cumsum output and is always fp32 (the kernel exp2s it directly).
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+    # State (initial + final) is fp32 in production; h and v_new stay in the input dtype. See the
+    # note in test_chunk_delta_h_fwd.
+    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
+
+    gh, gvn, ght = _fwd_h_ref(
+        k.double(), w.double(), v.double(), gk.double(), h0.double() if use_h0 else None
+    )
+    rh, rvn, rht = _fwd_h_ref(k, w, v, gk, h0)
+
+    h = torch.empty(B * num_chunks, H, K, V, device="cuda", dtype=dtype)
+    v_new = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
+    ht = torch.empty(B, H, K, V, device="cuda", dtype=torch.float32)
+    # GRID_N=1 forces each program to walk all MAX_N=B sequences through the persistent loop.
+    grid_n = 1
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop[(grid_n * H, triton.cdiv(V, BV))](
+        k,
+        v,
+        w,
+        v_new,
+        None,
+        gk,
+        h,
+        h0,
+        ht,
+        None,
+        None,
+        None,
+        T,
+        H=H,
+        K=K,
+        V=V,
+        BT=64,
+        BV=BV,
+        USE_EXP2=True,
+        GRID_N=grid_n,
+        MAX_N=B,
+        num_warps=4,
+        num_stages=2,
+    )
+    tag = f"T={T} h0={use_h0}"
+    assert_golden(h, gh, rh, dtype, f"delta_h_forloop h {tag}")
+    assert_golden(v_new, gvn, rvn, dtype, f"delta_h_forloop v_new {tag}")
+    assert_golden(ht, ght, rht, dtype, f"delta_h_forloop ht {tag}")
+
+
+def _fwd_intra_ref(q, k, gk, beta, scale, chunk_size=64, BC=16, causal_normref=True):
+    """Reference for ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop``.
+
+    Per 16-token sub-chunk, gates are rebased against a *normref* row before ``2^{g - g_norm}``
+    gating is folded into q/k::
+
+        Aqk[l, m] = scale * <q_l 2^{gm_l}, k_m 2^{-gm_m}>    (l >= m, incl. diag)
+        L[l, m]   = beta_l * <k_l 2^{gm_l}, k_m 2^{-gm_m}>   (l >  m, strict)
+        Akk_block = (I + L)^{-1}                             (unit lower-triangular inverse)
+
+    Only the diagonal 16x16 blocks of ``Aqk`` are written by this kernel so
+    keep zero off-diagonal ``Aqk`` entries
+    """
+    B, T, H, _ = q.shape
+    sub_chunks = chunk_size // BC
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    qc, kc, gkc, bc = q.to(acc), k.to(acc), gk.to(acc), beta.to(acc)
+    Aqk = torch.zeros(B, T, H, chunk_size, dtype=acc, device=q.device)
+    Akk = torch.zeros(B, T, H, BC, dtype=acc, device=q.device)
+    eye = torch.eye(BC, dtype=acc, device=q.device)
+    full_tril = torch.tril(torch.ones(BC, BC, dtype=torch.bool, device=q.device))
+    for it in range(num_chunks):
+        for ii in range(sub_chunks):
+            i_ti = it * chunk_size + ii * BC
+            if i_ti >= T:
+                continue
+            e = min(i_ti + BC, T)
+            L = e - i_ti
+            normref_idx = 0 if causal_normref else min(BC // 2, L - 1)
+            gm = gkc[:, i_ti:e] - gkc[:, i_ti + normref_idx : i_ti + normref_idx + 1]
+            gq = gm.exp2()  # (b, L, H, K)
+            qg = qc[:, i_ti:e] * gq
+            kg = kc[:, i_ti:e] * (-gm).exp2()
+            kgq = kc[:, i_ti:e] * gq
+            tril = full_tril[:L, :L]
+            aqk = scale * torch.einsum("blhk,bmhk->blhm", qg, kg)
+            Aqk[:, i_ti:e, :, ii * BC : ii * BC + L] = aqk * tril[None, :, None, :]
+            raw = torch.einsum("blhk,bmhk->blhm", kgq, kg) * bc[:, i_ti:e][..., None]
+            m_lower = raw.permute(0, 2, 1, 3) * torch.tril(tril, -1)  # (b, H, l, m), strict
+            eyeL = eye[:L, :L].expand(B, H, L, L)
+            inv = torch.linalg.solve_triangular(eyeL + m_lower, eyeL, upper=False)
+            Akk[:, i_ti:e, :, :L] = inv.permute(0, 2, 1, 3)
+    return Aqk, Akk
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("T", [64, 128, 130])
+@pytest.mark.parametrize("H,K", [(1, 64), (2, 128)])
+@pytest.mark.parametrize("causal_normref", [True, False])
+def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
+    torch.manual_seed(13)
+    B = 1
+    BC = 16
+    num_chunks = triton.cdiv(T, 64)
+    sub_chunks = 64 // BC
+    scale = K**-0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
+    # gk (cumulative gate) and beta are fp32 in production; the kernel exp2s gk directly.
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+    beta = torch.rand(B, T, H, device="cuda", dtype=torch.float32) * 0.1
+
+    gAqk, gAkk = _fwd_intra_ref(
+        q.double(), k.double(), gk.double(), beta.double(), scale, causal_normref=causal_normref
+    )
+    rAqk, rAkk = _fwd_intra_ref(q, k, gk, beta, scale, causal_normref=causal_normref)
+
+    # Aqk is zero-initialized: the kernel writes only diagonal blocks, leaving the rest zero.
+    Aqk = torch.zeros(B, T, H, 64, device="cuda", dtype=dtype)
+    Akk = torch.zeros(B, T, H, BC, device="cuda", dtype=torch.float32)
+    chunk_kda_fwd_kernel_intra_sub_chunk_forloop[(num_chunks, sub_chunks, B * H)](
+        q=q,
+        k=k,
+        g=gk,
+        beta=beta,
+        Aqk=Aqk,
+        Akk=Akk,
+        scale=scale,
+        cu_seqlens=None,
+        chunk_indices=None,
+        num_chunks=None,
+        T=T,
+        H=H,
+        K=K,
+        BT=64,
+        BC=BC,
+        BK=triton.next_power_of_2(K),
+        USE_GATHER=IS_GATHER_SUPPORTED,
+        CAUSAL_NORMREF=causal_normref,
+        GRID_NT=num_chunks,
+        MAX_NT=num_chunks,
+    )
+    tag = f"T={T} H={H} K={K} causal_normref={causal_normref}"
+    assert_golden(Aqk, gAqk, rAqk, dtype, f"fwd_intra Aqk {tag}")
+    assert_golden(Akk, gAkk, rAkk, dtype, f"fwd_intra Akk {tag}")
+
+
+def _recompute_wu_ref(k, v, beta, A, gk, q, chunk_size=64):
+    """Reference for ``recompute_w_u_fwd`` (per-chunk 64-token block, ``gk`` in log2 units)::
+
+    w  = A @ (k * beta * 2^gk)
+    u  = A @ (v * beta)
+    qg = q * 2^gk
+    kg = k * 2^(gk_last - gk)      (gk_last = gate at the chunk's last row)
+    """
+    B, T, H, K = k.shape
+    V = v.shape[-1]
+    num_chunks = T // chunk_size
+    acc = torch.float64 if k.dtype == torch.float64 else torch.float32
+    kf, vf, bf = k.to(acc), v.to(acc), beta.to(acc)
+    Af, gf, qf = A.to(acc), gk.to(acc), q.to(acc)
+    # Block-diagonal per chunk: reshape the token axis to (chunk, in-chunk row) and contract
+    # the in-chunk column axis of A against each chunk independently.
+    gr = gf.reshape(B, num_chunks, chunk_size, H, K)
+    kr = kf.reshape(gr.shape)
+    Ac = Af.reshape(B, num_chunks, chunk_size, H, chunk_size)
+    kb = (kr * bf.reshape(B, num_chunks, chunk_size, H)[..., None]) * gr.exp2()
+    vb = (vf * bf[..., None]).reshape(B, num_chunks, chunk_size, H, V)
+    W = torch.einsum("bnihj,bnjhk->bnihk", Ac, kb).reshape(B, T, H, K)
+    U = torch.einsum("bnihj,bnjhv->bnihv", Ac, vb).reshape(B, T, H, V)
+    KG = (kr * (gr[:, :, -1:] - gr).exp2()).reshape(B, T, H, K)
+    QG = qf * gf.exp2()
+    return W, U, QG, KG
+
+
+@requires_cute
+@pytest.mark.parametrize("num_chunks", [4, 8])
+@pytest.mark.parametrize("H", [2, 4])
+def test_recompute_w_u_fwd_cute(num_chunks, H):
+    torch.manual_seed(20)
+    B, K, V = 1, 128, 128
+    T = num_chunks * 64
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda", dtype=torch.float32), dim=-1
+    ).to(torch.bfloat16)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+    beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
+    # A is the block-lower-triangular (I - Akk)^-1; the kernel reads it triangularly, so
+    # mask the random draw to the per-chunk lower triangle (incl. diagonal).
+    A = torch.randn(B, T, H, 64, device="cuda", dtype=torch.float32) * 0.1
+    A = A * _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
+    # gk is the cumulative per-channel log2-decay (<= 0), so 2^gk <= 1.
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+
+    cu = torch.tensor([0, T], device="cuda", dtype=torch.long)
+    w, u, qg, kg = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        q=q,
+        gk=gk,
+        cu_seqlens=cu,
+        chunk_indices=prepare_chunk_indices(cu, 64),
+        num_chunks=torch.tensor(num_chunks, device="cuda", dtype=torch.long),
+        chunk_size=64,
+    )
+
+    gW, gU, gQG, gKG = _recompute_wu_ref(
+        k.double(), v.double(), beta.double(), A.double(), gk.double(), q.double()
+    )
+    rW, rU, rQG, rKG = _recompute_wu_ref(k, v, beta, A, gk, q)
+    tag = f"NT={num_chunks} H={H}"
+    assert_golden(w, gW, rW, torch.bfloat16, f"recompute_w_u w {tag}")
+    assert_golden(u, gU, rU, torch.bfloat16, f"recompute_w_u u {tag}")
+    assert_golden(qg, gQG, rQG, torch.bfloat16, f"recompute_w_u qg {tag}")
+    assert_golden(kg, gKG, rKG, torch.bfloat16, f"recompute_w_u kg {tag}")
+
+
+def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
+    """Reference for ``blackwell_delta_h_bwd_dhu_v1`` — the backward of the delta-rule
+    h-recurrence (see ``_fwd_h_ref``), iterated over chunks in reverse::
+
+        dh_out[c] = dh                                      (snapshot before update)
+        dv2[c]    = k_c @ dh + dv_in_c
+        dh        = 2^{gk_last_c} * dh + scale*(q_c^T @ do_c) - w_c^T @ dv2_c
+        dh0       = dh   (final, when h0 is provided)
+
+    ``dh`` is seeded with ``dht`` when given, else zero. ``gk_last_c`` is the gate at the
+    chunk's last row. match the kernel's stated ops exactly (no gate on ``k @ dh``,
+    per-channel decay ``2^{gk_last}`` only — matching the forward cuteDSL config).
+    """
+    B, T, H, K = q.shape
+    V = do.shape[-1]
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    qf, kf, wf, dof, dvf, gf = (t.to(acc) for t in (q, k, w, do, dv, gk))
+    dh_out = torch.zeros(B, num_chunks, H, K, V, dtype=acc, device=q.device)
+    dv2 = torch.zeros(B, T, H, V, dtype=acc, device=q.device)
+    # Reverse recurrence is sequential across chunks; batch (B, H) into the matmuls.
+    D = (
+        dht.to(acc).clone()
+        if dht is not None
+        else torch.zeros(B, H, K, V, dtype=acc, device=q.device)
+    )
+    for c in reversed(range(num_chunks)):
+        s = c * chunk_size
+        e = min(s + chunk_size, T)
+        dh_out[:, c] = D
+        dv2c = torch.einsum("blhk,bhkv->blhv", kf[:, s:e], D) + dvf[:, s:e]  # (B, L, H, V)
+        dv2[:, s:e] = dv2c
+        D = (
+            gf[:, e - 1].exp2()[..., None] * D
+            + scale * torch.einsum("blhk,blhv->bhkv", qf[:, s:e], dof[:, s:e])
+            - torch.einsum("blhk,blhv->bhkv", wf[:, s:e], dv2c)
+        )
+    dh0 = D if h0 is not None else None
+    return dh_out, dh0, dv2
+
+
+@requires_cute
+@pytest.mark.parametrize("bv", [16, 32])
+@pytest.mark.parametrize("num_chunks", [4, 5])
+@pytest.mark.parametrize("use_h0,use_dht", [(False, False), (True, False), (True, True)])
+def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
+    # Non-varlen path: B=1, K=V=128, chunk_size=64. Covers the dht (final-state grad)
+    # and h0 (initial-state grad -> dh0) input paths, and both BV=16/BV=32 SS-mode tiles.
+    torch.manual_seed(21)
+    B, H, K, V = 1, 2, 128, 128
+    T = num_chunks * 64
+    scale = K**-0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda", dtype=torch.float32), dim=-1
+    )
+    w = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    do = torch.randn(B, T, H, V, device="cuda", dtype=torch.float32)
+    dv = torch.randn(B, T, H, V, device="cuda", dtype=torch.float32)
+    # gk is the cumulative per-channel log2-decay (<= 0), so 2^{gk_last} <= 1.
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
+    dht = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_dht else None
+
+    qb, kb, wb, dob, dvb = (t.to(torch.bfloat16) for t in (q, k, w, do, dv))
+    dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_v1(
+        qb, kb, wb, dob, dvb, gk=gk, h0=h0, dht=dht, scale=scale, chunk_size=64, bv=bv
+    )
+
+    h0d = h0.double() if use_h0 else None
+    dhtd = dht.double() if use_dht else None
+    gDH, gDH0, gDV2 = _delta_h_bwd_dhu_ref(
+        qb.double(),
+        kb.double(),
+        wb.double(),
+        dob.double(),
+        dvb.double(),
+        gk.double(),
+        h0d,
+        dhtd,
+        scale,
+    )
+    rDH, rDH0, rDV2 = _delta_h_bwd_dhu_ref(qb, kb, wb, dob, dvb, gk, h0, dht, scale)
+
+    tag = f"NT={num_chunks} h0={use_h0} dht={use_dht} bv={bv}"
+    assert_golden(dh, gDH, rDH, torch.bfloat16, f"delta_h_bwd dh {tag}")
+    assert_golden(dv2, gDV2, rDV2, torch.bfloat16, f"delta_h_bwd dv2 {tag}")
+    if use_h0:
+        assert_golden(dh0, gDH0, rDH0, torch.bfloat16, f"delta_h_bwd dh0 {tag}")
+
+
+@requires_cute
+@pytest.mark.parametrize("sm_count,expected_bv", [(1024, 16), (8, 32)])
+def test_delta_h_bwd_dhu_dispatch_selects_bv(monkeypatch, sm_count, expected_bv):
+    """The BV-dispatch wrapper picks BV=32 when V-tiles exceed the SM count, else BV=16.
+
+    The leaf kernel is mocked so this isolates the selection heuristic (an integer compare)
+    without a kernel launch; numerics for both BV tiles are covered by the leaf test above.
+    """
+    B, H, K, V = 1, 2, 128, 128
+    q = torch.empty(B, 64, H, K, device="cuda")
+    zeros = torch.empty(B, 64, H, V, device="cuda")
+
+    captured = {}
+
+    def fake_v1(*args, bv, **kwargs):
+        captured["bv"] = bv
+        return zeros, None, zeros
+
+    class _Props:
+        multi_processor_count = sm_count
+
+    monkeypatch.setattr(dispatch_mod.torch.cuda, "get_device_properties", lambda device: _Props())
+    monkeypatch.setattr(dispatch_mod, "blackwell_delta_h_bwd_dhu_v1", fake_v1)
+
+    dispatch_mod.blackwell_delta_h_bwd_dhu_dispatch(q, q, q, zeros, zeros)
+    assert captured["bv"] == expected_bv
+
+
+def _inter_solve_ref(q, k, gk, beta, scale, chunk_size=64):
+    """Reference for the composed CuTe forward-intra inter-solve (K3b off-diagonal Aqk +
+    K4b 64x64 block inverse), per 64-token chunk with ``gk`` the cumulative gate::
+
+        Aqk[l, m] = scale * <q_l 2^{gk_l}, k_m 2^{-gk_m}>          (l >= m, incl. diag)
+        raw[l, m] = beta_l * <k_l 2^{gk_l}, k_m 2^{-gk_m}>         (l >  m, strict)
+        Akk       = (I + raw)^-1                                   (unit lower-triangular)
+    """
+    B, T, H, K = q.shape
+    num_chunks = T // chunk_size
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    qf, kf, gf, bf = (t.to(acc) for t in (q, k, gk, beta))
+    # Reshape the token axis to (chunk, in-chunk row); each 64x64 block solves independently
+    # with (B, num_chunks, H) as batch dims.
+    gr = gf.reshape(B, num_chunks, chunk_size, H, K)
+    qg = qf.reshape(B, num_chunks, chunk_size, H, K) * gr.exp2()
+    kgi = kf.reshape(B, num_chunks, chunk_size, H, K) * (-gr).exp2()
+    kb = (
+        kf.reshape(B, num_chunks, chunk_size, H, K)
+        * bf.reshape(B, num_chunks, chunk_size, H)[..., None]
+        * gr.exp2()
+    )
+    eye = torch.eye(chunk_size, dtype=acc, device=q.device)
+    ones = torch.ones(chunk_size, chunk_size, dtype=acc, device=q.device)
+    aqk = scale * torch.einsum("bnlhk,bnmhk->bnhlm", qg, kgi) * torch.tril(ones)
+    raw = torch.einsum("bnlhk,bnmhk->bnhlm", kb, kgi) * torch.tril(ones, -1)
+    akk = torch.linalg.solve_triangular(eye + raw, eye.expand_as(raw), upper=False)
+    # (B, num_chunks, H, l, m) -> (B, num_chunks, l, H, m) -> (B, T, H, chunk_size)
+    Aqk = aqk.permute(0, 1, 3, 2, 4).reshape(B, T, H, chunk_size)
+    Akk = akk.permute(0, 1, 3, 2, 4).reshape(B, T, H, chunk_size)
+    return Aqk, Akk
+
+
+def _chunk_tril_mask(T: int, BT: int, device) -> torch.Tensor:
+    """(T, BT) bool mask keeping each row's block-lower-triangular columns (incl. diagonal)."""
+    row_local = (torch.arange(T, device=device) % BT)[:, None]
+    return torch.arange(BT, device=device)[None, :] <= row_local
+
+
+@requires_cute
+@pytest.mark.parametrize("num_chunks", [4, 8])
+@pytest.mark.parametrize("H", [2, 4])
+def test_chunk_kda_fwd_intra_cute(num_chunks, H):
+    torch.manual_seed(22)
+    B, K, V = 1, 128, 128
+    T = num_chunks * 64
+    scale = K**-0.5
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda", dtype=torch.float32), dim=-1
+    ).to(torch.bfloat16)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+    g_inc = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.05
+    gk = g_inc.view(B, num_chunks, 64, H, K).cumsum(2).view(B, T, H, K)
+    beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
+
+    cu = torch.tensor([0, T], device="cuda", dtype=torch.long)
+    w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
+        q,
+        k,
+        v,
+        gk,
+        beta,
+        scale,
+        recompute_cu_seqlens=cu,
+        recompute_chunk_indices=prepare_chunk_indices(cu, 64),
+        recompute_num_chunks=torch.tensor(num_chunks, device="cuda", dtype=torch.long),
+        chunk_size=64,
+    )
+
+    gAqk, gAkk = _inter_solve_ref(q.double(), k.double(), gk.double(), beta.double(), scale)
+    rAqk, rAkk = _inter_solve_ref(q, k, gk, beta, scale)
+    gW, gU = _recompute_wu_ref(
+        k.double(), v.double(), beta.double(), gAkk, gk.double(), q.double()
+    )[:2]
+    rW, rU = _recompute_wu_ref(k, v, beta, rAkk, gk, q)[:2]
+
+    tag = f"NT={num_chunks} H={H}"
+    mask = _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
+    Aqk_tril = torch.where(mask, Aqk, torch.zeros_like(Aqk))
+    assert_golden(Aqk_tril, gAqk, rAqk, torch.bfloat16, f"fwd_intra_cute Aqk {tag}")
+    assert_golden(Akk, gAkk, rAkk, torch.bfloat16, f"fwd_intra_cute Akk {tag}")
+    assert_golden(w, gW, rW, torch.bfloat16, f"fwd_intra_cute w {tag}")
+    assert_golden(u, gU, rU, torch.bfloat16, f"fwd_intra_cute u {tag}")
+
+
+def _fixed_meta(num_chunks):
+    """Build single-document (cu_seqlens, chunk_indices, num_chunks) metadata for T=num_chunks*64.
+
+    The composed CuTe backward kernels compile a single-document work-list, so the leaf-kernel
+    tests exercise one packed document of complete 64-token chunks.
+    """
+    T = num_chunks * 64
+    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+    chunk_indices = prepare_chunk_indices(cu, 64).to(torch.int32)
+    nc = torch.tensor([chunk_indices.shape[0]], dtype=torch.int32, device="cuda")
+    return cu, chunk_indices, nc
+
+
+def _perchunk_gate(cu, chunk_indices, T, H, K, gate_inc=0.5):
+    """Per-chunk cumulative log2-gate (reset at every chunk boundary), filled only over each
+    chunk's valid rows so a partial tail never differences gates across a document boundary."""
+    g = torch.zeros(1, T, H, K, device="cuda", dtype=torch.float32)
+    for seq_idx, chunk_idx in chunk_indices.tolist():
+        bos, eos = cu[seq_idx].item(), cu[seq_idx + 1].item()
+        rs = bos + chunk_idx * 64
+        valid = min(eos - rs, 64)
+        inc = -torch.rand(valid, H, K, device="cuda", dtype=torch.float32) * gate_inc
+        g[0, rs : rs + valid] = inc.cumsum(0)
+    return g
+
+
+def _perchunk_unit_lower(cu, chunk_indices, T, H):
+    """Per-chunk unit-lower-triangular ``A`` (a plausible (I - Akk)^-1), filled only over each
+    chunk's valid rows/cols; tail rows of a partial chunk stay zero."""
+    A = torch.zeros(1, T, H, 64, device="cuda", dtype=torch.float32)
+    for seq_idx, chunk_idx in chunk_indices.tolist():
+        bos, eos = cu[seq_idx].item(), cu[seq_idx + 1].item()
+        rs = bos + chunk_idx * 64
+        valid = min(eos - rs, 64)
+        tri = torch.tril(torch.ones(valid, 64, device="cuda", dtype=torch.bool), diagonal=-1)
+        blk = torch.randn(valid, H, 64, device="cuda") * 0.05 * tri[:, None, :]
+        idx = torch.arange(valid, device="cuda")
+        blk[idx, :, idx] = 1.0  # unit diagonal on the valid sub-block
+        A[0, rs : rs + valid] = blk
+    return A.to(torch.bfloat16)
+
+
+def _default_worklist(T, chunk_size, device):
+    """Single-doc [0, T] fallback: cu_seqlens + one (seq_idx=0, chunk_idx) row per full chunk."""
+    n = T // chunk_size
+    cu = torch.tensor([0, T], device=device, dtype=torch.int32)
+    chunk_indices = torch.stack(
+        [torch.zeros(n, dtype=torch.long, device=device), torch.arange(n, device=device)], dim=1
+    )
+    return cu, chunk_indices
+
+
+def _bwd_intra_ref(q, k, g, beta, dAqk, dAkk, chunk_size=64, cu_seqlens=None, chunk_indices=None):
+    """fp64 oracle for ``chunk_kda_bwd_intra`` (the intra-chunk backward of the K3b/K4b
+    forward).
+
+    Given the incoming grads ``dAqk``/``dAkk`` (grad of loss w.r.t. the forward Aqk/Akk),
+    returns this stage's intra contributions (dq, dk, db, dg) with the running grads set to
+    zero. Per 64-token chunk, indexing i=query/row, j=key/col, ``exp2 = 2^{g_i - g_j}``::
+
+        Aqk path:  dq = sum_j dAqk*exp2*k_j        dk += sum_i dAqk*exp2*q_i
+                   dg  = sum_j dAqk*exp2*q_i*k_j - sum_i (same)
+        Akk path:  dk += sum_j dAkk*exp2*beta_i*k_j + sum_i dAkk*exp2*beta_i*k_i
+                   db  = sum_j dAkk * <exp2*k_i, k_j>
+                   dg += sum_j dAkk*exp2*beta_i*k_i*k_j - sum_i (same)
+
+    Both dAqk and dAkk are masked with a NON-strict causal mask (i>=j, incl. diagonal) to
+    match fla upstream. No ``scale`` (folded upstream into dAqk) and no ``ln2`` in dg (the
+    kernel differentiates 2^g directly without the chain-rule factor, by convention).
+    """
+    B, T, H, Kd = q.shape
+    device = q.device
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    qf, kf, gf, bf = (t.to(acc) for t in (q, k, g, beta))
+    daqk, dakk = dAqk.to(acc), dAkk.to(acc)
+    dq = torch.zeros(B, T, H, Kd, dtype=acc, device=device)
+    dk = torch.zeros_like(dq)
+    dg = torch.zeros_like(dq)
+    db = torch.zeros(B, T, H, dtype=acc, device=device)
+    # Varlen work-list iteration (see ``_bwd_wy_dqkg_ref``): a partial last chunk uses only its
+    # ``valid`` rows/cols so the non-strict causal mask never straddles a document boundary.
+    if chunk_indices is None:
+        cu_seqlens, chunk_indices = _default_worklist(T, chunk_size, device)
+    cu = cu_seqlens.tolist()
+    for b in range(B):
+        for seq_idx, chunk_idx in chunk_indices.tolist():
+            bos, eos = cu[seq_idx], cu[seq_idx + 1]
+            row_start = bos + chunk_idx * chunk_size
+            cl = min(eos - row_start, chunk_size)
+            s = slice(row_start, row_start + cl)
+            mask = torch.tril(torch.ones(cl, cl, dtype=torch.bool, device=device))[:, :, None]
+            q_i, k_i, k_j = qf[b, s][:, None], kf[b, s][:, None], kf[b, s][None, :]
+            beta_i = bf[b, s][:, None, :, None]
+            exp2 = torch.exp2(gf[b, s][:, None] - gf[b, s][None, :])  # 2^{g_i - g_j}
+            aq = torch.where(mask, daqk[b, s, :, :cl].permute(0, 2, 1), 0.0)  # (i, j, H)
+            ak = torch.where(mask, dakk[b, s, :, :cl].permute(0, 2, 1), 0.0)
+
+            aqk = aq[..., None] * exp2  # (i, j, H, K)
+            t_aqk = aqk * q_i * k_j
+            dq[b, s] = (aqk * k_j).sum(1)
+            dk[b, s] = (aqk * q_i).sum(0)
+            dg[b, s] = t_aqk.sum(1) - t_aqk.sum(0)
+
+            akk = ak[..., None] * exp2 * beta_i  # (i, j, H, K)
+            t_akk = akk * k_i * k_j
+            dk[b, s] += (akk * k_j).sum(1) + (akk * k_i).sum(0)
+            db[b, s] = (ak * (exp2 * k_i * k_j).sum(-1)).sum(1)
+            dg[b, s] += t_akk.sum(1) - t_akk.sum(0)
+    return dq, dk, db, dg
+
+
+@requires_cute
+@pytest.mark.parametrize("num_chunks", [2, 4])
+@pytest.mark.parametrize("H", [2, 4])
+def test_chunk_kda_bwd_intra_cute(num_chunks, H):
+    torch.manual_seed(3)
+    B, K = 1, 128
+    T = num_chunks * 64
+    cu, chunk_indices, nc = _fixed_meta(num_chunks)
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.nn.functional.normalize(
+        torch.randn(B, T, H, K, device="cuda", dtype=torch.float32), dim=-1
+    ).to(torch.bfloat16)
+    g = _perchunk_gate(cu, chunk_indices, T, H, K, gate_inc=0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
+    # Incoming grads: dense random (the kernel masks to the non-strict causal triangle).
+    dAqk = torch.randn(B, T, H, 64, device="cuda", dtype=torch.float32) * 0.1
+    dAkk = torch.randn(B, T, H, 64, device="cuda", dtype=torch.float32) * 0.1
+    zq = torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
+    zb = torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
+
+    dq, dk, dg, db = chunk_kda_bwd_intra_cute(
+        q,
+        k,
+        g,
+        beta,
+        dAqk,
+        dAkk,
+        zq.clone(),
+        zq.clone(),
+        zb.clone(),
+        zq.clone(),
+        cu_seqlens=cu,
+        chunk_indices=chunk_indices,
+        num_chunks=nc,
+    )
+
+    gdq, gdk, gdb, gdg = _bwd_intra_ref(
+        q.double(),
+        k.double(),
+        g.double(),
+        beta.double(),
+        dAqk.double(),
+        dAkk.double(),
+        cu_seqlens=cu,
+        chunk_indices=chunk_indices,
+    )
+    rdq, rdk, rdb, rdg = _bwd_intra_ref(
+        q, k, g, beta, dAqk, dAkk, cu_seqlens=cu, chunk_indices=chunk_indices
+    )
+
+    tag = f"NT={num_chunks} H={H}"
+    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_intra_cute dq {tag}")
+    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_intra_cute dk {tag}")
+    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_intra_cute db {tag}")
+    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_intra_cute dg {tag}")
+
+
+def _bwd_wy_dqkg_ref(
+    q,
+    k,
+    v,
+    v_new,
+    g,
+    beta,
+    A,
+    h,
+    do,
+    dh,
+    dv,
+    scale,
+    chunk_size=64,
+    cu_seqlens=None,
+    chunk_indices=None,
+):
+    """fp64 oracle for ``chunk_kda_bwd_wy_dqkg_fused`` — the fused WY / ``(I-Akk)^-1``
+    chunk-level backward.
+
+    Given the recomputed forward intermediates (``A`` = Akk inverse, ``h`` = chunk-start
+    hidden state, ``v_new``) and the incoming grads (``do``, ``dh``, ``dv``), produces the
+    six per-token grads. All six are FRESH (write-only). Conventions: ``scale`` (=K**-0.5)
+    multiplies ``dq`` only; ``beta`` enters raw; gate grads differentiate ``2^g`` directly
+    (no ``ln2``); ``dA`` is masked with a STRICT-lower mask (diagonal=-1)::
+
+        dq  = (do @ h) * 2^g * scale
+        dv2 = (A^T @ dv) * beta ; dk = (v_new @ dh) * 2^{g_last-g} + (A^T @ dw) * 2^g * beta
+        dA  = -A^T @ striL(beta * (dv@v^T + dw@kg^T)) @ A     (dw = -dv @ h, kg = k*2^g)
+
+    Per 64-token chunk; ``A``/``dA`` sliced to ``[:chunk_len]``; ``h``/``dh`` indexed by
+    the chunk id on the num_chunks axis.
+    """
+    B, T, H, K = q.shape
+    V = v.shape[3]
+    device = q.device
+    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
+    dq = torch.zeros(B, T, H, K, dtype=acc, device=device)
+    dk = torch.zeros(B, T, H, K, dtype=acc, device=device)
+    dv2 = torch.zeros(B, T, H, V, dtype=acc, device=device)
+    db = torch.zeros(B, T, H, dtype=acc, device=device)
+    dg = torch.zeros(B, T, H, K, dtype=acc, device=device)
+    dA = torch.zeros(B, T, H, chunk_size, dtype=acc, device=device)
+    if chunk_indices is None:
+        cu_seqlens, chunk_indices = _default_worklist(T, chunk_size, device)
+    cu = cu_seqlens.tolist()
+    for b in range(B):
+        for flat, (seq_idx, chunk_idx) in enumerate(chunk_indices.tolist()):
+            bos, eos = cu[seq_idx], cu[seq_idx + 1]
+            row_start = bos + chunk_idx * chunk_size
+            cl = min(eos - row_start, chunk_size)
+            s = slice(row_start, row_start + cl)
+            q_f, k_f, v_f = q[b, s].to(acc), k[b, s].to(acc), v[b, s].to(acc)
+            v_new_f, g_f = v_new[b, s].to(acc), g[b, s].to(acc)
+            beta_f = beta[b, s].to(acc)
+            A_f = A[b, s, :, :cl].to(acc)
+            h_f, dh_f = h[b, flat].to(acc), dh[b, flat].to(acc)
+            do_f, dv_f = do[b, s].to(acc), dv[b, s].to(acc)
+
+            strict = torch.tril(torch.ones(cl, cl, device=device, dtype=torch.bool), -1)
+            exp2_g = torch.exp2(g_f)
+            beta_k = beta_f.unsqueeze(-1)
+            kg = k_f * exp2_g  # k * 2^g
+            A_t = A_f.permute(1, 2, 0)  # (H, col, row): A_f transposed on (row, col)
+
+            rev_decay = torch.exp2(g_f[-1:].float() - g_f)  # 2^{g_last - g}, per key channel
+            dq_chunk = torch.einsum("thv,hkv->thk", do_f, h_f) * exp2_g * scale
+            dk_state = torch.einsum("thv,hkv->thk", v_new_f, dh_f) * rev_decay
+            dw = -torch.einsum("thv,hkv->thk", dv_f, h_f)  # (row, H, K)
+            dvb = torch.einsum("ths,thv->shv", A_f, dv_f)  # (A^T @ dv)  (col, H, V)
+            dkgb = torch.einsum("ths,thk->shk", A_f, dw)  # (A^T @ dw)  (col, H, K)
+
+            dv2_chunk = dvb * beta_k
+            db_chunk = (dvb * v_f).sum(-1) + (dkgb * kg).sum(-1)
+            dk_chunk = dk_state + dkgb * exp2_g * beta_k
+            kdk_state = k_f * dk_state
+            dg_chunk = q_f * dq_chunk - kdk_state + kg * dkgb * beta_k
+            dg_chunk[-1] += (h_f * dh_f).sum(-1) * torch.exp2(g_f[-1]) + kdk_state.sum(0)
+
+            dA_repr = torch.einsum("thv,shv->hts", dv_f, v_f) + torch.einsum(
+                "thk,shk->hts", dw, kg
+            )
+            dA_repr = torch.where(strict, dA_repr, 0.0) * beta_f.transpose(0, 1).unsqueeze(1)
+            dA_raw = torch.where(strict, -torch.bmm(A_t, torch.bmm(dA_repr, A_t)), 0.0)
+
+            dq[b, s], dk[b, s] = dq_chunk, dk_chunk
+            dv2[b, s], db[b, s], dg[b, s] = dv2_chunk, db_chunk, dg_chunk
+            dA[b, s, :, :cl] = dA_raw.permute(1, 0, 2)
+    return dq, dk, dv2, db, dg, dA
+
+
+@requires_cute
+@pytest.mark.parametrize("num_chunks", [2, 4])
+@pytest.mark.parametrize("H", [2, 4])
+def test_chunk_kda_bwd_wy_dqkg_fused_cute(num_chunks, H):
+    torch.manual_seed(4)
+    B, K, V = 1, 128, 128
+    HV = H
+    T = num_chunks * 64
+    scale = K**-0.5
+    cu, chunk_indices, _ = _fixed_meta(num_chunks)
+
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16) * 0.2
+    v_new = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16) * 0.2
+    do = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16) * 0.2
+    dv = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16) * 0.2
+    h = torch.randn(B, num_chunks, HV, K, V, device="cuda", dtype=torch.bfloat16) * 0.1
+    dh = torch.randn(B, num_chunks, HV, K, V, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    # g: per-chunk cumulative decreasing log2-gate -> exp2 stays in (0, 1], no overflow.
+    g = _perchunk_gate(cu, chunk_indices, T, HV, K, gate_inc=0.5)
+    beta = torch.sigmoid(torch.randn(B, T, HV, device="cuda", dtype=torch.float32))
+    # A: per-chunk unit-lower-triangular (a plausible (I - Akk)^-1).
+    A = _perchunk_unit_lower(cu, chunk_indices, T, HV)
+
+    dq, dk, dv2, dg, db, dA = chunk_kda_bwd_wy_dqkg_fused_cute(
+        q,
+        k,
+        v,
+        v_new,
+        g,
+        beta,
+        A,
+        h,
+        do,
+        dh,
+        dv,
+        cu_seqlens=cu,
+        chunk_size=64,
+        chunk_indices=chunk_indices,
+    )
+
+    ref_args = (v_new, g, beta, A, h, do, dh, dv)
+    gdq, gdk, gdv2, gdb, gdg, gdA = _bwd_wy_dqkg_ref(
+        q.double(),
+        k.double(),
+        v.double(),
+        *(t.double() for t in ref_args),
+        scale,
+        cu_seqlens=cu,
+        chunk_indices=chunk_indices,
+    )
+    rdq, rdk, rdv2, rdb, rdg, rdA = _bwd_wy_dqkg_ref(
+        q, k, v, *ref_args, scale, cu_seqlens=cu, chunk_indices=chunk_indices
+    )
+
+    tag = f"NT={num_chunks} H={H}"
+    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_wy_cute dq {tag}")
+    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_wy_cute dk {tag}")
+    assert_golden(dv2, gdv2, rdv2, torch.bfloat16, f"bwd_wy_cute dv2 {tag}")
+    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_wy_cute db {tag}")
+    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_wy_cute dg {tag}")
+    assert_golden(dA, gdA, rdA, torch.bfloat16, f"bwd_wy_cute dA {tag}")
