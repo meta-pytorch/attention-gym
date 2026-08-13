@@ -69,8 +69,8 @@ def _validate_chunk_kda_inputs(
     if any(tensor.dtype not in _SUPPORTED_INPUT_DTYPES for tensor in data_tensors):
         supported = ", ".join(str(dtype) for dtype in _SUPPORTED_INPUT_DTYPES)
         raise TypeError(f"chunk_kda inputs must use one of {supported}")
-    if batch != 1 or head_dim != _HEAD_DIM:
-        raise ValueError("the CuTe KDA core requires B=1 and K=V=128")
+    if head_dim != _HEAD_DIM:
+        raise ValueError("the CuTe KDA core requires K=V=128")
     if tokens % _CHUNK_SIZE:
         raise ValueError("the CuTe KDA core requires complete 64-token chunks")
     if not torch.compiler.is_compiling() and torch.cuda.get_device_capability(q.device) < (10, 0):
@@ -510,17 +510,26 @@ def chunk_kda(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply the graph-capturable, first-order Blackwell KDA core.
 
-    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Every packed
+    ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches are
+    lowered to the same packed representation with equal-length sequences. Every
     sequence must contain complete 64-token chunks. The output uses ``q.dtype``;
     recurrent states remain FP32 and have one leading entry per logical sequence.
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
+    batch, tokens, heads, head_dim = q.shape
     q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
     cumulative_gate = cumulative_gate.float().contiguous()
     beta = beta.float().contiguous()
     if initial_state is not None:
         initial_state = initial_state.float().contiguous()
+    if batch > 1:
+        packed_shape = (1, batch * tokens, heads, head_dim)
+        q, k, v, cumulative_gate = (
+            tensor.reshape(packed_shape) for tensor in (q, k, v, cumulative_gate)
+        )
+        beta = beta.reshape(1, batch * tokens, heads)
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
     output, state, _Aqk, _Akk, _cu_seqlens, _chunk_indices, _num_chunks = _chunk_kda_fwd_custom_op(
         q,
         k,
@@ -533,7 +542,9 @@ def chunk_kda(
         fastmath,
         profile_ranges,
     )
-    return output.to(output_dtype), state if output_final_state else None
+    return output.reshape(batch, tokens, heads, head_dim).to(output_dtype), (
+        state if output_final_state else None
+    )
 
 
 __all__ = ["chunk_kda"]
