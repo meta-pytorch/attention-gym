@@ -40,6 +40,7 @@ from torch._guards import active_fake_mode
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.utils import (
     prepare_chunk_indices,
     prepare_lens,
@@ -1881,20 +1882,30 @@ def blackwell_delta_h_bwd_dhu_v1(
     bv: int = 16,
     N: int | None = None,
     NT: int | None = None,
+    metadata: RaggedChunkMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     BlackwellDeltaHBwd backward dhu — cuteDSL SM100 kernel.
 
-    Returns (dh, dh0, dv2).
+    Ragged metadata supplies graph-replayable chunk offsets and the static output
+    capacity. The legacy packed arguments remain supported. Returns (dh, dh0, dv2).
     """
     B, T, H, K = q.shape
     V = do.shape[-1]
     BT = chunk_size
-    is_vl = cu_seqlens is not None
     dev = q.device
 
     assert K == 128, "BlackwellDeltaHBwd requires head_k=128"
 
+    if metadata is not None:
+        if any(value is not None for value in (cu_seqlens, chunk_offsets, num_seqs, N, NT)):
+            raise ValueError("pass either metadata or legacy packed arguments, not both")
+        cu_seqlens = metadata.cu_seqlens
+        chunk_offsets = metadata.chunk_offsets
+        N = metadata.cu_seqlens.shape[0] - 1
+        NT = metadata.capacity
+
+    is_vl = cu_seqlens is not None
     if cu_seqlens is None:
         N = N if N is not None else B
         NT = NT if NT is not None else (T + BT - 1) // BT
@@ -1939,9 +1950,9 @@ def blackwell_delta_h_bwd_dhu_v1(
         dho = dh_out[0]  # (NT, H, K, V)
         dv2_k = dv2[0]
         if num_seqs is None:
-            ns_tensor = torch.tensor([N], dtype=torch.int32, device=dev)
+            ns_tensor = cu_i32.new_full((1,), N)
         elif isinstance(num_seqs, int):
-            ns_tensor = torch.tensor([num_seqs], dtype=torch.int32, device=dev)
+            ns_tensor = cu_i32.new_full((1,), num_seqs)
         else:
             ns_tensor = num_seqs.int() if num_seqs.dtype != torch.int32 else num_seqs
             if ns_tensor.dim() == 0:
