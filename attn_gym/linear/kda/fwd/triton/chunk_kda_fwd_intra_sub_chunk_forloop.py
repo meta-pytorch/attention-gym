@@ -13,11 +13,18 @@
 # consumed by the CuTe forward path
 # (attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra).
 
+import torch
 import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym.linear.kda.chunk_scheduler import (
+    RaggedChunkMetadata,
+    load_ragged_chunk_work,
+)
 from attn_gym.linear.kda.utils import (
+    IS_GATHER_SUPPORTED,
+    ChunkMetadata,
     autotune_cache_kwargs,
     exp2,
     gather,
@@ -28,6 +35,7 @@ from attn_gym.linear.kda.utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
             args["q"],
             args["k"],
@@ -37,6 +45,7 @@ from attn_gym.linear.kda.utils import (
             args["Akk"],
             args["cu_seqlens"],
             args["chunk_indices"],
+            args["chunk_offsets"],
             args["num_chunks"],
         ),
     }
@@ -68,6 +77,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     scale,
     cu_seqlens,
     chunk_indices,
+    chunk_offsets,
     num_chunks,
     T,
     q_stride_t,
@@ -81,6 +91,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    IS_RAGGED: tl.constexpr,
+    NUM_SEQUENCES: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     USE_GATHER: tl.constexpr,
     CAUSAL_NORMREF: tl.constexpr = True,
@@ -96,15 +108,27 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
         i_t_orig = i_t_start + _iter * GRID_NT
         _run = i_t_orig < MAX_NT
-        if IS_VARLEN and HAS_NUM_CHUNKS and _run:
-            _run = i_t_orig < tl.load(num_chunks)
+        if IS_VARLEN and _run:
+            if IS_RAGGED:
+                _run = i_t_orig < tl.load(chunk_offsets + NUM_SEQUENCES)
+            elif HAS_NUM_CHUNKS:
+                _run = i_t_orig < tl.load(num_chunks)
         if _run:
             if IS_VARLEN:
-                chunk_offset = ptr_offset((i_t_orig,), (2,))
-                i_n, i_t = (
-                    tl.load(chunk_indices + chunk_offset).to(tl.int32),
-                    tl.load(chunk_indices + chunk_offset + 1).to(tl.int32),
-                )
+                if IS_RAGGED:
+                    i_n, i_t, _, _ = load_ragged_chunk_work(
+                        cu_seqlens,
+                        chunk_offsets,
+                        i_t_orig,
+                        NUM_SEQUENCES,
+                        BT,
+                    )
+                else:
+                    chunk_offset = ptr_offset((i_t_orig,), (2,))
+                    i_n, i_t = (
+                        tl.load(chunk_indices + chunk_offset).to(tl.int32),
+                        tl.load(chunk_indices + chunk_offset + 1).to(tl.int32),
+                    )
                 if USE_INT64_OFFSETS:
                     i_n = i_n.to(tl.int64)
                     i_t = i_t.to(tl.int64)
@@ -226,4 +250,84 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
 
-__all__ = ["chunk_kda_fwd_kernel_intra_sub_chunk_forloop"]
+def chunk_kda_fwd_intra_diagonal(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the scheduler-aware diagonal intra-chunk stage in isolation."""
+    batch, tokens, heads, key_dim = k.shape
+    if batch != 1 or key_dim != 128 or chunk_size != 64:
+        raise ValueError("the diagonal KDA stage requires B=1, K=128, and chunk_size=64")
+
+    subchunk_size = 16
+    subchunks = triton.cdiv(chunk_size, subchunk_size)
+    capacity = (
+        metadata.capacity
+        if isinstance(metadata, RaggedChunkMetadata)
+        else triton.cdiv(tokens, chunk_size)
+    )
+    grid_chunks = min(
+        torch.cuda.get_device_properties(k.device).multi_processor_count,
+        capacity,
+    )
+    Aqk = torch.empty(
+        (batch, tokens, heads, chunk_size),
+        device=k.device,
+        dtype=k.dtype,
+    )
+    Akkd = torch.empty(
+        (batch, tokens, heads, subchunk_size),
+        device=k.device,
+        dtype=torch.float32,
+    )
+
+    ragged = isinstance(metadata, RaggedChunkMetadata)
+    multiple_sequences = ragged or metadata.has_multiple_sequences
+    chunk_kda_fwd_kernel_intra_sub_chunk_forloop[(grid_chunks, subchunks, batch * heads)](
+        q=q,
+        k=k,
+        g=g,
+        beta=beta,
+        Aqk=Aqk,
+        Akk=Akkd,
+        scale=scale,
+        cu_seqlens=metadata.cu_seqlens if multiple_sequences else None,
+        chunk_indices=(
+            metadata.chunk_indices
+            if isinstance(metadata, ChunkMetadata) and multiple_sequences
+            else None
+        ),
+        chunk_offsets=metadata.chunk_offsets if ragged else None,
+        num_chunks=(
+            metadata.num_chunks
+            if isinstance(metadata, ChunkMetadata) and multiple_sequences
+            else None
+        ),
+        T=tokens,
+        q_stride_t=q.stride(1),
+        q_stride_h=q.stride(2),
+        k_stride_t=k.stride(1),
+        k_stride_h=k.stride(2),
+        H=heads,
+        K=key_dim,
+        BT=chunk_size,
+        BC=subchunk_size,
+        BK=triton.next_power_of_2(key_dim),
+        NUM_SEQUENCES=metadata.cu_seqlens.shape[0] - 1 if ragged else 0,
+        USE_GATHER=IS_GATHER_SUPPORTED,
+        CAUSAL_NORMREF=False,
+        GRID_NT=grid_chunks,
+        MAX_NT=capacity,
+    )
+    return Aqk, Akkd
+
+
+__all__ = [
+    "chunk_kda_fwd_intra_diagonal",
+    "chunk_kda_fwd_kernel_intra_sub_chunk_forloop",
+]
