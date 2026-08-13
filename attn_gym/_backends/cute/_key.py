@@ -171,6 +171,16 @@ def _canonicalize(item: Any) -> Any:
     return item
 
 
+def make_runtime_key(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    target: CompileTarget,
+) -> bytes:
+    """Encode the persistent invocation identity for process-local lookup."""
+    key_data = (_canonicalize(args), _canonicalize(kwargs), target)
+    return pickle.dumps(key_data, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def make_key(
     fn: Callable[..., Any],
     args: tuple[Any, ...],

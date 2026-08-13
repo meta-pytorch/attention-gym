@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import struct
 import sys
 import threading
 import time
@@ -425,6 +426,175 @@ def test_run_tunable_sets_target_before_candidate_generation(isolated_cache):
     assert selected is config
     assert result == config.timing
     assert observed_targets == [target]
+
+
+def test_runtime_cache_skips_persistent_key_for_immutable_arguments(isolated_cache, monkeypatch):
+    make_key_calls = 0
+    original_make_key = cute_cache._make_key
+
+    def counting_make_key(*args, **kwargs):
+        nonlocal make_key_calls
+        make_key_calls += 1
+        return original_make_key(*args, **kwargs)
+
+    monkeypatch.setattr(cute_cache, "_make_key", counting_make_key)
+
+    @cute_cache.jit_cache
+    def compile_kernel(config: CompileConfig) -> FakeCompiled:
+        return FakeCompiled(config.variant)
+
+    assert compile_kernel(CompileConfig("shared", 1.0))() == "shared"
+    assert compile_kernel(CompileConfig("shared", 1.0))() == "shared"
+    assert make_key_calls == 1
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=1, currsize=1)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [(True, 1), (1, 1.0), (0.0, -0.0)],
+)
+def test_runtime_cache_preserves_scalar_representation(isolated_cache, first, second):
+    def describe(value) -> str:
+        if isinstance(value, float):
+            return f"float:{value.hex()}"
+        return f"{type(value).__name__}:{value}"
+
+    @cute_cache.jit_cache
+    def compile_kernel(value) -> FakeCompiled:
+        return FakeCompiled(describe(value))
+
+    assert compile_kernel(first)() == describe(first)
+    assert compile_kernel(second)() == describe(second)
+    assert compile_kernel(first)() == describe(first)
+    assert compile_kernel(second)() == describe(second)
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=2, misses=2, currsize=2)
+
+
+def test_explicit_cache_key_is_shared_by_memory_and_disk(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache(cache_key=lambda _value: "shared")
+    def compile_kernel(value: str) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(value)
+
+    assert compile_kernel("first")() == "first"
+    assert compile_kernel("second")() == "first"
+    compile_kernel.cache_clear()
+    assert compile_kernel("third")() == "first"
+    assert compile_count == 1
+    assert len(list(isolated_cache.rglob("*.o"))) == 1
+
+
+def test_explicit_cache_key_is_shared_by_precompile_and_lookup(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache(cache_key=lambda _value: "shared")
+    def compile_kernel(value: str) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(value)
+
+    assert not compile_kernel.is_cached("first")
+    compile_kernel.precompile("first")
+    assert compile_kernel.is_cached("second")
+    assert compile_kernel("second")() == "first"
+    assert compile_count == 1
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=0, currsize=1)
+
+
+def test_explicit_cache_key_must_be_hashable():
+    @cute_cache.jit_cache(cache_key=lambda _value: [])
+    def compile_kernel(value: str) -> FakeCompiled:
+        return FakeCompiled(value)
+
+    with pytest.raises(TypeError, match="cache_key must return a hashable value"):
+        compile_kernel("value")
+
+
+def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):
+    compile_count = 0
+    target = cute_target.CompileTarget("first")
+    monkeypatch.setattr(cute_cache, "get_compile_target", lambda: target)
+
+    @cute_cache.jit_cache
+    def compile_kernel(value: str) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(cute_cache.get_compile_target().device_type)
+
+    assert compile_kernel("shared")() == "first"
+    target = cute_target.CompileTarget("second")
+    assert compile_kernel("shared")() == "second"
+    target = cute_target.CompileTarget("first")
+    assert compile_kernel("shared")() == "first"
+    assert compile_count == 2
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=2, currsize=2)
+
+
+def test_runtime_key_fuzz_matches_persistent_key_equivalence(isolated_cache):
+    same_nan = struct.unpack("!d", bytes.fromhex("7ff8000000000001"))[0]
+    same_nan_copy = struct.unpack("!d", bytes.fromhex("7ff8000000000001"))[0]
+    other_nan = struct.unpack("!d", bytes.fromhex("7ff8000000000002"))[0]
+    calls = [
+        ((True,), {}),
+        ((1,), {}),
+        ((1.0,), {}),
+        ((0.0,), {}),
+        ((-0.0,), {}),
+        ((same_nan,), {}),
+        ((same_nan_copy,), {}),
+        ((other_nan,), {}),
+        ((CompileConfig("shared", 1.0),), {}),
+        ((["nested", {"value": True}],), {}),
+        ((["nested", {"value": 1}],), {}),
+        (({same_nan: "value"},), {}),
+        (({same_nan: "value", same_nan_copy: "value"},), {}),
+        ((), {"first": 1, "second": 2}),
+        ((), {"second": 2, "first": 1}),
+    ]
+    target = cute_target.CompileTarget("test")
+
+    def compile_kernel(value=None, **kwargs):
+        return value, kwargs
+
+    runtime_keys = [cute_cache._make_runtime_key(*call, target) for call in calls]
+    persistent_keys = [cute_cache._make_key(compile_kernel, *call, target) for call in calls]
+    for left in range(len(calls)):
+        for right in range(len(calls)):
+            if runtime_keys[left] == runtime_keys[right]:
+                assert persistent_keys[left] == persistent_keys[right]
+
+    assert runtime_keys[5] == runtime_keys[6]
+    assert runtime_keys[5] != runtime_keys[7]
+    assert runtime_keys[-2] == runtime_keys[-1]
+
+    bool_target = cute_target.CompileTarget("test", sm_count=True)
+    int_target = cute_target.CompileTarget("test", sm_count=1)
+    assert cute_cache._make_runtime_key((), {}, bool_target) != cute_cache._make_runtime_key(
+        (), {}, int_target
+    )
+
+
+def test_runtime_cache_snapshots_mutable_arguments(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache
+    def compile_kernel(values: list[str]) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(values[0])
+
+    values = ["first"]
+    assert compile_kernel(values)() == "first"
+    assert compile_kernel(["first"])() == "first"
+    values[0] = "second"
+    assert compile_kernel(values)() == "second"
+    assert compile_kernel(["second"])() == "second"
+    compile_kernel.cache_clear()
+    assert compile_kernel(["first"])() == "first"
+    assert compile_count == 2
 
 
 def test_same_key_compiles_once_across_threads(isolated_cache):
