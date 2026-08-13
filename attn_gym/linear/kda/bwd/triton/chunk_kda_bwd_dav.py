@@ -18,6 +18,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import (
     ChunkMetadata,
     autotune_cache_kwargs,
@@ -39,6 +40,7 @@ def _requires_int64_offsets(args) -> bool:
         args["dA"],
         args["cu_seqlens"],
         args["chunk_indices"],
+        args["chunk_offsets"],
         args["num_chunks"],
     )
 
@@ -47,6 +49,7 @@ def _requires_int64_offsets(args) -> bool:
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
+        "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
         "USE_TMA": _uses_tensor_descriptors,
         "USE_INT64_OFFSETS": _requires_int64_offsets,
     }
@@ -68,6 +71,7 @@ def chunk_kda_bwd_kernel_dAv(
     dA,
     cu_seqlens,
     chunk_indices,
+    chunk_offsets,
     num_chunks,
     scale,
     T,
@@ -77,6 +81,8 @@ def chunk_kda_bwd_kernel_dAv(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
+    IS_RAGGED: tl.constexpr,
+    NUM_SEQUENCES: tl.constexpr,
     USE_TMA: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
@@ -89,12 +95,23 @@ def chunk_kda_bwd_kernel_dAv(
 
     if not USE_TMA:
         if IS_VARLEN:
-            if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
-                return
-            i_n, i_t = (
-                tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
-                tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
-            )
+            if IS_RAGGED:
+                if i_t >= tl.load(chunk_offsets + NUM_SEQUENCES):
+                    return
+                i_n, i_t, _, _ = load_ragged_chunk_work(
+                    cu_seqlens,
+                    chunk_offsets,
+                    i_t,
+                    NUM_SEQUENCES,
+                    BT,
+                )
+            else:
+                if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
+                    return
+                i_n, i_t = (
+                    tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
+                    tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
+                )
             if USE_INT64_OFFSETS:
                 i_n = i_n.to(tl.int64)
                 i_t = i_t.to(tl.int64)
@@ -199,11 +216,11 @@ def chunk_kda_bwd_dav(
     scale: float,
     *,
     chunk_size: int = 64,
-    metadata: ChunkMetadata | None = None,
+    metadata: ChunkMetadata | RaggedChunkMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Differentiate the fixed-length or packed KDA intra-chunk value term."""
     batch, tokens, heads, value_dim = v.shape
-    if tokens % chunk_size:
+    if tokens % chunk_size and not isinstance(metadata, RaggedChunkMetadata):
         raise ValueError(f"the KDA dAv kernel requires complete chunks, got T={tokens}")
     if A.shape != (batch, tokens, heads, chunk_size):
         raise ValueError("A must have shape [B, T, H, chunk_size]")
@@ -212,7 +229,9 @@ def chunk_kda_bwd_dav(
 
     dv = torch.empty_like(v)
     dA = torch.empty_like(A, dtype=torch.float32)
-    chunks = tokens // chunk_size
+    chunks = (
+        metadata.capacity if isinstance(metadata, RaggedChunkMetadata) else tokens // chunk_size
+    )
     block_value_dim = 64
     if (
         metadata is None
@@ -227,6 +246,7 @@ def chunk_kda_bwd_dav(
             dA=TensorDescriptor.from_tensor(dA, [1, chunk_size, 1, chunk_size]),
             cu_seqlens=None,
             chunk_indices=None,
+            chunk_offsets=None,
             num_chunks=None,
             scale=scale,
             T=tokens,
@@ -234,6 +254,7 @@ def chunk_kda_bwd_dav(
             V=value_dim,
             BT=chunk_size,
             BV=block_value_dim,
+            NUM_SEQUENCES=0,
         )
     else:
         chunk_kda_bwd_kernel_dAv[(chunks, batch * heads)](
@@ -243,14 +264,24 @@ def chunk_kda_bwd_dav(
             dv=dv,
             dA=dA,
             cu_seqlens=None if metadata is None else metadata.cu_seqlens,
-            chunk_indices=None if metadata is None else metadata.chunk_indices,
-            num_chunks=None if metadata is None else metadata.num_chunks,
+            chunk_indices=(
+                metadata.chunk_indices if isinstance(metadata, ChunkMetadata) else None
+            ),
+            chunk_offsets=(
+                metadata.chunk_offsets if isinstance(metadata, RaggedChunkMetadata) else None
+            ),
+            num_chunks=metadata.num_chunks if isinstance(metadata, ChunkMetadata) else None,
             scale=scale,
             T=tokens,
             H=heads,
             V=value_dim,
             BT=chunk_size,
             BV=block_value_dim,
+            NUM_SEQUENCES=(
+                metadata.cu_seqlens.shape[0] - 1
+                if isinstance(metadata, RaggedChunkMetadata)
+                else 0
+            ),
         )
     return dv, dA
 
