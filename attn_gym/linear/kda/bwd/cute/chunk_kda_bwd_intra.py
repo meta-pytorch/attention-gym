@@ -23,6 +23,8 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.utils import ChunkMetadata
 
 BT = 64  # chunk_size
@@ -938,10 +940,11 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     mDk2: cute.Tensor,
     mDg2: cute.Tensor,
     mCuSeqlens: cute.Tensor,
-    mChunkIndices: cute.Tensor,
+    mChunkRouting: cute.Tensor,
     mNumChunks: cute.Tensor,
     use_i32_metadata: Constexpr,
     grid_chunks: Constexpr,
+    ragged: Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
@@ -958,12 +961,13 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     row0 = row_base + gid
     row1 = row0 + 8
 
-    # num_chunks is a runtime device scalar, so the chunk axis is a fixed cap
-    # (grid_chunks) and each CTA strides chunk_start, chunk_start + grid_chunks,
-    # ... while < num_chunks. This replaces the old grid that was sized by the
-    # padded chunk_indices.shape[0] (often ~16x the live chunk count). The
-    # numerator stays >= 0 because chunk_start < grid_chunks.
-    num_chunks_runtime = mNumChunks[0].to(Int32)
+    # The chunk axis remains fixed while the active count is loaded on-device,
+    # allowing graph replay to change sequence boundaries without a new launch.
+    if cutlass.const_expr(ragged):
+        num_sequences = Int32(cute.size(mChunkRouting)) - 1
+        num_chunks_runtime = Int32(mChunkRouting[num_sequences])
+    else:
+        num_chunks_runtime = mNumChunks[0].to(Int32)
     iters = (num_chunks_runtime - chunk_start + grid_chunks - 1) // grid_chunks
 
     # SMEM is allocated once and reused across the chunk-loop iterations.
@@ -1001,22 +1005,30 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
 
     for chunk_iter in cutlass.range(iters, unroll=1):
         chunk_block = chunk_start + chunk_iter * grid_chunks
-        seq_idx = Int32(0)
-        chunk_idx = Int32(0)
-        bos = Int32(0)
-        eos = Int32(0)
-        if use_i32_metadata:
-            seq_idx = mChunkIndices[chunk_block, 0].to(Int32)
-            chunk_idx = mChunkIndices[chunk_block, 1].to(Int32)
-            bos = mCuSeqlens[seq_idx].to(Int32)
-            eos = mCuSeqlens[seq_idx + 1].to(Int32)
+        if cutlass.const_expr(ragged):
+            _, _, row_start, valid = load_ragged_chunk_work(
+                mCuSeqlens,
+                mChunkRouting,
+                chunk_block,
+                Int32(BT),
+            )
         else:
-            seq_idx = mChunkIndices[chunk_block, 0].to(Int32)
-            chunk_idx = mChunkIndices[chunk_block, 1].to(Int32)
-            bos = mCuSeqlens[seq_idx].to(Int32)
-            eos = mCuSeqlens[seq_idx + 1].to(Int32)
-        row_start = bos + chunk_idx * BT
-        valid = cutlass.min(eos - row_start, Int32(BT))
+            seq_idx = Int32(0)
+            chunk_idx = Int32(0)
+            bos = Int32(0)
+            eos = Int32(0)
+            if use_i32_metadata:
+                seq_idx = mChunkRouting[chunk_block, 0].to(Int32)
+                chunk_idx = mChunkRouting[chunk_block, 1].to(Int32)
+                bos = mCuSeqlens[seq_idx].to(Int32)
+                eos = mCuSeqlens[seq_idx + 1].to(Int32)
+            else:
+                seq_idx = mChunkRouting[chunk_block, 0].to(Int32)
+                chunk_idx = mChunkRouting[chunk_block, 1].to(Int32)
+                bos = mCuSeqlens[seq_idx].to(Int32)
+                eos = mCuSeqlens[seq_idx + 1].to(Int32)
+            row_start = bos + chunk_idx * BT
+            valid = cutlass.min(eos - row_start, Int32(BT))
         # Match Triton's default safe-gate normalization reference
         # (causal_gate_normref=False): use the middle row of this BC subchunk,
         # clamped for partial chunks. This keeps local diagonal dA scaling
@@ -1920,9 +1932,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
 
 
 class ChunkKdaBwdIntraHmmaGrid:
-    def __init__(self, use_i32_metadata: bool, grid_chunks: int):
+    """Launch the persistent legacy-map or ragged-scheduler kernel."""
+
+    def __init__(self, use_i32_metadata: bool, grid_chunks: int, ragged: bool):
         self.use_i32_metadata = use_i32_metadata
         self.grid_chunks = grid_chunks
+        self.ragged = ragged
 
     @cute.jit
     def __call__(
@@ -1941,7 +1956,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         mDk2: cute.Tensor,
         mDg2: cute.Tensor,
         mCuSeqlens: cute.Tensor,
-        mChunkIndices: cute.Tensor,
+        mChunkRouting: cute.Tensor,
         mNumChunks: cute.Tensor,
         stream: cuda.CUstream = None,
     ):
@@ -1960,10 +1975,11 @@ class ChunkKdaBwdIntraHmmaGrid:
             mDk2,
             mDg2,
             mCuSeqlens,
-            mChunkIndices,
+            mChunkRouting,
             mNumChunks,
             self.use_i32_metadata,
             self.grid_chunks,
+            self.ragged,
             _name_prefix="cutlass_dsl_chunk_kda_bwd_intra",
         ).launch(
             grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
@@ -1979,13 +1995,19 @@ class ChunkKdaBwdIntraConfig(NamedTuple):
 
 
 @jit_cache
-def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
-    """Compile one persistent fixed-length intra-chunk backward specialization."""
-    if not 1 <= grid_chunks <= chunks:
-        raise ValueError(f"grid_chunks must be in [1, {chunks}], got {grid_chunks}")
+def _compile_chunk_kda_bwd_intra(
+    heads: int,
+    capacity: int,
+    grid_chunks: int,
+    ragged: bool,
+):
+    """Compile one persistent intra-chunk backward specialization."""
+    if not 1 <= grid_chunks <= capacity:
+        raise ValueError(f"grid_chunks must be in [1, {capacity}], got {grid_chunks}")
     op = ChunkKdaBwdIntraHmmaGrid(
         use_i32_metadata=True,
         grid_chunks=grid_chunks,
+        ragged=ragged,
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()
 
@@ -2032,7 +2054,10 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
     dk2 = column_token_head(cutlass.BFloat16, KEY_DIM)
     dg2 = column_token_head(cutlass.Float32, KEY_DIM)
     cu_seqlens = normal(cutlass.Int32, (sequences,))
-    chunk_indices = normal(cutlass.Int32, (chunks, 2))
+    chunk_routing = normal(
+        cutlass.Int32,
+        (sequences,) if ragged else (capacity, 2),
+    )
     num_chunks = normal(cutlass.Int32, (1,))
     return compile_tvm_ffi(
         op,
@@ -2050,9 +2075,9 @@ def _compile_chunk_kda_bwd_intra(heads: int, chunks: int, grid_chunks: int):
         dk2,
         dg2,
         cu_seqlens,
-        chunk_indices,
+        chunk_routing,
         num_chunks,
-        name=f"kda_bwd_intra_h{heads}_c{chunks}_gc{grid_chunks}",
+        name=f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_rg{int(ragged)}",
     )
 
 
@@ -2077,8 +2102,10 @@ class ChunkKdaBwdIntraTunable:
         dg2: torch.Tensor
         db_partial: torch.Tensor
         cu_seqlens: torch.Tensor
-        chunk_indices: torch.Tensor
+        chunk_routing: torch.Tensor
         num_chunks: torch.Tensor
+        capacity: int
+        ragged: bool
 
     # The public wrapper replaces this universal fallback with a target-aware default.
     default_config = ChunkKdaBwdIntraConfig(1)
@@ -2093,24 +2120,26 @@ class ChunkKdaBwdIntraTunable:
 
     @classmethod
     def configs(cls, args: Args) -> tuple[ChunkKdaBwdIntraConfig, ...]:
-        """Generate persistent-grid candidates from sequence length and target size."""
-        chunks = args.q.shape[1] // BT
+        """Generate persistent-grid candidates from routing capacity and target size."""
         sm_count = get_compile_target().sm_count
         if sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        grid_limit = min(chunks, 1 << (sm_count.bit_length() - 1))
+        grid_limit = min(args.capacity, 1 << (sm_count.bit_length() - 1))
         values = (
-            cls.default_for(chunks, sm_count).grid_chunks,
+            cls.default_for(args.capacity, sm_count).grid_chunks,
             max(1, grid_limit // 4),
             grid_limit,
-            min(chunks, sm_count),
-            min(chunks, grid_limit * 2),
+            min(args.capacity, sm_count),
+            min(args.capacity, grid_limit * 2),
         )
         return tuple(ChunkKdaBwdIntraConfig(value) for value in dict.fromkeys(values))
 
     @staticmethod
-    def compile_call(config: ChunkKdaBwdIntraConfig, args: Args) -> tuple[int, int, int]:
-        return args.q.shape[2], args.q.shape[1] // BT, config.grid_chunks
+    def compile_call(
+        config: ChunkKdaBwdIntraConfig,
+        args: Args,
+    ) -> tuple[int, int, int, bool]:
+        return args.q.shape[2], args.capacity, config.grid_chunks, args.ragged
 
     compile = staticmethod(_compile_chunk_kda_bwd_intra)
 
@@ -2134,7 +2163,7 @@ class ChunkKdaBwdIntraTunable:
             _column_token_head(args.dk2),
             _column_token_head(args.dg2),
             args.cu_seqlens,
-            args.chunk_indices,
+            args.chunk_routing,
             args.num_chunks.reshape(1),
         )
         return (
@@ -2156,13 +2185,13 @@ def chunk_kda_bwd_intra(
     dk: torch.Tensor,
     db: torch.Tensor,
     dg: torch.Tensor,
-    metadata: ChunkMetadata,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
     *,
     config: ChunkKdaBwdIntraConfig | None = None,
     tune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the final intra-chunk backward stage.
+    """Run or tune the final legacy-map or fixed-capacity ragged backward stage.
 
     The returned gate gradient includes the ``ln(2)`` factor for differentiating ``2**g``;
     the incoming ``dg`` and this stage's contribution are both scaled at the final writer.
@@ -2170,8 +2199,22 @@ def chunk_kda_bwd_intra(
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != KEY_DIM:
         raise ValueError("the intra-chunk backward requires B=1 and K=128")
-    if tokens % BT:
+    ragged = isinstance(metadata, RaggedChunkMetadata)
+    if not ragged and tokens % BT:
         raise ValueError("the intra-chunk backward requires complete 64-token chunks")
+    if ragged and tokens == 0:
+        return (
+            torch.empty_like(q, memory_format=torch.contiguous_format),
+            torch.empty_like(k, memory_format=torch.contiguous_format),
+            torch.empty_like(g, memory_format=torch.contiguous_format),
+            db.clone(memory_format=torch.contiguous_format),
+        )
+
+    capacity = metadata.capacity if ragged else metadata.chunk_indices.shape[0]
+    chunk_routing = metadata.chunk_offsets if ragged else metadata.chunk_indices
+    # The ragged specialization reads its active count from chunk_offsets[-1].
+    # Keep this compile-time-dead ABI placeholder 128-byte aligned for CuTe.
+    num_chunks = metadata.chunk_offsets[:1] if ragged else metadata.num_chunks
 
     # The kernel combines the incoming gradients with its intra-chunk contribution into
     # new output buffers. Beta is different: four K-phase CTAs contribute to every token,
@@ -2202,14 +2245,16 @@ def chunk_kda_bwd_intra(
         dg2=dg2,
         db_partial=db_partial,
         cu_seqlens=metadata.cu_seqlens,
-        chunk_indices=metadata.chunk_indices,
-        num_chunks=metadata.num_chunks,
+        chunk_routing=chunk_routing,
+        num_chunks=num_chunks,
+        capacity=capacity,
+        ragged=ragged,
     )
     target = detect_compile_target(q.device.index)
     if not tune and config is None:
         if target.sm_count is None:
             raise RuntimeError("KDA launch requires a CUDA target with an SM count")
-        config = ChunkKdaBwdIntraTunable.default_for(tokens // BT, target.sm_count)
+        config = ChunkKdaBwdIntraTunable.default_for(capacity, target.sm_count)
     result, _ = run_tunable(
         ChunkKdaBwdIntraTunable,
         args,
