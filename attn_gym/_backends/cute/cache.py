@@ -20,7 +20,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
@@ -28,8 +28,9 @@ from typing import Any, ParamSpec, TypeVar
 from typing_extensions import Self
 
 from ._key import make_key as _make_key
+from ._key import make_runtime_key as _make_runtime_key
 from ._key import source_fingerprint as _source_fingerprint
-from .target import get_compile_target
+from .target import CompileTarget, get_compile_target
 
 try:
     import fcntl
@@ -138,8 +139,9 @@ def _cache_entry(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     extra_sources: tuple[str, ...],
+    target: CompileTarget,
 ) -> _CacheEntry:
-    key = _make_key(fn, args, kwargs, get_compile_target())
+    key = _make_key(fn, args, kwargs, target)
     directory = get_cache_path() / _source_fingerprint(fn, extra_sources)
     return _CacheEntry(key, directory / f"{key}.o", directory / f"{key}.lock")
 
@@ -224,13 +226,16 @@ def jit_cache(
     persistent: bool = True,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     extra_sources: Iterable[str | os.PathLike[str]] = (),
+    cache_key: Callable[P, Hashable] | None = None,
 ) -> Callable[P, T]:
     """Cache a ``cute.compile`` function in memory and optionally on disk.
 
     The function's arguments must be static values that completely determine
-    generated code. ``persistent=False`` keeps only the process-local cache.
-    ``extra_sources`` explicitly adds downstream files or trees to source
-    invalidation; neither setting requires an environment variable.
+    generated code. Their canonical encoding provides the process-local key;
+    ``cache_key`` may define an explicit structural key instead. Persistent
+    hashing and path construction occur only after a process-local miss.
+    ``persistent=False`` keeps only the process-local cache. ``extra_sources``
+    explicitly adds downstream files or trees to source invalidation.
     """
     if fn is None:
         return functools.partial(
@@ -238,11 +243,13 @@ def jit_cache(
             persistent=persistent,
             lock_timeout=lock_timeout,
             extra_sources=extra_sources,
+            cache_key=cache_key,
         )
     if lock_timeout <= 0:
         raise ValueError(f"lock_timeout must be positive, got {lock_timeout}")
     source_paths = tuple(os.fspath(Path(path).expanduser().resolve()) for path in extra_sources)
     memory_cache: dict[str, T] = {}
+    runtime_cache: dict[bytes, T] = {}
     key_locks: dict[str, threading.Lock] = {}
     state_lock = threading.RLock()
     cache_pid = os.getpid()
@@ -256,15 +263,23 @@ def jit_cache(
             return
         state_lock = threading.RLock()
         memory_cache.clear()
+        runtime_cache.clear()
         key_locks.clear()
         hits = 0
         misses = 0
         cache_pid = current_pid
 
-    def remember(key: str, compiled: T, *, hit: bool) -> T:
+    def remember(
+        key: str,
+        compiled: T,
+        *,
+        runtime_key: bytes,
+        hit: bool,
+    ) -> T:
         nonlocal hits, misses
         with state_lock:
             memory_cache[key] = compiled
+            runtime_cache[runtime_key] = compiled
             if hit:
                 hits += 1
             else:
@@ -302,36 +317,69 @@ def jit_cache(
     def disk_cache_enabled() -> bool:
         return persistent and cache_enabled()
 
+    def key_arguments(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if cache_key is None:
+            return args, kwargs
+        static_key = cache_key(*args, **kwargs)
+        try:
+            hash(static_key)
+        except TypeError as error:
+            raise TypeError("jit_cache cache_key must return a hashable value") from error
+        return (static_key,), {}
+
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
         nonlocal hits
-        entry = _cache_entry(fn, args, kwargs, source_paths)
         reset_after_fork()
+        target = get_compile_target()
+        key_args, key_kwargs = key_arguments(args, kwargs)
+        runtime_key = _make_runtime_key(key_args, key_kwargs, target)
+        with state_lock:
+            if runtime_key in runtime_cache:
+                hits += 1
+                return runtime_cache[runtime_key]
+
+        entry = _cache_entry(fn, key_args, key_kwargs, source_paths, target)
         with state_lock:
             if entry.key in memory_cache:
-                hits += 1
-                return memory_cache[entry.key]
+                return remember(
+                    entry.key,
+                    memory_cache[entry.key],
+                    runtime_key=runtime_key,
+                    hit=True,
+                )
             key_lock = key_locks.setdefault(entry.key, threading.Lock())
 
         with key_lock:
             reset_after_fork()
             with state_lock:
                 if entry.key in memory_cache:
-                    hits += 1
-                    return memory_cache[entry.key]
+                    return remember(
+                        entry.key,
+                        memory_cache[entry.key],
+                        runtime_key=runtime_key,
+                        hit=True,
+                    )
 
             if not disk_cache_enabled():
-                return remember(entry.key, _compile(fn, args, kwargs), hit=False)
+                return remember(
+                    entry.key,
+                    _compile(fn, args, kwargs),
+                    runtime_key=runtime_key,
+                    hit=False,
+                )
 
             compiled = load_from_disk(entry)
             if compiled is not None:
-                return remember(entry.key, compiled, hit=True)
+                return remember(entry.key, compiled, runtime_key=runtime_key, hit=True)
 
             try:
                 with _FileLock(entry.lock_path, lock_timeout):
                     compiled = load_from_disk(entry)
                     if compiled is not None:
-                        return remember(entry.key, compiled, hit=True)
+                        return remember(entry.key, compiled, runtime_key=runtime_key, hit=True)
                     if entry.object_path.exists():
                         logger.warning(
                             "Replacing corrupt CuTeDSL cache artifact %s",
@@ -339,20 +387,26 @@ def jit_cache(
                         )
                         entry.object_path.unlink(missing_ok=True)
                     compiled = compile_and_publish(entry, args, kwargs, strict=False)
-                    return remember(entry.key, compiled, hit=False)
+                    return remember(entry.key, compiled, runtime_key=runtime_key, hit=False)
             except CacheLockError:
                 logger.warning(
                     "CuTeDSL cache lock unavailable for key %s; compiling without disk cache",
                     entry.key,
                     exc_info=True,
                 )
-                return remember(entry.key, _compile(fn, args, kwargs), hit=False)
+                return remember(
+                    entry.key,
+                    _compile(fn, args, kwargs),
+                    runtime_key=runtime_key,
+                    hit=False,
+                )
 
     def precompile(*args: P.args, **kwargs: P.kwargs) -> None:
         """Populate one disk entry without loading or returning the artifact."""
         if not disk_cache_enabled():
             raise RuntimeError("parallel CuTeDSL precompilation requires the disk cache")
-        entry = _cache_entry(fn, args, kwargs, source_paths)
+        key_args, key_kwargs = key_arguments(args, kwargs)
+        entry = _cache_entry(fn, key_args, key_kwargs, source_paths, get_compile_target())
         if _artifact_exists(entry.object_path):
             return
         with _FileLock(entry.lock_path, lock_timeout):
@@ -363,7 +417,9 @@ def jit_cache(
 
     def is_cached(*args: P.args, **kwargs: P.kwargs) -> bool:
         """Return whether a nonempty disk artifact exists for this invocation."""
-        return _artifact_exists(_cache_entry(fn, args, kwargs, source_paths).object_path)
+        key_args, key_kwargs = key_arguments(args, kwargs)
+        entry = _cache_entry(fn, key_args, key_kwargs, source_paths, get_compile_target())
+        return _artifact_exists(entry.object_path)
 
     def prepare_cache() -> None:
         """Warm source fingerprinting before compiler workers are forked."""
@@ -375,6 +431,7 @@ def jit_cache(
         reset_after_fork()
         with state_lock:
             memory_cache.clear()
+            runtime_cache.clear()
             key_locks.clear()
             hits = 0
             misses = 0

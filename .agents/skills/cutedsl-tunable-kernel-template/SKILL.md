@@ -174,7 +174,12 @@ process-global and sticky; callers that temporarily override it must restore the
 
 Inside `compile(...)`:
 
-1. Accept only static values that completely determine generated code and the fake ABI.
+1. Accept only static values that completely determine generated code and the fake ABI. Keep them
+   structurally stable so `jit_cache` can encode them for warm process-local lookups before
+   constructing a persistent hash or cache path. When the call tuple is not the right specialization
+   identity, pass `cache_key=` a pure function returning a complete hashable tuple or frozen config.
+   Return the structural key itself, never `hash(key)`; `jit_cache` adds function, target, and source
+   identity and uses the same structural key for memory and disk caching.
 2. Keep batch-, token-, and head-count-like extents symbolic with `cute.sym_int()`/`cute.sym_int64()`
    when their dependent strides also remain dynamic. Bake a dimension into `compile_call(...)` only
    when it changes layout/stride address arithmetic, tiling, vectorization, block shape, shared-memory
