@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import chunk_kda
+from attn_gym.linear import naive_chunk_kda_from_cumulative
+from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
+    _chunk_kda_bwd_custom_op,
+    _chunk_kda_fwd_ragged_custom_op,
+    chunk_kda,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -117,6 +122,102 @@ def test_public_ragged_backward_matches_independent_sequences():
     for actual, expected in zip(gradients[:-1], expected_gradients):
         torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(gradients[-1], expected_state_gradient, rtol=3e-2, atol=3e-2)
+
+
+def test_public_ragged_backward_matches_naive_reference():
+    lengths = [65, 0, 63]
+    tokens = sum(lengths)
+    actual_inputs = _inputs(tokens)
+    reference_inputs = _clone_inputs(actual_inputs)
+    actual_state = (torch.randn(3, 1, 128, 128, device="cuda") / 8).requires_grad_()
+    reference_state = actual_state.detach().clone().requires_grad_()
+    output_grad = torch.randn(1, tokens, 1, 128, device="cuda")
+    state_grad = torch.randn_like(actual_state)
+
+    actual = _run_gradients(
+        actual_inputs,
+        actual_state,
+        _offsets(lengths),
+        output_grad,
+        state_grad,
+    )
+
+    outputs = []
+    states = []
+    token_start = 0
+    for sequence, length in enumerate(lengths):
+        if length == 0:
+            states.append(reference_state[sequence])
+            continue
+        token_slice = slice(token_start, token_start + length)
+        output, final_state = naive_chunk_kda_from_cumulative(
+            *(value[:, token_slice].float() for value in reference_inputs[:4]),
+            reference_inputs[4][:, token_slice].float(),
+            initial_state=reference_state[sequence : sequence + 1],
+            output_final_state=True,
+            chunk_size=64,
+        )
+        outputs.append(output)
+        states.append(final_state[0])
+        token_start += length
+    reference_output = torch.cat(outputs, dim=1)
+    reference_final_state = torch.stack(states)
+    loss = (reference_output * output_grad).sum() + (reference_final_state * state_grad).sum()
+    reference_gradients = torch.autograd.grad(
+        loss,
+        (*reference_inputs, reference_state),
+    )
+
+    actual_output, actual_final_state, actual_gradients = actual
+    torch.testing.assert_close(actual_output.float(), reference_output, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual_final_state, reference_final_state, rtol=2e-2, atol=3e-3)
+    for gradient, reference in zip(actual_gradients, reference_gradients, strict=True):
+        tolerance = 3e-2 + 3e-2 * reference.abs().max()
+        assert (gradient.float() - reference.float()).abs().max() <= tolerance
+
+
+def test_ragged_custom_op_registrations():
+    inputs = _inputs(128)
+    initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
+    cu_seqlens = _offsets([65, 63])
+    forward_args = (
+        *inputs,
+        initial_state,
+        cu_seqlens,
+        True,
+        False,
+        False,
+    )
+    torch.library.opcheck(
+        _chunk_kda_fwd_ragged_custom_op,
+        forward_args,
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+        rtol=2e-2,
+        atol=2e-3,
+    )
+
+    with torch.no_grad():
+        output, state, Aqk, Akk, chunk_offsets = _chunk_kda_fwd_ragged_custom_op(*forward_args)
+    torch.library.opcheck(
+        _chunk_kda_bwd_custom_op,
+        (
+            *(value.detach() for value in inputs),
+            Aqk,
+            Akk,
+            cu_seqlens,
+            chunk_offsets,
+            chunk_offsets.new_empty(()),
+            torch.randn_like(output),
+            torch.randn_like(state),
+            initial_state.detach(),
+            True,
+            False,
+            False,
+        ),
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+        rtol=2e-2,
+        atol=2e-3,
+    )
 
 
 def test_public_ragged_forward_and_backward_fullgraph():
