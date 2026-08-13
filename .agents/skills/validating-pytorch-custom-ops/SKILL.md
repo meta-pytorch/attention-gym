@@ -15,12 +15,51 @@ Use this workflow whenever adding a backend under `attn_gym/linear/<variant>/imp
 2. **Triton implementation:** direct Triton kernels can work under `torch.compile`. Prefer
    `torch.library.triton_op` with `torch.library.wrap_triton` when a stable operator boundary is
    useful and compiler subsystems should remain able to inspect the implementation.
-3. **CuTeDSL or external implementation:** use a private `torch.library.custom_op` when the launcher
-   cannot be traced correctly.
+3. **CuTeDSL or external implementation:** use a private registered operator
+   (`torch.library.define`/`impl`, below) when the launcher cannot be traced correctly.
 
 The documented public function remains an ordinary Python function that owns semantic validation,
 mode selection, and backend dispatch. Compiling only a private launcher does not prove that the
 public operation is compile-friendly.
+
+## Operator boundary CPU overhead
+
+Every registered-operator boundary costs CPU time per call. Microbenchmark (torch 2.14 nightly,
+B200, identical trivial launcher, CPU wall-clock per call, medians over interleaved rounds):
+
+| boundary                        | inference | fwd, requires_grad=True     |
+| ------------------------------- | --------- | --------------------------- |
+| raw Python                      | 1.2 us    | 3.7 us (+autograd.Function) |
+| `define`/`impl`                 | 2.6 us    | 5.3 us (+autograd.Function) |
+| `custom_op`                     | 5.5 us    | 8.2 us (+autograd.Function) |
+| `impl(op, "Autograd")` kernel   | 6.8 us    | 7.4 us                      |
+| `custom_op` + register_autograd | —         | 10.2 us                     |
+
+Nesting one registered op inside another pays the boundary again (nested `custom_op` 7.1 us,
+nested `define`/`impl` 3.7 us). Wrapping the real `kda_l2norm_fwd` launcher in `custom_op` added
+~11 us per forward call over invoking the launcher directly.
+
+Consequences for launch-bound paths (small kernels, high call rate):
+
+- Registration exists for compile and fake-tensor consumers; eager execution gains nothing from
+  it. The eager floor is a plain `autograd.Function` over the launcher with no `torch.library`
+  registration (real `l2norm` op: ~17 us cheaper per gradient-tracking forward and ~58 us per
+  fwd+bwd than the `custom_op` boundary), at the cost of `fullgraph=True` support.
+- Use the define/impl pattern below for repo operators; `torch.library.custom_op` costs ~3 us
+  more per call for schema inference and mutation checking and is only preferable for
+  prototypes.
+- Prefer `autograd.Function` over `register_autograd` for hot training ops; it was the cheapest
+  measured autograd boundary. Registering a Python kernel at the Autograd dispatch key
+  (`torch.library.impl(op, "Autograd")`) makes the raw op differentiable but runs Python on
+  every call, including inference; use it only when direct `torch.ops` calls must be
+  differentiable.
+- Give each hot path at most one registered-operator boundary. Nested custom ops double the
+  dispatch tax; share the Python launcher between entrypoint ops instead of calling one op from
+  another.
+- A `define`/`impl` op has no autograd kernel: backprop through a direct call warns and produces
+  no gradient, so route all differentiable use through the `autograd.Function` wrapper.
+- `torch.library.opcheck` accepts `torch.ops.attn_gym.op.default`, so the validation workflow
+  below is unchanged.
 
 ## Public result contract
 
@@ -47,22 +86,79 @@ A registered operator's output structure and arity must agree with its schema. D
 returning a tensor and a tuple based on an argument. Represent optional outputs explicitly and match
 them in the fake implementation.
 
-## Opaque custom operator pattern
+## Opaque operator pattern (define/impl + autograd.Function)
+
+The repo standard for opaque kernel boundaries. Write the schema string yourself; nothing is
+inferred from annotations:
 
 ```python
 import torch
 from torch import Tensor
 
+torch.library.define(
+    "attn_gym::example_fwd",
+    "(Tensor query, Tensor key, Tensor value, Tensor? initial_state) -> (Tensor, Tensor)",
+)
+torch.library.define("attn_gym::example_bwd", "(Tensor query, Tensor grad_output) -> Tensor")
 
-@torch.library.custom_op("attn_gym::example_forward", mutates_args=())
-def example_forward(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-    return launch_backend(query, key, value)
+
+def _example_fwd_cuda(
+    query: Tensor, key: Tensor, value: Tensor, initial_state: Tensor | None
+) -> tuple[Tensor, Tensor]:
+    return launch_backend(query, key, value, initial_state)
 
 
-@example_forward.register_fake
-def example_forward_fake(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-    return torch.empty_like(value)
+# Register with an explicit call, not as a decorator: the decorator form returns None,
+# and keeping the launcher callable lets benchmarks and tests bypass the boundary.
+torch.library.impl("attn_gym::example_fwd", "CUDA", _example_fwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::example_fwd")
+def _example_fwd_fake(
+    query: Tensor, key: Tensor, value: Tensor, initial_state: Tensor | None
+) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(value), query.new_empty(query.shape[:2])
+
+
+_example_fwd = torch.ops.attn_gym.example_fwd.default
+_example_bwd = torch.ops.attn_gym.example_bwd.default  # impl/fake registered the same way
+
+
+class _Example(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        output, state = _example_fwd(query, key, value, None)
+        ctx.save_for_backward(query)
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: Tensor):
+        (query,) = ctx.saved_tensors
+        return _example_bwd(query, grad_output), None, None
 ```
+
+Schema rules:
+
+- Optional tensors are `Tensor?`; scalars are `int`, `float`, `bool`; defaults may be embedded
+  (`Tensor? cu_seqlens=None`).
+- Encode mutation explicitly with alias annotations: `(Tensor(a!) state, Tensor value) -> ()`.
+- The schema language is a superset of what `custom_op` annotation inference accepts, adding
+  e.g. `ScalarType`, `Layout`, `MemoryFormat`, `Generator`, `SymInt`, and `int[2]`. Neither flow
+  accepts arbitrary Python objects, dataclasses, or callables; flatten configs to scalars or
+  specialize per-config outside the op.
+- Optional *outputs* parse as `Tensor?` but the compile stack handles `None` returns
+  unreliably, and a sentinel empty tensor forces empty-tensor plumbing on every caller. For
+  "N or N+1 returns depending on a flag", define two fixed-arity schemas sharing one launcher
+  (see `kda_chunk_fwd` / `kda_chunk_fwd_with_state`) and let the `autograd.Function` branch on
+  the flag; its output arity is free to vary. A future "flexible custom ops" feature may lift
+  this, but it does not work with `torch.compile` yet.
+- Tensors needed only by the backward (autograd tapes, packing metadata) should be op outputs
+  saved by the `autograd.Function` via `ctx.save_for_backward`, not part of the wrapper's
+  user-facing return. Unlike `register_autograd`, the Function is not limited to saving
+  user-visible outputs.
+- Bind `torch.ops.attn_gym.<op>.default` to a module-level name and call that; resolving the
+  `torch.ops` attribute chain per call adds overhead.
 
 The fake implementation describes output metadata without running the kernel. It must:
 
@@ -80,15 +176,10 @@ optional kernel dependencies lazily.
 
 ### Mutation and aliasing
 
-Declare every mutated argument:
+Declare every mutated argument in the schema string:
 
 ```python
-@torch.library.custom_op(
-    "attn_gym::update_state",
-    mutates_args={"state"},
-)
-def update_state(state: Tensor, value: Tensor) -> None:
-    launch_state_update(state, value)
+torch.library.define("attn_gym::update_state", "(Tensor(a!) state, Tensor value) -> ()")
 ```
 
 Do not declare an operator functional if its launcher writes into an input, including recurrent
@@ -96,25 +187,21 @@ state, cache, workspace, or output buffers. Prefer functional operators when pra
 
 ### Autograd
 
-Training backends must register an autograd formula:
+Training backends attach autograd with a `torch.autograd.Function` outside the registered ops, as
+in the pattern above: `forward` calls the forward op (autograd is already disabled inside
+`Function.forward`, so no redispatch guard is needed), `backward` calls the backward op, and the
+public API routes through `Function.apply`. Notes:
 
-```python
-def setup_context(ctx, inputs, output):
-    query, key, value = inputs
-    ctx.save_for_backward(query, key, value)
-
-
-def backward(ctx, grad_output):
-    query, key, value = ctx.saved_tensors
-    return backward_formula(query, key, value, grad_output)
-
-
-example_forward.register_autograd(backward, setup_context=setup_context)
-```
-
-The backward formula must itself use operations understood by PyTorch. Return one gradient entry per
-forward input and `None` for nondifferentiable inputs. If training is unsupported, reject
-requiring-gradient inputs clearly instead of silently detaching them.
+- Mark first-order-only backwards with `@torch.autograd.function.once_differentiable`.
+- Return one gradient entry per forward input and `None` for nondifferentiable inputs.
+- Use `ctx.mark_non_differentiable(...)` for auxiliary outputs and
+  `ctx.set_materialize_grads(False)` when the backward handles `None` grads.
+- The raw forward op is not differentiable; direct `torch.ops` calls that backprop through it
+  warn and produce no gradient. Route all differentiable use through the wrapper.
+- Do not use `CustomOpDef.register_autograd` (slowest measured path) or an Autograd dispatch-key
+  kernel (taxes every inference call) unless raw op calls must be differentiable.
+- If training is unsupported, reject requiring-gradient inputs clearly instead of silently
+  detaching them.
 
 ## Compiler-visible Triton pattern
 

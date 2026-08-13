@@ -10,13 +10,18 @@ from torch._inductor.lowering import make_pointwise, register_lowering
 from torch._inductor.virtualized import ops
 from torch.nn.attention.flex_attention import _score_mod_signature
 
+torch.library.define("approx::tanh", "(Tensor inp) -> Tensor")
 
-@torch.library.custom_op("approx::tanh", mutates_args=())
-def _tanh_approx(inp: Tensor) -> Tensor:
+
+def _tanh_approx_impl(inp: Tensor) -> Tensor:
     return torch.tanh(inp)
 
 
-@_tanh_approx.register_fake
+# CompositeExplicitAutograd covers CPU and CUDA.
+torch.library.impl("approx::tanh", "CompositeExplicitAutograd", _tanh_approx_impl)
+
+
+@torch.library.register_fake("approx::tanh")
 def _(inp: torch.Tensor) -> torch.Tensor:
     return torch.tanh(inp)
 

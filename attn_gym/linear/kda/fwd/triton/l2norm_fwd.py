@@ -8,8 +8,8 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
 
-# A Triton pointer does not carry tensor shape or stride metadata. The custom-op boundary
-# keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
+# A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
+# boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
 
 
 @triton.autotune(
@@ -113,8 +113,10 @@ def l2norm_fwd_kernel(
     )
 
 
-@torch.library.custom_op("attn_gym::kda_l2norm_fwd", mutates_args=())
-def _l2norm_fwd_custom_op(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+torch.library.define("attn_gym::kda_l2norm_fwd", "(Tensor x, float eps) -> (Tensor, Tensor)")
+
+
+def _l2norm_fwd_cuda(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch L2Norm using runtime shape and stride metadata."""
     _, tokens, heads, head_dim = x.shape
     # Compact outputs enumerate rows in the same batch-token-head order reconstructed by
@@ -142,7 +144,10 @@ def _l2norm_fwd_custom_op(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, to
     return output.view_as(x), rstd
 
 
-@_l2norm_fwd_custom_op.register_fake
+torch.library.impl("attn_gym::kda_l2norm_fwd", "CUDA", _l2norm_fwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::kda_l2norm_fwd")
 def _l2norm_fwd_fake(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Describe compact output metadata without launching Triton."""
     del eps
@@ -153,8 +158,13 @@ def _l2norm_fwd_fake(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.T
     )
 
 
-@torch.library.custom_op("attn_gym::kda_l2norm_bwd", mutates_args=())
-def _l2norm_bwd_custom_op(
+torch.library.define(
+    "attn_gym::kda_l2norm_bwd",
+    "(Tensor output, Tensor rstd, Tensor d_output) -> Tensor",
+)
+
+
+def _l2norm_bwd_cuda(
     output: torch.Tensor,
     rstd: torch.Tensor,
     d_output: torch.Tensor,
@@ -186,7 +196,10 @@ def _l2norm_bwd_custom_op(
     return d_input
 
 
-@_l2norm_bwd_custom_op.register_fake
+torch.library.impl("attn_gym::kda_l2norm_bwd", "CUDA", _l2norm_bwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::kda_l2norm_bwd")
 def _l2norm_bwd_fake(
     output: torch.Tensor,
     rstd: torch.Tensor,
@@ -197,10 +210,14 @@ def _l2norm_bwd_fake(
     return torch.empty_like(output)
 
 
+_l2norm_fwd_op = torch.ops.attn_gym.kda_l2norm_fwd.default
+_l2norm_bwd_op = torch.ops.attn_gym.kda_l2norm_bwd.default
+
+
 class _L2Norm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, eps: float) -> torch.Tensor:
-        output, rstd = _l2norm_fwd_custom_op(x, eps)
+        output, rstd = _l2norm_fwd_op(x, eps)
         ctx.save_for_backward(output.view(-1, x.shape[-1]), rstd)
         ctx.input_shape = x.shape
         return output
@@ -209,7 +226,7 @@ class _L2Norm(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_output: torch.Tensor):
         output, rstd = ctx.saved_tensors
-        d_input = _l2norm_bwd_custom_op(output, rstd, d_output)
+        d_input = _l2norm_bwd_op(output, rstd, d_output)
         return d_input.view(ctx.input_shape), None
 
 

@@ -216,8 +216,23 @@ def _chunk_kda_fwd(
     )
 
 
-@torch.library.custom_op("attn_gym::kda_chunk_fwd", mutates_args=())
-def _chunk_kda_fwd_custom_op(
+# Fixed-arity schema pair instead of an optional final-state output. Tapes and packing
+# metadata are op outputs only so the autograd.Function can save them.
+_FWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
+    "Tensor? initial_state, Tensor? cu_seqlens, bool profile_ranges)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd",
+    f"{_FWD_ARGS} -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd_with_state",
+    f"{_FWD_ARGS} -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+
+
+def _chunk_kda_fwd_shared(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -226,22 +241,12 @@ def _chunk_kda_fwd_custom_op(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     output_final_state: bool,
-    fastmath: bool,
     profile_ranges: bool,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+):
     """Keep the complete composed forward behind one compiler-opaque boundary."""
-    del fastmath  # This static option configures the registered backward.
     q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
-    output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd(
+    return _chunk_kda_fwd(
         q,
         k,
         v,
@@ -252,12 +257,9 @@ def _chunk_kda_fwd_custom_op(
         output_final_state=output_final_state,
         profile_ranges=profile_ranges,
     )
-    state = final_state if final_state is not None else q.new_empty((0,), dtype=torch.float32)
-    return output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks
 
 
-@_chunk_kda_fwd_custom_op.register_fake
-def _chunk_kda_fwd_fake(
+def _chunk_kda_fwd_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -265,8 +267,37 @@ def _chunk_kda_fwd_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
-    output_final_state: bool,
-    fastmath: bool,
+    profile_ranges: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    output, _final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd_shared(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        False,
+        profile_ranges,
+    )
+    return output, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks
+
+
+def _chunk_kda_fwd_with_state_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     profile_ranges: bool,
 ) -> tuple[
     torch.Tensor,
@@ -277,20 +308,31 @@ def _chunk_kda_fwd_fake(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Describe the composed forward outputs without invoking a launcher."""
-    del k, cumulative_gate, beta, initial_state, fastmath, profile_ranges
-    batch, tokens, heads, head_dim = q.shape
-    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    state = (
-        q.new_empty((state_batch, heads, head_dim, v.shape[-1]), dtype=torch.float32)
-        if output_final_state
-        else q.new_empty((0,), dtype=torch.float32)
+    output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd_shared(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        True,
+        profile_ranges,
     )
+    return output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks
+
+
+torch.library.impl("attn_gym::kda_chunk_fwd", "CUDA", _chunk_kda_fwd_cuda)
+torch.library.impl("attn_gym::kda_chunk_fwd_with_state", "CUDA", _chunk_kda_fwd_with_state_cuda)
+
+
+def _fwd_fake_common(q, v, cu_seqlens):
+    """Describe the composed forward outputs shared by both schemas."""
+    batch, tokens, heads, _head_dim = q.shape
     tape_shape = (batch, tokens, heads, _CHUNK_SIZE)
     chunks = tokens // _CHUNK_SIZE
     return (
         v.new_empty(v.shape),
-        state,
         q.new_empty(tape_shape),
         q.new_empty(tape_shape),
         q.new_empty((0 if cu_seqlens is not None else 2,), dtype=torch.int32),
@@ -299,8 +341,60 @@ def _chunk_kda_fwd_fake(
     )
 
 
-@torch.library.custom_op("attn_gym::kda_chunk_bwd", mutates_args=())
-def _chunk_kda_bwd_custom_op(
+@torch.library.register_fake("attn_gym::kda_chunk_fwd")
+def _chunk_kda_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    profile_ranges: bool,
+):
+    del k, cumulative_gate, beta, initial_state, profile_ranges
+    return _fwd_fake_common(q, v, cu_seqlens)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd_with_state")
+def _chunk_kda_fwd_with_state_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    profile_ranges: bool,
+):
+    del k, cumulative_gate, beta, initial_state, profile_ranges
+    batch, _tokens, heads, head_dim = q.shape
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    output, Aqk, Akk, cu, chunk_indices, num_chunks = _fwd_fake_common(q, v, cu_seqlens)
+    state = q.new_empty((state_batch, heads, head_dim, v.shape[-1]), dtype=torch.float32)
+    return output, state, Aqk, Akk, cu, chunk_indices, num_chunks
+
+
+# Fixed-arity schema pair instead of an optional initial-state-gradient output.
+_BWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
+    "Tensor Akk, Tensor cu_seqlens, Tensor chunk_indices, Tensor num_chunks, "
+    "Tensor? d_output, Tensor? d_final_state, {initial_state}, bool fastmath, "
+    "bool profile_ranges)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd",
+    _BWD_ARGS.format(initial_state="Tensor? initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd_with_state_grad",
+    _BWD_ARGS.format(initial_state="Tensor initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+
+
+def _chunk_kda_bwd_shared(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -316,7 +410,7 @@ def _chunk_kda_bwd_custom_op(
     initial_state: torch.Tensor | None,
     fastmath: bool,
     profile_ranges: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+):
     """Keep the complete first-order composed backward opaque to AOTAutograd."""
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
 
@@ -324,7 +418,7 @@ def _chunk_kda_bwd_custom_op(
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     if d_output is None:
         d_output = v.new_zeros(v.shape)
-    dq, dk, dv, dg, db, d_initial_state = chunk_kda_bwd(
+    return chunk_kda_bwd(
         q,
         k,
         v,
@@ -339,14 +433,49 @@ def _chunk_kda_bwd_custom_op(
         fastmath=fastmath,
         profile_ranges=profile_ranges,
     )
-    initial_state_gradient = (
-        d_initial_state if d_initial_state is not None else q.new_empty((0,), dtype=torch.float32)
+
+
+def _chunk_kda_bwd_cuda(*args) -> tuple[torch.Tensor, ...]:
+    dq, dk, dv, dg, db, _d_initial_state = _chunk_kda_bwd_shared(*args)
+    return dq, dk, dv, dg, db
+
+
+def _chunk_kda_bwd_with_state_grad_cuda(*args) -> tuple[torch.Tensor, ...]:
+    return _chunk_kda_bwd_shared(*args)
+
+
+torch.library.impl("attn_gym::kda_chunk_bwd", "CUDA", _chunk_kda_bwd_cuda)
+torch.library.impl(
+    "attn_gym::kda_chunk_bwd_with_state_grad", "CUDA", _chunk_kda_bwd_with_state_grad_cuda
+)
+
+
+def _bwd_fake_common(q, k, v, cumulative_gate, beta):
+    """Describe backward output metadata without invoking a launcher."""
+    return (
+        q.new_empty(q.shape),
+        k.new_empty(k.shape),
+        v.new_empty(v.shape),
+        cumulative_gate.new_empty(cumulative_gate.shape),
+        beta.new_empty(beta.shape),
     )
-    return dq, dk, dv, dg, db, initial_state_gradient
 
 
-@_chunk_kda_bwd_custom_op.register_fake
+@torch.library.register_fake("attn_gym::kda_chunk_bwd")
 def _chunk_kda_bwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    *args,
+):
+    del args
+    return _bwd_fake_common(q, k, v, cumulative_gate, beta)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_bwd_with_state_grad")
+def _chunk_kda_bwd_with_state_grad_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -359,133 +488,124 @@ def _chunk_kda_bwd_fake(
     num_chunks: torch.Tensor,
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
-    initial_state: torch.Tensor | None,
+    initial_state: torch.Tensor,
     fastmath: bool,
     profile_ranges: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Describe backward output metadata without invoking a launcher."""
-    del (
-        Aqk,
-        Akk,
-        cu_seqlens,
-        chunk_indices,
-        num_chunks,
-        d_output,
-        d_final_state,
-        fastmath,
-        profile_ranges,
-    )
-    d_initial_state = (
-        torch.empty_like(initial_state)
-        if initial_state is not None
-        else q.new_empty((0,), dtype=torch.float32)
-    )
-    return (
-        q.new_empty(q.shape),
-        k.new_empty(k.shape),
-        v.new_empty(v.shape),
-        cumulative_gate.new_empty(cumulative_gate.shape),
-        beta.new_empty(beta.shape),
-        d_initial_state,
-    )
+):
+    del Aqk, Akk, cu_seqlens, chunk_indices, num_chunks, d_output, d_final_state
+    del fastmath, profile_ranges
+    return (*_bwd_fake_common(q, k, v, cumulative_gate, beta), torch.empty_like(initial_state))
 
 
-def _setup_chunk_kda_context(ctx, inputs, output) -> None:
-    (
+_chunk_kda_fwd_op = torch.ops.attn_gym.kda_chunk_fwd.default
+_chunk_kda_fwd_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_with_state.default
+_chunk_kda_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
+_chunk_kda_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
+
+
+class _ChunkKDA(torch.autograd.Function):
+    """First-order autograd wrapper around the opaque composed forward and backward ops.
+
+    The forward returns ``output`` alone or ``(output, final_state)``; the autograd tapes
+    and packing metadata are saved as intermediates rather than exposed as outputs.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
         q,
         k,
         v,
         cumulative_gate,
         beta,
         initial_state,
-        _input_cu_seqlens,
+        cu_seqlens,
         output_final_state,
         fastmath,
         profile_ranges,
-    ) = inputs
-    _output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = output
-    backward_cu_seqlens = cu_seqlens if _input_cu_seqlens is None else _input_cu_seqlens
-    ctx.save_for_backward(
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        Aqk,
-        Akk,
-        initial_state,
-        backward_cu_seqlens,
-        chunk_indices,
-        num_chunks,
-    )
-    ctx.has_initial_state = initial_state is not None
-    ctx.fastmath = fastmath
-    ctx.profile_ranges = profile_ranges
-    ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(Aqk, Akk)
-    if not output_final_state:
-        ctx.mark_non_differentiable(state)
+    ):
+        if output_final_state:
+            output, state, Aqk, Akk, fwd_cu_seqlens, chunk_indices, num_chunks = (
+                _chunk_kda_fwd_with_state_op(
+                    q, k, v, cumulative_gate, beta, initial_state, cu_seqlens, profile_ranges
+                )
+            )
+        else:
+            output, Aqk, Akk, fwd_cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd_op(
+                q, k, v, cumulative_gate, beta, initial_state, cu_seqlens, profile_ranges
+            )
+        backward_cu_seqlens = fwd_cu_seqlens if cu_seqlens is None else cu_seqlens
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            Aqk,
+            Akk,
+            initial_state,
+            backward_cu_seqlens,
+            chunk_indices,
+            num_chunks,
+        )
+        ctx.has_initial_state = initial_state is not None
+        ctx.fastmath = fastmath
+        ctx.profile_ranges = profile_ranges
+        ctx.set_materialize_grads(False)
+        if output_final_state:
+            return output, state
+        return output
 
-
-@torch.autograd.function.once_differentiable
-def _chunk_kda_backward(
-    ctx,
-    d_output,
-    d_final_state,
-    _dAqk,
-    _dAkk,
-    _d_cu_seqlens,
-    _d_chunk_indices,
-    _d_num_chunks,
-):
-    (
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        Aqk,
-        Akk,
-        initial_state,
-        cu_seqlens,
-        chunk_indices,
-        num_chunks,
-    ) = ctx.saved_tensors
-    dq, dk, dv, dg, db, d_initial_state = _chunk_kda_bwd_custom_op(
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        Aqk,
-        Akk,
-        cu_seqlens,
-        chunk_indices,
-        num_chunks,
-        d_output,
-        d_final_state,
-        initial_state,
-        ctx.fastmath,
-        ctx.profile_ranges,
-    )
-    return (
-        dq,
-        dk,
-        dv,
-        dg,
-        db,
-        d_initial_state if ctx.has_initial_state else None,
-        None,
-        None,
-        None,
-        None,
-    )
-
-
-_chunk_kda_fwd_custom_op.register_autograd(
-    _chunk_kda_backward,
-    setup_context=_setup_chunk_kda_context,
-)
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, d_output, d_final_state=None):
+        (
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            Aqk,
+            Akk,
+            initial_state,
+            cu_seqlens,
+            chunk_indices,
+            num_chunks,
+        ) = ctx.saved_tensors
+        args = (
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            Aqk,
+            Akk,
+            cu_seqlens,
+            chunk_indices,
+            num_chunks,
+            d_output,
+            d_final_state,
+            initial_state,
+            ctx.fastmath,
+            ctx.profile_ranges,
+        )
+        if ctx.has_initial_state:
+            dq, dk, dv, dg, db, d_initial_state = _chunk_kda_bwd_with_state_grad_op(*args)
+        else:
+            dq, dk, dv, dg, db = _chunk_kda_bwd_op(*args)
+            d_initial_state = None
+        return (
+            dq,
+            dk,
+            dv,
+            dg,
+            db,
+            d_initial_state,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def chunk_kda(
@@ -525,21 +645,34 @@ def chunk_kda(
         )
         beta = beta.reshape(1, batch * tokens, heads)
         cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
-    output, state, _Aqk, _Akk, _cu_seqlens, _chunk_indices, _num_chunks = _chunk_kda_fwd_custom_op(
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        initial_state,
-        cu_seqlens,
-        output_final_state,
-        fastmath,
-        profile_ranges,
-    )
-    return output.reshape(batch, tokens, heads, head_dim).to(output_dtype), (
-        state if output_final_state else None
-    )
+    if output_final_state:
+        output, state = _ChunkKDA.apply(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            True,
+            fastmath,
+            profile_ranges,
+        )
+    else:
+        output = _ChunkKDA.apply(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            False,
+            fastmath,
+            profile_ranges,
+        )
+        state = None
+    return output.reshape(batch, tokens, heads, head_dim).to(output_dtype), state
 
 
 __all__ = ["chunk_kda"]

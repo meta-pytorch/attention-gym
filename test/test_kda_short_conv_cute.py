@@ -12,11 +12,12 @@ import attn_gym.linear.kda.short_conv.cute as cute_backend
 from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
-    _backward_custom_op,
+    _backward_op,
     _candidate_configs,
-    _configured_backward_custom_op,
-    _configured_forward_custom_op,
-    _forward_custom_op,
+    _configured_backward_op,
+    _configured_backward_with_state_grad_op,
+    _configured_forward_op,
+    _forward_op,
     cute_causal_conv1d_silu,
     tune_causal_conv1d_silu,
 )
@@ -840,24 +841,27 @@ def test_short_conv_explicit_config_and_tuning_flow():
 @pytest.mark.parametrize("packed", [False, True])
 def test_short_conv_custom_op_registration(packed: bool):
     """Exercise dense and packed schemas, fake implementations, and autograd."""
+    # The raw ops have no autograd kernel; differentiable use goes through the
+    # autograd.Function wrappers, so opcheck runs on detached inputs.
     x, weight = _inputs(batch=1 if packed else 2)
+    x, weight = x.detach(), weight.detach()
     grad_output = torch.randn_like(x)
     cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32) if packed else None
-    torch.library.opcheck(_forward_custom_op, (x, weight, cu_seqlens))
+    torch.library.opcheck(_forward_op, (x, weight, cu_seqlens))
     torch.library.opcheck(
-        _backward_custom_op,
+        _backward_op,
         (x, weight, grad_output, cu_seqlens),
         test_utils=("test_schema", "test_faketensor"),
     )
     if packed:
         configs = (128, 4, 8, 128, 4, 10, 128, 4, 128)
         torch.library.opcheck(
-            _configured_forward_custom_op,
+            _configured_forward_op,
             (x, weight, cu_seqlens, None, *configs),
         )
         torch.library.opcheck(
-            _configured_backward_custom_op,
-            (x, weight, grad_output, cu_seqlens, None, False, *configs[3:]),
+            _configured_backward_op,
+            (x, weight, grad_output, cu_seqlens, None, *configs[3:]),
             test_utils=("test_schema", "test_faketensor"),
         )
 
@@ -865,6 +869,7 @@ def test_short_conv_custom_op_registration(packed: bool):
 def test_short_conv_stateful_custom_op_registration():
     """Exercise packed schemas, fake tensors, and autograd with caller-provided history."""
     x, weight = _inputs()
+    x, weight = x.detach(), weight.detach()
     cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32)
     num_sequences = cu_seqlens.shape[0] - 1
     initial_state = torch.randn(
@@ -873,14 +878,18 @@ def test_short_conv_stateful_custom_op_registration():
         x.shape[2],
         device="cuda",
         dtype=torch.bfloat16,
-        requires_grad=True,
     )
     grad_output = torch.randn_like(x)
-    torch.library.opcheck(_forward_custom_op, (x, weight, cu_seqlens, initial_state))
+    torch.library.opcheck(_forward_op, (x, weight, cu_seqlens, initial_state))
     config = (128, 4, 10, 128, 4, 128)
     torch.library.opcheck(
-        _configured_backward_custom_op,
-        (x, weight, grad_output, cu_seqlens, initial_state, True, *config),
+        _configured_backward_op,
+        (x, weight, grad_output, cu_seqlens, initial_state, *config),
+        test_utils=("test_schema", "test_faketensor"),
+    )
+    torch.library.opcheck(
+        _configured_backward_with_state_grad_op,
+        (x, weight, grad_output, cu_seqlens, initial_state, *config),
         test_utils=("test_schema", "test_faketensor"),
     )
 
@@ -1056,14 +1065,14 @@ def test_short_conv_cuda_graph_replay():
     """Capture the compiled launchers and replay with changed input values."""
     x, weight = _inputs()
     grad_output = torch.randn_like(x)
-    _forward_custom_op(x, weight)
-    _backward_custom_op(x, weight, grad_output)
+    _forward_op(x, weight)
+    _backward_op(x, weight, grad_output)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _forward_custom_op(x, weight)
-        captured_gradients = _backward_custom_op(x, weight, grad_output)
+        captured_output = _forward_op(x, weight)
+        captured_gradients = _backward_op(x, weight, grad_output)
 
     graph.replay()
     first_output = captured_output.clone()
@@ -1075,8 +1084,8 @@ def test_short_conv_cuda_graph_replay():
 
     assert not torch.equal(captured_output, first_output)
     assert not torch.equal(captured_gradients[0], first_gradients[0])
-    expected_output = _forward_custom_op(x, weight)
-    expected_gradients = _backward_custom_op(x, weight, grad_output)
+    expected_output = _forward_op(x, weight)
+    expected_gradients = _backward_op(x, weight, grad_output)
     torch.testing.assert_close(captured_output, expected_output)
     torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
@@ -1095,17 +1104,17 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
         dtype=torch.bfloat16,
     )
     config = (128, 4, 10, 128, 4, 128)
-    _forward_custom_op(x, weight, cu_seqlens, initial_state)
-    _configured_backward_custom_op(
-        x, weight, grad_output, cu_seqlens, initial_state, True, *config
+    _forward_op(x, weight, cu_seqlens, initial_state)
+    _configured_backward_with_state_grad_op(
+        x, weight, grad_output, cu_seqlens, initial_state, *config
     )
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _forward_custom_op(x, weight, cu_seqlens, initial_state)
-        captured_gradients = _configured_backward_custom_op(
-            x, weight, grad_output, cu_seqlens, initial_state, True, *config
+        captured_output = _forward_op(x, weight, cu_seqlens, initial_state)
+        captured_gradients = _configured_backward_with_state_grad_op(
+            x, weight, grad_output, cu_seqlens, initial_state, *config
         )
 
     with torch.no_grad():
@@ -1114,9 +1123,9 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_output = _forward_custom_op(x, weight, cu_seqlens, initial_state)
-    expected_gradients = _configured_backward_custom_op(
-        x, weight, grad_output, cu_seqlens, initial_state, True, *config
+    expected_output = _forward_op(x, weight, cu_seqlens, initial_state)
+    expected_gradients = _configured_backward_with_state_grad_op(
+        x, weight, grad_output, cu_seqlens, initial_state, *config
     )
     torch.testing.assert_close(captured_output, expected_output)
     for actual_gradient, expected_gradient in zip(
@@ -1152,15 +1161,15 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         defaults.weight_gradient.channels_per_thread,
         defaults.weight_gradient.times_per_block,
     )
-    _configured_backward_custom_op(
-        x, weight, grad_output, cu_seqlens, initial_state, True, *config
+    _configured_backward_with_state_grad_op(
+        x, weight, grad_output, cu_seqlens, initial_state, *config
     )
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_gradients = _configured_backward_custom_op(
-            x, weight, grad_output, cu_seqlens, initial_state, True, *config
+        captured_gradients = _configured_backward_with_state_grad_op(
+            x, weight, grad_output, cu_seqlens, initial_state, *config
         )
 
     first_gradients = tuple(gradient.clone() for gradient in captured_gradients)
@@ -1174,8 +1183,8 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
 
     assert not torch.equal(captured_gradients[0], first_gradients[0])
     assert not torch.equal(captured_gradients[1], first_gradients[1])
-    expected_gradients = _configured_backward_custom_op(
-        x, weight, grad_output, cu_seqlens, initial_state, True, *config
+    expected_gradients = _configured_backward_with_state_grad_op(
+        x, weight, grad_output, cu_seqlens, initial_state, *config
     )
     for actual_gradient, expected_gradient in zip(
         captured_gradients,
