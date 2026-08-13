@@ -1715,6 +1715,8 @@ def recompute_w_u_fwd(
     cu_seqlens = metadata.cu_seqlens
     ragged = isinstance(metadata, RaggedChunkMetadata)
     chunk_routing = metadata.chunk_offsets if ragged else metadata.chunk_indices
+    # The ragged specialization reads its active count from chunk_offsets[-1].
+    # Keep this compile-time-dead ABI placeholder 128-byte aligned for CuTe.
     num_chunks = metadata.chunk_offsets[:1] if ragged else metadata.num_chunks
     if not ragged:
         assert T % BT == 0, f"recompute_w_u_fwd requires T % BT == 0 (T={T}, BT={BT})"

@@ -2212,6 +2212,8 @@ def chunk_kda_bwd_intra(
 
     capacity = metadata.capacity if ragged else metadata.chunk_indices.shape[0]
     chunk_routing = metadata.chunk_offsets if ragged else metadata.chunk_indices
+    # The ragged specialization reads its active count from chunk_offsets[-1].
+    # Keep this compile-time-dead ABI placeholder 128-byte aligned for CuTe.
     num_chunks = metadata.chunk_offsets[:1] if ragged else metadata.num_chunks
 
     # The kernel combines the incoming gradients with its intra-chunk contribution into

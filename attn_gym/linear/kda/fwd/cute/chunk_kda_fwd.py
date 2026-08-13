@@ -657,7 +657,7 @@ def _chunk_kda_ragged_backward(
         cu_seqlens,
         chunk_offsets,
     ) = ctx.saved_tensors
-    unused_num_chunks = chunk_offsets.new_empty(())
+    active_chunks = chunk_offsets[-1:]
     dq, dk, dv, dg, db, d_initial_state = _chunk_kda_bwd_custom_op(
         q,
         k,
@@ -668,7 +668,7 @@ def _chunk_kda_ragged_backward(
         Akk,
         cu_seqlens,
         chunk_offsets,
-        unused_num_chunks,
+        active_chunks,
         d_output,
         d_final_state,
         initial_state,

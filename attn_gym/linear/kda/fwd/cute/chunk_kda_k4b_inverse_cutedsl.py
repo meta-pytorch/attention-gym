@@ -331,75 +331,34 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         od_base_row = chunk_idx * self.num_offdiag_blocks
 
         if is_active and warp_idx == 0:
-            if cutlass.const_expr(self.ragged):
-                acc_od0.fill(0.0)
-                acc_od1.fill(0.0)
-                acc_od2.fill(0.0)
-                acc_od3.fill(0.0)
-                acc_od4.fill(0.0)
-                acc_od5.fill(0.0)
-                if is_active:
-                    for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                        row = tCcC[i][0]
-                        col = tCcC[i][1]
-                        rc = head_idx * self.BC * self.BC + row * self.BC + col
-                        acc_od0[i] = mAkkOD[od_base_row + 0, rc]
-                        acc_od1[i] = mAkkOD[od_base_row + 1, rc]
-                        acc_od2[i] = mAkkOD[od_base_row + 2, rc]
-                        acc_od3[i] = mAkkOD[od_base_row + 3, rc]
-                        acc_od4[i] = mAkkOD[od_base_row + 4, rc]
-                        acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            else:
-                for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                    row = tCcC[i][0]
-                    col = tCcC[i][1]
-                    rc = head_idx * self.BC * self.BC + row * self.BC + col
-                    acc_od0[i] = mAkkOD[od_base_row + 0, rc]
-                    acc_od1[i] = mAkkOD[od_base_row + 1, rc]
-                    acc_od2[i] = mAkkOD[od_base_row + 2, rc]
-                    acc_od3[i] = mAkkOD[od_base_row + 3, rc]
-                    acc_od4[i] = mAkkOD[od_base_row + 4, rc]
-                    acc_od5[i] = mAkkOD[od_base_row + 5, rc]
+            for i in cutlass.range_constexpr(cute.size(acc_od0)):
+                row = tCcC[i][0]
+                col = tCcC[i][1]
+                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                acc_od0[i] = mAkkOD[od_base_row + 0, rc]
+                acc_od1[i] = mAkkOD[od_base_row + 1, rc]
+                acc_od2[i] = mAkkOD[od_base_row + 2, rc]
+                acc_od3[i] = mAkkOD[od_base_row + 3, rc]
+                acc_od4[i] = mAkkOD[od_base_row + 4, rc]
+                acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi0, i_tc0, lane_idx, h_akkd_col, vr0)
 
         if is_active and warp_idx == 1:
-            if cutlass.const_expr(self.ragged):
-                acc_od2.fill(0.0)
-                acc_od4.fill(0.0)
-                acc_od5.fill(0.0)
-                if is_active:
-                    for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                        row = tCcC[i][0]
-                        col = tCcC[i][1]
-                        rc = head_idx * self.BC * self.BC + row * self.BC + col
-                        acc_od2[i] = mAkkOD[od_base_row + 2, rc]
-                        acc_od4[i] = mAkkOD[od_base_row + 4, rc]
-                        acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            else:
-                for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                    row = tCcC[i][0]
-                    col = tCcC[i][1]
-                    rc = head_idx * self.BC * self.BC + row * self.BC + col
-                    acc_od2[i] = mAkkOD[od_base_row + 2, rc]
-                    acc_od4[i] = mAkkOD[od_base_row + 4, rc]
-                    acc_od5[i] = mAkkOD[od_base_row + 5, rc]
+            for i in cutlass.range_constexpr(cute.size(acc_od0)):
+                row = tCcC[i][0]
+                col = tCcC[i][1]
+                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                acc_od2[i] = mAkkOD[od_base_row + 2, rc]
+                acc_od4[i] = mAkkOD[od_base_row + 4, rc]
+                acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi1, i_tc1, lane_idx, h_akkd_col, vr1)
 
         if is_active and warp_idx == 2:
-            if cutlass.const_expr(self.ragged):
-                acc_od5.fill(0.0)
-                if is_active:
-                    for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                        row = tCcC[i][0]
-                        col = tCcC[i][1]
-                        rc = head_idx * self.BC * self.BC + row * self.BC + col
-                        acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            else:
-                for i in cutlass.range_constexpr(cute.size(acc_od0)):
-                    row = tCcC[i][0]
-                    col = tCcC[i][1]
-                    rc = head_idx * self.BC * self.BC + row * self.BC + col
-                    acc_od5[i] = mAkkOD[od_base_row + 5, rc]
+            for i in cutlass.range_constexpr(cute.size(acc_od0)):
+                row = tCcC[i][0]
+                col = tCcC[i][1]
+                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi2, i_tc2, lane_idx, h_akkd_col, vr2)
 
         if is_active and warp_idx == 3:
