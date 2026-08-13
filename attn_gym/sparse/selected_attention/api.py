@@ -144,7 +144,7 @@ def selected_attention(
     local_kv: Tensor,
     sparse_kv: Tensor,
     kv_indices: Tensor,
-    attention_sink: Tensor | None = None,
+    attention_sink: Tensor | None,
     doc_ids: Tensor | None = None,
     sliding_window_size: int = 512,
     backend: str = "triton",

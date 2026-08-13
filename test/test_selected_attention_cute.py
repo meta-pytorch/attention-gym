@@ -101,9 +101,7 @@ def test_cute_precision_vs_fp64(
     local_kv_lp = randn_lp(batch, 1, seq_len, head_dim)
     sparse_kv_lp = randn_lp(batch, 1, sparse_seq_len, head_dim)
 
-    scores = torch.randn(
-        batch, seq_len, sparse_seq_len, dtype=dtype, device=device, generator=gen
-    )
+    scores = torch.randn(batch, seq_len, sparse_seq_len, dtype=dtype, device=device, generator=gen)
     _, kv_indices = torch.topk(scores, k=min(num_topk, sparse_seq_len), dim=-1)
 
     sink = None
