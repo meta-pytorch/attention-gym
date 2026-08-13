@@ -11,7 +11,9 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.utils import (
+    ChunkMetadata,
     autotune_cache_kwargs,
     exp,
     exp2,
@@ -797,11 +799,16 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,
     output_final_state: bool = True,
     cu_seqlens: torch.Tensor | None = None,
+    metadata: ChunkMetadata | RaggedChunkMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk KDA state recurrence."""
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
-    if tokens % chunk_size:
+    if metadata is not None:
+        if cu_seqlens is not None:
+            raise ValueError("pass either metadata or cu_seqlens, not both")
+        cu_seqlens = metadata.cu_seqlens
+    if tokens % chunk_size and not isinstance(metadata, RaggedChunkMetadata):
         raise ValueError(
             f"the inter-chunk state recurrence requires complete chunks, got T={tokens}"
         )
@@ -823,7 +830,9 @@ def chunk_gated_delta_rule_fwd_h(
             )
         initial_state = initial_state.contiguous()
 
-    chunks = tokens // chunk_size
+    chunks = (
+        metadata.capacity if isinstance(metadata, RaggedChunkMetadata) else tokens // chunk_size
+    )
     h = k.new_empty(batch, chunks, heads, key_dim, value_dim)
     v_new = torch.empty_like(u)
     final_state = (
@@ -846,7 +855,13 @@ def chunk_gated_delta_rule_fwd_h(
         h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
-        chunk_offsets=None if cu_seqlens is None else cu_seqlens // chunk_size,
+        chunk_offsets=(
+            metadata.chunk_offsets
+            if isinstance(metadata, RaggedChunkMetadata)
+            else None
+            if cu_seqlens is None
+            else cu_seqlens // chunk_size
+        ),
         num_seqs=None,
         T=tokens,
         H=heads,
