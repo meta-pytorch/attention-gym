@@ -61,6 +61,39 @@ def _clone_inputs(inputs):
     return tuple(tensor.detach().clone().requires_grad_(tensor.requires_grad) for tensor in inputs)
 
 
+def _packed_qkv_tensor(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Place Q, K, and V in one packed projection tensor."""
+    batch, tokens, heads, head_dim = q.shape
+    qkv = q.new_empty(batch, tokens, 3, heads, head_dim)
+    for index, tensor in enumerate((q, k, v)):
+        qkv[:, :, index].copy_(tensor.detach())
+    qkv.requires_grad_(q.requires_grad or k.requires_grad or v.requires_grad)
+    return qkv
+
+
+def _strided_qkv_views(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return sibling Q/K/V views of one packed projection."""
+    return _packed_qkv_tensor(q, k, v).unbind(2)
+
+
+def _unaligned_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Preserve compact logical strides while shifting the base by one element."""
+    storage = tensor.new_empty(tensor.numel() + 1)
+    view = storage[1:].view(tensor.shape)
+    view.copy_(tensor.detach())
+    storage.requires_grad_(tensor.requires_grad)
+    return view
+
+
+def _head_major_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Create a dense head-major view whose generated outputs must not inherit its strides."""
+    storage = tensor.detach().permute(0, 2, 1, 3).contiguous()
+    storage.requires_grad_(tensor.requires_grad)
+    return storage.permute(0, 2, 1, 3)
+
+
 def _assert_golden(
     actual: torch.Tensor,
     golden: torch.Tensor,
@@ -141,6 +174,102 @@ def test_optimized_chunk_kda_matches_reference():
         error = (actual_gradient.float() - expected_gradient).abs().max()
         tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
         assert error <= tolerance
+
+
+def test_optimized_chunk_kda_accepts_strided_packed_qkv_views():
+    """Read Q/K/V directly from one packed projection in forward and backward."""
+    torch.manual_seed(29)
+    q, k, v, cumulative_gate, beta = _inputs(tokens=128, heads=2)
+    q, k, v = _strided_qkv_views(q, k, v)
+    expected_stride = (128 * 3 * 2 * 128, 3 * 2 * 128, 128, 1)
+    assert all(tensor.stride() == expected_stride for tensor in (q, k, v))
+    assert not any(tensor.is_contiguous() for tensor in (q, k, v))
+    actual_inputs = (q, k, v, cumulative_gate, beta)
+    expected_inputs = _clone_inputs(actual_inputs)
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+
+    actual_output, actual_state = chunk_kda(
+        *actual_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    expected_output, expected_state = chunk_kda(
+        *expected_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    assert actual_state is not None and expected_state is not None
+    torch.testing.assert_close(actual_output, expected_output)
+    torch.testing.assert_close(actual_state, expected_state)
+
+    d_output = torch.randn_like(actual_output)
+    d_state = torch.randn_like(actual_state)
+    actual_gradients = torch.autograd.grad(
+        (actual_output, actual_state), actual_inputs, (d_output, d_state)
+    )
+    expected_gradients = torch.autograd.grad(
+        (expected_output, expected_state), expected_inputs, (d_output, d_state)
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_optimized_chunk_kda_accumulates_into_packed_qkv_backing():
+    """Map compact kernel gradients back through the packed QKV views."""
+    torch.manual_seed(41)
+    q, k, v, cumulative_gate, beta = _inputs(tokens=128, heads=2)
+    actual_qkv = _packed_qkv_tensor(q, k, v)
+    expected_qkv = actual_qkv.detach().clone().requires_grad_()
+    actual_q, actual_k, actual_v = actual_qkv.unbind(2)
+    expected_q, expected_k, expected_v = (tensor.contiguous() for tensor in expected_qkv.unbind(2))
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+
+    actual, _ = chunk_kda(
+        actual_q,
+        actual_k,
+        actual_v,
+        cumulative_gate,
+        beta,
+        cu_seqlens=cu_seqlens,
+    )
+    expected, _ = chunk_kda(
+        expected_q,
+        expected_k,
+        expected_v,
+        cumulative_gate,
+        beta,
+        cu_seqlens=cu_seqlens,
+    )
+    torch.testing.assert_close(actual, expected)
+    d_output = torch.randn_like(actual)
+    actual_gradient = torch.autograd.grad(actual, actual_qkv, d_output)[0]
+    expected_gradient = torch.autograd.grad(expected, expected_qkv, d_output)[0]
+    assert actual_gradient.is_contiguous()
+    torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_optimized_chunk_kda_compacts_unsupported_head_major_qkv_views():
+    """Keep compact internal output ABIs when inputs use a head-major layout."""
+    torch.manual_seed(37)
+    expected_inputs = _inputs(tokens=128, heads=2)
+    actual_inputs = list(_clone_inputs(expected_inputs))
+    actual_inputs[:3] = tuple(_head_major_view(tensor) for tensor in actual_inputs[:3])
+    actual_inputs = tuple(actual_inputs)
+    assert all(tensor.stride(-1) == 1 for tensor in actual_inputs[:3])
+    assert all(tensor.stride(-2) != tensor.shape[-1] for tensor in actual_inputs[:3])
+
+    expected, _ = chunk_kda(*expected_inputs)
+    actual, _ = chunk_kda(*actual_inputs)
+    torch.testing.assert_close(actual, expected)
+    d_output = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(expected, expected_inputs, d_output)
+    actual_gradients = torch.autograd.grad(actual, actual_inputs, d_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
 def test_optimized_chunk_kda_packed_matches_independent_sequences():
@@ -384,6 +513,7 @@ def test_chunk_kda_custom_op_registration():
     """Validate schema, fake tensors, autograd registration, and AOT dispatch."""
     torch.manual_seed(5)
     q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
+    q, k, v = _strided_qkv_views(q, k, v)
     torch.library.opcheck(
         _chunk_kda_fwd_custom_op,
         (
@@ -495,7 +625,10 @@ def test_chunk_kda_packed_fullgraph_forward_and_backward():
     """Keep packed metadata inside the strict compiled forward and backward graph."""
     torch.manual_seed(17)
     eager_inputs = _inputs(tokens=128, heads=2)
-    compiled_inputs = _clone_inputs(eager_inputs)
+    compiled_inputs = list(_clone_inputs(eager_inputs))
+    compiled_inputs[:3] = _strided_qkv_views(*eager_inputs[:3])
+    compiled_inputs = tuple(compiled_inputs)
+    assert not any(tensor.is_contiguous() for tensor in compiled_inputs[:3])
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
 
     def operation(*args):
@@ -511,6 +644,30 @@ def test_chunk_kda_packed_fullgraph_forward_and_backward():
         actual_gradients,
         expected_gradients,
         strict=True,
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_chunk_kda_fullgraph_unaligned_qkv_fallback():
+    """Apply the same runtime alignment fallback in eager and compiled execution."""
+    torch.manual_seed(31)
+    expected_inputs = _inputs(heads=2)
+    actual_inputs = list(_clone_inputs(expected_inputs))
+    actual_inputs[:3] = tuple(_unaligned_view(tensor) for tensor in actual_inputs[:3])
+    actual_inputs = tuple(actual_inputs)
+    assert all(tensor.data_ptr() % 16 == 2 for tensor in actual_inputs[:3])
+
+    def operation(*args):
+        return chunk_kda(*args)[0]
+
+    expected = operation(*expected_inputs)
+    actual = torch.compile(operation, fullgraph=True)(*actual_inputs)
+    torch.testing.assert_close(actual, expected)
+    d_output = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(expected, expected_inputs, d_output)
+    actual_gradients = torch.autograd.grad(actual, actual_inputs, d_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient)
 

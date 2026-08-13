@@ -19,7 +19,7 @@ import cutlass
 import torch
 import triton
 from cutlass import cute
-from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
@@ -83,16 +83,16 @@ def _compile_k3b(
         varlen=varlen,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
-    q = make_fake_compact_tensor(
+    q = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride_order=(1, 0),
+        stride=(cute.sym_int(divisibility=8), 1),
         assumed_align=16,
     )
-    k = make_fake_compact_tensor(
+    k = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride_order=(1, 0),
+        stride=(cute.sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     g = make_fake_compact_tensor(
@@ -267,8 +267,9 @@ def chunk_kda_fwd_inter_solve_cute(
     if isinstance(k, FakeTensor):
         return Aqk, Akk
 
-    q_flat = q.reshape(B * T, H * K).contiguous()
-    k_flat = k.reshape(B * T, H * K).contiguous()
+    # Q/K heads are compact, but token rows may retain a packed-projection pitch.
+    q_flat = q[0].reshape(T, H * K)
+    k_flat = k[0].reshape(T, H * K)
     g_flat = gk.reshape(B * T, H * K).contiguous()
     beta_flat = beta.reshape(B * T, H).contiguous()
     akkd_flat = Akkd.reshape(B * T, H * BC).contiguous()

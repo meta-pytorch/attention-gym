@@ -16,6 +16,8 @@ _SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
+_QKV_ALIGNMENT_BYTES = 16
+_QKV_ALIGNMENT_ELEMENTS = _QKV_ALIGNMENT_BYTES // 2
 
 
 def _validate_chunk_kda_inputs(
@@ -75,6 +77,24 @@ def _validate_chunk_kda_inputs(
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
 
+def _has_supported_qkv_layout(tensor: torch.Tensor) -> bool:
+    """Return whether QKV rows satisfy the vectorized kernel input contract."""
+    return (
+        tensor.stride(-1) == 1
+        and tensor.stride(-2) == tensor.shape[-1]
+        and all(stride % _QKV_ALIGNMENT_ELEMENTS == 0 for stride in tensor.stride()[:-1])
+        and tensor.data_ptr() % _QKV_ALIGNMENT_BYTES == 0
+    )
+
+
+def _normalize_qkv_layout(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy only layouts unsupported by one or more composed KDA stages."""
+    if _has_supported_qkv_layout(tensor):
+        return tensor
+    # contiguous() may return an unaligned, nonzero-offset tensor unchanged.
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
 def _validate_private_abi(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,17 +103,22 @@ def _validate_private_abi(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
 ) -> None:
-    tensors = (q, k, v, cumulative_gate, beta)
+    contiguous_tensors = (cumulative_gate, beta)
     if initial_state is not None:
-        tensors += (initial_state,)
+        contiguous_tensors += (initial_state,)
     if (q.dtype, k.dtype, v.dtype) != (torch.bfloat16,) * 3:
         raise TypeError("the private chunk_kda ABI requires bfloat16 q, k, and v")
     if cumulative_gate.dtype != torch.float32 or beta.dtype != torch.float32:
         raise TypeError("the private chunk_kda ABI requires float32 cumulative_gate and beta")
     if initial_state is not None and initial_state.dtype != torch.float32:
         raise TypeError("the private chunk_kda ABI requires a float32 initial_state")
-    if not all(tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("the private chunk_kda ABI requires contiguous inputs")
+    if not all(tensor.is_contiguous() for tensor in contiguous_tensors):
+        raise ValueError("the private chunk_kda ABI requires contiguous gate, beta, and state")
+    if not all(_has_supported_qkv_layout(tensor) for tensor in (q, k, v)):
+        raise ValueError(
+            "the private chunk_kda ABI requires QKV to have contiguous heads and "
+            "16-byte-aligned token rows"
+        )
     if torch.cuda.get_device_capability(q.device) < (10, 0):
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
@@ -221,6 +246,7 @@ def _chunk_kda_fwd_custom_op(
 ]:
     """Keep the complete composed forward behind one compiler-opaque boundary."""
     del fastmath  # This static option configures the registered backward.
+    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     output, final_state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = _chunk_kda_fwd(
         q,
@@ -270,7 +296,7 @@ def _chunk_kda_fwd_fake(
     tape_shape = (batch, tokens, heads, _CHUNK_SIZE)
     chunks = tokens // _CHUNK_SIZE
     return (
-        torch.empty_like(v),
+        v.new_empty(v.shape),
         state,
         q.new_empty(tape_shape),
         q.new_empty(tape_shape),
@@ -301,8 +327,10 @@ def _chunk_kda_bwd_custom_op(
     """Keep the complete first-order composed backward opaque to AOTAutograd."""
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
 
+    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     if d_output is None:
-        d_output = torch.zeros_like(v)
+        d_output = v.new_zeros(v.shape)
     dq, dk, dv, dg, db, d_initial_state = chunk_kda_bwd(
         q,
         k,
@@ -360,11 +388,11 @@ def _chunk_kda_bwd_fake(
         else q.new_empty((0,), dtype=torch.float32)
     )
     return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(cumulative_gate),
-        torch.empty_like(beta),
+        q.new_empty(q.shape),
+        k.new_empty(k.shape),
+        v.new_empty(v.shape),
+        cumulative_gate.new_empty(cumulative_gate.shape),
+        beta.new_empty(beta.shape),
         d_initial_state,
     )
 
@@ -488,9 +516,7 @@ def chunk_kda(
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype
-    # TODO: Accept the QKV view's strided token dimension in the forward and
-    # backward CuTe ABIs; only V's innermost dimension needs to be contiguous.
-    q, k, v = (tensor.to(torch.bfloat16).contiguous() for tensor in (q, k, v))
+    q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
     cumulative_gate = cumulative_gate.float().contiguous()
     beta = beta.float().contiguous()
     if initial_state is not None:

@@ -28,6 +28,7 @@ dependencies = [
 tests = [
     "pytest",
     "pytest-xdist",
+    "typer",
     "jsonargparse",
     "docstring-parser",
     "numpy",
