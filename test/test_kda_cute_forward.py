@@ -723,6 +723,28 @@ def test_chunk_kda_fullgraph_forward_and_backward(dtype, initial_state, output_f
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+def test_chunk_kda_shape_packed_batch_fullgraph_forward_and_backward():
+    """Compile generated dense-batch boundaries through graph-safe packed scheduling."""
+    torch.manual_seed(47)
+    eager_inputs = _inputs(batch=2, tokens=128)
+    compiled_inputs = _clone_inputs(eager_inputs)
+
+    def operation(*args):
+        return chunk_kda(*args)[0]
+
+    expected = operation(*eager_inputs)
+    actual = torch.compile(operation, fullgraph=True)(*compiled_inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    d_output = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(expected, eager_inputs, d_output)
+    actual_gradients = torch.autograd.grad(actual, compiled_inputs, d_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
 def test_chunk_kda_packed_fullgraph_forward_and_backward():
     """Keep packed metadata inside the strict compiled forward and backward graph."""
     torch.manual_seed(17)

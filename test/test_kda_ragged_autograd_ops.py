@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("cutlass")
+
 from attn_gym.linear import naive_chunk_kda_from_cumulative
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_op,
@@ -13,29 +15,20 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_fwd_ragged_with_state_op,
     _ChunkKDARagged,
 )
-from attn_gym.testing.kda import cumulative_sequence_offsets
+from attn_gym.testing.kda import (
+    clone_kda_inputs,
+    cumulative_sequence_offsets,
+    make_kda_test_inputs,
+)
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTe KDA core requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the CuTe KDA core requires CUDA capability 10.0 or 10.3",
 )
 
 
-def _inputs(tokens: int):
-    torch.manual_seed(41)
-    shape = (1, tokens, 1, 128)
-    values = [
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        -torch.rand(shape, device="cuda"),
-        torch.rand(1, tokens, 1, device="cuda"),
-    ]
-    return tuple(value.requires_grad_() for value in values)
-
-
 def test_ragged_custom_op_registrations():
-    inputs = _inputs(128)
+    inputs = make_kda_test_inputs(128, requires_grad=True)
     initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
     cu_seqlens = cumulative_sequence_offsets([65, 63])
     forward_args = (
@@ -103,10 +96,6 @@ def test_ragged_custom_op_registrations():
         rtol=2e-2,
         atol=2e-3,
     )
-
-
-def _clone_inputs(inputs):
-    return tuple(value.detach().clone().requires_grad_() for value in inputs)
 
 
 def _run_composed_gradients(
@@ -201,7 +190,7 @@ def test_ragged_autograd_composition_matches_reference_and_fullgraph(
 ):
     lengths = [65, 0, 63]
     tokens = sum(lengths)
-    inputs = _inputs(tokens)
+    inputs = make_kda_test_inputs(tokens, requires_grad=True)
     initial_state = (
         (torch.randn(3, 1, 128, 128, device="cuda") / 8).requires_grad_()
         if has_initial_state
@@ -237,7 +226,7 @@ def test_ragged_autograd_composition_matches_reference_and_fullgraph(
         output_grad,
         state_grad,
     )
-    reference_inputs = _clone_inputs(inputs)
+    reference_inputs = clone_kda_inputs(inputs)
     reference_state = (
         None if initial_state is None else initial_state.detach().clone().requires_grad_()
     )
@@ -252,7 +241,7 @@ def test_ragged_autograd_composition_matches_reference_and_fullgraph(
     _assert_run_close(actual, expected)
 
     compiled = torch.compile(operation, fullgraph=True)
-    compiled_inputs = _clone_inputs(inputs)
+    compiled_inputs = clone_kda_inputs(inputs)
     compiled_state = (
         None if initial_state is None else initial_state.detach().clone().requires_grad_()
     )
