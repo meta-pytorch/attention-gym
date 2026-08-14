@@ -26,10 +26,12 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
+    SequenceMode,
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,
     _chunk_kda_fwd_op,
     _chunk_kda_fwd_with_state_op,
+    _prepare_sequence_metadata,
 )
 from attn_gym.linear.kda.utils import prepare_complete_chunk_metadata
 
@@ -322,6 +324,40 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
             torch.bfloat16,
             f"packed input gradient {index}",
         )
+
+
+@pytest.mark.parametrize(
+    ("batch", "tokens", "explicit_offsets", "expected_mode", "expected_packed_shape"),
+    [
+        (1, 128, None, SequenceMode.DENSE, (1, 128, 1, 128)),
+        (2, 128, None, SequenceMode.SHAPE_PACKED, (1, 256, 1, 128)),
+        (2, 65, None, SequenceMode.SHAPE_PACKED, (1, 130, 1, 128)),
+        (1, 128, [0, 64, 128], SequenceMode.PACKED, (1, 128, 1, 128)),
+    ],
+)
+def test_sequence_metadata_preserves_boundary_provenance(
+    batch, tokens, explicit_offsets, expected_mode, expected_packed_shape
+):
+    """Distinguish shape-generated boundaries from replayable caller-owned values."""
+    q = torch.empty((batch, tokens, 1, 128), device="cuda", dtype=torch.bfloat16)
+    cu_seqlens = (
+        None
+        if explicit_offsets is None
+        else torch.tensor(explicit_offsets, device="cuda", dtype=torch.int32)
+    )
+
+    metadata = _prepare_sequence_metadata(q, cu_seqlens)
+
+    assert metadata.mode is expected_mode
+    assert metadata.packed_shape == expected_packed_shape
+    assert metadata.output_shape == q.shape
+    if cu_seqlens is not None:
+        assert metadata.cu_seqlens is cu_seqlens
+    elif expected_mode is SequenceMode.DENSE:
+        assert metadata.cu_seqlens is None
+    else:
+        expected = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * tokens
+        torch.testing.assert_close(metadata.cu_seqlens, expected)
 
 
 def test_optimized_chunk_kda_dense_batch_matches_equal_length_packing():
