@@ -27,8 +27,11 @@ Optimizations:
 """
 
 import cutlass
-from cutlass import cute
+from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
+
+from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
 
 class ChunkKDAFwdK4bInverseCuteDSL:
@@ -41,7 +44,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         num_subchunks: int = 4,
         fwd_sub_mode: str = "cute_recurrence",
         skip_fwd_sub: bool = False,
-        varlen: bool = False,
+        schedule: ChunkSchedule = ChunkSchedule.DENSE,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK4bInverseCuteDSL only supports four subchunks, got {num_subchunks}"
@@ -57,7 +60,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
         self.fwd_sub_mode = "skip" if skip_fwd_sub else fwd_sub_mode
-        self.varlen = varlen
+        self.schedule = schedule
 
     @cute.jit
     def _fwd_sub_block(self, mAkkd, sAi, block_start, tidx, akkd_col_off, valid_rows):
@@ -110,8 +113,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         mAkk: cute.Tensor,
         H: int,
         total_chunks: int,
-        cu_seqlens: cute.Tensor,
-        chunk_indices: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        chunk_indices: cute.Tensor | None,
+        chunk_offsets: cute.Tensor | None,
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mAkk.element_type
@@ -121,7 +125,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             self._sai_dtype = self._dtype
             self._sai_stride = self.BC
 
-        if cutlass.const_expr(self.varlen):
+        if cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
             NT = cute.size(chunk_indices, mode=[0]) // 2
             grid = (NT, H, 1)
         else:
@@ -133,6 +137,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
 
         @cute.struct
         class SharedStorage:
+            work: cute.struct.MemRange[Int32, 3]
             sAi0: cute.struct.Align[
                 cute.struct.MemRange[self._sai_dtype, self.BC * self._sai_stride], 128
             ]
@@ -193,6 +198,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             mAkk,
             cu_seqlens,
             chunk_indices,
+            chunk_offsets,
             sSchurA_layout,
             sAi_layout,
             sSchurB_layout,
@@ -208,8 +214,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         mAkkOD: cute.Tensor,
         mAkkd: cute.Tensor,
         mAkk: cute.Tensor,
-        cu_seqlens,
-        chunk_indices,
+        cu_seqlens: cute.Tensor | None,
+        chunk_indices: cute.Tensor | None,
+        chunk_offsets: cute.Tensor | None,
         sSchurA_layout: cute.Layout,
         sAi_layout: cute.Layout,
         sSchurB_layout: cute.Layout,
@@ -223,15 +230,52 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         warp_idx = tidx // self.WARP_SIZE
         lane_idx = tidx % self.WARP_SIZE
 
-        if cutlass.const_expr(self.varlen):
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        work = storage.work.get_tensor(cute.make_layout(3))
+        sAi0 = storage.sAi0.get_tensor(sAi_layout)
+        sAi1 = storage.sAi1.get_tensor(sAi_layout)
+        sAi2 = storage.sAi2.get_tensor(sAi_layout)
+        sAi3 = storage.sAi3.get_tensor(sAi_layout)
+        sSchurA0 = storage.sSchurA0.get_tensor(sSchurA_layout)
+        sSchurB0 = storage.sSchurB0.get_tensor(sSchurB_layout)
+        sSchurA1 = storage.sSchurA1.get_tensor(sSchurA_layout)
+        sSchurB1 = storage.sSchurB1.get_tensor(sSchurB_layout)
+        sSchurA2 = storage.sSchurA2.get_tensor(sSchurA_layout)
+        sSchurB2 = storage.sSchurB2.get_tensor(sSchurB_layout)
+
+        if cutlass.const_expr(self.schedule is ChunkSchedule.RAGGED):
+            if tidx == 0:
+                num_sequences = Int32(cute.size(chunk_offsets)) - 1
+                active_chunks = Int32(chunk_offsets[num_sequences])
+                work[0] = Int32(0)
+                work[1] = Int32(0)
+                work[2] = Int32(0)
+                if chunk_idx < active_chunks:
+                    _, _, token_start, valid_tokens = load_ragged_chunk_work(
+                        cu_seqlens,
+                        chunk_offsets,
+                        Int32(chunk_idx),
+                        Int32(self.BT),
+                    )
+                    work[0] = Int32(1)
+                    work[1] = token_start
+                    work[2] = token_start + valid_tokens
+            cute.arch.sync_threads()
+            is_active = work[0]
+            chunk_base = work[1]
+            eos = work[2]
+        elif cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
             i_n = chunk_indices[chunk_idx * 2]
             i_t = chunk_indices[chunk_idx * 2 + 1]
             bos = cu_seqlens[i_n]
             eos = cu_seqlens[i_n + 1]
             chunk_base = bos + i_t * self.BT
+            is_active = Int32(1)
         else:
             chunk_base = chunk_idx * self.BT
             eos = cute.size(mAkk, mode=[0])
+            is_active = Int32(1)
 
         i_tc0 = chunk_base
         i_tc1 = chunk_base + self.BC
@@ -245,19 +289,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         vr1 = cutlass.min(cutlass.max(eos - i_tc1, 0), self.BC)
         vr2 = cutlass.min(cutlass.max(eos - i_tc2, 0), self.BC)
         vr3 = cutlass.min(cutlass.max(eos - i_tc3, 0), self.BC)
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sAi0 = storage.sAi0.get_tensor(sAi_layout)
-        sAi1 = storage.sAi1.get_tensor(sAi_layout)
-        sAi2 = storage.sAi2.get_tensor(sAi_layout)
-        sAi3 = storage.sAi3.get_tensor(sAi_layout)
-        sSchurA0 = storage.sSchurA0.get_tensor(sSchurA_layout)
-        sSchurB0 = storage.sSchurB0.get_tensor(sSchurB_layout)
-        sSchurA1 = storage.sSchurA1.get_tensor(sSchurA_layout)
-        sSchurB1 = storage.sSchurB1.get_tensor(sSchurB_layout)
-        sSchurA2 = storage.sSchurA2.get_tensor(sSchurA_layout)
-        sSchurB2 = storage.sSchurB2.get_tensor(sSchurB_layout)
 
         thr_mma = tiled_mma.get_slice(lane_idx)
         thrA = smem_copy_A.get_slice(lane_idx)
@@ -297,7 +328,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         # ══════════════════════════════════════════════════════════
         od_base_row = chunk_idx * self.num_offdiag_blocks
 
-        if warp_idx == 0:
+        if is_active and warp_idx == 0:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
@@ -310,7 +341,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi0, i_tc0, lane_idx, h_akkd_col, vr0)
 
-        if warp_idx == 1:
+        if is_active and warp_idx == 1:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
@@ -320,7 +351,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi1, i_tc1, lane_idx, h_akkd_col, vr1)
 
-        if warp_idx == 2:
+        if is_active and warp_idx == 2:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
@@ -328,7 +359,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._fwd_sub_block(mAkkd, sAi2, i_tc2, lane_idx, h_akkd_col, vr2)
 
-        if warp_idx == 3:
+        if is_active and warp_idx == 3:
             self._fwd_sub_block(mAkkd, sAi3, i_tc3, lane_idx, h_akkd_col, vr3)
 
         cute.arch.barrier(barrier_id=0, number_of_threads=128)
@@ -338,7 +369,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         # ══════════════════════════════════════════════════════════
 
         # ── WARP 0: 9 GEMMs (reordered for B-fragment reuse) ──
-        if warp_idx == 0:
+        if is_active and warp_idx == 0:
             # GEMM 1: tmp = Ai11 @ Akk10
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
                 c0 = tCcC[k * 2]
@@ -465,7 +496,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                     mAkk[i_tc3 + row, h_akk_col + 0 * self.BC + col] = self._dtype(acc_tmp[i])
 
         # ── WARP 1: 5 GEMMs with B-reuse on sAi1_T ──
-        if warp_idx == 1:
+        if is_active and warp_idx == 1:
             # GEMM 1: tmp = Ai22 @ Akk21
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
                 c0 = tCcC[k * 2]
@@ -544,7 +575,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                     mAkk[i_tc3 + row, h_akk_col + 1 * self.BC + col] = self._dtype(acc_res2[i])
 
         # ── WARP 2: 2 GEMMs + store Ai32 ──
-        if warp_idx == 2:
+        if is_active and warp_idx == 2:
             # GEMM 1: tmp = Ai33 @ Akk32
             for k in cutlass.range_constexpr(cute.size(acc_tmp) // 2):
                 c0 = tCcC[k * 2]
@@ -583,7 +614,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                     mAkk[i_tc3 + row, h_akk_col + 2 * self.BC + col] = self._dtype(acc_res1[i])
 
         # ── WARP 3: Store all 4 diagonal blocks ──
-        if warp_idx == 3:
+        if is_active and warp_idx == 3:
             for k in cutlass.range_constexpr(self.BC * self.BC // 32):
                 linear_idx = lane_idx + k * 32
                 row = linear_idx // self.BC

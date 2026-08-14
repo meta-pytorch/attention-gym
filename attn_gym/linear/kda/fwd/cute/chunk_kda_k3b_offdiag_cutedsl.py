@@ -29,6 +29,7 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
 
+from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
 
@@ -41,8 +42,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         D: int = 128,
         chunk_size: int = 64,
         num_subchunks: int = 4,
-        varlen: bool = False,
-        ragged: bool = False,
+        schedule: ChunkSchedule = ChunkSchedule.DENSE,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK3bOffdiagCuteDSL only supports four subchunks, got {num_subchunks}"
@@ -53,9 +53,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         )
         self.BC = BC
         self.D = D
-        assert not (varlen and ragged), "legacy varlen and ragged scheduling are exclusive"
-        self.varlen = varlen
-        self.ragged = ragged
+        self.schedule = schedule
         self.BT = chunk_size
         self.num_offdiag_blocks = num_subchunks * (num_subchunks - 1) // 2
         self.num_threads = 128
@@ -74,14 +72,14 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         scale: cutlass.Float32,
         H: int,
         total_chunks: int,
-        cu_seqlens: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
         chunk_indices: cute.Tensor | None,
-        chunk_offsets: cute.Tensor,
+        chunk_offsets: cute.Tensor | None,
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mQ.element_type
 
-        if cutlass.const_expr(self.varlen):
+        if cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
             NT = cute.size(chunk_indices, mode=[0]) // 2
             num_pairs = NT * self.num_offdiag_blocks
         else:
@@ -166,9 +164,9 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         mAqk: cute.Tensor,
         mAkkOD: cute.Tensor,
         scale: cutlass.Float32,
-        cu_seqlens: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
         chunk_indices: cute.Tensor | None,
-        chunk_offsets: cute.Tensor,
+        chunk_offsets: cute.Tensor | None,
         sGated_layout: cute.ComposedLayout,
         sGref_layout: cute.Layout,
         sBeta_layout: cute.Layout,
@@ -202,7 +200,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         sGref = storage.sGref.get_tensor(sGref_layout)
         sBeta = storage.sBeta.get_tensor(sBeta_layout)
 
-        if cutlass.const_expr(self.ragged):
+        if cutlass.const_expr(self.schedule is ChunkSchedule.RAGGED):
             num_sequences = Int32(cute.size(chunk_offsets)) - 1
             active_chunks = Int32(chunk_offsets[num_sequences])
             chunk_base = Int32(0)
@@ -215,7 +213,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                     Int32(self.BT),
                 )
                 eos = chunk_base + valid_tokens
-        elif cutlass.const_expr(self.varlen):
+        elif cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
             i_n = chunk_indices[chunk_idx * 2]
             i_t = chunk_indices[chunk_idx * 2 + 1]
             bos = cu_seqlens[i_n]
@@ -232,7 +230,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         # ══════════════════════════════════════════════════════════
         # Phase 1: Gating into SMEM
         # ══════════════════════════════════════════════════════════
-        if cutlass.const_expr(self.varlen or self.ragged):
+        if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
             col = tidx
             h_col = h_offset + col
             if chunk_base + self.BT <= eos:
@@ -376,7 +374,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                if cutlass.const_expr(self.varlen or self.ragged):
+                if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
                     if chunk_base + self.BT <= eos or ti_row + row < eos:
                         mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
                             acc_Aqk[i] * scale
@@ -401,7 +399,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                if cutlass.const_expr(self.varlen or self.ragged):
+                if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
                     if ti_col + row < eos:
                         mAqk[ti_col + row, head_idx * self.BT + ri * self.BC + col] = out_dtype(
                             0.0

@@ -31,6 +31,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k4b_inverse_cutedsl import (
     ChunkKDAFwdK4bInverseCuteDSL,
 )
+from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
 from attn_gym.linear.kda.utils import (
     DEFAULT_CHUNK_SIZE,
     prepare_chunk_indices,
@@ -70,16 +71,9 @@ def _compile_k3b(
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
-    varlen: bool,
-    ragged: bool = False,
+    schedule: ChunkSchedule,
 ):
-    """Compile one persistent K3b TVM-FFI specialization.
-
-    ``varlen`` uses the legacy exact per-chunk work map. ``ragged`` uses a
-    capacity grid plus device-side offsets so boundaries can change on graph replay.
-    """
-    if varlen and ragged:
-        raise ValueError("varlen and ragged scheduling are mutually exclusive")
+    """Compile one persistent K3b TVM-FFI scheduling specialization."""
     _check_compile_target()
     offdiag_blocks = _validate_specialization(head_dim, chunk_size, subchunk_size)
     num_subchunks = chunk_size // subchunk_size
@@ -88,8 +82,7 @@ def _compile_k3b(
         D=head_dim,
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
-        varlen=varlen,
-        ragged=ragged,
+        schedule=schedule,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     q = make_fake_tensor(
@@ -128,27 +121,35 @@ def _compile_k3b(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    cu_seqlens = make_fake_compact_tensor(
-        cutlass.Int32,
-        (sequences,),
-        stride_order=(0,),
-        assumed_align=4,
+    cu_seqlens = (
+        None
+        if schedule is ChunkSchedule.DENSE
+        else make_fake_compact_tensor(
+            cutlass.Int32,
+            (sequences,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
     )
     chunk_indices = (
-        None
-        if ragged
-        else make_fake_compact_tensor(
+        make_fake_compact_tensor(
             cutlass.Int32,
             (chunks * 2,),
             stride_order=(0,),
             assumed_align=4,
         )
+        if schedule is ChunkSchedule.ALIGNED
+        else None
     )
-    chunk_offsets = make_fake_compact_tensor(
-        cutlass.Int32,
-        (sequences,),
-        stride_order=(0,),
-        assumed_align=4,
+    chunk_offsets = (
+        make_fake_compact_tensor(
+            cutlass.Int32,
+            (sequences,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+        if schedule is ChunkSchedule.RAGGED
+        else None
     )
     return compile_tvm_ffi(
         op,
@@ -165,8 +166,7 @@ def _compile_k3b(
         chunk_indices,
         chunk_offsets,
         name=(
-            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
-            f"_vl{int(varlen)}_rg{int(ragged)}"
+            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_schedule_{schedule.value}"
         ),
     )
 
@@ -177,9 +177,9 @@ def _compile_k4b(
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
-    varlen: bool,
+    schedule: ChunkSchedule,
 ):
-    """Compile one persistent K4b TVM-FFI specialization."""
+    """Compile one persistent K4b TVM-FFI scheduling specialization."""
     _check_compile_target()
     offdiag_blocks = _validate_specialization(head_dim, chunk_size, subchunk_size)
     num_subchunks = chunk_size // subchunk_size
@@ -188,7 +188,7 @@ def _compile_k4b(
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
         fwd_sub_mode="preinverted",
-        varlen=varlen,
+        schedule=schedule,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     AkkOD = make_fake_compact_tensor(
@@ -209,17 +209,35 @@ def _compile_k4b(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    cu_seqlens = make_fake_compact_tensor(
-        cutlass.Int32,
-        (sequences,),
-        stride_order=(0,),
-        assumed_align=4,
+    cu_seqlens = (
+        None
+        if schedule is ChunkSchedule.DENSE
+        else make_fake_compact_tensor(
+            cutlass.Int32,
+            (sequences,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
     )
-    chunk_indices = make_fake_compact_tensor(
-        cutlass.Int32,
-        (chunks * 2,),
-        stride_order=(0,),
-        assumed_align=4,
+    chunk_indices = (
+        make_fake_compact_tensor(
+            cutlass.Int32,
+            (chunks * 2,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+        if schedule is ChunkSchedule.ALIGNED
+        else None
+    )
+    chunk_offsets = (
+        make_fake_compact_tensor(
+            cutlass.Int32,
+            (sequences,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+        if schedule is ChunkSchedule.RAGGED
+        else None
     )
     return compile_tvm_ffi(
         op,
@@ -230,7 +248,10 @@ def _compile_k4b(
         1,
         cu_seqlens,
         chunk_indices,
-        name=(f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_vl{int(varlen)}"),
+        chunk_offsets,
+        name=(
+            f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_schedule_{schedule.value}"
+        ),
     )
 
 
@@ -271,14 +292,12 @@ def _chunk_kda_fwd_k3b_ragged_impl(
     g_flat = gk.reshape(tokens, heads * head_dim).contiguous()
     beta_flat = beta.reshape(tokens, heads).contiguous()
     Aqk_flat = Aqk.reshape(tokens, heads * chunk_size)
-    chunk_indices = None
     k3b = _compile_k3b(
         heads,
         head_dim,
         chunk_size,
         subchunk_size,
-        False,
-        True,
+        ChunkSchedule.RAGGED,
     )
     k3b(
         q_flat,
@@ -291,7 +310,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         heads,
         metadata.capacity,
         metadata.cu_seqlens,
-        chunk_indices,
+        None,
         metadata.chunk_offsets,
     )
     return Aqk, AkkOD
@@ -382,6 +401,136 @@ def chunk_kda_fwd_k3b_ragged_cute(
     return _chunk_kda_fwd_k3b_ragged_cuda(*args)
 
 
+def _chunk_kda_fwd_k4b_ragged_impl(
+    AkkOD: torch.Tensor,
+    Akkd: torch.Tensor,
+    metadata: RaggedChunkMetadata,
+    subchunk_size: int = _SUPPORTED_SUBCHUNK_SIZE,
+) -> torch.Tensor:
+    """Compute scheduler-routed K4 inverse blocks into a zero-initialized output."""
+    if Akkd.ndim != 4:
+        raise ValueError(f"Akkd must be 4D, got shape {tuple(Akkd.shape)}")
+    batch, tokens, heads, diagonal_width = Akkd.shape
+    chunk_size = _SUPPORTED_CHUNK_SIZE
+    metadata.validate_chunk_size(chunk_size)
+    offdiag_blocks = _validate_specialization(
+        _SUPPORTED_HEAD_DIM,
+        chunk_size,
+        subchunk_size,
+    )
+    if batch != 1:
+        raise ValueError(f"ragged K4 requires B=1, got {batch}")
+    if diagonal_width != subchunk_size:
+        raise ValueError(
+            f"Akkd must have trailing dimension {subchunk_size}, got {diagonal_width}"
+        )
+    akk_od_shape = (metadata.capacity * offdiag_blocks, heads * subchunk_size**2)
+    if AkkOD.shape != akk_od_shape:
+        raise ValueError(f"AkkOD must have shape {akk_od_shape}, got {tuple(AkkOD.shape)}")
+
+    Akk = torch.zeros(
+        (batch, tokens, heads, chunk_size),
+        dtype=torch.bfloat16,
+        device=Akkd.device,
+    )
+    if isinstance(Akkd, FakeTensor) or metadata.capacity == 0:
+        return Akk
+
+    k4b = _compile_k4b(
+        heads,
+        _SUPPORTED_HEAD_DIM,
+        chunk_size,
+        subchunk_size,
+        ChunkSchedule.RAGGED,
+    )
+    k4b(
+        AkkOD,
+        Akkd.reshape(tokens, heads * subchunk_size).contiguous(),
+        Akk.reshape(tokens, heads * chunk_size),
+        heads,
+        metadata.capacity,
+        metadata.cu_seqlens,
+        None,
+        metadata.chunk_offsets,
+    )
+    return Akk
+
+
+torch.library.define(
+    "attn_gym::kda_k4b_ragged",
+    "(Tensor AkkOD, Tensor Akkd, Tensor cu_seqlens, Tensor chunk_offsets, int capacity) -> Tensor",
+)
+
+
+def _chunk_kda_fwd_k4b_ragged_cuda(
+    AkkOD: torch.Tensor,
+    Akkd: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    capacity: int,
+) -> torch.Tensor:
+    metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, _SUPPORTED_CHUNK_SIZE)
+    return _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata)
+
+
+torch.library.impl("attn_gym::kda_k4b_ragged", "CUDA", _chunk_kda_fwd_k4b_ragged_cuda)
+
+
+@torch.library.register_fake("attn_gym::kda_k4b_ragged")
+def _chunk_kda_fwd_k4b_ragged_fake(
+    AkkOD: torch.Tensor,
+    Akkd: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    capacity: int,
+) -> torch.Tensor:
+    del AkkOD, cu_seqlens, chunk_offsets, capacity
+    return Akkd.new_empty((*Akkd.shape[:-1], _SUPPORTED_CHUNK_SIZE), dtype=torch.bfloat16)
+
+
+_chunk_kda_fwd_k4b_ragged_custom_op = torch.ops.attn_gym.kda_k4b_ragged.default
+
+
+def chunk_kda_fwd_k4b_ragged_cute(
+    AkkOD: torch.Tensor,
+    Akkd: torch.Tensor,
+    metadata: RaggedChunkMetadata,
+) -> torch.Tensor:
+    """Run graph-safe ragged K4 with a strict-compile custom-op boundary."""
+    metadata.validate_chunk_size(_SUPPORTED_CHUNK_SIZE)
+    args = (
+        AkkOD,
+        Akkd,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        metadata.capacity,
+    )
+    if torch.compiler.is_compiling():
+        return _chunk_kda_fwd_k4b_ragged_custom_op(*args)
+    return _chunk_kda_fwd_k4b_ragged_cuda(*args)
+
+
+def chunk_kda_fwd_inter_solve_ragged_cute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    Akkd: torch.Tensor,
+    Aqk: torch.Tensor,
+    scale: float,
+    metadata: RaggedChunkMetadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the production K3+K4 inter-solve stages with ragged scheduling."""
+    metadata.validate_chunk_size(_SUPPORTED_CHUNK_SIZE)
+    k3b = (
+        chunk_kda_fwd_k3b_ragged_cute
+        if torch.compiler.is_compiling()
+        else _chunk_kda_fwd_k3b_ragged_impl
+    )
+    Aqk, AkkOD = k3b(q, k, gk, beta, Aqk, scale, metadata)
+    return Aqk, chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, metadata)
+
+
 def chunk_kda_fwd_inter_solve_cute(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -453,19 +602,19 @@ def chunk_kda_fwd_inter_solve_cute(
         )
         akk_od = AkkOD
 
-    varlen = cu_seqlens is not None
-    if varlen:
-        assert chunk_indices is not None
+    schedule = ChunkSchedule.ALIGNED if cu_seqlens is not None else ChunkSchedule.DENSE
+    if schedule is ChunkSchedule.ALIGNED:
+        assert chunk_indices is not None and cu_seqlens is not None
         cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
         chunk_indices_i32 = chunk_indices.to(torch.int32).flatten().contiguous()
     else:
-        cu_seqlens_i32 = torch.empty(1, dtype=torch.int32, device=k.device)
-        chunk_indices_i32 = torch.empty(2, dtype=torch.int32, device=k.device)
+        cu_seqlens_i32 = None
+        chunk_indices_i32 = None
 
     with (
         torch.profiler.record_function("kda/cute/k3b_offdiag") if profile_ranges else nullcontext()
     ):
-        k3b = _compile_k3b(H, K, BT, BC, varlen)
+        k3b = _compile_k3b(H, K, BT, BC, schedule)
         k3b(
             q_flat,
             k_flat,
@@ -478,12 +627,12 @@ def chunk_kda_fwd_inter_solve_cute(
             NT,
             cu_seqlens_i32,
             chunk_indices_i32,
-            torch.empty_like(cu_seqlens_i32),
+            None,
         )
     with (
         torch.profiler.record_function("kda/cute/k4b_inverse") if profile_ranges else nullcontext()
     ):
-        k4b = _compile_k4b(H, K, BT, BC, varlen)
+        k4b = _compile_k4b(H, K, BT, BC, schedule)
         k4b(
             akk_od,
             akkd_flat,
@@ -492,8 +641,14 @@ def chunk_kda_fwd_inter_solve_cute(
             NT,
             cu_seqlens_i32,
             chunk_indices_i32,
+            None,
         )
     return Aqk, Akk
 
 
-__all__ = ["chunk_kda_fwd_inter_solve_cute", "chunk_kda_fwd_k3b_ragged_cute"]
+__all__ = [
+    "chunk_kda_fwd_inter_solve_cute",
+    "chunk_kda_fwd_inter_solve_ragged_cute",
+    "chunk_kda_fwd_k3b_ragged_cute",
+    "chunk_kda_fwd_k4b_ragged_cute",
+]
