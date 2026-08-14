@@ -27,6 +27,7 @@ from attn_gym._backends.cute import ceildiv, get_device_properties
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import (
     blackwell_delta_h_bwd_dhu_v1,
 )
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 
 
 def blackwell_delta_h_bwd_dhu_dispatch(
@@ -45,6 +46,7 @@ def blackwell_delta_h_bwd_dhu_dispatch(
     chunk_offsets: torch.Tensor | None = None,
     num_seqs: torch.Tensor | int | None = None,
     num_chunks: int | None = None,
+    metadata: RaggedChunkMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     BlackwellDeltaHBwd backward dhu — auto-dispatches BV=16 or BV=32.
@@ -54,6 +56,8 @@ def blackwell_delta_h_bwd_dhu_dispatch(
     batch, _tokens, heads, _head_dim = q.shape
     value_dim = do.shape[-1]
     logical_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    if metadata is not None:
+        logical_batch = metadata.cu_seqlens.shape[0] - 1
 
     w_tiles_bv16 = ceildiv(value_dim, 16) * heads * logical_batch
     sm_count = get_device_properties(q.device).multi_processor_count
@@ -77,4 +81,5 @@ def blackwell_delta_h_bwd_dhu_dispatch(
         num_seqs=num_seqs,
         bv=bv,
         NT=num_chunks,
+        metadata=metadata,
     )
