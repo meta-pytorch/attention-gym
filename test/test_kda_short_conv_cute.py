@@ -712,22 +712,26 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
 
 
 def test_kda_example_builds_packed_sequence_metadata():
-    """Keep Zipf-sampled logical lengths aligned, bounded, and cumulative."""
+    """Keep token-level and optionally aligned Zipf samples bounded and cumulative."""
     torch.manual_seed(0)
-    lengths, offsets = packed_sequence_metadata(4, 256, 64)
+    lengths, offsets = packed_sequence_metadata(4, 63, 64)
     assert len(lengths) == 4
-    assert all(length % 64 == 0 and 0 < length <= 256 for length in lengths)
+    assert all(0 < length <= 63 and length % 64 != 0 for length in lengths)
     assert offsets[0] == 0
     assert tuple(end - start for start, end in pairwise(offsets)) == lengths
 
+    padded_lengths, padded_offsets = packed_sequence_metadata(4, 256, 64, padded=True)
+    assert all(length % 64 == 0 and 0 < length <= 256 for length in padded_lengths)
+    assert tuple(end - start for start, end in pairwise(padded_offsets)) == padded_lengths
+
     with pytest.raises(ValueError, match="divisible"):
-        packed_sequence_metadata(2, 96, 64)
+        packed_sequence_metadata(2, 96, 64, padded=True)
     with pytest.raises(ValueError, match="at least one"):
         packed_sequence_metadata(3, 0, 64)
 
 
 def test_kda_example_packed_matches_sequence_for_loop():
-    """Match one packed block against explicit independent-sequence execution."""
+    """Match a tailed packed block with an empty sequence against independent execution."""
     torch.manual_seed(19)
     model = KDAAttention(
         hidden_size=32,
@@ -736,15 +740,17 @@ def test_kda_example_packed_matches_sequence_for_loop():
         backend="fused",
         device="cuda",
     )
-    offsets = (0, 64, 128, 192, 256)
+    offsets = (0, 65, 65, 128)
     packed_hidden = torch.randn(1, offsets[-1], 32, device="cuda", requires_grad=True)
     loop_hidden = packed_hidden.detach().clone().requires_grad_()
     cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
 
     actual = model(packed_hidden, cu_seqlens=cu_seqlens).hidden_states
-    loop_outputs = []
-    for start, end in pairwise(offsets):
-        loop_outputs.append(model(loop_hidden[:, start:end]).hidden_states)
+    loop_outputs = [
+        model(loop_hidden[:, start:end]).hidden_states
+        for start, end in pairwise(offsets)
+        if start < end
+    ]
     expected = torch.cat(loop_outputs, dim=1)
     torch.testing.assert_close(actual, expected)
 

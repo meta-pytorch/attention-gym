@@ -96,16 +96,20 @@ def packed_sequence_metadata(
     num_sequences: int,
     max_tokens: int,
     chunk_size: int,
+    padded: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Sample aligned sequence lengths from a truncated Zipf distribution."""
-    if max_tokens % chunk_size:
-        raise ValueError("packed tokens must be divisible by chunk_size")
-    if max_tokens < chunk_size:
-        raise ValueError("packed tokens must include at least one full chunk")
-    max_chunks = max_tokens // chunk_size
-    weights = torch.arange(1, max_chunks + 1, dtype=torch.float64).reciprocal()
-    chunk_counts = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
-    lengths = tuple(count * chunk_size for count in chunk_counts)
+    """Sample sequence lengths from a truncated Zipf distribution."""
+    if max_tokens < 1:
+        raise ValueError("packed tokens must include at least one token")
+    if padded:
+        if max_tokens % chunk_size:
+            raise ValueError("packed tokens must be divisible by chunk_size when padded")
+        max_length = max_tokens // chunk_size
+    else:
+        max_length = max_tokens
+    weights = torch.arange(1, max_length + 1, dtype=torch.float64).reciprocal()
+    sampled_lengths = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
+    lengths = tuple(length * chunk_size if padded else length for length in sampled_lengths)
     return lengths, (0, *accumulate(lengths))
 
 
@@ -225,7 +229,7 @@ class KDAAttention(nn.Module):
         q, k, v = qkv.view(batch, tokens, 3, self.num_heads, self.head_dim).unbind(2)
         q, k = self.qk_normalization(q, k)
         raw_gate, beta = self.gate_projections(hidden_states_compute)
-        cumulative_gate = self.gate_prefix_sum(raw_gate)
+        cumulative_gate = self.gate_prefix_sum(raw_gate, cu_seqlens=cu_seqlens)
         output, final_state = self.kda_core(
             q,
             k,
@@ -327,7 +331,12 @@ class KDAAttention(nn.Module):
         return raw_gate.contiguous(), beta
 
     @record_function("kda/gate_prefix_sum/{backend}")
-    def gate_prefix_sum(self, raw_gate: torch.Tensor) -> torch.Tensor:
+    def gate_prefix_sum(
+        self,
+        raw_gate: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.backend == "reference":
             return gate_fwd_ref(
                 raw_gate,
@@ -348,6 +357,7 @@ class KDAAttention(nn.Module):
             lower_bound=self.lower_bound,
             fastmath=self.fastmath,
             profile_ranges=self.profile_ranges,
+            cu_seqlens=cu_seqlens,
         )
 
     @record_function("kda/core/{backend}")
@@ -454,15 +464,19 @@ def main(
     ] = False,
     packed: Annotated[
         bool,
-        typer.Option(
-            help="Pack batch-size Zipf-distributed full-chunk sequences bounded by tokens."
-        ),
+        typer.Option(help="Pack batch-size Zipf-distributed sequences bounded by tokens."),
+    ] = False,
+    padded: Annotated[
+        bool,
+        typer.Option(help="Round packed Zipf samples to complete recurrence chunks."),
     ] = False,
 ) -> None:
     """Train the single-device KDA example."""
     torch.manual_seed(0)
     if packed and backend != BackendOption.FUSED:
         raise ValueError("--packed requires --backend=fused")
+    if padded and not packed:
+        raise ValueError("--padded requires --packed")
     model = KDAAttention(
         hidden_size,
         num_heads,
@@ -480,10 +494,15 @@ def main(
     input_shape = (batch_size, tokens, hidden_size)
     layout_name = ""
     if packed:
-        sequence_lengths, offsets = packed_sequence_metadata(batch_size, tokens, chunk_size)
+        sequence_lengths, offsets = packed_sequence_metadata(
+            batch_size,
+            tokens,
+            chunk_size,
+            padded=padded,
+        )
         cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
         input_shape = (1, offsets[-1], hidden_size)
-        layout_name = "_packed"
+        layout_name = "_packed_padded" if padded else "_packed"
         print(f"packed_sequence_lengths={sequence_lengths} cu_seqlens={offsets}")
     hidden_states = torch.randn(input_shape, device=device)
     target = torch.randn_like(hidden_states)
