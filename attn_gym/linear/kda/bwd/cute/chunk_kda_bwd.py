@@ -80,7 +80,7 @@ def chunk_kda_bwd(
             initial_state,
             chunk_size=chunk_size,
             output_final_state=False,
-            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+            metadata=metadata if metadata.has_multiple_sequences else None,
         )
     del u
 
