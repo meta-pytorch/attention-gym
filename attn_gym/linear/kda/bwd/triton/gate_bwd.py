@@ -23,11 +23,12 @@
 # emits its block's partial sum into dA[i_t, i_h]; the caller reduces over the
 # time-block axis. The dt_bias gradient is sum_t dg, also reduced by the caller.
 
+import torch
 import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.utils import autotune_cache_kwargs
+from attn_gym.linear.kda.utils import autotune_cache_kwargs, input_guard
 
 NUM_WARPS_AUTOTUNE = [4, 8, 16, 32]
 
@@ -118,3 +119,104 @@ def kda_gate_bwd_kernel(
         mask=m,
     )
     tl.store(dA + ptr_offset((i_t, i_h), DA_STRIDES), b_dalog)
+
+
+@triton.jit(do_not_specialize=["T"])
+def kda_gate_bwd_ragged_kernel(
+    g,
+    A_log,
+    dt_bias,
+    dyg,
+    dg,
+    dA,
+    lower_bound,
+    T,
+    G_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    DYG_STRIDES: tl.constexpr,
+    DG_STRIDES: tl.constexpr,
+    DA_STRIDES: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Differentiate the bounded gate with a fixed graph-capture-safe schedule."""
+    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+
+    token = i_t * BT + tl.arange(0, BT)
+    channel = tl.arange(0, BD)
+    mask = (token[:, None] < T) & (channel[None, :] < D)
+    gate_input = tl.load(
+        g + ptr_offset((token[:, None], i_h, channel[None, :]), G_STRIDES),
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    d_gate = tl.load(
+        dyg + ptr_offset((token[:, None], i_h, channel[None, :]), DYG_STRIDES),
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate_input += tl.load(
+        dt_bias + ptr_offset((i_h, channel), DT_BIAS_STRIDES),
+        mask=channel < D,
+        other=0.0,
+    ).to(tl.float32)
+
+    decay = tl.exp(tl.load(A_log + ptr_offset((i_h,), A_LOG_STRIDES)).to(tl.float32))
+    sigmoid = tl.sigmoid(decay * gate_input)
+    d_raw_gate = d_gate * (lower_bound * decay * sigmoid * (1.0 - sigmoid))
+    dA_log = tl.sum(tl.sum(d_raw_gate * gate_input, 1), 0)
+
+    tl.store(
+        dg + ptr_offset((token[:, None], i_h, channel[None, :]), DG_STRIDES),
+        d_raw_gate,
+        mask=mask,
+    )
+    tl.store(dA + ptr_offset((i_t, i_h), DA_STRIDES), dA_log)
+
+
+@input_guard(no_guard_contiguous=True)
+def kda_gate_bwd_ragged(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    d_gate: torch.Tensor,
+    *,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiate the pointwise bounded gate with FP32 parameter reductions."""
+    if g.ndim != 3:
+        raise ValueError(f"g must have shape [T, H, D], got {tuple(g.shape)}")
+    if d_gate.shape != g.shape:
+        raise ValueError(f"d_gate must have shape {tuple(g.shape)}, got {tuple(d_gate.shape)}")
+    tokens, heads, head_dim = g.shape
+    if A_log.shape != (heads,) or dt_bias.shape != (heads, head_dim):
+        raise ValueError("A_log or dt_bias shape does not match g")
+
+    block_tokens = 32
+    time_blocks = triton.cdiv(tokens, block_tokens)
+    dg = torch.empty_like(g, dtype=torch.float32)
+    dA_partial = A_log.new_empty((time_blocks, heads), dtype=torch.float32)
+    kda_gate_bwd_ragged_kernel[(time_blocks, heads)](
+        g,
+        A_log,
+        dt_bias,
+        d_gate,
+        dg,
+        dA_partial,
+        lower_bound,
+        tokens,
+        G_STRIDES=g.stride(),
+        A_LOG_STRIDES=A_log.stride(),
+        DT_BIAS_STRIDES=dt_bias.stride(),
+        DYG_STRIDES=d_gate.stride(),
+        DG_STRIDES=dg.stride(),
+        DA_STRIDES=dA_partial.stride(),
+        D=head_dim,
+        BT=block_tokens,
+        BD=triton.next_power_of_2(head_dim),
+        num_warps=4,
+        num_stages=3,
+    )
+    return dg, dA_partial.sum(0), dg.sum(0)

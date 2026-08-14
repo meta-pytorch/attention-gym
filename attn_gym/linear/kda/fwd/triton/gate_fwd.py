@@ -20,6 +20,14 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, storage_cosize
+from attn_gym.linear.kda.bwd.triton.cumsum import ragged_chunk_local_cumsum_vector
+from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_ragged
+from attn_gym.linear.kda.chunk_scheduler import (
+    RaggedChunkMetadata,
+    chunk_capacity,
+    load_ragged_chunk_work,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear.kda.utils import (
     IS_NVIDIA,
     RCP_LN2,
@@ -292,6 +300,223 @@ def kda_gate_chunk_cumsum_vector_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_sequences"])
+def bounded_gate_chunk_cumsum_ragged_kernel(
+    raw_gate,
+    A_log,
+    dt_bias,
+    output,
+    lower_bound,
+    scale,
+    cu_seqlens,
+    chunk_offsets,
+    num_sequences,
+    G_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Apply the bounded gate and prefix sum to one device-routed ragged chunk."""
+    global_chunk = tl.program_id(0)
+    i_h = tl.program_id(1).to(tl.int64)
+    i_d = tl.program_id(2).to(tl.int64)
+    if global_chunk >= tl.load(chunk_offsets + num_sequences):
+        return
+
+    _sequence, _local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
+        cu_seqlens,
+        chunk_offsets,
+        global_chunk,
+        num_sequences,
+        BT,
+    )
+    token_offset = tl.arange(0, BT)
+    token = token_start.to(tl.int64) + token_offset
+    channel = i_d * BD + tl.arange(0, BD)
+    mask = (token_offset[:, None] < valid_tokens) & (channel[None, :] < D)
+    gate_input = tl.load(
+        raw_gate + ptr_offset((token[:, None], i_h, channel[None, :]), G_STRIDES),
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    bias = tl.load(
+        dt_bias + ptr_offset((i_h, channel), DT_BIAS_STRIDES),
+        mask=channel < D,
+        other=0.0,
+    ).to(tl.float32)
+    decay = tl.load(A_log + ptr_offset((i_h,), A_LOG_STRIDES)).to(tl.float32)
+    gate = lower_bound.to(tl.float32) * tl.sigmoid(exp(decay) * (gate_input + bias[None, :]))
+    gate = tl.where(mask, gate, 0.0)
+    cumulative = tl.cumsum(gate, axis=0) * scale
+    tl.store(
+        output + ptr_offset((token[:, None], i_h, channel[None, :]), O_STRIDES),
+        cumulative,
+        mask=mask,
+    )
+
+
+@input_guard(no_guard_contiguous=True)
+def bounded_gate_cumsum_ragged(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    chunk_size: int,
+    lower_bound: float,
+) -> tuple[torch.Tensor, RaggedChunkMetadata]:
+    """Prepare device routing and run the graph-safe packed gate forward."""
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, raw_gate.shape[1], chunk_size)
+    output = torch.empty_like(raw_gate, dtype=torch.float32)
+    _, _, heads, head_dim = raw_gate.shape
+    block_dim = 32
+    bounded_gate_chunk_cumsum_ragged_kernel[
+        (metadata.capacity, heads, triton.cdiv(head_dim, block_dim))
+    ](
+        raw_gate,
+        A_log,
+        dt_bias,
+        output,
+        lower_bound,
+        RCP_LN2,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        metadata.cu_seqlens.shape[0] - 1,
+        G_STRIDES=raw_gate.stride()[1:],
+        A_LOG_STRIDES=A_log.stride(),
+        DT_BIAS_STRIDES=dt_bias.stride(),
+        O_STRIDES=output.stride()[1:],
+        D=head_dim,
+        BT=metadata.chunk_size,
+        BD=block_dim,
+        num_warps=2,
+        num_stages=3,
+    )
+    return output, metadata
+
+
+torch.library.define(
+    "attn_gym::kda_bounded_gate_fwd_ragged",
+    "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, Tensor cu_seqlens, "
+    "int chunk_size, float lower_bound) -> (Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_bounded_gate_bwd_ragged",
+    "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, Tensor d_cumulative, "
+    "Tensor cu_seqlens, Tensor chunk_offsets, int chunk_size, float lower_bound, "
+    "bool profile_ranges) -> (Tensor, Tensor, Tensor)",
+)
+
+
+def _bounded_gate_cumsum_ragged_fwd_cuda(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ragged gate activation, scheduling, and prefix sums as one functional op."""
+    output, metadata = bounded_gate_cumsum_ragged(
+        raw_gate,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        lower_bound=lower_bound,
+    )
+    return output, metadata.chunk_offsets
+
+
+def _bounded_gate_cumsum_ragged_bwd_cuda(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    d_cumulative: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    chunk_size: int,
+    lower_bound: float,
+    profile_ranges: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run ragged reverse scan, pointwise derivative, and reductions as one functional op."""
+    metadata = RaggedChunkMetadata(
+        cu_seqlens,
+        chunk_offsets,
+        chunk_capacity(raw_gate.shape[1], cu_seqlens.shape[0] - 1, chunk_size),
+        chunk_size,
+    )
+    with (
+        torch.profiler.record_function("kda/triton/gate_backward_ragged")
+        if profile_ranges
+        else nullcontext()
+    ):
+        d_gate = ragged_chunk_local_cumsum_vector(
+            d_cumulative.float(),
+            metadata,
+            reverse=True,
+            scale=RCP_LN2,
+        )
+        dg_fp32, dA_log, d_dt_bias = kda_gate_bwd_ragged(
+            raw_gate[0],
+            A_log,
+            dt_bias,
+            d_gate[0],
+            lower_bound=lower_bound,
+        )
+    return dg_fp32.unsqueeze(0).to(raw_gate.dtype), dA_log, d_dt_bias
+
+
+torch.library.impl(
+    "attn_gym::kda_bounded_gate_fwd_ragged", "CUDA", _bounded_gate_cumsum_ragged_fwd_cuda
+)
+torch.library.impl(
+    "attn_gym::kda_bounded_gate_bwd_ragged", "CUDA", _bounded_gate_cumsum_ragged_bwd_cuda
+)
+
+
+@torch.library.register_fake("attn_gym::kda_bounded_gate_fwd_ragged")
+def _bounded_gate_cumsum_ragged_fwd_fake(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe ragged gate output and scheduler tape metadata."""
+    del A_log, dt_bias, chunk_size, lower_bound
+    return torch.empty_like(raw_gate, dtype=torch.float32), torch.empty_like(cu_seqlens)
+
+
+@torch.library.register_fake("attn_gym::kda_bounded_gate_bwd_ragged")
+def _bounded_gate_cumsum_ragged_bwd_fake(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    d_cumulative: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    chunk_size: int,
+    lower_bound: float,
+    profile_ranges: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Describe ragged gate input and parameter gradients."""
+    del d_cumulative, cu_seqlens, chunk_offsets, chunk_size, lower_bound, profile_ranges
+    return (
+        torch.empty_like(raw_gate),
+        A_log.new_empty(A_log.shape),
+        dt_bias.new_empty(dt_bias.shape),
+    )
+
+
+_bounded_gate_cumsum_ragged_fwd_op = torch.ops.attn_gym.kda_bounded_gate_fwd_ragged.default
+_bounded_gate_cumsum_ragged_bwd_op = torch.ops.attn_gym.kda_bounded_gate_bwd_ragged.default
+
+
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
@@ -510,12 +735,26 @@ class _BoundedGateCumsum(torch.autograd.Function):
         lower_bound: float,
         fastmath: bool,
         profile_ranges: bool,
+        cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
-        ctx.save_for_backward(raw_gate, A_log, dt_bias)
         ctx.chunk_size = chunk_size
         ctx.lower_bound = lower_bound
         ctx.fastmath = fastmath
         ctx.profile_ranges = profile_ranges
+        ctx.ragged = cu_seqlens is not None
+        if cu_seqlens is not None:
+            output, chunk_offsets = _bounded_gate_cumsum_ragged_fwd_op(
+                raw_gate,
+                A_log,
+                dt_bias,
+                cu_seqlens,
+                chunk_size,
+                lower_bound,
+            )
+            ctx.save_for_backward(raw_gate, A_log, dt_bias, cu_seqlens, chunk_offsets)
+            return output
+
+        ctx.save_for_backward(raw_gate, A_log, dt_bias)
         return kda_gate_chunk_cumsum(
             raw_gate,
             A_log,
@@ -528,6 +767,30 @@ class _BoundedGateCumsum(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_cumulative: torch.Tensor):
+        if ctx.ragged:
+            raw_gate, A_log, dt_bias, cu_seqlens, chunk_offsets = ctx.saved_tensors
+            dg, dA_log, d_dt_bias = _bounded_gate_cumsum_ragged_bwd_op(
+                raw_gate,
+                A_log,
+                dt_bias,
+                d_cumulative,
+                cu_seqlens,
+                chunk_offsets,
+                ctx.chunk_size,
+                ctx.lower_bound,
+                ctx.profile_ranges,
+            )
+            return (
+                dg,
+                dA_log,
+                d_dt_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
         from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import fused_gate_bwd
 
         raw_gate, A_log, dt_bias = ctx.saved_tensors
@@ -553,6 +816,7 @@ class _BoundedGateCumsum(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -565,8 +829,14 @@ def bounded_gate_cumsum(
     lower_bound: float = -5.0,
     fastmath: bool = False,
     profile_ranges: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply the bounded KDA gate with fused forward and first-order backward."""
+    """Apply a bounded KDA gate and sequence-local chunk prefix sums.
+
+    Packed ``cu_seqlens`` must start at zero, end at ``T``, and be monotonic; repeated
+    offsets represent empty sequences. Values remain device-resident and are validated
+    by the scheduler so fixed-shape CUDA Graphs can replay with different boundaries.
+    """
     if raw_gate.ndim != 4:
         raise ValueError(f"raw_gate must have shape [B, T, H, D], got {tuple(raw_gate.shape)}")
     batch, tokens, heads, head_dim = raw_gate.shape
@@ -588,8 +858,23 @@ def bounded_gate_cumsum(
             f"dt_bias must be float32 with shape {(heads, head_dim)}, "
             f"got {tuple(dt_bias.shape)} and {dt_bias.dtype}"
         )
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
+        raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed cu_seqlens require raw_gate to have batch size one")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
+        if (
+            cu_seqlens.dtype != torch.int32
+            or cu_seqlens.device != raw_gate.device
+            or not cu_seqlens.is_contiguous()
+        ):
+            raise ValueError("cu_seqlens must be contiguous CUDA int32 on raw_gate.device")
+        if fastmath:
+            raise ValueError("packed bounded_gate_cumsum does not support fastmath=True")
     return _BoundedGateCumsum.apply(
         raw_gate,
         A_log,
@@ -598,6 +883,7 @@ def bounded_gate_cumsum(
         lower_bound,
         fastmath,
         profile_ranges,
+        cu_seqlens,
     )
 
 

@@ -67,29 +67,33 @@ and the per-head output uses learned RMS normalization before sigmoid gating.
 `--backend=fused` selects the composed CuTeDSL/Triton forward and first-order
 backward, including optimized Q/K normalization, bounded-gate activation and
 prefix sum, intra-chunk solves, inter-chunk state recurrence, output
-composition, and the fused bounded-gate reverse-cumsum backward leaf.
-The kernel boundaries are labeled explicitly in profiler traces. The low-level
-gate leaf consumes the complete
-`[B, T, H, D]` gate tensor in one launch and emits per-batch, per-chunk
-partials for the shared parameter reduction. The example explicitly runs
-projections in BF16 while retaining FP32 parameters and gate reductions; no
-ambient autocast context is required.
+composition, and bounded-gate backward.
+The kernel boundaries are labeled explicitly in profiler traces. Dense gate backward
+consumes the complete `[B, T, H, D]` gate tensor in one CuTe launch and emits
+per-batch, per-chunk partials for the shared parameter reduction. Packed gate backward
+instead uses a graph-safe ragged FP32 reverse cumsum followed by the pointwise Triton
+derivative and FP32 parameter reductions. The example explicitly runs projections in BF16
+while retaining FP32 parameters and gate reductions; no ambient autocast context is
+required.
 The CuTe gate path requires a head dimension divisible by 32 in `[32, 1024]`.
-The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and complete
-64-token chunks. Dense `[B, T, H, D]` inputs are lowered internally to equal-length packed
+The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and 64-token
+chunks. Dense `[B, T, H, D]` inputs are lowered internally to equal-length packed
 sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts explicitly packed
-`[1, T, H, D]` inputs. Both forms carry sequence boundaries through the forward, backward, and
-recurrent states; each logical sequence must currently contain an integer number of 64-token
-chunks. `KDAAttention.forward` threads explicit offsets through its short
-convolution and KDA core; the gate prefix sum already resets at every aligned chunk boundary. The
-optimized boundaries are first-order and do not support higher-order autograd. Run
+`[1, T, H, D]` inputs. Both forms carry sequence boundaries through the forward,
+backward, and recurrent states; logical sequences may have tails or be empty.
+`KDAAttention.forward` threads explicit offsets through its short convolution,
+bounded-gate prefix sum, and KDA core. The optimized boundaries are first-order and do
+not support higher-order autograd. Run
 `python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`
-to sample chunk-aligned lengths from a truncated Zipf distribution, pack them into one physical
-batch, print their `cu_seqlens`, and pass those offsets through the complete training step. The complete composed
-core forward and backward use private custom operators with fake-tensor and
-autograd registrations, so the public `chunk_kda` operation supports strict
-`torch.compile(fullgraph=True)` and CUDA Graph capture. Pass `--compile` to the
-training example to compile the complete module as one full graph. This keeps
+to sample token-level lengths from a truncated Zipf distribution, pack them into one
+physical batch, print their `cu_seqlens`, and pass those offsets through the complete
+training step. Add `--padded` when chunk-aligned samples are needed. The complete
+composed core forward and backward use private custom
+operators with fake-tensor registrations and first-order autograd wrappers, so the public
+`chunk_kda` operation supports strict `torch.compile(fullgraph=True)` and CUDA Graph
+capture for fixed token and sequence counts; changing either shape requires recompilation
+or recapture. Pass `--compile` to the training example to compile the complete module as
+one full graph. This keeps
 the custom KDA core behind its registered operator boundary while allowing
 Inductor to fuse the surrounding PyTorch normalization, gating, and pointwise
 work. It can be combined with `--profile`; compilation warmups run before the
