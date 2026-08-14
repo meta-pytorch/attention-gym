@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import math
 from itertools import product
 
 import pytest
@@ -62,7 +61,12 @@ from attn_gym.linear.kda.naive import (
     l2norm_fwd_ref,
 )
 from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, ChunkMetadata, prepare_chunk_indices
-from attn_gym.testing.kda import bwd_wy_dqkg_reference as _bwd_wy_dqkg_ref
+from attn_gym.testing.kda import (
+    bwd_intra_reference as _bwd_intra_ref,
+)
+from attn_gym.testing.kda import (
+    bwd_wy_dqkg_reference as _bwd_wy_dqkg_ref,
+)
 
 IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
@@ -1913,65 +1917,6 @@ def _default_worklist(T, chunk_size, device):
         [torch.zeros(n, dtype=torch.long, device=device), torch.arange(n, device=device)], dim=1
     )
     return cu, chunk_indices
-
-
-def _bwd_intra_ref(q, k, g, beta, dAqk, dAkk, chunk_size=64, cu_seqlens=None, chunk_indices=None):
-    """fp64 oracle for ``chunk_kda_bwd_intra`` (the intra-chunk backward of the K3b/K4b
-    forward).
-
-    Given the incoming grads ``dAqk``/``dAkk`` (grad of loss w.r.t. the forward Aqk/Akk),
-    returns this stage's intra contributions (dq, dk, db, dg) with the running grads set to
-    zero. Per 64-token chunk, indexing i=query/row, j=key/col, ``exp2 = 2^{g_i - g_j}``::
-
-        Aqk path:  dq = sum_j dAqk*exp2*k_j        dk += sum_i dAqk*exp2*q_i
-                   dg  = sum_j dAqk*exp2*q_i*k_j - sum_i (same)
-        Akk path:  dk += sum_j dAkk*exp2*beta_i*k_j + sum_i dAkk*exp2*beta_i*k_i
-                   db  = sum_j dAkk * <exp2*k_i, k_j>
-                   dg += sum_j dAkk*exp2*beta_i*k_i*k_j - sum_i (same)
-
-    Both dAqk and dAkk are masked with a NON-strict causal mask (i>=j, incl. diagonal) to
-    match fla upstream. There is no ``scale`` because it is folded upstream into dAqk.
-    The final ``dg`` writer applies ``ln(2)`` for the derivative of ``2**g``.
-    """
-    B, T, H, Kd = q.shape
-    device = q.device
-    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
-    qf, kf, gf, bf = (t.to(acc) for t in (q, k, g, beta))
-    daqk, dakk = dAqk.to(acc), dAkk.to(acc)
-    dq = torch.zeros(B, T, H, Kd, dtype=acc, device=device)
-    dk = torch.zeros_like(dq)
-    dg = torch.zeros_like(dq)
-    db = torch.zeros(B, T, H, dtype=acc, device=device)
-    # Varlen work-list iteration (see ``_bwd_wy_dqkg_ref``): a partial last chunk uses only its
-    # ``valid`` rows/cols so the non-strict causal mask never straddles a document boundary.
-    if chunk_indices is None:
-        cu_seqlens, chunk_indices = _default_worklist(T, chunk_size, device)
-    cu = cu_seqlens.tolist()
-    for b in range(B):
-        for seq_idx, chunk_idx in chunk_indices.tolist():
-            bos, eos = cu[seq_idx], cu[seq_idx + 1]
-            row_start = bos + chunk_idx * chunk_size
-            cl = min(eos - row_start, chunk_size)
-            s = slice(row_start, row_start + cl)
-            mask = torch.tril(torch.ones(cl, cl, dtype=torch.bool, device=device))[:, :, None]
-            q_i, k_i, k_j = qf[b, s][:, None], kf[b, s][:, None], kf[b, s][None, :]
-            beta_i = bf[b, s][:, None, :, None]
-            exp2 = torch.exp2(gf[b, s][:, None] - gf[b, s][None, :])  # 2^{g_i - g_j}
-            aq = torch.where(mask, daqk[b, s, :, :cl].permute(0, 2, 1), 0.0)  # (i, j, H)
-            ak = torch.where(mask, dakk[b, s, :, :cl].permute(0, 2, 1), 0.0)
-
-            aqk = aq[..., None] * exp2  # (i, j, H, K)
-            t_aqk = aqk * q_i * k_j
-            dq[b, s] = (aqk * k_j).sum(1)
-            dk[b, s] = (aqk * q_i).sum(0)
-            dg[b, s] = t_aqk.sum(1) - t_aqk.sum(0)
-
-            akk = ak[..., None] * exp2 * beta_i  # (i, j, H, K)
-            t_akk = akk * k_i * k_j
-            dk[b, s] += (akk * k_j).sum(1) + (akk * k_i).sum(0)
-            db[b, s] = (ak * (exp2 * k_i * k_j).sum(-1)).sum(1)
-            dg[b, s] += t_akk.sum(1) - t_akk.sum(0)
-    return dq, dk, db, dg * math.log(2.0)
 
 
 @requires_cute
