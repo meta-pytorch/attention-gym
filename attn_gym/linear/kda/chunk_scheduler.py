@@ -54,6 +54,13 @@ class RaggedChunkMetadata(NamedTuple):
     capacity: int
     chunk_size: int
 
+    def validate_chunk_size(self, chunk_size: int) -> None:
+        """Reject consumers configured for a different logical chunk size."""
+        if self.chunk_size != chunk_size:
+            raise ValueError(
+                f"metadata chunk size must match chunk_size={chunk_size}, got {self.chunk_size}"
+            )
+
 
 class ChunkWork(NamedTuple):
     """One sequence-local chunk decoded from a global logical work index."""
@@ -114,11 +121,11 @@ def chunk_work_oracle(cu_seqlens: list[int], chunk_size: int) -> list[ChunkWork]
     return work
 
 
-@triton.jit(debug=True)
+@triton.jit(debug=True, do_not_specialize=["num_sequences"])
 def _prepare_ragged_chunk_offsets_kernel(
     cu_seqlens,
     chunk_offsets,
-    num_sequences: tl.constexpr,
+    num_sequences,
     tokens: tl.constexpr,
     chunk_size: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -148,7 +155,7 @@ def load_ragged_chunk_work(
     cu_seqlens,
     chunk_offsets,
     global_chunk,
-    num_sequences: tl.constexpr,
+    num_sequences,
     chunk_size: tl.constexpr,
 ):
     """Binary-search one known-active global chunk's sequence boundaries.
@@ -177,13 +184,12 @@ def load_ragged_chunk_work(
     return sequence, local_chunk, token_start, valid_tokens
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_sequences"])
 def _decode_ragged_chunk_work_kernel(
     cu_seqlens,
     chunk_offsets,
     work,
-    num_sequences: tl.constexpr,
-    capacity: tl.constexpr,
+    num_sequences,
     chunk_size: tl.constexpr,
 ):
     global_chunk = tl.program_id(0)
@@ -256,7 +262,6 @@ def decode_ragged_chunk_work(metadata: RaggedChunkMetadata) -> torch.Tensor:
             metadata.chunk_offsets,
             work,
             num_sequences=metadata.cu_seqlens.shape[0] - 1,
-            capacity=metadata.capacity,
             chunk_size=metadata.chunk_size,
             num_warps=1,
         )

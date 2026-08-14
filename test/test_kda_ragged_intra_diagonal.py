@@ -102,6 +102,19 @@ def test_ragged_intra_diagonal_accepts_zero_capacity():
     assert Akk.shape == (1, 0, 1, 16)
 
 
+def test_ragged_intra_diagonal_rejects_mismatched_metadata_chunk_size():
+    inputs = _inputs(128)
+    cu_seqlens = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 32)
+
+    with pytest.raises(ValueError, match="metadata chunk size must match chunk_size=64, got 32"):
+        chunk_kda_fwd_intra_diagonal(
+            *inputs,
+            scale=128**-0.5,
+            metadata=metadata,
+        )
+
+
 def test_ragged_intra_diagonal_fullgraph():
     inputs = _inputs(128)
     cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32)

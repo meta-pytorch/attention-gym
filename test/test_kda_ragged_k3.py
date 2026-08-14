@@ -8,20 +8,15 @@ import torch
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     _chunk_kda_fwd_k3b_ragged_custom_op,
+    chunk_kda_fwd_inter_solve_cute,
     chunk_kda_fwd_k3b_ragged_cute,
 )
+from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="the CuTe K3 kernel requires CUDA capability 10.0 or newer",
 )
-
-
-def _offsets(lengths: list[int]) -> list[int]:
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length)
-    return offsets
 
 
 def _inputs(tokens: int):
@@ -36,7 +31,7 @@ def _inputs(tokens: int):
 
 def _run(inputs, lengths: list[int]):
     tokens = sum(lengths)
-    cu_seqlens = torch.tensor(_offsets(lengths), device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
     Aqk, AkkOD = chunk_kda_fwd_k3b_ragged_cute(
         *inputs,
@@ -46,17 +41,30 @@ def _run(inputs, lengths: list[int]):
     return metadata, Aqk, AkkOD
 
 
-def _sequence_local_reference(inputs, lengths: list[int]):
+def _sequence_local_varlen_reference(inputs, lengths: list[int]):
     Aqk_parts = []
     AkkOD_parts = []
     start = 0
     for length in lengths:
         if length:
-            local_inputs = tuple(tensor[:, start : start + length].clone() for tensor in inputs)
-            metadata, Aqk, AkkOD = _run(local_inputs, [length])
-            active_rows = int(metadata.chunk_offsets[-1]) * 6
+            q, k, g, beta, Aqk = (tensor[:, start : start + length].clone() for tensor in inputs)
+            chunks = (length + 63) // 64
+            Akkd = torch.zeros(1, length, 1, 16, device="cuda")
+            AkkOD = torch.empty(chunks * 6, 16 * 16, device="cuda")
+            cu_seqlens = cumulative_sequence_offsets([length])
+            Aqk, _ = chunk_kda_fwd_inter_solve_cute(
+                q,
+                k,
+                g,
+                beta,
+                Akkd,
+                scale=128**-0.5,
+                cu_seqlens=cu_seqlens,
+                Aqk=Aqk,
+                AkkOD=AkkOD,
+            )
             Aqk_parts.append(Aqk)
-            AkkOD_parts.append(AkkOD[:active_rows])
+            AkkOD_parts.append(AkkOD)
         start += length
     return torch.cat(Aqk_parts, dim=1), torch.cat(AkkOD_parts)
 
@@ -65,7 +73,7 @@ def _sequence_local_reference(inputs, lengths: list[int]):
 def test_ragged_k3_matches_sequence_local_launches(lengths):
     inputs = _inputs(sum(lengths))
     metadata, actual_aqk, actual_akk_od = _run(inputs, lengths)
-    expected_aqk, expected_akk_od = _sequence_local_reference(inputs, lengths)
+    expected_aqk, expected_akk_od = _sequence_local_varlen_reference(inputs, lengths)
     active_rows = int(metadata.chunk_offsets[-1]) * 6
 
     torch.testing.assert_close(actual_aqk, expected_aqk)
@@ -83,6 +91,19 @@ def test_ragged_k3_accepts_all_empty_sequences(lengths):
     assert Aqk.shape == (1, 0, 1, 64)
     assert AkkOD.shape == (metadata.capacity * 6, 256)
     torch.testing.assert_close(AkkOD, torch.zeros_like(AkkOD))
+
+
+def test_ragged_k3_rejects_mismatched_metadata_chunk_size():
+    inputs = _inputs(128)
+    cu_seqlens = cumulative_sequence_offsets([128])
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 32)
+
+    with pytest.raises(ValueError, match="metadata chunk size must match chunk_size=64, got 32"):
+        chunk_kda_fwd_k3b_ragged_cute(
+            *inputs,
+            scale=128**-0.5,
+            metadata=metadata,
+        )
 
 
 def test_ragged_k3_custom_op_and_fullgraph():
@@ -110,8 +131,16 @@ def test_ragged_k3_custom_op_and_fullgraph():
             metadata=graph_metadata,
         )
 
+    eager_aqk_before = inputs[-1].clone()
     expected = operation(*inputs, cu_seqlens)
-    actual = torch.compile(operation, fullgraph=True)(*inputs, cu_seqlens)
+    torch.testing.assert_close(inputs[-1], eager_aqk_before)
+    assert expected[0].data_ptr() != inputs[-1].data_ptr()
+
+    compiled_inputs = tuple(tensor.clone() for tensor in inputs)
+    compiled_aqk_before = compiled_inputs[-1].clone()
+    actual = torch.compile(operation, fullgraph=True)(*compiled_inputs, cu_seqlens)
+    torch.testing.assert_close(compiled_inputs[-1], compiled_aqk_before)
+    assert actual[0].data_ptr() != compiled_inputs[-1].data_ptr()
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(actual_tensor, expected_tensor)
 
@@ -140,7 +169,7 @@ def test_ragged_k3_replays_aligned_to_ragged():
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_aqk, expected_akk_od = _sequence_local_reference(inputs, [65, 63])
+    expected_aqk, expected_akk_od = _sequence_local_varlen_reference(inputs, [65, 63])
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     torch.testing.assert_close(actual_aqk, expected_aqk)
     torch.testing.assert_close(actual_akk_od, expected_akk_od)

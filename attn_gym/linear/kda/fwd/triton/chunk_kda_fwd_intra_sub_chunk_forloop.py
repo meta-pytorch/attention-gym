@@ -61,6 +61,7 @@ from attn_gym.linear.kda.utils import (
     do_not_specialize=[
         "T",
         "num_chunks",
+        "num_sequences",
         "q_stride_t",
         "q_stride_h",
         "k_stride_t",
@@ -92,7 +93,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     IS_VARLEN: tl.constexpr,
     HAS_NUM_CHUNKS: tl.constexpr,
     IS_RAGGED: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
+    num_sequences,
     USE_INT64_OFFSETS: tl.constexpr,
     USE_GATHER: tl.constexpr,
     CAUSAL_NORMREF: tl.constexpr = True,
@@ -110,7 +111,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
         _run = i_t_orig < MAX_NT
         if IS_VARLEN and _run:
             if IS_RAGGED:
-                _run = i_t_orig < tl.load(chunk_offsets + NUM_SEQUENCES)
+                _run = i_t_orig < tl.load(chunk_offsets + num_sequences)
             elif HAS_NUM_CHUNKS:
                 _run = i_t_orig < tl.load(num_chunks)
         if _run:
@@ -120,7 +121,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                         cu_seqlens,
                         chunk_offsets,
                         i_t_orig,
-                        NUM_SEQUENCES,
+                        num_sequences,
                         BT,
                     )
                 else:
@@ -263,6 +264,8 @@ def chunk_kda_fwd_intra_diagonal(
     batch, tokens, heads, key_dim = k.shape
     if batch != 1 or key_dim != 128 or chunk_size != 64:
         raise ValueError("the diagonal KDA stage requires B=1, K=128, and chunk_size=64")
+    if isinstance(metadata, RaggedChunkMetadata):
+        metadata.validate_chunk_size(chunk_size)
 
     subchunk_size = 16
     subchunks = triton.cdiv(chunk_size, subchunk_size)
@@ -320,7 +323,7 @@ def chunk_kda_fwd_intra_diagonal(
         BT=chunk_size,
         BC=subchunk_size,
         BK=triton.next_power_of_2(key_dim),
-        NUM_SEQUENCES=metadata.cu_seqlens.shape[0] - 1 if ragged else 0,
+        num_sequences=metadata.cu_seqlens.shape[0] - 1 if ragged else 0,
         USE_GATHER=IS_GATHER_SUPPORTED,
         CAUSAL_NORMREF=False,
         GRID_NT=grid_chunks,

@@ -57,7 +57,15 @@ from attn_gym.linear.kda.utils import (
     key=["H", "K", "V", "T", "BT"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T", "num_chunks", "q_stride_t", "q_stride_h"])
+@triton.jit(
+    do_not_specialize=[
+        "T",
+        "num_chunks",
+        "num_sequences",
+        "q_stride_t",
+        "q_stride_h",
+    ]
+)
 def chunk_gla_fwd_kernel_o(
     q,
     v,
@@ -77,7 +85,7 @@ def chunk_gla_fwd_kernel_o(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
+    num_sequences,
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -94,14 +102,14 @@ def chunk_gla_fwd_kernel_o(
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         if IS_RAGGED:
-            if i_t >= tl.load(chunk_offsets + NUM_SEQUENCES):
+            if i_t >= tl.load(chunk_offsets + num_sequences):
                 return
             i_tg = i_t
             i_n, i_t, _, _ = load_ragged_chunk_work(
                 cu_seqlens,
                 chunk_offsets,
                 i_t,
-                NUM_SEQUENCES,
+                num_sequences,
                 BT,
             )
         else:
@@ -182,6 +190,53 @@ def chunk_gla_fwd_kernel_o(
 
 
 @triton.jit
+def _compose_output_tma(
+    q_desc,
+    v_desc,
+    g_desc,
+    h_desc,
+    o_desc,
+    A_desc,
+    scale,
+    batch,
+    token_start,
+    head,
+    chunk,
+    value_tile,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Compose one complete output tile with TMA-backed tensor descriptors."""
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    for key_tile in range(tl.cdiv(K, BK)):
+        key_start = key_tile * BK
+        b_q = q_desc.load([batch, token_start, head, key_start])
+        b_q = tl.reshape(b_q, [BT, BK])
+        b_g = g_desc.load([batch, token_start, head, key_start])
+        b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+
+        b_h = h_desc.load([batch, chunk, head, key_start, value_tile * BV])
+        b_h = tl.reshape(b_h, [BK, BV]).to(b_qg.dtype)
+        b_o += tl.dot(b_qg, b_h)
+
+    b_o *= scale
+    b_A = A_desc.load([batch, token_start, head, 0])
+    b_A = tl.reshape(b_A, [BT, BT])
+    offset = tl.arange(0, BT)
+    b_A = tl.where(offset[:, None] >= offset[None, :], b_A, 0.0)
+    b_v = v_desc.load([batch, token_start, head, value_tile * BV])
+    b_v = tl.reshape(b_v, [BT, BV])
+    b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+    o_desc.store(
+        [batch, token_start, head, value_tile * BV],
+        tl.reshape(b_o.to(b_v.dtype), [1, BT, 1, BV]),
+    )
+
+
+@triton.jit
 def chunk_gla_fwd_kernel_o_tma(
     q_desc,
     v_desc,
@@ -198,36 +253,29 @@ def chunk_gla_fwd_kernel_o_tma(
     BV: tl.constexpr,
 ):
     """Compose fixed KDA output tiles with TMA-backed tensor descriptors."""
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
-
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        b_q = q_desc.load([i_b, i_t * BT, i_h, i_k * BK])
-        b_q = tl.reshape(b_q, [BT, BK])
-        b_g = g_desc.load([i_b, i_t * BT, i_h, i_k * BK])
-        b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
-        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
-
-        b_h = h_desc.load([i_b, i_t, i_h, i_k * BK, i_v * BV])
-        b_h = tl.reshape(b_h, [BK, BV]).to(b_qg.dtype)
-        b_o += tl.dot(b_qg, b_h)
-
-    b_o *= scale
-    b_A = A_desc.load([i_b, i_t * BT, i_h, 0])
-    b_A = tl.reshape(b_A, [BT, BT])
-    o_i = tl.arange(0, BT)
-    b_A = tl.where(o_i[:, None] >= o_i[None, :], b_A, 0.0)
-    b_v = v_desc.load([i_b, i_t * BT, i_h, i_v * BV])
-    b_v = tl.reshape(b_v, [BT, BV])
-    b_o += tl.dot(b_A.to(b_v.dtype), b_v)
-    o_desc.store(
-        [i_b, i_t * BT, i_h, i_v * BV],
-        tl.reshape(b_o.to(b_v.dtype), [1, BT, 1, BV]),
+    value_tile, chunk, batch_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    batch, head = batch_head // H, batch_head % H
+    _compose_output_tma(
+        q_desc,
+        v_desc,
+        g_desc,
+        h_desc,
+        o_desc,
+        A_desc,
+        scale,
+        batch,
+        chunk * BT,
+        head,
+        chunk,
+        value_tile,
+        K,
+        BT,
+        BK,
+        BV,
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gla_fwd_kernel_o_ragged_tma(
     q_desc,
     v_desc,
@@ -252,42 +300,37 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
+    num_sequences,
 ):
     """Compose full ragged chunks with TMA and partial tails with masked pointers."""
     i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if global_chunk >= tl.load(chunk_offsets + NUM_SEQUENCES):
+    if global_chunk >= tl.load(chunk_offsets + num_sequences):
         return
     _, _, token_start, valid_tokens = load_ragged_chunk_work(
         cu_seqlens,
         chunk_offsets,
         global_chunk,
-        NUM_SEQUENCES,
+        num_sequences,
         BT,
     )
     if valid_tokens == BT:
-        b_o = tl.zeros([BT, BV], dtype=tl.float32)
-        for i_k in range(tl.cdiv(K, BK)):
-            b_q = q_desc.load([0, token_start, i_h, i_k * BK])
-            b_q = tl.reshape(b_q, [BT, BK])
-            b_g = g_desc.load([0, token_start, i_h, i_k * BK])
-            b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
-            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
-            b_h = h_desc.load([0, global_chunk, i_h, i_k * BK, i_v * BV])
-            b_h = tl.reshape(b_h, [BK, BV]).to(b_qg.dtype)
-            b_o += tl.dot(b_qg, b_h)
-
-        b_o *= scale
-        b_A = A_desc.load([0, token_start, i_h, 0])
-        b_A = tl.reshape(b_A, [BT, BT])
-        o_i = tl.arange(0, BT)
-        b_A = tl.where(o_i[:, None] >= o_i[None, :], b_A, 0.0)
-        b_v = v_desc.load([0, token_start, i_h, i_v * BV])
-        b_v = tl.reshape(b_v, [BT, BV])
-        b_o += tl.dot(b_A.to(b_v.dtype), b_v)
-        o_desc.store(
-            [0, token_start, i_h, i_v * BV],
-            tl.reshape(b_o.to(b_v.dtype), [1, BT, 1, BV]),
+        _compose_output_tma(
+            q_desc,
+            v_desc,
+            g_desc,
+            h_desc,
+            o_desc,
+            A_desc,
+            scale,
+            0,
+            token_start,
+            i_h,
+            global_chunk,
+            i_v,
+            K,
+            BT,
+            BK,
+            BV,
         )
     else:
         o_i = tl.arange(0, BT)
@@ -341,6 +384,8 @@ def chunk_gla_fwd_o_gk(
     metadata: ChunkMetadata | RaggedChunkMetadata | None = None,
 ) -> torch.Tensor:
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
+    if isinstance(metadata, RaggedChunkMetadata):
+        metadata.validate_chunk_size(chunk_size)
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     if metadata is None and tokens % chunk_size:
@@ -433,7 +478,7 @@ def chunk_gla_fwd_o_gk(
                 BT=chunk_size,
                 BK=block_key_dim,
                 BV=block_value_dim,
-                NUM_SEQUENCES=metadata.cu_seqlens.shape[0] - 1,
+                num_sequences=metadata.cu_seqlens.shape[0] - 1,
                 num_warps=2,
                 num_stages=3,
             )
@@ -465,7 +510,7 @@ def chunk_gla_fwd_o_gk(
             K=key_dim,
             V=value_dim,
             BT=chunk_size,
-            NUM_SEQUENCES=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
+            num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
             USE_EXP2=True,
         )
     return output
