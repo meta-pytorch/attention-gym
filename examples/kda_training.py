@@ -385,7 +385,6 @@ class KDAAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             output_final_state=return_final_state,
             fastmath=self.fastmath,
-            profile_ranges=self.profile_ranges,
         )
 
     @record_function("kda/output_normalization")
