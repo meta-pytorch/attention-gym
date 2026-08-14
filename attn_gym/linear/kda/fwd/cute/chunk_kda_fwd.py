@@ -189,7 +189,7 @@ def _chunk_kda_fwd(
             initial_state,
             chunk_size=_CHUNK_SIZE,
             output_final_state=output_final_state,
-            cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
+            metadata=metadata if metadata.has_multiple_sequences else None,
         )
     with record("kda/triton/output_composition"):
         output = chunk_gla_fwd_o_gk(

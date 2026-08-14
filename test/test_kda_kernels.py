@@ -1273,6 +1273,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         None,
         None,
         None,
+        None,
         scale,
         T,
         q.stride(1),
@@ -1281,6 +1282,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         K=K,
         V=V,
         BT=64,
+        num_sequences=0,
         USE_EXP2=True,
     )
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o T={T} H={H} K={K} V={V}")
