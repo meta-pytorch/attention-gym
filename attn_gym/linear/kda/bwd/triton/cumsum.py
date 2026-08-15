@@ -21,7 +21,6 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import (
     autotune_cache_kwargs,
     check_shared_mem,
@@ -178,88 +177,6 @@ def chunk_local_cumsum_vector_kernel(
         b_o.to(o.dtype.element_ty),
         mask=m,
     )
-
-
-@triton.jit(do_not_specialize=["num_sequences"])
-def ragged_chunk_local_cumsum_vector_kernel(
-    s,
-    o,
-    scale,
-    cu_seqlens,
-    chunk_offsets,
-    num_sequences,
-    S_STRIDES: tl.constexpr,
-    O_STRIDES: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-):
-    """Scan one device-routed sequence-local chunk in FP32."""
-    global_chunk = tl.program_id(0)
-    i_h = tl.program_id(1).to(tl.int64)
-    i_s = tl.program_id(2).to(tl.int64)
-    if global_chunk >= tl.load(chunk_offsets + num_sequences):
-        return
-
-    _sequence, _local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
-        cu_seqlens,
-        chunk_offsets,
-        global_chunk,
-        num_sequences,
-        BT,
-    )
-    token = token_start.to(tl.int64) + tl.arange(0, BT)
-    channel = i_s * BS + tl.arange(0, BS)
-    mask = (tl.arange(0, BT)[:, None] < valid_tokens) & (channel[None, :] < S)
-    values = tl.load(
-        s + ptr_offset((token[:, None], i_h, channel[None, :]), S_STRIDES),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    result = tl.cumsum(values, axis=0, reverse=REVERSE) * scale
-    tl.store(
-        o + ptr_offset((token[:, None], i_h, channel[None, :]), O_STRIDES),
-        result,
-        mask=mask,
-    )
-
-
-@input_guard(no_guard_contiguous=True)
-def ragged_chunk_local_cumsum_vector(
-    g: torch.Tensor,
-    metadata: RaggedChunkMetadata,
-    *,
-    reverse: bool,
-    scale: float,
-) -> torch.Tensor:
-    """Compute a graph-safe FP32 cumsum over device-routed ragged chunks."""
-    if g.ndim != 4 or g.shape[0] != 1:
-        raise ValueError(f"ragged vector cumsum expects shape [1, T, H, D], got {tuple(g.shape)}")
-    if metadata.cu_seqlens.device != g.device:
-        raise ValueError("ragged metadata and input must be on the same device")
-
-    output = torch.empty_like(g, dtype=torch.float32)
-    _, _, heads, head_dim = g.shape
-    block_size = 32
-    ragged_chunk_local_cumsum_vector_kernel[
-        (metadata.capacity, heads, triton.cdiv(head_dim, block_size))
-    ](
-        g,
-        output,
-        scale,
-        metadata.cu_seqlens,
-        metadata.chunk_offsets,
-        metadata.cu_seqlens.shape[0] - 1,
-        S_STRIDES=g.stride()[1:],
-        O_STRIDES=output.stride()[1:],
-        S=head_dim,
-        BT=metadata.chunk_size,
-        BS=block_size,
-        REVERSE=reverse,
-        num_warps=4,
-    )
-    return output
 
 
 @input_guard(no_guard_contiguous=("g",))

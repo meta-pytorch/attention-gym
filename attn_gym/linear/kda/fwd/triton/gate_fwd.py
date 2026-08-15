@@ -20,7 +20,6 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, storage_cosize
-from attn_gym.linear.kda.bwd.triton.cumsum import ragged_chunk_local_cumsum_vector
 from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_ragged
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
@@ -442,7 +441,7 @@ def _bounded_gate_cumsum_ragged_bwd_cuda(
     lower_bound: float,
     profile_ranges: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run ragged reverse scan, pointwise derivative, and reductions as one functional op."""
+    """Differentiate the packed gate prefix sum with one fused launch."""
     metadata = RaggedChunkMetadata(
         cu_seqlens,
         chunk_offsets,
@@ -454,20 +453,15 @@ def _bounded_gate_cumsum_ragged_bwd_cuda(
         if profile_ranges
         else nullcontext()
     ):
-        d_gate = ragged_chunk_local_cumsum_vector(
-            d_cumulative.float(),
-            metadata,
-            reverse=True,
-            scale=RCP_LN2,
-        )
-        dg_fp32, dA_log, d_dt_bias = kda_gate_bwd_ragged(
-            raw_gate[0],
+        return kda_gate_bwd_ragged(
+            raw_gate,
             A_log,
             dt_bias,
-            d_gate[0],
+            d_cumulative,
+            metadata,
             lower_bound=lower_bound,
+            scale=RCP_LN2,
         )
-    return dg_fp32.unsqueeze(0).to(raw_gate.dtype), dA_log, d_dt_bias
 
 
 torch.library.impl(
