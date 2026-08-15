@@ -53,18 +53,11 @@ def test_ragged_chunk_scheduler_matches_cpu_oracle(lengths):
     expected, offsets = _expected_tensor(lengths, 64)
     cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, offsets[-1], 64)
-    actual = decode_ragged_chunk_work(metadata).cpu()
 
     assert metadata.chunk_size == 64
-
-    active_chunks = expected.shape[0]
     assert metadata.capacity == chunk_capacity(offsets[-1], len(lengths), 64)
-    assert metadata.chunk_offsets[-1].item() == active_chunks
-    torch.testing.assert_close(actual[:active_chunks], expected)
-    torch.testing.assert_close(
-        actual[active_chunks:],
-        torch.full_like(actual[active_chunks:], -1),
-    )
+    assert metadata.chunk_offsets[-1].item() == expected.shape[0]
+    _assert_work_matches(decode_ragged_chunk_work(metadata), expected)
 
 
 @pytest.mark.parametrize("chunk_size", [16, 32, 64])
@@ -78,30 +71,40 @@ def test_ragged_chunk_scheduler_preserves_chunk_size(chunk_size):
     torch.testing.assert_close(decode_ragged_chunk_work(metadata).cpu(), expected)
 
 
-def test_ragged_chunk_scheduler_cuda_graph_replays_boundaries():
-    cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32)
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-    warm_work = decode_ragged_chunk_work(metadata)
-    del warm_work
+def _assert_work_matches(work: torch.Tensor, expected: torch.Tensor) -> None:
+    """Active rows match the CPU oracle; the capacity filler rows are -1."""
+    active_chunks = expected.shape[0]
+    torch.testing.assert_close(work[:active_chunks].cpu(), expected)
+    filler = work[active_chunks:].cpu()
+    torch.testing.assert_close(filler, torch.full_like(filler, -1))
+
+
+@pytest.mark.parametrize(
+    ("initial_offsets", "replay_offsets", "replay_lengths"),
+    (
+        pytest.param([0, 65, 128], [0, 1, 128], [1, 127], id="boundaries"),
+        pytest.param([0, 64, 128], [0, 32, 65], [32, 33], id="active-token-count"),
+    ),
+)
+def test_ragged_chunk_scheduler_cuda_graph_replay(initial_offsets, replay_offsets, replay_lengths):
+    """Reread boundaries and the active endpoint from device memory on replay."""
+    cu_seqlens = torch.tensor(initial_offsets, device="cuda", dtype=torch.int32)
+    warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, initial_offsets[-1], 64)
+    decode_ragged_chunk_work(warm_metadata)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        work = decode_ragged_chunk_work(captured_metadata)
+        metadata = prepare_ragged_chunk_metadata(cu_seqlens, initial_offsets[-1], 64)
+        work = decode_ragged_chunk_work(metadata)
 
-    cu_seqlens.copy_(torch.tensor([0, 1, 128], device="cuda", dtype=torch.int32))
+    cu_seqlens.copy_(torch.tensor(replay_offsets, device="cuda", dtype=torch.int32))
     graph.replay()
     torch.cuda.synchronize()
 
-    expected, _ = _expected_tensor([1, 127], 64)
-    active_chunks = expected.shape[0]
-    assert captured_metadata.chunk_offsets[-1].item() == active_chunks
-    torch.testing.assert_close(work[:active_chunks].cpu(), expected)
-    torch.testing.assert_close(
-        work[active_chunks:].cpu(),
-        torch.full_like(work[active_chunks:].cpu(), -1),
-    )
+    expected, _ = _expected_tensor(replay_lengths, 64)
+    assert metadata.chunk_offsets[-1].item() == expected.shape[0]
+    _assert_work_matches(work, expected)
 
 
 def test_ragged_chunk_scheduler_fullgraph():
@@ -115,26 +118,6 @@ def test_ragged_chunk_scheduler_fullgraph():
     actual_offsets, actual_work = torch.compile(operation, fullgraph=True)(cu_seqlens)
     torch.testing.assert_close(actual_offsets, expected_offsets)
     torch.testing.assert_close(actual_work, expected_work)
-
-
-def test_ragged_chunk_scheduler_replays_active_token_count():
-    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
-    prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        work = decode_ragged_chunk_work(metadata)
-
-    cu_seqlens.copy_(torch.tensor([0, 32, 65], device="cuda", dtype=torch.int32))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected, _ = _expected_tensor([32, 33], 64)
-    torch.testing.assert_close(work[: expected.shape[0]].cpu(), expected)
-    inactive_work = work[expected.shape[0] :].cpu()
-    torch.testing.assert_close(inactive_work, torch.full_like(inactive_work, -1))
 
 
 def test_ragged_chunk_capacity_is_tight_for_empty_sequences():

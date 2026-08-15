@@ -78,15 +78,20 @@ def _run_naive_gradients(
     return reference_output, reference_final_state, gradients
 
 
-def _assert_run_close(actual, expected):
+def _assert_run_close(actual, expected, active_tokens=None):
+    """Compare runs exactly on outputs/state; token tensors only over the active prefix."""
+    prefix = slice(None) if active_tokens is None else slice(None, active_tokens)
     actual_output, actual_state, actual_gradients = actual
     expected_output, expected_state, expected_gradients = expected
-    torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(actual_output[:, prefix], expected_output, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
     for actual_gradient, expected_gradient in zip(
-        actual_gradients, expected_gradients, strict=True
+        actual_gradients[:-1], expected_gradients[:-1], strict=True
     ):
-        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            actual_gradient[:, prefix], expected_gradient, rtol=3e-2, atol=3e-2
+        )
+    torch.testing.assert_close(actual_gradients[-1], expected_gradients[-1], rtol=3e-2, atol=3e-2)
 
 
 def test_public_ragged_backward_matches_independent_sequences():
@@ -241,7 +246,9 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
     with torch.no_grad():
         for tensor in inputs:
             tensor[:, active_tokens:].fill_(float("nan"))
-        output_grad[:, active_tokens:].fill_(float("nan"))
+        # The loss multiplies the full physical buffer, so the suffix cotangent
+        # must stay finite; the suffix inputs need not.
+        output_grad[:, active_tokens:].zero_()
     graph.replay()
     torch.cuda.synchronize()
 
@@ -252,17 +259,7 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
         output_grad[:, :active_tokens],
         state_grad,
     )
-    actual_output, actual_state, actual_gradients = actual
-    expected_output, expected_state, expected_gradients = expected
-    torch.testing.assert_close(actual_output[:, :active_tokens], expected_output, rtol=0, atol=0)
-    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
-    for actual_gradient, expected_gradient in zip(
-        actual_gradients[:-1], expected_gradients[:-1], strict=True
-    ):
-        torch.testing.assert_close(
-            actual_gradient[:, :active_tokens], expected_gradient, rtol=3e-2, atol=3e-2
-        )
-    torch.testing.assert_close(actual_gradients[-1], expected_gradients[-1], rtol=3e-2, atol=3e-2)
+    _assert_run_close(actual, expected, active_tokens)
 
 
 def test_dense_tail_batch_gradients_match_explicit_packed_lowering():

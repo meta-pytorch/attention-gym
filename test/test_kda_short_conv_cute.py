@@ -1346,9 +1346,9 @@ def test_short_conv_cuda_graph_replay():
     assert not torch.equal(captured_gradients[0], first_gradients[0])
     expected_output = _forward_op(x, weight)
     expected_gradients = _backward_op(x, weight, grad_output)
-    torch.testing.assert_close(captured_output, expected_output)
-    torch.testing.assert_close(captured_gradients[0], expected_gradients[0])
-    torch.testing.assert_close(captured_gradients[1], expected_gradients[1])
+    torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(captured_gradients[0], expected_gradients[0], rtol=0, atol=0)
+    torch.testing.assert_close(captured_gradients[1], expected_gradients[1], rtol=0, atol=0)
 
 
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
@@ -1393,18 +1393,20 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
         x, weight, grad_output, cu_seqlens, initial_state, *config
     )
     torch.testing.assert_close(
-        captured_output[:, :active_tokens], expected_output[:, :active_tokens]
+        captured_output[:, :active_tokens], expected_output[:, :active_tokens], rtol=0, atol=0
     )
     torch.testing.assert_close(
         captured_gradients[0][:, :active_tokens],
         expected_gradients[0][:, :active_tokens],
+        rtol=0,
+        atol=0,
     )
     for actual_gradient, expected_gradient in zip(
         captured_gradients[1:],
         expected_gradients[1:],
         strict=True,
     ):
-        torch.testing.assert_close(actual_gradient, expected_gradient)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
 
 
 def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_history():
@@ -1469,10 +1471,12 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
     torch.testing.assert_close(
         captured_gradients[0][:, :active_tokens],
         expected_gradients[0][:, :active_tokens],
+        rtol=0,
+        atol=0,
     )
     for actual_gradient, expected_gradient in zip(
         captured_gradients[1:],
         expected_gradients[1:],
         strict=True,
     ):
-        torch.testing.assert_close(actual_gradient, expected_gradient)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)

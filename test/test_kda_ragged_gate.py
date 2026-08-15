@@ -19,12 +19,13 @@ from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _bounded_gate_cumsum_ragged_fwd_op,
     bounded_gate_cumsum,
 )
-from attn_gym.testing.kda import cumulative_sequence_offsets
+from attn_gym.linear.kda.utils import RCP_LN2
+from attn_gym.testing.kda import clone_kda_inputs, cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 LOWER_BOUND = -3.25
-RCP_LN2 = 1.4426950216
+BF16_EPS = torch.finfo(torch.bfloat16).eps
 
 
 def _inputs(tokens: int, heads: int = 2, head_dim: int = 128, batch: int = 1):
@@ -36,6 +37,11 @@ def _inputs(tokens: int, heads: int = 2, head_dim: int = 128, batch: int = 1):
     dt_bias = 0.25 * torch.randn(heads, head_dim, device="cuda", dtype=torch.float32)
     d_cumulative = torch.randn(shape, device="cuda", dtype=torch.float32)
     return raw_gate, A_log, dt_bias, d_cumulative
+
+
+def _leaves(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Reuse the given storage as differentiable leaves."""
+    return tuple(tensor.detach().requires_grad_() for tensor in tensors)
 
 
 def _poison_inactive_suffix(
@@ -72,7 +78,74 @@ def _active_reference(
     return torch.cat(chunks, dim=1)
 
 
-@pytest.mark.parametrize("padding", (0, 17), ids=["full", "padded"])
+Run = tuple[torch.Tensor, tuple[torch.Tensor, ...]]
+
+
+def _run(
+    inputs: tuple[torch.Tensor, ...],
+    cu_seqlens: torch.Tensor,
+    d_cumulative: torch.Tensor,
+    chunk_size: int = 64,
+) -> Run:
+    """Run the ragged gate kernel and differentiate every leaf against one cotangent."""
+    output = bounded_gate_cumsum(
+        *inputs,
+        chunk_size=chunk_size,
+        lower_bound=LOWER_BOUND,
+        cu_seqlens=cu_seqlens,
+    )
+    return output, torch.autograd.grad(output, inputs, d_cumulative)
+
+
+def _reference_run(
+    inputs: tuple[torch.Tensor, ...],
+    lengths: list[int],
+    d_cumulative: torch.Tensor,
+    chunk_size: int = 64,
+) -> Run:
+    """Evaluate the Python reference and its gradients on the active prefix."""
+    expected = _active_reference(*inputs, lengths, chunk_size)
+    return expected, torch.autograd.grad(expected, inputs, d_cumulative[:, : sum(lengths)])
+
+
+def _assert_matches_reference(actual: Run, expected: Run, active_tokens: int, *, gate_rtol):
+    """Compare a kernel run against the Python reference over the active prefix."""
+    actual_output, actual_gradients = actual
+    expected_output, expected_gradients = expected
+    torch.testing.assert_close(
+        actual_output[:, :active_tokens], expected_output, rtol=1e-6, atol=8e-5
+    )
+    torch.testing.assert_close(
+        actual_gradients[0][:, :active_tokens],
+        expected_gradients[0][:, :active_tokens],
+        rtol=gate_rtol,
+        atol=1e-6,
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients[1:], expected_gradients[1:], strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=5e-5, atol=7e-4)
+
+
+def _assert_bitwise_match(actual: Run, other: Run, active_tokens: int) -> None:
+    """Require bit-for-bit agreement between two kernel runs over the active prefix."""
+    actual_output, actual_gradients = actual
+    other_output, other_gradients = other
+    torch.testing.assert_close(
+        actual_output[:, :active_tokens], other_output[:, :active_tokens], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual_gradients[0][:, :active_tokens],
+        other_gradients[0][:, :active_tokens],
+        rtol=0,
+        atol=0,
+    )
+    for actual_gradient, other_gradient in zip(
+        actual_gradients[1:], other_gradients[1:], strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, other_gradient, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("head_dim", "chunk_size"),
     (
@@ -81,79 +154,37 @@ def _active_reference(
         (1024, 64),
     ),
 )
-def test_bounded_gate_cumsum_ragged_matches_active_reference(head_dim, chunk_size, padding):
+def test_bounded_gate_cumsum_ragged_matches_active_reference(head_dim, chunk_size):
     """Ignore poisoned storage beyond the dynamic terminal offset in forward and backward."""
     lengths = [chunk_size + 1, 0, chunk_size - 1]
     active_tokens = sum(lengths)
-    raw_gate, A_log, dt_bias, d_cumulative = _inputs(
-        active_tokens + padding,
-        head_dim=head_dim,
-    )
+    raw_gate, A_log, dt_bias, d_cumulative = _inputs(active_tokens + 17, head_dim=head_dim)
     _poison_inactive_suffix(raw_gate, d_cumulative, active_tokens)
-    actual_inputs = tuple(
-        tensor.detach().requires_grad_() for tensor in (raw_gate, A_log, dt_bias)
-    )
-    reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in actual_inputs)
+    inputs = _leaves(raw_gate, A_log, dt_bias)
+    reference_inputs = clone_kda_inputs(inputs)
     cu_seqlens = cumulative_sequence_offsets(lengths)
 
-    actual = bounded_gate_cumsum(
-        *actual_inputs,
-        chunk_size=chunk_size,
-        lower_bound=LOWER_BOUND,
-        cu_seqlens=cu_seqlens,
-    )
-    actual_gradients = torch.autograd.grad(actual, actual_inputs, d_cumulative)
-    expected = _active_reference(*reference_inputs, lengths, chunk_size)
-    expected_gradients = torch.autograd.grad(
-        expected,
-        reference_inputs,
-        d_cumulative[:, :active_tokens],
-    )
+    actual = _run(inputs, cu_seqlens, d_cumulative, chunk_size)
+    expected = _reference_run(reference_inputs, lengths, d_cumulative, chunk_size)
+    _assert_matches_reference(actual, expected, active_tokens, gate_rtol=4 * BF16_EPS)
 
-    torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=1e-6, atol=8e-5)
-    torch.testing.assert_close(
-        actual_gradients[0][:, :active_tokens],
-        expected_gradients[0][:, :active_tokens],
-        rtol=4 * torch.finfo(torch.bfloat16).eps,
-        atol=1e-6,
+    # The padded run must also match an exactly sized kernel run bit-for-bit, which
+    # transitively pins the full-capacity (no padding) numeric path as well.
+    sliced_inputs = (
+        inputs[0][:, :active_tokens].detach().clone().requires_grad_(),
+        *clone_kda_inputs(inputs[1:]),
     )
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=5e-5, atol=7e-4)
-    torch.testing.assert_close(actual_gradients[2], expected_gradients[2], rtol=5e-5, atol=7e-4)
-
-    # The padded run must also match a physically sliced kernel run bit-for-bit.
-    sliced_gate = actual_inputs[0][:, :active_tokens].detach().clone().requires_grad_()
-    sliced_params = tuple(tensor.detach().clone().requires_grad_() for tensor in actual_inputs[1:])
-    sliced = bounded_gate_cumsum(
-        sliced_gate,
-        *sliced_params,
-        chunk_size=chunk_size,
-        lower_bound=LOWER_BOUND,
-        cu_seqlens=cu_seqlens,
-    )
-    sliced_gradients = torch.autograd.grad(
-        sliced,
-        (sliced_gate, *sliced_params),
-        d_cumulative[:, :active_tokens],
-    )
-    torch.testing.assert_close(actual[:, :active_tokens], sliced, rtol=0, atol=0)
-    torch.testing.assert_close(
-        actual_gradients[0][:, :active_tokens], sliced_gradients[0], rtol=0, atol=0
-    )
-    for actual_gradient, sliced_gradient in zip(
-        actual_gradients[1:], sliced_gradients[1:], strict=True
-    ):
-        torch.testing.assert_close(actual_gradient, sliced_gradient, rtol=0, atol=0)
+    sliced = _run(sliced_inputs, cu_seqlens, d_cumulative[:, :active_tokens], chunk_size)
+    _assert_bitwise_match(actual, sliced, active_tokens)
 
 
 def test_bounded_gate_cumsum_ragged_zero_active_tokens():
     """Produce zero parameter gradients when every physical token is inactive."""
     raw_gate, A_log, dt_bias, d_cumulative = _inputs(64)
     _poison_inactive_suffix(raw_gate, d_cumulative, 0)
-    inputs = tuple(tensor.detach().requires_grad_() for tensor in (raw_gate, A_log, dt_bias))
-    cu_seqlens = cumulative_sequence_offsets([0, 0])
+    inputs = _leaves(raw_gate, A_log, dt_bias)
 
-    output = bounded_gate_cumsum(*inputs, lower_bound=LOWER_BOUND, cu_seqlens=cu_seqlens)
-    gradients = torch.autograd.grad(output, inputs, d_cumulative)
+    output, gradients = _run(inputs, cumulative_sequence_offsets([0, 0]), d_cumulative)
 
     assert output.shape == raw_gate.shape
     torch.testing.assert_close(gradients[1], torch.zeros_like(A_log), rtol=0, atol=0)
@@ -205,12 +236,8 @@ def test_bounded_gate_cumsum_ragged_reduce_overhead():
     active_tokens = sum(lengths)
     raw_gate, A_log, dt_bias, d_cumulative = _inputs(active_tokens + 17)
     _poison_inactive_suffix(raw_gate, d_cumulative, active_tokens)
-    reference_inputs = tuple(
-        tensor.detach().requires_grad_() for tensor in (raw_gate, A_log, dt_bias)
-    )
-    compiled_inputs = tuple(
-        tensor.detach().clone().requires_grad_() for tensor in reference_inputs
-    )
+    reference_inputs = _leaves(raw_gate, A_log, dt_bias)
+    compiled_inputs = clone_kda_inputs(reference_inputs)
     cu_seqlens = cumulative_sequence_offsets(lengths)
 
     def operation(raw_gate, A_log, dt_bias, offsets):
@@ -222,29 +249,16 @@ def test_bounded_gate_cumsum_ragged_reduce_overhead():
             cu_seqlens=offsets,
         )
 
-    expected = _active_reference(*reference_inputs, lengths, 64)
-    expected_gradients = torch.autograd.grad(
-        expected,
-        reference_inputs,
-        d_cumulative[:, :active_tokens],
-    )
+    expected = _reference_run(reference_inputs, lengths, d_cumulative)
     with inductor_config.patch("triton.cudagraph_or_error", True):
         actual = torch.compile(operation, fullgraph=True, mode="reduce-overhead")(
             *compiled_inputs, cu_seqlens
         )
         actual_gradients = torch.autograd.grad(actual, compiled_inputs, d_cumulative)
 
-    torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=1e-6, atol=8e-5)
-    torch.testing.assert_close(
-        actual_gradients[0][:, :active_tokens],
-        expected_gradients[0][:, :active_tokens],
-        rtol=torch.finfo(torch.bfloat16).eps,
-        atol=1e-6,
+    _assert_matches_reference(
+        (actual, actual_gradients), expected, active_tokens, gate_rtol=BF16_EPS
     )
-    for actual_gradient, expected_gradient in zip(
-        actual_gradients[1:], expected_gradients[1:], strict=True
-    ):
-        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=5e-5, atol=7e-4)
 
 
 def test_bounded_gate_cumsum_ragged_cuda_graph_replay():
@@ -254,22 +268,14 @@ def test_bounded_gate_cumsum_ragged_cuda_graph_replay():
     fresh_gate = raw_gate.clone()
     fresh_d_cumulative = d_cumulative.clone()
     _poison_inactive_suffix(raw_gate, d_cumulative, sum(initial_lengths))
-    inputs = tuple(tensor.detach().requires_grad_() for tensor in (raw_gate, A_log, dt_bias))
+    inputs = _leaves(raw_gate, A_log, dt_bias)
     cu_seqlens = cumulative_sequence_offsets(initial_lengths)
 
-    def run(current_inputs, offsets):
-        output = bounded_gate_cumsum(
-            *current_inputs,
-            lower_bound=LOWER_BOUND,
-            cu_seqlens=offsets,
-        )
-        return output, torch.autograd.grad(output, current_inputs, d_cumulative)
-
-    run(inputs, cu_seqlens)
+    _run(inputs, cu_seqlens, d_cumulative)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual, actual_gradients = run(inputs, cu_seqlens)
+        actual = _run(inputs, cu_seqlens, d_cumulative)
 
     for replay_lengths in ([65, 0, 32], [72, 1, 72]):
         active_tokens = sum(replay_lengths)
@@ -282,40 +288,12 @@ def test_bounded_gate_cumsum_ragged_cuda_graph_replay():
         torch.cuda.synchronize()
 
         # Replay must match a fresh eager kernel run on the same storage bit-for-bit.
-        eager_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
-        eager, eager_gradients = run(eager_inputs, cu_seqlens)
-        torch.testing.assert_close(
-            actual[:, :active_tokens], eager[:, :active_tokens], rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            actual_gradients[0][:, :active_tokens],
-            eager_gradients[0][:, :active_tokens],
-            rtol=0,
-            atol=0,
-        )
-        for actual_gradient, eager_gradient in zip(
-            actual_gradients[1:], eager_gradients[1:], strict=True
-        ):
-            torch.testing.assert_close(actual_gradient, eager_gradient, rtol=0, atol=0)
+        eager = _run(clone_kda_inputs(inputs), cu_seqlens, d_cumulative)
+        _assert_bitwise_match(actual, eager, active_tokens)
 
-        reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
-        expected = _active_reference(*reference_inputs, replay_lengths, 64)
-        expected_gradients = torch.autograd.grad(
-            expected,
-            reference_inputs,
-            d_cumulative[:, :active_tokens],
-        )
-        torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=1e-6, atol=8e-5)
-        torch.testing.assert_close(
-            actual_gradients[0][:, :active_tokens],
-            expected_gradients[0][:, :active_tokens],
-            rtol=torch.finfo(torch.bfloat16).eps,
-            atol=1e-6,
-        )
-        for actual_gradient, expected_gradient in zip(
-            actual_gradients[1:], expected_gradients[1:], strict=True
-        ):
-            torch.testing.assert_close(actual_gradient, expected_gradient, rtol=5e-5, atol=7e-4)
+        reference_inputs = clone_kda_inputs(inputs)
+        expected = _reference_run(reference_inputs, replay_lengths, d_cumulative)
+        _assert_matches_reference(actual, expected, active_tokens, gate_rtol=BF16_EPS)
 
 
 @pytest.mark.parametrize(
