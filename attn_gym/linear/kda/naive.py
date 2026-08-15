@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import reduce
 from itertools import pairwise
 
 import torch
@@ -18,13 +19,15 @@ def naive_recurrent_kda(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Reference O(T) KDA delta rule. State S in [K, V], per (batch, head).
 
     Per step t (per-channel decay a_t = 2^{g_t} in R^K):
         S <- diag(a_t) S ;  delta = beta_t * (v_t - k^T S) ;  S <- S + outer(k_t, delta) ;  o_t = q^T S
 
-    Shapes: q, k, g (B, T, H, K); v (B, T, H, V); beta (B, T, H); state (B, H, K, V).
+    Shapes: q, k, g (B, T, H, K); v (B, T, H, V); beta (B, T, H); state (B, H, K, V),
+    or (N, H, K, V) over the N documents of a packed row in varlen mode.
 
     Args:
         q: query tensor
@@ -34,9 +37,41 @@ def naive_recurrent_kda(
         beta: scalar-per-head delta step size / write gate
         scale: query scale for q k^T (optional; default 1/sqrt(K))
         initial_state: initial recurrent state (B, H, K, V) (optional)
-        output_final_state: also return the final state (optional)
+        output_final_state: also return the final state (optional; in the compute dtype)
+        cu_seqlens: optional int32 offsets (varlen mode); the recurrence restarts at
+            each document boundary ``[cu_seqlens[i]:cu_seqlens[i + 1]]``.
     """
     b, t, h, k_dim = q.shape
+
+    if cu_seqlens is not None:
+        if b != 1:
+            raise ValueError(f"varlen mode packs documents into one row, got batch {b}")
+        outputs, final_states = [], []
+        for doc, (bos, eos) in enumerate(pairwise(cu_seqlens.tolist())):
+            output, final_state = naive_recurrent_kda(
+                q[:, bos:eos],
+                k[:, bos:eos],
+                v[:, bos:eos],
+                g[:, bos:eos],
+                beta[:, bos:eos],
+                scale,
+                initial_state[doc : doc + 1] if initial_state is not None else None,
+                output_final_state,
+            )
+            outputs.append(output)
+            final_states.append(final_state)
+        return (
+            torch.cat(outputs, dim=1),
+            torch.cat(final_states) if output_final_state else None,
+        )
+
+    output_dtype = q.dtype
+    optional = () if initial_state is None else (initial_state,)
+    dtype = reduce(torch.promote_types, (x.dtype for x in (k, v, g, beta, *optional)), q.dtype)
+    q, k, v, g, beta = (x.to(dtype) for x in (q, k, v, g, beta))
+    if initial_state is not None:
+        initial_state = initial_state.to(dtype)
+
     q = q * scale if scale is not None else q * k_dim**-0.5
     state = initial_state if initial_state is not None else q.new_zeros(b, h, k_dim, v.shape[-1])
     outputs = []
@@ -47,7 +82,7 @@ def naive_recurrent_kda(
         delta = delta * beta[:, i][..., None]
         state = state + torch.einsum("bhk,bhv->bhkv", k[:, i], delta)  # + outer(k, delta)
         outputs.append(torch.einsum("bhk,bhkv->bhv", q[:, i], state))  # q^T S
-    return torch.stack(outputs, dim=1), (state if output_final_state else None)
+    return torch.stack(outputs, dim=1).to(output_dtype), (state if output_final_state else None)
 
 
 def _naive_chunk_kda_step(
