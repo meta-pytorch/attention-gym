@@ -829,9 +829,9 @@ def bounded_gate_cumsum(
 
     Packed ``cu_seqlens`` must start at zero, end at or before the physical ``T``, and
     be monotonic; repeated offsets represent empty sequences. Output values and raw-gate
-    gradients are defined only on ``[0, cu_seqlens[-1])``. Values remain device-resident
-    and are validated by the scheduler so fixed-shape CUDA Graphs can replay with
-    different boundaries and active lengths.
+    gradients are defined only on ``[0, cu_seqlens[-1])``. The offsets remain
+    device-resident and are validated by the scheduler so fixed-shape CUDA Graphs can
+    replay with different boundaries and active lengths.
     """
     if raw_gate.ndim != 4:
         raise ValueError(f"raw_gate must have shape [B, T, H, D], got {tuple(raw_gate.shape)}")

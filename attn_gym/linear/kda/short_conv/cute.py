@@ -154,7 +154,19 @@ def advance_sequence_bounds(
     sequence_end: Int32,
     time: Int32,
 ):
-    """Advance packed sequence metadata when time crosses a boundary."""
+    """Advance packed sequence metadata when time crosses a boundary.
+
+    NOTE [Boundary trigger forms]: offsets are monotone with ``end <= tokens``
+    (device-asserted by the scheduler; ``sequence_bounds`` is a binary search).
+    Kernels resolve bounds at tile entry and walk ``time`` with unit stride, so
+    every boundary is hit by equality: side-effect-free refreshes may use ``>=``
+    (self-healing) or ``==`` (skips the inactive-tail re-lookup); once-only side
+    effects such as the input-gradient terminal flush MUST use ``==``. Any
+    traversal-stride change must revisit every ``== sequence_end`` trigger. The
+    ``skip_sequence_boundaries`` constexpr fast path is perf-load-bearing
+    (GB300, C=12288: 17-19% for full-capacity replays; a runtime bool loses
+    28-33%).
+    """
     if time >= sequence_end:
         sequence, sequence_start, sequence_end = sequence_bounds(cu_seqlens, time)
     return sequence, sequence_start, sequence_end
@@ -1173,7 +1185,6 @@ class CausalConv1dSiluInputGradientTma(
         channel_block, time_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
-        channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
         stage_tokens = self.tma_stage_tokens
         subtiles = self.times_per_block // stage_tokens
@@ -1193,7 +1204,6 @@ class CausalConv1dSiluInputGradientTma(
             (self.channels_per_thread, self.width),
             Float32,
         )
-        weights.fill(Float32(0.0))
         history.fill(self.dtype.cute_type(0.0))
         grad_z.fill(Float32(0.0))
         sequence, sequence_start, sequence_end = tile_sequence_bounds(
@@ -1202,9 +1212,12 @@ class CausalConv1dSiluInputGradientTma(
             Int32(batch),
             self.tokens,
         )
-        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-            for tap in cutlass.range_constexpr(self.width):
-                weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+        weight_tile = cute.local_tile(
+            weight,
+            (self.channels_per_thread, self.width),
+            (channel_group, 0),
+        )
+        weights.store(weight_tile.load().to(Float32))
         if cutlass.const_expr(initial_state is None):
             for history_offset in cutlass.range_constexpr(self.width - 1):
                 history_time = time_start + history_offset - (self.width - 1)
@@ -1245,7 +1258,7 @@ class CausalConv1dSiluInputGradientTma(
                 if output_time < self.tokens:
                     if cutlass.const_expr(cu_seqlens is not None):  # noqa: SIM102
                         if cutlass.const_expr(not skip_sequence_boundaries):  # noqa: SIM102
-                            # Equality flushes the terminal boundary once; later capacity is undefined.
+                            # Once-only flush: must be "=="; see NOTE [Boundary trigger forms].
                             if output_time == sequence_end:
                                 previous_sequence_start = sequence_start
                                 sequence, sequence_start, sequence_end = sequence_bounds(
@@ -1677,7 +1690,9 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                 if time < self.tokens:
                     active_time = True
                     if cutlass.const_expr(cu_seqlens is not None):
-                        if time >= sequence_end:
+                        # "==" skips the inactive-tail re-lookup; legal because the
+                        # walk is unit-stride -- see NOTE [Boundary trigger forms].
+                        if time == sequence_end:
                             sequence, sequence_start, sequence_end = sequence_bounds(
                                 cu_seqlens,
                                 Int32(time),

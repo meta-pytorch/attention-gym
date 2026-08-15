@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -43,16 +45,12 @@ def _run_ragged(
     q, k, w, do, dv, gk, h0, dht = inputs
     offsets = cumulative_sequence_offsets(lengths) if cu_seqlens is None else cu_seqlens
     metadata = prepare_ragged_chunk_metadata(offsets, q.shape[1], 64)
-    options = {
-        "gk": gk,
-        "h0": h0,
-        "dht": dht,
-        "scale": 128**-0.5,
-        "metadata": metadata,
-    }
-    if bv is not None:
-        return blackwell_delta_h_bwd_dhu_v1(q, k, w, do, dv, bv=bv, **options)
-    return blackwell_delta_h_bwd_dhu_dispatch(q, k, w, do, dv, **options)
+    operation = (
+        blackwell_delta_h_bwd_dhu_dispatch
+        if bv is None
+        else partial(blackwell_delta_h_bwd_dhu_v1, bv=bv)
+    )
+    return operation(q, k, w, do, dv, gk=gk, h0=h0, dht=dht, scale=128**-0.5, metadata=metadata)
 
 
 def test_ragged_delta_h_handles_all_empty_sequences():
@@ -120,7 +118,9 @@ def test_ragged_delta_h_matches_independent_sequences():
 
 @pytest.mark.parametrize("bv", [16, 32])
 @pytest.mark.parametrize(
-    "lengths", [[130, 0, 0], [63, 130]], ids=["small-partial", "large-partial"]
+    "lengths",
+    [[130, 0, 0], [63, 130]],
+    ids=["trailing-empty-sequences", "tail-then-multichunk"],
 )
 def test_ragged_delta_h_ignores_nan_poisoned_physical_suffix(bv, lengths):
     physical_tokens = 256

@@ -1275,11 +1275,13 @@ class BlackwellDeltaHBwdV1:
             while has_work:
                 w_idx = bx + tile_idx * gdx
                 bi_m = (w_idx // ((V + self.BV - 1) // self.BV)) // H
-                partial_rows = Int32(0)
+                tail_valid_rows = Int32(0)
                 if cutlass.const_expr(self.varlen):
                     seq_len = cu_seqlens[bi_m + 1] - cu_seqlens[bi_m]
                     NT = (seq_len + BT - 1) // BT
-                    partial_rows = seq_len % self.BT
+                    # Chunks iterate in reverse, so ct == 0 is the trailing
+                    # (possibly partial) chunk of this sequence.
+                    tail_valid_rows = seq_len % self.BT
                 else:
                     NT = (T + BT - 1) // BT
 
@@ -1303,12 +1305,12 @@ class BlackwellDeltaHBwdV1:
 
                     # --- MMA2: q^T(SMEM A) × do(SMEM B) → qdo_acc(TMEM) ---
                     # do is the COMPUTE-warp-produced, partial-chunk-masked
-                    # B-operand (1-stage R2S), mirroring dv2/MMA3 -- so the over-
-                    # read mask is off the MMA warp's critical path entirely.
+                    # B-operand (1-stage R2S), mirroring dv2/MMA3, so only the
+                    # A-operand tail neutralization below runs on the MMA warp.
                     qh = pq_C.wait_and_advance()
                     if cutlass.const_expr(self.varlen):  # noqa: SIM102
-                        if ct == 0 and partial_rows != 0:
-                            self._neutralize_reduction_rows(sQ, qh.index, partial_rows, mma_tid)
+                        if ct == 0 and tail_valid_rows != 0:
+                            self._neutralize_reduction_rows(sQ, qh.index, tail_valid_rows, mma_tid)
                     doh = pdob_C.wait_and_advance()
                     qdod = pqdo_P.acquire_and_advance()
                     for kp in cutlass.range(cute.size(t_q_a, mode=[2]), unroll_full=True):
@@ -1328,8 +1330,8 @@ class BlackwellDeltaHBwdV1:
                     dv2bh = pdv2b_C.wait_and_advance()
                     wh = pw_C.wait_and_advance()
                     if cutlass.const_expr(self.varlen):  # noqa: SIM102
-                        if ct == 0 and partial_rows != 0:
-                            self._neutralize_reduction_rows(sW, wh.index, partial_rows, mma_tid)
+                        if ct == 0 and tail_valid_rows != 0:
+                            self._neutralize_reduction_rows(sW, wh.index, tail_valid_rows, mma_tid)
                     wdvd = pwdv_P.acquire_and_advance()
                     for kp in cutlass.range(cute.size(t_w_a, mode=[2]), unroll_full=True):
                         mma_wdv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
@@ -1628,8 +1630,16 @@ class BlackwellDeltaHBwdV1:
     # ------------------------------------------------------------------
 
     @cute.jit
-    def _neutralize_reduction_rows(self, smem, stage, valid, tid):
-        """Zero invalid Q/W rows and publish them to the warp-issued UMMA."""
+    def _neutralize_reduction_rows(self, smem, stage, valid_rows, tid):
+        """Zero token columns ``[valid_rows, BT)`` of a Q/W stage and publish to UMMA.
+
+        MMA2/MMA3 reduce over tokens, so a tail chunk's over-read tokens must be
+        finite on both operands: the masked B-operand contributes zero, but
+        ``0 * NaN`` is NaN and the physical suffix past ``cu_seqlens[-1]`` is
+        undefined. This runs for every ragged tail, not just the terminal one,
+        because any tail's over-read window may cross the terminal offset
+        (e.g. trailing empty sequences).
+        """
         key_atom = cute.size(smem, mode=[0, 0, 0])
         token_atom = cute.size(smem, mode=[0, 1])
         # Trace-time guards for the hard-coded coordinate nesting below; a
@@ -1638,7 +1648,7 @@ class BlackwellDeltaHBwdV1:
         assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
         assert key_atom * cute.size(smem, mode=[0, 0, 1]) == self.BK, "key modes must tile BK"
         assert token_atom * cute.size(smem, mode=[2]) == self.BT, "token modes must tile BT"
-        for token in cutlass.range(valid, self.BT, unroll=1):
+        for token in cutlass.range(valid_rows, self.BT, unroll=1):
             for key_block in cutlass.range_constexpr(self.BK // self.WARP_SZ):
                 key = tid + key_block * self.WARP_SZ
                 coord = (
