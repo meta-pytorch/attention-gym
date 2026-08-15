@@ -1694,7 +1694,7 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     chunk_size: int = BT,
     dot_precision: str | MmaPrecision = "bf16",
-    experimental_prefetch: bool = True,
+    experimental_prefetch: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1721,6 +1721,10 @@ def recompute_w_u_fwd(
       - "tf32x3"          : tf32 base + first-order residual products on U for
                             ~fp32 accuracy. Only valid when A is fp32.
     The accumulator is always fp32; W is single-pass for every mode.
+
+    experimental_prefetch issues the next work item's cp.async loads during the
+    current MMA. Off by default: on B200 it measured consistently slower (44-80us
+    on 16k-33k-token dense and ragged workloads) with bitwise-identical outputs.
     """
     has_gk = gk is not None
     has_q = q is not None and has_gk
