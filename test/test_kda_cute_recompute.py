@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 import torch
 
@@ -19,6 +21,7 @@ pytestmark = pytest.mark.skipif(
 def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monkeypatch):
     from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
         _compile_recompute_w_u,
+        _recompute_w_u_fwd_cute,
         recompute_w_u_fwd,
     )
 
@@ -39,30 +42,36 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
         torch.tensor(1, device="cuda", dtype=torch.int32),
     )
 
-    def run_recompute():
+    def run_recompute(**kwargs):
         return recompute_w_u_fwd(
             k,
             v,
             beta,
             A,
             metadata=metadata,
+            **kwargs,
         )
 
-    w, u, _, _ = run_recompute()
+    # Compile-cache reuse contract lives on the CuTe kernel, which the public
+    # API no longer reaches; call the internal entry to keep it compiling.
+    w_cute, u_cute, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata)
     first_cache_info = _compile_recompute_w_u.cache_info()
-    repeated_w, repeated_u, _, _ = run_recompute()
+    repeated_w, repeated_u, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata)
     second_cache_info = _compile_recompute_w_u.cache_info()
     assert second_cache_info.hits == first_cache_info.hits + 1
     assert second_cache_info.currsize == first_cache_info.currsize
-    torch.testing.assert_close(repeated_w, w, rtol=0, atol=0)
-    torch.testing.assert_close(repeated_u, u, rtol=0, atol=0)
+    torch.testing.assert_close(repeated_w, w_cute, rtol=0, atol=0)
+    torch.testing.assert_close(repeated_u, u_cute, rtol=0, atol=0)
+
+    w, u, _, _ = run_recompute()
 
     A = A.nan_to_num().float().transpose(1, 2)
     beta = beta.transpose(1, 2)[..., None]
     expected_w = (A @ (k.transpose(1, 2).float() * beta)).transpose(1, 2)
     expected_u = (A @ (v.transpose(1, 2).float() * beta)).transpose(1, 2)
-    torch.testing.assert_close(w.float(), expected_w, rtol=2e-2, atol=0.2)
-    torch.testing.assert_close(u.float(), expected_u, rtol=2e-2, atol=0.2)
+    for actual_w, actual_u in ((w, u), (w_cute, u_cute)):
+        torch.testing.assert_close(actual_w.float(), expected_w, rtol=2e-2, atol=0.2)
+        torch.testing.assert_close(actual_u.float(), expected_u, rtol=2e-2, atol=0.2)
 
 
 def test_recompute_uses_optional_q_and_gate_arguments():
@@ -125,3 +134,134 @@ def test_recompute_rejects_mismatched_ragged_chunk_size():
 
     with pytest.raises(ValueError, match="metadata chunk size must match chunk_size=64"):
         recompute_w_u_fwd(k, v, beta, A, metadata)
+
+
+def test_recompute_fake_tensors_reach_no_launch():
+    """Fake tracing must stop at output metadata on every dispatch path."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+
+    with FakeTensorMode():
+        k = torch.empty(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16)
+        v = torch.empty_like(k)
+        q = torch.empty_like(k)
+        gk = torch.empty(1, 128, 2, 128, device="cuda", dtype=torch.float32)
+        beta = torch.empty(1, 128, 2, device="cuda")
+        A = torch.empty(1, 128, 2, 64, device="cuda", dtype=torch.bfloat16)
+        cu_seqlens = torch.empty(2, device="cuda", dtype=torch.int32)
+        chunk_indices = torch.empty(2, 2, device="cuda", dtype=torch.int32)
+        metadata = ChunkMetadata(
+            cu_seqlens, chunk_indices, torch.empty((), device="cuda", dtype=torch.int32)
+        )
+        w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+    assert w.shape == k.shape and u.shape == v.shape
+    assert qg.shape == k.shape and kg.shape == k.shape
+
+
+def test_recompute_triton_matches_cute_on_ragged_partial_chunks():
+    """Pin the default path against the CuTe kernel on tails and empty sequences."""
+    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+
+    torch.manual_seed(6)
+    lengths = [65, 0, 63, 129, 1]
+    total = sum(lengths)
+    offsets = torch.tensor([0, 65, 65, 128, 257, 258], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(offsets, total, 64)
+    k = torch.randn(1, total, 2, 128, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn_like(k) / 8
+    q = torch.randn_like(k) / 8
+    gk = -torch.rand(1, total, 2, 128, device="cuda", dtype=torch.float32)
+    beta = torch.rand(1, total, 2, device="cuda")
+    # A content is arbitrary: both paths apply identical inclusive-tril masking.
+    A = torch.randn(1, total, 2, 64, device="cuda", dtype=torch.bfloat16) / 8
+
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import _recompute_w_u_fwd_cute
+
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+    w_c, u_c, qg_c, kg_c = _recompute_w_u_fwd_cute(
+        k, v, beta, A, metadata=metadata, q=q, gk=gk, dot_precision="tf32"
+    )
+    # qg/kg are pointwise and unaffected by dot precision: bitwise.
+    torch.testing.assert_close(qg, qg_c, rtol=0, atol=0)
+    torch.testing.assert_close(kg, kg_c, rtol=0, atol=0)
+    # w/u differ only by bf16-vs-tf32 operand rounding.
+    torch.testing.assert_close(w.float(), w_c.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(u.float(), u_c.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_recompute_precision_modes_match_cute_and_tighten_error():
+    """tf32/tf32x3 run real higher-precision dots, not silently-degraded bf16."""
+    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
+        _recompute_w_u_fwd_cute,
+        recompute_w_u_fwd,
+    )
+
+    torch.manual_seed(7)
+    total = 257  # tail chunk included
+    offsets = torch.tensor([0, 129, 257], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(offsets, total, 64)
+    k = torch.randn(1, total, 2, 128, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn_like(k) / 8
+    beta = torch.rand(1, total, 2, device="cuda")
+    A = torch.randn(1, total, 2, 64, device="cuda", dtype=torch.float32) / 8
+
+    reference_u = None
+    for precision in ("bf16", "tf32", "tf32x3"):
+        w, u, _, _ = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, dot_precision=precision)
+        w_c, u_c, _, _ = _recompute_w_u_fwd_cute(
+            k, v, beta, A, metadata=metadata, dot_precision=precision
+        )
+        torch.testing.assert_close(w.float(), w_c.float(), rtol=5e-3, atol=5e-3)
+        torch.testing.assert_close(u.float(), u_c.float(), rtol=5e-3, atol=5e-3)
+        if reference_u is None:
+            # Chunkwise fp32 reference: A holds per-chunk [rows, 64] blocks.
+            reference_u = torch.zeros_like(v, dtype=torch.float32)
+            bounds = offsets.tolist()
+            for start, end in pairwise(bounds):
+                for cs in range(start, end, 64):
+                    ce = min(cs + 64, end)
+                    n = ce - cs
+                    a_blk = A[0, cs:ce, :, :n].float().permute(1, 0, 2).tril()
+                    v_blk = (v[0, cs:ce].float() * beta[0, cs:ce, :, None]).permute(1, 0, 2)
+                    reference_u[0, cs:ce] = (a_blk @ v_blk).permute(1, 0, 2)
+        errors = (u.float() - reference_u).abs().max().item()
+        if precision == "bf16":
+            bf16_error = errors
+        elif precision == "tf32x3":
+            assert errors < bf16_error, (
+                f"tf32x3 U error {errors} should beat bf16 error {bf16_error}"
+            )
+
+    with pytest.raises(ValueError, match="tf32x3"):
+        recompute_w_u_fwd(k, v, beta, A.bfloat16(), metadata=metadata, dot_precision="tf32x3")
+
+
+def test_recompute_supports_grouped_value_heads():
+    """H_V > H_K maps each value head onto its key-head group for k/gk."""
+    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
+        _recompute_w_u_fwd_cute,
+        recompute_w_u_fwd,
+    )
+
+    torch.manual_seed(8)
+    total, hk, hv = 130, 2, 4
+    offsets = torch.tensor([0, 65, 130], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(offsets, total, 64)
+    k = torch.randn(1, total, hk, 128, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn(1, total, hv, 128, device="cuda", dtype=torch.bfloat16) / 8
+    q = torch.randn(1, total, hv, 128, device="cuda", dtype=torch.bfloat16) / 8
+    gk = -torch.rand(1, total, hk, 128, device="cuda", dtype=torch.float32)
+    beta = torch.rand(1, total, hv, device="cuda")
+    A = torch.randn(1, total, hv, 64, device="cuda", dtype=torch.bfloat16) / 8
+
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+    w_c, u_c, qg_c, kg_c = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+    assert w.shape == (1, total, hv, 128) and kg.shape == (1, total, hv, 128)
+    torch.testing.assert_close(qg, qg_c, rtol=0, atol=0)
+    torch.testing.assert_close(kg, kg_c, rtol=0, atol=0)
+    torch.testing.assert_close(w.float(), w_c.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(u.float(), u_c.float(), rtol=2e-2, atol=2e-2)

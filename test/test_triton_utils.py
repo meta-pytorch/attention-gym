@@ -67,3 +67,16 @@ def test_ptr_offset_preserves_caller_selected_integer_width(index):
 
     _store_ptr_offset[(1,)](output, index, stride=stride, use_int64_offsets=True)
     assert output.item() == index * stride
+
+
+@triton.jit
+def _store_runtime_stride_offset(output, index, stride):
+    tl.store(output, ptr_offset((index,), (stride,)))
+
+
+def test_ptr_offset_accepts_runtime_strides():
+    """Stride values may be runtime scalars; only the tuple arity is static."""
+    output = torch.empty(1, device="cuda", dtype=torch.int64)
+    for stride in (3, 12288):
+        _store_runtime_stride_offset[(1,)](output, 7, stride)
+        assert output.item() == 7 * stride

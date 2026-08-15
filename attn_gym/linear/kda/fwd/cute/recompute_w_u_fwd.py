@@ -6,6 +6,17 @@
 #
 # CuTe DSL implementation of recompute_w_u_fwd (SM100 / Blackwell).
 #
+# TODO: at chunk_size=64 this tcgen05/UMMA kernel is memory-bound and its
+# operand staging (cp.async -> CVT -> swizzled SMEM -> UMMA) costs ~40% of its
+# runtime, so the register-operand Triton kernel in fwd/triton/recompute_w_u.py
+# now serves the ENTIRE public contract (all dot_precision modes and grouped
+# value heads); this kernel is unreachable from the public API and only tests
+# call `_recompute_w_u_fwd_cute` to keep it compiling. It is kept solely
+# because warp-MMA register pressure collapses at larger chunk sizes (register
+# accumulators scale with BT x K: measured ~70x cliff at BT=256; evidence in
+# PR #311) and TMEM accumulation becomes necessary there. If chunk_size never
+# grows past 64, delete this file.
+#
 # This is the narrow production CuTe path for varlen B=1 full chunks:
 # BT=64 and head_dim K=V=128. It recomputes:
 #   w  = A @ (k * beta * exp2(gk))  or A @ (k * beta) when gk is absent
@@ -70,6 +81,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
+from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
@@ -1523,9 +1535,58 @@ def recompute_w_u_fwd(
     torch.Tensor | None,
 ]:
     """
-    Recompute KDA W/U intermediates on the native CuTe path.
+    Recompute KDA W/U intermediates.
 
-    Supported scope: packed B=1, chunk_size=64, K=V=128. Legacy metadata uses
+    Computes per chunk:
+      - w = A @ (k * beta * exp2(gk)), or A @ (k * beta) without gk
+      - u = A @ (v * beta)
+      - qg = q * exp2(gk), returned only when both q and gk are provided
+      - kg = k * exp2(gk_last - gk), returned only when gk is provided
+
+    Supported scope: packed B=1, chunk_size=64; grouped value heads with
+    H_V % H_K == 0. dot_precision selects the tensor-core operand precision
+    ("bf16" default and fastest; "tf32" more accurate; "tf32x3" ~fp32 accuracy
+    on U, requires fp32 A). All modes run the register-operand Triton kernel
+    (``fwd/triton/recompute_w_u.py``) — this operator is memory-bound at
+    BT=64, so tcgen05 operand staging is pure overhead (see the module TODO
+    for why the CuTe kernel below is kept).
+    """
+    precision = _normalize_precision(dot_precision)
+    return recompute_w_u_fwd_triton(
+        k,
+        v,
+        beta,
+        A,
+        metadata,
+        q=q,
+        gk=gk,
+        chunk_size=chunk_size,
+        dot_precision=precision.value,
+    )
+
+
+def _recompute_w_u_fwd_cute(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    metadata: ChunkMetadata | RaggedChunkMetadata,
+    q: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    chunk_size: int = BT,
+    dot_precision: str | MmaPrecision = "bf16",
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """
+    Retained CuTe/UMMA reference implementation; unreachable from the public
+    API (see the module TODO). Tests call it directly to keep it compiling and
+    to pin the Triton kernel's numerics against an independent engine.
+
+    Scope: packed B=1, chunk_size=64, K=V=128. Legacy metadata uses
     its device ``num_chunks`` scalar; ragged metadata reads the active count from
     ``chunk_offsets[N]`` and masks final partial chunks. Neither path specializes
     on metadata values, so fixed-shape CUDA graph replay may change boundaries.
