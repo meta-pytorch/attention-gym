@@ -52,7 +52,8 @@ def make_inputs(args: argparse.Namespace, requires_grad: bool = False):
     query = randn(args.batch, args.heads, args.sequence_length, args.head_dim)
     local_kv = randn(args.batch, kv_heads, args.sequence_length, args.head_dim)
     sparse_kv = randn(args.batch, kv_heads, args.sparse_seq_len, args.head_dim)
-    attention_sink = randn(args.heads)
+
+    attention_sink = None
 
     scores = torch.randn(
         args.batch, args.sequence_length, args.sparse_seq_len, device=device, generator=generator
@@ -73,7 +74,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=512)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--share-kv", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--backend", nargs="+", default=["triton"], choices=["eager", "triton"])
+    parser.add_argument(
+        "--backend", nargs="+", default=["triton"], choices=["eager", "triton", "cute"]
+    )
     parser.add_argument("--calculate-bwd", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=int, default=100, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=500, help="Measurement duration in ms")
@@ -83,6 +86,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if "cute" in args.backend:
+        assert args.head_dim == 512, "cute backend requires 512 head dim"
+        assert args.dtype == "bfloat16", "cute backend requires bf16"
+        assert args.heads == 128, "cute backend requires 128 heads"
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 
@@ -157,9 +164,11 @@ def main() -> None:
             ):
                 return torch.autograd.grad(
                     _out,
-                    (_query, _local_kv, _sparse_kv, _attention_sink),
+                    (_query, _local_kv, _sparse_kv)
+                    + ((_attention_sink,) if _attention_sink is not None else ()),
                     grad_outputs=_grad_output,
                     retain_graph=True,
+                    allow_unused=True,
                 )
 
             bwd()  # warmup autograd graph
