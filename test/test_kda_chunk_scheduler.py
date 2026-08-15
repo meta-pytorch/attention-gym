@@ -117,7 +117,7 @@ def test_ragged_chunk_scheduler_fullgraph():
     torch.testing.assert_close(actual_work, expected_work)
 
 
-def test_ragged_chunk_scheduler_replays_aligned_to_ragged():
+def test_ragged_chunk_scheduler_replays_active_token_count():
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
     torch.cuda.synchronize()
@@ -127,12 +127,14 @@ def test_ragged_chunk_scheduler_replays_aligned_to_ragged():
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
         work = decode_ragged_chunk_work(metadata)
 
-    cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
+    cu_seqlens.copy_(torch.tensor([0, 32, 65], device="cuda", dtype=torch.int32))
     graph.replay()
     torch.cuda.synchronize()
 
-    expected, _ = _expected_tensor([65, 63], 64)
-    torch.testing.assert_close(work.cpu(), expected)
+    expected, _ = _expected_tensor([32, 33], 64)
+    torch.testing.assert_close(work[: expected.shape[0]].cpu(), expected)
+    inactive_work = work[expected.shape[0] :].cpu()
+    torch.testing.assert_close(inactive_work, torch.full_like(inactive_work, -1))
 
 
 def test_ragged_chunk_capacity_is_tight_for_empty_sequences():
@@ -177,7 +179,7 @@ def test_ragged_chunk_scheduler_rejects_excess_sequences():
         ([1, 64], 64),
         ([0, 65, 64], 64),
         ([0, -1, 64], 64),
-        ([0, 63], 64),
+        ([0, 65], 64),
     ],
 )
 def test_ragged_chunk_scheduler_rejects_invalid_boundaries(boundaries, tokens):

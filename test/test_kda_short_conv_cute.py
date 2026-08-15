@@ -5,6 +5,7 @@ from itertools import pairwise
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._inductor import config as inductor_config
 
 pytest.importorskip("cutlass")
 
@@ -79,7 +80,8 @@ def _packed_state_reference(
             ).transpose(1, 2)
             outputs.append(F.silu(output))
         final_states.append(extended[:, -(width - 1) :] if width > 1 else extended[:, :0])
-    return torch.cat(outputs, dim=1), torch.cat(final_states, dim=0)
+    output = torch.cat(outputs, dim=1) if outputs else x[:, :0]
+    return output, torch.cat(final_states, dim=0)
 
 
 @pytest.mark.parametrize("width", [1, 4, 5])
@@ -524,6 +526,127 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
         )
 
 
+@pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+@pytest.mark.parametrize(
+    ("tokens", "channels", "width", "boundaries"),
+    [
+        (67, 12, 5, [0, 0, 3, 17, 53]),
+        (384, 512, 4, [0, 0, 3, 17, 301]),
+        (384, 512, 4, [0, 0, 3, 17, 256]),
+        (67, 12, 5, [0, 0, 0, 0, 0]),
+        (384, 512, 4, [0, 301]),
+        (384, 512, 4, [0, 384]),
+    ],
+    ids=[
+        "generic",
+        "tma",
+        "tma-boundary",
+        "all-inactive",
+        "tma-single-sequence",
+        "tma-single-sequence-full",
+    ],
+)
+def test_short_conv_dynamic_active_endpoint_ignores_nan_suffix(
+    stateful: bool,
+    tokens: int,
+    channels: int,
+    width: int,
+    boundaries: list[int],
+):
+    """Exclude inactive physical capacity from every defined value and gradient."""
+    torch.manual_seed(23)
+    active_tokens = boundaries[-1]
+    x, weight = _inputs(tokens=tokens, channels=channels, width=width)
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+    cu_seqlens = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+    initial_state = None
+    if stateful:
+        initial_state = torch.randn(
+            cu_seqlens.shape[0] - 1,
+            width - 1,
+            channels,
+            device="cuda",
+            dtype=x.dtype,
+            requires_grad=True,
+        )
+
+    expected_x = x[:, :active_tokens].detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_state = (
+        torch.zeros(
+            cu_seqlens.shape[0] - 1,
+            width - 1,
+            channels,
+            device="cuda",
+            dtype=x.dtype,
+        )
+        if initial_state is None
+        else initial_state.detach().clone().requires_grad_()
+    )
+    expected_output, expected_final = _packed_state_reference(
+        expected_x,
+        expected_weight,
+        cu_seqlens,
+        expected_state,
+    )
+    actual_output, actual_final = cute_causal_conv1d_silu(
+        x,
+        weight,
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        return_final_state=True,
+    )
+    torch.testing.assert_close(
+        actual_output[:, :active_tokens], expected_output, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(actual_final, expected_final)
+
+    grad_output = torch.randn_like(x)
+    grad_output[:, active_tokens:].fill_(float("nan"))
+    grad_final = torch.randn_like(actual_final)
+    actual_inputs = (x, weight) if initial_state is None else (x, weight, initial_state)
+    expected_inputs = (
+        (expected_x, expected_weight)
+        if initial_state is None
+        else (expected_x, expected_weight, expected_state)
+    )
+    actual_gradients = torch.autograd.grad(
+        (actual_output, actual_final),
+        actual_inputs,
+        (grad_output, grad_final),
+    )
+    expected_gradients = torch.autograd.grad(
+        (expected_output, expected_final),
+        expected_inputs,
+        (grad_output[:, :active_tokens], grad_final),
+        allow_unused=True,
+    )
+    expected_gradients = tuple(
+        torch.zeros_like(value) if gradient is None else gradient
+        for value, gradient in zip(expected_inputs, expected_gradients, strict=True)
+    )
+    torch.testing.assert_close(
+        actual_gradients[0][:, :active_tokens],
+        expected_gradients[0],
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    torch.testing.assert_close(
+        actual_gradients[1],
+        expected_gradients[1],
+        rtol=3e-2,
+        atol=2e-1,
+    )
+    if stateful:
+        torch.testing.assert_close(
+            actual_gradients[2],
+            expected_gradients[2],
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+
 def test_short_conv_batched_forward_and_backward_match_pytorch():
     """Keep batches independent across the optimized convolution width."""
     width = 4
@@ -761,6 +884,134 @@ def test_kda_example_packed_matches_sequence_for_loop():
     actual_gradient = torch.autograd.grad(actual, packed_hidden, cotangent)[0]
     expected_gradient = torch.autograd.grad(expected, loop_hidden, cotangent)[0]
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
+
+
+def test_kda_example_masked_capacity_matches_active_run_under_graph_replay():
+    """Replay a shorter active length over a stale suffix and match an exactly sized run."""
+    torch.manual_seed(31)
+    capacity, hidden_size = 128, 32
+    model = KDAAttention(
+        hidden_size=hidden_size,
+        num_heads=1,
+        head_dim=128,
+        backend="fused",
+        device="cuda",
+        mask_inactive_capacity=True,
+    )
+    names, parameters = zip(*model.named_parameters(), strict=True)
+    hidden = torch.randn(1, capacity, hidden_size, device="cuda", requires_grad=True)
+    cotangent = torch.randn(1, capacity, hidden_size, device="cuda")
+    cu_seqlens = torch.tensor([0, 64, capacity], device="cuda", dtype=torch.int32)
+
+    def run(states, offsets, grad_output):
+        output = model(states, cu_seqlens=offsets).hidden_states
+        return output, torch.autograd.grad(output, (states, *parameters), grad_output)
+
+    run(hidden, cu_seqlens, cotangent)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output, captured_gradients = run(hidden, cu_seqlens, cotangent)
+
+    active_tokens = 96
+    active_offsets = torch.tensor([0, 33, active_tokens], device="cuda", dtype=torch.int32)
+    with torch.no_grad():
+        cu_seqlens.copy_(active_offsets)
+        hidden[:, active_tokens:].fill_(float("nan"))
+        cotangent[:, active_tokens:].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_output, expected_gradients = run(
+        hidden[:, :active_tokens].detach().clone().requires_grad_(),
+        active_offsets,
+        cotangent[:, :active_tokens],
+    )
+    torch.testing.assert_close(
+        captured_output[:, :active_tokens], expected_output, rtol=3e-2, atol=3e-2
+    )
+    assert not captured_output[:, active_tokens:].any()
+    torch.testing.assert_close(
+        captured_gradients[0][:, :active_tokens], expected_gradients[0], rtol=3e-2, atol=3e-2
+    )
+    assert not captured_gradients[0][:, active_tokens:].any()
+    for name, actual_gradient, expected_gradient in zip(
+        names,
+        captured_gradients[1:],
+        expected_gradients[1:],
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=3e-2,
+            atol=3e-2,
+            msg=lambda message, parameter=name: f"{parameter}: {message}",
+        )
+
+
+def test_kda_example_masked_capacity_supports_strict_fullgraph_autograd():
+    """Compile the reusable gradient barriers through the complete example."""
+    torch.manual_seed(32)
+    capacity, active_tokens, hidden_size = 128, 96, 32
+    model = KDAAttention(
+        hidden_size=hidden_size,
+        num_heads=1,
+        head_dim=128,
+        backend="fused",
+        device="cuda",
+        mask_inactive_capacity=True,
+    )
+    names, parameters = zip(*model.named_parameters(), strict=True)
+    hidden = torch.randn(1, capacity, hidden_size, device="cuda")
+    hidden[:, active_tokens:] = float("nan")
+    hidden.requires_grad_()
+    cotangent = torch.randn_like(hidden)
+    cotangent[:, active_tokens:].fill_(float("nan"))
+    offsets = torch.tensor([0, 33, active_tokens], device="cuda", dtype=torch.int32)
+
+    expected_hidden = hidden[:, :active_tokens].detach().clone().requires_grad_()
+    expected_output = model(expected_hidden, cu_seqlens=offsets).hidden_states
+    expected_gradients = torch.autograd.grad(
+        expected_output,
+        (expected_hidden, *parameters),
+        cotangent[:, :active_tokens],
+    )
+
+    with inductor_config.patch("triton.cudagraph_or_error", True):
+        compiled = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+        actual_output = compiled(hidden, cu_seqlens=offsets).hidden_states
+        actual_gradients = torch.autograd.grad(
+            actual_output,
+            (hidden, *parameters),
+            cotangent,
+        )
+
+    torch.testing.assert_close(
+        actual_output[:, :active_tokens], expected_output, rtol=3e-2, atol=3e-2
+    )
+    assert not actual_output[:, active_tokens:].any()
+    torch.testing.assert_close(
+        actual_gradients[0][:, :active_tokens],
+        expected_gradients[0],
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    assert not actual_gradients[0][:, active_tokens:].any()
+    for name, actual_gradient, expected_gradient in zip(
+        names,
+        actual_gradients[1:],
+        expected_gradients[1:],
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=3e-2,
+            atol=3e-2,
+            msg=lambda message, parameter=name: f"{parameter}: {message}",
+        )
 
 
 def test_short_conv_accepts_misaligned_contiguous_storage():
@@ -1101,10 +1352,10 @@ def test_short_conv_cuda_graph_replay():
 
 
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
-    """Replay the packed-state custom operators with changed device metadata."""
+    """Replay fallback kernels after changing boundaries, active length, and history."""
     x, weight = _inputs(tokens=31)
     grad_output = torch.randn_like(x)
-    cu_seqlens = torch.tensor([0, 0, 11, 31, 31], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 0, 11, 27, 27], device="cuda", dtype=torch.int32)
     initial_state = torch.randn(
         cu_seqlens.shape[0] - 1,
         weight.shape[1] - 1,
@@ -1126,9 +1377,14 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
             x, weight, grad_output, cu_seqlens, initial_state, *config
         )
 
+    active_tokens = 23
     with torch.no_grad():
         initial_state.add_(0.25)
-        cu_seqlens.copy_(torch.tensor([0, 0, 8, 31, 31], device="cuda", dtype=torch.int32))
+        cu_seqlens.copy_(
+            torch.tensor([0, 0, 8, active_tokens, active_tokens], device="cuda", dtype=torch.int32)
+        )
+        x[:, active_tokens:].fill_(float("nan"))
+        grad_output[:, active_tokens:].fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
@@ -1136,21 +1392,27 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
     expected_gradients = _configured_backward_with_state_grad_op(
         x, weight, grad_output, cu_seqlens, initial_state, *config
     )
-    torch.testing.assert_close(captured_output, expected_output)
+    torch.testing.assert_close(
+        captured_output[:, :active_tokens], expected_output[:, :active_tokens]
+    )
+    torch.testing.assert_close(
+        captured_gradients[0][:, :active_tokens],
+        expected_gradients[0][:, :active_tokens],
+    )
     for actual_gradient, expected_gradient in zip(
-        captured_gradients,
-        expected_gradients,
+        captured_gradients[1:],
+        expected_gradients[1:],
         strict=True,
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
 def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_history():
-    """Reread arbitrary boundaries and caller history in packed TMA backward replay."""
+    """Reread boundaries, active length, and caller history in packed TMA replay."""
     x, weight = _inputs(tokens=384, channels=512)
     grad_output = torch.randn_like(x)
     cu_seqlens = torch.tensor(
-        [0, 0, 3, 17, 129, 257, 384],
+        [0, 0, 3, 17, 129, 257, 301],
         device="cuda",
         dtype=torch.int32,
     )
@@ -1182,22 +1444,35 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         )
 
     first_gradients = tuple(gradient.clone() for gradient in captured_gradients)
+    active_tokens = 279
     with torch.no_grad():
         initial_state.add_(0.25)
         cu_seqlens.copy_(
-            torch.tensor([0, 1, 8, 31, 130, 300, 384], device="cuda", dtype=torch.int32)
+            torch.tensor(
+                [0, 1, 8, 31, 130, 250, active_tokens],
+                device="cuda",
+                dtype=torch.int32,
+            )
         )
+        x[:, active_tokens:].fill_(float("nan"))
+        grad_output[:, active_tokens:].fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
-    assert not torch.equal(captured_gradients[0], first_gradients[0])
+    assert not torch.equal(
+        captured_gradients[0][:, :active_tokens], first_gradients[0][:, :active_tokens]
+    )
     assert not torch.equal(captured_gradients[1], first_gradients[1])
     expected_gradients = _configured_backward_with_state_grad_op(
         x, weight, grad_output, cu_seqlens, initial_state, *config
     )
+    torch.testing.assert_close(
+        captured_gradients[0][:, :active_tokens],
+        expected_gradients[0][:, :active_tokens],
+    )
     for actual_gradient, expected_gradient in zip(
-        captured_gradients,
-        expected_gradients,
+        captured_gradients[1:],
+        expected_gradients[1:],
         strict=True,
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient)

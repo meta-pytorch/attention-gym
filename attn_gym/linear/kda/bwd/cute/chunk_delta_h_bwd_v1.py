@@ -1267,6 +1267,7 @@ class BlackwellDeltaHBwdV1:
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_id == self.MMA_WARP_ID:
             cute.arch.setmaxregister_decrease(self.aux_regs)
+            mma_tid = tid - self.MMA_WARP_ID * self.WARP_SZ
 
             tile_idx = Int32(0)
             has_work = tile_idx < n_iters
@@ -1274,13 +1275,15 @@ class BlackwellDeltaHBwdV1:
             while has_work:
                 w_idx = bx + tile_idx * gdx
                 bi_m = (w_idx // ((V + self.BV - 1) // self.BV)) // H
+                partial_rows = Int32(0)
                 if cutlass.const_expr(self.varlen):
-                    tok_m = cu_seqlens[bi_m]
-                    NT = (cu_seqlens[bi_m + 1] - tok_m + BT - 1) // BT
+                    seq_len = cu_seqlens[bi_m + 1] - cu_seqlens[bi_m]
+                    NT = (seq_len + BT - 1) // BT
+                    partial_rows = seq_len % self.BT
                 else:
                     NT = (T + BT - 1) // BT
 
-                for _ct in cutlass.range(0, NT, unroll=0):
+                for ct in cutlass.range(0, NT, unroll=0):
                     # --- MMA1: k(SMEM A) × dh(SMEM B) → dv_acc(TMEM) ---
                     dhbh = pdhb_C.wait_and_advance()
                     kh = pk_C.wait_and_advance()
@@ -1303,6 +1306,9 @@ class BlackwellDeltaHBwdV1:
                     # B-operand (1-stage R2S), mirroring dv2/MMA3 -- so the over-
                     # read mask is off the MMA warp's critical path entirely.
                     qh = pq_C.wait_and_advance()
+                    if cutlass.const_expr(self.varlen):  # noqa: SIM102
+                        if ct == 0 and partial_rows != 0:
+                            self._neutralize_reduction_rows(sQ, qh.index, partial_rows, mma_tid)
                     doh = pdob_C.wait_and_advance()
                     qdod = pqdo_P.acquire_and_advance()
                     for kp in cutlass.range(cute.size(t_q_a, mode=[2]), unroll_full=True):
@@ -1321,6 +1327,9 @@ class BlackwellDeltaHBwdV1:
                     # --- MMA3: w(SMEM A) × dv2(SMEM B) → wdv_acc(TMEM) ---
                     dv2bh = pdv2b_C.wait_and_advance()
                     wh = pw_C.wait_and_advance()
+                    if cutlass.const_expr(self.varlen):  # noqa: SIM102
+                        if ct == 0 and partial_rows != 0:
+                            self._neutralize_reduction_rows(sW, wh.index, partial_rows, mma_tid)
                     wdvd = pwdv_P.acquire_and_advance()
                     for kp in cutlass.range(cute.size(t_w_a, mode=[2]), unroll_full=True):
                         mma_wdv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
@@ -1615,8 +1624,32 @@ class BlackwellDeltaHBwdV1:
         tmem.free(tp)
 
     # ------------------------------------------------------------------
-    # TMA partition helpers
+    # SMEM and TMA helpers
     # ------------------------------------------------------------------
+
+    @cute.jit
+    def _neutralize_reduction_rows(self, smem, stage, valid, tid):
+        """Zero invalid Q/W rows and publish them to the warp-issued UMMA."""
+        key_atom = cute.size(smem, mode=[0, 0, 0])
+        token_atom = cute.size(smem, mode=[0, 1])
+        # Trace-time guards for the hard-coded coordinate nesting below; a
+        # make_smem_layout_a change that reshapes the atom would otherwise
+        # silently redirect these writes inside the same buffer.
+        assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
+        assert key_atom * cute.size(smem, mode=[0, 0, 1]) == self.BK, "key modes must tile BK"
+        assert token_atom * cute.size(smem, mode=[2]) == self.BT, "token modes must tile BT"
+        for token in cutlass.range(valid, self.BT, unroll=1):
+            for key_block in cutlass.range_constexpr(self.BK // self.WARP_SZ):
+                key = tid + key_block * self.WARP_SZ
+                coord = (
+                    ((key % key_atom, key // key_atom), token % token_atom),
+                    0,
+                    token // token_atom,
+                    stage,
+                )
+                smem[coord] = self.io_type(0.0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
 
     @cute.jit
     def _part_a(self, atom, desc, smem, tile, mma, batch, head):

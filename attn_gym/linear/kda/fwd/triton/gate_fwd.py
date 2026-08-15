@@ -367,7 +367,7 @@ def bounded_gate_cumsum_ragged(
     chunk_size: int,
     lower_bound: float,
 ) -> tuple[torch.Tensor, RaggedChunkMetadata]:
-    """Prepare device routing and run the graph-safe packed gate forward."""
+    """Run the graph-safe gate over the device-selected active token prefix."""
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, raw_gate.shape[1], chunk_size)
     output = torch.empty_like(raw_gate, dtype=torch.float32)
     _, _, heads, head_dim = raw_gate.shape
@@ -827,9 +827,11 @@ def bounded_gate_cumsum(
 ) -> torch.Tensor:
     """Apply a bounded KDA gate and sequence-local chunk prefix sums.
 
-    Packed ``cu_seqlens`` must start at zero, end at ``T``, and be monotonic; repeated
-    offsets represent empty sequences. Values remain device-resident and are validated
-    by the scheduler so fixed-shape CUDA Graphs can replay with different boundaries.
+    Packed ``cu_seqlens`` must start at zero, end at or before the physical ``T``, and
+    be monotonic; repeated offsets represent empty sequences. Output values and raw-gate
+    gradients are defined only on ``[0, cu_seqlens[-1])``. Values remain device-resident
+    and are validated by the scheduler so fixed-shape CUDA Graphs can replay with
+    different boundaries and active lengths.
     """
     if raw_gate.ndim != 4:
         raise ValueError(f"raw_gate must have shape [B, T, H, D], got {tuple(raw_gate.shape)}")

@@ -44,9 +44,9 @@ class RaggedChunkMetadata(NamedTuple):
             different chunking scheme.
 
     On CUDA Graph replay, values in ``cu_seqlens`` may change from aligned to ragged
-    without host synchronization or recapture, provided the total token and
-    sequence tensor shapes remain fixed. Changing either shape requires a separate
-    compiled or captured graph, as it does for the input tensors themselves.
+    without host synchronization or recapture, provided the physical token capacity
+    and sequence tensor shapes remain fixed. The terminal offset is the dynamic active
+    token count and may be smaller than the physical capacity.
     """
 
     cu_seqlens: torch.Tensor
@@ -135,13 +135,7 @@ def _prepare_ragged_chunk_offsets_kernel(
     sequence_mask = sequence < num_sequences
     begin = tl.load(cu_seqlens + sequence, mask=sequence_mask, other=0)
     end = tl.load(cu_seqlens + sequence + 1, mask=sequence_mask, other=0)
-    valid = (
-        (begin >= 0)
-        & (begin <= end)
-        & (end <= tokens)
-        & ((sequence != 0) | (begin == 0))
-        & ((sequence != num_sequences - 1) | (end == tokens))
-    )
+    valid = (begin >= 0) & (begin <= end) & (end <= tokens) & ((sequence != 0) | (begin == 0))
     tl.device_assert(valid, "invalid packed cu_seqlens", mask=sequence_mask)
 
     count = tl.where(sequence_mask & valid, (end - begin + chunk_size - 1) // chunk_size, 0)

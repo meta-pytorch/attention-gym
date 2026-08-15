@@ -80,21 +80,79 @@ The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and 6
 chunks. Dense `[B, T, H, D]` inputs are lowered internally to equal-length packed
 sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts explicitly packed
 `[1, T, H, D]` inputs. Both forms carry sequence boundaries through the forward,
-backward, and recurrent states; logical sequences may have tails or be empty.
+backward, and recurrent states; logical sequences may have tails or be empty. For
+fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
+values outside `[0, cu_seqlens[-1])` are unspecified. Primitives deliberately do not mask
+this inactive suffix automatically; caller-owned masking keeps that cost out of each
+primitive hot path.
+
+Callers that use dynamic active lengths within fixed-capacity tensors must opt in to
+masking. Ragged primitives read only `[0, cu_seqlens[-1])` from token-shaped inputs,
+including output cotangents, and leave the suffix of token-shaped outputs and input
+gradients unspecified. Four edge rules make those primitives safe to compose:
+
+- **Caller buffer → ordinary operation:** value-mask the buffer. A zero cotangent does
+  not neutralize a NaN activation in a weight reduction: `0 * NaN` is still NaN.
+- **Parameterized producer → ragged primitive:** add a gradient barrier so the
+  primitive's unspecified input-gradient suffix cannot enter the producer's reduction.
+- **Ragged primitive → ordinary operation:** value-mask the primitive output before the
+  ordinary operation saves it for backward.
+- **Ragged primitive → ragged primitive:** do nothing; neither primitive reads the
+  inactive suffix.
+
+Construct one device-resident predicate inside the captured graph and reuse it at every
+boundary. This keeps all masks consistent and lets replay recompute them when
+`cu_seqlens[-1]` changes without a host read or recapture.
+
+```python
+from attn_gym.linear.kda import (
+    active_token_mask,
+    mask_inactive_token_gradients,
+    mask_inactive_tokens,
+)
+
+active_mask = active_token_mask(hidden, cu_seqlens)
+hidden = mask_inactive_tokens(hidden, active_mask)  # Caller → ordinary projection.
+projected = input_projection(hidden)
+projected = mask_inactive_token_gradients(projected, active_mask)
+stage = ragged_primitive_one(projected, cu_seqlens=cu_seqlens)
+output = ragged_primitive_two(stage, cu_seqlens=cu_seqlens)  # No mask between primitives.
+output = mask_inactive_tokens(output, active_mask)
+output = output_projection(output)
+output = mask_inactive_token_gradients(output, active_mask)  # Model boundary.
+```
+
+`mask_inactive_token_gradients(x, active_mask)` broadcasts the predicate as
+`[1, T, 1, ...]` and evaluates `torch.where(mask, x, x.detach())`. It preserves forward
+values but materializes an elementwise result; its purpose is masked automatic-
+differentiation semantics, not a free forward identity. Automatic-differentiation paths
+are zero on inactive rows, and subsequent derivatives inherit the same mask. Recurrent
+and convolution states have one row per logical sequence rather than one row per physical
+token, so token masks must not be applied to them.
+
+::: attn_gym.linear.kda.active_token_mask
+
+::: attn_gym.linear.kda.mask_inactive_tokens
+
+::: attn_gym.linear.kda.mask_inactive_token_gradients
+
 `KDAAttention.forward` threads explicit offsets through its short convolution,
-bounded-gate prefix sum, and KDA core. The optimized boundaries are first-order and do
-not support higher-order autograd. Run
+bounded-gate prefix sum, and KDA core. Set `mask_inactive_capacity=True` only when the
+packed tensor reserves physical rows beyond `cu_seqlens[-1]`; dense and exact-packed
+callers leave it disabled and pay no masking cost. The optimized boundaries are
+first-order and do not support higher-order autograd. Run
 `python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`
-to sample token-level lengths from a truncated Zipf distribution, pack them into one
-physical batch, print their `cu_seqlens`, and pass those offsets through the complete
-training step. Add `--padded` when chunk-aligned samples are needed. The complete
-composed core forward and backward use private custom
+to sample token-level lengths from a truncated Zipf distribution, pack them exactly
+into one physical batch, print their `cu_seqlens`, and pass those offsets through the
+complete training step. Add `--padded` when chunk-aligned samples are needed. The
+complete composed core forward and backward use private custom
 operators with fake-tensor registrations and first-order autograd wrappers, so the public
 `chunk_kda` operation supports strict `torch.compile(fullgraph=True)` and CUDA Graph
-capture for fixed token and sequence counts; changing either shape requires recompilation
-or recapture. Pass `--compile` to the training example to compile the complete module as
-one full graph. This keeps
-the custom KDA core behind its registered operator boundary while allowing
+capture for fixed physical token capacity and sequence count. Boundary values and the active
+token count may change on replay; changing the physical token capacity or sequence count
+requires recompilation or recapture. Pass `--compile` to compile the complete example as
+one full graph. This keeps the custom KDA core behind its registered operator boundary
+while allowing
 Inductor to fuse the surrounding PyTorch normalization, gating, and pointwise
 work. It can be combined with `--profile`; compilation warmups run before the
 trace starts. Like FLA's default training path, its backward recomputes the W/U,
@@ -129,10 +187,10 @@ the production structure but remain ordinary PyTorch teaching implementations.
 For integrations that fuse gate activation with its forward chunk prefix sum,
 `naive_chunk_kda_from_cumulative` exposes the matching reference boundary. Its
 cumulative log2 gate is inclusive and resets at the same `chunk_size` passed to
-KDA; the function does not perform a second cumulative sum. The composed `chunk_kda` backend consumes this same representation. That
-trainable operator remains intentionally narrow: physical batch size one, complete
-64-token chunks within every fixed or packed sequence, BF16 kernel operands,
-`head_dim=128`, `chunk_size=64`, and Blackwell.
+KDA; the function does not perform a second cumulative sum. The composed `chunk_kda`
+backend consumes this same representation. That trainable operator remains intentionally
+narrow: explicit packed inputs use physical batch size one, kernel operands are BF16,
+`head_dim=128`, `chunk_size=64`, and execution requires Blackwell.
 
 ::: attn_gym.linear.naive_chunk_kda
 
