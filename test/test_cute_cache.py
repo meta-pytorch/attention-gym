@@ -165,6 +165,9 @@ def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
         def get_name() -> str:
             return "stable_kernel_name"
 
+        def set_name_prefix(self, name: str) -> None:
+            observed["name_prefix"] = name
+
     monkeypatch.setattr(cute, "compile", FakeCompile())
     monkeypatch.setattr(
         cute.runtime,
@@ -178,7 +181,8 @@ def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
         "option": cute.EnableTVMFFI,
         "entrypoint": entrypoint,
         "args": (fake_tensor, fake_stream),
-        "kwargs": {"_name_prefix": "stable_kernel_name"},
+        "kwargs": {},
+        "name_prefix": "stable_kernel_name",
     }
 
 

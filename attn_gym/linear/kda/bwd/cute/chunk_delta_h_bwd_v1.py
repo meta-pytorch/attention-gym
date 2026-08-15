@@ -609,6 +609,7 @@ class BlackwellDeltaHBwdV1:
         self.shared_type = Shared
         self.grid = self._launch_grid(B, H, V)
 
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             mma_dv,
             mma_qdo,
@@ -656,7 +657,6 @@ class BlackwellDeltaHBwdV1:
             use_gk,
             use_dht,
             use_dh0,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=self.grid,
             block=[self.CTA_THREADS, 1, 1],
