@@ -896,6 +896,7 @@ class ShortConvTmaKernel:
     def make_pipeline(
         self,
         tidx: Int32,
+        batch: Int32,
         tma_atom_x: cute.CopyAtom,
         tma_tensor_x: cute.Tensor,
         tma_atom_dy: cute.CopyAtom,
@@ -932,8 +933,8 @@ class ShortConvTmaKernel:
         )
 
         cta_tiler = (self.tma_stage_tokens, channels_per_block)
-        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None))
-        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None))
+        gX_tiles = cute.local_tile(tma_tensor_x, cta_tiler, (None, None, batch))
+        gD_tiles = cute.local_tile(tma_tensor_dy, cta_tiler, (None, None, batch))
         tXsX, tXgX = cpasync.tma_partition(
             tma_atom_x,
             0,
@@ -970,22 +971,28 @@ class ShortConvTmaKernel:
 
     @cute.jit
     def make_tma_atoms(self, x: cute.Tensor, grad_output: cute.Tensor):
-        """Build matching TMA load atoms for input and output-gradient tiles."""
+        """Build matching per-batch TMA load atoms for input and output-gradient tiles."""
         staged = self.staged_layout()
         cta_tiler = (
             self.tma_stage_tokens,
             self.threads * self.channels_per_thread,
         )
+        # Keep the batch mode separate so a partial trailing time box clamps
+        # (zero-fills) inside its own batch instead of straddling batch rows.
+        batched = cute.make_layout(
+            (self.tokens, self.channels, self.batches),
+            stride=(self.channels, 1, self.tokens * self.channels),
+        )
         load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
             load_op,
-            x,
+            cute.make_tensor(x.iterator, batched),
             staged,
             cta_tiler,
         )
         tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
             load_op,
-            grad_output,
+            cute.make_tensor(grad_output.iterator, batched),
             staged,
             cta_tiler,
         )
@@ -1172,12 +1179,13 @@ class CausalConv1dSiluInputGradientTma(
             tDgD,
         ) = self.make_pipeline(
             tidx,
+            Int32(batch),
             tma_atom_x,
             tma_tensor_x,
             tma_atom_dy,
             tma_tensor_dy,
         )
-        first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
+        first_time_tile = Int32(time_start // stage_tokens)
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_x)
             cpasync.prefetch_descriptor(tma_atom_dy)
@@ -1454,12 +1462,13 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             tDgD,
         ) = self.make_pipeline(
             tidx,
+            Int32(batch),
             tma_atom_x,
             tma_tensor_x,
             tma_atom_dy,
             tma_tensor_dy,
         )
-        first_time_tile = Int32((batch * self.tokens + time_start) // stage_tokens)
+        first_time_tile = Int32(time_start // stage_tokens)
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_x)
@@ -1902,20 +1911,22 @@ def supports_tma(
     operation_type: type[ShortConvTmaKernel],
     config: ShortConvConfig,
     selected_config: ShortConvConfig | None,
-    tokens: int,
     channels: int,
     width: int,
     num_sequences: int | None,
     *,
     packed_supported: bool = False,
 ) -> bool:
-    """Return whether a measured TMA specialization supports this static problem."""
+    """Return whether the TMA gradient kernels support this static schedule.
+
+    TMA zero-fills out-of-bounds token rows, so any token count works; only the
+    schedule's channel and stage divisibility matter.
+    """
     return (
         config == selected_config
         and width > 1
         and channels % (config.threads * config.channels_per_thread) == 0
         and config.times_per_block % operation_type.tma_stage_tokens == 0
-        and tokens % operation_type.tma_stage_tokens == 0
         and (num_sequences is None or packed_supported)
     )
 
@@ -1938,7 +1949,6 @@ def _compile_input_gradient(
         None
         if dtype.name == "fp32" and num_sequences is None
         else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
-        tokens,
         channels,
         width,
         num_sequences,
@@ -1986,7 +1996,6 @@ def _compile_weight_gradient(
         CausalConv1dSiluWeightGradientPartialsTma,
         config,
         tuned_config(dtype, packed=num_sequences is not None).weight_gradient,
-        tokens,
         channels,
         width,
         num_sequences,
