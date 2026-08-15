@@ -154,7 +154,6 @@ def test_short_conv_packed_defaults_select_tma(dtype: torch.dtype):
         cute_backend.CausalConv1dSiluInputGradientTma,
         defaults.input_gradient,
         cute_backend.tuned_config(descriptor, packed=True).input_gradient,
-        384,
         512,
         4,
         7,
@@ -164,7 +163,6 @@ def test_short_conv_packed_defaults_select_tma(dtype: torch.dtype):
         cute_backend.CausalConv1dSiluWeightGradientPartialsTma,
         defaults.weight_gradient,
         cute_backend.tuned_config(descriptor, packed=True).weight_gradient,
-        384,
         512,
         4,
         7,
@@ -292,13 +290,15 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
     ("width", "dtype"),
     [(3, torch.bfloat16), (4, torch.float32), (5, torch.float16)],
 )
+@pytest.mark.parametrize("tokens", [384, 379])
 def test_short_conv_tma_backward_matches_batched_reference(
     width: int,
     dtype: torch.dtype,
+    tokens: int,
 ):
-    """Exercise aligned dense batches through the selected TMA schedules."""
+    """Exercise dense batches, including partial trailing TMA boxes, through TMA schedules."""
     torch.manual_seed(7)
-    x, weight = _inputs(tokens=384, channels=256, width=width, batch=2, dtype=dtype)
+    x, weight = _inputs(tokens=tokens, channels=256, width=width, batch=2, dtype=dtype)
     grad_output = torch.randn_like(x)
 
     actual = cute_causal_conv1d_silu(x, weight)
@@ -368,14 +368,15 @@ def test_short_conv_tma_input_gradient_wider_than_time_tile():
     torch.testing.assert_close(actual_dx, expected_dx, rtol=3e-2, atol=3e-2)
 
 
-def test_short_conv_packed_tma_backward_matches_fallback():
+@pytest.mark.parametrize("tokens", [384, 379])
+def test_short_conv_packed_tma_backward_matches_fallback(tokens: int):
     """Stage physical tiles while resetting both gradients at arbitrary boundaries."""
     dtype = torch.bfloat16
     torch.manual_seed(8)
-    x, weight = _inputs(tokens=384, channels=512, width=4, dtype=dtype)
+    x, weight = _inputs(tokens=tokens, channels=512, width=4, dtype=dtype)
     grad_output = torch.randn_like(x)
     cu_seqlens = torch.tensor(
-        [0, 0, 3, 17, 18, 129, 257, 384],
+        [0, 0, 3, 17, 18, 129, 257, tokens],
         device="cuda",
         dtype=torch.int32,
     )
@@ -408,7 +409,9 @@ def test_short_conv_packed_tma_backward_matches_fallback():
         case torch.float16:
             fallback_rtol, input_atol, weight_atol = 1e-4, 2e-3, 8e-3
         case torch.bfloat16:
-            fallback_rtol, input_atol, weight_atol = 1e-4, 1e-4, 1e-4
+            # One bf16 ULP of headroom: partial trailing time blocks change dw's
+            # FP32 partial-reduction boundaries between the TMA and fallback trees.
+            fallback_rtol, input_atol, weight_atol = 1e-2, 1e-4, 1e-4
         case torch.float32:
             fallback_rtol, input_atol, weight_atol = 1e-6, 5e-6, 2e-5
         case _:
