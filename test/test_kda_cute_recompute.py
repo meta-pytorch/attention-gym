@@ -39,30 +39,36 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
         torch.tensor(1, device="cuda", dtype=torch.int32),
     )
 
-    def run_recompute():
+    def run_recompute(**kwargs):
         return recompute_w_u_fwd(
             k,
             v,
             beta,
             A,
             metadata=metadata,
+            **kwargs,
         )
 
-    w, u, _, _ = run_recompute()
+    # Compile-cache reuse contract lives on the CuTe path (tf32); the default
+    # bf16 path routes to the register-operand Triton kernel.
+    w_cute, u_cute, _, _ = run_recompute(dot_precision="tf32")
     first_cache_info = _compile_recompute_w_u.cache_info()
-    repeated_w, repeated_u, _, _ = run_recompute()
+    repeated_w, repeated_u, _, _ = run_recompute(dot_precision="tf32")
     second_cache_info = _compile_recompute_w_u.cache_info()
     assert second_cache_info.hits == first_cache_info.hits + 1
     assert second_cache_info.currsize == first_cache_info.currsize
-    torch.testing.assert_close(repeated_w, w, rtol=0, atol=0)
-    torch.testing.assert_close(repeated_u, u, rtol=0, atol=0)
+    torch.testing.assert_close(repeated_w, w_cute, rtol=0, atol=0)
+    torch.testing.assert_close(repeated_u, u_cute, rtol=0, atol=0)
+
+    w, u, _, _ = run_recompute()
 
     A = A.nan_to_num().float().transpose(1, 2)
     beta = beta.transpose(1, 2)[..., None]
     expected_w = (A @ (k.transpose(1, 2).float() * beta)).transpose(1, 2)
     expected_u = (A @ (v.transpose(1, 2).float() * beta)).transpose(1, 2)
-    torch.testing.assert_close(w.float(), expected_w, rtol=2e-2, atol=0.2)
-    torch.testing.assert_close(u.float(), expected_u, rtol=2e-2, atol=0.2)
+    for actual_w, actual_u in ((w, u), (w_cute, u_cute)):
+        torch.testing.assert_close(actual_w.float(), expected_w, rtol=2e-2, atol=0.2)
+        torch.testing.assert_close(actual_u.float(), expected_u, rtol=2e-2, atol=0.2)
 
 
 def test_recompute_uses_optional_q_and_gate_arguments():

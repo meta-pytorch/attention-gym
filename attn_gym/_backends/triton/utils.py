@@ -8,8 +8,12 @@ import triton.language as tl
 
 
 @triton.jit
-def ptr_offset(indices, strides: tl.constexpr):
-    """Compute a broadcasted linear offset from index and stride tuples."""
+def ptr_offset(indices, strides):
+    """Compute a broadcasted linear offset from index and stride tuples.
+
+    Only the tuple arity must be static; stride values may be runtime scalars
+    (e.g. a strided token dimension), and compile-time values still fold.
+    """
     tl.static_assert(len(indices) == len(strides), "indices and strides must have equal length")
     offset = 0
     for axis in tl.static_range(len(strides)):

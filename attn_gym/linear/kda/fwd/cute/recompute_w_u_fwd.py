@@ -6,6 +6,16 @@
 #
 # CuTe DSL implementation of recompute_w_u_fwd (SM100 / Blackwell).
 #
+# TODO: at chunk_size=64 this tcgen05/UMMA kernel is memory-bound and its
+# operand staging (cp.async -> CVT -> swizzled SMEM -> UMMA) costs ~40% of its
+# runtime, so the register-operand Triton kernel in fwd/triton/recompute_w_u.py
+# is the default bf16 path. This kernel is kept only because warp-MMA register
+# pressure collapses at larger chunk sizes (measured ~70x cliff at BT=256; see
+# agent_space/bt_regime_sweep evidence in the roofline campaign) and TMEM
+# accumulation becomes necessary there, plus it serves the tf32/tf32x3
+# precision modes. If chunk_size never grows past 64 and the tf32 modes remain
+# unused, delete this file in favor of the Triton kernel.
+#
 # This is the narrow production CuTe path for varlen B=1 full chunks:
 # BT=64 and head_dim K=V=128. It recomputes:
 #   w  = A @ (k * beta * exp2(gk))  or A @ (k * beta) when gk is absent
@@ -70,6 +80,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
+from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
@@ -1730,6 +1741,10 @@ def recompute_w_u_fwd(
     has_q = q is not None and has_gk
 
     precision = _normalize_precision(dot_precision)
+    # Memory-bound at BT=64: register-operand dots avoid the UMMA staging tax
+    # (see the module TODO). tf32/tf32x3 accuracy modes stay on the CuTe path.
+    if precision.is_bf16:
+        return recompute_w_u_fwd_triton(k, v, beta, A, metadata, q=q, gk=gk, chunk_size=chunk_size)
     assert chunk_size == BT, (
         f"recompute_w_u_fwd only supports chunk_size={BT} on the native CuTe "
         f"path; got {chunk_size}. chunk_size=32 is not supported yet "
