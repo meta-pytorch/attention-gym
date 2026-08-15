@@ -457,7 +457,6 @@ def _kernel_varlen_b1_full_chunk(
     has_q: Constexpr,
     has_gk: Constexpr,
     u_dot_precision_tf32x3: Constexpr,
-    prefetch_next_tile: Constexpr,
     mma_is_bf16: Constexpr,
     ragged: Constexpr,
 ):
@@ -671,64 +670,6 @@ def _kernel_varlen_b1_full_chunk(
         # once since alloc happens once.
         tmem.relinquish_alloc_permit()
 
-        # ---- Persistent-loop prologue: prefetch the first work item ----
-        # The raw staging buffers are only needed through CVT/A packing. Once
-        # those are complete, later iterations can reuse the same raw buffers
-        # for the next work item while the current tile drains from TMEM.
-        if cutlass.const_expr(prefetch_next_tile) and iters_per_cta_outer > 0:
-            prologue_work_idx = cta_idx
-            prologue_chunk_block = prologue_work_idx % num_chunks_runtime
-            prologue_value_head_idx = prologue_work_idx // num_chunks_runtime
-            prologue_key_head_idx = prologue_value_head_idx // head_group_size
-            prologue_time_base, prologue_valid = _resolve_chunk_route(
-                mCuSeqlens,
-                mChunkRouting,
-                route,
-                prologue_chunk_block,
-                tidx,
-                ragged,
-            )
-
-            (
-                prologue_gK_tile,
-                prologue_gV_tile,
-                prologue_gQ_tile,
-                prologue_gG_tile,
-                prologue_gA_tile,
-            ) = _make_input_tiles(
-                mK,
-                mV,
-                mQ,
-                mG,
-                mA,
-                prologue_time_base,
-                prologue_key_head_idx,
-                prologue_value_head_idx,
-                has_q,
-                has_gk,
-            )
-            _copy_input_tiles(
-                tiled_copy_bf16,
-                tiled_copy_fp32_kv,
-                tiled_copy_a,
-                thr_copy_bf16,
-                thr_copy_fp32_kv,
-                thr_copy_a,
-                prologue_gK_tile,
-                prologue_gV_tile,
-                prologue_gQ_tile,
-                prologue_gG_tile,
-                prologue_gA_tile,
-                sK_stage,
-                sV_stage,
-                sQ_stage,
-                sG_stage,
-                sA_stage,
-                prologue_valid,
-                has_q,
-                has_gk,
-            )
-
         # ---- Persistent loop over runtime (chunk, head) work items ----
         for persistent_iter in cutlass.range(iters_per_cta_outer, unroll=1):
             work_idx = persistent_iter * num_persistent_ctas + cta_idx
@@ -746,40 +687,39 @@ def _kernel_varlen_b1_full_chunk(
                 ragged,
             )
 
-            if cutlass.const_expr(not prefetch_next_tile):
-                gK_tile, gV_tile, gQ_tile, gG_tile, gA_tile = _make_input_tiles(
-                    mK,
-                    mV,
-                    mQ,
-                    mG,
-                    mA,
-                    time_base,
-                    key_head_idx,
-                    value_head_idx,
-                    has_q,
-                    has_gk,
-                )
-                _copy_input_tiles(
-                    tiled_copy_bf16,
-                    tiled_copy_fp32_kv,
-                    tiled_copy_a,
-                    thr_copy_bf16,
-                    thr_copy_fp32_kv,
-                    thr_copy_a,
-                    gK_tile,
-                    gV_tile,
-                    gQ_tile,
-                    gG_tile,
-                    gA_tile,
-                    sK_stage,
-                    sV_stage,
-                    sQ_stage,
-                    sG_stage,
-                    sA_stage,
-                    valid,
-                    has_q,
-                    has_gk,
-                )
+            gK_tile, gV_tile, gQ_tile, gG_tile, gA_tile = _make_input_tiles(
+                mK,
+                mV,
+                mQ,
+                mG,
+                mA,
+                time_base,
+                key_head_idx,
+                value_head_idx,
+                has_q,
+                has_gk,
+            )
+            _copy_input_tiles(
+                tiled_copy_bf16,
+                tiled_copy_fp32_kv,
+                tiled_copy_a,
+                thr_copy_bf16,
+                thr_copy_fp32_kv,
+                thr_copy_a,
+                gK_tile,
+                gV_tile,
+                gQ_tile,
+                gG_tile,
+                gA_tile,
+                sK_stage,
+                sV_stage,
+                sQ_stage,
+                sG_stage,
+                sA_stage,
+                valid,
+                has_q,
+                has_gk,
+            )
 
             # Stage beta[time_base:time_base+BT, value_head_idx] into SMEM once per chunk.
             # beta staging only depends on gmem mBeta (independent of the K/V/Q/G
@@ -1025,62 +965,6 @@ def _kernel_varlen_b1_full_chunk(
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                     acc_empty_u.commit()
 
-            if cutlass.const_expr(prefetch_next_tile and not u_dot_precision_tf32x3):
-                next_persistent_iter = persistent_iter + 1
-                if next_persistent_iter < iters_per_cta_outer:
-                    next_work_idx = next_persistent_iter * num_persistent_ctas + cta_idx
-                    next_chunk_block = next_work_idx % num_chunks_runtime
-                    next_value_head_idx = next_work_idx // num_chunks_runtime
-                    next_key_head_idx = next_value_head_idx // head_group_size
-                    next_time_base, next_valid = _resolve_chunk_route(
-                        mCuSeqlens,
-                        mChunkRouting,
-                        route,
-                        next_chunk_block,
-                        tidx,
-                        ragged,
-                    )
-
-                    (
-                        next_gK_tile,
-                        next_gV_tile,
-                        next_gQ_tile,
-                        next_gG_tile,
-                        next_gA_tile,
-                    ) = _make_input_tiles(
-                        mK,
-                        mV,
-                        mQ,
-                        mG,
-                        mA,
-                        next_time_base,
-                        next_key_head_idx,
-                        next_value_head_idx,
-                        has_q,
-                        has_gk,
-                    )
-                    _copy_input_tiles(
-                        tiled_copy_bf16,
-                        tiled_copy_fp32_kv,
-                        tiled_copy_a,
-                        thr_copy_bf16,
-                        thr_copy_fp32_kv,
-                        thr_copy_a,
-                        next_gK_tile,
-                        next_gV_tile,
-                        next_gQ_tile,
-                        next_gG_tile,
-                        next_gA_tile,
-                        sK_stage,
-                        sV_stage,
-                        sQ_stage,
-                        sG_stage,
-                        sA_stage,
-                        next_valid,
-                        has_q,
-                        has_gk,
-                    )
-
             # ---- 5. Epilogue: TMEM -> rmem -> bf16 -> gmem ----
             # W and U are waited independently so EPI_W can overlap with MMA_U
             # (TMEM alloc permit was released once before the chunk loop.)
@@ -1281,62 +1165,6 @@ def _kernel_varlen_b1_full_chunk(
                         )
                     acc_empty_u_a_res.commit()
 
-                if cutlass.const_expr(prefetch_next_tile):
-                    next_persistent_iter = persistent_iter + 1
-                    if next_persistent_iter < iters_per_cta_outer:
-                        next_work_idx = next_persistent_iter * num_persistent_ctas + cta_idx
-                        next_chunk_block = next_work_idx % num_chunks_runtime
-                        next_value_head_idx = next_work_idx // num_chunks_runtime
-                        next_key_head_idx = next_value_head_idx // head_group_size
-                        next_time_base, next_valid = _resolve_chunk_route(
-                            mCuSeqlens,
-                            mChunkRouting,
-                            route,
-                            next_chunk_block,
-                            tidx,
-                            ragged,
-                        )
-
-                        (
-                            next_gK_tile,
-                            next_gV_tile,
-                            next_gQ_tile,
-                            next_gG_tile,
-                            next_gA_tile,
-                        ) = _make_input_tiles(
-                            mK,
-                            mV,
-                            mQ,
-                            mG,
-                            mA,
-                            next_time_base,
-                            next_key_head_idx,
-                            next_value_head_idx,
-                            has_q,
-                            has_gk,
-                        )
-                        _copy_input_tiles(
-                            tiled_copy_bf16,
-                            tiled_copy_fp32_kv,
-                            tiled_copy_a,
-                            thr_copy_bf16,
-                            thr_copy_fp32_kv,
-                            thr_copy_a,
-                            next_gK_tile,
-                            next_gV_tile,
-                            next_gQ_tile,
-                            next_gG_tile,
-                            next_gA_tile,
-                            sK_stage,
-                            sV_stage,
-                            sQ_stage,
-                            sG_stage,
-                            sA_stage,
-                            next_valid,
-                            has_q,
-                            has_gk,
-                        )
-
             # Drain U stage (stage 1).
             acc_full_u = acc_consumer.wait_and_advance()
             if tidx < 128:
@@ -1378,7 +1206,6 @@ class RecomputeWUForwardVarlenB1FullChunk:
         has_q: bool = True,
         has_gk: bool = True,
         precision: MmaPrecision = MmaPrecision.BF16,
-        prefetch_next_tile: bool = False,
         ragged: bool = False,
     ):
         assert chunk_size == BT, (
@@ -1392,7 +1219,6 @@ class RecomputeWUForwardVarlenB1FullChunk:
         self.has_q = has_q
         self.has_gk = has_gk
         self.precision = precision
-        self.prefetch_next_tile = prefetch_next_tile
         self.ragged = ragged
         self.threads_per_cta = THREADS_PER_CTA
 
@@ -1417,7 +1243,6 @@ class RecomputeWUForwardVarlenB1FullChunk:
         a_is_fp32: Constexpr = self.a_is_fp32
         has_q: Constexpr = self.has_q
         has_gk: Constexpr = self.has_gk
-        prefetch_next_tile: Constexpr = self.prefetch_next_tile
         # The single precision enum drives the kernel's compile-time flags; the
         # two booleans below are mutually exclusive by construction.
         mma_is_bf16: Constexpr = self.precision.is_bf16
@@ -1469,7 +1294,6 @@ class RecomputeWUForwardVarlenB1FullChunk:
             has_q,
             has_gk,
             u_dot_precision_tf32x3,
-            prefetch_next_tile,
             mma_is_bf16,
             ragged,
         ).launch(
@@ -1496,7 +1320,6 @@ def _compile_recompute_w_u(
     has_q: bool,
     has_gk: bool,
     precision: MmaPrecision,
-    prefetch_next_tile: bool,
     cu_seqlens_i32: bool,
     chunk_routing_i32: bool,
     num_chunks_i32: bool,
@@ -1626,7 +1449,6 @@ def _compile_recompute_w_u(
         has_q=has_q,
         has_gk=has_gk,
         precision=precision,
-        prefetch_next_tile=prefetch_next_tile,
         ragged=ragged,
     )
     return compile_tvm_ffi(
@@ -1647,7 +1469,7 @@ def _compile_recompute_w_u(
         name=(
             f"kda_recompute_hk{key_heads}_hv{value_heads}_k{key_dim}_v{value_dim}_"
             f"a{int(a_is_fp32)}_b{int(beta_is_fp32)}_q{int(has_q)}_g{int(has_gk)}_"
-            f"{precision.value}_p{int(prefetch_next_tile)}_i{int(cu_seqlens_i32)}"
+            f"{precision.value}_i{int(cu_seqlens_i32)}"
             f"{int(chunk_routing_i32)}{int(num_chunks_i32)}_rg{int(ragged)}"
         ),
     )
@@ -1694,7 +1516,6 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     chunk_size: int = BT,
     dot_precision: str | MmaPrecision = "bf16",
-    experimental_prefetch: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1721,6 +1542,7 @@ def recompute_w_u_fwd(
       - "tf32x3"          : tf32 base + first-order residual products on U for
                             ~fp32 accuracy. Only valid when A is fp32.
     The accumulator is always fp32; W is single-pass for every mode.
+
     """
     has_gk = gk is not None
     has_q = q is not None and has_gk
@@ -1899,7 +1721,6 @@ def recompute_w_u_fwd(
         has_q,
         has_gk,
         precision,
-        experimental_prefetch,
         cu_seqlens.dtype == torch.int32,
         chunk_routing.dtype == torch.int32,
         True if num_chunks_i is None else num_chunks_i.dtype == torch.int32,
