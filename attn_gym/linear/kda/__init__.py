@@ -6,6 +6,11 @@
 
 """KDA (Kimi Delta Attention) references and optional optimized kernels."""
 
+from attn_gym.linear.kda.masking import (
+    active_token_mask,
+    mask_inactive_token_gradients,
+    mask_inactive_tokens,
+)
 from attn_gym.linear.kda.naive import (
     naive_chunk_kda,
     naive_chunk_kda_from_cumulative,
@@ -13,6 +18,9 @@ from attn_gym.linear.kda.naive import (
 )
 
 __all__ = [
+    "active_token_mask",
+    "mask_inactive_token_gradients",
+    "mask_inactive_tokens",
     "naive_chunk_kda",
     "naive_chunk_kda_from_cumulative",
     "naive_recurrent_kda",

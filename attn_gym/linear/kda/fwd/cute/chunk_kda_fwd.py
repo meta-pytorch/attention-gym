@@ -901,11 +901,12 @@ def chunk_kda(
 
     ``cu_seqlens`` selects packed ``[1, T, H, D]`` execution. Dense batches and
     dense tails are lowered to the same packed representation with equal-length
-    sequences. Logical sequences may end in a partial 64-token chunk. The optimized
-    core computes Q/K/V in BF16 and gates, beta, and recurrent states in FP32. FP16
-    or FP32 Q/K/V inputs are cast to BF16 for the core, and the output is cast back
-    to ``q.dtype``. Recurrent states remain FP32 and have one leading entry per
-    logical sequence.
+    sequences. Logical sequences may end in a partial 64-token chunk, and the terminal
+    offset may be smaller than the physical token capacity. Values after the terminal
+    offset are outside the operation's contract. The optimized core computes Q/K/V in
+    BF16 and gates, beta, and recurrent states in FP32. FP16 or FP32 Q/K/V inputs are
+    cast to BF16 for the core, and the output is cast back to ``q.dtype``. Recurrent
+    states remain FP32 and have one leading entry per logical sequence.
     """
     _validate_chunk_kda_inputs(q, k, v, cumulative_gate, beta, initial_state, cu_seqlens)
     output_dtype = q.dtype

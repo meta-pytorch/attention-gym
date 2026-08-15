@@ -47,6 +47,11 @@ import typer
 from torch import nn
 
 from attn_gym.linear import naive_chunk_kda_from_cumulative
+from attn_gym.linear.kda import (
+    active_token_mask,
+    mask_inactive_token_gradients,
+    mask_inactive_tokens,
+)
 from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
@@ -114,7 +119,13 @@ def packed_sequence_metadata(
 
 
 class KDAAttention(nn.Module):
-    """Minimal trainable KDA attention with a transformer-style module ABI."""
+    """Minimal trainable KDA attention with a transformer-style module ABI.
+
+    Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
+    beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
+    without changing the physical shape. Leave the option disabled for dense or
+    exact-packed inputs to avoid masking work.
+    """
 
     def __init__(
         self,
@@ -131,6 +142,7 @@ class KDAAttention(nn.Module):
         compute_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         profile_ranges: bool = False,
+        mask_inactive_capacity: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size < 1 or num_heads < 1 or head_dim < 1:
@@ -157,6 +169,7 @@ class KDAAttention(nn.Module):
         self.fastmath = fastmath
         self.rms_norm_eps = rms_norm_eps
         self.profile_ranges = profile_ranges
+        self.mask_inactive_capacity = mask_inactive_capacity
         self.compute_dtype = (
             (torch.bfloat16 if backend == "fused" else torch.float32)
             if compute_dtype is None
@@ -219,16 +232,32 @@ class KDAAttention(nn.Module):
                 )
             initial_state = initial_state.to(device=hidden_states.device, dtype=torch.float32)
 
+        # Keep the endpoint on-device: a captured graph rebuilds this one mask on
+        # replay, then every value mask and gradient barrier below reuses it.
+        active_mask = (
+            active_token_mask(hidden_states, cu_seqlens)
+            if self.mask_inactive_capacity and cu_seqlens is not None
+            else None
+        )
+        # A zero cotangent cannot neutralize a NaN activation in a weight reduction.
+        hidden_states = mask_inactive_tokens(hidden_states, active_mask)
         hidden_states_compute, qkv = self.qkv_projection(hidden_states)
+        # The short-convolution dInput suffix is undefined; keep it out of qkv_proj dW.
+        qkv = mask_inactive_token_gradients(qkv, active_mask)
         qkv, final_conv_state = self.short_convolution(
             qkv,
             initial_conv_state,
             cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
         )
+        # Ordinary Q/K normalization reads and saves every physical row.
+        qkv = mask_inactive_tokens(qkv, active_mask)
         q, k, v = qkv.view(batch, tokens, 3, self.num_heads, self.head_dim).unbind(2)
         q, k = self.qk_normalization(q, k)
         raw_gate, beta = self.gate_projections(hidden_states_compute)
+        # These barriers exclude undefined primitive dInputs from projection dW.
+        raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
+        beta = mask_inactive_token_gradients(beta, active_mask)
         cumulative_gate = self.gate_prefix_sum(raw_gate, cu_seqlens=cu_seqlens)
         output, final_state = self.kda_core(
             q,
@@ -240,9 +269,12 @@ class KDAAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
         )
-        output = self.output_normalization(output)
+        # KDA leaves its output suffix undefined; sanitize it before RMSNorm saves it.
+        output = self.output_normalization(mask_inactive_tokens(output, active_mask))
         output_gate = self.output_gate(hidden_states_compute, output)
         output = self.output_projection(output, output_gate)
+        # Keep arbitrary suffix cotangents out of every model parameter reduction.
+        output = mask_inactive_token_gradients(output, active_mask)
 
         return KDAAttentionOutput(
             output.to(hidden_states.dtype),
@@ -399,6 +431,9 @@ class KDAAttention(nn.Module):
 
     @record_function("kda/output_normalization")
     def output_normalization(self, output: torch.Tensor) -> torch.Tensor:
+        # TODO: Consider a cu_seqlens-aware RMSNorm for fixed-capacity CUDA Graph
+        # replay. Masking makes the inactive suffix numerically inert, but native
+        # RMSNorm's gamma backward still scans all physical tokens.
         return F.rms_norm(
             output,
             (self.head_dim,),

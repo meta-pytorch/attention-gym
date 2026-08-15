@@ -5,6 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("cutlass")
+
+from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import blackwell_delta_h_bwd_dhu_v1
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1_dispatch import (
     blackwell_delta_h_bwd_dhu_dispatch,
 )
@@ -12,8 +15,8 @@ from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTe delta-H backward stage requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the CuTe delta-H backward stage requires SM100 or SM103",
 )
 
 
@@ -35,22 +38,21 @@ def _run_ragged(
     inputs: tuple[torch.Tensor, ...],
     lengths: list[int],
     cu_seqlens: torch.Tensor | None = None,
+    bv: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, w, do, dv, gk, h0, dht = inputs
     offsets = cumulative_sequence_offsets(lengths) if cu_seqlens is None else cu_seqlens
     metadata = prepare_ragged_chunk_metadata(offsets, q.shape[1], 64)
-    return blackwell_delta_h_bwd_dhu_dispatch(
-        q,
-        k,
-        w,
-        do,
-        dv,
-        gk=gk,
-        h0=h0,
-        dht=dht,
-        scale=128**-0.5,
-        metadata=metadata,
-    )
+    options = {
+        "gk": gk,
+        "h0": h0,
+        "dht": dht,
+        "scale": 128**-0.5,
+        "metadata": metadata,
+    }
+    if bv is not None:
+        return blackwell_delta_h_bwd_dhu_v1(q, k, w, do, dv, bv=bv, **options)
+    return blackwell_delta_h_bwd_dhu_dispatch(q, k, w, do, dv, **options)
 
 
 def test_ragged_delta_h_handles_all_empty_sequences():
@@ -114,6 +116,39 @@ def test_ragged_delta_h_matches_independent_sequences():
     )
     torch.testing.assert_close(dh0, torch.stack(expected_dh0), rtol=0, atol=0)
     torch.testing.assert_close(dv, expected_dv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bv", [16, 32])
+@pytest.mark.parametrize(
+    "lengths", [[130, 0, 0], [63, 130]], ids=["small-partial", "large-partial"]
+)
+def test_ragged_delta_h_ignores_nan_poisoned_physical_suffix(bv, lengths):
+    physical_tokens = 256
+    active_tokens = sum(lengths)
+    inputs = _inputs(physical_tokens, len(lengths))
+    active_inputs = tuple(value[:, :active_tokens].clone() for value in inputs[:6]) + tuple(
+        value.clone() for value in inputs[6:]
+    )
+    for value in inputs[:6]:
+        value[:, active_tokens:].fill_(torch.nan)
+
+    dh, dh0, dv = _run_ragged(inputs, lengths, bv=bv)
+    expected_dh, expected_dh0, expected_dv = _run_ragged(active_inputs, lengths, bv=bv)
+
+    active_chunks = sum((length + 63) // 64 for length in lengths)
+    torch.testing.assert_close(
+        dh[:, :active_chunks],
+        expected_dh[:, :active_chunks],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(dh0, expected_dh0, rtol=0, atol=0)
+    torch.testing.assert_close(
+        dv[:, :active_tokens],
+        expected_dv[:, :active_tokens],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_ragged_delta_h_preserves_legacy_packed_arguments():

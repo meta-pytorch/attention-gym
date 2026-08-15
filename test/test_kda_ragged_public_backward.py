@@ -236,18 +236,33 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
     with torch.cuda.graph(graph):
         actual = _run_gradients(inputs, initial_state, offsets, output_grad, state_grad)
 
-    offsets.copy_(cumulative_sequence_offsets([65, 63]))
+    active_tokens = 65
+    offsets.copy_(cumulative_sequence_offsets([32, 33]))
+    with torch.no_grad():
+        for tensor in inputs:
+            tensor[:, active_tokens:].fill_(float("nan"))
+        output_grad[:, active_tokens:].fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
     expected = _run_gradients(
-        clone_kda_inputs(inputs),
+        tuple(tensor[:, :active_tokens].detach().clone().requires_grad_() for tensor in inputs),
         initial_state.detach().clone().requires_grad_(),
-        cumulative_sequence_offsets([65, 63]),
-        output_grad,
+        cumulative_sequence_offsets([32, 33]),
+        output_grad[:, :active_tokens],
         state_grad,
     )
-    _assert_run_close(actual, expected)
+    actual_output, actual_state, actual_gradients = actual
+    expected_output, expected_state, expected_gradients = expected
+    torch.testing.assert_close(actual_output[:, :active_tokens], expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients[:-1], expected_gradients[:-1], strict=True
+    ):
+        torch.testing.assert_close(
+            actual_gradient[:, :active_tokens], expected_gradient, rtol=3e-2, atol=3e-2
+        )
+    torch.testing.assert_close(actual_gradients[-1], expected_gradients[-1], rtol=3e-2, atol=3e-2)
 
 
 def test_dense_tail_batch_gradients_match_explicit_packed_lowering():

@@ -62,6 +62,22 @@ def test_public_ragged_forward_matches_independent_sequences_and_fullgraph():
     torch.testing.assert_close(compiled_state, actual_state, rtol=0, atol=0)
 
 
+def test_public_ragged_forward_accepts_inactive_physical_capacity():
+    inputs = tuple(
+        torch.full_like(tensor, float("nan")) for tensor in make_kda_test_inputs(64, seed=29)
+    )
+    initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
+
+    _output, final_state = chunk_kda(
+        *inputs,
+        initial_state,
+        cu_seqlens=cumulative_sequence_offsets([0, 0]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(final_state, initial_state, rtol=0, atol=0)
+
+
 def test_dense_tail_batch_matches_explicit_packed_lowering():
     shape = (2, 65, 1, 128)
     q, k, v, gate, beta = make_kda_test_inputs(65, batch=2, seed=31)
@@ -92,7 +108,7 @@ def test_dense_tail_batch_matches_explicit_packed_lowering():
     torch.testing.assert_close(dense_state, packed_state, rtol=0, atol=0)
 
 
-def test_public_forward_replays_aligned_to_ragged():
+def test_public_forward_replays_active_token_count():
     inputs = make_kda_test_inputs(128, seed=23)
     initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
     offsets = cumulative_sequence_offsets([64, 64])
@@ -113,15 +129,18 @@ def test_public_forward_replays_aligned_to_ragged():
             output_final_state=True,
         )
 
-    offsets.copy_(cumulative_sequence_offsets([65, 63]))
+    active_tokens = 65
+    offsets.copy_(cumulative_sequence_offsets([32, 33]))
+    for tensor in inputs:
+        tensor[:, active_tokens:].fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
     expected, expected_state = chunk_kda(
-        *inputs,
+        *(tensor[:, :active_tokens] for tensor in inputs),
         initial_state,
-        cu_seqlens=cumulative_sequence_offsets([65, 63]),
+        cu_seqlens=cumulative_sequence_offsets([32, 33]),
         output_final_state=True,
     )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
