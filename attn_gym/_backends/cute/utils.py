@@ -85,8 +85,7 @@ def compile_tvm_ffi(
 
     from cutlass import cute
 
-    # CuTeDSL 4.6.2 removed the `_name_prefix=` call kwarg; `set_name_prefix()` on
-    # the jit wrapper is the compatible spelling across 4.5.0 through 4.7.0+.
+    # Requires CuTeDSL >= 4.5.0 for `set_name_prefix` (`_name_prefix=` was removed in 4.6.2).
     # Class-based entrypoints hold the jit wrapper on their `__call__`.
     jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
     jit_wrapper.set_name_prefix(name)
