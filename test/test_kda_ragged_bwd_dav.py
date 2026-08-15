@@ -150,3 +150,15 @@ def test_ragged_bwd_dav_replays_aligned_to_ragged():
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     for replayed, independent in zip(actual, expected, strict=True):
         torch.testing.assert_close(replayed, independent, rtol=0, atol=0)
+
+
+def test_ragged_bwd_dav_op_registration():
+    """Validate the opaque ragged dAv operator against its schema and fake."""
+    inputs = _inputs(128)
+    cu_seqlens = cumulative_sequence_offsets([65, 63])
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, _CHUNK_SIZE)
+    torch.library.opcheck(
+        torch.ops.attn_gym.kda_chunk_bwd_dav_ragged.default,
+        (*inputs, metadata.cu_seqlens, metadata.chunk_offsets, _SCALE, _CHUNK_SIZE),
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+    )
