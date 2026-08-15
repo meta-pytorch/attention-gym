@@ -85,12 +85,15 @@ def compile_tvm_ffi(
 
     from cutlass import cute
 
+    # Requires CuTeDSL >= 4.5.0 for `set_name_prefix` (`_name_prefix=` was removed in 4.6.2).
+    # Class-based entrypoints hold the jit wrapper on their `__call__`.
+    jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
+    jit_wrapper.set_name_prefix(name)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile[cute.EnableTVMFFI](
         entrypoint,
         *compile_args,
         stream,
-        _name_prefix=name,
     )
 
 

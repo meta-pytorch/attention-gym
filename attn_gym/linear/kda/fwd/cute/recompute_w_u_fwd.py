@@ -1446,6 +1446,7 @@ class RecomputeWUForwardVarlenB1FullChunk:
             AB_STAGES,
         )
 
+        _kernel_varlen_b1_full_chunk.set_name_prefix("cutlass_dsl_recompute_w_u_fwd")
         _kernel_varlen_b1_full_chunk(
             tiled_mma,
             mQ,
@@ -1471,7 +1472,6 @@ class RecomputeWUForwardVarlenB1FullChunk:
             prefetch_next_tile,
             mma_is_bf16,
             ragged,
-            _name_prefix="cutlass_dsl_recompute_w_u_fwd",
         ).launch(
             grid=(self.num_persistent_ctas, 1, 1),
             block=(THREADS_PER_CTA, 1, 1),

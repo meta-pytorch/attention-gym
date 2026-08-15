@@ -28,7 +28,8 @@ def copy_kernel(source: cute.Tensor, destination: cute.Tensor):
 @cute.jit
 def launch_copy(source: cute.Tensor, destination: cute.Tensor, stream):
     """Launch the toy cache validation kernel."""
-    copy_kernel(source, destination, _name_prefix="attention_gym_cache_copy").launch(
+    copy_kernel.set_name_prefix("attention_gym_cache_copy")
+    copy_kernel(source, destination).launch(
         grid=(1, 1, 1),
         block=(_THREADS, 1, 1),
         stream=stream,

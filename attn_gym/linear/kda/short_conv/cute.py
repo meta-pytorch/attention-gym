@@ -415,13 +415,13 @@ class CausalConv1dSiluForward(ShortConvKernel):
         stream,
     ):
         """Launch the configured forward specialization."""
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             x,
             weight,
             output,
             cu_seqlens,
             initial_state,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
@@ -623,6 +623,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         stream,
     ):
         """Launch the configured input-gradient specialization."""
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             x,
             weight,
@@ -630,7 +631,6 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             grad_x,
             cu_seqlens,
             initial_state,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
@@ -771,6 +771,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         stream,
     ):
         """Launch the configured weight-gradient specialization."""
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             x,
             weight,
@@ -778,7 +779,6 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             partials,
             cu_seqlens,
             initial_state,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
@@ -1389,6 +1389,7 @@ class CausalConv1dSiluInputGradientTma(
             x,
             grad_output,
         )
+        self.tma_kernel.set_name_prefix(self.get_name())
         self.tma_kernel(
             x,
             weight,
@@ -1400,7 +1401,6 @@ class CausalConv1dSiluInputGradientTma(
             tma_tensor_x,
             tma_atom_dy,
             tma_tensor_dy,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 self.channels // (self.threads * self.channels_per_thread),
@@ -1639,6 +1639,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             x,
             grad_output,
         )
+        self.tma_kernel.set_name_prefix(self.get_name())
         self.tma_kernel(
             x,
             weight,
@@ -1650,7 +1651,6 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             tma_tensor_x,
             tma_atom_dy,
             tma_tensor_dy,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 self.channels // (self.threads * self.channels_per_thread),
@@ -1798,6 +1798,7 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
         stream,
     ):
         """Launch the initial-state gradient specialization."""
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             x,
             weight,
@@ -1805,7 +1806,6 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
             grad_output,
             grad_initial_state,
             cu_seqlens,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),

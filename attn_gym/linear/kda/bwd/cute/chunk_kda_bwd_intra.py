@@ -1952,6 +1952,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         mNumChunks: cute.Tensor | None,
         stream: cuda.CUstream = None,
     ):
+        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix("cutlass_dsl_chunk_kda_bwd_intra")
         _chunk_kda_bwd_intra_hmma_grid_kernel(
             mQ,
             mK,
@@ -1971,7 +1972,6 @@ class ChunkKdaBwdIntraHmmaGrid:
             mNumChunks,
             self.grid_chunks,
             self.ragged,
-            _name_prefix="cutlass_dsl_chunk_kda_bwd_intra",
         ).launch(
             grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),

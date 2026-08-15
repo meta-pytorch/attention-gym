@@ -341,6 +341,7 @@ class FusedGateBwdOp:
             cta_tiler,
         )
 
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             mG,
             mA_log,
@@ -352,7 +353,6 @@ class FusedGateBwdOp:
             tma_tensor_g,
             tma_atom_d,
             tma_tensor_d,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=(cute.ceil_div(mG.shape[1], self.chunk_size), self.heads, mG.shape[0]),
             block=(self.head_dim, 1, 1),
