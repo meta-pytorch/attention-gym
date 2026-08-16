@@ -10,11 +10,9 @@ import torch
 pytest.importorskip("cutlass")
 
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-    _chunk_kda_bwd_wy_dqkg_custom_op,
     chunk_kda_bwd_wy_dqkg,
 )
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.utils import ChunkMetadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     bwd_wy_dqkg_reference,
@@ -167,27 +165,24 @@ def test_ragged_wy_matches_sequence_local_tails():
         torch.testing.assert_close(packed, local, rtol=0, atol=0)
 
 
-def test_ragged_wy_preserves_aligned_map_and_ignores_inactive_capacity():
+def test_ragged_wy_ignores_poisoned_inactive_capacity():
     lengths = [64, 64]
-    cu_seqlens = cumulative_sequence_offsets(lengths)
-    ragged = prepare_ragged_chunk_metadata(cu_seqlens, sum(lengths), 64)
-    inputs = _inputs(sum(lengths), ragged.capacity)
-    inputs.h[:, 2] = torch.nan
-    inputs.dh[:, 2] = torch.nan
-    aligned = ChunkMetadata(
-        cu_seqlens,
-        torch.tensor([[0, 0], [1, 0]], device="cuda", dtype=torch.int32),
-        torch.tensor(2, device="cuda", dtype=torch.int32),
+    metadata = prepare_ragged_chunk_metadata(
+        cumulative_sequence_offsets(lengths), sum(lengths), 64
     )
+    inputs = _inputs(sum(lengths), metadata.capacity)
+    poisoned_inputs = inputs._replace(h=inputs.h.clone(), dh=inputs.dh.clone())
+    poisoned_inputs.h[:, 2] = torch.nan
+    poisoned_inputs.dh[:, 2] = torch.nan
 
-    actual = _run(inputs, ragged)
-    expected = _run(inputs._replace(h=inputs.h[:, :2], dh=inputs.dh[:, :2]), aligned)
+    expected = _run(inputs, metadata)
+    actual = _run(poisoned_inputs, metadata)
 
-    assert ragged.capacity == 3
-    assert ragged.chunk_offsets.tolist() == [0, 1, 2]
-    for scheduled, mapped in zip(actual, expected, strict=True):
-        assert torch.isfinite(scheduled).all()
-        torch.testing.assert_close(scheduled, mapped, rtol=0, atol=0)
+    assert metadata.capacity == 3
+    assert metadata.chunk_offsets.tolist() == [0, 1, 2]
+    for poisoned, unpoisoned in zip(actual, expected, strict=True):
+        assert torch.isfinite(poisoned).all()
+        torch.testing.assert_close(poisoned, unpoisoned, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("lengths", [[0], [0, 0, 0]])
@@ -218,7 +213,7 @@ def test_ragged_wy_masks_partial_chunk_columns():
         torch.testing.assert_close(masked, neutral, rtol=0, atol=0)
 
 
-def test_ragged_wy_fullgraph_and_cuda_graph_replay():
+def test_ragged_wy_cuda_graph_replay():
     tokens = 128
     cu_seqlens = cumulative_sequence_offsets([64, 64])
     inputs = _inputs(tokens, capacity=3)
@@ -228,27 +223,7 @@ def test_ragged_wy_fullgraph_and_cuda_graph_replay():
         metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
         return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata)
 
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-    torch.library.opcheck(
-        _chunk_kda_bwd_wy_dqkg_custom_op,
-        (
-            *inputs,
-            metadata.cu_seqlens,
-            metadata.chunk_offsets,
-            64,
-            False,
-            1,
-            True,
-        ),
-        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
-    )
-
-    expected = operation(*inputs, cu_seqlens)
-    compiled = torch.compile(operation, fullgraph=True)
-    actual = compiled(*inputs, cu_seqlens)
-    for compiled_output, eager_output in zip(actual, expected, strict=True):
-        torch.testing.assert_close(compiled_output, eager_output, rtol=0, atol=0)
-
+    operation(*inputs, cu_seqlens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

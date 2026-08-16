@@ -52,8 +52,9 @@ from attn_gym.linear.kda import (
     mask_inactive_token_gradients,
     mask_inactive_tokens,
 )
-from attn_gym.linear.kda.fwd.cute import chunk_kda
-from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
+from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import _chunk_kda
+from attn_gym.linear.kda.fwd.triton.gate_fwd import _bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref
 from attn_gym.linear.kda.short_conv import cute_causal_conv1d_silu
@@ -258,17 +259,46 @@ class KDAAttention(nn.Module):
         # These barriers exclude undefined primitive dInputs from projection dW.
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
         beta = mask_inactive_token_gradients(beta, active_mask)
-        cumulative_gate = self.gate_prefix_sum(raw_gate, cu_seqlens=cu_seqlens)
-        output, final_state = self.kda_core(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            initial_state,
-            cu_seqlens=cu_seqlens,
-            return_final_state=return_final_state,
+        metadata = (
+            None
+            if cu_seqlens is None
+            else prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
         )
+        if metadata is None:
+            cumulative_gate = self.gate_prefix_sum(raw_gate)
+            output, final_state = self.kda_core(
+                q,
+                k,
+                v,
+                cumulative_gate,
+                beta,
+                initial_state,
+                return_final_state=return_final_state,
+            )
+        else:
+            with _record_function(self.profile_ranges, "kda/gate_prefix_sum/fused"):
+                cumulative_gate = _bounded_gate_cumsum(
+                    raw_gate,
+                    self.A_log,
+                    self.dt_bias,
+                    chunk_size=self.chunk_size,
+                    lower_bound=self.lower_bound,
+                    fastmath=self.fastmath,
+                    profile_ranges=self.profile_ranges,
+                    metadata=metadata,
+                )
+            with _record_function(self.profile_ranges, "kda/core/fused"):
+                output, final_state = _chunk_kda(
+                    q,
+                    k,
+                    v,
+                    cumulative_gate,
+                    beta,
+                    initial_state,
+                    metadata=metadata,
+                    output_final_state=return_final_state,
+                    fastmath=self.fastmath,
+                )
         # KDA leaves its output suffix undefined; sanitize it before RMSNorm saves it.
         output = self.output_normalization(mask_inactive_tokens(output, active_mask))
         output_gate = self.output_gate(hidden_states_compute, output)
@@ -381,7 +411,7 @@ class KDAAttention(nn.Module):
                 None,
             )
 
-        return bounded_gate_cumsum(
+        return _bounded_gate_cumsum(
             raw_gate,
             self.A_log,
             self.dt_bias,
@@ -417,7 +447,7 @@ class KDAAttention(nn.Module):
                 chunk_size=self.chunk_size,
             )
 
-        return chunk_kda(
+        return _chunk_kda(
             q,
             k,
             v,

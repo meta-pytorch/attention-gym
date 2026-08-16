@@ -24,10 +24,10 @@
 #   qg = q * exp2(gk)               when both q and gk are present
 #   kg = k * exp2(gk_last - gk)     when gk is present
 #
-# The grid is persistent over runtime (chunk, head) work items. Legacy metadata
-# supplies a caller-owned CUDA scalar, while ragged metadata loads the active
-# count from chunk_offsets[N]. Both remain device-side so CUDA graph replay can
-# change the active chunk count without recompiling or reallocating metadata.
+# The grid is persistent over runtime (chunk, head) work items. Dense inputs
+# derive chunk coordinates directly from the token dimension. Ragged metadata
+# loads the active count from chunk_offsets[N], so CUDA graph replay can change
+# sequence boundaries without recompiling or reallocating metadata.
 #
 # ----------------------------------------------------------------------------
 # MMA input precision (dot_precision knob)
@@ -82,7 +82,6 @@ from attn_gym._backends.cute.target import get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
-from attn_gym.linear.kda.utils import ChunkMetadata
 
 # ============================================================================
 # Constants
@@ -378,19 +377,19 @@ def _store_epilogue_tile(
 
 @cute.jit
 def _resolve_chunk_route(
-    cu_seqlens: cute.Tensor,
-    chunk_routing: cute.Tensor,
+    cu_seqlens: cute.Tensor | None,
+    chunk_offsets: cute.Tensor | None,
     route: cute.Tensor,
     global_chunk: Int32,
     tidx: Int32,
     ragged: Constexpr,
 ):
-    """Resolve one map-backed or scheduler-backed logical chunk for the CTA."""
+    """Resolve one dense or scheduler-backed logical chunk for the CTA."""
     if cutlass.const_expr(ragged):
         if tidx == 0:
             _, _, token_start, valid_tokens = load_ragged_chunk_work(
                 cu_seqlens,
-                chunk_routing,
+                chunk_offsets,
                 global_chunk,
                 Int32(BT),
             )
@@ -399,12 +398,7 @@ def _resolve_chunk_route(
         cute.arch.sync_threads()
         return Int32(route[0]), Int32(route[1])
 
-    sequence = chunk_routing[global_chunk, 0].to(Int32)
-    local_chunk = chunk_routing[global_chunk, 1].to(Int32)
-    begin = cu_seqlens[sequence].to(Int32)
-    end = cu_seqlens[sequence + 1].to(Int32)
-    token_start = begin + local_chunk * BT
-    return token_start, cutlass.min(end - token_start, Int32(BT))
+    return global_chunk * BT, Int32(BT)
 
 
 # ============================================================================
@@ -459,9 +453,8 @@ def _kernel_varlen_b1_full_chunk(
     mU: cute.Tensor,
     mQG: cute.Tensor | None,
     mKG: cute.Tensor | None,
-    mCuSeqlens: cute.Tensor,
-    mChunkRouting: cute.Tensor,
-    mNumChunks: cute.Tensor | None,
+    mCuSeqlens: cute.Tensor | None,
+    mChunkOffsets: cute.Tensor | None,
     a_smem_layout: cute.ComposedLayout,
     b_smem_layout: cute.ComposedLayout,
     num_persistent_ctas: Constexpr,
@@ -518,10 +511,10 @@ def _kernel_varlen_b1_full_chunk(
     num_value_heads = cute.size(mV.shape[2])
     head_group_size = num_value_heads // num_key_heads
     if cutlass.const_expr(ragged):
-        num_sequences = Int32(cute.size(mChunkRouting)) - 1
-        num_chunks_runtime = Int32(mChunkRouting[num_sequences])
+        num_sequences = Int32(cute.size(mChunkOffsets)) - 1
+        num_chunks_runtime = Int32(mChunkOffsets[num_sequences])
     else:
-        num_chunks_runtime = mNumChunks[0].to(Int32)
+        num_chunks_runtime = Int32(cute.size(mK.shape[1])) // BT
     total_work_runtime = num_chunks_runtime * num_value_heads
     iters_per_cta_outer = (
         total_work_runtime + num_persistent_ctas - 1 - cta_idx
@@ -692,7 +685,7 @@ def _kernel_varlen_b1_full_chunk(
             # ---- Varlen chunk coords (for CVT / EPI addressing) ----
             time_base, valid = _resolve_chunk_route(
                 mCuSeqlens,
-                mChunkRouting,
+                mChunkOffsets,
                 route,
                 chunk_block,
                 tidx,
@@ -1205,9 +1198,10 @@ class RecomputeWUForwardVarlenB1FullChunk:
     """
     Launch wrapper for the varlen B=1 full-chunk UMMA kernel.
 
+    Despite the historical name, the same specialization also serves the direct dense
+    route (``ragged=False``) and masked ragged tails.
     The specialization knobs are compile-time constants: optional q/gk outputs,
-    A dtype, and the MMA operand precision (MmaPrecision). num_chunks remains a
-    runtime device scalar passed through to the kernel.
+    A dtype, the MMA operand precision (MmaPrecision), and dense or ragged routing.
     """
 
     def __init__(
@@ -1247,9 +1241,8 @@ class RecomputeWUForwardVarlenB1FullChunk:
         mU: cute.Tensor,
         mQG: cute.Tensor | None,
         mKG: cute.Tensor | None,
-        mCuSeqlens: cute.Tensor,
-        mChunkRouting: cute.Tensor,
-        mNumChunks: cute.Tensor | None,
+        mCuSeqlens: cute.Tensor | None,
+        mChunkOffsets: cute.Tensor | None,
         stream: cuda.CUstream = None,
     ):
         a_is_fp32: Constexpr = self.a_is_fp32
@@ -1297,8 +1290,7 @@ class RecomputeWUForwardVarlenB1FullChunk:
             mQG,
             mKG,
             mCuSeqlens,
-            mChunkRouting,
-            mNumChunks,
+            mChunkOffsets,
             a_smem_layout,
             b_smem_layout,
             self.num_persistent_ctas,
@@ -1333,8 +1325,6 @@ def _compile_recompute_w_u(
     has_gk: bool,
     precision: MmaPrecision,
     cu_seqlens_i32: bool,
-    chunk_routing_i32: bool,
-    num_chunks_i32: bool,
     ragged: bool,
 ):
     """Compile one persistent recompute specialization from fake tensors."""
@@ -1354,7 +1344,6 @@ def _compile_recompute_w_u(
     assert value_dim == VAL_DIM, f"KDA recompute requires value_dim={VAL_DIM}, got {value_dim}"
 
     tokens = cute.sym_int() if ragged else cute.sym_int(divisibility=chunk_size)
-    sequence_entries, chunks = cute.sym_int(), cute.sym_int()
     tensor_shape = (1, tokens)
     q = (
         make_fake_tensor(
@@ -1432,28 +1421,23 @@ def _compile_recompute_w_u(
         if has_gk
         else None
     )
-    cu_seqlens = make_fake_compact_tensor(
-        cutlass.Int32 if cu_seqlens_i32 else cutlass.Int64,
-        (sequence_entries,),
-        stride_order=(0,),
-        assumed_align=INDEX_ALIGN_BYTES if cu_seqlens_i32 else 8,
-    )
-    chunk_routing = make_fake_compact_tensor(
-        cutlass.Int32 if chunk_routing_i32 else cutlass.Int64,
-        (sequence_entries,) if ragged else (chunks, 2),
-        stride_order=(0,) if ragged else (1, 0),
-        assumed_align=INDEX_ALIGN_BYTES if chunk_routing_i32 else 8,
-    )
-    num_chunks = (
-        None
-        if ragged
-        else make_fake_compact_tensor(
-            cutlass.Int32 if num_chunks_i32 else cutlass.Int64,
-            (1,),
+    if ragged:
+        sequence_entries = cute.sym_int()
+        cu_seqlens = make_fake_compact_tensor(
+            cutlass.Int32 if cu_seqlens_i32 else cutlass.Int64,
+            (sequence_entries,),
             stride_order=(0,),
-            assumed_align=INDEX_ALIGN_BYTES if num_chunks_i32 else 8,
+            assumed_align=INDEX_ALIGN_BYTES if cu_seqlens_i32 else 8,
         )
-    )
+        chunk_offsets = make_fake_compact_tensor(
+            cutlass.Int32,
+            (sequence_entries,),
+            stride_order=(0,),
+            assumed_align=INDEX_ALIGN_BYTES,
+        )
+    else:
+        cu_seqlens = None
+        chunk_offsets = None
     op = RecomputeWUForwardVarlenB1FullChunk(
         num_persistent_ctas=target.sm_count * 2,
         chunk_size=chunk_size,
@@ -1476,13 +1460,11 @@ def _compile_recompute_w_u(
         qg,
         kg,
         cu_seqlens,
-        chunk_routing,
-        num_chunks,
+        chunk_offsets,
         name=(
             f"kda_recompute_hk{key_heads}_hv{value_heads}_k{key_dim}_v{value_dim}_"
             f"a{int(a_is_fp32)}_b{int(beta_is_fp32)}_q{int(has_q)}_g{int(has_gk)}_"
-            f"{precision.value}_i{int(cu_seqlens_i32)}"
-            f"{int(chunk_routing_i32)}{int(num_chunks_i32)}_rg{int(ragged)}"
+            f"{precision.value}_i{int(cu_seqlens_i32)}_rg{int(ragged)}"
         ),
     )
 
@@ -1523,7 +1505,7 @@ def recompute_w_u_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    metadata: ChunkMetadata | RaggedChunkMetadata,
+    metadata: RaggedChunkMetadata | None = None,
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     chunk_size: int = BT,
@@ -1543,13 +1525,12 @@ def recompute_w_u_fwd(
       - qg = q * exp2(gk), returned only when both q and gk are provided
       - kg = k * exp2(gk_last - gk), returned only when gk is provided
 
-    Supported scope: packed B=1, chunk_size=64; grouped value heads with
-    H_V % H_K == 0. dot_precision selects the tensor-core operand precision
-    ("bf16" default and fastest; "tf32" more accurate; "tf32x3" ~fp32 accuracy
-    on U, requires fp32 A). All modes run the register-operand Triton kernel
-    (``fwd/triton/recompute_w_u.py``) — this operator is memory-bound at
-    BT=64, so tcgen05 operand staging is pure overhead (see the module TODO
-    for why the CuTe kernel below is kept).
+    Supported scope: B=1, chunk_size=64; grouped value heads with H_V % H_K == 0.
+    Dense inputs derive complete chunks directly from the token dimension; ragged
+    inputs use caller-prepared sequence offsets. ``dot_precision`` selects the
+    tensor-core operand precision ("bf16" default and fastest; "tf32" more accurate;
+    "tf32x3" ~fp32 accuracy on U and requires fp32 A). All modes run the
+    register-operand Triton kernel (``fwd/triton/recompute_w_u.py``).
     """
     precision = _normalize_precision(dot_precision)
     return recompute_w_u_fwd_triton(
@@ -1570,7 +1551,7 @@ def _recompute_w_u_fwd_cute(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    metadata: ChunkMetadata | RaggedChunkMetadata,
+    metadata: RaggedChunkMetadata | None = None,
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     chunk_size: int = BT,
@@ -1586,10 +1567,10 @@ def _recompute_w_u_fwd_cute(
     API (see the module TODO). Tests call it directly to keep it compiling and
     to pin the Triton kernel's numerics against an independent engine.
 
-    Scope: packed B=1, chunk_size=64, K=V=128. Legacy metadata uses
-    its device ``num_chunks`` scalar; ragged metadata reads the active count from
-    ``chunk_offsets[N]`` and masks final partial chunks. Neither path specializes
-    on metadata values, so fixed-shape CUDA graph replay may change boundaries.
+    Scope: B=1, chunk_size=64, K=V=128. Dense inputs derive complete chunks
+    directly from the token dimension. Ragged metadata reads the active count
+    from ``chunk_offsets[N]`` and masks final partial chunks without specializing
+    on boundary values, so CUDA graph replay may change boundaries.
 
     Computes per chunk:
       - w = A @ (k * beta * exp2(gk)), or A @ (k * beta) without gk
@@ -1614,8 +1595,8 @@ def _recompute_w_u_fwd_cute(
         f"path; got {chunk_size}. chunk_size=32 is not supported yet "
         f"(tf32 UMMA requires M>=64)."
     )
-    ragged = isinstance(metadata, RaggedChunkMetadata)
-    if ragged:
+    ragged = metadata is not None
+    if metadata is not None:
         metadata.validate_chunk_size(chunk_size)
 
     assert k.ndim == 4, f"k must be 4D [B, T, H, K], got shape {tuple(k.shape)}"
@@ -1632,10 +1613,9 @@ def _recompute_w_u_fwd_cute(
     V = v.shape[3]
     device = k.device
     assert B == 1, f"recompute_w_u_fwd requires B=1, got B={B}"
-    cu_seqlens = metadata.cu_seqlens
-    chunk_routing = metadata.chunk_offsets if ragged else metadata.chunk_indices
-    num_chunks = None if ragged else metadata.num_chunks
-    if not ragged:
+    cu_seqlens = None if metadata is None else metadata.cu_seqlens
+    chunk_offsets = None if metadata is None else metadata.chunk_offsets
+    if metadata is None:
         assert T % BT == 0, f"recompute_w_u_fwd requires T % BT == 0 (T={T}, BT={BT})"
     assert K == KEY_DIM, f"recompute_w_u_fwd requires head_dim K={KEY_DIM}, got {K}"
     assert V == VAL_DIM, f"recompute_w_u_fwd requires head_dim V={VAL_DIM}, got {V}"
@@ -1718,51 +1698,26 @@ def _recompute_w_u_fwd_cute(
     if isinstance(k, FakeTensor):
         return w, u, qg_out, kg_out
 
-    # Require caller-owned routing metadata. The wrapper must not allocate
-    # hidden metadata tensors on the hot path.
-    assert chunk_routing is not None, "recompute_w_u_fwd requires caller-provided routing"
-    assert cu_seqlens.dtype in (
-        torch.int32,
-        torch.int64,
-    ), f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}"
-    assert cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 2, (
-        f"cu_seqlens must be 1D with >=2 entries, got shape {tuple(cu_seqlens.shape)}"
-    )
-    assert cu_seqlens.device == k.device, (
-        f"cu_seqlens must be on {k.device}, got {cu_seqlens.device}"
-    )
-    assert cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous"
-    assert chunk_routing.dtype in (
-        torch.int32,
-        torch.int64,
-    ), f"chunk routing must be int32 or int64, got {chunk_routing.dtype}"
-    if ragged:
-        assert chunk_routing.shape == cu_seqlens.shape, (
-            "ragged chunk_offsets and cu_seqlens must have matching shapes"
-        )
-        assert chunk_routing.dtype == torch.int32, "ragged chunk_offsets must be int32"
-    else:
-        assert chunk_routing.ndim == 2 and chunk_routing.shape[-1] == 2, (
-            f"chunk_indices must have shape (num_chunks, 2), got {tuple(chunk_routing.shape)}"
-        )
-    assert chunk_routing.device == k.device, (
-        f"chunk routing must be on {k.device}, got {chunk_routing.device}"
-    )
-    assert chunk_routing.is_contiguous(), "chunk routing must be contiguous"
-    if num_chunks is not None:
-        assert num_chunks.dtype in (
+    if metadata is not None:
+        assert cu_seqlens.dtype in (
             torch.int32,
             torch.int64,
-        ), f"num_chunks must be int32 or int64, got {num_chunks.dtype}"
-        assert num_chunks.numel() == 1, (
-            f"num_chunks must contain one scalar value, got shape {tuple(num_chunks.shape)}"
+        ), f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}"
+        assert cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 2, (
+            f"cu_seqlens must be 1D with >=2 entries, got shape {tuple(cu_seqlens.shape)}"
         )
-        assert num_chunks.device == k.device, (
-            f"num_chunks must be on {k.device}, got {num_chunks.device}"
+        assert cu_seqlens.device == k.device, (
+            f"cu_seqlens must be on {k.device}, got {cu_seqlens.device}"
         )
-        assert num_chunks.is_contiguous(), "num_chunks must be contiguous"
-
-    num_chunks_i = None if num_chunks is None else num_chunks.reshape(1)
+        assert cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous"
+        assert chunk_offsets.shape == cu_seqlens.shape, (
+            "ragged chunk_offsets and cu_seqlens must have matching shapes"
+        )
+        assert chunk_offsets.dtype == torch.int32, "ragged chunk_offsets must be int32"
+        assert chunk_offsets.device == k.device, (
+            f"chunk_offsets must be on {k.device}, got {chunk_offsets.device}"
+        )
+        assert chunk_offsets.is_contiguous(), "chunk_offsets must be contiguous"
 
     a_is_fp32 = A.dtype == torch.float32
     # tf32x3 emulates fp32 by adding first-order residual products; once A is
@@ -1782,9 +1737,7 @@ def _recompute_w_u_fwd_cute(
         has_q,
         has_gk,
         precision,
-        cu_seqlens.dtype == torch.int32,
-        chunk_routing.dtype == torch.int32,
-        True if num_chunks_i is None else num_chunks_i.dtype == torch.int32,
+        cu_seqlens is None or cu_seqlens.dtype == torch.int32,
         ragged,
     )
     compiled(
@@ -1799,8 +1752,7 @@ def _recompute_w_u_fwd_cute(
         qg_out,
         kg_out,
         cu_seqlens,
-        chunk_routing,
-        num_chunks_i,
+        chunk_offsets,
     )
 
     return w, u, qg_out, kg_out

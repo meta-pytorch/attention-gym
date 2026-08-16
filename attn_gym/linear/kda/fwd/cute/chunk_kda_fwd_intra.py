@@ -25,7 +25,7 @@ from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
-from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE, ChunkMetadata
+from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE
 
 
 def chunk_kda_fwd_intra(
@@ -35,7 +35,7 @@ def chunk_kda_fwd_intra(
     gk: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    metadata: ChunkMetadata | RaggedChunkMetadata,
+    metadata: RaggedChunkMetadata | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
 ) -> tuple[
@@ -77,7 +77,7 @@ def chunk_kda_fwd_intra(
     with (
         torch.profiler.record_function("kda/cute/inter_solve") if profile_ranges else nullcontext()
     ):
-        if isinstance(metadata, RaggedChunkMetadata):
+        if metadata is not None:
             Aqk, Akk = chunk_kda_fwd_inter_solve_ragged_cute(
                 q=q,
                 k=k,
@@ -96,9 +96,7 @@ def chunk_kda_fwd_intra(
                 beta=beta,
                 Akkd=Akkd,
                 scale=scale,
-                cu_seqlens=metadata.cu_seqlens if metadata.has_multiple_sequences else None,
                 chunk_size=BT,
-                chunk_indices=metadata.chunk_indices if metadata.has_multiple_sequences else None,
                 Aqk=Aqk,
                 profile_ranges=profile_ranges,
             )

@@ -147,12 +147,21 @@ Schema rules:
   e.g. `ScalarType`, `Layout`, `MemoryFormat`, `Generator`, `SymInt`, and `int[2]`. Neither flow
   accepts arbitrary Python objects, dataclasses, or callables; flatten configs to scalars or
   specialize per-config outside the op.
-- Optional *outputs* parse as `Tensor?` but the compile stack handles `None` returns
-  unreliably, and a sentinel empty tensor forces empty-tensor plumbing on every caller. For
-  "N or N+1 returns depending on a flag", define two fixed-arity schemas sharing one launcher
-  (see `kda_chunk_fwd` / `kda_chunk_fwd_with_state`) and let the `autograd.Function` branch on
-  the flag; its output arity is free to vary. A future "flexible custom ops" feature may lift
-  this, but it does not work with `torch.compile` yet.
+- Optional *outputs* parse as `Tensor?` and, as of torch 2.15 nightly (verified 2026-08-16:
+  plain fullgraph compile, `autograd.Function` wrapping + backward, and `opcheck` all pass for
+  both the tensor and `None` branches), no longer hard-fail the compile stack; on older
+  releases the `None` return handling was unreliable. Keep the fixed-arity convention anyway:
+  for "N or N+1 returns depending on a flag", define two fixed-arity schemas sharing one
+  launcher (see `kda_chunk_fwd` / `kda_chunk_fwd_with_state`) and let the `autograd.Function`
+  branch on the flag; its output arity is free to vary. The bool flag specializes into separate
+  graphs regardless, so a merged optional-output schema saves nothing under compile, while a
+  `Tensor?` return forces `None`-narrowing on every caller and extra schema boxing costs real
+  time on launch-bound eager paths (collapsing schema pairs measured 3.22% slower on the dense
+  forward probe, PR #314).
+- Optional *inputs* are fully compile-safe: the merged `kda_chunk_bwd` schema takes
+  `Tensor? cu_seqlens, Tensor? chunk_offsets` for both dense and ragged and passes the strict
+  fullgraph matrix. The forward keeps separate dense/ragged ops as a measured eager-dispatch
+  decision, not a compile requirement.
 - Tensors needed only by the backward (autograd tapes, packing metadata) should be op outputs
   saved by the `autograd.Function` via `ctx.save_for_backward`, not part of the wrapper's
   user-facing return. Unlike `register_autograd`, the Function is not limited to saving

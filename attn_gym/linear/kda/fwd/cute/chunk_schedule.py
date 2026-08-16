@@ -9,7 +9,6 @@ class ChunkSchedule(Enum):
     """Logical chunk-routing policy selected when compiling a kernel."""
 
     DENSE = "dense"
-    ALIGNED = "aligned"
     RAGGED = "ragged"
 
 

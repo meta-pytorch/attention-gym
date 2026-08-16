@@ -29,8 +29,6 @@ Architecture follows FMHA/MSLK Blackwell patterns:
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-import torch.nn.functional as F
-import triton
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
@@ -41,19 +39,6 @@ from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.utils import (
-    prepare_chunk_indices,
-    prepare_lens,
-    tensor_cache,
-)
-
-
-@tensor_cache
-def _cumulative_chunk_offsets(cu_seqlens, chunk_size):
-    return (
-        F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0).cumsum(-1).int()
-    )
-
 
 # ============================================================================
 # BlackwellDeltaHBwdV1 — warp-specialized backward inter-chunk recurrence
@@ -175,9 +160,7 @@ class BlackwellDeltaHBwdV1:
         dv2_out_in: cute.Tensor,
         cu_seqlens_in: cute.Tensor,
         chunk_offsets_in: cute.Tensor,
-        num_seqs_in: cute.Tensor,
         problem_shape: tuple[Int32, Int32, Int32, Int32, Int32],
-        total_nt: Int32,
         scale: Float32,
         use_gk: Int32,
         use_dht: Int32,
@@ -197,12 +180,12 @@ class BlackwellDeltaHBwdV1:
         dv2p = dv2_out_in.iterator
         cup = cu_seqlens_in.iterator
         cop = chunk_offsets_in.iterator
-        nsp = num_seqs_in.iterator
 
         B, T, H, K, V = problem_shape
         if cutlass.const_expr(self.varlen):
             dB = Int32(1)
-            NT = total_nt
+            # The ragged chunk capacity arrives via the dh tensor's chunk axis.
+            NT = Int32(cute.size(dh_out_in.shape[0]))
         else:
             dB = B
             NT = (T + self.BT - 1) // self.BT
@@ -532,7 +515,6 @@ class BlackwellDeltaHBwdV1:
 
         cu_lens = cute.make_tensor(cup, cute.make_layout((B + 1,)))
         ch_offs = cute.make_tensor(cop, cute.make_layout((B + 1,)))
-        ns_t = cute.make_tensor(nsp, cute.make_layout((1,)))
 
         # TMA byte counts
         self.k_bytes = cute.size_in_bytes(self.io_type, s_k_one)
@@ -651,7 +633,6 @@ class BlackwellDeltaHBwdV1:
             s_dv2_r2s_staged,
             cu_lens,
             ch_offs,
-            ns_t,
             problem_shape,
             scale,
             use_gk,
@@ -712,7 +693,6 @@ class BlackwellDeltaHBwdV1:
         s_dv2_r2s_staged: cute.ComposedLayout,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
-        num_seqs: cute.Tensor,
         problem_shape: tuple[Int32, Int32, Int32, Int32, Int32],
         scale: Float32,
         use_gk: Int32,
@@ -970,11 +950,7 @@ class BlackwellDeltaHBwdV1:
         gdx = cute.arch.grid_dim()[0]
         n_vtiles = (V + self.BV - 1) // self.BV
 
-        if cutlass.const_expr(self.varlen):
-            actual_seqs = num_seqs[0]
-            w_tiles = n_vtiles * H * actual_seqs
-        else:
-            w_tiles = n_vtiles * H * B
+        w_tiles = n_vtiles * H * B
 
         n_iters = (w_tiles - bx + gdx - 1) // gdx
         w_idx = Int32(0)
@@ -1866,7 +1842,6 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
 
     cuf = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=128)
     cof = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=128)
-    nsf = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=128)
 
     return compile_tvm_ffi(
         kern,
@@ -1882,9 +1857,7 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
         dv2f,
         cuf,
         cof,
-        nsf,
         (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
-        Int32(1),
         Float32(1.0),
         Int32(0),
         Int32(0),
@@ -1917,21 +1890,17 @@ def blackwell_delta_h_bwd_dhu_v1(
     h0: torch.Tensor | None = None,
     dht: torch.Tensor | None = None,
     scale: float = 1.0,
-    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     dv2_out: torch.Tensor | None = None,
-    chunk_offsets: torch.Tensor | None = None,
-    num_seqs: torch.Tensor | int | None = None,
     bv: int = 16,
-    N: int | None = None,
-    NT: int | None = None,
     metadata: RaggedChunkMetadata | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    BlackwellDeltaHBwd backward dhu — cuteDSL SM100 kernel.
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Run the CuTeDSL SM100 delta-H backward leaf.
 
-    Ragged metadata supplies graph-replayable chunk offsets and the static output
-    capacity. The legacy packed arguments remain supported. Returns (dh, dh0, dv2).
+    ``metadata=None`` selects dense execution. Ragged callers pass one canonical metadata
+    object; empty boundary ranges encode inactive logical sequences. Ragged ``dh`` has
+    ``metadata.capacity`` chunk slots, and values beyond ``chunk_offsets[-1]`` are undefined.
+    Returns ``(dh, dh0, dv2)``, where ``dh0`` is absent when no initial state was supplied.
     """
     B, T, H, K = q.shape
     V = do.shape[-1]
@@ -1940,36 +1909,11 @@ def blackwell_delta_h_bwd_dhu_v1(
 
     assert K == 128, "BlackwellDeltaHBwd requires head_k=128"
 
-    if metadata is not None:
-        metadata.validate_chunk_size(chunk_size)
-        if any(value is not None for value in (cu_seqlens, chunk_offsets, num_seqs, N, NT)):
-            raise ValueError("pass either metadata or legacy packed arguments, not both")
-        cu_seqlens = metadata.cu_seqlens
-        chunk_offsets = metadata.chunk_offsets
-        N = metadata.cu_seqlens.shape[0] - 1
-        NT = metadata.capacity
-
-    is_vl = cu_seqlens is not None
-    if cu_seqlens is None:
-        N = N if N is not None else B
-        NT = NT if NT is not None else (T + BT - 1) // BT
-        ch_offs = None
+    if metadata is None:
+        NT = (T + BT - 1) // BT
     else:
-        # Accept pre-computed N and NT from the dispatch to avoid redundant
-        # prepare_chunk_indices on padded cu_seqlens (breaks CUDA graph capture
-        # and wastes CPU time).
-        if N is None:
-            N = len(cu_seqlens) - 1
-        if NT is None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            NT = len(chunk_indices)
-        ch_offs = (
-            chunk_offsets
-            if chunk_offsets is not None
-            else _cumulative_chunk_offsets(cu_seqlens, BT)
-        )
-
-    tot_nt = B * NT
+        metadata.validate_chunk_size(chunk_size)
+        NT = metadata.capacity
 
     fgk = 1 if gk is not None else 0
     fdht = 1 if dht is not None else 0
@@ -1982,10 +1926,9 @@ def blackwell_delta_h_bwd_dhu_v1(
     if _is_fake_mode():
         return dh_out, dh0_out, dv2
 
-    if is_vl:
+    if metadata is not None:
         assert B == 1, "varlen requires B=1"
-        cu_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
-        co_i32 = ch_offs.int() if ch_offs is not None and ch_offs.dtype != torch.int32 else ch_offs
+        N = metadata.cu_seqlens.shape[0] - 1
         q_k, k_k, w_k = q[0], k[0], w[0]
         do_k, dv_k = do[0], dv[0]
         gk_k = gk[0] if gk is not None else _get_dummy((T, H, K), torch.float32, dev)
@@ -1993,14 +1936,6 @@ def blackwell_delta_h_bwd_dhu_v1(
         dh0_k = dh0_out if dh0_out is not None else _get_dummy((N, H, K, V), torch.float32, dev)
         dho = dh_out[0]  # (NT, H, K, V)
         dv2_k = dv2[0]
-        if num_seqs is None:
-            ns_tensor = cu_i32.new_full((1,), N)
-        elif isinstance(num_seqs, int):
-            ns_tensor = cu_i32.new_full((1,), num_seqs)
-        else:
-            ns_tensor = num_seqs.int() if num_seqs.dtype != torch.int32 else num_seqs
-            if ns_tensor.dim() == 0:
-                ns_tensor = ns_tensor.unsqueeze(0)
 
         ps = (Int32(N), Int32(T), Int32(H), Int32(K), Int32(V))
         fn = _compile_bwd_dhu(True, H, K, V, chunk_size, bv)
@@ -2015,21 +1950,13 @@ def blackwell_delta_h_bwd_dhu_v1(
             dh0_k,
             dho,
             dv2_k,
-            cu_i32,
-            co_i32,
-            ns_tensor,
+            metadata.cu_seqlens,
+            metadata.chunk_offsets,
             ps,
-            Int32(tot_nt),
             Float32(scale),
             Int32(fgk),
             Int32(fdht),
             Int32(fdh0),
-        )
-
-        return (
-            dh_out,
-            (dh0_out if h0 is not None else None),
-            dv2,
         )
     else:
         gk_k = gk if gk is not None else _get_dummy((B, T, H, K), torch.float32, dev)
@@ -2037,7 +1964,6 @@ def blackwell_delta_h_bwd_dhu_v1(
         dh0_k = dh0_out if dh0_out is not None else _get_dummy((B, H, K, V), torch.float32, dev)
         cu_d = _get_dummy((2,), torch.int32, dev)
         co_d = _get_dummy((2,), torch.int32, dev)
-        ns_d = _get_dummy((1,), torch.int32, dev)
 
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
         fn = _compile_bwd_dhu(False, H, K, V, chunk_size, bv)
@@ -2054,17 +1980,11 @@ def blackwell_delta_h_bwd_dhu_v1(
             dv2,
             cu_d,
             co_d,
-            ns_d,
             ps,
-            Int32(NT),
             Float32(scale),
             Int32(fgk),
             Int32(fdht),
             Int32(fdh0),
         )
 
-        return (
-            dh_out,
-            (dh0_out if h0 is not None else None),
-            dv2,
-        )
+    return dh_out, dh0_out, dv2

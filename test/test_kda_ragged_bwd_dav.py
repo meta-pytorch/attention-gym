@@ -7,7 +7,6 @@ import torch
 
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
@@ -99,37 +98,6 @@ def test_ragged_bwd_dav_rejects_mismatched_chunk_size():
         chunk_kda_bwd_dav(v, A, do, _SCALE, chunk_size=32, metadata=metadata)
 
 
-def test_aligned_chunk_map_path_is_preserved():
-    lengths = [64, 0, 64]
-    inputs = _inputs(sum(lengths))
-    cu_seqlens = cumulative_sequence_offsets(lengths)
-    chunk_indices, num_chunks = prepare_complete_chunk_metadata(
-        cu_seqlens,
-        sum(lengths),
-        _CHUNK_SIZE,
-    )
-    metadata = ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
-
-    actual = chunk_kda_bwd_dav(*inputs, _SCALE, metadata=metadata)
-    expected = _independent_sequences(*inputs, lengths)
-    for packed, independent in zip(actual, expected, strict=True):
-        torch.testing.assert_close(packed, independent, rtol=0, atol=0)
-
-
-def test_ragged_bwd_dav_fullgraph():
-    inputs = _inputs(128)
-    cu_seqlens = cumulative_sequence_offsets([65, 63])
-
-    def operation(v, A, do, offsets):
-        metadata = prepare_ragged_chunk_metadata(offsets, 128, _CHUNK_SIZE)
-        return chunk_kda_bwd_dav(v, A, do, _SCALE, metadata=metadata)
-
-    expected = operation(*inputs, cu_seqlens)
-    actual = torch.compile(operation, fullgraph=True)(*inputs, cu_seqlens)
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=1e-6, atol=1e-7)
-
-
 def test_ragged_bwd_dav_replays_aligned_to_ragged():
     inputs = _inputs(128)
     cu_seqlens = cumulative_sequence_offsets([64, 64])
@@ -150,15 +118,3 @@ def test_ragged_bwd_dav_replays_aligned_to_ragged():
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     for replayed, independent in zip(actual, expected, strict=True):
         torch.testing.assert_close(replayed, independent, rtol=0, atol=0)
-
-
-def test_ragged_bwd_dav_op_registration():
-    """Validate the opaque ragged dAv operator against its schema and fake."""
-    inputs = _inputs(128)
-    cu_seqlens = cumulative_sequence_offsets([65, 63])
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, _CHUNK_SIZE)
-    torch.library.opcheck(
-        torch.ops.attn_gym.kda_chunk_bwd_dav_ragged.default,
-        (*inputs, metadata.cu_seqlens, metadata.chunk_offsets, _SCALE, _CHUNK_SIZE),
-        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
-    )

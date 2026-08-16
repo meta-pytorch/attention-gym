@@ -73,18 +73,11 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         H: int,
         total_chunks: int,
         cu_seqlens: cute.Tensor | None,
-        chunk_indices: cute.Tensor | None,
         chunk_offsets: cute.Tensor | None,
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mQ.element_type
-
-        if cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
-            NT = cute.size(chunk_indices, mode=[0]) // 2
-            num_pairs = NT * self.num_offdiag_blocks
-        else:
-            num_pairs = total_chunks * self.num_offdiag_blocks
-        grid = (num_pairs, H, 1)
+        grid = (total_chunks * self.num_offdiag_blocks, H, 1)
 
         smem_k_block_size = 64
         swizzle_bits = 3
@@ -143,7 +136,6 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             mAkkOD,
             scale,
             cu_seqlens,
-            chunk_indices,
             chunk_offsets,
             sGated_layout,
             sGref_layout,
@@ -165,7 +157,6 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         mAkkOD: cute.Tensor,
         scale: cutlass.Float32,
         cu_seqlens: cute.Tensor | None,
-        chunk_indices: cute.Tensor | None,
         chunk_offsets: cute.Tensor | None,
         sGated_layout: cute.ComposedLayout,
         sGref_layout: cute.Layout,
@@ -213,12 +204,6 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                     Int32(self.BT),
                 )
                 eos = chunk_base + valid_tokens
-        elif cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
-            i_n = chunk_indices[chunk_idx * 2]
-            i_t = chunk_indices[chunk_idx * 2 + 1]
-            bos = cu_seqlens[i_n]
-            eos = cu_seqlens[i_n + 1]
-            chunk_base = bos + i_t * self.BT
         else:
             chunk_base = chunk_idx * self.BT
             eos = cute.size(mQ, mode=[0])
@@ -257,8 +242,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 actual_col = cutlass.min(self.BC, cutlass.max(eos - ti_col, 0))
                 safe_ti_row = cutlass.min(ti_row, cutlass.max(eos - 1, 0))
 
-                if tidx < self.D:
+                if tidx < self.D and eos > 0:
                     sGref[tidx] = mG[safe_ti_row, h_col]
+                if tidx < self.D and eos == 0:
+                    # Capacity-only CTAs (eos stays 0) must not touch token storage; a zero
+                    # reference gate keeps their SMEM tiles deterministic zeros.
+                    sGref[tidx] = mG.element_type(0.0)
                 if tidx < self.BC:
                     beta_val = cutlass.Float32(0.0)
                     if tidx < actual_row:

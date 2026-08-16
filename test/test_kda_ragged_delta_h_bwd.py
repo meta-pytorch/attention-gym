@@ -151,42 +151,12 @@ def test_ragged_delta_h_ignores_nan_poisoned_physical_suffix(bv, lengths):
     )
 
 
-def test_ragged_delta_h_preserves_legacy_packed_arguments():
-    lengths = [64, 64]
-    inputs = _inputs(sum(lengths), len(lengths))
-    metadata = prepare_ragged_chunk_metadata(
-        cumulative_sequence_offsets(lengths), sum(lengths), 64
-    )
-    metadata_outputs = blackwell_delta_h_bwd_dhu_dispatch(
-        *inputs[:5],
-        gk=inputs[5],
-        h0=inputs[6],
-        dht=inputs[7],
-        scale=128**-0.5,
-        metadata=metadata,
-    )
-    legacy_outputs = blackwell_delta_h_bwd_dhu_dispatch(
-        *inputs[:5],
-        gk=inputs[5],
-        h0=inputs[6],
-        dht=inputs[7],
-        scale=128**-0.5,
-        cu_seqlens=metadata.cu_seqlens,
-        chunk_offsets=metadata.chunk_offsets,
-        num_seqs=metadata.cu_seqlens.new_full((1,), len(lengths)),
-        num_chunks=2,
-    )
-
-    metadata_dh, metadata_dh0, metadata_dv = metadata_outputs
-    legacy_dh, legacy_dh0, legacy_dv = legacy_outputs
-    assert metadata_dh.shape[1] == 3
-    assert legacy_dh.shape[1] == 2
-    torch.testing.assert_close(metadata_dh[:, :2], legacy_dh, rtol=0, atol=0)
-    torch.testing.assert_close(metadata_dh0, legacy_dh0, rtol=0, atol=0)
-    torch.testing.assert_close(metadata_dv, legacy_dv, rtol=0, atol=0)
-
-
-def test_ragged_delta_h_replays_aligned_to_tails():
+@pytest.mark.parametrize(
+    "replayed_lengths",
+    ([65, 63], [128, 0]),
+    ids=["tails", "empty-sequence"],
+)
+def test_ragged_delta_h_replays_aligned_boundaries(replayed_lengths):
     tokens = 128
     inputs = _inputs(tokens, 2)
     cu_seqlens = cumulative_sequence_offsets([64, 64])
@@ -202,12 +172,18 @@ def test_ragged_delta_h_replays_aligned_to_tails():
             cu_seqlens,
         )
 
-    cu_seqlens.copy_(cumulative_sequence_offsets([65, 63]))
+    cu_seqlens.copy_(cumulative_sequence_offsets(replayed_lengths))
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_dh, expected_dh0, expected_dv = _run_ragged(inputs, [65, 63])
+    expected_dh, expected_dh0, expected_dv = _run_ragged(inputs, replayed_lengths)
+    active_chunks = sum((length + 63) // 64 for length in replayed_lengths)
     assert captured_dh.shape[1] == 3
-    torch.testing.assert_close(captured_dh, expected_dh, rtol=0, atol=0)
+    torch.testing.assert_close(
+        captured_dh[:, :active_chunks],
+        expected_dh[:, :active_chunks],
+        rtol=0,
+        atol=0,
+    )
     torch.testing.assert_close(captured_dh0, expected_dh0, rtol=0, atol=0)
     torch.testing.assert_close(captured_dv, expected_dv, rtol=0, atol=0)

@@ -24,16 +24,14 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     ChunkKdaBwdWyDqkgConfig,
     chunk_kda_bwd_wy_dqkg,
 )
+from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    SequenceMode,
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,
     _chunk_kda_fwd_op,
     _chunk_kda_fwd_with_state_op,
-    _prepare_sequence_metadata,
 )
-from attn_gym.linear.kda.utils import prepare_complete_chunk_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -327,37 +325,45 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
 
 
 @pytest.mark.parametrize(
-    ("batch", "tokens", "explicit_offsets", "expected_mode", "expected_packed_shape"),
+    ("batch", "tokens", "explicit_offsets", "expected_route"),
     [
-        (1, 128, None, SequenceMode.DENSE, (1, 128, 1, 128)),
-        (2, 128, None, SequenceMode.SHAPE_PACKED, (1, 256, 1, 128)),
-        (2, 65, None, SequenceMode.SHAPE_PACKED, (1, 130, 1, 128)),
-        (1, 128, [0, 64, 128], SequenceMode.PACKED, (1, 128, 1, 128)),
+        (1, 128, None, "dense"),
+        (2, 128, None, "ragged"),
+        (1, 65, None, "ragged"),
+        (1, 128, [0, 64, 128], "ragged"),
     ],
 )
-def test_sequence_metadata_preserves_boundary_provenance(
-    batch, tokens, explicit_offsets, expected_mode, expected_packed_shape
+def test_chunk_kda_selects_direct_dense_or_ragged_route(
+    monkeypatch, batch, tokens, explicit_offsets, expected_route
 ):
-    """Distinguish shape-generated boundaries from replayable caller-owned values."""
-    q = torch.empty((batch, tokens, 1, 128), device="cuda", dtype=torch.bfloat16)
+    """Keep complete single sequences on the direct launcher without a mode object."""
+    module = importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd")
+    routes = []
+
+    def dense_forward(q, _k, v, _gate, _beta, _state):
+        routes.append("dense")
+        tape = q.new_empty((*q.shape[:3], 64))
+        return torch.empty_like(v), tape, tape
+
+    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets):
+        routes.append("ragged")
+        tape = q.new_empty((*q.shape[:3], 64))
+        return torch.empty_like(v), tape, tape
+
+    monkeypatch.setattr(module, "_chunk_kda_fwd_op", dense_forward)
+    monkeypatch.setattr(module, "_chunk_kda_fwd_ragged_op", ragged_forward)
+    inputs = tuple(tensor.detach() for tensor in _inputs(batch=batch, tokens=tokens))
     cu_seqlens = (
         None
         if explicit_offsets is None
         else torch.tensor(explicit_offsets, device="cuda", dtype=torch.int32)
     )
 
-    metadata = _prepare_sequence_metadata(q, cu_seqlens)
+    output, state = chunk_kda(*inputs, cu_seqlens=cu_seqlens)
 
-    assert metadata.mode is expected_mode
-    assert metadata.packed_shape == expected_packed_shape
-    assert metadata.output_shape == q.shape
-    if cu_seqlens is not None:
-        assert metadata.cu_seqlens is cu_seqlens
-    elif expected_mode is SequenceMode.DENSE:
-        assert metadata.cu_seqlens is None
-    else:
-        expected = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * tokens
-        torch.testing.assert_close(metadata.cu_seqlens, expected)
+    assert output.shape == inputs[0].shape
+    assert state is None
+    assert routes == [expected_route]
 
 
 def test_optimized_chunk_kda_dense_batch_matches_equal_length_packing():
@@ -571,6 +577,7 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
 
     def fake_delta_h(**kwargs):
         captured["bv"] = kwargs["bv"]
+        captured["metadata"] = kwargs["metadata"]
         return result
 
     class DeviceProperties:
@@ -578,19 +585,21 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
 
     monkeypatch.setattr(dispatch, "blackwell_delta_h_bwd_dhu_v1", fake_delta_h)
     monkeypatch.setattr(dispatch, "get_device_properties", lambda _device: DeviceProperties())
-    tensor = torch.empty(1, 1, 2, 128, device="cuda")
+    tensor = torch.empty(1, 7, 2, 128, device="cuda")
     cu_seqlens = torch.arange(8, dtype=torch.int32, device="cuda")
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, tensor.shape[1], 64)
     actual = dispatch.blackwell_delta_h_bwd_dhu_dispatch(
         tensor,
         tensor,
         tensor,
         tensor,
         tensor,
-        cu_seqlens=cu_seqlens,
+        metadata=metadata,
     )
 
     assert actual is result
     assert captured["bv"] == 32
+    assert captured["metadata"] is metadata
 
 
 def test_chunk_kda_op_registration():
@@ -607,7 +616,6 @@ def test_chunk_kda_op_registration():
         cumulative_gate.detach(),
         beta.detach(),
         initial_state.detach(),
-        None,
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
@@ -618,16 +626,13 @@ def test_chunk_kda_backward_op_registration():
     torch.manual_seed(6)
     q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
     with torch.no_grad():
-        _output, state, Aqk, Akk, cu_seqlens, chunk_indices, num_chunks = (
-            _chunk_kda_fwd_with_state_op(
-                q,
-                k,
-                v,
-                cumulative_gate,
-                beta,
-                initial_state,
-                None,
-            )
+        _output, state, Aqk, Akk = _chunk_kda_fwd_with_state_op(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
         )
     torch.library.opcheck(
         _chunk_kda_bwd_op,
@@ -639,13 +644,11 @@ def test_chunk_kda_backward_op_registration():
             beta.detach(),
             Aqk,
             Akk,
-            cu_seqlens,
-            chunk_indices,
-            num_chunks,
+            None,
+            None,
             None,
             torch.randn_like(state),
             None,
-            False,  # ragged
             False,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
@@ -662,13 +665,11 @@ def test_chunk_kda_backward_op_registration():
             beta.detach(),
             Aqk,
             Akk,
-            cu_seqlens,
-            chunk_indices,
-            num_chunks,
+            None,
+            None,
             None,
             torch.randn_like(state),
             initial_state.detach(),
-            False,  # ragged
             False,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
@@ -852,25 +853,6 @@ def test_chunk_kda_cuda_graph_replay():
     torch.testing.assert_close(state, expected_state)
     for actual_gradient, expected_gradient in zip(gradients, expected_gradients, strict=True):
         torch.testing.assert_close(actual_gradient, expected_gradient)
-
-
-def test_prepare_complete_chunk_metadata_handles_more_sequences_than_threads():
-    """Let each metadata-kernel lane emit multiple logical sequence spans."""
-    num_sequences = 300
-    chunk_counts = torch.arange(num_sequences, device="cuda", dtype=torch.int32) % 4 + 1
-    chunk_offsets = torch.cat((chunk_counts.new_zeros(1), chunk_counts.cumsum(0)))
-    cu_seqlens = chunk_offsets * 64
-    total_chunks = int(chunk_offsets[-1])
-    chunk_indices, num_chunks = prepare_complete_chunk_metadata(cu_seqlens, 64 * total_chunks, 64)
-
-    sequence_indices = torch.arange(
-        num_sequences, device="cuda", dtype=torch.int32
-    ).repeat_interleave(chunk_counts)
-    local_chunks = torch.arange(total_chunks, device="cuda", dtype=torch.int32)
-    local_chunks -= chunk_offsets[:-1].repeat_interleave(chunk_counts)
-    expected = torch.stack((sequence_indices, local_chunks), dim=1)
-    torch.testing.assert_close(chunk_indices, expected)
-    assert num_chunks.item() == total_chunks
 
 
 def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():

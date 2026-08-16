@@ -7,7 +7,6 @@ import torch
 
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
@@ -86,29 +85,6 @@ def test_ragged_recurrence_accepts_all_empty_sequences():
     assert h.shape == (1, 0, 1, 128, 128)
     assert v_new.shape == u.shape
     torch.testing.assert_close(final_state, initial_state, rtol=0, atol=0)
-
-
-def test_complete_chunk_metadata_matches_ragged_metadata():
-    torch.manual_seed(2)
-    lengths = [64, 64]
-    shape = (1, sum(lengths), 1, 128)
-    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
-    w = torch.randn_like(k) / 8
-    u = torch.randn_like(k) / 8
-    gk = -torch.rand(shape, device="cuda")
-    initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
-    cu_seqlens = cumulative_sequence_offsets(lengths)
-    chunk_indices, num_chunks = prepare_complete_chunk_metadata(cu_seqlens, sum(lengths), 64)
-    metadata = ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
-
-    actual_h, actual_v, actual_final = chunk_gated_delta_rule_fwd_h(
-        k, w, u, gk, initial_state, metadata=metadata
-    )
-    expected_h, expected_v, expected_final = _run(k, w, u, gk, initial_state, lengths)
-
-    torch.testing.assert_close(actual_h, expected_h[:, :2], rtol=0, atol=0)
-    torch.testing.assert_close(actual_v, expected_v, rtol=0, atol=0)
-    torch.testing.assert_close(actual_final, expected_final, rtol=0, atol=0)
 
 
 def test_ragged_recurrence_rejects_mismatched_metadata_chunk_size():

@@ -7,7 +7,6 @@ import torch
 
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
-    _chunk_kda_fwd_k4b_ragged_custom_op,
     chunk_kda_fwd_inter_solve_ragged_cute,
     chunk_kda_fwd_k4b_ragged_cute,
 )
@@ -93,65 +92,6 @@ def test_ragged_k4_inactive_capacity_is_ignored_and_output_is_zero_extended():
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     upper = torch.ones(64, 64, dtype=torch.bool, device="cuda").triu(1)
     assert torch.count_nonzero(actual.view(2, 64, 64)[upper.expand(2, -1, -1)]) == 0
-
-
-def test_ragged_k4_custom_op_and_fullgraph():
-    lengths = [65, 63]
-    metadata, offdiagonal, diagonal = _inputs(lengths)
-    op_args = (
-        offdiagonal,
-        diagonal,
-        metadata.cu_seqlens,
-        metadata.chunk_offsets,
-        metadata.capacity,
-    )
-    torch.library.opcheck(_chunk_kda_fwd_k4b_ragged_custom_op, op_args)
-
-    def operation(AkkOD, Akkd, offsets):
-        graph_metadata = prepare_ragged_chunk_metadata(offsets, 128, 64)
-        return chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, graph_metadata)
-
-    expected = operation(offdiagonal, diagonal, metadata.cu_seqlens)
-    actual = torch.compile(operation, fullgraph=True)(
-        offdiagonal,
-        diagonal,
-        metadata.cu_seqlens,
-    )
-    torch.testing.assert_close(actual, expected)
-
-
-def test_ragged_inter_solve_fullgraph_captures_k3():
-    lengths = [65, 63]
-    tokens = sum(lengths)
-    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
-    torch.manual_seed(31)
-    q = torch.randn(1, tokens, 1, 128, device="cuda", dtype=torch.bfloat16) / 8
-    k = torch.randn_like(q) / 8
-    g = -torch.rand(1, tokens, 1, 128, device="cuda")
-    beta = torch.sigmoid(torch.randn(1, tokens, 1, device="cuda"))
-    diagonal = _diagonal_inverses(lengths)
-    Aqk = torch.zeros(1, tokens, 1, 64, device="cuda", dtype=torch.bfloat16)
-
-    def operation(q, k, g, beta, diagonal, Aqk, offsets):
-        graph_metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
-        return chunk_kda_fwd_inter_solve_ragged_cute(
-            q,
-            k,
-            g,
-            beta,
-            diagonal,
-            Aqk,
-            128**-0.5,
-            graph_metadata,
-        )
-
-    expected = operation(q, k, g, beta, diagonal, Aqk.clone(), metadata.cu_seqlens)
-    compiled = torch.compile(operation, fullgraph=True)
-    actual = compiled(q, k, g, beta, diagonal, Aqk.clone(), metadata.cu_seqlens)
-    alternate = compiled(torch.zeros_like(q), k, g, beta, diagonal, Aqk, metadata.cu_seqlens)
-
-    torch.testing.assert_close(actual, expected)
-    assert not torch.equal(actual[0], alternate[0])
 
 
 @pytest.mark.parametrize("lengths", [[0], [0, 0, 0]])

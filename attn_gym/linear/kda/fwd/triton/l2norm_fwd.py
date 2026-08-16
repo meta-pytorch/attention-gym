@@ -13,46 +13,6 @@ from attn_gym._backends.triton.utils import ptr_offset
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=4)],
-    key=["D"],
-)
-@triton.jit
-def l2norm_fwd_kernel1(
-    x,
-    y,
-    rstd,
-    eps,
-    X_STRIDES: tl.constexpr,
-    Y_STRIDES: tl.constexpr,
-    RSTD_STRIDES: tl.constexpr,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-):
-    i_row = tl.program_id(0).to(tl.int64)
-    i_bt = i_row // H
-    o_d = tl.arange(0, BD).to(tl.int64)
-    mask = o_d < D
-    # Inductor passes Python floats as fp64; keep the reduction in fp32.
-    eps = eps.to(tl.float32)
-
-    b_x = tl.load(
-        x
-        + ptr_offset(
-            (i_bt // T, i_bt % T, i_row % H, o_d),
-            X_STRIDES,
-        ),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x) + eps)
-    b_y = b_x * b_rstd
-    tl.store(y + ptr_offset((i_row, o_d), Y_STRIDES), b_y, mask=mask)
-    tl.store(rstd + ptr_offset((i_row,), RSTD_STRIDES), b_rstd)
-
-
-@triton.autotune(
     configs=[
         triton.Config({"BT": 16}, num_warps=4, num_stages=3),
     ],

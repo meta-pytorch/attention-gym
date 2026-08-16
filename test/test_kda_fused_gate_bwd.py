@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Correctness tests for fused CuTeDSL KDA reverse-cumsum and gate backward."""
+"""Correctness tests for the shipped bounded-gate forward and backward paths."""
 
 from __future__ import annotations
 
@@ -24,10 +24,6 @@ from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import (
     _fused_gate_bwd_op,
     fused_gate_bwd,
 )
-from attn_gym.linear.kda.bwd.triton.cumsum import (
-    chunk_local_cumsum_vector_kernel,
-)
-from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_kernel
 from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
 from attn_gym.linear.kda.naive import fused_gate_bwd_ref
 
@@ -49,6 +45,16 @@ def _inputs(tokens: int, heads: int = 16, head_dim: int = 128, batch: int = 2):
     return g, A_log, dt_bias, d_cumulative
 
 
+def _forward_reference(g, A_log, dt_bias, lower_bound=-5.0, chunk_size=64):
+    """Apply the shipped bounded gate and chunk-local prefix sum in PyTorch."""
+    gate_input = g.float() + dt_bias
+    gate = lower_bound * torch.sigmoid(A_log.exp().view(1, 1, -1, 1) * gate_input)
+    return torch.cat(
+        [chunk.cumsum(1) * math.log2(math.e) for chunk in gate.split(chunk_size, dim=1)],
+        dim=1,
+    )
+
+
 def _autograd_reference(
     g,
     A_log,
@@ -61,11 +67,12 @@ def _autograd_reference(
     g_ref = g.float().detach().requires_grad_()
     A_log_ref = A_log.detach().requires_grad_()
     dt_bias_ref = dt_bias.detach().requires_grad_()
-    z = g_ref + dt_bias_ref
-    gate = lower_bound * torch.sigmoid(A_log_ref.exp().view(1, 1, -1, 1) * z)
-    cumulative = torch.cat(
-        [chunk.cumsum(1) * math.log2(math.e) for chunk in gate.split(chunk_size, dim=1)],
-        dim=1,
+    cumulative = _forward_reference(
+        g_ref,
+        A_log_ref,
+        dt_bias_ref,
+        lower_bound=lower_bound,
+        chunk_size=chunk_size,
     )
     return torch.autograd.grad(
         cumulative,
@@ -189,9 +196,18 @@ def test_bounded_gate_cumsum_rejects_backward_unsupported_shape(shape, match):
         bounded_gate_cumsum(raw_gate, A_log, dt_bias)
 
 
-def test_bounded_gate_cumsum_autograd_boundary():
-    """Exercise the fused forward and backward through the public gate boundary."""
-    g, A_log, dt_bias, d_cumulative = _inputs(65, heads=2, batch=1)
+@pytest.mark.parametrize(
+    ("batch", "tokens", "head_dim", "chunk_size"),
+    ((2, 65, 128, 64), (1, 17, 32, 8)),
+)
+def test_bounded_gate_cumsum_autograd_boundary(batch, tokens, head_dim, chunk_size):
+    """Exercise batched, strided, tail, and nondefault public gate routes."""
+    g, A_log, dt_bias, d_cumulative = _inputs(
+        tokens,
+        heads=2,
+        head_dim=head_dim,
+        batch=batch,
+    )
     g_storage = torch.empty(*g.shape[:-1], 2 * g.shape[-1], dtype=g.dtype, device="cuda")
     A_storage = torch.empty(2 * A_log.shape[0], dtype=A_log.dtype, device="cuda")
     bias_storage = torch.empty(
@@ -202,7 +218,14 @@ def test_bounded_gate_cumsum_autograd_boundary():
     dt_bias = bias_storage[..., ::2].copy_(dt_bias).requires_grad_()
     inputs = (g, A_log, dt_bias)
     assert not all(tensor.is_contiguous() for tensor in inputs)
-    output = bounded_gate_cumsum(*inputs, chunk_size=64, lower_bound=-3.25)
+    output = bounded_gate_cumsum(*inputs, chunk_size=chunk_size, lower_bound=-3.25)
+    expected_output = _forward_reference(
+        g,
+        A_log,
+        dt_bias,
+        lower_bound=-3.25,
+        chunk_size=chunk_size,
+    )
     actual = torch.autograd.grad(output, inputs, d_cumulative)
     expected = _autograd_reference(
         g,
@@ -210,9 +233,10 @@ def test_bounded_gate_cumsum_autograd_boundary():
         dt_bias,
         d_cumulative,
         lower_bound=-3.25,
-        chunk_size=64,
+        chunk_size=chunk_size,
     )
 
+    torch.testing.assert_close(output, expected_output, rtol=2e-5, atol=2e-5)
     _assert_bf16_within_one_ulp(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=5e-4)
     torch.testing.assert_close(actual[2], expected[2], rtol=5e-5, atol=7e-4)
@@ -275,88 +299,6 @@ def test_fused_gate_bwd_fastmath_specialization_is_correct():
 
     _assert_output_close(actual, expected)
     torch.testing.assert_close(actual.dA_partial.sum((0, 1)), expected_dA, rtol=5e-5, atol=7e-4)
-
-
-def test_fused_gate_bwd_matches_triton_composition():
-    """Preserve the exact deployed reverse-cumsum plus gate-backward contract."""
-    inputs = _inputs(65, batch=1)
-    batched_g, A_log, dt_bias, batched_d_cumulative = inputs
-    g = batched_g[0]
-    d_cumulative = batched_d_cumulative[0]
-    tokens, heads, head_dim = g.shape
-    d_gate = torch.empty_like(d_cumulative)
-    triton_dg = torch.empty_like(d_cumulative)
-    cumsum_chunks = triton.cdiv(tokens, 64)
-    gate_chunks = triton.cdiv(tokens, 32)
-    triton_dA_partial = torch.empty(gate_chunks, heads, device="cuda", dtype=torch.float32)
-
-    cumsum_kernel = chunk_local_cumsum_vector_kernel.fn.fn
-    cumsum_kernel[(triton.cdiv(head_dim, 32), cumsum_chunks, heads)](
-        d_cumulative,
-        d_gate,
-        math.log2(math.e),
-        None,
-        None,
-        tokens,
-        d_cumulative.stride(0),
-        d_gate.stride(0),
-        S_STRIDES=d_cumulative.stride(),
-        O_STRIDES=d_gate.stride(),
-        B=1,
-        H=heads,
-        S=head_dim,
-        BT=64,
-        BS=32,
-        REVERSE=True,
-        HAS_SCALE=True,
-        IS_VARLEN=False,
-        num_warps=4,
-    )
-    gate_kernel = kda_gate_bwd_kernel.fn.fn
-    gate_kernel[(gate_chunks, heads)](
-        g,
-        A_log,
-        dt_bias,
-        d_gate,
-        triton_dg,
-        triton_dA_partial,
-        -5.0,
-        tokens,
-        G_STRIDES=g.stride(),
-        A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=dt_bias.stride(),
-        DYG_STRIDES=d_gate.stride(),
-        DG_STRIDES=triton_dg.stride(),
-        DA_STRIDES=triton_dA_partial.stride(),
-        H=heads,
-        D=head_dim,
-        BT=32,
-        BD=head_dim,
-        HAS_BIAS=True,
-        USE_LOWER_BOUND=True,
-        num_warps=4,
-        num_stages=3,
-    )
-
-    actual = fused_gate_bwd(*inputs)
-    torch.testing.assert_close(
-        actual.dg[0].float(),
-        triton_dg,
-        rtol=torch.finfo(torch.bfloat16).eps,
-        atol=1e-3,
-    )
-    torch.testing.assert_close(
-        actual.dA_partial.sum((0, 1)),
-        triton_dA_partial.sum(0),
-        rtol=2e-4,
-        atol=2e-2,
-    )
-    torch.testing.assert_close(
-        actual.d_dt_bias,
-        triton_dg.sum(0),
-        rtol=2e-4,
-        atol=2e-2,
-    )
 
 
 def test_fused_gate_bwd_op_registration():

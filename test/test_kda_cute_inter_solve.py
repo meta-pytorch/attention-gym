@@ -52,8 +52,6 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
     cumulative_gate = (torch.randn(shape, device="cuda") * 0.01).cumsum(1)
     beta = torch.rand(1, 128, 1, device="cuda")
     diagonal_inverse = torch.randn(1, 128, 1, 16, device="cuda") * 0.01
-    cu_seqlens = torch.tensor([0, 128], device="cuda", dtype=torch.int64)
-    chunk_indices = torch.tensor([[0, 0], [0, 1]], device="cuda", dtype=torch.int64)
 
     def run_inter_solve():
         Akk = torch.full((1, 128, 1, 64), torch.nan, device="cuda", dtype=q.dtype)
@@ -64,8 +62,6 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
             beta,
             diagonal_inverse,
             128**-0.5,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
             Akk=Akk,
         )
 

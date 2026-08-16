@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+import attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o as output_module
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -76,12 +76,27 @@ def test_ragged_output_composition_matches_reference(lengths):
     scale = 0.125
 
     expected = _reference(q, v, g, A, h, lengths, scale)
-    actual = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+    actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_ragged_output_routes_full_chunks_through_tma_and_masks_tails():
+def test_ragged_output_routes_full_chunks_through_tma_and_masks_tails(monkeypatch):
     torch.manual_seed(2)
+    launch_count = 0
+    tma_kernel = output_module.chunk_gla_fwd_kernel_o_ragged_tma
+
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            launch = tma_kernel[grid]
+
+            def record_launch(*args, **kwargs):
+                nonlocal launch_count
+                launch_count += 1
+                return launch(*args, **kwargs)
+
+            return record_launch
+
+    monkeypatch.setattr(output_module, "chunk_gla_fwd_kernel_o_ragged_tma", RecordingKernel())
     lengths = [65, 63]
     tokens = sum(lengths)
     heads = 1
@@ -95,7 +110,9 @@ def test_ragged_output_routes_full_chunks_through_tma_and_masks_tails():
     scale = 0.125
 
     expected = _reference(q, v, g, A, h, lengths, scale)
-    actual = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+    expected_tma = output_module._can_use_tensor_descriptors(q, v, g, h, torch.empty_like(v), A)
+    actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+    assert launch_count == int(expected_tma)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
@@ -114,13 +131,13 @@ def test_ragged_output_replays_aligned_to_ragged():
     scale = 0.125
 
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-    chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=warm_metadata)
+    output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=warm_metadata)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-        actual = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+        actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
     graph.replay()

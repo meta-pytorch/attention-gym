@@ -1,4 +1,4 @@
-"""End-to-end gradient tests for public ragged CuTe KDA."""
+"""End-to-end behavior and gradient tests for public ragged CuTe KDA."""
 
 from __future__ import annotations
 
@@ -29,15 +29,23 @@ def _run_gradients(
     output_grad,
     state_grad,
     operation=chunk_kda,
+    *,
+    output_final_state=True,
 ):
     output, final_state = operation(
         *inputs,
         initial_state,
         cu_seqlens=offsets,
-        output_final_state=True,
+        output_final_state=output_final_state,
     )
-    loss = (output.float() * output_grad).sum() + (final_state * state_grad).sum()
-    return output, final_state, torch.autograd.grad(loss, (*inputs, initial_state))
+    losses = []
+    if output_grad is not None:
+        losses.append((output.float() * output_grad).sum())
+    if state_grad is not None:
+        assert final_state is not None
+        losses.append((final_state * state_grad).sum())
+    targets = (*inputs, *((initial_state,) if initial_state is not None else ()))
+    return output, final_state, torch.autograd.grad(sum(losses), targets)
 
 
 def _run_naive_gradients(
@@ -47,34 +55,50 @@ def _run_naive_gradients(
     output_grad,
     state_grad,
     dtype,
+    *,
+    output_final_state,
 ):
     """Run sequence-local naive KDA in one precision for a numerical measuring stick."""
     reference_inputs = tuple(value.detach().to(dtype).requires_grad_() for value in inputs)
-    reference_state = initial_state.detach().to(dtype).requires_grad_()
+    reference_state = (
+        None if initial_state is None else initial_state.detach().to(dtype).requires_grad_()
+    )
     outputs = []
     states = []
     token_start = 0
     for sequence, length in enumerate(lengths):
         if length == 0:
-            states.append(reference_state[sequence])
+            if output_final_state:
+                states.append(reference_state[sequence])
             continue
         token_slice = slice(token_start, token_start + length)
+        sequence_state = (
+            None if reference_state is None else reference_state[sequence : sequence + 1]
+        )
         output, final_state = naive_chunk_kda_from_cumulative(
             *(value[:, token_slice] for value in reference_inputs[:4]),
             reference_inputs[4][:, token_slice],
-            initial_state=reference_state[sequence : sequence + 1],
-            output_final_state=True,
+            initial_state=sequence_state,
+            output_final_state=output_final_state,
             chunk_size=64,
         )
         outputs.append(output)
-        states.append(final_state[0])
+        if output_final_state:
+            states.append(final_state[0])
         token_start += length
     reference_output = torch.cat(outputs, dim=1)
-    reference_final_state = torch.stack(states)
-    loss = (reference_output * output_grad.to(dtype)).sum() + (
-        reference_final_state * state_grad.to(dtype)
-    ).sum()
-    gradients = torch.autograd.grad(loss, (*reference_inputs, reference_state))
+    reference_final_state = torch.stack(states) if output_final_state else None
+    losses = []
+    if output_grad is not None:
+        losses.append((reference_output * output_grad.to(dtype)).sum())
+    if state_grad is not None:
+        losses.append((reference_final_state * state_grad.to(dtype)).sum())
+    targets = (*reference_inputs, *((reference_state,) if reference_state is not None else ()))
+    gradients = torch.autograd.grad(sum(losses), targets, allow_unused=True)
+    gradients = tuple(
+        torch.zeros_like(target) if gradient is None else gradient
+        for target, gradient in zip(targets, gradients, strict=True)
+    )
     return reference_output, reference_final_state, gradients
 
 
@@ -84,14 +108,33 @@ def _assert_run_close(actual, expected, active_tokens=None):
     actual_output, actual_state, actual_gradients = actual
     expected_output, expected_state, expected_gradients = expected
     torch.testing.assert_close(actual_output[:, prefix], expected_output, rtol=0, atol=0)
-    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+    if expected_state is None:
+        assert actual_state is None
+    else:
+        torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
     for actual_gradient, expected_gradient in zip(
-        actual_gradients[:-1], expected_gradients[:-1], strict=True
+        actual_gradients, expected_gradients, strict=True
     ):
-        torch.testing.assert_close(
-            actual_gradient[:, prefix], expected_gradient, rtol=3e-2, atol=3e-2
-        )
-    torch.testing.assert_close(actual_gradients[-1], expected_gradients[-1], rtol=3e-2, atol=3e-2)
+        if active_tokens is not None and actual_gradient.shape != expected_gradient.shape:
+            actual_gradient = actual_gradient[:, prefix]
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
+
+
+def test_public_ragged_preserves_state_for_all_empty_sequences():
+    """Ignore poisoned physical capacity when every logical sequence is empty."""
+    inputs = tuple(
+        torch.full_like(tensor, float("nan")) for tensor in make_kda_test_inputs(64, seed=29)
+    )
+    initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
+
+    _output, final_state = chunk_kda(
+        *inputs,
+        initial_state,
+        cu_seqlens=cumulative_sequence_offsets([0, 0]),
+        output_final_state=True,
+    )
+
+    torch.testing.assert_close(final_state, initial_state, rtol=0, atol=0)
 
 
 def test_public_ragged_backward_matches_independent_sequences():
@@ -146,13 +189,30 @@ def test_public_ragged_backward_matches_independent_sequences():
     torch.testing.assert_close(gradients[-1], expected_state_gradient, rtol=3e-2, atol=3e-2)
 
 
-def test_public_ragged_backward_matches_naive_reference():
+@pytest.mark.parametrize(
+    ("has_initial_state", "output_final_state", "cotangents"),
+    [
+        (False, False, "output"),
+        (True, True, "output"),
+        (True, True, "state"),
+        (True, True, "both"),
+    ],
+)
+def test_public_ragged_backward_matches_naive_reference(
+    has_initial_state,
+    output_final_state,
+    cotangents,
+):
     lengths = [65, 0, 63]
     tokens = sum(lengths)
     actual_inputs = make_kda_test_inputs(tokens, requires_grad=True)
-    actual_state = (torch.randn(3, 1, 128, 128, device="cuda") / 8).requires_grad_()
-    output_grad = torch.randn(1, tokens, 1, 128, device="cuda")
-    state_grad = torch.randn_like(actual_state)
+    actual_state = (
+        (torch.randn(3, 1, 128, 128, device="cuda") / 8).requires_grad_()
+        if has_initial_state
+        else None
+    )
+    output_grad = None if cotangents == "state" else torch.randn(1, tokens, 1, 128, device="cuda")
+    state_grad = torch.randn_like(actual_state) if cotangents in ("state", "both") else None
 
     actual = _run_gradients(
         actual_inputs,
@@ -160,6 +220,7 @@ def test_public_ragged_backward_matches_naive_reference():
         cumulative_sequence_offsets(lengths),
         output_grad,
         state_grad,
+        output_final_state=output_final_state,
     )
     low_precision = _run_naive_gradients(
         actual_inputs,
@@ -168,6 +229,7 @@ def test_public_ragged_backward_matches_naive_reference():
         output_grad,
         state_grad,
         torch.float32,
+        output_final_state=output_final_state,
     )
     high_precision = _run_naive_gradients(
         actual_inputs,
@@ -176,12 +238,24 @@ def test_public_ragged_backward_matches_naive_reference():
         output_grad,
         state_grad,
         torch.float64,
+        output_final_state=output_final_state,
     )
 
-    names = ("output", "final_state", "dq", "dk", "dv", "dg", "db", "d_initial_state")
-    actual_values = (*actual[:2], *actual[2])
-    low_precision_values = (*low_precision[:2], *low_precision[2])
-    high_precision_values = (*high_precision[:2], *high_precision[2])
+    names = ["output"]
+    actual_values = [actual[0]]
+    low_precision_values = [low_precision[0]]
+    high_precision_values = [high_precision[0]]
+    if output_final_state:
+        names.append("final_state")
+        actual_values.append(actual[1])
+        low_precision_values.append(low_precision[1])
+        high_precision_values.append(high_precision[1])
+    names.extend(("dq", "dk", "dv", "dg", "db"))
+    if has_initial_state:
+        names.append("d_initial_state")
+    actual_values.extend(actual[2])
+    low_precision_values.extend(low_precision[2])
+    high_precision_values.extend(high_precision[2])
     for name, value, high_precision_value, low_precision_value in zip(
         names,
         actual_values,
@@ -197,25 +271,54 @@ def test_public_ragged_backward_matches_naive_reference():
         )
 
 
-def test_public_ragged_forward_and_backward_fullgraph():
-    lengths = [65, 63]
+@pytest.mark.parametrize(
+    ("has_initial_state", "output_final_state", "cotangents"),
+    [
+        (False, False, "output"),
+        (True, True, "output"),
+        (True, True, "state"),
+        (True, True, "both"),
+    ],
+)
+def test_public_ragged_forward_and_backward_fullgraph(
+    has_initial_state,
+    output_final_state,
+    cotangents,
+):
+    """Compile normal and optional-cotangent public ragged autograd paths."""
+    lengths = [65, 0, 63]
     inputs = make_kda_test_inputs(sum(lengths), requires_grad=True)
     compiled_inputs = clone_kda_inputs(inputs)
-    initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
-    compiled_state = initial_state.detach().clone().requires_grad_()
-    output_grad = torch.randn(1, sum(lengths), 1, 128, device="cuda")
-    state_grad = torch.randn_like(initial_state)
+    initial_state = (
+        (torch.randn(3, 1, 128, 128, device="cuda") / 8).requires_grad_()
+        if has_initial_state
+        else None
+    )
+    compiled_state = (
+        None if initial_state is None else initial_state.detach().clone().requires_grad_()
+    )
+    output_grad = (
+        None if cotangents == "state" else torch.randn(1, sum(lengths), 1, 128, device="cuda")
+    )
+    state_grad = torch.randn_like(initial_state) if cotangents in ("state", "both") else None
     offsets = cumulative_sequence_offsets(lengths)
 
-    expected = _run_gradients(inputs, initial_state, offsets, output_grad, state_grad)
-    compiled = torch.compile(chunk_kda, fullgraph=True)
+    expected = _run_gradients(
+        inputs,
+        initial_state,
+        offsets,
+        output_grad,
+        state_grad,
+        output_final_state=output_final_state,
+    )
     actual = _run_gradients(
         compiled_inputs,
         compiled_state,
         offsets,
         output_grad,
         state_grad,
-        operation=compiled,
+        operation=torch.compile(chunk_kda, fullgraph=True),
+        output_final_state=output_final_state,
     )
 
     _assert_run_close(actual, expected)
@@ -260,6 +363,85 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
         state_grad,
     )
     _assert_run_close(actual, expected, active_tokens)
+
+
+@pytest.mark.parametrize(
+    ("captured_lengths", "active_lengths"),
+    [
+        pytest.param([64, 64, 64, 64], [65, 64, 0, 0], id="fewer-tokens-and-sequences"),
+        pytest.param([64, 64], [128, 0], id="full-capacity-fewer-sequences"),
+    ],
+)
+def test_public_ragged_cuda_graph_replay_with_fewer_sequences(captured_lengths, active_lengths):
+    """Capture N sequences at capacity T, then replay M<N by zero-padding the offsets tail.
+
+    The replay contract: a graph captured for T tokens across N sequences stays valid for any
+    L<=T tokens across M<=N sequences when the caller repeats the active endpoint in the
+    cu_seqlens tail. Empty tail slots must pass their initial state (and its cotangent)
+    through unchanged.
+    """
+    capacity = sum(captured_lengths)
+    sequences = len(captured_lengths)
+    active_sequences = sum(1 for length in active_lengths if length > 0)
+    active_tokens = sum(active_lengths)
+    inputs = make_kda_test_inputs(capacity, requires_grad=True)
+    initial_state = (torch.randn(sequences, 1, 128, 128, device="cuda") / 8).requires_grad_()
+    output_grad = torch.randn(1, capacity, 1, 128, device="cuda")
+    state_grad = torch.randn_like(initial_state)
+    offsets = cumulative_sequence_offsets(captured_lengths)
+
+    _run_gradients(
+        clone_kda_inputs(inputs),
+        initial_state.detach().clone().requires_grad_(),
+        offsets,
+        output_grad,
+        state_grad,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, final_state, gradients = _run_gradients(
+            inputs, initial_state, offsets, output_grad, state_grad
+        )
+
+    offsets.copy_(cumulative_sequence_offsets(active_lengths))
+    with torch.no_grad():
+        for tensor in inputs:
+            tensor[:, active_tokens:].fill_(float("nan"))
+        output_grad[:, active_tokens:].zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_output, expected_state, expected_gradients = _run_gradients(
+        tuple(tensor[:, :active_tokens].detach().clone().requires_grad_() for tensor in inputs),
+        initial_state[:active_sequences].detach().clone().requires_grad_(),
+        cumulative_sequence_offsets(active_lengths[:active_sequences]),
+        output_grad[:, :active_tokens],
+        state_grad[:active_sequences],
+    )
+
+    torch.testing.assert_close(output[:, :active_tokens], expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(final_state[:active_sequences], expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        final_state[active_sequences:], initial_state[active_sequences:], rtol=0, atol=0
+    )
+    for index, (actual_gradient, expected_gradient) in enumerate(
+        zip(gradients[:-1], expected_gradients[:-1], strict=True)
+    ):
+        torch.testing.assert_close(
+            actual_gradient[:, :active_tokens],
+            expected_gradient,
+            rtol=3e-2,
+            atol=3e-2,
+            msg=lambda message, index=index: f"input gradient {index}: {message}",
+        )
+    torch.testing.assert_close(
+        gradients[-1][:active_sequences], expected_gradients[-1], rtol=3e-2, atol=3e-2
+    )
+    torch.testing.assert_close(
+        gradients[-1][active_sequences:], state_grad[active_sequences:], rtol=0, atol=0
+    )
 
 
 def test_dense_tail_batch_gradients_match_explicit_packed_lowering():
