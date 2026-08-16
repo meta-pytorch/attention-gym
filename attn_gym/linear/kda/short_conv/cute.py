@@ -29,6 +29,7 @@ from cutlass.cute.nvgpu import cpasync
 
 from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
 
 
 @dataclass(frozen=True)
@@ -89,21 +90,6 @@ class ShortConvTunedConfig:
             case _:
                 raise ValueError(f"unsupported short-convolution dtype {dtype}")
         return cls(forward, *gradients)
-
-
-@cute.jit
-def _silu(value):
-    """Apply SiLU to an FP32 register tensor."""
-    half = value * 0.5
-    return half * cute.math.tanh(half, fastmath=True) + half
-
-
-@cute.jit
-def _silu_derivative(value):
-    """Evaluate the SiLU derivative from its preactivation."""
-    half = value * 0.5
-    tanh_half = cute.math.tanh(half, fastmath=True)
-    return (tanh_half + 1.0) * 0.5 + half * (1.0 - tanh_half * tanh_half) * 0.5
 
 
 @cute.jit
@@ -2017,11 +2003,15 @@ def _compile_forward(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
-    num_sequences: int | None = None,
-    has_initial_state: bool = False,
+    num_sequences: int | None,
+    has_initial_state: bool,
+    activation: Activation,
 ):
     """Compile one static forward specialization."""
-    operation = CausalConv1dSiluForward(batches, tokens, channels, width, config, dtype, _silu)
+    activation_fn = activation.forward
+    operation = CausalConv1dSiluForward(
+        batches, tokens, channels, width, config, dtype, activation_fn
+    )
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2079,10 +2069,12 @@ def _compile_input_gradient(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
-    num_sequences: int | None = None,
-    has_initial_state: bool = False,
+    num_sequences: int | None,
+    has_initial_state: bool,
+    activation: Activation,
 ):
     """Compile one static input-gradient specialization."""
+    derivative = activation.derivative
     use_tma = supports_tma(
         CausalConv1dSiluInputGradientTma,
         config,
@@ -2093,7 +2085,7 @@ def _compile_input_gradient(
         width,
     )
     operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
-    operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
+    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2119,10 +2111,12 @@ def _compile_weight_gradient(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
-    num_sequences: int | None = None,
-    has_initial_state: bool = False,
+    num_sequences: int | None,
+    has_initial_state: bool,
+    activation: Activation,
 ):
     """Compile one static weight-gradient specialization."""
+    derivative = activation.derivative
     num_time_blocks = ceildiv(tokens, config.times_per_block)
     partials = cute.runtime.make_fake_compact_tensor(
         Float32,
@@ -2142,7 +2136,7 @@ def _compile_weight_gradient(
         if use_tma
         else CausalConv1dSiluWeightGradientPartials
     )
-    operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
+    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2169,13 +2163,15 @@ def _compile_initial_state_gradient(
     dtype: ShortConvDType,
     threads: int,
     channels_per_thread: int,
-    num_sequences: int | None = None,
+    num_sequences: int | None,
+    activation: Activation,
 ):
     """Compile one initial-state gradient specialization."""
+    derivative = activation.derivative
     state_sequences = batches if num_sequences is None else num_sequences
     config = ShortConvConfig(threads, channels_per_thread, times_per_block=1)
     operation = CausalConv1dSiluInitialStateGradient(
-        state_sequences, tokens, channels, width, config, dtype, _silu_derivative
+        state_sequences, tokens, channels, width, config, dtype, derivative
     )
     return compile_tvm_ffi(
         operation,
@@ -2244,8 +2240,11 @@ def _launch_forward(
     config: ShortConvConfig,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
+    *,
+    activation: str | None,
 ) -> torch.Tensor:
     """Allocate and launch the compiled forward specialization."""
+    resolved_activation = resolve_activation(activation)
     x, weight = _aligned(x), _aligned(weight)
     if initial_state is not None:
         initial_state = _aligned(initial_state)
@@ -2262,6 +2261,7 @@ def _launch_forward(
         config,
         None if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         initial_state is not None,
+        resolved_activation,
     )
     compiled(
         x.view(batches * tokens, channels),
@@ -2282,8 +2282,11 @@ def _launch_backward(
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     compute_initial_state_grad: bool = True,
+    *,
+    activation: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Launch configured gradient kernels and reduce FP32 partials."""
+    resolved_activation = resolve_activation(activation)
     x, weight = _aligned(x), _aligned(weight)
     if initial_state is not None:
         initial_state = _aligned(initial_state)
@@ -2302,6 +2305,7 @@ def _launch_backward(
         input_config,
         num_sequences,
         initial_state is not None,
+        resolved_activation,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2332,6 +2336,7 @@ def _launch_backward(
         weight_config,
         num_sequences,
         initial_state is not None,
+        resolved_activation,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2350,6 +2355,7 @@ def _launch_backward(
             input_config.threads,
             input_config.channels_per_thread,
             num_sequences,
+            resolved_activation,
         )(
             x.view(batches * tokens, channels),
             weight,
@@ -2421,11 +2427,12 @@ def _candidate_configs(
     )
 
 
-def tune_causal_conv1d_silu(
+def tune_causal_conv1d(
     x: torch.Tensor,
     weight: torch.Tensor,
     grad_output: torch.Tensor,
     *,
+    activation: str | None = None,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     forward_configs: Iterable[ShortConvConfig] | None = None,
@@ -2436,11 +2443,15 @@ def tune_causal_conv1d_silu(
     """Compile and benchmark forward, input-gradient, and weight-gradient schedules.
 
     Width is an operation parameter and is specialized but not autotuned. Packed
-    offsets and initial state use the same inputs accepted by the public operation.
-    The returned configs can be passed directly to :func:`cute_causal_conv1d_silu`.
+    offsets, activation, and initial state use the same inputs accepted by the public
+    operation. The returned configs can be passed directly to :func:`causal_conv1d`.
     Tuning uses the shared CuTeDSL ``tune`` flow: cached variants compile in
     parallel and execute sequentially under the vetted Inductor GPU benchmarker.
     """
+    resolved_activation = resolve_activation(activation)
+    # Script-defined (__main__) activations cannot be pickled into the fresh
+    # compiler driver; compile those candidates in this process instead.
+    parallel_compile = parallel_compile and resolved_activation.crosses_process_boundary
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     if grad_output.shape != x.shape or grad_output.dtype != x.dtype:
         raise ValueError("grad_output must match x shape and dtype")
@@ -2487,6 +2498,7 @@ def tune_causal_conv1d_silu(
             config,
             num_sequences,
             kernel_initial_state is not None,
+            resolved_activation,
         ),
         parallel_compile=parallel_compile,
     )
@@ -2514,6 +2526,7 @@ def tune_causal_conv1d_silu(
             config,
             num_sequences,
             kernel_initial_state is not None,
+            resolved_activation,
         ),
         parallel_compile=parallel_compile,
     )
@@ -2556,6 +2569,7 @@ def tune_causal_conv1d_silu(
             config,
             num_sequences,
             kernel_initial_state is not None,
+            resolved_activation,
         ),
         parallel_compile=parallel_compile,
     )
@@ -2569,7 +2583,8 @@ def _config(threads: int, channels_per_thread: int, times_per_block: int) -> Sho
 
 torch.library.define(
     "attn_gym::_cute_short_conv_fwd",
-    "(Tensor x, Tensor weight, Tensor? cu_seqlens=None, Tensor? initial_state=None) -> Tensor",
+    "(Tensor x, Tensor weight, Tensor? cu_seqlens=None, Tensor? initial_state=None,"
+    " *, str? activation=None) -> Tensor",
 )
 
 
@@ -2578,6 +2593,8 @@ def _cute_short_conv_fwd_cuda(
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
 ) -> torch.Tensor:
     """Launch the tuned K3 defaults through the lean production schema."""
     return _launch_forward(
@@ -2586,6 +2603,7 @@ def _cute_short_conv_fwd_cuda(
         ShortConvTunedConfig.default(x.dtype).forward,
         cu_seqlens,
         initial_state,
+        activation=activation,
     )
 
 
@@ -2598,14 +2616,17 @@ def _default_forward_fake(
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
 ) -> torch.Tensor:
-    del weight, cu_seqlens, initial_state
+    del weight, cu_seqlens, initial_state, activation
     return torch.empty_like(x)
 
 
 torch.library.define(
     "attn_gym::_cute_short_conv_bwd",
-    "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens=None) -> (Tensor, Tensor)",
+    "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens=None,"
+    " *, str? activation=None) -> (Tensor, Tensor)",
 )
 
 
@@ -2614,6 +2635,8 @@ def _cute_short_conv_bwd_cuda(
     weight: torch.Tensor,
     grad_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the tuned K3 backward defaults through the lean schema."""
     defaults = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None)
@@ -2624,6 +2647,7 @@ def _cute_short_conv_bwd_cuda(
         defaults.input_gradient,
         defaults.weight_gradient,
         cu_seqlens,
+        activation=activation,
     )
     return grad_x, grad_weight
 
@@ -2637,8 +2661,10 @@ def _default_backward_fake(
     weight: torch.Tensor,
     grad_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del grad_output, cu_seqlens
+    del grad_output, cu_seqlens, activation
     return torch.empty_like(x), torch.empty_like(weight)
 
 
@@ -2647,7 +2673,8 @@ torch.library.define(
     "(Tensor x, Tensor weight, Tensor? cu_seqlens, Tensor? initial_state,"
     " int forward_threads, int forward_channels, int forward_times,"
     " int input_threads, int input_channels, int input_times,"
-    " int weight_threads, int weight_channels, int weight_times) -> Tensor",
+    " int weight_threads, int weight_channels, int weight_times,"
+    " *, str? activation=None) -> Tensor",
 )
 
 
@@ -2665,6 +2692,8 @@ def _cute_short_conv_configured_fwd_cuda(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> torch.Tensor:
     """Keep the configured CuTeDSL forward launcher behind an opaque operator."""
     del input_threads, input_channels, input_times, weight_threads, weight_channels, weight_times
@@ -2674,6 +2703,7 @@ def _cute_short_conv_configured_fwd_cuda(
         _config(forward_threads, forward_channels, forward_times),
         cu_seqlens,
         initial_state,
+        activation=activation,
     )
 
 
@@ -2697,6 +2727,8 @@ def _forward_fake(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> torch.Tensor:
     """Describe forward output metadata without invoking the compiler."""
     del (
@@ -2712,6 +2744,7 @@ def _forward_fake(
         weight_threads,
         weight_channels,
         weight_times,
+        activation,
     )
     return torch.empty_like(x)
 
@@ -2719,7 +2752,8 @@ def _forward_fake(
 _CONFIGURED_BWD_ARGS = (
     "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens, {initial_state},"
     " int input_threads, int input_channels, int input_times,"
-    " int weight_threads, int weight_channels, int weight_times)"
+    " int weight_threads, int weight_channels, int weight_times,"
+    " *, str? activation=None)"
 )
 torch.library.define(
     "attn_gym::_cute_short_conv_configured_bwd",
@@ -2744,6 +2778,8 @@ def _cute_short_conv_configured_bwd_cuda(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep the configured first-order backward launchers opaque.
 
@@ -2759,6 +2795,7 @@ def _cute_short_conv_configured_bwd_cuda(
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=False,
+        activation=activation,
     )
     return grad_x, grad_weight
 
@@ -2775,6 +2812,8 @@ def _cute_short_conv_configured_bwd_with_state_grad_cuda(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the configured first-order backward including the state gradient."""
     grad_x, grad_weight, grad_initial_state = _launch_backward(
@@ -2786,6 +2825,7 @@ def _cute_short_conv_configured_bwd_with_state_grad_cuda(
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=True,
+        activation=activation,
     )
     return grad_x, grad_weight, grad_initial_state
 
@@ -2813,6 +2853,8 @@ def _backward_fake(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Describe backward output metadata without invoking the compiler."""
     del (
@@ -2825,6 +2867,7 @@ def _backward_fake(
         weight_threads,
         weight_channels,
         weight_times,
+        activation,
     )
     return torch.empty_like(x), torch.empty_like(weight)
 
@@ -2842,6 +2885,8 @@ def _backward_with_state_grad_fake(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    *,
+    activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Describe stateful backward output metadata without invoking the compiler."""
     del (
@@ -2853,6 +2898,7 @@ def _backward_with_state_grad_fake(
         weight_threads,
         weight_channels,
         weight_times,
+        activation,
     )
     return torch.empty_like(x), torch.empty_like(weight), torch.empty_like(initial_state)
 
@@ -2874,17 +2920,22 @@ class _ShortConv(torch.autograd.Function):
         weight: torch.Tensor,
         cu_seqlens: torch.Tensor | None,
         initial_state: torch.Tensor | None,
+        activation: str | None,
     ) -> torch.Tensor:
-        output = _forward_op(x, weight, cu_seqlens, initial_state)
+        output = _forward_op(x, weight, cu_seqlens, initial_state, activation=activation)
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
+        ctx.activation = activation
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output: torch.Tensor):
         x, weight, cu_seqlens, initial_state = ctx.saved_tensors
+        activation = ctx.activation
         if initial_state is None:
-            grad_x, grad_weight = _backward_op(x, weight, grad_output, cu_seqlens)
+            grad_x, grad_weight = _backward_op(
+                x, weight, grad_output, cu_seqlens, activation=activation
+            )
             grad_initial_state = None
         else:
             defaults = ShortConvTunedConfig.default(
@@ -2903,14 +2954,26 @@ class _ShortConv(torch.autograd.Function):
             )
             if ctx.needs_input_grad[3]:
                 grad_x, grad_weight, grad_initial_state = _configured_backward_with_state_grad_op(
-                    x, weight, grad_output, cu_seqlens, initial_state, *configs
+                    x,
+                    weight,
+                    grad_output,
+                    cu_seqlens,
+                    initial_state,
+                    *configs,
+                    activation=activation,
                 )
             else:
                 grad_x, grad_weight = _configured_backward_op(
-                    x, weight, grad_output, cu_seqlens, initial_state, *configs
+                    x,
+                    weight,
+                    grad_output,
+                    cu_seqlens,
+                    initial_state,
+                    *configs,
+                    activation=activation,
                 )
                 grad_initial_state = None
-        return grad_x, grad_weight, None, grad_initial_state
+        return grad_x, grad_weight, None, grad_initial_state, None
 
 
 class _ConfiguredShortConv(torch.autograd.Function):
@@ -2921,6 +2984,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         weight: torch.Tensor,
         cu_seqlens: torch.Tensor | None,
         initial_state: torch.Tensor | None,
+        activation: str | None,
         forward_threads: int,
         forward_channels: int,
         forward_times: int,
@@ -2945,9 +3009,11 @@ class _ConfiguredShortConv(torch.autograd.Function):
             weight_threads,
             weight_channels,
             weight_times,
+            activation=activation,
         )
         # Save inputs and backward specializations for preactivation recomputation.
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
+        ctx.activation = activation
         ctx.input_threads = input_threads
         ctx.input_channels = input_channels
         ctx.input_times = input_times
@@ -2971,11 +3037,23 @@ class _ConfiguredShortConv(torch.autograd.Function):
         )
         if initial_state is not None and ctx.needs_input_grad[3]:
             grad_x, grad_weight, grad_initial_state = _configured_backward_with_state_grad_op(
-                x, weight, grad_output, cu_seqlens, initial_state, *configs
+                x,
+                weight,
+                grad_output,
+                cu_seqlens,
+                initial_state,
+                *configs,
+                activation=ctx.activation,
             )
         else:
             grad_x, grad_weight = _configured_backward_op(
-                x, weight, grad_output, cu_seqlens, initial_state, *configs
+                x,
+                weight,
+                grad_output,
+                cu_seqlens,
+                initial_state,
+                *configs,
+                activation=ctx.activation,
             )
             grad_initial_state = None
         return (
@@ -2983,6 +3061,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
             grad_weight,
             None,
             grad_initial_state,
+            None,
             None,
             None,
             None,
@@ -3064,10 +3143,11 @@ def final_conv_state(
     return packed_final_conv_state(x, initial_state, state_length, cu_seqlens)
 
 
-def cute_causal_conv1d_silu(
+def causal_conv1d(
     x: torch.Tensor,
     weight: torch.Tensor,
     *,
+    activation: str | None = None,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
@@ -3075,7 +3155,7 @@ def cute_causal_conv1d_silu(
     input_grad_config: ShortConvConfig | None = None,
     weight_grad_config: ShortConvConfig | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Apply causal depthwise convolution and SiLU with CuTeDSL.
+    """Apply causal depthwise convolution with an optional fused activation.
 
     Width is inferred from ``weight.shape[1]`` and compile-time specialized.
     Schedule fields control register shapes, vector partitioning, unrolled loops,
@@ -3086,6 +3166,11 @@ def cute_causal_conv1d_silu(
             Each batch row is convolved as an independent sequence.
         weight: Contiguous depthwise weights with shape ``[C, W]`` matching
             ``x`` dtype and device.
+        activation: Optional activation fused into the convolution epilogue and
+            recomputed by the backward kernels. ``None`` applies no activation;
+            ``"silu"`` is built in and :func:`register_activation` adds custom
+            names. The name is an ordinary string argument, so compiled graphs
+            specialize on it like any other static scalar.
         cu_seqlens: Optional contiguous CUDA int32 offsets delimiting independent
             sequences in a packed ``[1, T, C]`` input. Offsets must be nondecreasing,
             begin at zero, and end at an active endpoint ``L <= T``; repeated offsets
@@ -3105,6 +3190,7 @@ def cute_causal_conv1d_silu(
         parameter, state, and final-state values exclude the inactive suffix. When
         ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
     """
+    resolve_activation(activation)
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
     kernel_initial_state = None if weight.shape[1] == 1 else initial_state
@@ -3132,13 +3218,14 @@ def cute_causal_conv1d_silu(
         and input_grad == default_input_grad
         and weight_grad == default_weight_grad
     ):
-        output = _ShortConv.apply(x, weight, cu_seqlens, kernel_initial_state)
+        output = _ShortConv.apply(x, weight, cu_seqlens, kernel_initial_state, activation)
     else:
         output = _ConfiguredShortConv.apply(
             x,
             weight,
             cu_seqlens,
             kernel_initial_state,
+            activation,
             forward.threads,
             forward.channels_per_thread,
             forward.times_per_block,
@@ -3164,6 +3251,6 @@ def cute_causal_conv1d_silu(
 __all__ = [
     "ShortConvConfig",
     "ShortConvTunedConfig",
-    "cute_causal_conv1d_silu",
-    "tune_causal_conv1d_silu",
+    "causal_conv1d",
+    "tune_causal_conv1d",
 ]

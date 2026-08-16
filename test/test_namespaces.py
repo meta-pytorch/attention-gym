@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import attn_gym
 import attn_gym.linear
 import attn_gym.sparse
@@ -29,3 +32,9 @@ def test_documented_mask_and_score_mods_are_exported():
             generate_mla_rope_score_mod,
         )
     )
+
+
+def test_linear_base_import_keeps_cutedsl_lazy():
+    """The optional CuTeDSL backend must never become an eager import."""
+    script = "import sys, attn_gym.linear; assert 'cutlass' not in sys.modules"
+    subprocess.run([sys.executable, "-c", script], check=True)

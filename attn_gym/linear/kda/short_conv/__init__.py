@@ -6,16 +6,18 @@
 
 """Optimized KDA short-convolution operations."""
 
+from attn_gym.linear.kda.short_conv.activations import register_activation
 from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
-    cute_causal_conv1d_silu,
-    tune_causal_conv1d_silu,
+    causal_conv1d,
+    tune_causal_conv1d,
 )
 
 __all__ = [
     "ShortConvConfig",
     "ShortConvTunedConfig",
-    "cute_causal_conv1d_silu",
-    "tune_causal_conv1d_silu",
+    "causal_conv1d",
+    "register_activation",
+    "tune_causal_conv1d",
 ]

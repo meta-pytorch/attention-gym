@@ -126,7 +126,7 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
     consumed_metadata = []
     fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
     prepare_metadata = kda_training.prepare_ragged_chunk_metadata
-    short_conv = kda_training.cute_causal_conv1d_silu
+    short_conv = kda_training.causal_conv1d
     fused_l2norm = kda_training.l2norm
     gate = kda_training._bounded_gate_cumsum
     core = kda_training._chunk_kda
@@ -156,7 +156,7 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
         return core(*args, **kwargs)
 
     monkeypatch.setattr(kda_training, "prepare_ragged_chunk_metadata", record_prepare)
-    monkeypatch.setattr(kda_training, "cute_causal_conv1d_silu", record_short_conv)
+    monkeypatch.setattr(kda_training, "causal_conv1d", record_short_conv)
     monkeypatch.setattr(kda_training, "l2norm", record_l2norm)
     monkeypatch.setattr(kda_training, "_bounded_gate_cumsum", record_gate)
     monkeypatch.setattr(kda_training, "_chunk_kda", record_core)

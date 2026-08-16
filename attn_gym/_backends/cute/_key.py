@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import dataclasses
+import dis
 import enum
 import functools
 import hashlib
+import inspect
 import os
 import pickle
 import platform
 import sys
+import threading
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -111,6 +115,80 @@ def _is_named_tuple(item: Any) -> bool:
     return isinstance(item, tuple) and isinstance(fields, tuple)
 
 
+@functools.cache
+def _unwrapped(function: types.FunctionType) -> types.FunctionType:
+    """Resolve decorator wrappers once; wrapper chains are fixed at definition."""
+    return inspect.unwrap(function)
+
+
+@functools.cache
+def _function_static_parts(function: types.FunctionType) -> tuple[str, tuple[str, ...]]:
+    """Fetch a function's source and referenced global names once per function."""
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError) as error:
+        raise TypeError(
+            f"function {function.__qualname__!r} has no stable cache key; it must be "
+            "defined in a source file so compiled kernels can key on its code"
+        ) from error
+    global_names = tuple(
+        sorted(
+            {
+                instruction.argval
+                for instruction in dis.get_instructions(function)
+                if instruction.opname == "LOAD_GLOBAL"
+            }
+        )
+    )
+    return source, global_names
+
+
+_FUNCTIONS_IN_PROGRESS = threading.local()
+
+
+def _canonicalize_function(function: types.FunctionType) -> tuple[Any, ...]:
+    """Encode a function by content: source plus current closure and global values.
+
+    Compiled CuTeDSL kernels inline the traced expressions, so the identity must
+    cover everything that shapes the generated code: the source text, captured
+    closure cells, and referenced module-global values (imported modules and
+    builtins are stable references and are skipped). Values are re-read on every
+    key computation, so mutating a captured global recompiles instead of
+    silently reusing a kernel traced with the old value.
+    """
+    unwrapped = _unwrapped(function)
+    in_progress = getattr(_FUNCTIONS_IN_PROGRESS, "stack", None)
+    if in_progress is None:
+        in_progress = _FUNCTIONS_IN_PROGRESS.stack = set()
+    if id(unwrapped) in in_progress:
+        raise TypeError(
+            f"function {unwrapped.__qualname__!r} participates in a reference cycle "
+            "and has no stable cache key"
+        )
+    in_progress.add(id(unwrapped))
+    try:
+        source, global_names = _function_static_parts(unwrapped)
+        cells = tuple(_canonicalize(cell.cell_contents) for cell in unwrapped.__closure__ or ())
+        module_globals = unwrapped.__globals__
+        globals_used = tuple(
+            (name, _canonicalize(module_globals[name]))
+            for name in global_names
+            if name in module_globals and not isinstance(module_globals[name], types.ModuleType)
+        )
+        # Default values appear in the source text, but a *mutable* default
+        # object can change behavior after definition without changing it.
+        defaults = _canonicalize(unwrapped.__defaults__)
+        keyword_defaults = _canonicalize(unwrapped.__kwdefaults__)
+    finally:
+        in_progress.discard(id(unwrapped))
+    return ("function", source, cells, globals_used, defaults, keyword_defaults)
+
+
+def function_cache_key(function: Callable[..., Any]) -> tuple[Any, ...]:
+    """Return the content-addressed cache identity of a traced function."""
+    return _canonicalize_function(function)
+
+
 def _pickle_sort_key(item: Any) -> bytes:
     return pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -144,6 +222,8 @@ def _canonicalize(item: Any) -> Any:
         )
     if isinstance(item, enum.Enum):
         return ("enum", type(item).__module__, type(item).__qualname__, item.name)
+    if isinstance(item, types.FunctionType):
+        return _canonicalize_function(item)
     if isinstance(item, type):
         return ("type", item.__module__, item.__qualname__)
     if isinstance(item, Path):
