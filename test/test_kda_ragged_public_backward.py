@@ -325,11 +325,14 @@ def test_public_ragged_forward_and_backward_fullgraph(
 
 
 def test_public_ragged_forward_and_backward_cuda_graph_replay():
+    """Replay changing L and M under fixed token and sequence capacities."""
     inputs = make_kda_test_inputs(128, requires_grad=True)
-    initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
+    initial_state = (torch.randn(4, 1, 128, 128, device="cuda") / 8).requires_grad_()
     output_grad = torch.randn(1, 128, 1, 128, device="cuda")
     state_grad = torch.randn_like(initial_state)
-    offsets = cumulative_sequence_offsets([64, 64])
+    # Capture N=4 state slots with M=2 nonempty sequences. Repeating the active
+    # endpoint encodes the unused sequence-capacity tail without changing shape.
+    offsets = cumulative_sequence_offsets([64, 64, 0, 0])
 
     _run_gradients(
         clone_kda_inputs(inputs),
@@ -344,8 +347,9 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
     with torch.cuda.graph(graph):
         actual = _run_gradients(inputs, initial_state, offsets, output_grad, state_grad)
 
-    active_tokens = 65
-    offsets.copy_(cumulative_sequence_offsets([32, 33]))
+    active_lengths = [17, 15, 33]
+    active_tokens = sum(active_lengths)
+    offsets.copy_(cumulative_sequence_offsets([*active_lengths, 0]))
     with torch.no_grad():
         for tensor in inputs:
             tensor[:, active_tokens:].fill_(float("nan"))
@@ -358,7 +362,7 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
     expected = _run_gradients(
         tuple(tensor[:, :active_tokens].detach().clone().requires_grad_() for tensor in inputs),
         initial_state.detach().clone().requires_grad_(),
-        cumulative_sequence_offsets([32, 33]),
+        cumulative_sequence_offsets([*active_lengths, 0]),
         output_grad[:, :active_tokens],
         state_grad,
     )

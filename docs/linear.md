@@ -74,7 +74,12 @@ per-batch, per-chunk partials for the shared parameter reduction. Packed gate ba
 instead uses one graph-safe ragged Triton launch that fuses the reverse scan, bounded-gate
 derivative, and FP32 parameter-gradient partials. The example explicitly runs projections
 in BF16 while retaining FP32 parameters and gate reductions; no ambient autocast context
-is required.
+is required. Distributed mixed-precision policies must preserve `A_log` and `dt_bias` as
+FP32 when parameters are materialized, rather than only casting activations inside
+`forward`. A module-wide BF16 FSDP policy violates the fused gate ABI. A correctness-first
+integration can keep the KDA unit under an FP32 policy while its projections explicitly
+compute in BF16; isolating only the strict-FP32 decay state is a future bandwidth
+optimization.
 The CuTe dense gate backward requires a head dimension divisible by 32 in `[32, 1024]`;
 gate forward is Triton for both dense and ragged inputs.
 The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and 64-token
@@ -88,6 +93,18 @@ fixed-capacity execution, the terminal offset may be smaller than physical `T`; 
 values outside `[0, cu_seqlens[-1])` are unspecified. Primitives deliberately do not mask
 this inactive suffix automatically; caller-owned masking keeps that cost out of each
 primitive hot path.
+
+A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
+replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal
+endpoint through the unused tail:
+
+```text
+[0, sequence_start_1, ..., L, L, ..., L]
+```
+
+The repeated ranges are ordinary empty sequences. Stateful APIs therefore retain `N`
+state rows even when only `M` sequences are nonempty. Both `L` and `M` may change on
+replay, but physical token capacity `T` and metadata capacity `N` may not.
 
 Callers that use dynamic active lengths within fixed-capacity tensors must opt in to
 masking. Ragged primitives read only `[0, cu_seqlens[-1])` from token-shaped inputs,
@@ -162,9 +179,15 @@ work. It can be combined with `--profile`; compilation warmups run before the
 trace starts. Like FLA's default training path, its backward recomputes the W/U,
 gated Q/K, recurrent-state, and
 corrected-value intermediates instead of retaining them across the forward/backward
-boundary. Million-token training still requires model-level activation
-checkpointing and context parallelism; this single-device example implements
-neither distributed policy.
+boundary.
+
+Graph-safe active-token replay does not by itself make complete model time proportional
+to `L`. The ragged short convolution, gate scan, and KDA core can skip inactive token
+work, but the example's projections, output normalization, output gate, and output
+projection still process physical capacity `T`. An end-to-end integration needs
+active-prefix-aware surrounding operations to turn smaller `L` into a comparable step-time
+reduction. Million-token training also requires model-level activation checkpointing and
+context parallelism; this single-device example implements neither distributed policy.
 
 The module can sit behind a transformer layer's attention slot while state is
 threaded explicitly:

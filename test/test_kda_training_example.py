@@ -124,7 +124,10 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
     """Match independent execution while sharing one packed schedule across fused stages."""
     scheduled_metadata = []
     consumed_metadata = []
+    fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
     prepare_metadata = kda_training.prepare_ragged_chunk_metadata
+    short_conv = kda_training.cute_causal_conv1d_silu
+    fused_l2norm = kda_training.l2norm
     gate = kda_training._bounded_gate_cumsum
     core = kda_training._chunk_kda
 
@@ -132,17 +135,29 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
         scheduled_metadata.append(prepare_metadata(*args))
         return scheduled_metadata[-1]
 
+    def record_short_conv(*args, **kwargs):
+        fused_calls["short_conv"] += 1
+        return short_conv(*args, **kwargs)
+
+    def record_l2norm(*args, **kwargs):
+        fused_calls["l2norm"] += 1
+        return fused_l2norm(*args, **kwargs)
+
     def record_gate(*args, **kwargs):
+        fused_calls["gate"] += 1
         if kwargs.get("metadata") is not None:
             consumed_metadata.append(kwargs["metadata"])
         return gate(*args, **kwargs)
 
     def record_core(*args, **kwargs):
+        fused_calls["core"] += 1
         if kwargs.get("metadata") is not None:
             consumed_metadata.append(kwargs["metadata"])
         return core(*args, **kwargs)
 
     monkeypatch.setattr(kda_training, "prepare_ragged_chunk_metadata", record_prepare)
+    monkeypatch.setattr(kda_training, "cute_causal_conv1d_silu", record_short_conv)
+    monkeypatch.setattr(kda_training, "l2norm", record_l2norm)
     monkeypatch.setattr(kda_training, "_bounded_gate_cumsum", record_gate)
     monkeypatch.setattr(kda_training, "_chunk_kda", record_core)
     torch.manual_seed(19)
@@ -159,6 +174,8 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
     cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
 
     actual = model(packed_hidden, cu_seqlens=cu_seqlens).hidden_states
+    assert fused_calls == {"short_conv": 1, "l2norm": 2, "gate": 1, "core": 1}
+
     loop_outputs = [
         model(loop_hidden[:, start:end]).hidden_states
         for start, end in pairwise(offsets)
@@ -183,17 +200,18 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
     [
         pytest.param([0, 64, 128], [0, 33, 96], id="fewer-tokens"),
         pytest.param([0, 48, 96, 128], [0, 33, 96, 96], id="fewer-tokens-and-sequences"),
+        pytest.param(
+            [0, 64, 128, 128, 128],
+            [0, 33, 64, 96, 96],
+            id="more-sequences-within-capacity",
+        ),
     ],
 )
 def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
     captured_offsets,
     replayed_offsets,
 ):
-    """Replay a shorter active length over a stale suffix and match an exactly sized run.
-
-    The second case drops a whole sequence at replay time by repeating the active endpoint
-    in the cu_seqlens tail (capture N sequences, replay M<N).
-    """
+    """Replay changing L and M over stale capacity and match an exactly sized run."""
     torch.manual_seed(31)
     capacity, hidden_size = captured_offsets[-1], 32
     model = KDAAttention(
