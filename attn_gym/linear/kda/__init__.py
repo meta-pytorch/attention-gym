@@ -10,6 +10,7 @@ import importlib
 
 from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
+from attn_gym.linear.kda.fwd.triton.recurrent import recurrent_kda
 from attn_gym.linear.kda.masking import (
     active_token_mask,
     mask_inactive_token_gradients,
@@ -52,6 +53,7 @@ __all__ = sorted(  # noqa: PLE0605 -- the lazy half comes from _CUTEDSL_EXPORTS
         "naive_chunk_kda",
         "naive_chunk_kda_from_cumulative",
         "naive_recurrent_kda",
+        "recurrent_kda",
         *_CUTEDSL_EXPORTS,
     ]
 )
