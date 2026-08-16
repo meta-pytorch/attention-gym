@@ -214,18 +214,18 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 m_Aqk_store = m_c[:, None] & (o_Aqk[None, :] < BT)
                 m_Akk_store = m_c[:, None] & (o_i[None, :] < BC)
                 tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), mask=m_Aqk_store)
-                tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
-                tl.debug_barrier()
-
-                # forward substitution
-                b_Ai = -b_Akk
-                for i in range(2, min(BC, T_local - i_ti)):
-                    b_a = -tl.load(Akk_off + ptr_offset((i_ti + i, o_i), (H * BC, 1)))
-                    b_a = tl.where(o_i < i, b_a, 0.0)
-                    b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-                    b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-                b_Ai += m_I
+                # Forward substitution computes M with M = N + N @ M for N = -Akk
+                # (strictly lower, so N^BC == 0) and stores the unit inverse
+                # (I + Akk)^-1 = I + M. Use the log-depth Neumann factorization
+                # (I - N)^-1 = (I + N)(I + N^2)(I + N^4)(I + N^8): register-resident
+                # dots instead of a BC-step serial load -> reduce -> select chain.
+                # Rows at or past T_local carry zero data and stay identity rows.
+                b_N = -b_Akk
+                b_Ai = b_N + m_I
+                for _double in tl.static_range(3):
+                    b_N = tl.sum(b_N[:, :, None] * b_N[None, :, :], 1)
+                    b_Ai += tl.sum(b_Ai[:, :, None] * b_N[None, :, :], 1)
                 tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
 
