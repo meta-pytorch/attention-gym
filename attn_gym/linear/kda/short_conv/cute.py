@@ -69,31 +69,23 @@ class ShortConvTunedConfig:
         dtype: torch.dtype = torch.bfloat16,
         *,
         packed: bool = False,
-        stateful: bool = False,
     ) -> ShortConvTunedConfig:
         """Return measured GB300 defaults for one storage dtype and layout mode."""
         match dtype:
-            case torch.float16:
+            case torch.float16 | torch.bfloat16:
                 forward = ShortConvConfig(128, 4, 16)
-                match packed, stateful:
-                    case True, _:
-                        gradients = ShortConvConfig(128, 4, 16), ShortConvConfig(128, 2, 32)
-                    case False, _:
-                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
-            case torch.bfloat16:
-                forward = ShortConvConfig(128, 4, 16)
-                match packed, stateful:
-                    case True, _:
-                        gradients = ShortConvConfig(128, 4, 16), ShortConvConfig(128, 2, 32)
-                    case False, _:
-                        gradients = ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64)
+                gradients = (
+                    (ShortConvConfig(128, 4, 16), ShortConvConfig(128, 2, 32))
+                    if packed
+                    else (ShortConvConfig(128, 2, 32), ShortConvConfig(128, 2, 64))
+                )
             case torch.float32:
                 forward = ShortConvConfig(128, 4, 4)
-                match packed, stateful:
-                    case True, _:
-                        gradients = ShortConvConfig(128, 2, 16), ShortConvConfig(128, 4, 32)
-                    case False, _:
-                        gradients = ShortConvConfig(128, 2, 12), ShortConvConfig(128, 2, 160)
+                gradients = (
+                    (ShortConvConfig(128, 2, 16), ShortConvConfig(128, 4, 32))
+                    if packed
+                    else (ShortConvConfig(128, 2, 12), ShortConvConfig(128, 2, 160))
+                )
             case _:
                 raise ValueError(f"unsupported short-convolution dtype {dtype}")
         return cls(forward, *gradients)
@@ -2065,9 +2057,6 @@ def supports_tma(
     selected_config: ShortConvConfig | None,
     channels: int,
     width: int,
-    num_sequences: int | None,
-    *,
-    packed_supported: bool = False,
 ) -> bool:
     """Return whether the TMA gradient kernels support this static schedule.
 
@@ -2079,7 +2068,6 @@ def supports_tma(
         and width > 1
         and channels % (config.threads * config.channels_per_thread) == 0
         and config.times_per_block % operation_type.tma_stage_tokens == 0
-        and (num_sequences is None or packed_supported)
     )
 
 
@@ -2103,8 +2091,6 @@ def _compile_input_gradient(
         else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
         channels,
         width,
-        num_sequences,
-        packed_supported=True,
     )
     operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
     operation = operation_type(batches, tokens, channels, width, config, dtype, _silu_derivative)
@@ -2150,8 +2136,6 @@ def _compile_weight_gradient(
         tuned_config(dtype, packed=num_sequences is not None).weight_gradient,
         channels,
         width,
-        num_sequences,
-        packed_supported=True,
     )
     operation_type = (
         CausalConv1dSiluWeightGradientPartialsTma
@@ -2393,10 +2377,9 @@ def _candidate_configs(
     dtype: torch.dtype = torch.bfloat16,
     *,
     packed: bool = False,
-    stateful: bool = False,
 ) -> tuple[ShortConvConfig, ...]:
     """Return the focused schedule space used by the explicit tuning flow."""
-    defaults = ShortConvTunedConfig.default(dtype, packed=packed, stateful=stateful)
+    defaults = ShortConvTunedConfig.default(dtype, packed=packed)
     if kind == "forward":
         default = defaults.forward
         candidates = (
@@ -2470,18 +2453,15 @@ def tune_causal_conv1d_silu(
     batches, tokens, channels = x.shape
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
+    packed = cu_seqlens is not None
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     x_matrix = x.view(batches * tokens, channels)
     grad_matrix = grad_output.view(batches * tokens, channels)
     kernel_initial_state = None if width == 1 else initial_state
     state_matrix = None if kernel_initial_state is None else kernel_initial_state.flatten(0, 1)
 
-    candidate_kwargs = {
-        "packed": cu_seqlens is not None,
-        "stateful": kernel_initial_state is not None,
-    }
     forward_candidates = tuple(
-        _candidate_configs("forward", channels, x.dtype, **candidate_kwargs)
+        _candidate_configs("forward", channels, x.dtype, packed=packed)
         if forward_configs is None
         else forward_configs
     )
@@ -2512,7 +2492,7 @@ def tune_causal_conv1d_silu(
     )
 
     input_candidates = tuple(
-        _candidate_configs("input_gradient", channels, x.dtype, **candidate_kwargs)
+        _candidate_configs("input_gradient", channels, x.dtype, packed=packed)
         if input_grad_configs is None
         else input_grad_configs
     )
@@ -2539,7 +2519,7 @@ def tune_causal_conv1d_silu(
     )
 
     weight_candidates = tuple(
-        _candidate_configs("weight_gradient", channels, x.dtype, **candidate_kwargs)
+        _candidate_configs("weight_gradient", channels, x.dtype, packed=packed)
         if weight_grad_configs is None
         else weight_grad_configs
     )
@@ -2910,7 +2890,6 @@ class _ShortConv(torch.autograd.Function):
             defaults = ShortConvTunedConfig.default(
                 x.dtype,
                 packed=cu_seqlens is not None,
-                stateful=True,
             )
             input_config = defaults.input_gradient
             weight_config = defaults.weight_gradient
@@ -3132,7 +3111,6 @@ def cute_causal_conv1d_silu(
     defaults = ShortConvTunedConfig.default(
         x.dtype,
         packed=cu_seqlens is not None,
-        stateful=kernel_initial_state is not None,
     )
     default_forward = defaults.forward
     default_input_grad = defaults.input_gradient

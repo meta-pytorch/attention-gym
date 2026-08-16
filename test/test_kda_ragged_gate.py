@@ -14,6 +14,7 @@ from torch._inductor import config as inductor_config
 
 pytest.importorskip("triton")
 
+from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _bounded_gate_cumsum_ragged_bwd_op,
     _bounded_gate_cumsum_ragged_fwd_op,
@@ -195,11 +196,13 @@ def test_bounded_gate_cumsum_ragged_op_registration():
     """Validate functional schemas, fake tensors, and AOT dispatch for both compositions."""
     raw_gate, A_log, dt_bias, d_cumulative = _inputs(128)
     cu_seqlens = cumulative_sequence_offsets([65, 0, 63])
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, raw_gate.shape[1], 64)
     forward_args = (
         raw_gate.detach(),
         A_log.detach(),
         dt_bias.detach(),
         cu_seqlens,
+        metadata.chunk_offsets,
         64,
         LOWER_BOUND,
     )
@@ -211,8 +214,6 @@ def test_bounded_gate_cumsum_ragged_op_registration():
         test_utils=test_utils,
     )
 
-    with torch.no_grad():
-        _output, chunk_offsets = _bounded_gate_cumsum_ragged_fwd_op(*forward_args)
     torch.library.opcheck(
         _bounded_gate_cumsum_ragged_bwd_op,
         (
@@ -221,7 +222,7 @@ def test_bounded_gate_cumsum_ragged_op_registration():
             dt_bias.detach(),
             d_cumulative.detach(),
             cu_seqlens,
-            chunk_offsets,
+            metadata.chunk_offsets,
             64,
             LOWER_BOUND,
             False,

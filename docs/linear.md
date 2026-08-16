@@ -71,15 +71,18 @@ composition, and bounded-gate backward.
 The kernel boundaries are labeled explicitly in profiler traces. Dense gate backward
 consumes the complete `[B, T, H, D]` gate tensor in one CuTe launch and emits
 per-batch, per-chunk partials for the shared parameter reduction. Packed gate backward
-instead uses a graph-safe ragged FP32 reverse cumsum followed by the pointwise Triton
-derivative and FP32 parameter reductions. The example explicitly runs projections in BF16
-while retaining FP32 parameters and gate reductions; no ambient autocast context is
-required.
-The CuTe gate path requires a head dimension divisible by 32 in `[32, 1024]`.
+instead uses one graph-safe ragged Triton launch that fuses the reverse scan, bounded-gate
+derivative, and FP32 parameter-gradient partials. The example explicitly runs projections
+in BF16 while retaining FP32 parameters and gate reductions; no ambient autocast context
+is required.
+The CuTe dense gate backward requires a head dimension divisible by 32 in `[32, 1024]`;
+gate forward is Triton for both dense and ragged inputs.
 The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and 64-token
-chunks. Dense `[B, T, H, D]` inputs are lowered internally to equal-length packed
-sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts explicitly packed
-`[1, T, H, D]` inputs. Both forms carry sequence boundaries through the forward,
+chunks. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
+direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
+equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
+explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
+forward,
 backward, and recurrent states; logical sequences may have tails or be empty. For
 fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
 values outside `[0, cu_seqlens[-1])` are unspecified. Primitives deliberately do not mask
@@ -136,9 +139,10 @@ token, so token masks must not be applied to them.
 
 ::: attn_gym.linear.kda.mask_inactive_token_gradients
 
-`KDAAttention.forward` threads explicit offsets through its short convolution,
-bounded-gate prefix sum, and KDA core. Set `mask_inactive_capacity=True` only when the
-packed tensor reserves physical rows beyond `cu_seqlens[-1]`; dense and exact-packed
+`KDAAttention.forward` passes explicit offsets to its short convolution and prepares one
+private ragged chunk schedule shared by the bounded-gate prefix sum and KDA core. Set
+`mask_inactive_capacity=True` only when the packed tensor reserves physical rows beyond
+`cu_seqlens[-1]`; dense and exact-packed
 callers leave it disabled and pay no masking cost. The optimized boundaries are
 first-order and do not support higher-order autograd. Run
 `python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`

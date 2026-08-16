@@ -12,7 +12,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     chunk_kda_bwd_intra,
 )
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.utils import ChunkMetadata, prepare_complete_chunk_metadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     bwd_intra_reference,
@@ -165,23 +164,6 @@ def test_ragged_bwd_intra_accepts_all_empty_sequences():
     assert dq.dtype == dk.dtype == torch.bfloat16
     assert dg.dtype == db.dtype == torch.float32
     torch.testing.assert_close(db, inputs[8], rtol=0, atol=0)
-
-
-def test_ragged_bwd_intra_preserves_aligned_map_routing():
-    inputs = _inputs(128)
-    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
-    chunk_indices, num_chunks = prepare_complete_chunk_metadata(cu_seqlens, 128, 64)
-    aligned = ChunkMetadata(cu_seqlens, chunk_indices, num_chunks)
-
-    expected = chunk_kda_bwd_intra(
-        *inputs,
-        aligned,
-        config=ChunkKdaBwdIntraConfig(2),
-    )
-    actual = _run(inputs, [64, 64])
-
-    for ragged, complete in zip(actual, expected, strict=True):
-        torch.testing.assert_close(ragged, complete, rtol=0, atol=0)
 
 
 def test_ragged_bwd_intra_replays_aligned_to_partial():

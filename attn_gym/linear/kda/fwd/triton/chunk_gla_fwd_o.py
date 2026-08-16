@@ -18,19 +18,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
-from attn_gym.linear.kda.utils import (
-    ChunkMetadata,
-    autotune_cache_kwargs,
-    exp,
-    exp2,
-)
+from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
 
 
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
-        "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
             args["q"],
             args["v"],
@@ -39,9 +32,7 @@ from attn_gym.linear.kda.utils import (
             args["o"],
             args["A"],
             args["cu_seqlens"],
-            args["chunk_indices"],
             args["chunk_offsets"],
-            args["num_chunks"],
         ),
     }
 )
@@ -60,7 +51,6 @@ from attn_gym.linear.kda.utils import (
 @triton.jit(
     do_not_specialize=[
         "T",
-        "num_chunks",
         "num_sequences",
         "q_stride_t",
         "q_stride_h",
@@ -74,9 +64,7 @@ def chunk_gla_fwd_kernel_o(
     o,
     A,
     cu_seqlens,
-    chunk_indices,
     chunk_offsets,
-    num_chunks,
     scale,
     T,
     q_stride_t,
@@ -90,8 +78,6 @@ def chunk_gla_fwd_kernel_o(
     BV: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    HAS_NUM_CHUNKS: tl.constexpr,
-    IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -101,35 +87,25 @@ def chunk_gla_fwd_kernel_o(
         i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        if IS_RAGGED:
-            if i_t >= tl.load(chunk_offsets + num_sequences):
-                return
-            i_tg = i_t
-            i_n, i_t, _, _ = load_ragged_chunk_work(
-                cu_seqlens,
-                chunk_offsets,
-                i_t,
-                num_sequences,
-                BT,
-            )
-        else:
-            if HAS_NUM_CHUNKS and i_t >= tl.load(num_chunks):
-                return
-            i_tg = i_t
-            i_n, i_t = (
-                tl.load(chunk_indices + ptr_offset((i_t, 0), (2, 1))).to(tl.int32),
-                tl.load(chunk_indices + ptr_offset((i_t, 1), (2, 1))).to(tl.int32),
-            )
+        if i_t >= tl.load(chunk_offsets + num_sequences):
+            return
+        i_tg = i_t
+        i_n, i_t, token_start, _ = load_ragged_chunk_work(
+            cu_seqlens,
+            chunk_offsets,
+            i_t,
+            num_sequences,
+            BT,
+        )
         if USE_INT64_OFFSETS:
             i_n = i_n.to(tl.int64)
             i_t = i_t.to(tl.int64)
-        bos, eos = (
-            tl.load(cu_seqlens + ptr_offset((i_n, 0), (1, 1))).to(tl.int32),
-            tl.load(cu_seqlens + ptr_offset((i_n, 1), (1, 1))).to(tl.int32),
-        )
+            token_start = token_start.to(tl.int64)
+        eos = tl.load(cu_seqlens + ptr_offset((i_n, 1), (1, 1))).to(tl.int32)
         if USE_INT64_OFFSETS:
-            bos = bos.to(tl.int64)
             eos = eos.to(tl.int64)
+        # token_start == bos + i_t * BT; only eos still needs a load for masking.
+        bos = token_start - i_t * BT
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
@@ -381,24 +357,16 @@ def chunk_gla_fwd_o_gk(
     scale: float,
     *,
     chunk_size: int = 64,
-    metadata: ChunkMetadata | RaggedChunkMetadata | None = None,
+    metadata: RaggedChunkMetadata | None = None,
 ) -> torch.Tensor:
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
-    if isinstance(metadata, RaggedChunkMetadata):
+    if metadata is not None:
         metadata.validate_chunk_size(chunk_size)
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     if metadata is None and tokens % chunk_size:
         raise ValueError(f"the dense KDA output kernel requires complete chunks, got T={tokens}")
-    chunks = (
-        triton.cdiv(tokens, chunk_size)
-        if metadata is None
-        else (
-            metadata.capacity
-            if isinstance(metadata, RaggedChunkMetadata)
-            else tokens // chunk_size
-        )
-    )
+    chunks = triton.cdiv(tokens, chunk_size) if metadata is None else metadata.capacity
     if g.shape != q.shape:
         raise ValueError("g must have the same shape as q")
     if v.shape != (batch, tokens, heads, value_dim):
@@ -413,7 +381,7 @@ def chunk_gla_fwd_o_gk(
 
     output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     ragged_tma = (
-        isinstance(metadata, RaggedChunkMetadata)
+        metadata is not None
         and batch == 1
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
         and _can_use_tensor_descriptors(q, v, g, h, output, A)
@@ -495,13 +463,7 @@ def chunk_gla_fwd_o_gk(
             o=output,
             A=A,
             cu_seqlens=None if metadata is None else metadata.cu_seqlens,
-            chunk_indices=(
-                metadata.chunk_indices if isinstance(metadata, ChunkMetadata) else None
-            ),
-            chunk_offsets=(
-                metadata.chunk_offsets if isinstance(metadata, RaggedChunkMetadata) else None
-            ),
-            num_chunks=metadata.num_chunks if isinstance(metadata, ChunkMetadata) else None,
+            chunk_offsets=None if metadata is None else metadata.chunk_offsets,
             scale=scale,
             T=tokens,
             q_stride_t=q.stride(1),

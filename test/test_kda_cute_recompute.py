@@ -7,8 +7,10 @@ from itertools import pairwise
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.utils import ChunkMetadata, prepare_chunk_indices
+from attn_gym.linear.kda.chunk_scheduler import (
+    RaggedChunkMetadata,
+    prepare_ragged_chunk_metadata,
+)
 
 pytest.importorskip("cutlass")
 
@@ -34,29 +36,15 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
     beta = torch.rand(1, 64, 1, device="cuda")
     A = torch.randn(1, 64, 64, device="cuda", dtype=torch.bfloat16)
     A = A.tril().masked_fill(torch.ones_like(A, dtype=torch.bool).triu(1), torch.nan).unsqueeze(2)
-    cu_seqlens = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
-    chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
-    metadata = ChunkMetadata(
-        cu_seqlens,
-        chunk_indices,
-        torch.tensor(1, device="cuda", dtype=torch.int32),
-    )
 
-    def run_recompute(**kwargs):
-        return recompute_w_u_fwd(
-            k,
-            v,
-            beta,
-            A,
-            metadata=metadata,
-            **kwargs,
-        )
+    def run_recompute():
+        return recompute_w_u_fwd(k, v, beta, A, metadata=None)
 
     # Compile-cache reuse contract lives on the CuTe kernel, which the public
     # API no longer reaches; call the internal entry to keep it compiling.
-    w_cute, u_cute, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata)
+    w_cute, u_cute, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=None)
     first_cache_info = _compile_recompute_w_u.cache_info()
-    repeated_w, repeated_u, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata)
+    repeated_w, repeated_u, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=None)
     second_cache_info = _compile_recompute_w_u.cache_info()
     assert second_cache_info.hits == first_cache_info.hits + 1
     assert second_cache_info.currsize == first_cache_info.currsize
@@ -85,21 +73,11 @@ def test_recompute_uses_optional_q_and_gate_arguments():
     gk = -torch.rand(shape, device="cuda", dtype=torch.float32)
     beta = torch.rand(1, 64, 1, device="cuda")
     A = torch.randn(1, 64, 64, device="cuda", dtype=torch.bfloat16).tril().unsqueeze(2)
-    cu_seqlens = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
-    metadata = ChunkMetadata(
-        cu_seqlens,
-        prepare_chunk_indices(cu_seqlens, 64),
-        torch.tensor(1, device="cuda", dtype=torch.int32),
-    )
 
-    plain_w, plain_u, plain_qg, plain_kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata)
-    q_only_w, q_only_u, q_only_qg, q_only_kg = recompute_w_u_fwd(
-        k, v, beta, A, metadata=metadata, q=q
-    )
-    gate_w, gate_u, gate_qg, gate_kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, gk=gk)
-    both_w, both_u, both_qg, both_kg = recompute_w_u_fwd(
-        k, v, beta, A, metadata=metadata, q=q, gk=gk
-    )
+    plain_w, plain_u, plain_qg, plain_kg = recompute_w_u_fwd(k, v, beta, A, metadata=None)
+    q_only_w, q_only_u, q_only_qg, q_only_kg = recompute_w_u_fwd(k, v, beta, A, metadata=None, q=q)
+    gate_w, gate_u, gate_qg, gate_kg = recompute_w_u_fwd(k, v, beta, A, metadata=None, gk=gk)
+    both_w, both_u, both_qg, both_kg = recompute_w_u_fwd(k, v, beta, A, metadata=None, q=q, gk=gk)
 
     assert plain_qg is plain_kg is q_only_qg is q_only_kg is None
     assert gate_qg is None
@@ -150,13 +128,12 @@ def test_recompute_fake_tensors_reach_no_launch():
         beta = torch.empty(1, 128, 2, device="cuda")
         A = torch.empty(1, 128, 2, 64, device="cuda", dtype=torch.bfloat16)
         cu_seqlens = torch.empty(2, device="cuda", dtype=torch.int32)
-        chunk_indices = torch.empty(2, 2, device="cuda", dtype=torch.int32)
-        metadata = ChunkMetadata(
-            cu_seqlens, chunk_indices, torch.empty((), device="cuda", dtype=torch.int32)
-        )
-        w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
-    assert w.shape == k.shape and u.shape == v.shape
-    assert qg.shape == k.shape and kg.shape == k.shape
+        chunk_offsets = torch.empty(2, device="cuda", dtype=torch.int32)
+        ragged = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity=2, chunk_size=64)
+        for metadata in (None, ragged):
+            w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+            assert w.shape == k.shape and u.shape == v.shape
+            assert qg.shape == k.shape and kg.shape == k.shape
 
 
 def test_recompute_triton_matches_cute_on_ragged_partial_chunks():

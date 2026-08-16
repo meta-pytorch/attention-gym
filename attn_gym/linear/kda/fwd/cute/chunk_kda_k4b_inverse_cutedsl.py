@@ -9,7 +9,7 @@ CuTe DSL K4b: 4×4 block lower-triangular matrix inverse.
 
 Grid: (total_chunks, H, 1) — one CTA per (chunk, head).
 128 threads (4 warps):
-    Phase 1: Per-warp OD register load + parallel forward substitution
+    Phase 1: Per-warp OD register load + preinverted diagonal-block load
     Phase 2a: Warps 0-2 parallel Schur L1 (Ai10, Ai21, Ai32), Warp 3 stores diags
     Phase 2b+c: Warp 0 interleaved Schur L2+L3 with B-fragment reuse
     Phase 2b: Warp 1 Schur L2 (Ai31) with B-fragment reuse
@@ -21,7 +21,7 @@ Optimizations:
   - 4 warps (128 threads) with parallel Schur complement (9-GEMM critical path vs 16)
   - OD blocks in registers (zero-latency staging reads, 6KB SMEM saved)
   - B-fragment reuse: GEMMs 2→3→6' share B=sAi0_T, GEMMs 4→7 share B=Ai10
-  - Parallel forward substitution (4 blocks simultaneously)
+  - Parallel diagonal-inverse loads (4 blocks simultaneously)
   - Overlapped diagonal stores (warp 3 stores while warps 0-2 compute)
   - Flat padded SMEM layout (no swizzle) for reduced address computation
 """
@@ -42,8 +42,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         BC: int = 16,
         chunk_size: int = 64,
         num_subchunks: int = 4,
-        fwd_sub_mode: str = "cute_recurrence",
-        skip_fwd_sub: bool = False,
         schedule: ChunkSchedule = ChunkSchedule.DENSE,
     ):
         assert num_subchunks == 4, (
@@ -59,50 +57,21 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
-        self.fwd_sub_mode = "skip" if skip_fwd_sub else fwd_sub_mode
         self.schedule = schedule
 
     @cute.jit
-    def _fwd_sub_block(self, mAkkd, sAi, block_start, tidx, akkd_col_off, valid_rows):
-        """Forward substitution: inverse of (I - L) for a single BC×BC diagonal block."""
-        if cutlass.const_expr(self.fwd_sub_mode == "preinverted"):
-            for k in cutlass.range_constexpr(self.BC * self.BC // 32):
-                linear_idx = tidx + k * 32
-                row = linear_idx // self.BC
-                col = linear_idx % self.BC
-                if row < valid_rows:
-                    sAi[row, col] = self._sai_dtype(mAkkd[block_start + row, akkd_col_off + col])
-                else:
-                    sAi[row, col] = self._sai_dtype(0.0)
-            cute.arch.sync_warp()
-            return
-
+    def _load_diagonal_inverse_block(
+        self, mAkkd, sAi, block_start, tidx, akkd_col_off, valid_rows
+    ):
+        """Load one preinverted BC×BC diagonal block, zero-filling invalid rows."""
         for k in cutlass.range_constexpr(self.BC * self.BC // 32):
             linear_idx = tidx + k * 32
             row = linear_idx // self.BC
             col = linear_idx % self.BC
             if row < valid_rows:
-                val = mAkkd[block_start + row, akkd_col_off + col]
-                if row > col:
-                    sAi[row, col] = -val
-                else:
-                    sAi[row, col] = 0.0
+                sAi[row, col] = self._dtype(mAkkd[block_start + row, akkd_col_off + col])
             else:
-                sAi[row, col] = 0.0
-        cute.arch.sync_warp()
-
-        if cutlass.const_expr(self.fwd_sub_mode == "cute_recurrence"):
-            for i in cutlass.range_constexpr(2, self.BC):
-                if tidx < self.BC:
-                    my_col = tidx
-                    acc = sAi[i, my_col]
-                    for j in cutlass.range_constexpr(i):
-                        acc = acc + sAi[i, j] * sAi[j, my_col]
-                    sAi[i, my_col] = acc
-                cute.arch.sync_warp()
-
-        if tidx < self.BC:
-            sAi[tidx, tidx] = sAi[tidx, tidx] + 1.0
+                sAi[row, col] = self._dtype(0.0)
         cute.arch.sync_warp()
 
     @cute.jit
@@ -114,42 +83,23 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         H: int,
         total_chunks: int,
         cu_seqlens: cute.Tensor | None,
-        chunk_indices: cute.Tensor | None,
         chunk_offsets: cute.Tensor | None,
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mAkk.element_type
-        self._sai_dtype: type[cutlass.Numeric] = cutlass.Float32
-        self._sai_stride = self.BC + 1
-        if cutlass.const_expr(self.fwd_sub_mode == "preinverted"):
-            self._sai_dtype = self._dtype
-            self._sai_stride = self.BC
-
-        if cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
-            NT = cute.size(chunk_indices, mode=[0]) // 2
-            grid = (NT, H, 1)
-        else:
-            grid = (total_chunks, H, 1)
+        grid = (total_chunks, H, 1)
 
         sSchurA_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC + 8, 1))
-        sAi_layout = cute.make_layout((self.BC, self.BC), stride=(self._sai_stride, 1))
+        sAi_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC, 1))
         sSchurB_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC + 8, 1))
 
         @cute.struct
         class SharedStorage:
             work: cute.struct.MemRange[Int32, 3]
-            sAi0: cute.struct.Align[
-                cute.struct.MemRange[self._sai_dtype, self.BC * self._sai_stride], 128
-            ]
-            sAi1: cute.struct.Align[
-                cute.struct.MemRange[self._sai_dtype, self.BC * self._sai_stride], 128
-            ]
-            sAi2: cute.struct.Align[
-                cute.struct.MemRange[self._sai_dtype, self.BC * self._sai_stride], 128
-            ]
-            sAi3: cute.struct.Align[
-                cute.struct.MemRange[self._sai_dtype, self.BC * self._sai_stride], 128
-            ]
+            sAi0: cute.struct.Align[cute.struct.MemRange[self._dtype, self.BC * self.BC], 128]
+            sAi1: cute.struct.Align[cute.struct.MemRange[self._dtype, self.BC * self.BC], 128]
+            sAi2: cute.struct.Align[cute.struct.MemRange[self._dtype, self.BC * self.BC], 128]
+            sAi3: cute.struct.Align[cute.struct.MemRange[self._dtype, self.BC * self.BC], 128]
             sSchurA0: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, self.BC * (self.BC + 8)], 128
             ]
@@ -197,7 +147,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             mAkkd,
             mAkk,
             cu_seqlens,
-            chunk_indices,
             chunk_offsets,
             sSchurA_layout,
             sAi_layout,
@@ -215,7 +164,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         mAkkd: cute.Tensor,
         mAkk: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
-        chunk_indices: cute.Tensor | None,
         chunk_offsets: cute.Tensor | None,
         sSchurA_layout: cute.Layout,
         sAi_layout: cute.Layout,
@@ -265,13 +213,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             is_active = work[0]
             chunk_base = work[1]
             eos = work[2]
-        elif cutlass.const_expr(self.schedule is ChunkSchedule.ALIGNED):
-            i_n = chunk_indices[chunk_idx * 2]
-            i_t = chunk_indices[chunk_idx * 2 + 1]
-            bos = cu_seqlens[i_n]
-            eos = cu_seqlens[i_n + 1]
-            chunk_base = bos + i_t * self.BT
-            is_active = Int32(1)
         else:
             chunk_base = chunk_idx * self.BT
             eos = cute.size(mAkk, mode=[0])
@@ -324,7 +265,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         acc_od5 = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
 
         # ══════════════════════════════════════════════════════════
-        # PHASE 1: Per-warp OD loading + parallel forward substitution
+        # PHASE 1: Per-warp OD loading + preinverted diagonal-block loading
         # ══════════════════════════════════════════════════════════
         od_base_row = chunk_idx * self.num_offdiag_blocks
 
@@ -339,7 +280,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 acc_od3[i] = mAkkOD[od_base_row + 3, rc]
                 acc_od4[i] = mAkkOD[od_base_row + 4, rc]
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            self._fwd_sub_block(mAkkd, sAi0, i_tc0, lane_idx, h_akkd_col, vr0)
+            self._load_diagonal_inverse_block(mAkkd, sAi0, i_tc0, lane_idx, h_akkd_col, vr0)
 
         if is_active and warp_idx == 1:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
@@ -349,7 +290,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 acc_od2[i] = mAkkOD[od_base_row + 2, rc]
                 acc_od4[i] = mAkkOD[od_base_row + 4, rc]
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            self._fwd_sub_block(mAkkd, sAi1, i_tc1, lane_idx, h_akkd_col, vr1)
+            self._load_diagonal_inverse_block(mAkkd, sAi1, i_tc1, lane_idx, h_akkd_col, vr1)
 
         if is_active and warp_idx == 2:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
@@ -357,10 +298,10 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 col = tCcC[i][1]
                 rc = head_idx * self.BC * self.BC + row * self.BC + col
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
-            self._fwd_sub_block(mAkkd, sAi2, i_tc2, lane_idx, h_akkd_col, vr2)
+            self._load_diagonal_inverse_block(mAkkd, sAi2, i_tc2, lane_idx, h_akkd_col, vr2)
 
         if is_active and warp_idx == 3:
-            self._fwd_sub_block(mAkkd, sAi3, i_tc3, lane_idx, h_akkd_col, vr3)
+            self._load_diagonal_inverse_block(mAkkd, sAi3, i_tc3, lane_idx, h_akkd_col, vr3)
 
         cute.arch.barrier(barrier_id=0, number_of_threads=128)
 
@@ -624,10 +565,10 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                 value2 = sAi2[row, col_idx]
                 value3 = sAi3[row, col_idx]
                 if col_idx > row:
-                    value0 = self._sai_dtype(0.0)
-                    value1 = self._sai_dtype(0.0)
-                    value2 = self._sai_dtype(0.0)
-                    value3 = self._sai_dtype(0.0)
+                    value0 = self._dtype(0.0)
+                    value1 = self._dtype(0.0)
+                    value2 = self._dtype(0.0)
+                    value3 = self._dtype(0.0)
                 if i_tc0 + row < eos:
                     mAkk[i_tc0 + row, h_akk_col + 0 * self.BC + col_idx] = self._dtype(value0)
                 if i_tc1 + row < eos:

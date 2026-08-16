@@ -230,8 +230,8 @@ def naive_chunk_kda(
 def l2norm_fwd_ref(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """L2 normalization over the last dim: ``y = x / sqrt(sum(x^2) + eps)``.
 
-    Naive counterpart of ``l2norm_fwd_kernel`` / ``l2norm_fwd_kernel1``. The reduction runs
-    in fp32 (or fp64 when ``x`` is already fp64) to mirror the kernels' fp32 accumulation,
+    Naive counterpart of ``l2norm_fwd_kernel``. The reduction runs in fp32 (or fp64 when
+    ``x`` is already fp64) to mirror the kernel's fp32 accumulation,
     then downcasts back to ``x.dtype``. Pass an fp64 ``x`` for a golden value or a
     low-precision ``x`` to mimic the kernel.
 
@@ -248,8 +248,8 @@ def l2norm_fwd_ref(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def l2norm_bwd_ref(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     """Gradient of the L2 norm: ``dx = rstd * (dy - y * <dy, y>)``.
 
-    Naive counterpart of ``l2norm_bwd_kernel`` / ``l2norm_bwd_kernel1``. Runs in fp32 (or
-    fp64 when ``y`` is fp64) to match the kernels' accumulation, then downcasts to ``y.dtype``.
+    Naive counterpart of ``l2norm_bwd_kernel``. Runs in fp32 (or fp64 when ``y`` is fp64)
+    to match the kernel's accumulation, then downcasts to ``y.dtype``.
 
     Args:
         y: normalized forward output; shape ``(..., D)``.
@@ -271,9 +271,8 @@ def chunk_cumsum_ref(
 ) -> torch.Tensor:
     """Chunk-local cumsum over the time axis (dim=1), optionally per document.
 
-    Naive counterpart of ``chunk_local_cumsum_scalar_kernel`` /
-    ``chunk_local_cumsum_vector_kernel``. The cumulative sum restarts at every
-    ``chunk_size`` boundary (and at every document boundary, in varlen mode).
+    The cumulative sum restarts at every ``chunk_size`` boundary and at every document
+    boundary in variable-length mode.
 
     Args:
         x: input with time on dim=1, e.g. ``(B, T, H)`` (scalar) or ``(B, T, H, S)``
@@ -314,10 +313,13 @@ def gate_fwd_ref(
     chunk_size: int,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Gate map, then chunk-local cumsum.
+    """Reference KDA gate map followed by a chunk-local cumulative sum.
 
-    Naive counterpart of ``kda_gate_chunk_cumsum_vector_kernel`` (fused gate + chunk cumsum).
-    The gate map runs in fp32 (or fp64 when ``g`` is fp64) to match the kernel's fp32 math.
+    The shipped optimized gate uses a required bias, finite lower bound, forward scan, and
+    dense or scheduler-routed ragged inputs. A missing bias or lower bound and reverse scans
+    remain reference-only modes. The ``scale`` argument expresses the optimized path's fixed
+    log2(e) post-scan scale; other values are reference-only. Gate math runs in fp32 (or fp64
+    when ``g`` is fp64).
 
     Args:
         g: raw gate input; shape ``(B, T, H, S)``.
@@ -372,8 +374,9 @@ def gate_bwd_ref(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Gradients of the pointwise gate map (no cumsum) w.r.t. ``g``, ``A_log``, ``dt_bias``.
 
-    Naive counterpart of ``kda_gate_bwd_kernel``, computed by autograd through the forward
-    map in fp32 (or fp64 when ``g`` is fp64) to match the kernel's fp32 math.
+    This reference differentiates the forward map in fp32 (or fp64 when ``g`` is fp64).
+    A missing bias or lower bound is a reference-only mode; optimized dense and ragged KDA
+    backward implement the bounded, biased contract.
 
     Args:
         g: raw gate input; shape ``(B, T, H, S)``.

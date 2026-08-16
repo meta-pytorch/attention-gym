@@ -38,11 +38,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
-from attn_gym.linear.kda.utils import (
-    ChunkMetadata,
-    autotune_cache_kwargs,
-    exp2,
-)
+from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 
 # Compile-time dot-precision selector shared with the launch wrapper.
 _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
@@ -53,7 +49,6 @@ _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
         "STORE_QG": lambda args: args["q"] is not None,
         "HAS_GK": lambda args: args["gk"] is not None,
         "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
-        "HAS_NUM_CHUNKS": lambda args: args["num_chunks"] is not None,
     }
 )
 @triton.autotune(
@@ -63,7 +58,7 @@ _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
 )
 @triton.jit(
     do_not_specialize=[
-        "num_chunks",
+        "T",
         "num_sequences",
         "q_stride_t",
         "k_stride_t",
@@ -82,9 +77,8 @@ def recompute_w_u_fwd_kernel(
     A,
     gk,
     cu_seqlens,
-    chunk_indices,
     chunk_offsets,
-    num_chunks,
+    T,
     q_stride_t,
     k_stride_t,
     v_stride_t,
@@ -100,7 +94,6 @@ def recompute_w_u_fwd_kernel(
     STORE_QG: tl.constexpr,
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
-    HAS_NUM_CHUNKS: tl.constexpr,
 ):
     """Recompute one chunk's W/U (and optional QG/KG) with register-operand dots."""
     i_c, i_hv = tl.program_id(0), tl.program_id(1).to(tl.int64)
@@ -108,17 +101,17 @@ def recompute_w_u_fwd_kernel(
     if IS_RAGGED:
         if i_c >= tl.load(chunk_offsets + num_sequences):
             return
-        i_n, i_t, _, _ = load_ragged_chunk_work(cu_seqlens, chunk_offsets, i_c, num_sequences, BT)
-    else:
-        if HAS_NUM_CHUNKS and i_c >= tl.load(num_chunks):
-            return
-        i_n, i_t = (
-            tl.load(chunk_indices + ptr_offset((i_c, 0), (2, 1))).to(tl.int32),
-            tl.load(chunk_indices + ptr_offset((i_c, 1), (2, 1))).to(tl.int32),
+        i_n, i_t, token_start, _ = load_ragged_chunk_work(
+            cu_seqlens, chunk_offsets, i_c, num_sequences, BT
         )
-    bos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int64)
-    eos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int64)
-    T_local = (eos - bos).to(tl.int32)
+        # token_start == bos + i_t * BT; only eos still needs a load for masking.
+        bos = (token_start - i_t * BT).to(tl.int64)
+        eos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int64)
+        T_local = (eos - bos).to(tl.int32)
+    else:
+        i_t = i_c
+        bos = 0
+        T_local = T
 
     o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
     m_t = o_t < T_local
@@ -218,7 +211,7 @@ def recompute_w_u_fwd_triton(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    metadata: ChunkMetadata | RaggedChunkMetadata,
+    metadata: RaggedChunkMetadata | None = None,
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     *,
@@ -272,9 +265,13 @@ def recompute_w_u_fwd_triton(
     for name, tensor in (("beta", beta), ("A", A), ("gk", gk)):
         if tensor is not None and not tensor.is_contiguous():
             raise ValueError(f"recompute_w_u_fwd_triton requires contiguous {name}")
-    ragged = isinstance(metadata, RaggedChunkMetadata)
-    if ragged:
+    if metadata is not None:
         metadata.validate_chunk_size(chunk_size)
+    elif tokens % chunk_size:
+        raise ValueError(
+            "dense recompute_w_u_fwd_triton requires complete chunks, "
+            f"got T={tokens} and chunk_size={chunk_size}"
+        )
     has_gk = gk is not None
     has_q = q is not None and has_gk
 
@@ -286,11 +283,7 @@ def recompute_w_u_fwd_triton(
     # (chunk_kda_fwd_intra); the autotuned launch must not run.
     if isinstance(k, FakeTensor):
         return w, u, qg, kg
-    # Assumption: legacy ChunkMetadata comes from prepare_complete_chunk_metadata,
-    # which device-validates chunk-aligned sequences, so T % chunk_size == 0 holds
-    # for any constructible metadata and the floor-sized grid covers every chunk
-    # (partial tails are only routable through RaggedChunkMetadata).
-    chunks = metadata.capacity if ragged else tokens // chunk_size
+    chunks = metadata.capacity if metadata is not None else tokens // chunk_size
     if chunks:
         recompute_w_u_fwd_kernel[(chunks, value_heads)](
             q=q if has_q else None,
@@ -303,10 +296,9 @@ def recompute_w_u_fwd_triton(
             u=u,
             A=A,
             gk=gk,
-            cu_seqlens=metadata.cu_seqlens,
-            chunk_indices=None if ragged else metadata.chunk_indices,
-            chunk_offsets=metadata.chunk_offsets if ragged else None,
-            num_chunks=None if ragged else metadata.num_chunks,
+            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
+            chunk_offsets=None if metadata is None else metadata.chunk_offsets,
+            T=tokens,
             q_stride_t=q.stride(1) if has_q else 0,
             k_stride_t=k.stride(1),
             v_stride_t=v.stride(1),
@@ -318,7 +310,7 @@ def recompute_w_u_fwd_triton(
             BK=64,
             BV=64,
             PRECISION=_PRECISION_MODES[dot_precision],
-            num_sequences=metadata.cu_seqlens.shape[0] - 1 if ragged else 0,
+            num_sequences=0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
         )
     return w, u, qg, kg
 

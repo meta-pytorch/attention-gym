@@ -8,30 +8,17 @@
 
 from __future__ import annotations
 
-from itertools import product
-
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
-import attn_gym.linear.kda.bwd.triton.cumsum as cumsum_module
 from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_kernel_dAv
-from attn_gym.linear.kda.bwd.triton.cumsum import (
-    chunk_local_cumsum_scalar,
-    chunk_local_cumsum_scalar_kernel,
-    chunk_local_cumsum_vector_kernel,
-)
-from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_kernel
-from attn_gym.linear.kda.bwd.triton.l2norm_bwd import (
-    l2norm_bwd_kernel,
-    l2norm_bwd_kernel1,
-)
+from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
     chunk_gla_fwd_kernel_o,
@@ -41,26 +28,17 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import
     chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
+    _bounded_gate_chunk_cumsum_dense_kernel,
     _requires_int64_offsets,
-    kda_gate_chunk_cumsum,
-    kda_gate_chunk_cumsum_vector_kernel,
-    kda_gate_chunk_cumsum_vector_kernel_forloop,
 )
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     _l2norm_bwd_op,
     _l2norm_fwd_op,
     l2norm,
     l2norm_fwd_kernel,
-    l2norm_fwd_kernel1,
 )
-from attn_gym.linear.kda.naive import (
-    chunk_cumsum_ref,
-    gate_bwd_ref,
-    gate_fwd_ref,
-    l2norm_bwd_ref,
-    l2norm_fwd_ref,
-)
-from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, ChunkMetadata, prepare_chunk_indices
+from attn_gym.linear.kda.naive import l2norm_bwd_ref, l2norm_fwd_ref
+from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, RCP_LN2
 from attn_gym.testing.kda import (
     bwd_intra_reference as _bwd_intra_ref,
 )
@@ -151,17 +129,7 @@ def _representative_config(kernel, *, num_warps, num_stages=None, **kwargs):
 @pytest.fixture(scope="module", autouse=True)
 def use_one_autotune_config_for_correctness_tests():
     """Avoid benchmarking configs whose outputs these tests never inspect."""
-    selections = (
-        _representative_config(l2norm_bwd_kernel, BT=16, num_warps=4),
-        _representative_config(l2norm_bwd_kernel1, num_warps=4),
-        _representative_config(kda_gate_bwd_kernel, num_warps=4, num_stages=3),
-        _representative_config(chunk_local_cumsum_scalar_kernel, num_warps=4),
-        _representative_config(
-            chunk_local_cumsum_vector_kernel,
-            BS=32,
-            num_warps=4,
-        ),
-    )
+    selections = (_representative_config(l2norm_bwd_kernel, BT=16, num_warps=4),)
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
         for autotuner, config in selections:
@@ -186,17 +154,6 @@ def assert_golden(
         f"{name}: kernel err {a_err:.3e} exceeds budget {budget:.3e} "
         f"(ref err {r_err:.3e}, band {band:.3e}, dtype {dtype})"
     )
-
-
-def _cu_seqlens(doc_lens: tuple[int, ...]) -> torch.Tensor:
-    cu = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=DEV)
-    cu[1:] = torch.tensor(doc_lens, dtype=torch.int32, device=DEV).cumsum(0)
-    return cu
-
-
-def _optional_matrix_strides(tensor: torch.Tensor | None) -> tuple[int, ...]:
-    """Return matrix strides or inert strides for a disabled optional input."""
-    return (0, 0) if tensor is None else tensor.stride()
 
 
 def _empty_strided_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -224,9 +181,6 @@ L2NORM_SHAPES = (
     (64, 128, False),
     (130, 32, False),
 )
-GATE_TS = (1, 15, 16, 17, 33, 64)
-VARLEN_DOCS = ((16,), (16, 32, 16), (7, 16, 24, 1), (64, 3))
-
 _L2NORM_CASES = [(torch.float32, T, D, strided) for T, D, strided in L2NORM_SHAPES] + [
     (dtype, 17, 64, False) for dtype in DTYPES[1:]
 ]
@@ -272,25 +226,6 @@ def test_l2norm_fwd(dtype, T, D, strided):
     )
     assert_golden(y, golden, ref, dtype, f"l2norm_fwd_kernel T={T} D={D}")
     assert_golden(rstd, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel rstd T={T} D={D}")
-
-    # single-row kernel
-    y1 = _empty_strided_like(x) if strided else torch.empty_like(x)
-    rstd1 = _empty_strided_like(rstd_template) if strided else torch.empty_like(rstd_template)
-    l2norm_fwd_kernel1[(T,)](
-        x,
-        y1,
-        rstd1,
-        eps,
-        X_STRIDES=(0, x.stride(0), 0, x.stride(1)),
-        Y_STRIDES=y1.stride(),
-        RSTD_STRIDES=rstd1.stride(),
-        T=T,
-        H=1,
-        D=D,
-        BD=BD,
-    )
-    assert_golden(y1, golden, ref, dtype, f"l2norm_fwd_kernel1 T={T} D={D}")
-    assert_golden(rstd1, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel1 rstd T={T} D={D}")
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
@@ -424,288 +359,15 @@ def test_l2norm_bwd(dtype, T, D, strided):
     )
     assert_golden(dx, golden, ref, dtype, f"l2norm_bwd_kernel T={T} D={D}")
 
-    dx1 = _empty_strided_like(y) if strided else torch.empty_like(y)
-    l2norm_bwd_kernel1[(T,)](
-        y,
-        rstd,
-        dy,
-        dx1,
-        D,
-        Y_STRIDES=y.stride(),
-        RSTD_STRIDES=rstd.stride(),
-        DY_STRIDES=dy_strides,
-        DX_STRIDES=dx1.stride(),
-        TOKENS=T,
-        HEADS=1,
-        BD=BD,
-    )
-    assert_golden(dx1, golden, ref, dtype, f"l2norm_bwd_kernel1 T={T} D={D}")
 
-
-# gate forward (gate map + chunk-local cumsum)
-def _run_gate_fwd(
-    g,
-    A_log,
-    dt_bias,
-    o,
-    scale,
-    lower_bound,
-    chunk_size,
-    cu_seqlens,
-    reverse=False,
-    *,
-    grid_nt=None,
-):
-    """Launch the direct or persistent gate kernel with logical tensor strides."""
-    # o carries the full output dim S; g may carry a reduced dim S_in = S / F_REPEAT.
-    B, T, H, S = o.shape
-    S_in = g.shape[-1]
-    F_REPEAT = S // S_in
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        NT = chunk_indices.shape[0]
-    else:
-        chunk_indices = None
-        NT = triton.cdiv(T, chunk_size)
-
-    kernel = kda_gate_chunk_cumsum_vector_kernel
-    kernel_kwargs = {}
-    if grid_nt is not None:
-        kernel = kda_gate_chunk_cumsum_vector_kernel_forloop
-        kernel_kwargs = {"GRID_NT": grid_nt, "MAX_NT": NT}
-    # BS is autotuned; the HAS_*/USE_*/IS_VARLEN/USE_REPEAT flags come from @triton.heuristics.
-    grid = lambda meta: (grid_nt or NT, B * H, triton.cdiv(S, meta["BS"]))
-    kernel[grid](
-        g,
-        A_log,
-        dt_bias,
-        o,
-        scale,
-        cu_seqlens,
-        chunk_indices,
-        lower_bound,
-        T,
-        None,
-        g.stride(0),
-        o.stride(0),
-        S_STRIDES=g.stride()[1:],
-        A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=_optional_matrix_strides(dt_bias),
-        O_STRIDES=o.stride()[1:],
-        B=B,
-        H=H,
-        S=S,
-        S_in=S_in,
-        F_REPEAT=F_REPEAT,
-        BT=chunk_size,
-        REVERSE=reverse,
-        **kernel_kwargs,
-    )
-
-
-_GATE_FWD_CASES = (
-    [
-        (torch.float32, 17, lower_bound, has_bias, scale, reverse)
-        for lower_bound, has_bias, scale, reverse in product(
-            (None, 0.5), (False, True), (None, 2.0), (False, True)
-        )
-    ]
-    + [(torch.float32, T, None, False, None, False) for T in GATE_TS if T != 17]
-    + [(dtype, 17, None, False, None, False) for dtype in DTYPES[1:]]
-)
-
-
-@pytest.mark.parametrize(
-    "dtype,T,lower_bound,has_bias,scale,reverse",
-    _GATE_FWD_CASES,
-    ids=_case_id,
-)
-def test_gate_fwd(dtype, T, lower_bound, has_bias, scale, reverse):
-    torch.manual_seed(2)
-    B, H, S, chunk = 2, 2, 16, 16
-    g64 = torch.randn(B, T, H, S, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    bias64 = torch.randn(H, S, device=DEV, dtype=torch.float64) if has_bias else None
-
-    golden = gate_fwd_ref(g64, A_log64, bias64, lower_bound, scale, reverse, chunk, None)
-
-    g = g64.to(dtype)
-    A_log = A_log64.to(torch.float32)
-    bias = bias64.to(dtype) if has_bias else None
-    ref = gate_fwd_ref(g, A_log, bias, lower_bound, scale, reverse, chunk, None)
-
-    o = kda_gate_chunk_cumsum(
-        g,
-        A_log,
-        bias,
-        chunk_size=chunk,
-        lower_bound=lower_bound,
-        scale=scale,
-        reverse=reverse,
-    )
-    tag = f"T={T} lb={lower_bound} bias={has_bias} scale={scale} rev={reverse}"
-    assert_golden(o, golden, ref, dtype, f"gate_fwd {tag}")
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [(0, 17, 2, 32), (1, 0, 2, 32), (1, 17, 0, 32), (1, 17, 2, 0)],
-)
-def test_gate_fwd_wrapper_rejects_empty_dimensions(shape):
-    g = torch.empty(shape, device=DEV)
-    A_log = torch.empty(shape[2], device=DEV)
-    dt_bias = torch.empty(shape[2:], device=DEV)
-    with pytest.raises(ValueError, match="no empty dimensions"):
-        kda_gate_chunk_cumsum(g, A_log, dt_bias)
-
-
-_GATE_FWD_VARLEN_CASES = [
-    (torch.float32, docs, lower_bound) for docs, lower_bound in product(VARLEN_DOCS, (None, 0.5))
-] + [(dtype, VARLEN_DOCS[2], None) for dtype in DTYPES[1:]]
-
-
-@pytest.mark.parametrize(
-    "dtype,docs,lower_bound",
-    _GATE_FWD_VARLEN_CASES,
-    ids=_case_id,
-)
-def test_gate_fwd_varlen(dtype, docs, lower_bound):
-    torch.manual_seed(3)
-    H, S, chunk = 2, 16, 16
-    total = sum(docs)
-    cu = _cu_seqlens(docs)
-    g64 = torch.randn(1, total, H, S, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    bias64 = torch.randn(H, S, device=DEV, dtype=torch.float64)
-
-    golden = gate_fwd_ref(g64, A_log64, bias64, lower_bound, None, False, chunk, cu)
-
-    g = g64.to(dtype)
-    A_log = A_log64.to(torch.float32)
-    bias = bias64.to(dtype)
-    ref = gate_fwd_ref(g, A_log, bias, lower_bound, None, False, chunk, cu)
-
-    generated = kda_gate_chunk_cumsum(
-        g,
-        A_log,
-        bias,
-        chunk_size=chunk,
-        lower_bound=lower_bound,
-        cu_seqlens=cu,
-    )
-    chunk_indices = prepare_chunk_indices(cu, chunk)
-    explicit = kda_gate_chunk_cumsum(
-        g,
-        A_log,
-        bias,
-        chunk_size=chunk,
-        lower_bound=lower_bound,
-        cu_seqlens=cu,
-        chunk_indices=chunk_indices,
-        num_chunks=torch.tensor(len(chunk_indices), dtype=torch.int32, device=DEV),
-    )
-    tag = f"gate_fwd_varlen docs={docs} lb={lower_bound}"
-    assert_golden(generated, golden, ref, dtype, f"{tag} generated")
-    assert_golden(explicit, golden, ref, dtype, f"{tag} explicit")
-
-
-# gate forward with a reduced input dim S_in < S (USE_REPEAT branch): the kernel maps
-# output column j to input column j // F_REPEAT, i.e. a repeat_interleave over channels.
-@pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
-@pytest.mark.parametrize("f_repeat", [2, 4])
-@pytest.mark.parametrize("reverse", [False, True])
-def test_gate_fwd_repeat(dtype, f_repeat, reverse):
-    torch.manual_seed(8)
-    B, T, H, chunk = 1, 33, 2, 16  # partial trailing chunk (33 = 2*16 + 1)
-    S_in = 8
-    S = S_in * f_repeat
-    g64 = torch.randn(B, T, H, S_in, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    bias64 = torch.randn(H, S, device=DEV, dtype=torch.float64)  # bias is in full dim S
-
-    g64_full = g64.repeat_interleave(f_repeat, dim=-1)
-    golden = gate_fwd_ref(g64_full, A_log64, bias64, None, None, reverse, chunk, None)
-
-    g = g64.to(dtype)
-    A_log = A_log64.to(torch.float32)
-    bias = bias64.to(dtype)
-    ref = gate_fwd_ref(
-        g.repeat_interleave(f_repeat, dim=-1), A_log, bias, None, None, reverse, chunk, None
-    )
-
-    o = torch.empty(B, T, H, S, device=DEV, dtype=dtype)
-    _run_gate_fwd(g, A_log, bias, o, None, None, chunk, None, reverse=reverse)
-    assert_golden(o, golden, ref, dtype, f"gate_fwd_repeat f_repeat={f_repeat} rev={reverse}")
-
-
-def test_gate_fwd_varlen_repeat():
-    """Cover packed varlen, repeated channels, and non-contiguous strides together."""
-    torch.manual_seed(9)
-    dtype = torch.float32
-    docs = (7, 17)
-    total, H, S_in, f_repeat, chunk = sum(docs), 2, 8, 2, 16
-    S = S_in * f_repeat
-    cu = _cu_seqlens(docs)
-    g64 = torch.randn(1, total, H, S_in, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    bias64 = torch.randn(H, S, device=DEV, dtype=torch.float64)
-
-    g64_full = g64.repeat_interleave(f_repeat, dim=-1)
-    golden = gate_fwd_ref(g64_full, A_log64, bias64, 0.5, None, True, chunk, cu)
-
-    g = _strided_copy(g64.to(dtype))
-    A_log = _strided_copy(A_log64.to(torch.float32))
-    bias = _strided_copy(bias64.to(dtype))
-    ref = gate_fwd_ref(
-        g.repeat_interleave(f_repeat, dim=-1), A_log, bias, 0.5, None, True, chunk, cu
-    )
-    output_template = torch.empty(1, total, H, S, device=DEV, dtype=dtype)
-    o = _empty_strided_like(output_template)
-
-    _run_gate_fwd(g, A_log, bias, o, None, 0.5, chunk, cu, reverse=True)
-    assert_golden(o, golden, ref, dtype, "gate_fwd_varlen_repeat")
-
-    o_forloop = _empty_strided_like(output_template)
-    _run_gate_fwd(
-        g,
-        A_log,
-        bias,
-        o_forloop,
-        None,
-        0.5,
-        chunk,
-        cu,
-        reverse=True,
-        grid_nt=2,
-    )
-    assert_golden(o_forloop, golden, ref, dtype, "gate_fwd_varlen_repeat_forloop")
-
-
-def test_gate_fwd_forloop_fixed_batch():
-    """Cover the persistent kernel's fixed-length and nonzero-batch offsets."""
-    torch.manual_seed(11)
-    dtype = torch.float32
-    B, T, H, S, chunk = 2, 33, 2, 16, 16
-    g64 = torch.randn(B, T, H, S, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    golden = gate_fwd_ref(g64, A_log64, None, None, None, False, chunk, None)
-
-    g = g64.to(dtype)
-    A_log = A_log64.to(torch.float32)
-    ref = gate_fwd_ref(g, A_log, None, None, None, False, chunk, None)
-    o = torch.empty_like(g)
-
-    _run_gate_fwd(g, A_log, None, o, None, None, chunk, None, grid_nt=2)
-    assert_golden(o, golden, ref, dtype, "gate_fwd_forloop_fixed_batch")
-
-
-def test_gate_fwd_int64_offsets():
-    """Force the 64-bit offset specialization without allocating a huge tensor."""
+def test_bounded_gate_fwd_int64_offsets():
+    """Force the dense bounded gate's 64-bit offset specialization."""
     torch.manual_seed(12)
-    g = torch.randn(1, 1, 1, 1, device=DEV)
+    raw_gate = torch.randn(1, 1, 1, 32, device=DEV, dtype=torch.bfloat16)
     A_log = torch.randn(1, device=DEV)
-    o = torch.empty_like(g)
-    grid = lambda meta: (1, 1, triton.cdiv(1, meta["BS"]))
+    dt_bias = torch.randn(1, 32, device=DEV)
+    output = torch.empty_like(raw_gate, dtype=torch.float32)
+    synthetic_batch_stride = 1 << 31
 
     # B=2 makes the synthetic batch span exceed int32, while the one-program
     # grid accesses only batch zero and therefore remains within the tiny allocation.
@@ -714,438 +376,39 @@ def test_gate_fwd_int64_offsets():
             "B": 2,
             "T": 1,
             "H": 1,
-            "S": 1,
-            "S_in": 1,
-            "s_batch_stride": 1 << 31,
-            "o_batch_stride": 1 << 31,
-            "S_STRIDES": g.stride()[1:],
+            "D": 32,
+            "g_batch_stride": synthetic_batch_stride,
+            "o_batch_stride": synthetic_batch_stride,
+            "G_STRIDES": raw_gate.stride()[1:],
             "A_LOG_STRIDES": A_log.stride(),
-            "DT_BIAS_STRIDES": (0, 0),
-            "O_STRIDES": o.stride()[1:],
+            "DT_BIAS_STRIDES": dt_bias.stride(),
+            "O_STRIDES": output.stride()[1:],
         }
     )
-    kda_gate_chunk_cumsum_vector_kernel[grid](
-        g,
+    _bounded_gate_chunk_cumsum_dense_kernel[(1, 1, 1)](
+        raw_gate,
         A_log,
-        None,
-        o,
-        None,
-        None,
-        None,
-        None,
+        dt_bias,
+        output,
+        -3.25,
+        RCP_LN2,
         1,
-        None,
-        1 << 31,
-        1 << 31,
-        S_STRIDES=g.stride()[1:],
+        synthetic_batch_stride,
+        synthetic_batch_stride,
+        G_STRIDES=raw_gate.stride()[1:],
         A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=(0, 0),
-        O_STRIDES=o.stride()[1:],
+        DT_BIAS_STRIDES=dt_bias.stride(),
+        O_STRIDES=output.stride()[1:],
         B=2,
         H=1,
-        S=1,
-        S_in=1,
-        F_REPEAT=1,
+        D=32,
         BT=1,
-        REVERSE=False,
+        BD=32,
+        num_warps=2,
+        num_stages=3,
     )
-    ref = gate_fwd_ref(g, A_log, None, None, None, False, 1, None)
-    torch.testing.assert_close(o, ref)
-
-
-# gate backward (pointwise gate map only -- no cumsum)
-_GATE_BWD_CASES = (
-    [
-        (
-            torch.float32,
-            17,
-            lower_bound,
-            has_bias,
-            12 if lower_bound is None and has_bias else 16,
-            lower_bound is None and has_bias,
-        )
-        for lower_bound, has_bias in product((None, 0.5), (False, True))
-    ]
-    + [(torch.float32, T, None, False, 16, False) for T in GATE_TS if T != 17]
-    + [(dtype, 17, None, False, 16, False) for dtype in DTYPES[1:]]
-)
-
-
-@pytest.mark.parametrize(
-    "dtype,T,lower_bound,has_bias,D,strided",
-    _GATE_BWD_CASES,
-    ids=_case_id,
-)
-def test_gate_bwd(dtype, T, lower_bound, has_bias, D, strided):
-    torch.manual_seed(4)
-    H, BT = 2, 16
-    g64 = torch.randn(T, H, D, device=DEV, dtype=torch.float64)
-    A_log64 = torch.randn(H, device=DEV, dtype=torch.float64)
-    bias64 = torch.randn(H, D, device=DEV, dtype=torch.float64) if has_bias else None
-    dyg64 = torch.randn(T, H, D, device=DEV, dtype=torch.float64)
-
-    # gate_bwd math is applied per (T, H, D) row; add B=1 for the ref helper.
-    def as_bthd(x):
-        return None if x is None else x.unsqueeze(0)
-
-    gold_dg, gold_dA, gold_db = gate_bwd_ref(
-        as_bthd(g64), A_log64, bias64, as_bthd(dyg64), lower_bound
-    )
-
-    g = g64.to(dtype)
-    A_log = A_log64.to(torch.float32)
-    bias = bias64.to(dtype) if has_bias else None
-    dyg = dyg64.to(dtype)
-    if strided:
-        assert bias is not None
-        g, A_log, dyg = map(_strided_copy, (g, A_log, dyg))
-        bias = _strided_copy(bias)
-    ref_dg, ref_dA, ref_db = gate_bwd_ref(as_bthd(g), A_log, bias, as_bthd(dyg), lower_bound)
-
-    NT = triton.cdiv(T, BT)
-    BD = triton.next_power_of_2(D)
-    dg = _empty_strided_like(g) if strided else torch.empty_like(g)
-    dA_template = torch.zeros(NT, H, device=DEV, dtype=torch.float32)
-    dA = _strided_copy(dA_template) if strided else dA_template
-    kda_gate_bwd_kernel[(NT, H)](
-        g,
-        A_log,
-        bias,
-        dyg,
-        dg,
-        dA,
-        lower_bound,
-        T,
-        G_STRIDES=g.stride(),
-        A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=_optional_matrix_strides(bias),
-        DYG_STRIDES=dyg.stride(),
-        DG_STRIDES=dg.stride(),
-        DA_STRIDES=dA.stride(),
-        H=H,
-        D=D,
-        BT=BT,
-        BD=BD,
-    )
-
-    tag = f"T={T} D={D} lb={lower_bound} bias={has_bias} strided={strided}"
-    assert_golden(
-        dg, gold_dg.reshape(T, H, D), ref_dg.reshape(T, H, D), dtype, f"gate_bwd dg {tag}"
-    )
-    assert_golden(dA.sum(0), gold_dA, ref_dA, dtype, f"gate_bwd dA_log {tag}")
-    if has_bias:
-        assert_golden(dg.sum(0), gold_db, ref_db.reshape(H, D), dtype, f"gate_bwd dt_bias {tag}")
-
-
-# Plain chunk-local cumsum (scalar + vector), used by the reverse-cumsum adjoint.
-# Exercise every static branch combination once, every runtime boundary once,
-# and every dtype once instead of taking their full Cartesian product.
-_CUMSUM_CASES = (
-    [(torch.float32, 17, reverse, scale) for reverse, scale in product((False, True), (None, 2.0))]
-    + [(torch.float32, T, False, None) for T in GATE_TS if T != 17]
-    + [(dtype, 17, False, None) for dtype in DTYPES[1:]]
-)
-
-
-@pytest.mark.parametrize("dtype,T,reverse,scale", _CUMSUM_CASES, ids=_case_id)
-def test_cumsum_scalar(dtype, T, reverse, scale):
-    torch.manual_seed(5)
-    B, H, BT = 2, 2, 16
-    s64 = torch.randn(B, T, H, device=DEV, dtype=torch.float64)
-    golden = chunk_cumsum_ref(s64, BT, reverse, scale, None)
-    s = s64.to(dtype)
-    ref = chunk_cumsum_ref(s, BT, reverse, scale, None)
-
-    o = torch.empty_like(s)
-    NT = triton.cdiv(T, BT)
-    chunk_local_cumsum_scalar_kernel[(NT, B * H)](
-        s,
-        o,
-        scale,
-        None,
-        None,
-        T,
-        s.stride(0),
-        o.stride(0),
-        S_STRIDES=s.stride()[1:],
-        O_STRIDES=o.stride()[1:],
-        B=B,
-        H=H,
-        BT=BT,
-        REVERSE=reverse,
-    )
-    assert_golden(o, golden, ref, dtype, f"cumsum_scalar T={T} rev={reverse} scale={scale}")
-
-
-class _KernelRecorder:
-    def __init__(self, name, calls):
-        self.name = name
-        self.calls = calls
-
-    def __getitem__(self, grid):
-        def launch(*args, **kwargs):
-            self.calls.append((self.name, args, kwargs))
-
-        return launch
-
-
-def test_cumsum_vector_autotune_is_batch_invariant():
-    assert "B" not in _autotuner(chunk_local_cumsum_vector_kernel).keys
-
-
-def test_cumsum_scalar_dispatches_by_layout(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        cumsum_module,
-        "chunk_local_cumsum_scalar_kernel",
-        _KernelRecorder("scalar", calls),
-    )
-    monkeypatch.setattr(
-        cumsum_module,
-        "chunk_local_cumsum_vector_kernel",
-        _KernelRecorder("vector", calls),
-    )
-
-    token_major = torch.randn(2, 65, 96, device=DEV)
-    output = chunk_local_cumsum_scalar(token_major, chunk_size=64)
-    name, args, kwargs = calls.pop()
-    assert name == "vector"
-    assert args[0].shape == (2, 65, 1, 96)
-    assert args[0].data_ptr() == token_major.data_ptr()
-    assert args[1].data_ptr() == output.data_ptr()
-    assert kwargs["S_STRIDES"] == args[0].stride()[1:]
-    assert kwargs["H"] == 1
-    assert kwargs["S"] == 96
-
-    strided = _strided_copy(token_major)
-    chunk_local_cumsum_scalar(strided, chunk_size=64)
-    name, args, kwargs = calls.pop()
-    assert name == "vector"
-    assert args[0].data_ptr() == strided.data_ptr()
-    assert args[0].stride(-1) == 2
-    assert kwargs["S_STRIDES"] == args[0].stride()[1:]
-
-    head_first = token_major.transpose(1, 2).contiguous()
-    chunk_local_cumsum_scalar(head_first, chunk_size=64, head_first=True)
-    assert calls.pop()[0] == "scalar"
-
-    small = torch.randn(2, 65, 15, device=DEV)
-    chunk_local_cumsum_scalar(small, chunk_size=64)
-    assert calls.pop()[0] == "scalar"
-
-
-@pytest.mark.parametrize(("reverse", "scale"), ((False, None), (True, 1.25)))
-def test_cumsum_scalar_vector_view_fixed(reverse, scale):
-    torch.manual_seed(51)
-    B, T, H, BT = 3, 129, 96, 64
-    source = torch.randn(B, T, H, device=DEV)
-    expected = chunk_cumsum_ref(source, BT, reverse=reverse, scale=scale)
-
-    actual = chunk_local_cumsum_scalar(source, BT, reverse=reverse, scale=scale)
-    torch.testing.assert_close(actual, expected)
-
-    strided = _strided_copy(source)
-    strided_actual = chunk_local_cumsum_scalar(strided, BT, reverse=reverse, scale=scale)
-    torch.testing.assert_close(strided_actual, expected)
-
-    single = chunk_local_cumsum_scalar(source[1:2], BT, reverse=reverse, scale=scale)
-    torch.testing.assert_close(actual[1], single[0], rtol=0, atol=0)
-
-    head_first = source.transpose(1, 2).contiguous()
-    head_first_actual = chunk_local_cumsum_scalar(
-        head_first,
-        BT,
-        reverse=reverse,
-        scale=scale,
-        head_first=True,
-    )
-    torch.testing.assert_close(head_first_actual, expected.transpose(1, 2))
-
-
-@pytest.mark.parametrize("dtype,T,reverse,scale", _CUMSUM_CASES, ids=_case_id)
-def test_cumsum_vector(dtype, T, reverse, scale):
-    torch.manual_seed(6)
-    B, H, S, BT = 2, 2, 16, 16
-    s64 = torch.randn(B, T, H, S, device=DEV, dtype=torch.float64)
-    golden = chunk_cumsum_ref(s64, BT, reverse, scale, None)
-    s = s64.to(dtype)
-    ref = chunk_cumsum_ref(s, BT, reverse, scale, None)
-
-    o = torch.empty_like(s)
-    NT = triton.cdiv(T, BT)
-    grid = lambda meta: (triton.cdiv(S, meta["BS"]), NT, B * H)
-    chunk_local_cumsum_vector_kernel[grid](
-        s,
-        o,
-        scale,
-        None,
-        None,
-        T,
-        s.stride(0),
-        o.stride(0),
-        S_STRIDES=s.stride()[1:],
-        O_STRIDES=o.stride()[1:],
-        B=B,
-        H=H,
-        S=S,
-        BT=BT,
-        REVERSE=reverse,
-    )
-    assert_golden(o, golden, ref, dtype, f"cumsum_vector T={T} rev={reverse} scale={scale}")
-
-
-_CUMSUM_VARLEN_CASES = [
-    (torch.float32, docs, reverse) for docs, reverse in product(VARLEN_DOCS, (False, True))
-] + [(dtype, VARLEN_DOCS[2], False) for dtype in DTYPES[1:]]
-
-
-@pytest.mark.parametrize(
-    "dtype,docs,reverse",
-    _CUMSUM_VARLEN_CASES,
-    ids=_case_id,
-)
-def test_cumsum_vector_varlen(dtype, docs, reverse):
-    torch.manual_seed(7)
-    H, S, BT = 2, 16, 16
-    total = sum(docs)
-    cu = _cu_seqlens(docs)
-    chunk_indices = prepare_chunk_indices(cu, BT)
-    s64 = torch.randn(1, total, H, S, device=DEV, dtype=torch.float64)
-    golden = chunk_cumsum_ref(s64, BT, reverse, None, cu)
-    s = s64.to(dtype)
-    ref = chunk_cumsum_ref(s, BT, reverse, None, cu)
-
-    o = torch.empty_like(s)
-    NT = chunk_indices.shape[0]
-    grid = lambda meta: (triton.cdiv(S, meta["BS"]), NT, H)
-    chunk_local_cumsum_vector_kernel[grid](
-        s,
-        o,
-        None,
-        cu,
-        chunk_indices,
-        total,
-        s.stride(0),
-        o.stride(0),
-        S_STRIDES=s.stride()[1:],
-        O_STRIDES=o.stride()[1:],
-        B=1,
-        H=H,
-        S=S,
-        BT=BT,
-        REVERSE=reverse,
-    )
-    assert_golden(o, golden, ref, dtype, f"cumsum_vector_varlen docs={docs} rev={reverse}")
-
-
-def test_cumsum_varlen_head_first():
-    """Exercise packed documents stored physically as (B, H, T[, S])."""
-    torch.manual_seed(10)
-    dtype = torch.float32
-    docs = (7, 17)
-    total, H, S, BT = sum(docs), 2, 16, 16
-    cu = _cu_seqlens(docs)
-    chunk_indices = prepare_chunk_indices(cu, BT)
-    NT = chunk_indices.shape[0]
-
-    scalar64 = torch.randn(1, total, H, device=DEV, dtype=torch.float64)
-    scalar = scalar64.to(dtype).permute(0, 2, 1).contiguous().permute(0, 2, 1)
-    scalar_out = torch.empty(1, H, total, device=DEV, dtype=dtype).permute(0, 2, 1)
-    chunk_local_cumsum_scalar_kernel[(NT, H)](
-        scalar,
-        scalar_out,
-        None,
-        cu,
-        chunk_indices,
-        total,
-        scalar.stride(0),
-        scalar_out.stride(0),
-        S_STRIDES=scalar.stride()[1:],
-        O_STRIDES=scalar_out.stride()[1:],
-        B=1,
-        H=H,
-        BT=BT,
-        REVERSE=True,
-    )
-    scalar_golden = chunk_cumsum_ref(scalar64, BT, True, None, cu)
-    scalar_ref = chunk_cumsum_ref(scalar, BT, True, None, cu)
-    assert_golden(
-        scalar_out,
-        scalar_golden,
-        scalar_ref,
-        dtype,
-        "cumsum_scalar_varlen_head_first",
-    )
-
-    vector64 = torch.randn(1, total, H, S, device=DEV, dtype=torch.float64)
-    vector = vector64.to(dtype).permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-    vector_out = torch.empty(1, H, total, S, device=DEV, dtype=dtype).permute(0, 2, 1, 3)
-    grid = lambda meta: (triton.cdiv(S, meta["BS"]), NT, H)
-    chunk_local_cumsum_vector_kernel[grid](
-        vector,
-        vector_out,
-        None,
-        cu,
-        chunk_indices,
-        total,
-        vector.stride(0),
-        vector_out.stride(0),
-        S_STRIDES=vector.stride()[1:],
-        O_STRIDES=vector_out.stride()[1:],
-        B=1,
-        H=H,
-        S=S,
-        BT=BT,
-        REVERSE=True,
-    )
-    vector_golden = chunk_cumsum_ref(vector64, BT, True, None, cu)
-    vector_ref = chunk_cumsum_ref(vector, BT, True, None, cu)
-    assert_golden(
-        vector_out,
-        vector_golden,
-        vector_ref,
-        dtype,
-        "cumsum_vector_varlen_head_first",
-    )
-
-
-def test_cumsum_scalar_vector_view_varlen():
-    torch.manual_seed(52)
-    docs = (31, 65, 79)
-    H, BT = 96, 64
-    cu = _cu_seqlens(docs)
-    source = torch.randn(1, sum(docs), H, device=DEV)
-    expected = chunk_cumsum_ref(source, BT, reverse=True, scale=0.75, cu_seqlens=cu)
-
-    actual = chunk_local_cumsum_scalar(
-        source,
-        BT,
-        reverse=True,
-        scale=0.75,
-        cu_seqlens=cu,
-    )
-    torch.testing.assert_close(actual, expected)
-
-    head_first = source.transpose(1, 2).contiguous()
-    head_first_actual = chunk_local_cumsum_scalar(
-        head_first,
-        BT,
-        reverse=True,
-        scale=0.75,
-        cu_seqlens=cu,
-        head_first=True,
-    )
-    torch.testing.assert_close(head_first_actual, expected.transpose(1, 2))
-
-    start, end = docs[0], docs[0] + docs[1]
-    single = chunk_local_cumsum_scalar(
-        source[:, start:end],
-        BT,
-        reverse=True,
-        scale=0.75,
-        cu_seqlens=_cu_seqlens((docs[1],)),
-    )
-    torch.testing.assert_close(actual[:, start:end], single, rtol=0, atol=0)
+    expected = -3.25 * torch.sigmoid(A_log.exp().view(1, 1, 1, 1) * (raw_gate + dt_bias))
+    torch.testing.assert_close(output, expected * RCP_LN2)
 
 
 def _bwd_dav_ref(v, A, do, scale, chunk_size=64):
@@ -1203,9 +466,7 @@ def test_chunk_kda_bwd_dav(dtype, T, H):
         dv=dv,
         dA=dA,
         cu_seqlens=None,
-        chunk_indices=None,
         chunk_offsets=None,
-        num_chunks=None,
         scale=scale,
         T=T,
         H=H,
@@ -1278,9 +539,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         o=o,
         A=A,
         cu_seqlens=None,
-        chunk_indices=None,
         chunk_offsets=None,
-        num_chunks=None,
         scale=scale,
         T=T,
         q_stride_t=q.stride(1),
@@ -1403,7 +662,6 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
         ht,
         None,
         None,
-        None,
         T,
         H=H,
         K=K,
@@ -1415,64 +673,6 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     assert_golden(h, gh, rh, dtype, f"delta_h h {tag}")
     assert_golden(v_new, gvn, rvn, dtype, f"delta_h v_new {tag}")
     assert_golden(ht, ght, rht, dtype, f"delta_h ht {tag}")
-
-
-@pytest.mark.parametrize("use_h0", [False, True], ids=["no-state", "state"])
-def test_chunk_delta_h_fwd_forloop(use_h0):
-    """Cover the persistent-grid delta-h variant that walks multiple sequences per program."""
-    dtype, T = torch.bfloat16, 128
-    torch.manual_seed(12)
-    B, H, K, V = 2, 2, 128, 128
-    BV = 64
-    num_chunks = triton.cdiv(T, 64)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
-    w = torch.randn(B, T, H, K, device="cuda", dtype=dtype) * 0.1
-    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    # gk is the fused gate/cumsum output and is always fp32 (the kernel exp2s it directly).
-    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
-    # State (initial + final) is fp32 in production; h and v_new stay in the input dtype. See the
-    # note in test_chunk_delta_h_fwd.
-    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
-
-    gh, gvn, ght = _fwd_h_ref(
-        k.double(), w.double(), v.double(), gk.double(), h0.double() if use_h0 else None
-    )
-    rh, rvn, rht = _fwd_h_ref(k, w, v, gk, h0)
-
-    h = torch.empty(B * num_chunks, H, K, V, device="cuda", dtype=dtype)
-    v_new = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
-    ht = torch.empty(B, H, K, V, device="cuda", dtype=torch.float32)
-    # GRID_N=1 forces each program to walk all MAX_N=B sequences through the persistent loop.
-    grid_n = 1
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64_forloop[(grid_n * H, triton.cdiv(V, BV))](
-        k,
-        v,
-        w,
-        v_new,
-        None,
-        gk,
-        h,
-        h0,
-        ht,
-        None,
-        None,
-        None,
-        T,
-        H=H,
-        K=K,
-        V=V,
-        BT=64,
-        BV=BV,
-        USE_EXP2=True,
-        GRID_N=grid_n,
-        MAX_N=B,
-        num_warps=4,
-        num_stages=2,
-    )
-    tag = f"T={T} h0={use_h0}"
-    assert_golden(h, gh, rh, dtype, f"delta_h_forloop h {tag}")
-    assert_golden(v_new, gvn, rvn, dtype, f"delta_h_forloop v_new {tag}")
-    assert_golden(ht, ght, rht, dtype, f"delta_h_forloop ht {tag}")
 
 
 def _fwd_intra_ref(q, k, gk, beta, scale, chunk_size=64, BC=16, causal_normref=True):
@@ -1559,9 +759,7 @@ def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
         Akk=Akk,
         scale=scale,
         cu_seqlens=None,
-        chunk_indices=None,
         chunk_offsets=None,
-        num_chunks=None,
         T=T,
         q_stride_t=q.stride(1),
         q_stride_h=q.stride(2),
@@ -1630,18 +828,12 @@ def test_recompute_w_u_fwd_cute():
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
 
-    cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
-    metadata = ChunkMetadata(
-        cu,
-        prepare_chunk_indices(cu, 64).to(torch.int32),
-        torch.tensor(num_chunks, device="cuda", dtype=torch.int32),
-    )
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
         v=v,
         beta=beta,
         A=A,
-        metadata=metadata,
+        metadata=None,
         q=q,
         gk=gk,
         chunk_size=64,
@@ -1834,12 +1026,6 @@ def test_chunk_kda_fwd_intra_cute():
     gk = g_inc.view(B, num_chunks, 64, H, K).cumsum(2).view(B, T, H, K)
     beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
 
-    cu = torch.tensor([0, T], device="cuda", dtype=torch.int32)
-    metadata = ChunkMetadata(
-        cu,
-        prepare_chunk_indices(cu, 64).to(torch.int32),
-        torch.tensor(num_chunks, device="cuda", dtype=torch.int32),
-    )
     w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
         q,
         k,
@@ -1847,7 +1033,7 @@ def test_chunk_kda_fwd_intra_cute():
         gk,
         beta,
         scale,
-        metadata,
+        None,
         chunk_size=64,
     )
 
@@ -1867,17 +1053,18 @@ def test_chunk_kda_fwd_intra_cute():
     assert_golden(u, gU, rU, torch.bfloat16, f"fwd_intra_cute u {tag}")
 
 
-def _fixed_meta(num_chunks):
-    """Build single-document (cu_seqlens, chunk_indices, num_chunks) metadata for T=num_chunks*64.
-
-    The composed CuTe backward kernels compile a single-document work-list, so the leaf-kernel
-    tests exercise one packed document of complete 64-token chunks.
-    """
-    T = num_chunks * 64
-    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
-    chunk_indices = prepare_chunk_indices(cu, 64).to(torch.int32)
-    nc = torch.tensor([chunk_indices.shape[0]], dtype=torch.int32, device="cuda")
-    return cu, chunk_indices, nc
+def _dense_reference_routes(num_chunks):
+    """Build the mathematical reference's single-document chunk work list."""
+    tokens = num_chunks * 64
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    chunk_indices = torch.stack(
+        (
+            torch.zeros(num_chunks, dtype=torch.int32, device="cuda"),
+            torch.arange(num_chunks, dtype=torch.int32, device="cuda"),
+        ),
+        dim=1,
+    )
+    return cu_seqlens, chunk_indices
 
 
 def _perchunk_gate(cu, chunk_indices, T, H, K, gate_inc=0.5):
@@ -1909,23 +1096,13 @@ def _perchunk_unit_lower(cu, chunk_indices, T, H):
     return A.to(torch.bfloat16)
 
 
-def _default_worklist(T, chunk_size, device):
-    """Single-doc [0, T] fallback: cu_seqlens + one (seq_idx=0, chunk_idx) row per full chunk."""
-    n = T // chunk_size
-    cu = torch.tensor([0, T], device=device, dtype=torch.int32)
-    chunk_indices = torch.stack(
-        [torch.zeros(n, dtype=torch.long, device=device), torch.arange(n, device=device)], dim=1
-    )
-    return cu, chunk_indices
-
-
 @requires_cute
 def test_chunk_kda_bwd_intra_cute():
     num_chunks, H = 4, 4
     torch.manual_seed(3)
     B, K = 1, 128
     T = num_chunks * 64
-    cu, chunk_indices, nc = _fixed_meta(num_chunks)
+    cu, chunk_indices = _dense_reference_routes(num_chunks)
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
     k = torch.nn.functional.normalize(
         torch.randn(B, T, H, K, device="cuda", dtype=torch.float32), dim=-1
@@ -1949,7 +1126,7 @@ def test_chunk_kda_bwd_intra_cute():
         zq.clone(),
         zb.clone(),
         zq.clone(),
-        ChunkMetadata(cu, chunk_indices, nc),
+        None,
     )
 
     gdq, gdk, gdb, gdg = _bwd_intra_ref(
@@ -1981,7 +1158,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
     HV = H
     T = num_chunks * 64
     scale = K**-0.5
-    cu, chunk_indices, num_chunks_tensor = _fixed_meta(num_chunks)
+    cu, chunk_indices = _dense_reference_routes(num_chunks)
 
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.2
@@ -2010,7 +1187,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
         do,
         dh,
         dv,
-        ChunkMetadata(cu, chunk_indices, num_chunks_tensor),
+        None,
         chunk_size=64,
     )
 

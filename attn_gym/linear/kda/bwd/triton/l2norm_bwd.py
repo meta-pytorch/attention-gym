@@ -25,55 +25,7 @@ import triton.language as tl
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
-_WARPS = [1, 2, 4, 8, 16, 32]
 _BT_LIST = [8, 16, 32, 64, 128]
-
-
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in _WARPS],
-    key=["D"],
-    **autotune_cache_kwargs,
-)
-@triton.jit
-def l2norm_bwd_kernel1(
-    y,
-    rstd,
-    dy,
-    dx,
-    D,
-    Y_STRIDES: tl.constexpr,
-    RSTD_STRIDES: tl.constexpr,
-    DY_STRIDES: tl.constexpr,
-    DX_STRIDES: tl.constexpr,
-    TOKENS: tl.constexpr,
-    HEADS: tl.constexpr,
-    BD: tl.constexpr,
-):
-    # One program per row; the entire feature vector fits in a single [BD] tile.
-    i_row = tl.program_id(0).to(tl.int64)
-    i_bt = i_row // HEADS
-    o_d = tl.arange(0, BD).to(tl.int64)
-    mask = o_d < D
-
-    b_y = tl.load(y + ptr_offset((i_row, o_d), Y_STRIDES), mask=mask, other=0.0).to(tl.float32)
-    b_dy = tl.load(
-        dy
-        + ptr_offset(
-            (i_bt // TOKENS, i_bt % TOKENS, i_row % HEADS, o_d),
-            DY_STRIDES,
-        ),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    b_rstd = tl.load(rstd + ptr_offset((i_row,), RSTD_STRIDES)).to(tl.float32)
-
-    b_dot = tl.sum(b_dy * b_y)
-    b_dx = b_rstd * (b_dy - b_y * b_dot)
-    tl.store(
-        dx + ptr_offset((i_row, o_d), DX_STRIDES),
-        b_dx.to(dx.dtype.element_ty),
-        mask=mask,
-    )
 
 
 @triton.autotune(

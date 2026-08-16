@@ -40,28 +40,18 @@ def blackwell_delta_h_bwd_dhu_dispatch(
     h0: torch.Tensor | None = None,
     dht: torch.Tensor | None = None,
     scale: float = 1.0,
-    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     dv2_out: torch.Tensor | None = None,
-    chunk_offsets: torch.Tensor | None = None,
-    num_seqs: torch.Tensor | int | None = None,
-    num_chunks: int | None = None,
     metadata: RaggedChunkMetadata | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    BlackwellDeltaHBwd backward dhu — auto-dispatches BV=16 or BV=32.
-
-    Returns (dh, dh0, dv2).
-    """
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Run dense or metadata-routed delta-H backward with automatic BV selection."""
     batch, _tokens, heads, _head_dim = q.shape
     value_dim = do.shape[-1]
-    logical_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    if metadata is not None:
-        logical_batch = metadata.cu_seqlens.shape[0] - 1
+    # Empty ranges remain real state slots, so keep BV selection shape-stable across replay.
+    logical_batch = batch if metadata is None else metadata.cu_seqlens.shape[0] - 1
 
     w_tiles_bv16 = ceildiv(value_dim, 16) * heads * logical_batch
     sm_count = get_device_properties(q.device).multi_processor_count
-
     bv = 32 if w_tiles_bv16 > sm_count else 16
 
     return blackwell_delta_h_bwd_dhu_v1(
@@ -74,12 +64,8 @@ def blackwell_delta_h_bwd_dhu_dispatch(
         h0=h0,
         dht=dht,
         scale=scale,
-        cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         dv2_out=dv2_out,
-        chunk_offsets=chunk_offsets,
-        num_seqs=num_seqs,
         bv=bv,
-        NT=num_chunks,
         metadata=metadata,
     )

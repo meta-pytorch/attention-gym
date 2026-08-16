@@ -37,7 +37,7 @@ class RaggedChunkMetadata(NamedTuple):
             boundary distribution with the same token and sequence tensor shapes.
             CUDA Graph capture fixes launch and allocation shapes, so kernels use
             this capacity while reading the actual active count from
-            ``chunk_offsets[-1]`` on the device. Capacity-only CTAs return before
+            ``chunk_offsets[-1]`` on the device. Capacity-only CTAs finish without
             accessing token data.
         chunk_size: Logical chunk size used to construct ``chunk_offsets``. Keeping
             it with the offsets prevents consumers from decoding them under a
