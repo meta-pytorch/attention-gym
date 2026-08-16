@@ -231,11 +231,14 @@ def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
         output = model(states, cu_seqlens=offsets).hidden_states
         return output, torch.autograd.grad(output, (states, *parameters), grad_output)
 
-    run(hidden, cu_seqlens, cotangent)
-    torch.cuda.synchronize()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        run(hidden, cu_seqlens, cotangent)
+    capture_stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=capture_stream):
         captured_output, captured_gradients = run(hidden, cu_seqlens, cotangent)
 
     active_tokens = replayed_offsets[-1]
@@ -251,11 +254,13 @@ def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_output, expected_gradients = run(
-        hidden[:, :active_tokens].detach().clone().requires_grad_(),
-        active_offsets,
-        cotangent[:, :active_tokens],
-    )
+    with torch.cuda.stream(capture_stream):
+        expected_output, expected_gradients = run(
+            hidden[:, :active_tokens].detach().clone().requires_grad_(),
+            active_offsets,
+            cotangent[:, :active_tokens],
+        )
+    capture_stream.synchronize()
     torch.testing.assert_close(
         captured_output[:, :active_tokens], expected_output, rtol=3e-2, atol=3e-2
     )

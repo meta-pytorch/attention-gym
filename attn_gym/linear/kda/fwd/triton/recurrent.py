@@ -19,9 +19,11 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym.linear.kda.validation import validate_kda_inputs
-
-_MAX_KEY_DIM = 256
+from attn_gym.linear.kda.ops import recurrent_forward as forward
+from attn_gym.linear.kda.ops import (
+    recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
+)
+from attn_gym.linear.kda.ops import recurrent_fwd_op as _recurrent_fwd_op
 
 
 @triton.jit
@@ -141,14 +143,6 @@ def _launch_recurrent_fwd(
     return output, final_state
 
 
-_RECURRENT_FWD_ARGS = (
-    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
-    " Tensor? initial_state, Tensor? cu_seqlens)"
-)
-torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
-torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
-
-
 def _kda_recurrent_fwd_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -179,123 +173,4 @@ def _kda_recurrent_fwd_no_state_cuda(
     )[0]
 
 
-torch.library.impl("attn_gym::kda_recurrent_fwd", "CUDA", _kda_recurrent_fwd_cuda)
-torch.library.impl(
-    "attn_gym::kda_recurrent_fwd_no_state", "CUDA", _kda_recurrent_fwd_no_state_cuda
-)
-
-
-@torch.library.register_fake("attn_gym::kda_recurrent_fwd")
-def _kda_recurrent_fwd_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del gate, beta, initial_state
-    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    final_state = q.new_empty(
-        num_sequences, q.shape[2], q.shape[3], v.shape[-1], dtype=torch.float32
-    )
-    return torch.empty_like(v, dtype=q.dtype), final_state
-
-
-@torch.library.register_fake("attn_gym::kda_recurrent_fwd_no_state")
-def _kda_recurrent_fwd_no_state_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-) -> torch.Tensor:
-    del gate, beta, initial_state, cu_seqlens
-    return torch.empty_like(v, dtype=q.dtype)
-
-
-_recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
-_recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
-
-
-def _validate_recurrent_kda_inputs(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-) -> None:
-    """Validate the shared contract plus the fused scan's own constraints."""
-    validate_kda_inputs(
-        q, k, v, gate, beta, initial_state, cu_seqlens, op_name="recurrent_kda", gate_name="gate"
-    )
-    if q.shape[-1] > _MAX_KEY_DIM:
-        raise ValueError(f"recurrent_kda requires K in [1, {_MAX_KEY_DIM}], got {q.shape[-1]}")
-    if not q.is_cuda:
-        raise ValueError("recurrent_kda requires CUDA tensors")
-    data_tensors = (q, k, v, gate, beta)
-    if initial_state is not None:
-        data_tensors += (initial_state,)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
-        raise RuntimeError(
-            "recurrent_kda is inference-only and has no backward; use chunk_kda for "
-            "training or call under torch.no_grad() / torch.inference_mode()"
-        )
-
-
-def recurrent_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None = None,
-    *,
-    cu_seqlens: torch.Tensor | None = None,
-    output_final_state: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Apply the fused O(T) KDA delta rule for decode and inference prefill.
-
-    Args:
-        q: Queries with shape ``[B, T, H, K]``; scaled by ``1/sqrt(K)`` internally.
-        k: Keys with the same shape as ``q``.
-        v: Values with shape ``[B, T, H, V]``.
-        gate: Per-token log2 decay with the same shape as ``q``, as produced by
-            ``bounded_gate_cumsum(chunk_size=1)`` — not the chunk-local
-            cumulative gate that ``chunk_kda`` consumes.
-        beta: Per-token write gate with shape ``[B, T, H]``.
-        initial_state: Optional recurrent state with one ``[H, K, V]`` entry per
-            logical sequence.
-        cu_seqlens: Optional device-resident int32 offsets selecting packed
-            ``[1, T, H, D]`` execution. Repeated offsets are empty padding slots
-            whose state passes through unchanged, and the terminal offset may sit
-            below the physical token capacity; values past it are outside the
-            operation's contract, so fixed-shape CUDA graphs can replay with
-            different boundaries and active lengths.
-        output_final_state: Also return the final recurrent state. When false,
-            the state is neither allocated nor written.
-
-    Returns:
-        The output in ``q.dtype`` and, when requested, the FP32 recurrent state.
-
-    The scan computes in FP32 regardless of input dtype. The fused scan is
-    inference-only: when autograd is enabled, calls whose data inputs require
-    gradients are rejected instead of silently detaching.
-    """
-    _validate_recurrent_kda_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
-    # The kernel loads every operand through an FP32 register cast, so only the
-    # layout needs normalizing here; recurrent states are always produced in FP32.
-    q, k, v, gate, beta = (tensor.contiguous() for tensor in (q, k, v, gate, beta))
-    if initial_state is not None:
-        initial_state = initial_state.contiguous()
-    if output_final_state:
-        return _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens)
-    return _recurrent_fwd_no_state_op(q, k, v, gate, beta, initial_state, cu_seqlens), None
-
-
-__all__ = ["recurrent_kda"]
+__all__ = ["_recurrent_fwd_no_state_op", "_recurrent_fwd_op", "forward"]

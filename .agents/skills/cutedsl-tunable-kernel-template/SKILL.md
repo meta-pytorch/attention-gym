@@ -24,6 +24,7 @@ Keep each value in one domain:
 | Real `torch.Tensor` inputs and outputs | Parent process and public wrapper |
 | Cohesive runtime tensor/output bundle | One parent-only `NamedTuple` or dataclass when the flat argument list grows |
 | Candidate generation from shapes/dtypes/device facts | `configs(*runtime_args)` in the parent |
+| Benchmark-winner reuse identity | Host-static `tuning_key(*runtime_args, target=...)` result |
 | Static, pickleable specialization values | Config record and `compile_call(...)` result |
 | Fake CuTe tensors matching the runtime ABI | Cached `compile(...)` method |
 | Fake environment stream and typed TVM-FFI option | `compile_tvm_ffi(...)` |
@@ -56,13 +57,15 @@ integer utilities such as `ceildiv` directly instead of wrapping one arithmetic 
 ```python
 from typing import NamedTuple
 
+from attn_gym._backends.cute.target import CompileTarget
+
 
 class MyConfig(NamedTuple):
     threads: int
     tile_size: int
 ```
 
-A tunable adapter supplies five distinct responsibilities. When its launch ABI has several values,
+A tunable adapter supplies seven distinct responsibilities. When its launch ABI has several values,
 make that ABI an `Args` type owned by the adapter rather than a separate module-level private type:
 
 ```python
@@ -73,7 +76,15 @@ class MyOp:
         output: torch.Tensor
         workspace: torch.Tensor
 
-    default_config = MyConfig(threads=128, tile_size=256)
+    @staticmethod
+    def default_config(args: Args, *, target: CompileTarget) -> MyConfig:
+        """Return a deterministic valid config without benchmarking."""
+        return MyConfig(threads=128, tile_size=256)
+
+    @staticmethod
+    def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
+        """Identify workloads that may safely reuse one benchmark winner."""
+        return (args.q.shape[1],)
 
     @staticmethod
     def configs(args: Args) -> tuple[MyConfig, ...]:
@@ -99,14 +110,19 @@ class MyOp:
 
 Keep these responsibilities distinct, but they need not all live on the CuTeDSL op class. A
 constructor-heavy DSL op may stay focused on layouts and device code while a small adapter owns the
-five static/class methods above.
+seven static/class methods above.
 
-- `default_config` is a conservative fallback and must be valid for every runtime input accepted by
-  the adapter. If the normal choice depends on inputs or target metadata, keep that selection method
-  on the adapter (for example, `default_for(...)`), call it from the parent wrapper, and pass its
-  result as `config=`. Do not leave an adapter-specific default heuristic as an unrelated module-level
-  helper. Name canonical mode configs after the mode rather than calling an architecture-specific
-  config the default.
+- `default_config(*runtime_args, target=...)` owns deterministic no-tune selection. It may inspect
+  tensor metadata, static operation arguments, and target facts, and must return a valid config for
+  every input accepted by the adapter without benchmarking or reading device-resident tensor values.
+  Keep this policy on the adapter rather than selecting a default in the parent wrapper. A constant
+  fallback simply ignores its arguments. Name canonical mode configs after the mode rather than
+  calling an architecture-specific config the default.
+- `tuning_key(*runtime_args, target=...)` defines when an autotuned winner may be reused. Return
+  host-visible tensor metadata and target facts only; never read device values or synchronize, because
+  the key must remain valid during CUDA Graph replay. Use `()` when `compile_call(...)` already
+  distinguishes every relevant workload. Exact keys are the safe starting point; introduce buckets
+  only after measurements establish stable winner regions.
 - `configs(...)` may inspect runtime shape, stride, dtype, alignment, or device facts.
 - `compile(...)` owns fake tensors and the cached artifact boundary.
 - `compile_call(...)` prevents runtime tensors from leaking into cache keys or subprocess payloads.

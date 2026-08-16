@@ -38,6 +38,7 @@ def chunk_kda_fwd_intra(
     metadata: RaggedChunkMetadata | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
+    autotune: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -107,6 +108,7 @@ def chunk_kda_fwd_intra(
         else nullcontext()
     ):
         w, u, _qg, kg = recompute_w_u_fwd(
+            autotune=autotune,
             k=k,
             v=v,
             beta=beta,

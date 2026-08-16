@@ -1510,6 +1510,7 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     chunk_size: int = BT,
     dot_precision: str | MmaPrecision = "bf16",
+    autotune: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1543,6 +1544,7 @@ def recompute_w_u_fwd(
         gk=gk,
         chunk_size=chunk_size,
         dot_precision=precision.value,
+        autotune=autotune,
     )
 
 

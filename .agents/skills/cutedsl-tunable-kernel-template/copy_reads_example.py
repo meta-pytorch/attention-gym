@@ -19,6 +19,7 @@ from cutlass import cute
 
 from attn_gym._backends.cute import benchmark_gpu, compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.cache import get_cache_path
+from attn_gym._backends.cute.target import CompileTarget
 
 # A 256 MiB source keeps the fixed-buffer benchmark larger than modern GPU L2 caches.
 NUM_ELEMENTS = 1 << 26
@@ -32,7 +33,30 @@ class ReadConfig(NamedTuple):
 class CopyReadsTunable:
     """Compile, tune, and launch the copy kernel."""
 
-    default_config = ReadConfig(128, 4)
+    @staticmethod
+    def default_config(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        *,
+        target: CompileTarget,
+    ) -> ReadConfig:
+        """Return the deterministic no-tune schedule for this input."""
+        del source, destination, target
+        return ReadConfig(128, 4)
+
+    @staticmethod
+    def tuning_key(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        *,
+        target: CompileTarget,
+    ) -> tuple[int]:
+        """Key winners by the runtime extent that changes launch work."""
+        if target.device_type != "cuda":
+            raise RuntimeError("copy_reads tuning requires a CUDA target")
+        if destination.numel() != source.numel():
+            raise ValueError("source and destination must have the same size")
+        return (source.numel(),)
 
     @staticmethod
     def configs(source: torch.Tensor, destination: torch.Tensor) -> tuple[ReadConfig, ...]:
@@ -163,7 +187,7 @@ def copy_reads(
 ) -> torch.Tensor:
     """Copy a real PyTorch tensor using a selected or freshly tuned kernel.
 
-    ``copy_reads(source)`` uses the op's ``default_config``. Pass ``config=...`` to
+    ``copy_reads(source)`` uses the op's input-aware ``default_config``. Pass ``config=...`` to
     force one specialization. ``tune=True`` asks the op to generate candidates
     from the runtime inputs; passing ``configs=...`` overrides those candidates.
     """

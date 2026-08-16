@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
 
@@ -395,6 +395,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
 
 
+_PINNED_FWD_H = PinnedConfigKernel(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
+
+
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -405,6 +408,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk KDA state recurrence."""
     batch, tokens, heads, key_dim = k.shape
@@ -451,7 +455,8 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (state_batch * heads, triton.cdiv(value_dim, meta["BV"]))
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64 if autotune else _PINNED_FWD_H
+    kernel[grid](
         k=k,
         v=u,
         w=w,

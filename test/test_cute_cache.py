@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import multiprocessing
 import os
 import struct
@@ -299,10 +300,19 @@ def test_run_tunable_uses_kernel_convention(isolated_cache):
     )
     compile_count = 0
     config_requests = []
+    default_requests = []
     launches = []
 
     class ToyKernel:
-        default_config = candidates[0]
+        @staticmethod
+        def default_config(prefix: str, _launch_log, *, target):
+            default_requests.append((prefix, target))
+            return candidates[0]
+
+        @staticmethod
+        def tuning_key(prefix: str, _launch_log, *, target):
+            assert prefix == "toy" and isinstance(target, cute_target.CompileTarget)
+            return ()
 
         @staticmethod
         def configs(prefix: str, _launch_log):
@@ -344,15 +354,18 @@ def test_run_tunable_uses_kernel_convention(isolated_cache):
     assert result == best.timing
     assert launches == [config.variant for config in candidates] + [best.variant]
     assert config_requests == ["toy"]
+    assert default_requests == []
     assert compile_count == len(candidates)
     assert len(list(isolated_cache.rglob("*.o"))) == len(candidates)
 
     launches.clear()
     result, selected = run_tunable(ToyKernel, "toy", launches)
-    assert selected is ToyKernel.default_config
+    assert selected is candidates[0]
     assert result == selected.timing
     assert launches == [selected.variant]
     assert config_requests == ["toy"]
+    assert len(default_requests) == 1
+    assert default_requests[0][0] == "toy"
     assert compile_count == len(candidates)
 
     launches.clear()
@@ -391,6 +404,137 @@ def test_run_tunable_uses_kernel_convention(isolated_cache):
         run_tunable(InvalidCompileCall, "toy", launches)
 
 
+def test_run_tunable_custom_benchmark_bypasses_cached_winner(isolated_cache, monkeypatch):
+    """Always execute an explicitly requested timing policy."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    candidates = (CompileConfig("slow", 3.0), CompileConfig("fast", 1.0))
+
+    class ToyKernel:
+        @staticmethod
+        def default_config(*, target):
+            assert target.device_type == "test"
+            return candidates[0]
+
+        @staticmethod
+        def tuning_key(*, target):
+            assert target.device_type == "test"
+            return ()
+
+        @staticmethod
+        def configs():
+            return candidates
+
+        @staticmethod
+        @cute_cache.jit_cache
+        def compile(config: CompileConfig) -> FakeCompiled:
+            return FakeCompiled(config.variant)
+
+        @staticmethod
+        def compile_call(config: CompileConfig):
+            return (config,)
+
+        @staticmethod
+        def launch(compiled: FakeCompiled, config: CompileConfig) -> float:
+            assert compiled() == config.variant
+            return config.timing
+
+    target = cute_target.CompileTarget("test")
+    monkeypatch.setattr(tune_module, "benchmark_gpu", measure_return_value)
+    _, cached = run_tunable(ToyKernel, autotune=True, parallel_compile=False, target=target)
+    assert cached is candidates[1]
+
+    benchmarked = []
+
+    def reverse_policy(fn) -> float:
+        timing = float(fn())
+        benchmarked.append(timing)
+        return -timing
+
+    _, selected = run_tunable(
+        ToyKernel,
+        autotune=True,
+        benchmark=reverse_policy,
+        parallel_compile=False,
+        target=target,
+    )
+    assert selected is candidates[0]
+    assert benchmarked == [config.timing for config in candidates]
+
+
+def test_run_tunable_keys_winners_by_runtime_workload(isolated_cache, monkeypatch):
+    """Separate winner decisions without recompiling shape-polymorphic binaries."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    candidates = (CompileConfig("small", 0.0), CompileConfig("large", 0.0))
+    compile_count = 0
+    measurements = []
+
+    class WorkloadAwareKernel:
+        @staticmethod
+        def default_config(_work_units: int, *, target):
+            assert target.device_type == "test"
+            return candidates[0]
+
+        @staticmethod
+        def tuning_key(work_units: int, *, target):
+            assert target.device_type == "test"
+            return (work_units,)
+
+        @staticmethod
+        def configs(_work_units: int):
+            return candidates
+
+        @staticmethod
+        @cute_cache.jit_cache
+        def compile(config: CompileConfig) -> FakeCompiled:
+            nonlocal compile_count
+            compile_count += 1
+            return FakeCompiled(config.variant)
+
+        @staticmethod
+        def compile_call(config: CompileConfig, _work_units: int):
+            return (config,)
+
+        @staticmethod
+        def launch(compiled: FakeCompiled, config: CompileConfig, work_units: int) -> float:
+            assert compiled() == config.variant
+            expected = "small" if work_units == 1 else "large"
+            return 1.0 if config.variant == expected else 2.0
+
+    def measure(fn) -> float:
+        timing = float(fn())
+        measurements.append(timing)
+        return timing
+
+    target = cute_target.CompileTarget("test")
+    monkeypatch.setattr(tune_module, "benchmark_gpu", measure)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+
+    _, small = run_tunable(
+        WorkloadAwareKernel, 1, autotune=True, parallel_compile=False, target=target
+    )
+    _, large = run_tunable(
+        WorkloadAwareKernel, 2, autotune=True, parallel_compile=False, target=target
+    )
+    assert small is candidates[0]
+    assert large is candidates[1]
+    assert measurements == [1.0, 2.0, 2.0, 1.0]
+    assert compile_count == len(candidates)
+    assert len(list(isolated_cache.rglob("*.o"))) == len(candidates)
+
+    run_tunable(WorkloadAwareKernel, 1, autotune=True, parallel_compile=False, target=target)
+    assert measurements == [1.0, 2.0, 2.0, 1.0]
+
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    _, persisted = run_tunable(
+        WorkloadAwareKernel, 2, autotune=True, parallel_compile=False, target=target
+    )
+    assert persisted == candidates[1]
+    assert measurements == [1.0, 2.0, 2.0, 1.0]
+    assert compile_count == len(candidates)
+
+
 def test_run_tunable_sets_target_before_candidate_generation(isolated_cache):
     """Generate target-aware candidates from the explicitly requested device."""
     config = CompileConfig("target-aware", 1.0)
@@ -398,7 +542,15 @@ def test_run_tunable_sets_target_before_candidate_generation(isolated_cache):
     observed_targets = []
 
     class TargetAwareKernel:
-        default_config = config
+        @staticmethod
+        def default_config(*, target):
+            observed_targets.append(target)
+            return config
+
+        @staticmethod
+        def tuning_key(*, target):
+            observed_targets.append(target)
+            return ()
 
         @staticmethod
         def configs():
@@ -708,6 +860,36 @@ def test_persistent_cache_can_be_disabled_with_an_option(tmp_path, monkeypatch):
     assert not list(cache_directory.rglob("*.o"))
 
 
+def test_bad_fork_check_precedes_cached_target_lookup(monkeypatch):
+    """Reject a child that inherited a target cached by its parent."""
+    import torch
+
+    class Properties:
+        major = 10
+        minor = 0
+        name = "test-gpu"
+        multi_processor_count = 100
+
+    bad_fork = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: Properties())
+    monkeypatch.setattr(torch.cuda, "_is_in_bad_fork", lambda: bad_fork, raising=False)
+    cute_target._query_compile_target.cache_clear()
+    try:
+        assert cute_target.detect_compile_target() == cute_target.CompileTarget(
+            device_type="cuda",
+            capability=(10, 0),
+            name="test-gpu",
+            sm_count=100,
+        )
+        bad_fork = True
+        with pytest.raises(RuntimeError, match="forked CUDA child"):
+            cute_target.detect_compile_target()
+    finally:
+        cute_target._query_compile_target.cache_clear()
+
+
 def test_explicit_target_avoids_device_discovery(monkeypatch):
     target = cute_target.CompileTarget(
         device_type="cuda",
@@ -872,3 +1054,72 @@ def test_parallel_population_then_sequential_reload(isolated_cache, process_coun
         misses=0,
         currsize=process_count,
     )
+
+
+def test_run_tunable_winner_cache_round_trip(tmp_path, monkeypatch):
+    """Winners persist across processes-worth of state and reject stale candidates."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+
+    key = "0" * 64
+    tune_module._store_winner(key, {"grid": 4})
+    assert tune_module._load_winner(key) == {"grid": 4}
+
+    # A fresh process sees only the disk copy.
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    assert tune_module._load_winner(key) == {"grid": 4}
+
+    # Corrupt and truncated payloads degrade to re-tuning rather than failing.
+    for payload in (b"not a pickle", b"", b"\x80\x04"):
+        monkeypatch.setattr(tune_module, "_WINNERS", {})
+        tune_module._winner_path(key).write_bytes(payload)
+        assert tune_module._load_winner(key) is None
+
+
+def test_winner_cache_honors_cutedsl_no_cache(tmp_path, monkeypatch):
+    """Keep local memoization while disabling winner-file reads and writes."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+
+    key = "1" * 64
+    tune_module._store_winner(key, "disk-winner")
+    path = tune_module._winner_path(key)
+    disk_payload = path.read_bytes()
+
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    assert tune_module._load_winner(key) is None
+
+    tune_module._store_winner(key, "memory-winner")
+    assert tune_module._load_winner(key) == "memory-winner"
+    assert path.read_bytes() == disk_payload
+
+
+def test_winner_key_tracks_candidates_and_namespace():
+    """Changing the candidate set or kernel namespace re-tunes."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+
+    class Kernel:
+        @staticmethod
+        def compile_call(config, capacity):
+            return (config, capacity)
+
+    class _FakeCompile:
+        @staticmethod
+        def cache_namespace():
+            return _FakeCompile.namespace
+
+        namespace = "namespace-a"
+
+    Kernel.compile = _FakeCompile
+    base = tune_module._winner_key(Kernel, [1, 2], (64,), ())
+    assert tune_module._winner_key(Kernel, [1, 2], (64,), ()) == base
+    assert tune_module._winner_key(Kernel, [1, 2, 3], (64,), ()) != base
+    assert tune_module._winner_key(Kernel, [1, 2], (128,), ()) != base
+    assert tune_module._winner_key(Kernel, [1, 2], (64,), ("other",)) != base
+    _FakeCompile.namespace = "namespace-b"
+    assert tune_module._winner_key(Kernel, [1, 2], (64,), ()) != base

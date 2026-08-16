@@ -333,6 +333,43 @@ Use the least opaque integration that provides the required compiler behavior:
    compilation, caching, or validation machinery, but the variant backend owns its operator schema,
    fake implementation, mutation declaration, autograd registration, and output/state metadata.
 
+#### Register contracts without importing optional backends
+
+When a public operation supports both a torch-only reference and an optional fused backend, put its
+private operator contracts in a small torch-only module:
+
+```text
+<variant>/
+  api.py                  # Imports ops.py, validates semantics, lazily selects a backend
+  ops.py                  # Schemas, fake kernels, dispatch registration, torch.ops handles
+  impl/reference.py       # Torch-only eager oracle
+  impl/triton.py          # Optional kernels and launchers
+  impl/cute.py            # Optional kernels and launchers
+```
+
+`ops.py` must not import Triton, CuTeDSL, or another optional implementation at module import time.
+Its device dispatch functions may import the selected launcher locally when the dispatcher executes
+the operator. This establishes schemas and fake implementations before Dynamo starts tracing while
+keeping reference imports usable with only PyTorch installed:
+
+```text
+import public API
+  register schemas, fake kernels, and lazy device dispatch
+
+call reference
+  run ordinary PyTorch without importing an optional backend
+
+call fused
+  trace an already-registered operator
+  import the optional launcher only when its device implementation executes
+```
+
+Do not register schemas, fake kernels, or device implementations as a side effect of a fused
+backend's first public call. A first-ever `torch.compile(..., fullgraph=True)` invocation must not
+depend on tracing-time registration. Test both boundaries in fresh processes: block optional
+backend imports and run the reference path on CPU, then make strict compilation the first fused
+operation in a backend-enabled process.
+
 Every custom operator used by an optimized backend must provide the compiler metadata required by
 its supported contract, including a fake implementation for shape and dtype propagation. Training
 backends must define an autograd formula or clearly reject gradient-requiring inputs. Mutation and

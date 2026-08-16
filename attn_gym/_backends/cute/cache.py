@@ -442,6 +442,11 @@ def jit_cache(
         with state_lock:
             return CacheInfo(hits=hits, misses=misses, currsize=len(memory_cache))
 
+    def cache_namespace() -> str:
+        """Identify the source/target namespace that owns this function's artifacts."""
+        return _source_fingerprint(fn, source_paths)
+
+    wrapper.cache_namespace = cache_namespace  # type: ignore[attr-defined]
     wrapper.precompile = precompile  # type: ignore[attr-defined]
     wrapper.is_cached = is_cached  # type: ignore[attr-defined]
     wrapper.disk_cache_enabled = disk_cache_enabled  # type: ignore[attr-defined]

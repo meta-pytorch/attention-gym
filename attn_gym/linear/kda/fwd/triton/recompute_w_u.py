@@ -36,7 +36,7 @@ import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 
@@ -206,6 +206,9 @@ def recompute_w_u_fwd_kernel(
         )
 
 
+_PINNED_W_U = PinnedConfigKernel(recompute_w_u_fwd_kernel)
+
+
 def recompute_w_u_fwd_triton(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -217,6 +220,7 @@ def recompute_w_u_fwd_triton(
     *,
     chunk_size: int = 64,
     dot_precision: str = "bf16",
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch the register-operand recompute for packed B=1 inputs."""
     batch, tokens, key_heads, key_dim = k.shape
@@ -285,7 +289,8 @@ def recompute_w_u_fwd_triton(
         return w, u, qg, kg
     chunks = metadata.capacity if metadata is not None else tokens // chunk_size
     if chunks:
-        recompute_w_u_fwd_kernel[(chunks, value_heads)](
+        kernel = recompute_w_u_fwd_kernel if autotune else _PINNED_W_U
+        kernel[(chunks, value_heads)](
             q=q if has_q else None,
             k=k,
             qg=qg,

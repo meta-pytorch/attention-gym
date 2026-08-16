@@ -10,11 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear import naive_chunk_kda_from_cumulative
-from attn_gym.linear.kda.naive import chunk_cumsum_ref
+from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda_from_cumulative
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd as _chunk_kda_bwd_module
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     ChunkKdaBwdIntraConfig,
@@ -25,7 +25,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.fwd.cute import chunk_kda
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,
@@ -337,21 +336,21 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
     monkeypatch, batch, tokens, explicit_offsets, expected_route
 ):
     """Keep complete single sequences on the direct launcher without a mode object."""
-    module = importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd")
+    module = importlib.import_module("attn_gym.linear.kda.impl.fused")
     routes = []
 
-    def dense_forward(q, _k, v, _gate, _beta, _state):
+    def dense_forward(q, _k, v, _gate, _beta, _state, _tune):
         routes.append("dense")
         tape = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), tape, tape
 
-    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets):
+    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _tune):
         routes.append("ragged")
         tape = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), tape, tape
 
-    monkeypatch.setattr(module, "_chunk_kda_fwd_op", dense_forward)
-    monkeypatch.setattr(module, "_chunk_kda_fwd_ragged_op", ragged_forward)
+    monkeypatch.setattr(module, "chunk_fwd_op", dense_forward)
+    monkeypatch.setattr(module, "chunk_fwd_ragged_op", ragged_forward)
     inputs = tuple(tensor.detach() for tensor in _inputs(batch=batch, tokens=tokens))
     cu_seqlens = (
         None
@@ -562,8 +561,8 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
     launches = (
         kernel,
         *(functools.partial(kernel, config=config) for config in candidates),
-        functools.partial(kernel, tune=True),
-        functools.partial(kernel, tune=True, configs=candidates),
+        functools.partial(kernel, autotune=True),
+        functools.partial(kernel, autotune=True, configs=candidates),
     )
 
     gradients = []
@@ -627,6 +626,7 @@ def test_chunk_kda_op_registration():
         cumulative_gate.detach(),
         beta.detach(),
         initial_state.detach(),
+        True,
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
@@ -644,6 +644,7 @@ def test_chunk_kda_backward_op_registration():
             cumulative_gate,
             beta,
             initial_state,
+            True,
         )
     torch.library.opcheck(
         _chunk_kda_bwd_op,
@@ -661,6 +662,7 @@ def test_chunk_kda_backward_op_registration():
             torch.randn_like(state),
             None,
             False,
+            True,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -682,6 +684,7 @@ def test_chunk_kda_backward_op_registration():
             torch.randn_like(state),
             initial_state.detach(),
             False,
+            True,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -906,7 +909,7 @@ def test_chunk_kda_validates_public_contract():
         chunk_kda(q, k, v, cumulative_gate, beta[:, :-1])
     with pytest.raises(ValueError, match="initial_state must have shape"):
         chunk_kda(q, k, v, cumulative_gate, beta, q.new_empty(1, 1, 64, 128))
-    with pytest.raises(ValueError, match="nonempty token"):
+    with pytest.raises(ValueError, match="nonempty"):
         chunk_kda(q[:, :0], k[:, :0], v[:, :0], cumulative_gate[:, :0], beta[:, :0])
     with pytest.raises(ValueError, match="same device"):
         chunk_kda(q, k, v, cumulative_gate, beta.cpu())

@@ -22,7 +22,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
-from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
@@ -2082,16 +2082,25 @@ class ChunkKdaBwdIntraTunable:
         chunk_offsets: torch.Tensor | None
         capacity: int
 
-    # The public wrapper replaces this universal fallback with a target-aware default.
-    default_config = ChunkKdaBwdIntraConfig(1)
+    @staticmethod
+    def default_config(args: Args, *, target: CompileTarget) -> ChunkKdaBwdIntraConfig:
+        """Choose a deterministic target- and capacity-aware persistent grid."""
+        if target.sm_count is None:
+            raise RuntimeError("KDA launch requires a CUDA target with an SM count")
+        chunks = args.capacity
+        grid_limit = min(chunks, 1 << (target.sm_count.bit_length() - 1))
+        amortized_grid = max(1, grid_limit // 2)
+        grid_chunks = (
+            amortized_grid if chunks % amortized_grid == 0 else min(chunks, target.sm_count)
+        )
+        return ChunkKdaBwdIntraConfig(grid_chunks)
 
     @staticmethod
-    def default_for(chunks: int, sm_count: int) -> ChunkKdaBwdIntraConfig:
-        """Prefer a smaller power-of-two grid when it evenly partitions the chunks."""
-        grid_limit = min(chunks, 1 << (sm_count.bit_length() - 1))
-        amortized_grid = max(1, grid_limit // 2)
-        grid_chunks = amortized_grid if chunks % amortized_grid == 0 else min(chunks, sm_count)
-        return ChunkKdaBwdIntraConfig(grid_chunks)
+    def tuning_key(_args: Args, *, target: CompileTarget) -> tuple[()]:
+        """Reuse winners because capacity is already a compile specialization."""
+        if target.sm_count is None:
+            raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
+        return ()
 
     @classmethod
     def configs(cls, args: Args) -> tuple[ChunkKdaBwdIntraConfig, ...]:
@@ -2101,7 +2110,7 @@ class ChunkKdaBwdIntraTunable:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
         grid_limit = min(args.capacity, 1 << (sm_count.bit_length() - 1))
         values = (
-            cls.default_for(args.capacity, sm_count).grid_chunks,
+            cls.default_config(args, target=get_compile_target()).grid_chunks,
             max(1, grid_limit // 4),
             grid_limit,
             min(args.capacity, sm_count),
@@ -2162,7 +2171,7 @@ def chunk_kda_bwd_intra(
     metadata: RaggedChunkMetadata | None,
     *,
     config: ChunkKdaBwdIntraConfig | None = None,
-    tune: bool = False,
+    autotune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run or tune the final dense or fixed-capacity ragged backward stage.
@@ -2222,15 +2231,13 @@ def chunk_kda_bwd_intra(
         capacity=capacity,
     )
     target = detect_compile_target(q.device.index)
-    if not tune and config is None:
-        if target.sm_count is None:
-            raise RuntimeError("KDA launch requires a CUDA target with an SM count")
-        config = ChunkKdaBwdIntraTunable.default_for(capacity, target.sm_count)
+    # An explicit config pins the schedule regardless of the plumbed flag.
+    autotune = autotune and config is None
     result, _ = run_tunable(
         ChunkKdaBwdIntraTunable,
         args,
         config=config,
-        autotune=tune,
+        autotune=autotune,
         configs=configs,
         parallel_compile=_compile_chunk_kda_bwd_intra.disk_cache_enabled(),
         target=target,

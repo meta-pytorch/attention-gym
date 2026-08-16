@@ -32,6 +32,7 @@ def test_ragged_custom_op_registrations():
         initial_state.detach(),
         cu_seqlens,
         metadata.chunk_offsets,
+        True,
     )
     torch.library.opcheck(
         _chunk_kda_fwd_ragged_with_state_op,
@@ -63,6 +64,7 @@ def test_ragged_custom_op_registrations():
             torch.randn_like(state),
             initial_state.detach(),
             False,
+            True,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -74,6 +76,7 @@ def test_ragged_custom_op_registrations():
         None,
         cu_seqlens,
         metadata.chunk_offsets,
+        True,
     )
     with torch.no_grad():
         output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args)
@@ -89,6 +92,7 @@ def test_ragged_custom_op_registrations():
             None,
             None,
             False,
+            True,
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,

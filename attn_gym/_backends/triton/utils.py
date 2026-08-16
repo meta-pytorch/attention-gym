@@ -67,3 +67,34 @@ def can_use_tma(tensor: torch.Tensor) -> bool:
         and storage_is_aligned
         and all(stride * element_size % 16 == 0 for stride in tensor.stride()[:-1])
     )
+
+
+class PinnedConfigKernel:
+    """An autotuned kernel pinned to its first config, the list's heuristic default.
+
+    Bypasses timing-based selection entirely so launches are reproducible
+    across processes, machines, and cache states. Heuristic constexprs
+    (``@triton.heuristics``) still apply.
+    """
+
+    def __init__(self, kernel):
+        from triton.runtime.autotuner import Autotuner, Heuristics
+
+        heuristic_values = None
+        if isinstance(kernel, Heuristics):
+            heuristic_values = kernel.values
+            kernel = kernel.fn
+        if not isinstance(kernel, Autotuner):
+            raise TypeError(f"expected an autotuned kernel, got {type(kernel).__name__}")
+        self._config_kwargs = kernel.configs[0].all_kwargs()
+        self._kernel = (
+            triton.heuristics(heuristic_values)(kernel.fn) if heuristic_values else kernel.fn
+        )
+
+    def __getitem__(self, grid):
+        launch = self._kernel[grid]
+
+        def pinned_launch(*args, **kwargs):
+            return launch(*args, **kwargs, **self._config_kwargs)
+
+        return pinned_launch

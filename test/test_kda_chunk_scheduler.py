@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from attn_gym.linear.kda.chunk_scheduler import (
-    MAX_NUM_SEQUENCES,
     chunk_capacity,
     chunk_work_oracle,
     decode_ragged_chunk_work,
@@ -136,24 +135,19 @@ def test_ragged_chunk_scheduler_accepts_zero_capacity():
     assert actual.shape == (0, 5)
 
 
-def test_ragged_chunk_scheduler_accepts_max_sequences():
-    cu_seqlens = torch.arange(MAX_NUM_SEQUENCES + 1, device="cuda", dtype=torch.int32)
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, MAX_NUM_SEQUENCES, 64)
+def test_ragged_chunk_scheduler_accepts_more_than_4096_sequences():
+    num_sequences = 4097
+    cu_seqlens = torch.arange(num_sequences + 1, device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, num_sequences, 64)
     actual = decode_ragged_chunk_work(metadata)
 
-    assert metadata.capacity == MAX_NUM_SEQUENCES
+    assert metadata.capacity == num_sequences
     torch.testing.assert_close(metadata.chunk_offsets, cu_seqlens)
     torch.testing.assert_close(actual[:, 0], cu_seqlens[:-1])
     torch.testing.assert_close(actual[:, 1], cu_seqlens[:-1])
     torch.testing.assert_close(actual[:, 2], torch.zeros_like(cu_seqlens[:-1]))
     torch.testing.assert_close(actual[:, 3], cu_seqlens[:-1])
     torch.testing.assert_close(actual[:, 4], torch.ones_like(cu_seqlens[:-1]))
-
-
-def test_ragged_chunk_scheduler_rejects_excess_sequences():
-    cu_seqlens = torch.zeros(MAX_NUM_SEQUENCES + 2, device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match=f"at most {MAX_NUM_SEQUENCES} sequences"):
-        prepare_ragged_chunk_metadata(cu_seqlens, 0, 64)
 
 
 @pytest.mark.parametrize(
