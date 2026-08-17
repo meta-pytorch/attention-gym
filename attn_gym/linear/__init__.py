@@ -19,6 +19,7 @@ from attn_gym.linear.kda import (
     naive_chunk_kda,
     naive_chunk_kda_from_cumulative,
     naive_recurrent_kda,
+    recurrent_kda,
 )
 
 # Note: Lazy Imports
@@ -36,6 +37,7 @@ KDA_OPS = [
     "naive_chunk_kda",
     "naive_chunk_kda_from_cumulative",
     "naive_recurrent_kda",
+    "recurrent_kda",
 ]
 
 GDN_OPS = [

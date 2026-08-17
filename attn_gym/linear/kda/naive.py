@@ -38,17 +38,31 @@ def naive_recurrent_kda(
         scale: query scale for q k^T (optional; default 1/sqrt(K))
         initial_state: initial recurrent state (B, H, K, V) (optional)
         output_final_state: also return the final state (optional; in the compute dtype)
-        cu_seqlens: optional int32 offsets (varlen mode); the recurrence restarts at
-            each document boundary ``[cu_seqlens[i]:cu_seqlens[i + 1]]``.
+        cu_seqlens: optional int32 offsets (varlen mode) with the public packed
+            contract: the recurrence restarts at each document boundary, empty
+            documents pass their state through, and output rows past the
+            terminal offset stay zero.
     """
     b, t, h, k_dim = q.shape
 
     if cu_seqlens is not None:
         if b != 1:
             raise ValueError(f"varlen mode packs documents into one row, got batch {b}")
-        outputs, final_states = [], []
-        for doc, (bos, eos) in enumerate(pairwise(cu_seqlens.tolist())):
-            output, final_state = naive_recurrent_kda(
+        offsets = cu_seqlens.tolist()
+        num_documents = len(offsets) - 1
+        compute_dtype = torch.promote_types(q.dtype, torch.float32)
+        output = torch.zeros(1, t, h, v.shape[-1], dtype=q.dtype, device=q.device)
+        final_state = (
+            initial_state.to(compute_dtype).clone()
+            if initial_state is not None
+            else torch.zeros(
+                num_documents, h, k_dim, v.shape[-1], dtype=compute_dtype, device=q.device
+            )
+        )
+        for doc, (bos, eos) in enumerate(pairwise(offsets)):
+            if bos == eos:
+                continue
+            doc_output, doc_state = naive_recurrent_kda(
                 q[:, bos:eos],
                 k[:, bos:eos],
                 v[:, bos:eos],
@@ -56,14 +70,11 @@ def naive_recurrent_kda(
                 beta[:, bos:eos],
                 scale,
                 initial_state[doc : doc + 1] if initial_state is not None else None,
-                output_final_state,
+                output_final_state=True,
             )
-            outputs.append(output)
-            final_states.append(final_state)
-        return (
-            torch.cat(outputs, dim=1),
-            torch.cat(final_states) if output_final_state else None,
-        )
+            output[:, bos:eos] = doc_output
+            final_state[doc] = doc_state[0]
+        return output, (final_state if output_final_state else None)
 
     output_dtype = q.dtype
     optional = () if initial_state is None else (initial_state,)
