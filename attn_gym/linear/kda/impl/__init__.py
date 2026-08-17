@@ -4,4 +4,4 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CuTeDSL KDA forward implementation modules; entry points are private."""
+"""Private KDA implementation backends."""

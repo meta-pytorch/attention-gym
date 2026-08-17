@@ -16,7 +16,12 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    PinnedConfigKernel,
+    can_use_tma,
+    ptr_offset,
+    requires_int64_offsets,
+)
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
 
@@ -348,6 +353,9 @@ def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
     return all(can_use_tma(tensor) for tensor in tensors)
 
 
+_PINNED_FWD_O = PinnedConfigKernel(chunk_gla_fwd_kernel_o)
+
+
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -358,6 +366,7 @@ def chunk_gla_fwd_o_gk(
     *,
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
     if metadata is not None:
@@ -455,7 +464,8 @@ def chunk_gla_fwd_o_gk(
         def grid(meta):
             return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
 
-        chunk_gla_fwd_kernel_o[grid](
+        kernel = chunk_gla_fwd_kernel_o if autotune else _PINNED_FWD_O
+        kernel[grid](
             q=q,
             v=v,
             g=g,

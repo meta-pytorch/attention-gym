@@ -7,8 +7,8 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from attn_gym.linear import naive_chunk_kda_from_cumulative
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import chunk_kda
+from attn_gym.linear import chunk_kda
+from attn_gym.linear.kda.naive import naive_chunk_kda_from_cumulative
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,

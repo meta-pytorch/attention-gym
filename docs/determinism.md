@@ -107,6 +107,35 @@ python examples/flex_determinism.py
 
 The script resets compiler state and uses fresh Inductor caches between runs so that it tests repeatability across independent compilations rather than repeatedly executing one cached kernel.
 
+## KDA determinism
+
+The KDA operations contain no atomics, so every kernel is bitwise-deterministic
+given a fixed configuration. The guarantees, strongest first:
+
+- **Same selected configurations, run to run: bitwise.** Repeating a call
+  that resolves to the same kernel configurations — across runs and processes —
+  reproduces identical bits for outputs and gradients. Under the default
+  ``autotune=True`` a cold winner cache re-benchmarks and timing noise may
+  select a different configuration; the next bullet removes that variable.
+- **`chunk_kda(..., autotune=False)`: bitwise by construction.** The default
+  (`autotune=True`) benchmarks candidate configurations — Triton and CuTeDSL
+  stages alike — the first time a shape is seen and reuses the cached winner
+  afterwards; `autotune=False` pins every stage to its fixed heuristic
+  configuration instead, so kernel selection is repeatable across machines and
+  cache states. `recurrent_kda` and `causal_conv1d` have single fixed
+  schedules and need no flag.
+- **CUDA-graph replay: bitwise** by construction, and the intended serving mode
+  for decode.
+- **Across lowerings: never bitwise.** Dense versus packed, chunked versus
+  recurrent, and fused versus reference are different kernels with different
+  reduction orders. They agree numerically, not bit-for-bit — for example, the
+  dense and packed chunk lowerings match bitwise everywhere except the FP32
+  cumulative-gate gradient, whose software reduction chains compile with
+  different schedules.
+
+The reference implementations compute in FP32 even inside an autocast region.
+
+
 ## References
 
 - [FlexAttention API reference](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)

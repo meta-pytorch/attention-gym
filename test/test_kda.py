@@ -4,12 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear import (
+from attn_gym.linear.kda.naive import (
+    chunk_cumsum_ref,
     naive_chunk_kda,
     naive_chunk_kda_from_cumulative,
     naive_recurrent_kda,
 )
-from attn_gym.linear.kda.naive import chunk_cumsum_ref
 
 
 def make_inputs(seq_len: int) -> tuple[torch.Tensor, ...]:

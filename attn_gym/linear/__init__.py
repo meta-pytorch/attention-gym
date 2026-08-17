@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Linear attention operations: ``from attn_gym.linear import ...``."""
+"""Linear attention operations."""
 
 import importlib
 from typing import TYPE_CHECKING
@@ -12,31 +12,27 @@ from typing import TYPE_CHECKING
 from attn_gym.linear.gdn import GatedDeltaRuleOutput, gated_delta_rule
 from attn_gym.linear.kda import (
     active_token_mask,
-    bounded_gate_cumsum,
-    l2norm,
+    chunk_kda,
     mask_inactive_token_gradients,
     mask_inactive_tokens,
-    naive_chunk_kda,
-    naive_chunk_kda_from_cumulative,
-    naive_recurrent_kda,
     recurrent_kda,
 )
+from attn_gym.linear.kda.api import Impl
 
 # Note: Lazy Imports
-# The CuTeDSL kernels are an optional dependency (`pip install attn-gym[linear]`);
-# torch- and triton-backed names import eagerly. Names backed by CuTeDSL resolve
-# lazily through PEP 562 module `__getattr__` (the standard scientific-python
-# lazy-import mechanism) so the base package imports without the extra, and a
-# missing backend raises an ImportError naming the install command.
+# Backend-backed names load on first use, keeping reference imports torch-only.
+# Missing backends raise an actionable ImportError.
 if TYPE_CHECKING:
-    from attn_gym.linear.kda import causal_conv1d, chunk_kda, register_activation
+    from attn_gym.linear.kda import (
+        bounded_gate_cumsum,
+        causal_conv1d,
+        l2norm,
+        register_activation,
+    )
 
 KDA_OPS = [
     "bounded_gate_cumsum",
     "chunk_kda",
-    "naive_chunk_kda",
-    "naive_chunk_kda_from_cumulative",
-    "naive_recurrent_kda",
     "recurrent_kda",
 ]
 
@@ -47,6 +43,7 @@ GDN_OPS = [
 
 # Model-agnostic building blocks; they currently ship from the KDA module.
 GENERIC_OPS = [
+    "Impl",
     "active_token_mask",
     "causal_conv1d",
     "l2norm",

@@ -15,6 +15,7 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from attn_gym.linear.kda.utils import profiler_range
 
 
 def chunk_kda_bwd(
@@ -32,6 +33,7 @@ def chunk_kda_bwd(
     *,
     chunk_size: int = 64,
     fastmath: bool = False,
+    autotune: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -53,7 +55,7 @@ def chunk_kda_bwd(
     # Forward deliberately saves only the minimal backward tape. Always
     # reconstruct the large W/U, gated Q/K, state, and corrected-value
     # intermediates here instead of retaining them for the lifetime of the graph.
-    with torch.profiler.record_function("kda/cute/backward_recompute_w_u"):
+    with profiler_range("kda/cute/backward_recompute_w_u"):
         w, u, qg, kg = recompute_w_u_fwd(
             q=q,
             k=k,
@@ -63,9 +65,10 @@ def chunk_kda_bwd(
             gk=g,
             metadata=metadata,
             chunk_size=chunk_size,
+            autotune=autotune,
         )
     assert qg is not None and kg is not None
-    with torch.profiler.record_function("kda/triton/backward_recompute_state"):
+    with profiler_range("kda/triton/backward_recompute_state"):
         h, v_new, _ = chunk_gated_delta_rule_fwd_h(
             kg,
             w,
@@ -75,10 +78,11 @@ def chunk_kda_bwd(
             chunk_size=chunk_size,
             output_final_state=False,
             metadata=metadata,
+            autotune=autotune,
         )
     del u
 
-    with torch.profiler.record_function("kda/triton/backward_dav"):
+    with profiler_range("kda/triton/backward_dav"):
         dv_intra, dAqk = chunk_kda_bwd_dav(
             v_new,
             Aqk,
@@ -86,8 +90,9 @@ def chunk_kda_bwd(
             head_dim**-0.5,
             chunk_size=chunk_size,
             metadata=metadata,
+            autotune=autotune,
         )
-    with torch.profiler.record_function("kda/cute/backward_delta_h"):
+    with profiler_range("kda/cute/backward_delta_h"):
         dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dispatch(
             qg,
             kg,
@@ -102,7 +107,7 @@ def chunk_kda_bwd(
             metadata=metadata,
         )
     del w, qg, kg, dv_intra
-    with torch.profiler.record_function("kda/cute/backward_wy_dqkg"):
+    with profiler_range("kda/cute/backward_wy_dqkg"):
         dq, dk, dv, dg, db, dAkk = chunk_kda_bwd_wy_dqkg(
             q,
             k,
@@ -118,9 +123,10 @@ def chunk_kda_bwd(
             metadata,
             chunk_size=chunk_size,
             fastmath=fastmath,
+            autotune=autotune,
         )
     del h, v_new, dh
-    with torch.profiler.record_function("kda/cute/backward_intra"):
+    with profiler_range("kda/cute/backward_intra"):
         dq, dk, dg, db = chunk_kda_bwd_intra(
             q,
             k,
@@ -133,6 +139,7 @@ def chunk_kda_bwd(
             db,
             dg,
             metadata,
+            autotune=autotune,
         )
     return dq, dk, dv, dg, db, d_initial_state
 

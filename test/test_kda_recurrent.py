@@ -14,11 +14,12 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from attn_gym.linear import naive_recurrent_kda, recurrent_kda
+from attn_gym.linear import recurrent_kda
 from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_no_state_op,
     _recurrent_fwd_op,
 )
+from attn_gym.linear.kda.naive import naive_recurrent_kda
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_kda requires CUDA"

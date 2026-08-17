@@ -46,7 +46,6 @@ import torch.nn.functional as F
 import typer
 from torch import nn
 
-from attn_gym.linear import naive_chunk_kda_from_cumulative
 from attn_gym.linear.kda import (
     active_token_mask,
     mask_inactive_token_gradients,
@@ -56,7 +55,7 @@ from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import _chunk_kda
 from attn_gym.linear.kda.fwd.triton.gate_fwd import _bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
-from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref
+from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref, naive_chunk_kda_from_cumulative
 from attn_gym.linear.kda.short_conv import causal_conv1d
 
 Backend = Literal["reference", "fused"]

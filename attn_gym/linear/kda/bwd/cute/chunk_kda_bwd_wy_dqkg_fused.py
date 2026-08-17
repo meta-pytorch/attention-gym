@@ -32,7 +32,7 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
-from attn_gym._backends.cute.target import detect_compile_target, get_compile_target
+from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
@@ -4793,7 +4793,23 @@ class ChunkKdaBwdWyDqkgTunable:
         chunk_size: int
         fastmath: bool
 
-    default_config = ChunkKdaBwdWyDqkgConfig(grid_waves=1)
+    @staticmethod
+    def default_config(
+        _args: Args,
+        *,
+        target: CompileTarget,
+    ) -> ChunkKdaBwdWyDqkgConfig:
+        """Choose the deterministic single-wave persistent schedule."""
+        if target.sm_count is None:
+            raise RuntimeError("KDA launch requires a CUDA target with an SM count")
+        return ChunkKdaBwdWyDqkgConfig(grid_waves=1)
+
+    @staticmethod
+    def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
+        """Key winners by the static persistent-grid work envelope."""
+        if target.sm_count is None:
+            raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
+        return (args.h.shape[1] * args.q.shape[2],)
 
     @staticmethod
     def configs(
@@ -4884,7 +4900,7 @@ def chunk_kda_bwd_wy_dqkg(
     chunk_size: int = 64,
     fastmath: bool = False,
     config: ChunkKdaBwdWyDqkgConfig | None = None,
-    tune: bool = False,
+    autotune: bool = False,
     configs: Iterable[ChunkKdaBwdWyDqkgConfig] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -4951,11 +4967,13 @@ def chunk_kda_bwd_wy_dqkg(
         chunk_size=chunk_size,
         fastmath=fastmath,
     )
+    # An explicit config pins the schedule regardless of the plumbed flag.
+    autotune = autotune and config is None
     result, _ = run_tunable(
         ChunkKdaBwdWyDqkgTunable,
         args,
         config=config,
-        autotune=tune,
+        autotune=autotune,
         configs=configs,
         parallel_compile=_compile_chunk_kda_bwd_wy_dqkg.disk_cache_enabled(),
         target=detect_compile_target(q.device.index),

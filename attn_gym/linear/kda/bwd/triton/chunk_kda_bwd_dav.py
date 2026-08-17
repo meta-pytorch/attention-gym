@@ -17,7 +17,12 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    PinnedConfigKernel,
+    can_use_tma,
+    ptr_offset,
+    requires_int64_offsets,
+)
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
@@ -294,6 +299,7 @@ def _launch_dav_ragged(
     scale: float,
     chunk_size: int,
     metadata: RaggedChunkMetadata,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the packed dAv kernel with TMA descriptors when the layout allows."""
     _, tokens, heads, value_dim = v.shape
@@ -327,7 +333,8 @@ def _launch_dav_ragged(
             num_stages=3,
         )
     else:
-        chunk_kda_bwd_kernel_dAv[(metadata.capacity, heads)](
+        kernel = chunk_kda_bwd_kernel_dAv if autotune else _PINNED_DAV
+        kernel[(metadata.capacity, heads)](
             v=v,
             A=A,
             do=do,
@@ -346,6 +353,9 @@ def _launch_dav_ragged(
     return dv, dA
 
 
+_PINNED_DAV = PinnedConfigKernel(chunk_kda_bwd_kernel_dAv)
+
+
 def chunk_kda_bwd_dav(
     v: torch.Tensor,
     A: torch.Tensor,
@@ -354,6 +364,7 @@ def chunk_kda_bwd_dav(
     *,
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Differentiate the fixed-length or packed KDA intra-chunk value term.
 
@@ -370,7 +381,7 @@ def chunk_kda_bwd_dav(
         metadata.validate_chunk_size(chunk_size)
         if batch != 1:
             raise ValueError("ragged KDA dAv metadata requires batch size 1")
-        return _launch_dav_ragged(v, A, do, scale, chunk_size, metadata)
+        return _launch_dav_ragged(v, A, do, scale, chunk_size, metadata, autotune)
     if tokens % chunk_size:
         raise ValueError(f"the KDA dAv kernel requires complete chunks, got T={tokens}")
 
@@ -382,7 +393,8 @@ def chunk_kda_bwd_dav(
 
     block_value_dim = 64
     if (value_dim, chunk_size) == (128, 64) and _can_use_tensor_descriptors(v, A, do, dv, dA):
-        chunk_kda_bwd_kernel_dAv[(chunks, batch * heads)](
+        kernel = chunk_kda_bwd_kernel_dAv if autotune else _PINNED_DAV
+        kernel[(chunks, batch * heads)](
             v=TensorDescriptor.from_tensor(v, [1, chunk_size, 1, block_value_dim]),
             A=TensorDescriptor.from_tensor(A, [1, chunk_size, 1, chunk_size]),
             do=TensorDescriptor.from_tensor(do, [1, chunk_size, 1, block_value_dim]),
@@ -399,7 +411,8 @@ def chunk_kda_bwd_dav(
             num_sequences=0,
         )
     else:
-        chunk_kda_bwd_kernel_dAv[(chunks, batch * heads)](
+        kernel = chunk_kda_bwd_kernel_dAv if autotune else _PINNED_DAV
+        kernel[(chunks, batch * heads)](
             v=v,
             A=A,
             do=do,

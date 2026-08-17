@@ -1,0 +1,384 @@
+"""Torch-only private operator contracts for fused KDA backends.
+
+Schemas, fake implementations, and dispatch registrations live here so they
+exist before graph capture. CUDA implementations import their optional backend
+only when the dispatcher executes the operator.
+"""
+
+from __future__ import annotations
+
+import importlib
+
+import torch
+
+_CHUNK_SIZE = 64
+
+
+# Fixed-arity schema pairs avoid optional outputs on hot paths.
+_CHUNK_FWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor? initial_state,"
+    " bool autotune)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd",
+    f"{_CHUNK_FWD_ARGS} -> (Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd_with_state",
+    f"{_CHUNK_FWD_ARGS} -> (Tensor, Tensor, Tensor, Tensor)",
+)
+
+_CHUNK_RAGGED_FWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
+    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, bool autotune)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd_ragged",
+    f"{_CHUNK_RAGGED_FWD_ARGS} -> (Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_fwd_ragged_with_state",
+    f"{_CHUNK_RAGGED_FWD_ARGS} -> (Tensor, Tensor, Tensor, Tensor)",
+)
+
+_CHUNK_BWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
+    "Tensor Akk, Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
+    "Tensor? d_final_state, {initial_state}, bool fastmath, bool autotune)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd",
+    _CHUNK_BWD_ARGS.format(initial_state="Tensor? initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd_with_state_grad",
+    _CHUNK_BWD_ARGS.format(initial_state="Tensor initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+
+_RECURRENT_FWD_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
+    " Tensor? initial_state, Tensor? cu_seqlens)"
+)
+torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
+torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
+torch.library.define(
+    "attn_gym::kda_prepare_chunk_offsets",
+    "(Tensor cu_seqlens, SymInt tokens, int chunk_size) -> Tensor",
+)
+
+
+def _chunk_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd")
+    except ImportError as error:
+        raise ImportError(
+            "chunk_kda(impl='fused') requires the optional CuTeDSL backend: "
+            "pip install attn-gym[linear]"
+        ) from error
+
+
+def _recurrent_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.triton.recurrent")
+    except ImportError as error:
+        raise ImportError(
+            "recurrent_kda(impl='fused') requires CUDA with Triton support"
+        ) from error
+
+
+def _chunk_fwd_cuda(*args):
+    return _chunk_backend()._chunk_kda_fwd_cuda(*args)
+
+
+def _chunk_fwd_with_state_cuda(*args):
+    return _chunk_backend()._chunk_kda_fwd_with_state_cuda(*args)
+
+
+def _chunk_fwd_ragged_cuda(*args):
+    return _chunk_backend()._chunk_kda_fwd_ragged_cuda(*args)
+
+
+def _chunk_fwd_ragged_with_state_cuda(*args):
+    return _chunk_backend()._chunk_kda_fwd_ragged_with_state_cuda(*args)
+
+
+def _chunk_bwd_cuda(*args):
+    return _chunk_backend()._chunk_kda_bwd_cuda(*args)
+
+
+def _chunk_bwd_with_state_grad_cuda(*args):
+    return _chunk_backend()._chunk_kda_bwd_with_state_grad_cuda(*args)
+
+
+def _recurrent_fwd_cuda(*args):
+    return _recurrent_backend()._kda_recurrent_fwd_cuda(*args)
+
+
+def _recurrent_fwd_no_state_cuda(*args):
+    return _recurrent_backend()._kda_recurrent_fwd_no_state_cuda(*args)
+
+
+def _prepare_chunk_offsets_cuda(*args):
+    from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
+
+    return _prepare_ragged_chunk_offsets(*args)
+
+
+torch.library.impl("attn_gym::kda_chunk_fwd", "CUDA", _chunk_fwd_cuda)
+torch.library.impl("attn_gym::kda_chunk_fwd_with_state", "CUDA", _chunk_fwd_with_state_cuda)
+torch.library.impl("attn_gym::kda_chunk_fwd_ragged", "CUDA", _chunk_fwd_ragged_cuda)
+torch.library.impl(
+    "attn_gym::kda_chunk_fwd_ragged_with_state",
+    "CUDA",
+    _chunk_fwd_ragged_with_state_cuda,
+)
+torch.library.impl("attn_gym::kda_chunk_bwd", "CUDA", _chunk_bwd_cuda)
+torch.library.impl(
+    "attn_gym::kda_chunk_bwd_with_state_grad",
+    "CUDA",
+    _chunk_bwd_with_state_grad_cuda,
+)
+torch.library.impl("attn_gym::kda_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
+torch.library.impl(
+    "attn_gym::kda_recurrent_fwd_no_state",
+    "CUDA",
+    _recurrent_fwd_no_state_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_prepare_chunk_offsets",
+    "CUDA",
+    _prepare_chunk_offsets_cuda,
+)
+
+
+def _chunk_fwd_fake_common(q: torch.Tensor, v: torch.Tensor):
+    tape_shape = (q.shape[0], q.shape[1], q.shape[2], _CHUNK_SIZE)
+    return v.new_empty(v.shape), q.new_empty(tape_shape), q.new_empty(tape_shape)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd")
+def _chunk_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    autotune: bool,
+):
+    del k, cumulative_gate, beta, initial_state, autotune
+    return _chunk_fwd_fake_common(q, v)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd_with_state")
+def _chunk_fwd_with_state_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    autotune: bool,
+):
+    del k, cumulative_gate, beta, initial_state, autotune
+    output, aqk, akk = _chunk_fwd_fake_common(q, v)
+    state = q.new_empty(
+        (q.shape[0], q.shape[2], q.shape[3], v.shape[-1]),
+        dtype=torch.float32,
+    )
+    return output, state, aqk, akk
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd_ragged")
+def _chunk_fwd_ragged_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    autotune: bool,
+):
+    del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, autotune
+    return _chunk_fwd_fake_common(q, v)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd_ragged_with_state")
+def _chunk_fwd_ragged_with_state_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    autotune: bool,
+):
+    del k, cumulative_gate, beta, initial_state, chunk_offsets, autotune
+    output, aqk, akk = _chunk_fwd_fake_common(q, v)
+    state = q.new_empty(
+        (cu_seqlens.shape[0] - 1, q.shape[2], q.shape[3], v.shape[-1]),
+        dtype=torch.float32,
+    )
+    return output, state, aqk, akk
+
+
+def _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta):
+    return (
+        q.new_empty(q.shape),
+        k.new_empty(k.shape),
+        v.new_empty(v.shape),
+        cumulative_gate.new_empty(cumulative_gate.shape),
+        beta.new_empty(beta.shape),
+    )
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_bwd")
+def _chunk_bwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    aqk: torch.Tensor,
+    akk: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    fastmath: bool,
+    autotune: bool,
+):
+    del aqk, akk, cu_seqlens, chunk_offsets, d_output, d_final_state, initial_state
+    del fastmath, autotune
+    return _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_bwd_with_state_grad")
+def _chunk_bwd_with_state_grad_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    aqk: torch.Tensor,
+    akk: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor,
+    fastmath: bool,
+    autotune: bool,
+):
+    del aqk, akk, cu_seqlens, chunk_offsets, d_output, d_final_state, fastmath, autotune
+    return (
+        *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
+        torch.empty_like(initial_state),
+    )
+
+
+@torch.library.register_fake("attn_gym::kda_recurrent_fwd")
+def _recurrent_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del k, gate, beta, initial_state
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    final_state = q.new_empty(
+        num_sequences, q.shape[2], q.shape[3], v.shape[-1], dtype=torch.float32
+    )
+    return torch.empty_like(v, dtype=q.dtype), final_state
+
+
+@torch.library.register_fake("attn_gym::kda_recurrent_fwd_no_state")
+def _recurrent_fwd_no_state_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    del q, k, gate, beta, initial_state, cu_seqlens
+    return torch.empty_like(v)
+
+
+@torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
+def _prepare_chunk_offsets_fake(
+    cu_seqlens: torch.Tensor,
+    tokens: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    del tokens, chunk_size
+    return torch.empty_like(cu_seqlens)
+
+
+chunk_fwd_op = torch.ops.attn_gym.kda_chunk_fwd.default
+chunk_fwd_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_with_state.default
+chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
+chunk_fwd_ragged_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_with_state.default
+chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
+chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
+recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
+recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
+prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
+
+
+def recurrent_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Validate and invoke the lazily loaded fused recurrent implementation."""
+    if q.shape[-1] > 256:
+        raise ValueError(f"recurrent_kda requires K in [1, 256], got {q.shape[-1]}")
+    if not q.is_cuda:
+        raise ValueError("the fused recurrent scan requires CUDA tensors")
+    data_tensors = (q, k, v, gate, beta)
+    if initial_state is not None:
+        data_tensors += (initial_state,)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
+        raise RuntimeError(
+            "recurrent_kda is inference-only and has no backward; use chunk_kda for "
+            "training or call under torch.no_grad() / torch.inference_mode()"
+        )
+
+    q, k, v, gate, beta = (tensor.contiguous() for tensor in (q, k, v, gate, beta))
+    if initial_state is not None:
+        initial_state = initial_state.contiguous()
+    if output_final_state:
+        return recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens)
+    return recurrent_fwd_no_state_op(q, k, v, gate, beta, initial_state, cu_seqlens), None
+
+
+__all__ = [
+    "chunk_bwd_op",
+    "chunk_bwd_with_state_grad_op",
+    "chunk_fwd_op",
+    "chunk_fwd_ragged_op",
+    "chunk_fwd_ragged_with_state_op",
+    "chunk_fwd_with_state_op",
+    "prepare_chunk_offsets_op",
+    "recurrent_forward",
+    "recurrent_fwd_no_state_op",
+    "recurrent_fwd_op",
+]

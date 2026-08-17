@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from dataclasses import dataclass
@@ -39,8 +40,8 @@ def set_compile_target(target: CompileTarget | None) -> None:
         _target = target
 
 
-def detect_compile_target(device: int | None = None) -> CompileTarget:
-    """Query target metadata in a process allowed to use the CUDA driver."""
+def _reject_bad_fork() -> None:
+    """Reject CUDA discovery even when the target query is already cached."""
     import torch
 
     is_bad_fork = getattr(torch.cuda, "_is_in_bad_fork", lambda: False)
@@ -50,11 +51,12 @@ def detect_compile_target(device: int | None = None) -> CompileTarget:
             "CompileTarget or use precompile_many(), which uses a fresh compiler process"
         )
 
-    configured_arch = os.getenv("CUTE_DSL_ARCH")
-    if not torch.cuda.is_available():
-        return CompileTarget(device_type="none", configured_arch=configured_arch)
 
-    device_index = torch.cuda.current_device() if device is None else device
+@functools.lru_cache
+def _query_compile_target(device_index: int, configured_arch: str | None) -> CompileTarget:
+    """Query the driver once per device; hot launchers re-resolve every call."""
+    import torch
+
     properties = torch.cuda.get_device_properties(device_index)
     return CompileTarget(
         device_type="cuda",
@@ -63,6 +65,18 @@ def detect_compile_target(device: int | None = None) -> CompileTarget:
         name=properties.name,
         sm_count=properties.multi_processor_count,
     )
+
+
+def detect_compile_target(device: int | None = None) -> CompileTarget:
+    """Query target metadata in a process allowed to use the CUDA driver."""
+    import torch
+
+    _reject_bad_fork()
+    configured_arch = os.getenv("CUTE_DSL_ARCH")
+    if not torch.cuda.is_available():
+        return CompileTarget(device_type="none", configured_arch=configured_arch)
+    device_index = torch.cuda.current_device() if device is None else device
+    return _query_compile_target(device_index, configured_arch)
 
 
 def get_compile_target() -> CompileTarget:

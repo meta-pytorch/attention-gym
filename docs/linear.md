@@ -167,10 +167,12 @@ to sample token-level lengths from a truncated Zipf distribution, pack them exac
 into one physical batch, print their `cu_seqlens`, and pass those offsets through the
 complete training step. Add `--padded` when chunk-aligned samples are needed. The
 complete composed core forward and backward use private custom
-operators with fake-tensor registrations and first-order autograd wrappers, so the public
-`chunk_kda` operation supports strict `torch.compile(fullgraph=True)` and CUDA Graph
-capture for fixed physical token capacity and sequence count. Boundary values and the active
-token count may change on replay; changing the physical token capacity or sequence count
+operators with fake-tensor registrations and first-order autograd wrappers, so fused
+`chunk_kda` supports strict `torch.compile(fullgraph=True)` and CUDA Graph capture for
+fixed physical token capacity and sequence count. Packed reference execution is
+eager-only: it reads `cu_seqlens` on the host to run each logical sequence
+independently. Boundary values and the active token count may change on replay;
+changing the physical token capacity or sequence count
 requires recompilation or recapture. Pass `--compile` to compile the complete example as
 one full graph. This keeps the custom KDA core behind its registered operator boundary
 while allowing
@@ -211,16 +213,24 @@ the model's packed-sequence metadata, cache layout, and distributed execution po
 short convolution, factorized gates, and learned gated RMS normalization match
 the production structure but remain ordinary PyTorch teaching implementations.
 
-For integrations that fuse gate activation with its forward chunk prefix sum,
-`naive_chunk_kda_from_cumulative` exposes the matching reference boundary. Its
-cumulative log2 gate is inclusive and resets at the same `chunk_size` passed to
-KDA; the function does not perform a second cumulative sum. The composed `chunk_kda`
-backend consumes this same representation. That trainable operator remains intentionally
-narrow: explicit packed inputs use physical batch size one, kernel operands are BF16,
-`head_dim=128`, `chunk_size=64`, and execution requires Blackwell.
+The two public KDA cores are `chunk_kda` (training and prefill; consumes the
+chunk-local inclusive cumulative log2 gate from `bounded_gate_cumsum(chunk_size=64)`
+without a second cumulative sum) and `recurrent_kda` (decode and inference prefill;
+consumes the per-token log2 gate from `bounded_gate_cumsum(chunk_size=1)`). Both
+select their implementation with `impl`: `"fused"` runs the optimized kernels and
+enforces their constraints (the chunked core needs BF16 operands, `head_dim=128`,
+`chunk_size=64`, and Blackwell; the fused scan is inference-only), while
+`"reference"` runs the eager FP32 oracle behind the identical packed contract on
+any hardware and head dimension, and stays differentiable. There is no automatic
+fallback between the two, and the chunk-versus-recurrent switch is caller policy
+(on B200 the scan wins below roughly 32 tokens per sequence).
 
-::: attn_gym.linear.naive_chunk_kda
+The serving limitations listed under `recurrent_kda` below are deliberate and
+the contract is otherwise stable to build against; CUDA-graph capture amortizes
+the multi-launch decode step.
 
-::: attn_gym.linear.naive_chunk_kda_from_cumulative
+::: attn_gym.linear.chunk_kda
 
-::: attn_gym.linear.naive_recurrent_kda
+::: attn_gym.linear.recurrent_kda
+
+::: attn_gym.linear.Impl
