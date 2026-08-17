@@ -47,10 +47,14 @@ across a chunk overflows gk to inf (and flushes gq to 0), producing NaNs.
 Measured: finite at 1.0 log2/tok, NaN at >=3.6. The shipped kernels are safe by
 construction (16-token windows: midpoint <= 2^58, row-0 <= 2^115; K3b's
 between-blocks reference keeps both factors <= 1). Clamping cannot fix this
-(late-pair true values are O(1) but would compute as 0*inf); a real fix needs
-per-row-block operand rebasing (sandwiched block gemms) or dispatch on the
-per-chunk measured drop. Until then the engine requires max in-chunk decay
-< ~120 log2 units.
+(late-pair true values are O(1) but would compute as 0*inf), and dispatch on
+the per-chunk drop is not viable either: at initialization the training
+example's own gate parameterization (A_log = dt_bias = 0 -> gate ~
+-5*sigmoid(z) ~ -2.5 nats/token) puts the MEDIAN per-chunk per-channel drop at
+231 log2 units, with 100% of (chunk, head, channel) triples above the 126-unit
+cliff. The engine would NaN on the first training step. The only real fix is
+per-row-block operand rebasing (sandwiched block gemms), which must land
+before this engine can be wired into training.
 
 Design + tradeoffs: ~/agent_notes/plans/attention_gym_intra_engine_tcgen05.md.
 """
