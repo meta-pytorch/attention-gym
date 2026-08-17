@@ -4,30 +4,34 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""SM100 (tcgen05) intra-chunk engine for KDA.
+"""SM100 (tcgen05) intra-chunk engines for KDA.
 
-Warp-specialized persistent kernel over (chunk, head) work units, following the
-``BlackwellDeltaHBwdV1`` architecture (high-level tcgen05: trivial tiled MMA,
-TmemAllocator, cute.gemm) with wy_dqkg's gated-operand idiom: CUDA warps produce
-gated bf16 MMA operands into SMEM via R2S alias views, handed to the MMA warp
-through PipelineAsyncUmma.
+Warp-specialized persistent kernels over (chunk, head) work units, following
+the ``BlackwellDeltaHBwdV1`` architecture (high-level tcgen05: trivial tiled
+MMA, TmemAllocator, cute.gemm) with wy_dqkg's gated-operand idiom: CUDA warps
+produce gated bf16 MMA operands into SMEM via R2S alias views, handed to the
+MMA warp through PipelineAsyncUmma.
 
-Backward mode (``mode="bwd"``) computes the full intra-chunk backward, with
-exp2 factored as gq[i,d] = 2^(g-gref), gk[j,d] = 2^(gref-g), gref = g[row 0]:
+``KdaIntraBwdEngine`` computes the intra-chunk backward as twelve 16-column
+strip commits per work unit (dq strips 0-3, dkb 0-3, dka 0-3), ping-ponging
+one shared depth-2 TMEM accumulator region so each strip's gemm overlaps the
+previous strip's drain. Strip c contracts tokens [16c, 16c+16) with operands
+rebased at that strip's first-row gate g[16c]; the drain applies the bounded
+row-side exp2 factor and accumulates strips in fp32 registers. With
+aq = causal-masked dAqk, ak_b = causal-masked dAkk * beta, and qg/kgq/kgk the
+gated q/k views:
 
-    phase A gemms:  dq  = aq @ kgk^T          dkb = ak @ kgk^T
-    phase B gemms:  S   = kgq @ kgk^T(d)      dka = aq^T @ qg^T
-                    dkc = (ak*beta)^T @ kgq^T
-    epilogue:       dq2 = dq_in + dq*gq
-                    dk2 = dk_in + dka*gk + dkb*gq*beta + dkc*gk
-                    dg2 = (dg_in + q*dq_s - k*dka_s + k*dkb_s - k*dkc_s) * ln2
-                    db2 = db_in + rowsum(ak * S)
+    strips:   dq  += (aq @ kgk^T) * gq        dkb += (ak_b @ kgk^T) * gq
+              dka += (aq^T @ qg^T + ak_b^T @ kgq^T) * gk
+    epilogue: dq2 = dq_in + dq                dk2 = dk_in + dkb + dka
+              dg2 = (dg_in + q*dq + k*dkb - k*dka) * ln2
+              db2 = db_in + rowsum_d(k * dkb) / beta
 
-Safety status per mode: the forward class (KdaIntraFwdEngine) uses the
-per-16-column-strip rebase and is bounded at the training gate range; the
-backward class below still uses the single chunk-row-0 reference and OVERFLOWS
-at init-realistic gates (see the note below) -- do not wire it into training
-until it receives the same strip treatment.
+There is no S gemm: sum_d kgq[r,d]*kgk[j,d] equals S[r,j] exactly, so db
+falls out of dkb via the rowsum identity in the epilogue.
+
+``KdaIntraFwdEngine`` computes the forward Aqk/AkkOD/Akkd on the same
+machinery; see its class docstring.
 
 Notes: causality and gk scale
 -----------------------------
@@ -37,28 +41,22 @@ gq = 2^(g-gref) on rows and gk = 2^(gref-g) on columns. gref cancels exactly in
 real arithmetic; in floating point the two exp2 roundings are independent, so
 outputs depend on gref at the ulp level. gref must therefore be causal (at or
 before every query row it serves) and independent of sequence length, or future
-gates perturb earlier outputs (~1.5e-5 bf16 measured for the midpoint variant)
-and prefix invariance breaks. This engine uses gref = g[chunk row 0]: causal
-and length-stable.
+gates perturb earlier outputs (~1.5e-5 bf16 measured for a midpoint variant)
+and prefix invariance breaks.
 
-The cost is one-sided intermediate scale: gk grows as 2^(drop since row 0), up
-to 2^R64 for the full-chunk drop R64. With the training gate bound of -5
-nats/token (7.21 log2 units), R64 reaches ~461 while the fp32/bf16 exponent
-budget is ~126: a channel sustaining more than ~2 log2 units/token of decay
-across a chunk overflows gk to inf (and flushes gq to 0), producing NaNs.
-Measured: finite at 1.0 log2/tok, NaN at >=3.6. The shipped kernels are safe by
-construction (16-token windows: midpoint <= 2^58, row-0 <= 2^115; K3b's
-between-blocks reference keeps both factors <= 1). Clamping cannot fix this
-(late-pair true values are O(1) but would compute as 0*inf), and dispatch on
-the per-chunk drop is not viable either: at initialization the training
-example's own gate parameterization (A_log = dt_bias = 0 -> gate ~
--5*sigmoid(z) ~ -2.5 nats/token) puts the MEDIAN per-chunk per-channel drop at
-231 log2 units, with 100% of (chunk, head, channel) triples above the 126-unit
-cliff. The engine would NaN on the first training step. The only real fix is
-per-row-block operand rebasing (sandwiched block gemms), which must land
-before this engine can be wired into training.
+Both engines rebase per 16-token strip, gref = g[16c], which bounds every exp2
+ABOVE by the 16-token drop: at the training gate bound of -5 nats/token (7.21
+log2 units) the largest in-strip factor is ~2^108, inside the ~2^128 budget,
+so nothing overflows. The A side (qg/kgq) is still produced for rows far below
+the reference and can UNDERFLOW: fastmath exp2 flushes to zero at the
+normal-range limit (measured cutoff exponent -126.1), silently zeroing pair
+products of at most ~2^-17.8 (4.4e-6) relative to unity, with measured
+downstream gain through K4b/recompute_w_u <= 1.007 -- negligible for the
+intended L2-normalized q/k and sigmoid beta.
 
-Design + tradeoffs: ~/agent_notes/plans/attention_gym_intra_engine_tcgen05.md.
+The backward engine is strip-rebased and safe at the training gate range but
+loses to the shipped chunk_kda_bwd_intra on perf (2412us vs 2056us on the zipf
+benchmark); see commit 296200f for the terminal verdict.
 """
 
 import math
@@ -143,8 +141,8 @@ def _kda_diag_neumann_inverse(akkd: torch.Tensor, metadata: RaggedChunkMetadata)
     return akkd
 
 
-class KdaIntraEngine:
-    """Warp-specialized SM100 intra-chunk engine (bwd mode)."""
+class KdaIntraBwdEngine:
+    """Warp-specialized SM100 intra-chunk backward engine (see module docstring)."""
 
     CUDA_WARP_IDS = (0, 1, 2, 3, 4, 5, 6, 7)
     LOAD_WARP_ID = 8
@@ -159,30 +157,21 @@ class KdaIntraEngine:
         chunk_size: int = 64,
         head_dim: int = 128,
         num_heads: int | None = None,
-        mode: str = "bwd",
         io_type=cutlass.BFloat16,
         acc_type=cutlass.Float32,
-        kq_depth: int = 1,
-        araw_depth: int = 1,
         grid_waves: int = 1,
     ):
         assert chunk_size == 64 and head_dim == 128
-        assert mode == "bwd", "fwd mode not wired yet"
-        self.mode = mode
         self.BT = chunk_size
         self.BK = head_dim
         self.io_type = io_type
         self.acc_type = acc_type
         self.num_heads = num_heads
 
-        # Token-contraction gemms (dq/dkb/dka/dkc): (M, N, K) = (BT, BK, BT).
+        # Token-contraction gemms (dq/dkb/dka): (M, N, K) = (BT, BK, BT).
         self.tok_tile = (self.BT, self.BK, self.BT)
-        # Channel-contraction gemm (S): (M, N, K) = (BT, BT, BK).
-        self.s_tile = (self.BT, self.BT, self.BK)
 
         self.raw_depth = 1  # g (held through the epilogue)
-        self.kq_depth = kq_depth
-        self.araw_depth = araw_depth
         self.grid_waves = grid_waves
         self.op_depth = 1
         self.acc_depth = 2
@@ -199,10 +188,7 @@ class KdaIntraEngine:
 
     def get_name(self) -> str:
         head_tag = f"_h{self.num_heads}" if self.num_heads is not None else ""
-        return (
-            f"kda_intra_engine_{self.mode}{head_tag}_k{self.BK}_bt{self.BT}"
-            f"_kq{self.kq_depth}_ar{self.araw_depth}_w{self.grid_waves}"
-        )
+        return f"kda_intra_engine_bwd{head_tag}_k{self.BK}_bt{self.BT}_w{self.grid_waves}"
 
     # ------------------------------------------------------------------
     # Host-side setup
@@ -229,7 +215,6 @@ class KdaIntraEngine:
         chunk_offsets_in: cute.Tensor,
         T: Int32,
         H: Int32,
-        capacity: Int32,
         stream,
     ):
         BT, BK = self.BT, self.BK
@@ -352,7 +337,7 @@ class KdaIntraEngine:
             bar_raw: cute.struct.MemRange[Int64, self.raw_depth * 2]
             bar_opA: cute.struct.MemRange[Int64, self.op_depth * 2]
             bar_opB: cute.struct.MemRange[Int64, self.op_depth * 2]
-            bar_accA: cute.struct.MemRange[Int64, self.acc_depth * 2]
+            bar_acc: cute.struct.MemRange[Int64, self.acc_depth * 2]
             tmem_buf: Int32
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_kraw)], self.align
@@ -367,7 +352,6 @@ class KdaIntraEngine:
             sAkRaw: cute.struct.Align[
                 cute.struct.MemRange[Float32, cute.cosize(s_araw)], self.align
             ]
-            sBeta: cute.struct.Align[cute.struct.MemRange[Float32, self.BT], 128]
             sAq: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_a_op)], self.align
             ]
@@ -383,13 +367,13 @@ class KdaIntraEngine:
             sKgqB: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_b_op)], self.align
             ]
-            sStg1: cute.struct.Align[
+            sDqSt: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_b_store)], self.align
             ]
-            sStg2: cute.struct.Align[
+            sDkbSt: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_b_store)], self.align
             ]
-            sStg3: cute.struct.Align[
+            sDkaSt: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_b_store)], self.align
             ]
 
@@ -431,7 +415,6 @@ class KdaIntraEngine:
             cu_seqlens_in,
             chunk_offsets_in,
             H,
-            capacity,
         ).launch(
             grid=self._launch_grid(),
             block=[self.CTA_THREADS, 1, 1],
@@ -481,7 +464,6 @@ class KdaIntraEngine:
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         H: Int32,
-        capacity: Int32,
     ):
         BT, BK = self.BT, self.BK
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -533,7 +515,7 @@ class KdaIntraEngine:
                 barrier_storage=bar,
             ).make_participants()
 
-        pacc_P, pacc_C = acc_pipe(sm.bar_accA.data_ptr())
+        pacc_P, pacc_C = acc_pipe(sm.bar_acc.data_ptr())
 
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
         tmem = utils.TmemAllocator(
@@ -569,9 +551,9 @@ class KdaIntraEngine:
         t_kgk_b = mma_tok.make_fragment_B(sKgk)
         sQgT2 = sm.sQg.get_tensor(s_b2_op.outer, swizzle=s_b2_op.inner)
         sKgqB2 = sm.sKgqB.get_tensor(s_b2_op.outer, swizzle=s_b2_op.inner)
-        sStg1 = sm.sStg1.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
-        sStg2 = sm.sStg2.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
-        sStg3 = sm.sStg3.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
+        sDqSt = sm.sDqSt.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
+        sDkbSt = sm.sDkbSt.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
+        sDkaSt = sm.sDkaSt.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
         t_qg_b = mma_tok2.make_fragment_B(sQgT2)
         t_kgqb_b = mma_tok2.make_fragment_B(sKgqB2)
 
@@ -608,9 +590,7 @@ class KdaIntraEngine:
             p_t_dq = sl_tok.partition_S(dq_flat)
             p_t_dkb = sl_tok.partition_S(t_dkb_acc[((None, None), 0, 0, None)])
             p_t_dka = sl_tok.partition_S(t_dka_acc[((None, None), 0, 0, None)])
-            id_md = cute.make_identity_tensor((BT, BK))
-            coords_md = sl_tok.partition_D(id_md)
-            reg_shape = coords_md.shape
+            reg_shape = sl_tok.partition_D(cute.make_identity_tensor((BT, BK))).shape
 
             # Vectorized epilogue copies: one thread map (4 rows x 32 col-groups,
             # 4 elems per copy) shared by fp32 128b loads, bf16 64b stores, and
@@ -772,7 +752,7 @@ class KdaIntraEngine:
                 # Strip c contracts tokens [16c, 16c+16) against the band
                 # reference g[16c]; the drain applies the bounded row-side
                 # factor and sums strips in fp32. MMA commit order: dq strips
-                # 0-3, dkb strips 0-3 (paccA), then dka strips 0-3 (paccB).
+                # 0-3, dkb strips 0-3, then dka strips 0-3.
                 tmp_reg = cute.make_rmem_tensor(reg_shape, self.acc_type)
                 tmp_bf16 = cute.make_rmem_tensor(reg_shape, self.io_type)
                 fin = cute.make_rmem_tensor(reg_shape, self.acc_type)
@@ -809,7 +789,7 @@ class KdaIntraEngine:
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
-                        thr_r2s.partition_D(sStg1[(None, None, 0)]),
+                        thr_r2s.partition_D(sDqSt[(None, None, 0)]),
                     )
 
                 for e in cutlass.range_constexpr(cute.size(fin)):
@@ -842,7 +822,7 @@ class KdaIntraEngine:
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
-                        thr_r2s.partition_D(sStg2[(None, None, 0)]),
+                        thr_r2s.partition_D(sDkbSt[(None, None, 0)]),
                     )
 
                 for e in cutlass.range_constexpr(cute.size(fin)):
@@ -875,7 +855,7 @@ class KdaIntraEngine:
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
-                        thr_r2s.partition_D(sStg3[(None, None, 0)]),
+                        thr_r2s.partition_D(sDkaSt[(None, None, 0)]),
                     )
                 self.cuda_bar.arrive_and_wait()
 
@@ -894,9 +874,9 @@ class KdaIntraEngine:
                 tout_g = ep_g.partition_D(gout_g)
                 tsqr = ep_b.partition_S(sQ[(None, None, kq_h.index)])
                 tskr = ep_b.partition_S(sK[(None, None, kq_h.index)])
-                tdq = ep_b.partition_S(sStg1[(None, None, 0)])
-                tdkb = ep_b.partition_S(sStg2[(None, None, 0)])
-                tdka = ep_b.partition_S(sStg3[(None, None, 0)])
+                tdq = ep_b.partition_S(sDqSt[(None, None, 0)])
+                tdkb = ep_b.partition_S(sDkbSt[(None, None, 0)])
+                tdka = ep_b.partition_S(sDkaSt[(None, None, 0)])
 
                 lane = local_tid % 32
                 for rb in cutlass.range_constexpr(cute.size(tin_q, mode=[1])):
@@ -1131,17 +1111,12 @@ def _compile_intra_engine_bwd(
     H: int,
     head_dim: int,
     chunk_size: int,
-    kq_depth: int = 1,
-    araw_depth: int = 1,
     grid_waves: int = 1,
 ):
-    op = KdaIntraEngine(
+    op = KdaIntraBwdEngine(
         chunk_size=chunk_size,
         head_dim=head_dim,
         num_heads=H,
-        mode="bwd",
-        kq_depth=kq_depth,
-        araw_depth=araw_depth,
         grid_waves=grid_waves,
     )
     st, sn = cute.sym_int(), cute.sym_int()
@@ -1172,7 +1147,7 @@ def _compile_intra_engine_bwd(
     ]
     cu = make_fake_compact_tensor(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=4)
     offs = make_fake_compact_tensor(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=4)
-    return compile_tvm_ffi(op, *args, cu, offs, 1, H, 1, name=op.get_name())
+    return compile_tvm_ffi(op, *args, cu, offs, 1, H, name=op.get_name())
 
 
 def kda_intra_engine_bwd(
@@ -1188,8 +1163,6 @@ def kda_intra_engine_bwd(
     dg: torch.Tensor,
     metadata: RaggedChunkMetadata,
     *,
-    kq_depth: int = 1,
-    araw_depth: int = 1,
     grid_waves: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Engine-backed intra-chunk backward matching chunk_kda_bwd_intra's contract."""
@@ -1199,9 +1172,7 @@ def kda_intra_engine_bwd(
     dk2 = torch.empty_like(k, memory_format=torch.contiguous_format)
     dg2 = torch.empty_like(g, memory_format=torch.contiguous_format)
     db2 = torch.empty_like(db, memory_format=torch.contiguous_format)
-    compiled = _compile_intra_engine_bwd(
-        heads, head_dim, metadata.chunk_size, kq_depth, araw_depth, grid_waves
-    )
+    compiled = _compile_intra_engine_bwd(heads, head_dim, metadata.chunk_size, grid_waves)
     compiled(
         q[0].contiguous(),
         k[0].contiguous(),
@@ -1221,7 +1192,6 @@ def kda_intra_engine_bwd(
         metadata.chunk_offsets,
         tokens,
         heads,
-        metadata.capacity,
     )
     return dq2, dk2, dg2, db2
 
@@ -1232,7 +1202,7 @@ def kda_intra_engine_bwd(
 
 
 class KdaIntraFwdEngine:
-    """Forward intra stage on the engine architecture (mode="fwd").
+    """Forward intra stage on the engine architecture.
 
     Two S-shaped gemms over the same gated operands the backward engine
     produces (see the bwd class):
@@ -1241,7 +1211,7 @@ class KdaIntraFwdEngine:
         Akk[i, j] = beta[i] * sum_d kgq[i, d] * kgk[j, d]  (strict lower)
 
     Warp plan: CUDA(0-7) production + drain/store, LOAD(8) TMA, MMA(9),
-    idle(10-11) padding warp-group 3 for setmaxregister alignment. The 16x16
+    idle(10-11) padding warp-group 2 for setmaxregister alignment. The 16x16
     diagonal-block Neumann inverses (K4b's Akkd input) run in a separate tiny
     Triton kernel invoked by the Python wrapper.
     """
@@ -1301,7 +1271,6 @@ class KdaIntraFwdEngine:
         chunk_offsets_in: cute.Tensor,
         T: Int32,
         H: Int32,
-        capacity: Int32,
         stream,
     ):
         BT, BK = self.BT, self.BK
@@ -1409,14 +1378,13 @@ class KdaIntraFwdEngine:
             sKgk: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_sb_op)], self.align
             ]
-            sSt1: cute.struct.Align[cute.struct.MemRange[Float32, self.BT * self.BT], self.align]
-            sSt2: cute.struct.Align[cute.struct.MemRange[Float32, self.BT * self.BT], self.align]
+            sAqkSt: cute.struct.Align[cute.struct.MemRange[Float32, self.BT * self.BT], self.align]
+            sAkkSt: cute.struct.Align[cute.struct.MemRange[Float32, self.BT * self.BT], self.align]
 
         self.shared_type = SharedF
         self.kernel(
             mma_s,
             mma16,
-            g_g,
             atom_q,
             desc_q,
             atom_k,
@@ -1437,7 +1405,6 @@ class KdaIntraFwdEngine:
             cu_seqlens_in,
             chunk_offsets_in,
             H,
-            capacity,
         ).launch(
             grid=self._launch_grid(),
             block=[self.CTA_THREADS, 1, 1],
@@ -1450,7 +1417,6 @@ class KdaIntraFwdEngine:
         self,
         mma_s: cute.TiledMma,
         mma16: cute.TiledMma,
-        g_g: cute.Tensor,
         atom_q: cute.CopyAtom,
         desc_q: cute.Tensor,
         atom_k: cute.CopyAtom,
@@ -1471,7 +1437,6 @@ class KdaIntraFwdEngine:
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         H: Int32,
-        capacity: Int32,
     ):
         BT, BK = self.BT, self.BK
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1531,8 +1496,8 @@ class KdaIntraFwdEngine:
         sKgk = sm.sKgk.get_tensor(s_sb_op.outer, swizzle=s_sb_op.inner)
         sKgkSt = sm.sKgk.get_tensor(s_opb_store.outer, swizzle=s_opb_store.inner)
         st_lay = cute.make_layout((BT, BT), stride=(BT, 1))
-        sSt1 = sm.sSt1.get_tensor(st_lay)
-        sSt2 = sm.sSt2.get_tensor(st_lay)
+        sAqkSt = sm.sAqkSt.get_tensor(st_lay)
+        sAkkSt = sm.sAkkSt.get_tensor(st_lay)
 
         t_qg_a = mma16.make_fragment_A(sQg)
         t_kgq_a = mma16.make_fragment_A(sKgq)
@@ -1563,9 +1528,7 @@ class KdaIntraFwdEngine:
             sl_s = tc_s.get_slice(local_tid % 128)
             p_t_aqk = sl_s.partition_S(aqk_flat)
             p_t_akk = sl_s.partition_S(t_akk_acc[((None, None), 0, 0, None)])
-            id_ss = cute.make_identity_tensor((BT, BT))
-            coords_ss = sl_s.partition_D(id_ss)
-            sreg_shape = coords_ss.shape
+            sreg_shape = sl_s.partition_D(cute.make_identity_tensor((BT, BT))).shape
             r2s_atom = sm100_utils.get_smem_store_op(
                 utils.LayoutEnum.ROW_MAJOR, Float32, self.acc_type, tc_s
             )
@@ -1692,10 +1655,10 @@ class KdaIntraFwdEngine:
                     if local_tid < 128:
                         cute.copy(tc_s, p_t_aqk[(None, None, None, acc_h.index)], s_reg)
                         cute.arch.fence_view_async_tmem_load()
-                        cute.copy(tc_r2s, tc_r2s.retile(s_reg), thr_r2s.partition_D(sSt1))
+                        cute.copy(tc_r2s, tc_r2s.retile(s_reg), thr_r2s.partition_D(sAqkSt))
                         cute.copy(tc_s, p_t_akk[(None, None, None, acc_h.index)], s_reg)
                         cute.arch.fence_view_async_tmem_load()
-                        cute.copy(tc_r2s, tc_r2s.retile(s_reg), thr_r2s.partition_D(sSt2))
+                        cute.copy(tc_r2s, tc_r2s.retile(s_reg), thr_r2s.partition_D(sAkkSt))
                     acc_h.release()
                     self.cuda_bar.arrive_and_wait()
 
@@ -1718,7 +1681,7 @@ class KdaIntraFwdEngine:
                                 col = st_col0 + e
                                 aqk_v = Float32(0.0)
                                 if col <= row and col < valid:
-                                    aqk_v = sSt1[(row, col)] * scale
+                                    aqk_v = sAqkSt[(row, col)] * scale
                                 r_a[e] = self.io_type(aqk_v)
                             cute.copy(cp_st_b, r_a, taq_o[(None, rb, None)])
 
@@ -1735,7 +1698,7 @@ class KdaIntraFwdEngine:
                             od_row = chunk_idx * 6 + pair
                             r_od = cute.make_rmem_tensor((4,), Float32)
                             for e in cutlass.range_constexpr(4):
-                                r_od[e] = sSt2[(row, st_col0 + e)] * beta_r
+                                r_od[e] = sAkkSt[(row, st_col0 + e)] * beta_r
                             od_raw = (
                                 g_akkod.iterator
                                 + od_row * (H * 256)
@@ -1766,7 +1729,7 @@ class KdaIntraFwdEngine:
                             dc = dc0 + e
                             a_v = Float32(0.0)
                             if dc < dr:
-                                a_v = sSt2[(arow, dib * 16 + dc)] * sBeta[arow]
+                                a_v = sAkkSt[(arow, dib * 16 + dc)] * sBeta[arow]
                             g_akkd[(token_start + arow, dc, (h_idx, 0))] = a_v
                     self.cuda_bar.arrive_and_wait()
 
@@ -1872,13 +1835,6 @@ class KdaIntraFwdEngine:
         ss, gs = cpasync.tma_partition(atom, 0, cute.make_layout(1), sg, gg)
         return atom, ss, gs
 
-    @cute.jit
-    def _gchunk(self, base_iter, token_start, h_idx, dtype, H, gstride):
-        """(BT, BK) gmem tile view at (token_start, head) for vectorized copies."""
-        raw = base_iter + token_start * H * self.BK + h_idx * self.BK
-        ptr = cute.make_ptr(dtype, raw.toint(), cute.AddressSpace.gmem, assumed_align=16)
-        return cute.make_tensor(ptr, cute.make_layout((self.BT, self.BK), stride=(gstride, 1)))
-
     def _launch_grid(self):
         sm_count = get_compile_target().sm_count
         if sm_count is None:
@@ -1915,7 +1871,6 @@ def _compile_intra_engine_fwd(H: int, head_dim: int, chunk_size: int):
         offs,
         1,
         H,
-        1,
         name=op.get_name(),
     )
 
@@ -1956,6 +1911,5 @@ def kda_intra_engine_fwd(
         metadata.chunk_offsets,
         tokens,
         heads,
-        metadata.capacity,
     )
     return aqk, akkod, _kda_diag_neumann_inverse(akkd, metadata)
