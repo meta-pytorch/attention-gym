@@ -170,13 +170,14 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 # so we are setting CAUSAL_NORMREF = True as default for now
                 # the only concern with doing topmost is what if the numbers are actually
                 # really big (but does this happen in practice? we will see)
-                # quantified: with the bounded gate (-5 nats = -7.21 log2/tok) the worst
-                # 16-token drop is ~115 log2 units vs the fp32/bf16 exponent budget of
-                # ~126, so topmost (row 0) cannot overflow here; midpoint halves the
-                # range but reads a future token's gate, which perturbs earlier rows at
-                # the ulp level (~1.5e-5 bf16) and breaks prefix/length invariance via
-                # the T_local clamp below. see "Notes: causality and gk scale" in
-                # attn_gym/linear/kda/intra/engine.py
+                # with the bounded gate, -5 nats/token is -7.21 log2 units/token, so over
+                # a 16-token subchunk the worst drop is about 115 log2 units. fp32/bf16 have
+                # about 126 units of exponent range, so using row 0 can't overflow here
+                # the midpoint cuts that range in half, but now we're reading a future token's
+                # gate, and the rounding changes earlier rows by about 1.5e-5 in bf16
+                # also the midpoint depends on T_local from the min/clamp below, so changing
+                # the prefix or sequence length can change the result
+                # see "Notes: causality and gk scale" in attn_gym/linear/kda/intra/engine.py
                 if CAUSAL_NORMREF:
                     normref_idx = 0
                 else:
