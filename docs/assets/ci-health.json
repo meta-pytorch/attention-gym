@@ -1,0 +1,19 @@
+{
+  "repository": "meta-pytorch/attention-gym",
+  "generated_at": null,
+  "runs_per_workflow": 0,
+  "overall": {
+    "total": 0,
+    "successes": 0,
+    "failures": 0,
+    "ignored": 0,
+    "success_rate": null,
+    "median_duration_seconds": null,
+    "p95_duration_seconds": null,
+    "latest": null,
+    "timeline": []
+  },
+  "workflows": [],
+  "jobs": [],
+  "failures": []
+}

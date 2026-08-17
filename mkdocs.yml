@@ -55,6 +55,9 @@ nav:
   - Linear Attention: linear.md
   - Examples: examples.md
   - Utilities: utilities.md
+  - Developers:
+      - Overview: developers/index.md
+      - CI Health: developers/ci-health.md
 
 markdown_extensions:
   - pymdownx.highlight:
