@@ -618,7 +618,7 @@ class KdaIntraEngine:
             ep_thr = cute.make_ordered_layout((8, 32), order=(1, 0))
             ep_val = cute.make_layout((1, 4))
             cp_g_f32 = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64),
                 ep_thr,
                 ep_val,
             )
@@ -634,7 +634,7 @@ class KdaIntraEngine:
             ep_row = local_tid // 32  # this thread's row within each 8-row step
             # (BT, BT) A-tile copies: 16 rows x 16 col-groups x 4 elems = 256 thr.
             cp_g_f32h4 = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64),
                 cute.make_ordered_layout((16, 16), order=(1, 0)),
                 cute.make_layout((1, 4)),
             )
@@ -655,6 +655,14 @@ class KdaIntraEngine:
             )
             tc_r2s = cute.make_tiled_copy_D(r2s_atom, tc_tok)
             thr_r2s = tc_r2s.get_slice(local_tid)
+            # S2R g loader in the drain fragment layout: with g unswizzled the
+            # partition addressing folds to affine offsets, replacing the
+            # per-element dynamic-coordinate indexing in the strip drains.
+            gld_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64
+            )
+            tc_gld = cute.make_tiled_copy_D(gld_atom, tc_tok)
+            thr_gld = tc_gld.get_slice(local_tid)
 
             it = Int32(0)
             has_work = it < n_iters
@@ -768,6 +776,8 @@ class KdaIntraEngine:
                 tmp_reg = cute.make_rmem_tensor(reg_shape, self.acc_type)
                 tmp_bf16 = cute.make_rmem_tensor(reg_shape, self.io_type)
                 fin = cute.make_rmem_tensor(reg_shape, self.acc_type)
+                tge_p = thr_gld.partition_S(sG[(None, None, raw_h.index)])
+                g_stage_it = sG[(None, None, raw_h.index)].iterator
 
                 for e in cutlass.range_constexpr(cute.size(fin)):
                     fin[e] = Float32(0.0)
@@ -776,16 +786,23 @@ class KdaIntraEngine:
                     if local_tid < 128:
                         cute.copy(tc_tok, p_t_dq[(None, None, None, sc % 2)], tmp_reg)
                         cute.arch.fence_view_async_tmem_load()
-                        for e in cutlass.range_constexpr(cute.size(fin)):
-                            crd = coords_md[e]
-                            gq_c = Float32(0.0)
-                            if crd[0] >= sc * 16:
-                                gq_c = cute.math.exp2(
-                                    sG[(crd[0], crd[1], raw_h.index)]
-                                    - sG[(sc * 16, crd[1], raw_h.index)],
-                                    fastmath=True,
-                                )
-                            fin[e] += tmp_reg[e] * gq_c
+                        tgr_p = thr_gld.partition_S(
+                            cute.make_tensor(
+                                g_stage_it + sc * 16 * BK,
+                                cute.make_layout((BT, BK), stride=(0, 1)),
+                            )
+                        )
+                        for mb in cutlass.range_constexpr(cute.size(tge_p, mode=[1])):
+                            for nb in cutlass.range_constexpr(cute.size(tge_p, mode=[2])):
+                                r_ge = cute.make_fragment_like(tge_p[(None, 0, 0)], Float32)
+                                cute.copy(tc_gld, tge_p[(None, mb, nb)], r_ge)
+                                r_gr = cute.make_fragment_like(r_ge, Float32)
+                                cute.copy(tc_gld, tgr_p[(None, mb, nb)], r_gr)
+                                for e in cutlass.range_constexpr(cute.size(r_ge)):
+                                    d = cutlass.min(r_ge[e] - r_gr[e], Float32(120.0))
+                                    fin[(e, mb, nb)] += tmp_reg[(e, mb, nb)] * cute.math.exp2(
+                                        d, fastmath=True
+                                    )
                     acc_h.release()
                 if local_tid < 128:
                     tmp_bf16.store(fin.load().to(self.io_type))
@@ -802,16 +819,23 @@ class KdaIntraEngine:
                     if local_tid < 128:
                         cute.copy(tc_tok, p_t_dkb[(None, None, None, sc % 2)], tmp_reg)
                         cute.arch.fence_view_async_tmem_load()
-                        for e in cutlass.range_constexpr(cute.size(fin)):
-                            crd = coords_md[e]
-                            gq_c = Float32(0.0)
-                            if crd[0] >= sc * 16:
-                                gq_c = cute.math.exp2(
-                                    sG[(crd[0], crd[1], raw_h.index)]
-                                    - sG[(sc * 16, crd[1], raw_h.index)],
-                                    fastmath=True,
-                                )
-                            fin[e] += tmp_reg[e] * gq_c
+                        tgr_p = thr_gld.partition_S(
+                            cute.make_tensor(
+                                g_stage_it + sc * 16 * BK,
+                                cute.make_layout((BT, BK), stride=(0, 1)),
+                            )
+                        )
+                        for mb in cutlass.range_constexpr(cute.size(tge_p, mode=[1])):
+                            for nb in cutlass.range_constexpr(cute.size(tge_p, mode=[2])):
+                                r_ge = cute.make_fragment_like(tge_p[(None, 0, 0)], Float32)
+                                cute.copy(tc_gld, tge_p[(None, mb, nb)], r_ge)
+                                r_gr = cute.make_fragment_like(r_ge, Float32)
+                                cute.copy(tc_gld, tgr_p[(None, mb, nb)], r_gr)
+                                for e in cutlass.range_constexpr(cute.size(r_ge)):
+                                    d = cutlass.min(r_ge[e] - r_gr[e], Float32(120.0))
+                                    fin[(e, mb, nb)] += tmp_reg[(e, mb, nb)] * cute.math.exp2(
+                                        d, fastmath=True
+                                    )
                     acc_h.release()
                 if local_tid < 128:
                     tmp_bf16.store(fin.load().to(self.io_type))
@@ -828,19 +852,23 @@ class KdaIntraEngine:
                     if local_tid < 128:
                         cute.copy(tc_tok, p_t_dka[(None, None, None, sc % 2)], tmp_reg)
                         cute.arch.fence_view_async_tmem_load()
-                        for e in cutlass.range_constexpr(cute.size(fin)):
-                            crd = coords_md[e]
-                            gk_c = Float32(0.0)
-                            # rows past the strip have exactly-zero partials
-                            # (aq/ak are strict-causal); gate the factor so the
-                            # huge exp2 never multiplies them.
-                            if crd[0] < sc * 16 + 16:
-                                gk_c = cute.math.exp2(
-                                    sG[(sc * 16, crd[1], raw_h.index)]
-                                    - sG[(crd[0], crd[1], raw_h.index)],
-                                    fastmath=True,
-                                )
-                            fin[e] += tmp_reg[e] * gk_c
+                        tgr_p = thr_gld.partition_S(
+                            cute.make_tensor(
+                                g_stage_it + sc * 16 * BK,
+                                cute.make_layout((BT, BK), stride=(0, 1)),
+                            )
+                        )
+                        for mb in cutlass.range_constexpr(cute.size(tge_p, mode=[1])):
+                            for nb in cutlass.range_constexpr(cute.size(tge_p, mode=[2])):
+                                r_ge = cute.make_fragment_like(tge_p[(None, 0, 0)], Float32)
+                                cute.copy(tc_gld, tge_p[(None, mb, nb)], r_ge)
+                                r_gr = cute.make_fragment_like(r_ge, Float32)
+                                cute.copy(tc_gld, tgr_p[(None, mb, nb)], r_gr)
+                                for e in cutlass.range_constexpr(cute.size(r_ge)):
+                                    d = cutlass.min(r_gr[e] - r_ge[e], Float32(120.0))
+                                    fin[(e, mb, nb)] += tmp_reg[(e, mb, nb)] * cute.math.exp2(
+                                        d, fastmath=True
+                                    )
                     acc_h.release()
                 if local_tid < 128:
                     tmp_bf16.store(fin.load().to(self.io_type))
@@ -1547,7 +1575,7 @@ class KdaIntraFwdEngine:
             ep_thr = cute.make_ordered_layout((8, 32), order=(1, 0))
             ep_val = cute.make_layout((1, 4))
             cp_f32 = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64),
                 ep_thr,
                 ep_val,
             )
