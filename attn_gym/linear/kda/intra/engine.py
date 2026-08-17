@@ -290,9 +290,8 @@ class KdaIntraEngine:
             mma_tok.make_fragment_C(cute.append(tok_c, self.acc_depth))
         )
         s_c = mma_s.partition_shape_C(self.s_tile[:2])
-        n_s = tcgen05.find_tmem_tensor_col_offset(
-            mma_s.make_fragment_C(cute.append(s_c, self.acc_depth))
-        )
+        s_fk_probe = mma_s.make_fragment_C(cute.append(s_c, self.acc_depth))
+        n_s = tcgen05.find_tmem_tensor_col_offset(s_fk_probe)
         # dkc accumulates into dka's columns (identical gk epilogue scale), so
         # all four regions coexist: no tmem reuse, no drain-order guard needed.
         self.tm_dq = 0
@@ -1330,10 +1329,26 @@ class KdaIntraFwdEngine:
             self.s_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
-        s_c = mma_s.partition_shape_C(self.s_tile[:2])
-        n_s = tcgen05.find_tmem_tensor_col_offset(
-            mma_s.make_fragment_C(cute.append(s_c, self.acc_depth))
+        # Per-16-column strip MMA: each strip's operands are rebased at that
+        # strip's own row-start gate, bounding every exp2 to a 16-token range
+        # (see "Notes: causality and gk scale" in the module docstring).
+        strip_tile = (BT, 16, BK)
+        mma16 = sm100_utils.make_trivial_tiled_mma(
+            self.io_type,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            self.acc_type,
+            self.cta_group,
+            strip_tile[:2],
+            tcgen05.OperandSource.SMEM,
         )
+        s_c = mma_s.partition_shape_C(self.s_tile[:2])
+        s_fk_probe = mma_s.make_fragment_C(cute.append(s_c, self.acc_depth))
+        n_s = tcgen05.find_tmem_tensor_col_offset(s_fk_probe)
+        # tmem addresses pack (lane << 16 | col); appended acc stages land at a
+        # LANE offset (stride 2^20 for the [64,64] fp32 fragment), not +cols.
+        # Take the stage stride from the fragment layout, never from col math.
+        self.tm_stage = s_fk_probe.layout.stride[3]
         self.tm_aqk = 0
         self.tm_akk = n_s
         raw_tot = 2 * n_s
@@ -1359,10 +1374,13 @@ class KdaIntraFwdEngine:
         )
         self.k_bytes = cute.size_in_bytes(self.io_type, cute.select(s_kraw, mode=[0, 1]))
         self.g_bytes = cute.size_in_bytes(Float32, cute.select(s_graw, mode=[0, 1]))
-        s_sa_op = sm100_utils.make_smem_layout_a(mma_s, self.s_tile, self.io_type, self.op_depth)
-        s_sb_op = sm100_utils.make_smem_layout_b(mma_s, self.s_tile, self.io_type, self.op_depth)
+        s_sa_op = sm100_utils.make_smem_layout_a(mma16, strip_tile, self.io_type, self.op_depth)
+        s_sb_op = sm100_utils.make_smem_layout_b(mma16, strip_tile, self.io_type, self.op_depth)
         s_op_store = sm100_utils.make_smem_layout_epi(
             self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BK), self.op_depth
+        )
+        s_opb_store = sm100_utils.make_smem_layout_epi(
+            self.io_type, utils.LayoutEnum.ROW_MAJOR, (16, BK), self.op_depth
         )
 
         @cute.struct
@@ -1395,6 +1413,7 @@ class KdaIntraFwdEngine:
         self.shared_type = SharedF
         self.kernel(
             mma_s,
+            mma16,
             g_g,
             atom_q,
             desc_q,
@@ -1407,6 +1426,7 @@ class KdaIntraFwdEngine:
             s_sa_op,
             s_sb_op,
             s_op_store,
+            s_opb_store,
             g_beta,
             g_aqk,
             g_akkod,
@@ -1427,6 +1447,7 @@ class KdaIntraFwdEngine:
     def kernel(
         self,
         mma_s: cute.TiledMma,
+        mma16: cute.TiledMma,
         g_g: cute.Tensor,
         atom_q: cute.CopyAtom,
         desc_q: cute.Tensor,
@@ -1439,6 +1460,7 @@ class KdaIntraFwdEngine:
         s_sa_op: cute.ComposedLayout,
         s_sb_op: cute.ComposedLayout,
         s_op_store: cute.ComposedLayout,
+        s_opb_store: cute.ComposedLayout,
         g_beta: cute.Tensor,
         g_aqk: cute.Tensor,
         g_akkod: cute.Tensor,
@@ -1505,14 +1527,15 @@ class KdaIntraFwdEngine:
         sKgq = sm.sKgq.get_tensor(s_sa_op.outer, swizzle=s_sa_op.inner)
         sKgqSt = sm.sKgq.get_tensor(s_op_store.outer, swizzle=s_op_store.inner)
         sKgk = sm.sKgk.get_tensor(s_sb_op.outer, swizzle=s_sb_op.inner)
-        sKgkSt = sm.sKgk.get_tensor(s_op_store.outer, swizzle=s_op_store.inner)
+        sKgkSt = sm.sKgk.get_tensor(s_opb_store.outer, swizzle=s_opb_store.inner)
         st_lay = cute.make_layout((BT, BT), stride=(BT, 1))
         sSt1 = sm.sSt1.get_tensor(st_lay)
         sSt2 = sm.sSt2.get_tensor(st_lay)
 
-        t_qg_a = mma_s.make_fragment_A(sQg)
-        t_kgq_a = mma_s.make_fragment_A(sKgq)
-        t_kgk_b = mma_s.make_fragment_B(sKgk)
+        t_qg_a = mma16.make_fragment_A(sQg)
+        t_kgq_a = mma16.make_fragment_A(sKgq)
+        t_kgk_b = mma16.make_fragment_B(sKgk)
+        s_f16 = mma16.make_fragment_C(mma16.partition_shape_C((BT, 16)))
         s_sh = mma_s.partition_shape_C(self.s_tile[:2])
         s_fk = mma_s.make_fragment_C(cute.append(s_sh, self.acc_depth))
         t_aqk_acc = cute.make_tensor(tp + self.tm_aqk, s_fk.layout)
@@ -1591,46 +1614,59 @@ class KdaIntraFwdEngine:
                     _, _, token_start, valid = load_ragged_chunk_work(
                         cu_seqlens, chunk_offsets, chunk_idx, Int32(BT)
                     )
-                    op_h = pop_P.acquire_and_advance()
                     raw_h = praw_C.wait_and_advance()
                     g_h = prawg_C.wait_and_advance()
-                    grf = cute.make_rmem_tensor((4,), self.acc_type)
-                    for e in cutlass.range_constexpr(4):
-                        grf[e] = sG[(0, ep_col0 + e, g_h.index)]
                     tsg_p = ep_g.partition_S(sG[(None, None, g_h.index)])
                     tsk_p = ep_b.partition_S(sK[(None, None, raw_h.index)])
                     tsq_p = ep_b.partition_S(sQ[(None, None, raw_h.index)])
-                    tqg_p = ep_b.partition_D(sQgSt[(None, None, op_h.index)])
-                    tkgq_p = ep_b.partition_D(sKgqSt[(None, None, op_h.index)])
-                    tkgk_p = ep_b.partition_D(sKgkSt[(None, None, op_h.index)])
-                    for rb in cutlass.range_constexpr(cute.size(tsg_p, mode=[1])):
-                        prow = ep_row + rb * 8
-                        r_g = cute.make_fragment_like(tsg_p[(None, 0, None)], Float32)
-                        r_k = cute.make_fragment_like(tsk_p[(None, 0, None)], self.io_type)
-                        r_q = cute.make_fragment_like(r_k, self.io_type)
-                        cute.copy(cp_f32, tsg_p[(None, rb, None)], r_g)
-                        cute.copy(cp_bf16, tsk_p[(None, rb, None)], r_k)
-                        cute.copy(cp_bf16, tsq_p[(None, rb, None)], r_q)
-                        r_qg = cute.make_fragment_like(r_k, self.io_type)
-                        r_kq = cute.make_fragment_like(r_k, self.io_type)
-                        r_kk = cute.make_fragment_like(r_k, self.io_type)
-                        for e in cutlass.range_constexpr(cute.size(r_qg)):
-                            qg_v = Float32(0.0)
-                            kgq_v = Float32(0.0)
-                            kgk_v = Float32(0.0)
-                            if prow < valid:
-                                gq = cute.math.exp2(r_g[e] - grf[e], fastmath=True)
-                                qg_v = Float32(r_q[e]) * gq
-                                kgq_v = Float32(r_k[e]) * gq
-                                kgk_v = Float32(r_k[e]) / gq
-                            r_qg[e] = self.io_type(qg_v)
-                            r_kq[e] = self.io_type(kgq_v)
-                            r_kk[e] = self.io_type(kgk_v)
-                        cute.copy(cp_bf16, r_qg, tqg_p[(None, rb, None)])
-                        cute.copy(cp_bf16, r_kq, tkgq_p[(None, rb, None)])
-                        cute.copy(cp_bf16, r_kk, tkgk_p[(None, rb, None)])
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    op_h.commit()
+                    for sc in cutlass.range_constexpr(4):
+                        row0 = sc * 16
+                        op_h = pop_P.acquire_and_advance()
+                        grf = cute.make_rmem_tensor((4,), self.acc_type)
+                        for e in cutlass.range_constexpr(4):
+                            grf[e] = sG[(row0, ep_col0 + e, g_h.index)]
+                        tqg_p = ep_b.partition_D(sQgSt[(None, None, op_h.index)])
+                        tkgq_p = ep_b.partition_D(sKgqSt[(None, None, op_h.index)])
+                        tkgk_p = ep_b.partition_D(sKgkSt[(None, None, op_h.index)])
+                        for rb in cutlass.range_constexpr(cute.size(tsg_p, mode=[1])):
+                            prow = ep_row + rb * 8
+                            if rb * 8 + 8 > row0:
+                                r_g = cute.make_fragment_like(tsg_p[(None, 0, None)], Float32)
+                                r_k = cute.make_fragment_like(tsk_p[(None, 0, None)], self.io_type)
+                                r_q = cute.make_fragment_like(r_k, self.io_type)
+                                cute.copy(cp_f32, tsg_p[(None, rb, None)], r_g)
+                                cute.copy(cp_bf16, tsk_p[(None, rb, None)], r_k)
+                                cute.copy(cp_bf16, tsq_p[(None, rb, None)], r_q)
+                                r_qg = cute.make_fragment_like(r_k, self.io_type)
+                                r_kq = cute.make_fragment_like(r_k, self.io_type)
+                                for e in cutlass.range_constexpr(cute.size(r_qg)):
+                                    qg_v = Float32(0.0)
+                                    kgq_v = Float32(0.0)
+                                    if prow < valid and prow >= row0:
+                                        gq = cute.math.exp2(r_g[e] - grf[e], fastmath=True)
+                                        qg_v = Float32(r_q[e]) * gq
+                                        kgq_v = Float32(r_k[e]) * gq
+                                    r_qg[e] = self.io_type(qg_v)
+                                    r_kq[e] = self.io_type(kgq_v)
+                                cute.copy(cp_bf16, r_qg, tqg_p[(None, rb, None)])
+                                cute.copy(cp_bf16, r_kq, tkgq_p[(None, rb, None)])
+                        for rb2 in cutlass.range_constexpr(2):
+                            srow = row0 + ep_row + rb2 * 8
+                            r_gb = cute.make_fragment_like(tsg_p[(None, 0, None)], Float32)
+                            r_kb = cute.make_fragment_like(tsk_p[(None, 0, None)], self.io_type)
+                            cute.copy(cp_f32, tsg_p[(None, sc * 2 + rb2, None)], r_gb)
+                            cute.copy(cp_bf16, tsk_p[(None, sc * 2 + rb2, None)], r_kb)
+                            r_kk = cute.make_fragment_like(r_kb, self.io_type)
+                            for e in cutlass.range_constexpr(cute.size(r_kk)):
+                                kgk_v = Float32(0.0)
+                                if srow < valid:
+                                    kgk_v = Float32(r_kb[e]) * cute.math.exp2(
+                                        grf[e] - r_gb[e], fastmath=True
+                                    )
+                                r_kk[e] = self.io_type(kgk_v)
+                            cute.copy(cp_bf16, r_kk, tkgk_p[(None, rb2, None)])
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        op_h.commit()
                     raw_h.release()
                     g_h.release()
 
@@ -1790,28 +1826,32 @@ class KdaIntraFwdEngine:
             it = Int32(0)
             has_work = it < n_iters
             while has_work:
-                op_h = pop_C.wait_and_advance()
                 acc_h = pacc_P.acquire_and_advance()
-                for kp in cutlass.range(cute.size(t_qg_a, mode=[2]), unroll_full=True):
-                    mma_s.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(
-                        mma_s,
-                        t_aqk_acc[None, None, None, acc_h.index],
-                        t_qg_a[None, None, kp, op_h.index],
-                        t_kgk_b[None, None, kp, op_h.index],
-                        t_aqk_acc[None, None, None, acc_h.index],
-                    )
-                for kp in cutlass.range(cute.size(t_kgq_a, mode=[2]), unroll_full=True):
-                    mma_s.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(
-                        mma_s,
-                        t_akk_acc[None, None, None, acc_h.index],
-                        t_kgq_a[None, None, kp, op_h.index],
-                        t_kgk_b[None, None, kp, op_h.index],
-                        t_akk_acc[None, None, None, acc_h.index],
-                    )
+                for sc in cutlass.range_constexpr(4):
+                    op_h = pop_C.wait_and_advance()
+                    col = acc_h.index * self.tm_stage + sc * 16
+                    aqk_c = cute.make_tensor(tp + self.tm_aqk + col, s_f16.layout)
+                    akk_c = cute.make_tensor(tp + self.tm_akk + col, s_f16.layout)
+                    for kp in cutlass.range(cute.size(t_qg_a, mode=[2]), unroll_full=True):
+                        mma16.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(
+                            mma16,
+                            aqk_c,
+                            t_qg_a[None, None, kp, op_h.index],
+                            t_kgk_b[None, None, kp, op_h.index],
+                            aqk_c,
+                        )
+                    for kp in cutlass.range(cute.size(t_kgq_a, mode=[2]), unroll_full=True):
+                        mma16.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(
+                            mma16,
+                            akk_c,
+                            t_kgq_a[None, None, kp, op_h.index],
+                            t_kgk_b[None, None, kp, op_h.index],
+                            akk_c,
+                        )
+                    op_h.release()
                 acc_h.commit()
-                op_h.release()
                 it = it + 1
                 has_work = it < n_iters
 
