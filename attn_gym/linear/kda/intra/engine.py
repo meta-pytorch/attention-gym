@@ -185,7 +185,7 @@ class KdaIntraEngine:
         self.araw_depth = araw_depth
         self.grid_waves = grid_waves
         self.op_depth = 1
-        self.acc_depth = 1
+        self.acc_depth = 2
 
         self.cuda_regs = 224
         self.aux_regs = 48
@@ -280,31 +280,17 @@ class KdaIntraEngine:
             self.tok_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
-        # Channel-contraction (S): A (BT, BK) K-major, B (BT, BK) K-major.
-        mma_s = sm100_utils.make_trivial_tiled_mma(
-            self.io_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            self.acc_type,
-            self.cta_group,
-            self.s_tile[:2],
-            tcgen05.OperandSource.SMEM,
-        )
-
         tok_c = mma_tok.partition_shape_C(self.tok_tile[:2])
         n_tok = tcgen05.find_tmem_tensor_col_offset(
             mma_tok.make_fragment_C(cute.append(tok_c, self.acc_depth))
         )
-        s_c = mma_s.partition_shape_C(self.s_tile[:2])
-        s_fk_probe = mma_s.make_fragment_C(cute.append(s_c, self.acc_depth))
-        n_s = tcgen05.find_tmem_tensor_col_offset(s_fk_probe)
-        # dkc accumulates into dka's columns (identical gk epilogue scale), so
-        # all four regions coexist: no tmem reuse, no drain-order guard needed.
-        self.tm_dq = 0
-        self.tm_dkb = n_tok
-        self.tm_dka = 2 * n_tok
-        self.tm_s = 3 * n_tok
-        raw_tot = 3 * n_tok + n_s
+        # dkc accumulates into dka's columns (identical gk epilogue scale). The
+        # S gemm is gone: db = rowsum_d(k * dkb_final) is the same contraction
+        # (sum_d kgq[r,d]*kgk[j,d] = S[r,j] exactly), computed in the epilogue.
+        # All twelve strip commits ping-pong two shared regions (commit order
+        # dq 0-3, dkb 0-3, dka 0-3: each output's strip c uses region c % 2),
+        # so the accumulator footprint is one depth-2 fragment.
+        raw_tot = n_tok
         tot = 1
         for _ in cutlass.range_constexpr(10):
             if cutlass.const_expr(tot < raw_tot):
@@ -318,23 +304,23 @@ class KdaIntraEngine:
         s_b_op = sm100_utils.make_smem_layout_b(mma_tok, self.tok_tile, self.io_type, 1)
         s_a2_op = sm100_utils.make_smem_layout_a(mma_tok2, self.tok_tile, self.io_type, 1)
         s_b2_op = sm100_utils.make_smem_layout_b(mma_tok2, self.tok_tile, self.io_type, 1)
-        s_sa_op = sm100_utils.make_smem_layout_a(mma_s, self.s_tile, self.io_type, 1)
-        s_sb_op = sm100_utils.make_smem_layout_b(mma_s, self.s_tile, self.io_type, 1)
         s_a_store = sm100_utils.make_smem_layout_epi(
             self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BT), 1
         )
         s_b_store = sm100_utils.make_smem_layout_epi(
             self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BK), 1
         )
-        s_sab_store = sm100_utils.make_smem_layout_epi(
-            self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BK), 1
-        )
-
         s_kraw = sm100_utils.make_smem_layout_epi(
             self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BK), self.raw_depth
         )
-        s_graw = sm100_utils.make_smem_layout_epi(
-            Float32, utils.LayoutEnum.ROW_MAJOR, (BT, BK), self.raw_depth
+        # g stays UNSWIZZLED: the per-strip drains index it per element with
+        # runtime coordinates, and plain row-major addressing keeps that to two
+        # integer ops instead of a dynamic swizzle chain (identity-swizzle
+        # composed layout so the .outer/.inner view sites stay uniform).
+        s_graw = cute.make_composed_layout(
+            cute.make_swizzle(0, 4, 3),
+            0,
+            cute.make_layout((BT, BK, self.raw_depth), stride=(BK, 1, BT * BK)),
         )
         s_araw = sm100_utils.make_smem_layout_epi(
             Float32, utils.LayoutEnum.ROW_MAJOR, (BT, BT), self.raw_depth
@@ -367,7 +353,6 @@ class KdaIntraEngine:
             bar_opA: cute.struct.MemRange[Int64, self.op_depth * 2]
             bar_opB: cute.struct.MemRange[Int64, self.op_depth * 2]
             bar_accA: cute.struct.MemRange[Int64, self.acc_depth * 2]
-            bar_accB: cute.struct.MemRange[Int64, self.acc_depth * 2]
             tmem_buf: Int32
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_kraw)], self.align
@@ -383,7 +368,6 @@ class KdaIntraEngine:
                 cute.struct.MemRange[Float32, cute.cosize(s_araw)], self.align
             ]
             sBeta: cute.struct.Align[cute.struct.MemRange[Float32, self.BT], 128]
-            sBetaRed: cute.struct.Align[cute.struct.MemRange[Float32, 2 * self.BT], 128]
             sAq: cute.struct.Align[
                 cute.struct.MemRange[self.io_type, cute.cosize(s_a_op)], self.align
             ]
@@ -414,7 +398,6 @@ class KdaIntraEngine:
         self.kernel(
             mma_tok,
             mma_tok2,
-            mma_s,
             atom_q,
             desc_q,
             atom_k,
@@ -432,11 +415,8 @@ class KdaIntraEngine:
             s_b_op,
             s_a2_op,
             s_b2_op,
-            s_sa_op,
-            s_sb_op,
             s_a_store,
             s_b_store,
-            s_sab_store,
             g_q,
             g_k,
             g_beta,
@@ -468,7 +448,6 @@ class KdaIntraEngine:
         self,
         mma_tok: cute.TiledMma,
         mma_tok2: cute.TiledMma,
-        mma_s: cute.TiledMma,
         atom_q: cute.CopyAtom,
         desc_q: cute.Tensor,
         atom_k: cute.CopyAtom,
@@ -486,11 +465,8 @@ class KdaIntraEngine:
         s_b_op: cute.ComposedLayout,
         s_a2_op: cute.ComposedLayout,
         s_b2_op: cute.ComposedLayout,
-        s_sa_op: cute.ComposedLayout,
-        s_sb_op: cute.ComposedLayout,
         s_a_store: cute.ComposedLayout,
         s_b_store: cute.ComposedLayout,
-        s_sab_store: cute.ComposedLayout,
         g_q: cute.Tensor,
         g_k: cute.Tensor,
         g_beta: cute.Tensor,
@@ -557,8 +533,7 @@ class KdaIntraEngine:
                 barrier_storage=bar,
             ).make_participants()
 
-        paccA_P, paccA_C = acc_pipe(sm.bar_accA.data_ptr())
-        paccB_P, paccB_C = acc_pipe(sm.bar_accB.data_ptr())
+        pacc_P, pacc_C = acc_pipe(sm.bar_accA.data_ptr())
 
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
         tmem = utils.TmemAllocator(
@@ -576,7 +551,6 @@ class KdaIntraEngine:
         sG = sm.sG.get_tensor(s_graw.outer, swizzle=s_graw.inner)
         sAqRaw = sm.sAqRaw.get_tensor(s_araw.outer, swizzle=s_araw.inner)
         sAkRaw = sm.sAkRaw.get_tensor(s_araw.outer, swizzle=s_araw.inner)
-        sBetaRed = sm.sBetaRed.get_tensor(cute.make_layout((2 * BT,)))
         sAq = sm.sAq.get_tensor(s_a_op.outer, swizzle=s_a_op.inner)
         sAqSt = sm.sAq.get_tensor(s_a_store.outer, swizzle=s_a_store.inner)
         sAk = sm.sAk.get_tensor(s_a_op.outer, swizzle=s_a_op.inner)
@@ -587,11 +561,6 @@ class KdaIntraEngine:
         sKgkSt = sm.sKgk.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
         sQgSt = sm.sQg.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
         sKgqBSt = sm.sKgqB.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
-        sKgqA = sm.sKgqB.get_tensor(s_sa_op.outer, swizzle=s_sa_op.inner)
-        sKgkS = sm.sKgk.get_tensor(s_sb_op.outer, swizzle=s_sb_op.inner)
-        # db products (ak * S) stage through the freed dAqk raw tile.
-        sDbSt = sm.sAqRaw.get_tensor(s_araw.outer, swizzle=s_araw.inner)
-
         # --- MMA fragments ---
         t_aq_a = mma_tok.make_fragment_A(sAq)
         t_ak_a = mma_tok.make_fragment_A(sAk)
@@ -605,19 +574,14 @@ class KdaIntraEngine:
         sStg3 = sm.sStg3.get_tensor(s_b_store.outer, swizzle=s_b_store.inner)
         t_qg_b = mma_tok2.make_fragment_B(sQgT2)
         t_kgqb_b = mma_tok2.make_fragment_B(sKgqB2)
-        t_kgqa_a = mma_s.make_fragment_A(sKgqA)
-        t_kgks_b = mma_s.make_fragment_B(sKgkS)
 
         tok_sh = mma_tok.partition_shape_C(self.tok_tile[:2])
         tok_fk = mma_tok.make_fragment_C(cute.append(tok_sh, self.acc_depth))
-        t_dq_acc = cute.make_tensor(tp + self.tm_dq, tok_fk.layout)
-        t_dkb_acc = cute.make_tensor(tp + self.tm_dkb, tok_fk.layout)
+        t_dq_acc = cute.make_tensor(tp + 0, tok_fk.layout)
+        t_dkb_acc = t_dq_acc
         tok2_sh = mma_tok2.partition_shape_C(self.tok_tile[:2])
         tok2_fk = mma_tok2.make_fragment_C(cute.append(tok2_sh, self.acc_depth))
-        t_dka_acc = cute.make_tensor(tp + self.tm_dka, tok2_fk.layout)
-        s_sh = mma_s.partition_shape_C(self.s_tile[:2])
-        s_fk = mma_s.make_fragment_C(cute.append(s_sh, self.acc_depth))
-        t_s_acc = cute.make_tensor(tp + self.tm_s, s_fk.layout)
+        t_dka_acc = cute.make_tensor(tp + 0, tok2_fk.layout)
 
         # --- Work decode ---
         bx = cute.arch.block_idx()[0]
@@ -647,18 +611,6 @@ class KdaIntraEngine:
             id_md = cute.make_identity_tensor((BT, BK))
             coords_md = sl_tok.partition_D(id_md)
             reg_shape = coords_md.shape
-
-            t2r_s_atom = cute.make_copy_atom(
-                tcgen05.Ld16x256bOp(tcgen05.Repetition(BT // 8), tcgen05.Pack.NONE),
-                self.acc_type,
-            )
-            s_flat = t_s_acc[((None, None), 0, 0, None)]
-            tc_s = tcgen05.make_tmem_copy(t2r_s_atom, s_flat[(None, None, 0)])
-            sl_s = tc_s.get_slice(local_tid)
-            p_t_s = sl_s.partition_S(s_flat)
-            id_ss = cute.make_identity_tensor((BT, BT))
-            coords_ss = sl_s.partition_D(id_ss)
-            sreg_shape = coords_ss.shape
 
             # Vectorized epilogue copies: one thread map (4 rows x 32 col-groups,
             # 4 elems per copy) shared by fp32 128b loads, bf16 64b stores, and
@@ -703,11 +655,6 @@ class KdaIntraEngine:
             )
             tc_r2s = cute.make_tiled_copy_D(r2s_atom, tc_tok)
             thr_r2s = tc_r2s.get_slice(local_tid)
-            r2s_s_atom = sm100_utils.get_smem_store_op(
-                utils.LayoutEnum.ROW_MAJOR, Float32, self.acc_type, tc_s
-            )
-            tc_r2s_s = cute.make_tiled_copy_D(r2s_s_atom, tc_s)
-            thr_r2s_s = tc_r2s_s.get_slice(local_tid)
 
             it = Int32(0)
             has_work = it < n_iters
@@ -756,10 +703,13 @@ class KdaIntraEngine:
                     cute.copy(cp_g_bf16h4, r_a1, taq_p[(None, rb, None)])
                     cute.copy(cp_g_bf16h4, r_a2, tak_p[(None, rb, None)])
 
+                # Band references: each 16-row band is rebased at its own
+                # first row's gate, bounding every exp2 to a 16-token drop.
                 ep_col0 = (local_tid % 32) * 4
-                grf = cute.make_rmem_tensor((4,), self.acc_type)
-                for e in cutlass.range_constexpr(4):
-                    grf[e] = sG[(0, ep_col0 + e, raw_h.index)]
+                grf_b = cute.make_rmem_tensor((4, 4), self.acc_type)
+                for b in cutlass.range_constexpr(4):
+                    for e in cutlass.range_constexpr(4):
+                        grf_b[(b, e)] = sG[(b * 16, ep_col0 + e, raw_h.index)]
                 tsg_p = ep_g.partition_S(sG[(None, None, raw_h.index)])
                 tsk_p = ep_b.partition_S(sK[(None, None, kq_h.index)])
                 tkgk_p = ep_b.partition_D(sKgkSt[(None, None, 0)])
@@ -774,7 +724,7 @@ class KdaIntraEngine:
                         kgk_v = Float32(0.0)
                         if prow < valid:
                             kgk_v = Float32(r_k[e]) * cute.math.exp2(
-                                grf[e] - r_g[e], fastmath=True
+                                grf_b[(rb // 2, e)] - r_g[e], fastmath=True
                             )
                         r_o[e] = self.io_type(kgk_v)
                     cute.copy(cp_g_bf16, r_o, tkgk_p[(None, rb, None)])
@@ -800,7 +750,7 @@ class KdaIntraEngine:
                         qg_v = Float32(0.0)
                         kgq_v = Float32(0.0)
                         if prow < valid:
-                            gq = cute.math.exp2(r_g[e] - grf[e], fastmath=True)
+                            gq = cute.math.exp2(r_g[e] - grf_b[(rb // 2, e)], fastmath=True)
                             qg_v = Float32(r_q[e]) * gq
                             kgq_v = Float32(r_k[e]) * gq
                         r_oq[e] = self.io_type(qg_v)
@@ -809,49 +759,99 @@ class KdaIntraEngine:
                     cute.copy(cp_g_bf16, r_ok, tkgqb_p[(None, rb, None)])
                 cute.arch.fence_proxy("async.shared", space="cta")
                 opB_h.commit()
-                kq_h.release()  # k/q raws done: TMA prefetches n+1 during epilogue
 
-                # ---- Drain all three accumulators as RAW bf16 stages ----
-                # All operand buffers are free once accB is committed (the MMA
-                # warp released opA at accA-commit and opB at accB-commit), so
-                # the raw accs stage into sKgk/sQg/sKgqB and every epilogue
-                # multiply happens in the coalesced pass domain below.
-                accA_h = paccA_C.wait_and_advance()
+                # ---- Per-strip gated drains (fp32 register accumulation) ----
+                # Strip c contracts tokens [16c, 16c+16) against the band
+                # reference g[16c]; the drain applies the bounded row-side
+                # factor and sums strips in fp32. MMA commit order: dq strips
+                # 0-3, dkb strips 0-3 (paccA), then dka strips 0-3 (paccB).
                 tmp_reg = cute.make_rmem_tensor(reg_shape, self.acc_type)
                 tmp_bf16 = cute.make_rmem_tensor(reg_shape, self.io_type)
+                fin = cute.make_rmem_tensor(reg_shape, self.acc_type)
 
+                for e in cutlass.range_constexpr(cute.size(fin)):
+                    fin[e] = Float32(0.0)
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_C.wait_and_advance()
+                    if local_tid < 128:
+                        cute.copy(tc_tok, p_t_dq[(None, None, None, sc % 2)], tmp_reg)
+                        cute.arch.fence_view_async_tmem_load()
+                        for e in cutlass.range_constexpr(cute.size(fin)):
+                            crd = coords_md[e]
+                            gq_c = Float32(0.0)
+                            if crd[0] >= sc * 16:
+                                gq_c = cute.math.exp2(
+                                    sG[(crd[0], crd[1], raw_h.index)]
+                                    - sG[(sc * 16, crd[1], raw_h.index)],
+                                    fastmath=True,
+                                )
+                            fin[e] += tmp_reg[e] * gq_c
+                    acc_h.release()
                 if local_tid < 128:
-                    cute.copy(tc_tok, p_t_dq[(None, None, None, accA_h.index)], tmp_reg)
-                    cute.arch.fence_view_async_tmem_load()
-                    tmp_bf16.store(tmp_reg.load().to(self.io_type))
+                    tmp_bf16.store(fin.load().to(self.io_type))
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
                         thr_r2s.partition_D(sStg1[(None, None, 0)]),
                     )
-                    cute.copy(tc_tok, p_t_dkb[(None, None, None, accA_h.index)], tmp_reg)
-                    cute.arch.fence_view_async_tmem_load()
-                    tmp_bf16.store(tmp_reg.load().to(self.io_type))
+
+                for e in cutlass.range_constexpr(cute.size(fin)):
+                    fin[e] = Float32(0.0)
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_C.wait_and_advance()
+                    if local_tid < 128:
+                        cute.copy(tc_tok, p_t_dkb[(None, None, None, sc % 2)], tmp_reg)
+                        cute.arch.fence_view_async_tmem_load()
+                        for e in cutlass.range_constexpr(cute.size(fin)):
+                            crd = coords_md[e]
+                            gq_c = Float32(0.0)
+                            if crd[0] >= sc * 16:
+                                gq_c = cute.math.exp2(
+                                    sG[(crd[0], crd[1], raw_h.index)]
+                                    - sG[(sc * 16, crd[1], raw_h.index)],
+                                    fastmath=True,
+                                )
+                            fin[e] += tmp_reg[e] * gq_c
+                    acc_h.release()
+                if local_tid < 128:
+                    tmp_bf16.store(fin.load().to(self.io_type))
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
                         thr_r2s.partition_D(sStg2[(None, None, 0)]),
                     )
-                accA_h.release()
-                accB_h = paccB_C.wait_and_advance()
+
+                for e in cutlass.range_constexpr(cute.size(fin)):
+                    fin[e] = Float32(0.0)
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_C.wait_and_advance()
+                    if local_tid < 128:
+                        cute.copy(tc_tok, p_t_dka[(None, None, None, sc % 2)], tmp_reg)
+                        cute.arch.fence_view_async_tmem_load()
+                        for e in cutlass.range_constexpr(cute.size(fin)):
+                            crd = coords_md[e]
+                            gk_c = Float32(0.0)
+                            # rows past the strip have exactly-zero partials
+                            # (aq/ak are strict-causal); gate the factor so the
+                            # huge exp2 never multiplies them.
+                            if crd[0] < sc * 16 + 16:
+                                gk_c = cute.math.exp2(
+                                    sG[(sc * 16, crd[1], raw_h.index)]
+                                    - sG[(crd[0], crd[1], raw_h.index)],
+                                    fastmath=True,
+                                )
+                            fin[e] += tmp_reg[e] * gk_c
+                    acc_h.release()
                 if local_tid < 128:
-                    cute.copy(tc_tok, p_t_dka[(None, None, None, accB_h.index)], tmp_reg)
-                    cute.arch.fence_view_async_tmem_load()
-                    tmp_bf16.store(tmp_reg.load().to(self.io_type))
+                    tmp_bf16.store(fin.load().to(self.io_type))
                     cute.copy(
                         tc_r2s,
                         tc_r2s.retile(tmp_bf16),
                         thr_r2s.partition_D(sStg3[(None, None, 0)]),
                     )
                 self.cuda_bar.arrive_and_wait()
-                self.cuda_bar.arrive_and_wait()
 
-                # ---- Coalesced epilogue passes (all math here) ----
+                # ---- Coalesced epilogue (staged values are FINAL domain) ----
                 gin = self._gchunk(g_dqin.iterator, token_start, h_idx, Float32, H, gstride)
                 gout = self._gchunk(g_dq2.iterator, token_start, h_idx, self.io_type, H, gstride)
                 gin_k = self._gchunk(g_dkin.iterator, token_start, h_idx, Float32, H, gstride)
@@ -864,30 +864,29 @@ class KdaIntraEngine:
                 tout_k = ep_b.partition_D(gout_k)
                 tin_g = ep_g.partition_S(gin_g)
                 tout_g = ep_g.partition_D(gout_g)
-                tsg = ep_g.partition_S(sG[(None, None, raw_h.index)])
-                tqg = ep_b.partition_S(sQgSt[(None, None, 0)])
-                tkgq = ep_b.partition_S(sKgqBSt[(None, None, 0)])
-                tkgk = ep_b.partition_S(sKgkSt[(None, None, 0)])
+                tsqr = ep_b.partition_S(sQ[(None, None, kq_h.index)])
+                tskr = ep_b.partition_S(sK[(None, None, kq_h.index)])
                 tdq = ep_b.partition_S(sStg1[(None, None, 0)])
                 tdkb = ep_b.partition_S(sStg2[(None, None, 0)])
                 tdka = ep_b.partition_S(sStg3[(None, None, 0)])
 
+                lane = local_tid % 32
                 for rb in cutlass.range_constexpr(cute.size(tin_q, mode=[1])):
-                    if ep_row + rb * 8 < valid:
-                        r_g = cute.make_fragment_like(tsg[(None, 0, None)], Float32)
-                        cute.copy(cp_g_f32, tsg[(None, rb, None)], r_g)
-                        r_dqr = cute.make_fragment_like(tdq[(None, 0, None)], self.io_type)
-                        cute.copy(cp_g_bf16, tdq[(None, rb, None)], r_dqr)
-                        r_dkbr = cute.make_fragment_like(tdkb[(None, 0, None)], self.io_type)
-                        cute.copy(cp_g_bf16, tdkb[(None, rb, None)], r_dkbr)
-                        r_dkar = cute.make_fragment_like(tdka[(None, 0, None)], self.io_type)
-                        cute.copy(cp_g_bf16, tdka[(None, rb, None)], r_dkar)
-                        r_qg = cute.make_fragment_like(tqg[(None, 0, None)], self.io_type)
-                        cute.copy(cp_g_bf16, tqg[(None, rb, None)], r_qg)
-                        r_kgq = cute.make_fragment_like(r_qg, self.io_type)
-                        cute.copy(cp_g_bf16, tkgq[(None, rb, None)], r_kgq)
-                        r_kgk = cute.make_fragment_like(r_qg, self.io_type)
-                        cute.copy(cp_g_bf16, tkgk[(None, rb, None)], r_kgk)
+                    row = ep_row + rb * 8
+                    db_p = Float32(0.0)
+                    beta_row = Float32(1.0)
+                    if row < valid:
+                        beta_row = g_beta[(token_start + row, (h_idx, 0))]
+                        r_dqf = cute.make_fragment_like(tdq[(None, 0, None)], self.io_type)
+                        cute.copy(cp_g_bf16, tdq[(None, rb, None)], r_dqf)
+                        r_dkbf = cute.make_fragment_like(r_dqf, self.io_type)
+                        cute.copy(cp_g_bf16, tdkb[(None, rb, None)], r_dkbf)
+                        r_dkaf = cute.make_fragment_like(r_dqf, self.io_type)
+                        cute.copy(cp_g_bf16, tdka[(None, rb, None)], r_dkaf)
+                        r_q = cute.make_fragment_like(r_dqf, self.io_type)
+                        cute.copy(cp_g_bf16, tsqr[(None, rb, None)], r_q)
+                        r_k = cute.make_fragment_like(r_dqf, self.io_type)
+                        cute.copy(cp_g_bf16, tskr[(None, rb, None)], r_k)
                         r_i1 = cute.make_fragment_like(tin_q[(None, 0, None)], Float32)
                         cute.copy(cp_g_f32, tin_q[(None, rb, None)], r_i1)
                         r_i2 = cute.make_fragment_like(tin_k[(None, 0, None)], Float32)
@@ -895,66 +894,41 @@ class KdaIntraEngine:
                         r_i3 = cute.make_fragment_like(tin_g[(None, 0, None)], Float32)
                         cute.copy(cp_g_f32, tin_g[(None, rb, None)], r_i3)
 
-                        r_o1 = cute.make_fragment_like(r_qg, self.io_type)
-                        r_o2 = cute.make_fragment_like(r_qg, self.io_type)
+                        r_o1 = cute.make_fragment_like(r_dqf, self.io_type)
+                        r_o2 = cute.make_fragment_like(r_dqf, self.io_type)
                         r_o3 = cute.make_fragment_like(r_i3, Float32)
                         for e in cutlass.range_constexpr(cute.size(r_o1)):
-                            gq = cute.math.exp2(r_g[e] - grf[e], fastmath=True)
-                            dq_r = Float32(r_dqr[e])
-                            dkb_r = Float32(r_dkbr[e])
-                            dka_r = Float32(r_dkar[e])
-                            r_o1[e] = self.io_type(r_i1[e] + dq_r * gq)
-                            r_o2[e] = self.io_type(r_i2[e] + dkb_r * gq + dka_r / gq)
-                            # dg identity via staged gated operands:
-                            # q*dq_s = qg*dq_raw, k*dkb_s = kgq*dkb_raw,
-                            # k*dka_s = kgk*dka_raw (gk = 1/gq folded into kgk).
+                            dqf_v = Float32(r_dqf[e])
+                            dkbf_v = Float32(r_dkbf[e])
+                            dkaf_v = Float32(r_dkaf[e])
+                            q_v = Float32(r_q[e])
+                            k_v = Float32(r_k[e])
+                            r_o1[e] = self.io_type(r_i1[e] + dqf_v)
+                            r_o2[e] = self.io_type(r_i2[e] + dkbf_v + dkaf_v)
                             r_o3[e] = Float32(
-                                (
-                                    r_i3[e]
-                                    + Float32(r_qg[e]) * dq_r
-                                    + Float32(r_kgq[e]) * dkb_r
-                                    - Float32(r_kgk[e]) * dka_r
-                                )
+                                (r_i3[e] + q_v * dqf_v + k_v * dkbf_v - k_v * dkaf_v)
                                 * Float32(LN2)
                             )
+                            # db = rowsum_d(k * dkb_final): the S identity.
+                            db_p += k_v * dkbf_v
                         cute.copy(cp_g_bf16, r_o1, tout_q[(None, rb, None)])
                         cute.copy(cp_g_bf16, r_o2, tout_k[(None, rb, None)])
                         cute.copy(cp_g_f32, r_o3, tout_g[(None, rb, None)])
-
-                # ---- db: rowsum(ak * S) via sAqRaw staging ----
-                s_reg = cute.make_rmem_tensor(sreg_shape, self.acc_type)
-                if local_tid < 128:
-                    cute.copy(tc_s, p_t_s[(None, None, None, accB_h.index)], s_reg)
-                    cute.arch.fence_view_async_tmem_load()
-                    cute.copy(
-                        tc_r2s_s,
-                        tc_r2s_s.retile(s_reg),
-                        thr_r2s_s.partition_D(sDbSt[(None, None, raw_h.index)]),
-                    )
-                accB_h.release()
+                    # One warp owns this row: reduce the 32 x 4-col partials.
+                    for off in cutlass.range_constexpr(5):
+                        db_p += cute.arch.shuffle_sync_bfly(db_p, 1 << off)
+                    if lane == 0 and row < valid:
+                        # db uses the RAW dAkk (no beta), but dkb's operand is
+                        # beta-folded; beta is row-constant so it divides out
+                        # exactly (dkb_fin = beta_r * dkb_raw_fin). sigmoid
+                        # betas below ~1e-35 would flush dkb_fin first, but
+                        # that regime is far outside trained gates.
+                        db_v = db_p / cutlass.max(beta_row, Float32(1e-35))
+                        g_db2[(token_start + row, (h_idx, 0))] = (
+                            g_dbin[(token_start + row, (h_idx, 0))] + db_v
+                        )
                 self.cuda_bar.arrive_and_wait()
-                # Row-per-thread masked dot: db[r] = sum_{j<=r} ak[r,j] * S[r,j].
-                if local_tid < 2 * BT:
-                    dbrow = local_tid % BT
-                    dbhalf = local_tid // BT
-                    total = Float32(0.0)
-                    if dbrow < valid:
-                        for j in cutlass.range_constexpr(BT // 2):
-                            jj = dbhalf * (BT // 2) + j
-                            if jj <= dbrow:
-                                total += (
-                                    sDbSt[(dbrow, jj, raw_h.index)]
-                                    * sAkRaw[(dbrow, jj, raw_h.index)]
-                                )
-                    sBetaRed[local_tid] = total
-                self.cuda_bar.arrive_and_wait()
-                if local_tid < BT and local_tid < valid:
-                    g_db2[(token_start + local_tid, (h_idx, 0))] = (
-                        g_dbin[(token_start + local_tid, (h_idx, 0))]
-                        + sBetaRed[local_tid]
-                        + sBetaRed[local_tid + BT]
-                    )
-                self.cuda_bar.arrive_and_wait()
+                kq_h.release()
                 raw_h.release()
 
                 it = it + 1
@@ -1037,61 +1011,53 @@ class KdaIntraEngine:
             it = Int32(0)
             has_work = it < n_iters
             while has_work:
-                # Phase A: dq = aq @ kgk^T, dkb = ak @ kgk^T
+                # Strip commits (order: dq 0-3, dkb 0-3, dka 0-3); every
+                # commit ping-pongs the shared depth-2 accumulator region so
+                # the next strip's gemm overlaps the previous strip's drain.
                 opA_h = popA_C.wait_and_advance()
-                accA_h = paccA_P.acquire_and_advance()
-                accB_h = paccB_P.acquire_and_advance()
-                for kp in cutlass.range(cute.size(t_aq_a, mode=[2]), unroll_full=True):
-                    mma_tok.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_P.acquire_and_advance()
+                    mma_tok.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(False))
                     cute.gemm(
                         mma_tok,
-                        t_dq_acc[None, None, None, accA_h.index],
-                        t_aq_a[None, None, kp, 0],
-                        t_kgk_b[None, None, kp, 0],
-                        t_dq_acc[None, None, None, accA_h.index],
+                        t_dq_acc[None, None, None, sc % 2],
+                        t_aq_a[None, None, sc, 0],
+                        t_kgk_b[None, None, sc, 0],
+                        t_dq_acc[None, None, None, sc % 2],
                     )
-                for kp in cutlass.range(cute.size(t_ak_a, mode=[2]), unroll_full=True):
-                    mma_tok.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                    acc_h.commit()
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_P.acquire_and_advance()
+                    mma_tok.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(False))
                     cute.gemm(
                         mma_tok,
-                        t_dkb_acc[None, None, None, accA_h.index],
-                        t_ak_a[None, None, kp, 0],
-                        t_kgk_b[None, None, kp, 0],
-                        t_dkb_acc[None, None, None, accA_h.index],
+                        t_dkb_acc[None, None, None, sc % 2],
+                        t_ak_a[None, None, sc, 0],
+                        t_kgk_b[None, None, sc, 0],
+                        t_dkb_acc[None, None, None, sc % 2],
                     )
-                accA_h.commit()
-
-                # Phase B: dka/dkc, then S.
+                    acc_h.commit()
                 opB_h = popB_C.wait_and_advance()
-                for kp in cutlass.range(cute.size(t_aqt_a, mode=[2]), unroll_full=True):
-                    mma_tok2.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                for sc in cutlass.range_constexpr(4):
+                    acc_h = pacc_P.acquire_and_advance()
+                    mma_tok2.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(False))
                     cute.gemm(
                         mma_tok2,
-                        t_dka_acc[None, None, None, accB_h.index],
-                        t_aqt_a[None, None, kp, 0],
-                        t_qg_b[None, None, kp, 0],
-                        t_dka_acc[None, None, None, accB_h.index],
+                        t_dka_acc[None, None, None, sc % 2],
+                        t_aqt_a[None, None, sc, 0],
+                        t_qg_b[None, None, sc, 0],
+                        t_dka_acc[None, None, None, sc % 2],
                     )
-                for kp in cutlass.range(cute.size(t_akbt_a, mode=[2]), unroll_full=True):
                     mma_tok2.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(True))
                     cute.gemm(
                         mma_tok2,
-                        t_dka_acc[None, None, None, accB_h.index],
-                        t_akbt_a[None, None, kp, 0],
-                        t_kgqb_b[None, None, kp, 0],
-                        t_dka_acc[None, None, None, accB_h.index],
+                        t_dka_acc[None, None, None, sc % 2],
+                        t_akbt_a[None, None, sc, 0],
+                        t_kgqb_b[None, None, sc, 0],
+                        t_dka_acc[None, None, None, sc % 2],
                     )
-                for kp in cutlass.range(cute.size(t_kgqa_a, mode=[2]), unroll_full=True):
-                    mma_s.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(
-                        mma_s,
-                        t_s_acc[None, None, None, accB_h.index],
-                        t_kgqa_a[None, None, kp, 0],
-                        t_kgks_b[None, None, kp, 0],
-                        t_s_acc[None, None, None, accB_h.index],
-                    )
-                opA_h.release()  # kgk (shared with the S B-operand) now free
-                accB_h.commit()
+                    acc_h.commit()
+                opA_h.release()
                 opB_h.release()
 
                 it = it + 1
