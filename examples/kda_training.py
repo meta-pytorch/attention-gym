@@ -57,7 +57,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import _chunk_kda
 from attn_gym.linear.kda.fwd.triton.gate_fwd import _bounded_gate_cumsum
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
 from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref
-from attn_gym.linear.kda.short_conv import cute_causal_conv1d_silu
+from attn_gym.linear.kda.short_conv import causal_conv1d
 
 Backend = Literal["reference", "fused"]
 
@@ -340,9 +340,10 @@ class KDAAttention(nn.Module):
             initial_state = initial_state.to(device=qkv.device, dtype=qkv.dtype).contiguous()
 
         if self.backend == "fused":
-            result = cute_causal_conv1d_silu(
+            result = causal_conv1d(
                 qkv,
                 self.qkv_conv1d.weight[:, 0].to(self.compute_dtype),
+                activation="silu",
                 initial_state=initial_state,
                 cu_seqlens=cu_seqlens,
                 return_final_state=return_final_state,

@@ -1,5 +1,6 @@
 """Infrastructure shared by CuTeDSL attention backends."""
 
+from ._key import function_cache_key
 from .cache import jit_cache
 from .tune import TunableKernel, benchmark_gpu, run_tunable, tune
 from .utils import (
@@ -16,6 +17,7 @@ __all__ = [
     "benchmark_gpu",
     "ceildiv",
     "compile_tvm_ffi",
+    "function_cache_key",
     "get_device_properties",
     "jit_cache",
     "run_tunable",

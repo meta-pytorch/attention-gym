@@ -1,6 +1,8 @@
 """Correctness and integration tests for the CuTeDSL KDA short convolution."""
 
+import sys
 from itertools import pairwise
+from types import FunctionType
 
 import pytest
 import torch
@@ -9,6 +11,7 @@ import torch.nn.functional as F
 pytest.importorskip("cutlass")
 
 import attn_gym.linear.kda.short_conv.cute as cute_backend
+from attn_gym.linear.kda.short_conv import activations
 from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
@@ -18,8 +21,8 @@ from attn_gym.linear.kda.short_conv.cute import (
     _configured_backward_with_state_grad_op,
     _configured_forward_op,
     _forward_op,
-    cute_causal_conv1d_silu,
-    tune_causal_conv1d_silu,
+    causal_conv1d,
+    tune_causal_conv1d,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -40,9 +43,13 @@ def _inputs(
     return x.requires_grad_(), weight.requires_grad_()
 
 
-def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _plain_conv_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     padded = F.pad(x.transpose(1, 2), (weight.shape[1] - 1, 0))
-    return F.silu(F.conv1d(padded, weight[:, None], groups=x.shape[-1])).transpose(1, 2)
+    return F.conv1d(padded, weight[:, None], groups=x.shape[-1]).transpose(1, 2)
+
+
+def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return F.silu(_plain_conv_reference(x, weight))
 
 
 def _packed_reference(
@@ -89,7 +96,7 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     x, weight = _inputs(width=width)
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight)
+    actual = causal_conv1d(x, weight, activation="silu")
     expected = _reference(x, weight)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -165,7 +172,7 @@ def test_short_conv_tma_rejects_partial_channel_tiles():
             4,
             config,
             cute_backend.SHORT_CONV_DTYPES[torch.bfloat16],
-            cute_backend._silu_derivative,
+            activations._silu_derivative,
         )
 
 
@@ -196,7 +203,7 @@ def test_short_conv_supported_dtypes_match_high_precision_reference(
     )
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    actual = causal_conv1d(x, weight, activation="silu", initial_state=initial_state)
     reference_input = torch.cat((initial_state, x), dim=1)
     expected = F.silu(
         F.conv1d(reference_input.transpose(1, 2), weight[:, None], groups=12)
@@ -252,7 +259,7 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
     x, weight = _inputs(tokens=19, channels=channels)
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight)
+    actual = causal_conv1d(x, weight, activation="silu")
     expected = _reference(x, weight)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -261,8 +268,10 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
 
-    compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
-    torch.testing.assert_close(compiled(x, weight), expected, rtol=2e-2, atol=2e-2)
+    compiled = torch.compile(causal_conv1d, fullgraph=True)
+    torch.testing.assert_close(
+        compiled(x, weight, activation="silu"), expected, rtol=2e-2, atol=2e-2
+    )
 
     for kind in ("forward", "input_gradient", "weight_gradient"):
         candidates = _candidate_configs(kind, channels)
@@ -285,7 +294,7 @@ def test_short_conv_tma_backward_matches_batched_reference(
     x, weight = _inputs(tokens=tokens, channels=256, width=width, batch=2, dtype=dtype)
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight)
+    actual = causal_conv1d(x, weight, activation="silu")
     expected = _reference(x, weight)
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
@@ -304,6 +313,7 @@ def test_short_conv_tma_backward_matches_batched_reference(
         grad_output,
         fallback_input,
         fallback_weight,
+        activation="silu",
     )
 
     tolerance = 1e-4 if dtype == torch.float32 else 3e-2
@@ -347,6 +357,7 @@ def test_short_conv_tma_input_gradient_wider_than_time_tile():
         grad_output,
         defaults.input_gradient,
         ShortConvConfig(128, 4, 128),
+        activation="silu",
     )[0]
 
     torch.testing.assert_close(actual_dx, expected_dx, rtol=3e-2, atol=3e-2)
@@ -364,7 +375,7 @@ def test_short_conv_packed_tma_backward_matches_fallback(tokens: int):
         dtype=torch.int32,
     )
 
-    actual = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+    actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
     expected = _packed_reference(x, weight, cu_seqlens)
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
@@ -375,6 +386,7 @@ def test_short_conv_packed_tma_backward_matches_fallback(tokens: int):
         ShortConvConfig(128, 4, 10),
         ShortConvConfig(64, 4, 128),
         cu_seqlens,
+        activation="silu",
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
@@ -395,7 +407,7 @@ def test_short_conv_dense_stateful_tma_backward_matches_reference():
     reference_state = initial_state.detach().clone().requires_grad_()
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    actual = causal_conv1d(x, weight, activation="silu", initial_state=initial_state)
     expected_input = torch.cat((reference_state, x), dim=1)
     expected = F.silu(
         F.conv1d(expected_input.transpose(1, 2), weight[:, None], groups=256)
@@ -435,9 +447,10 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
     )
     reference_state = initial_state.detach().clone().requires_grad_()
 
-    actual = cute_causal_conv1d_silu(
+    actual = causal_conv1d(
         x,
         weight,
+        activation="silu",
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
     )
@@ -460,6 +473,7 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
         ShortConvConfig(64, 4, 128),
         cu_seqlens,
         initial_state,
+        activation="silu",
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
@@ -538,9 +552,10 @@ def test_short_conv_dynamic_active_endpoint_ignores_nan_suffix(
         cu_seqlens,
         expected_state,
     )
-    actual_output, actual_final = cute_causal_conv1d_silu(
+    actual_output, actual_final = causal_conv1d(
         x,
         weight,
+        activation="silu",
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
         return_final_state=True,
@@ -603,7 +618,7 @@ def test_short_conv_batched_forward_and_backward_match_pytorch():
     grad_output = torch.randn_like(x)
     weight_config = ShortConvConfig(128, 4, 8)
 
-    actual = cute_causal_conv1d_silu(x, weight, weight_grad_config=weight_config)
+    actual = causal_conv1d(x, weight, activation="silu", weight_grad_config=weight_config)
     expected = _reference(x, weight)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -625,7 +640,7 @@ def test_short_conv_packed_forward_and_backward_match_independent_sequences(widt
     )
     grad_output = torch.randn_like(x)
 
-    actual = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+    actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
     expected = _packed_reference(x, weight, cu_seqlens)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -639,9 +654,10 @@ def test_short_conv_packed_final_state_uses_implicit_zero_history():
     """Return packed history for empty and short sequences without an initial state."""
     x, weight = _inputs(tokens=7, channels=12, width=5)
     cu_seqlens = torch.tensor([0, 0, 1, 3, 7], device="cuda", dtype=torch.int32)
-    actual, actual_final = cute_causal_conv1d_silu(
+    actual, actual_final = causal_conv1d(
         x,
         weight,
+        activation="silu",
         cu_seqlens=cu_seqlens,
         return_final_state=True,
     )
@@ -667,9 +683,10 @@ def test_short_conv_packed_state_forward_and_backward(width: int):
     )
     expected_state = initial_state.detach().clone().requires_grad_()
 
-    actual, actual_final = cute_causal_conv1d_silu(
+    actual, actual_final = causal_conv1d(
         x,
         weight,
+        activation="silu",
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
         return_final_state=True,
@@ -713,7 +730,7 @@ def test_short_conv_accepts_misaligned_contiguous_storage():
     assert x.is_contiguous() and x.data_ptr() % 16 != 0
     assert weight.is_contiguous() and weight.data_ptr() % 16 != 0
 
-    actual = cute_causal_conv1d_silu(x, weight)
+    actual = causal_conv1d(x, weight, activation="silu")
     expected = _reference(x, weight)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -734,10 +751,11 @@ def test_short_conv_explicit_config_and_tuning_flow():
     forward = ShortConvConfig(128, 2, 8)
     input_gradient = ShortConvConfig(128, 2, 10)
     weight_gradient = ShortConvConfig(128, 2, 128)
-    selected = tune_causal_conv1d_silu(
+    selected = tune_causal_conv1d(
         x,
         weight,
         grad_output,
+        activation="silu",
         initial_state=initial_state,
         forward_configs=(forward,),
         input_grad_configs=(input_gradient,),
@@ -747,9 +765,10 @@ def test_short_conv_explicit_config_and_tuning_flow():
     assert selected.forward == forward
     assert selected.input_gradient == input_gradient
     assert selected.weight_gradient == weight_gradient
-    actual = cute_causal_conv1d_silu(
+    actual = causal_conv1d(
         x,
         weight,
+        activation="silu",
         initial_state=initial_state,
         forward_config=selected.forward,
         input_grad_config=selected.input_gradient,
@@ -762,9 +781,10 @@ def test_short_conv_explicit_config_and_tuning_flow():
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
     compiled = torch.compile(
-        lambda x, weight, initial_state: cute_causal_conv1d_silu(
+        lambda x, weight, initial_state: causal_conv1d(
             x,
             weight,
+            activation="silu",
             initial_state=initial_state,
             forward_config=selected.forward,
             input_grad_config=selected.input_gradient,
@@ -858,7 +878,7 @@ def test_short_conv_constant_history_skips_its_gradient_kernel(monkeypatch):
         raise AssertionError("initial-state-gradient kernel should not be compiled")
 
     monkeypatch.setattr(cute_backend, "_compile_initial_state_gradient", fail_compile)
-    output = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    output = causal_conv1d(x, weight, activation="silu", initial_state=initial_state)
     torch.autograd.grad(output, (x, weight), torch.randn_like(output))
 
 
@@ -867,10 +887,10 @@ def test_short_conv_fullgraph_forward_and_backward():
     x, weight = _inputs(batch=2)
     grad_output = torch.randn_like(x)
 
-    expected_output = cute_causal_conv1d_silu(x, weight)
+    expected_output = causal_conv1d(x, weight, activation="silu")
     expected = torch.autograd.grad(expected_output, (x, weight), grad_output)
-    compiled = torch.compile(cute_causal_conv1d_silu, fullgraph=True)
-    actual_output = compiled(x, weight)
+    compiled = torch.compile(causal_conv1d, fullgraph=True)
+    actual_output = compiled(x, weight, activation="silu")
     actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
     torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
@@ -892,9 +912,10 @@ def test_short_conv_packed_stateful_fullgraph_forward_and_backward():
     grad_final = torch.randn_like(initial_state)
 
     def operation(x, weight, initial_state, cu_seqlens):
-        return cute_causal_conv1d_silu(
+        return causal_conv1d(
             x,
             weight,
+            activation="silu",
             cu_seqlens=cu_seqlens,
             initial_state=initial_state,
             return_final_state=True,
@@ -934,15 +955,16 @@ def test_short_conv_width_one_preserves_empty_state_gradients():
         dtype=torch.bfloat16,
         requires_grad=True,
     )
-    output = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    output = causal_conv1d(x, weight, activation="silu", initial_state=initial_state)
     (grad_initial_state,) = torch.autograd.grad(output.sum(), (initial_state,))
     assert grad_initial_state.shape == initial_state.shape
 
     packed_x, packed_weight = _inputs(tokens=7, width=1)
     cu_seqlens = torch.tensor([0, 0, 2, 7], device="cuda", dtype=torch.int32)
-    _, final_state = cute_causal_conv1d_silu(
+    _, final_state = causal_conv1d(
         packed_x,
         packed_weight,
+        activation="silu",
         cu_seqlens=cu_seqlens,
         return_final_state=True,
     )
@@ -961,9 +983,10 @@ def test_short_conv_final_state_preserves_unused_initial_state_gradient():
         dtype=torch.bfloat16,
         requires_grad=True,
     )
-    _, final_state = cute_causal_conv1d_silu(
+    _, final_state = causal_conv1d(
         x,
         weight,
+        activation="silu",
         initial_state=initial_state,
         return_final_state=True,
     )
@@ -990,7 +1013,7 @@ def test_short_conv_initial_state_obeys_autograd_versioning():
         device="cuda",
         dtype=torch.bfloat16,
     )
-    output = cute_causal_conv1d_silu(x, weight, initial_state=initial_state)
+    output = causal_conv1d(x, weight, activation="silu", initial_state=initial_state)
 
     with torch.no_grad():
         initial_state.add_(0.25)
@@ -1002,7 +1025,7 @@ def test_short_conv_packed_offsets_obey_autograd_versioning():
     """Reject sequence-boundary mutation between forward and backward."""
     x, weight = _inputs(tokens=31)
     cu_seqlens = torch.tensor([0, 3, 11, 31], device="cuda", dtype=torch.int32)
-    output = cute_causal_conv1d_silu(x, weight, cu_seqlens=cu_seqlens)
+    output = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
 
     with torch.no_grad():
         cu_seqlens[1] = 4
@@ -1014,14 +1037,14 @@ def test_short_conv_cuda_graph_replay():
     """Capture the compiled launchers and replay with changed input values."""
     x, weight = _inputs()
     grad_output = torch.randn_like(x)
-    _forward_op(x, weight)
-    _backward_op(x, weight, grad_output)
+    _forward_op(x, weight, activation="silu")
+    _backward_op(x, weight, grad_output, activation="silu")
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _forward_op(x, weight)
-        captured_gradients = _backward_op(x, weight, grad_output)
+        captured_output = _forward_op(x, weight, activation="silu")
+        captured_gradients = _backward_op(x, weight, grad_output, activation="silu")
 
     graph.replay()
     first_output = captured_output.clone()
@@ -1033,8 +1056,8 @@ def test_short_conv_cuda_graph_replay():
 
     assert not torch.equal(captured_output, first_output)
     assert not torch.equal(captured_gradients[0], first_gradients[0])
-    expected_output = _forward_op(x, weight)
-    expected_gradients = _backward_op(x, weight, grad_output)
+    expected_output = _forward_op(x, weight, activation="silu")
+    expected_gradients = _backward_op(x, weight, grad_output, activation="silu")
     torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
     torch.testing.assert_close(captured_gradients[0], expected_gradients[0], rtol=0, atol=0)
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1], rtol=0, atol=0)
@@ -1053,17 +1076,17 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
         dtype=torch.bfloat16,
     )
     config = (128, 4, 10, 128, 4, 128)
-    _forward_op(x, weight, cu_seqlens, initial_state)
+    _forward_op(x, weight, cu_seqlens, initial_state, activation="silu")
     _configured_backward_with_state_grad_op(
-        x, weight, grad_output, cu_seqlens, initial_state, *config
+        x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
     )
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _forward_op(x, weight, cu_seqlens, initial_state)
+        captured_output = _forward_op(x, weight, cu_seqlens, initial_state, activation="silu")
         captured_gradients = _configured_backward_with_state_grad_op(
-            x, weight, grad_output, cu_seqlens, initial_state, *config
+            x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
         )
 
     active_tokens = 23
@@ -1077,9 +1100,9 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_output = _forward_op(x, weight, cu_seqlens, initial_state)
+    expected_output = _forward_op(x, weight, cu_seqlens, initial_state, activation="silu")
     expected_gradients = _configured_backward_with_state_grad_op(
-        x, weight, grad_output, cu_seqlens, initial_state, *config
+        x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens], expected_output[:, :active_tokens], rtol=0, atol=0
@@ -1124,14 +1147,14 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         defaults.weight_gradient.times_per_block,
     )
     _configured_backward_with_state_grad_op(
-        x, weight, grad_output, cu_seqlens, initial_state, *config
+        x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
     )
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_gradients = _configured_backward_with_state_grad_op(
-            x, weight, grad_output, cu_seqlens, initial_state, *config
+            x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
         )
 
     first_gradients = tuple(gradient.clone() for gradient in captured_gradients)
@@ -1155,7 +1178,7 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
     )
     assert not torch.equal(captured_gradients[1], first_gradients[1])
     expected_gradients = _configured_backward_with_state_grad_op(
-        x, weight, grad_output, cu_seqlens, initial_state, *config
+        x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
     )
     torch.testing.assert_close(
         captured_gradients[0][:, :active_tokens],
@@ -1169,3 +1192,242 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         strict=True,
     ):
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
+def test_short_conv_identity_activation_matches_plain_conv():
+    """Run the None-activation kernels against an activation-free reference."""
+    torch.manual_seed(5)
+    x, weight = _inputs()
+    grad_output = torch.randn_like(x)
+
+    actual = causal_conv1d(x, weight)
+    expected = _plain_conv_reference(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+
+
+def test_short_conv_identity_activation_packed_stateful():
+    """Check the identity derivative through the packed stateful gradient kernels."""
+    torch.manual_seed(6)
+    x, weight = _inputs(width=4)
+    cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32)
+    initial_state = torch.randn(
+        3, weight.shape[1] - 1, x.shape[2], device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
+    grad_output = torch.randn_like(x)
+
+    actual = causal_conv1d(x, weight, cu_seqlens=cu_seqlens, initial_state=initial_state)
+    outputs = []
+    for sequence, (start, end) in enumerate(pairwise(cu_seqlens.cpu().tolist())):
+        extended = torch.cat((initial_state[sequence : sequence + 1], x[:, start:end]), dim=1)
+        outputs.append(
+            F.conv1d(extended.transpose(1, 2), weight[:, None], groups=x.shape[-1]).transpose(1, 2)
+        )
+    expected = torch.cat(outputs, dim=1)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    leaves = (x, weight, initial_state)
+    actual_gradients = torch.autograd.grad(actual, leaves, grad_output)
+    expected_gradients = torch.autograd.grad(expected, leaves, grad_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-1)
+
+
+_ACTIVATION_GLOBAL_SCALE = 2.0
+
+
+def _globally_scaled_activation(value):
+    return value * _ACTIVATION_GLOBAL_SCALE
+
+
+def _globally_scaled_derivative(value):
+    return _ACTIVATION_GLOBAL_SCALE
+
+
+def _tanh_activation(value):
+    from cutlass import cute
+
+    return cute.math.tanh(value, fastmath=True)
+
+
+def _tanh_activation_derivative(value):
+    from cutlass import cute
+
+    tanh_value = cute.math.tanh(value, fastmath=True)
+    return 1.0 - tanh_value * tanh_value
+
+
+def test_short_conv_registered_custom_activation():
+    """Fuse a user-registered CuTeDSL activation and validate both gradients."""
+    activations.register_activation("tanh", _tanh_activation, _tanh_activation_derivative)
+    torch.manual_seed(7)
+    x, weight = _inputs()
+    grad_output = torch.randn_like(x)
+
+    actual = causal_conv1d(x, weight, activation="tanh")
+    expected = torch.tanh(_plain_conv_reference(x, weight))
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+
+
+def _make_scaled(scale: float):
+    def scaled_activation(value):
+        return value * scale
+
+    def scaled_derivative(value):
+        return scale
+
+    return scaled_activation, scaled_derivative
+
+
+def test_short_conv_activation_registration_contract():
+    """Reject unknown names, invalid names, and silent re-registration."""
+    x, weight = _inputs()
+    with pytest.raises(ValueError, match="unknown activation"):
+        causal_conv1d(x, weight, activation="missing")
+    with pytest.raises(ValueError, match="nonempty string"):
+        activations.register_activation("", _tanh_activation, _tanh_activation_derivative)
+    # Distinct function objects with identical sources may reuse a name; different
+    # sources must not, so a stale cached kernel can never be served silently.
+    equivalent_forward = FunctionType(_tanh_activation.__code__, _tanh_activation.__globals__)
+    equivalent_derivative = FunctionType(
+        _tanh_activation_derivative.__code__, _tanh_activation_derivative.__globals__
+    )
+    activations.register_activation("tanh-contract", _tanh_activation, _tanh_activation_derivative)
+    activations.register_activation("tanh-contract", equivalent_forward, equivalent_derivative)
+    # The no-op keeps the original, importable callables in the registry.
+    assert activations._ACTIVATIONS["tanh-contract"].forward is _tanh_activation
+    # Closure re-registration is a no-op only for equal captured values.
+    activations.register_activation("scaled-contract", *_make_scaled(2.0))
+    activations.register_activation("scaled-contract", *_make_scaled(2.0))
+    with pytest.raises(ValueError, match="different implementation"):
+        activations.register_activation("scaled-contract", *_make_scaled(3.0))
+    # Functions without retrievable source have no stable cache identity.
+    namespace: dict = {}
+    exec("def sourceless(value):\n    return value", namespace)  # noqa: S102 -- sourceless fixture
+    with pytest.raises(ValueError, match="no stable cache identity"):
+        activations.register_activation(
+            "sourceless", namespace["sourceless"], namespace["sourceless"]
+        )
+    with pytest.raises(ValueError, match="different implementation"):
+        activations.register_activation(
+            "tanh-contract", activations._silu, activations._silu_derivative
+        )
+
+
+def test_short_conv_closure_activations_key_on_captured_values():
+    """Two factory instances with different captures compile different kernels."""
+    activations.register_activation("scaled-two", *_make_scaled(2.0))
+    activations.register_activation("scaled-three", *_make_scaled(3.0))
+    torch.manual_seed(9)
+    x, weight = _inputs(channels=6, width=3)
+    grad_output = torch.randn_like(x)
+
+    doubled = causal_conv1d(x, weight, activation="scaled-two")
+    tripled = causal_conv1d(x, weight, activation="scaled-three")
+    expected = _plain_conv_reference(x, weight)
+    torch.testing.assert_close(doubled, expected * 2.0, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(tripled, expected * 3.0, rtol=2e-2, atol=2e-2)
+
+    doubled_gradients = torch.autograd.grad(doubled, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected * 2.0, (x, weight), grad_output)
+    torch.testing.assert_close(doubled_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(doubled_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+
+
+def test_short_conv_global_mutation_recompiles():
+    """Mutating a referenced module global must recompile, not reuse stale kernels."""
+    module = sys.modules[__name__]
+    activations.register_activation(
+        "global-scaled", _globally_scaled_activation, _globally_scaled_derivative
+    )
+    torch.manual_seed(10)
+    x, weight = _inputs(channels=6, width=3)
+    expected = _plain_conv_reference(x, weight)
+
+    original = module._ACTIVATION_GLOBAL_SCALE
+    try:
+        doubled = causal_conv1d(x, weight, activation="global-scaled")
+        torch.testing.assert_close(doubled, expected * original, rtol=2e-2, atol=2e-2)
+        module._ACTIVATION_GLOBAL_SCALE = original + 1.0
+        rescaled = causal_conv1d(x, weight, activation="global-scaled")
+        torch.testing.assert_close(rescaled, expected * (original + 1.0), rtol=2e-2, atol=2e-2)
+    finally:
+        module._ACTIVATION_GLOBAL_SCALE = original
+
+
+def test_tune_compiles_serially_for_script_defined_activations(monkeypatch):
+    """__main__ and closure callables cannot cross the compiler-process boundary."""
+    captured = []
+
+    def fake_tune(configs, compile_fn, launch, *, compile_call=None, parallel_compile=True):
+        captured.append(parallel_compile)
+        return next(iter(configs))
+
+    monkeypatch.setattr(cute_backend, "tune", fake_tune)
+    script_forward = FunctionType(_tanh_activation.__code__, _tanh_activation.__globals__)
+    script_derivative = FunctionType(
+        _tanh_activation_derivative.__code__, _tanh_activation_derivative.__globals__
+    )
+    script_forward.__module__ = script_derivative.__module__ = "__main__"
+    activations.register_activation("script-scoped", script_forward, script_derivative)
+
+    x, weight = _inputs(channels=6, width=3)
+    config = ShortConvConfig(128, 2, 8)
+    selected = tune_causal_conv1d(
+        x,
+        weight,
+        torch.randn_like(x),
+        activation="script-scoped",
+        forward_configs=(config,),
+        input_grad_configs=(config,),
+        weight_grad_configs=(config,),
+    )
+    assert selected == ShortConvTunedConfig(config, config, config)
+    assert captured == [False, False, False]
+
+    captured.clear()
+    activations.register_activation("closure-scoped", *_make_scaled(4.0))
+    tune_causal_conv1d(
+        x,
+        weight,
+        torch.randn_like(x),
+        activation="closure-scoped",
+        forward_configs=(config,),
+        input_grad_configs=(config,),
+        weight_grad_configs=(config,),
+    )
+    assert captured == [False, False, False]
+
+
+def _defaulted_activation(value, options={"scale": 2.0}):  # noqa: B006 -- mutable default fixture
+    return value * options["scale"]
+
+
+def test_function_cache_key_covers_defaults_and_nested_functions():
+    """Pin the key surface: mutable defaults change keys; nested fns stay serial."""
+    from attn_gym._backends.cute import function_cache_key
+
+    before = function_cache_key(_defaulted_activation)
+    _defaulted_activation.__defaults__[0]["scale"] = 3.0
+    try:
+        assert function_cache_key(_defaulted_activation) != before
+    finally:
+        _defaulted_activation.__defaults__[0]["scale"] = 2.0
+
+    def nested_activation(value, scale=2.0):
+        return value * scale
+
+    # No closure, real module, but <locals>: must not claim process crossing.
+    activation = activations.Activation("nested", nested_activation, nested_activation)
+    assert not activation.crosses_process_boundary
