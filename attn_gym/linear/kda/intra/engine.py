@@ -49,6 +49,65 @@ from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_
 LN2 = math.log(2.0)
 
 
+# ---------------------------------------------------------------------------
+# Tiny standalone Triton kernel: 16x16 unit-lower Neumann inverses of the
+# engine's raw diag blocks (same log-depth factorization as the fwd forloop).
+# ---------------------------------------------------------------------------
+import triton
+import triton.language as tl
+
+from attn_gym.linear.kda.chunk_scheduler import (
+    load_ragged_chunk_work as _tl_load_ragged_chunk_work,
+)
+
+
+@triton.jit
+def _diag_neumann_inverse_kernel(
+    akkd,
+    cu_seqlens,
+    chunk_offsets,
+    num_sequences,
+    H: tl.constexpr,
+    BC: tl.constexpr,
+):
+    pid, i_h = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    if pid // 4 >= tl.load(chunk_offsets + num_sequences):
+        return
+    _, _, token_start, valid = _tl_load_ragged_chunk_work(
+        cu_seqlens, chunk_offsets, pid // 4, num_sequences, 4 * BC
+    )
+    sub = pid % 4
+    row0 = token_start + sub * BC
+    vsub = tl.minimum(tl.maximum(valid - sub * BC, 0), BC)
+    o_r = tl.arange(0, BC)
+    o_c = tl.arange(0, BC)
+    ptrs = akkd + (row0 + o_r[:, None]).to(tl.int64) * (H * BC) + i_h * BC + o_c[None, :]
+    m_r = o_r[:, None] < vsub
+    b_a = tl.load(ptrs, mask=m_r, other=0.0)
+    m_i = (o_r[:, None] == o_c[None, :]).to(tl.float32)
+    b_n = -b_a
+    b_p = b_n + m_i
+    for _d in tl.static_range(3):
+        b_n = tl.sum(b_n[:, :, None] * b_n[None, :, :], 1)
+        b_p += tl.sum(b_p[:, :, None] * b_n[None, :, :], 1)
+    tl.store(ptrs, b_p, mask=m_r)
+
+
+def kda_diag_neumann_inverse(akkd: torch.Tensor, metadata: RaggedChunkMetadata) -> torch.Tensor:
+    """In-place inv(I + strict(block)) over the engine's raw 16x16 diag blocks."""
+    _, _, heads, BC = akkd.shape
+    _diag_neumann_inverse_kernel[(metadata.capacity * 4, heads)](
+        akkd,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        metadata.cu_seqlens.shape[0] - 1,
+        H=heads,
+        BC=BC,
+        num_warps=1,
+    )
+    return akkd
+
+
 class KdaIntraEngine:
     """Warp-specialized SM100 intra-chunk engine (bwd mode)."""
 
@@ -1205,7 +1264,8 @@ class KdaIntraFwdEngine:
         g_in: cute.Tensor,  # [T, H, K] fp32
         beta_in: cute.Tensor,  # [T, H] fp32
         aqk_in: cute.Tensor,  # [T, H, BT] bf16 (out)
-        akk_in: cute.Tensor,  # [T, H, BT] fp32 (out)
+        akkod_in: cute.Tensor,  # [caps*6, H*256] fp32 (out, K3b blocked layout)
+        akkd_in: cute.Tensor,  # [T, H, 16] fp32 (out, diag-block inverses)
         scale: Float32,
         cu_seqlens_in: cute.Tensor,
         chunk_offsets_in: cute.Tensor,
@@ -1226,7 +1286,8 @@ class KdaIntraFwdEngine:
         g_k = tok_view(k_in, BK)
         g_g = tok_view(g_in, BK)
         g_aqk = tok_view(aqk_in, BT)
-        g_akk = tok_view(akk_in, BT)
+        g_akkod = akkod_in  # already flat [caps*6, H*256]
+        g_akkd = tok_view(akkd_in, 16)
         g_beta = cute.make_tensor(
             beta_in.iterator, cute.make_layout((T, (H, 1)), stride=(H, (1, 0)))
         )
@@ -1319,7 +1380,8 @@ class KdaIntraFwdEngine:
             s_op_store,
             g_beta,
             g_aqk,
-            g_akk,
+            g_akkod,
+            g_akkd,
             scale,
             cu_seqlens_in,
             chunk_offsets_in,
@@ -1350,7 +1412,8 @@ class KdaIntraFwdEngine:
         s_op_store: cute.ComposedLayout,
         g_beta: cute.Tensor,
         g_aqk: cute.Tensor,
-        g_akk: cute.Tensor,
+        g_akkod: cute.Tensor,
+        g_akkd: cute.Tensor,
         scale: Float32,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
@@ -1477,11 +1540,6 @@ class KdaIntraFwdEngine:
             # col-groups x 4 elems = 256 threads.
             st_thr = cute.make_ordered_layout((16, 16), order=(1, 0))
             st_val = cute.make_layout((1, 4))
-            cp_st_f = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
-                st_thr,
-                st_val,
-            )
             cp_st_b = cute.make_tiled_copy_tv(
                 cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(), self.io_type, num_bits_per_copy=64
@@ -1489,7 +1547,6 @@ class KdaIntraFwdEngine:
                 st_thr,
                 st_val,
             )
-            st_g = cp_st_f.get_slice(local_tid)
             st_b = cp_st_b.get_slice(local_tid)
             st_row_in = local_tid // 16
             st_col0 = (local_tid % 16) * 4
@@ -1585,35 +1642,65 @@ class KdaIntraFwdEngine:
                         ),
                         cute.make_layout((BT, BT), stride=(gstride_a, 1)),
                     )
-                    gak = cute.make_tensor(
-                        cute.make_ptr(
-                            Float32,
-                            (g_akk.iterator + token_start * H * BT + h_idx * BT).toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        ),
-                        cute.make_layout((BT, BT), stride=(gstride_a, 1)),
-                    )
                     taq_o = st_b.partition_D(gaq)
-                    tak_o = st_g.partition_D(gak)
                     for rb in cutlass.range_constexpr(cute.size(taq_o, mode=[1])):
                         row = rb * 16 + st_row_in
                         if row < valid:
-                            beta_r = sBeta[row]
                             r_a = cute.make_fragment_like(taq_o[(None, 0, None)], self.io_type)
-                            r_b = cute.make_fragment_like(tak_o[(None, 0, None)], Float32)
                             for e in cutlass.range_constexpr(cute.size(r_a)):
                                 col = st_col0 + e
                                 aqk_v = Float32(0.0)
                                 if col <= row and col < valid:
                                     aqk_v = sSt1[(row, col)] * scale
                                 r_a[e] = self.io_type(aqk_v)
-                                akk_v = Float32(0.0)
-                                if col < row and col < valid:
-                                    akk_v = sSt2[(row, col)] * beta_r
-                                r_b[e] = akk_v
                             cute.copy(cp_st_b, r_a, taq_o[(None, rb, None)])
-                            cute.copy(cp_st_f, r_b, tak_o[(None, rb, None)])
+
+                    # AkkOD: strict off-diagonal 16x16 blocks in K3b's blocked
+                    # layout [chunk*6 + pair, h*256 + r16*16 + c16], beta-scaled;
+                    # each thread's 4-col run is contiguous in the block row.
+                    for rb in cutlass.range_constexpr(cute.size(taq_o, mode=[1])):
+                        row = rb * 16 + st_row_in
+                        beta_r = sBeta[row]
+                        ri = row // 16
+                        ci_blk = st_col0 // 16
+                        if ci_blk < ri:
+                            pair = ri * (ri - 1) // 2 + ci_blk
+                            od_row = chunk_idx * 6 + pair
+                            r_od = cute.make_rmem_tensor((4,), Float32)
+                            for e in cutlass.range_constexpr(4):
+                                r_od[e] = sSt2[(row, st_col0 + e)] * beta_r
+                            od_raw = (
+                                g_akkod.iterator
+                                + od_row * (H * 256)
+                                + Int32(h_idx) * 256
+                                + (row % 16) * 16
+                                + (st_col0 % 16)
+                            )
+                            od_t = cute.make_tensor(
+                                cute.make_ptr(
+                                    Float32,
+                                    od_raw.toint(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((4,), stride=(1,)),
+                            )
+                            cute.autovec_copy(r_od, od_t)
+                    # Akkd RAW: beta-scaled strict diag blocks; the 16x16
+                    # Neumann inverses run in a tiny standalone Triton kernel
+                    # off this kernel's critical path.
+                    dib = local_tid // 64  # diag block 0..3
+                    dit = local_tid % 64
+                    dr = dit % 16
+                    dc0 = (dit // 16) * 4
+                    arow = dib * 16 + dr
+                    if arow < valid:
+                        for e in cutlass.range_constexpr(4):
+                            dc = dc0 + e
+                            a_v = Float32(0.0)
+                            if dc < dr:
+                                a_v = sSt2[(arow, dib * 16 + dc)] * sBeta[arow]
+                            g_akkd[(token_start + arow, dc, (h_idx, 0))] = a_v
                     self.cuda_bar.arrive_and_wait()
 
                 it = it + 1
@@ -1748,7 +1835,10 @@ def _compile_intra_engine_fwd(H: int, head_dim: int, chunk_size: int):
         fk(cutlass.Float32, head_dim),
         beta,
         fk(cutlass.BFloat16, chunk_size),
-        fk(cutlass.Float32, chunk_size),
+        make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), H * 256), stride_order=(1, 0), assumed_align=16
+        ),
+        fk(cutlass.Float32, 16),
         cutlass.Float32(1.0),
         cu,
         offs,
@@ -1766,16 +1856,18 @@ def kda_intra_engine_fwd(
     beta: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward intra stage: full-tile Aqk (bf16) and Akk (fp32) per chunk."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward intra: Aqk (bf16), AkkOD (K3b blocked), Akkd (diag inverses).
+
+    Drop-in producer for the K4b assembly stage, replacing forloop + K3b.
+    """
     batch, tokens, heads, head_dim = q.shape
     assert batch == 1 and head_dim == 128
     aqk = torch.empty(
         (1, tokens, heads, metadata.chunk_size), device=q.device, dtype=torch.bfloat16
     )
-    akk = torch.empty(
-        (1, tokens, heads, metadata.chunk_size), device=q.device, dtype=torch.float32
-    )
+    akkod = torch.zeros((metadata.capacity * 6, heads * 256), device=q.device, dtype=torch.float32)
+    akkd = torch.empty((1, tokens, heads, 16), device=q.device, dtype=torch.float32)
     compiled = _compile_intra_engine_fwd(heads, head_dim, metadata.chunk_size)
     compiled(
         q[0].contiguous(),
@@ -1783,7 +1875,8 @@ def kda_intra_engine_fwd(
         g[0].contiguous(),
         beta[0].contiguous(),
         aqk[0],
-        akk[0],
+        akkod,
+        akkd[0],
         float(scale),
         metadata.cu_seqlens,
         metadata.chunk_offsets,
@@ -1791,4 +1884,4 @@ def kda_intra_engine_fwd(
         heads,
         metadata.capacity,
     )
-    return aqk, akk
+    return aqk, akkod, akkd
