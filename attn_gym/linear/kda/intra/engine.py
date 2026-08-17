@@ -55,8 +55,14 @@ downstream gain through K4b/recompute_w_u <= 1.007 -- negligible for the
 intended L2-normalized q/k and sigmoid beta.
 
 The backward engine is strip-rebased and safe at the training gate range but
-loses to the shipped chunk_kda_bwd_intra on perf (2412us vs 2056us on the zipf
-benchmark); see commit 296200f for the terminal verdict.
+does not beat the shipped chunk_kda_bwd_intra on perf (2412us vs 2056us zipf;
+ablation ladder in commit 296200f -- the one unablated lever, splitting the
+drain factor math across both warp groups, bounds out at roughly parity), so
+the shipped kernel remains the production bwd path. The drain clamp
+min(delta, 120) exists so clamped-finite factors multiply the exactly-zero
+out-of-strip partials; it would also silently cap real in-strip factors if a
+gate ever exceeded ~8 log2/token sustained -- unreachable inside the -5
+nats/token activation bound.
 """
 
 import math
@@ -928,9 +934,11 @@ class KdaIntraBwdEngine:
                     if lane == 0 and row < valid:
                         # db uses the RAW dAkk (no beta), but dkb's operand is
                         # beta-folded; beta is row-constant so it divides out
-                        # exactly (dkb_fin = beta_r * dkb_raw_fin). sigmoid
-                        # betas below ~1e-35 would flush dkb_fin first, but
-                        # that regime is far outside trained gates.
+                        # exactly (dkb_fin = beta_r * dkb_raw_fin). CONTRACT:
+                        # beta must be positive (sigmoid-produced); rows with
+                        # beta <= ~1e-35 lose their db gradient (the shipped
+                        # kernel computes db from raw fp32 dAkk and carries no
+                        # such restriction).
                         db_v = db_p / cutlass.max(beta_row, Float32(1e-35))
                         g_db2[(token_start + row, (h_idx, 0))] = (
                             g_dbin[(token_start + row, (h_idx, 0))] + db_v
@@ -1895,6 +1903,9 @@ def kda_intra_engine_fwd(
     aqk = torch.empty(
         (1, tokens, heads, metadata.chunk_size), device=q.device, dtype=torch.bfloat16
     )
+    # zeros (not empty): the persistent kernel writes only ACTIVE chunks' blocks,
+    # while shipped K3b's capacity-wide grid zero-fills inactive ones; K4b reads
+    # capacity-indexed rows, so inactive rows must be zero.
     akkod = torch.zeros((metadata.capacity * 6, heads * 256), device=q.device, dtype=torch.float32)
     akkd = torch.empty((1, tokens, heads, 16), device=q.device, dtype=torch.float32)
     compiled = _compile_intra_engine_fwd(heads, head_dim, metadata.chunk_size)
