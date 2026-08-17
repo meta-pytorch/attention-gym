@@ -8,10 +8,9 @@ on:
 
 jobs:
   claude-code:
-    uses: pytorch/test-infra/.github/workflows/_claude-code.yml@main
+    uses: pytorch/test-infra/.github/workflows/_claude-code.yml@6f37b78f7f4703a08e2deb07a4ab50f9c5f700b4 # main
     permissions:
       contents: read
       pull-requests: write
       issues: write
       id-token: write
-    secrets: inherit

@@ -26,9 +26,10 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@6f37b78f7f4703a08e2deb07a4ab50f9c5f700b4 # main
     with:
       timeout: 60
+      test-infra-ref: 6f37b78f7f4703a08e2deb07a4ab50f9c5f700b4
       runner: ${{ matrix.runs-on }}
       gpu-arch-type: ${{ matrix.gpu-arch-type }}
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
