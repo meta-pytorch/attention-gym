@@ -1,0 +1,61 @@
+name: Delete old pull request branches
+
+on:
+  schedule:
+    - cron: "30 2 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: delete-old-pr-branches
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Report old pull request branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/delete_old_pr_branches.py --dry-run
+
+  delete:
+    if: github.event_name == 'schedule' && github.repository == 'meta-pytorch/attention-gym'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          # The cleanup script uses git push to delete eligible branches.
+          persist-credentials: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Test branch cleanup policy
+        run: python .github/scripts/test_delete_old_pr_branches.py
+
+      - name: Delete old pull request branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/delete_old_pr_branches.py
