@@ -435,8 +435,19 @@ def test_chunk_kda_single_sequence_metadata_matches_dense_path():
     explicit_gradients = torch.autograd.grad(
         (explicit_output, explicit_state), explicit_inputs, (d_output, d_state)
     )
-    for explicit_gradient, dense_gradient in zip(explicit_gradients, dense_gradients, strict=True):
-        torch.testing.assert_close(explicit_gradient, dense_gradient, rtol=0, atol=0)
+    # Forward values and most gradients stay bitwise across the two lowerings.
+    # The exception is the FP32 cumulative-gate gradient: it is the only output
+    # assembled by software FP32 reduction chains (dq/dk/dv come from MMA
+    # accumulators with hardware-fixed order), and the dense versus ragged
+    # constexpr specializations of the fused wy/dqkg kernel schedule those
+    # chains differently, so it accumulates a few rounding steps near zero and
+    # gets an absolute bound instead of bit equality.
+    gate_index = 3
+    for index, (explicit_gradient, dense_gradient) in enumerate(
+        zip(explicit_gradients, dense_gradients, strict=True)
+    ):
+        atol = 1e-8 if index == gate_index else 0.0
+        torch.testing.assert_close(explicit_gradient, dense_gradient, rtol=0, atol=atol)
 
 
 def test_optimized_chunk_kda_autograd_without_initial_state():
