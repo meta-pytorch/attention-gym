@@ -11,6 +11,7 @@ from attn_gym.linear.kda.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
     causal_conv1d,
+    causal_conv1d_decode,
     tune_causal_conv1d,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "ShortConvConfig",
     "ShortConvTunedConfig",
     "causal_conv1d",
+    "causal_conv1d_decode",
     "register_activation",
     "tune_causal_conv1d",
 ]

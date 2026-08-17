@@ -29,7 +29,16 @@ from cutlass.cute.nvgpu import cpasync
 
 from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym.linear.kda import ops as kda_ops
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
+
+_forward_op = kda_ops.short_conv_forward_op
+_backward_op = kda_ops.short_conv_backward_op
+_decode_op = kda_ops.short_conv_decode_op
+_configured_forward_op = kda_ops.short_conv_configured_forward_op
+_configured_backward_op = kda_ops.short_conv_configured_backward_op
+_configured_backward_with_state_grad_op = kda_ops.short_conv_configured_backward_with_state_grad_op
+_configured_decode_op = kda_ops.short_conv_configured_decode_op
 
 
 @dataclass(frozen=True)
@@ -417,6 +426,118 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
                 self.batches,
+            ),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+
+class CausalConv1dSiluDecode(ShortConvKernel):
+    """Advance a paged causal history by one token per sequence, activation fused."""
+
+    kernel_kind = "decode"
+    sequence_axis = "n"
+    time_tiled = False
+
+    def __init__(
+        self,
+        channels: int,
+        width: int,
+        config: ShortConvConfig,
+        dtype: ShortConvDType,
+        activation,
+    ):
+        assert channels % config.channels_per_thread == 0, (
+            f"decode channels ({channels}) must be divisible by channels_per_thread "
+            f"({config.channels_per_thread})"
+        )
+        super().__init__(0, 1, channels, width, config, dtype)
+        self.activation = activation
+
+    def get_name(self) -> str:
+        """Name the artifact without the runtime-bound sequence axis."""
+        return (
+            f"short_conv_{self.kernel_kind}_{self.dtype.name}_c{self.channels}"
+            f"_w{self.width}_th{self.threads}_v{self.channels_per_thread}"
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        state: cute.Tensor,
+        state_indices: cute.Tensor | None,
+    ):
+        """Advance one packed channel group of one sequence's history."""
+        thread_idx, _, _ = cute.arch.thread_idx()
+        channel_block, sequence, _ = cute.arch.block_idx()
+        channel_group = channel_block * self.threads + thread_idx
+        channel = channel_group * self.channels_per_thread
+
+        if channel < self.channels:
+            slot = Int32(sequence)
+            active = cutlass.Boolean(True)
+            if cutlass.const_expr(state_indices is not None):
+                slot = state_indices[sequence]
+                active = cutlass.Boolean(slot > 0)
+
+            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+            output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
+            state_groups = cute.zipped_divide(state, (1, self.channels_per_thread))
+
+            if active:
+                weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+                for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                    for tap in cutlass.range_constexpr(self.width):
+                        weights[channel_offset, tap] = Float32(
+                            weight[channel + channel_offset, tap]
+                        )
+
+                history_base = slot * (self.width - 1)
+                taps = cute.make_rmem_tensor(
+                    (self.channels_per_thread, self.width), self.dtype.cute_type
+                )
+                for row in cutlass.range_constexpr(self.width - 1):
+                    taps[(None, row)].store(
+                        state_groups[((0, None), (history_base + row, channel_group))].load()
+                    )
+                taps[(None, self.width - 1)].store(
+                    x_groups[((0, None), (sequence, channel_group))].load()
+                )
+
+                output_groups[((0, None), (sequence, channel_group))].store(
+                    self.activation(unrolled_dot(taps, weights, 0, self.width)).to(
+                        self.dtype.cute_type
+                    )
+                )
+                for row in cutlass.range_constexpr(self.width - 1):
+                    state_groups[((0, None), (history_base + row, channel_group))].store(
+                        taps[(None, row + 1)].load()
+                    )
+            else:
+                padding = cute.make_rmem_tensor((self.channels_per_thread,), self.dtype.cute_type)
+                padding.fill(self.dtype.cute_type(0.0))
+                output_groups[((0, None), (sequence, channel_group))].store(padding.load())
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        state: cute.Tensor,
+        state_indices: cute.Tensor | None,
+        stream,
+    ):
+        """Launch the configured decode specialization."""
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(x, weight, output, state, state_indices).launch(
+            grid=(
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+                cute.size(x, mode=[0]),
+                1,
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -2229,6 +2350,47 @@ def _validate_inputs(
             raise ValueError("initial_state must match x dtype and be contiguous on x.device")
 
 
+def _validate_decode_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None,
+) -> None:
+    """Validate the one-token in-place decode tensor contract."""
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape [num_sequences, C], got {tuple(x.shape)}")
+    if x.shape[0] < 1 or x.shape[1] < 1:
+        raise ValueError(
+            f"x must have positive sequence and channel dimensions, got {tuple(x.shape)}"
+        )
+    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or not x.is_contiguous():
+        raise ValueError("x must be a contiguous CUDA FP16, BF16, or FP32 tensor")
+    if weight.ndim != 2 or weight.shape[0] != x.shape[1] or weight.shape[1] < 2:
+        raise ValueError(
+            f"weight must have shape [{x.shape[1]}, W] with W >= 2, got {tuple(weight.shape)}"
+        )
+    if weight.dtype != x.dtype or weight.device != x.device or not weight.is_contiguous():
+        raise ValueError("weight must match x dtype and be contiguous on x.device")
+
+    sequences, channels = x.shape
+    slots = sequences if state_indices is None else (state.shape[0] if state.ndim == 3 else -1)
+    expected_state = (slots, weight.shape[1] - 1, channels)
+    if slots < 1 or state.ndim != 3 or state.shape != expected_state:
+        raise ValueError(f"state must have shape {expected_state}, got {tuple(state.shape)}")
+    if state.dtype != x.dtype or state.device != x.device or not state.is_contiguous():
+        raise ValueError("state must match x dtype and be contiguous on x.device")
+
+    if state_indices is not None and (
+        tuple(state_indices.shape) != (sequences,)
+        or state_indices.dtype != torch.int32
+        or state_indices.device != x.device
+        or not state_indices.is_contiguous()
+    ):
+        raise ValueError(
+            f"state_indices must be contiguous int32 with shape ({sequences},) on x.device"
+        )
+
+
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
     """Materialize the uncommon contiguous view that misses the launcher ABI alignment."""
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
@@ -2581,11 +2743,78 @@ def _config(threads: int, channels_per_thread: int, times_per_block: int) -> Sho
     return ShortConvConfig(threads, channels_per_thread, times_per_block)
 
 
-torch.library.define(
-    "attn_gym::_cute_short_conv_fwd",
-    "(Tensor x, Tensor weight, Tensor? cu_seqlens=None, Tensor? initial_state=None,"
-    " *, str? activation=None) -> Tensor",
-)
+def _fake_dynamic_rows(dtype: ShortConvDType, columns: int):
+    """Create a row-major fake tensor whose row count binds at launch."""
+    return cute.runtime.make_fake_compact_tensor(
+        dtype.cute_type,
+        (cute.sym_int32(), columns),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+
+
+def _fake_state_indices(paged: bool):
+    """Create runtime-bound slot indices or preserve the unpaged specialization."""
+    if not paged:
+        return None
+    return cute.runtime.make_fake_compact_tensor(
+        Int32,
+        (cute.sym_int32(),),
+        stride_order=(0,),
+        assumed_align=4,
+    )
+
+
+@jit_cache
+def _compile_decode(
+    channels: int,
+    width: int,
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    paged: bool,
+    activation: Activation,
+):
+    """Compile one decode specialization, shared across batch sizes and pool depths."""
+    operation = CausalConv1dSiluDecode(channels, width, config, dtype, activation.forward)
+    return compile_tvm_ffi(
+        operation,
+        _fake_dynamic_rows(dtype, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_dynamic_rows(dtype, channels),
+        _fake_dynamic_rows(dtype, channels),
+        _fake_state_indices(paged),
+    )
+
+
+def _launch_decode(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    config: ShortConvConfig,
+    state_indices: torch.Tensor | None,
+    *,
+    activation: str | None,
+) -> torch.Tensor:
+    """Allocate the output and launch the compiled decode specialization."""
+    resolved_activation = resolve_activation(activation)
+    x, weight = _aligned(x), _aligned(weight)
+    if state.data_ptr() % 16 != 0:
+        raise ValueError("state storage must be 16-byte aligned for the in-place advance")
+    channels = x.shape[1]
+    width = weight.shape[1]
+    _validate_config(config, channels, "forward_config")
+    dtype = SHORT_CONV_DTYPES[x.dtype]
+    output = torch.empty_like(x)
+    compiled = _compile_decode(
+        channels,
+        width,
+        dtype,
+        config,
+        state_indices is not None,
+        resolved_activation,
+    )
+    compiled(x, weight, output, state.flatten(0, 1), state_indices)
+    return output
 
 
 def _cute_short_conv_fwd_cuda(
@@ -2623,11 +2852,95 @@ def _default_forward_fake(
     return torch.empty_like(x)
 
 
-torch.library.define(
-    "attn_gym::_cute_short_conv_bwd",
-    "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens=None,"
-    " *, str? activation=None) -> (Tensor, Tensor)",
+def _cute_short_conv_decode_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    """Launch the tuned forward defaults through the decode schema."""
+    _validate_decode_inputs(x, weight, state, state_indices)
+    config = _compatible_config(ShortConvTunedConfig.default(x.dtype).forward, x.shape[1])
+    return _launch_decode(
+        x,
+        weight,
+        state,
+        config,
+        state_indices,
+        activation=activation,
+    )
+
+
+torch.library.impl("attn_gym::_cute_short_conv_decode", "CUDA", _cute_short_conv_decode_cuda)
+
+
+@torch.library.register_fake("attn_gym::_cute_short_conv_decode")
+def _decode_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None = None,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    del weight, state, state_indices, activation
+    return torch.empty_like(x)
+
+
+def _cute_short_conv_configured_decode_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    forward_threads: int,
+    forward_channels: int,
+    forward_times: int,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    """Keep configured decode compilation and launch work behind an opaque operator."""
+    _validate_decode_inputs(x, weight, state, state_indices)
+    return _launch_decode(
+        x,
+        weight,
+        state,
+        _config(forward_threads, forward_channels, forward_times),
+        state_indices,
+        activation=activation,
+    )
+
+
+torch.library.impl(
+    "attn_gym::_cute_short_conv_configured_decode",
+    "CUDA",
+    _cute_short_conv_configured_decode_cuda,
 )
+
+
+@torch.library.register_fake("attn_gym::_cute_short_conv_configured_decode")
+def _configured_decode_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    forward_threads: int,
+    forward_channels: int,
+    forward_times: int,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    del (
+        weight,
+        state,
+        state_indices,
+        forward_threads,
+        forward_channels,
+        forward_times,
+        activation,
+    )
+    return torch.empty_like(x)
 
 
 def _cute_short_conv_bwd_cuda(
@@ -2666,16 +2979,6 @@ def _default_backward_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del grad_output, cu_seqlens, activation
     return torch.empty_like(x), torch.empty_like(weight)
-
-
-torch.library.define(
-    "attn_gym::_cute_short_conv_configured_fwd",
-    "(Tensor x, Tensor weight, Tensor? cu_seqlens, Tensor? initial_state,"
-    " int forward_threads, int forward_channels, int forward_times,"
-    " int input_threads, int input_channels, int input_times,"
-    " int weight_threads, int weight_channels, int weight_times,"
-    " *, str? activation=None) -> Tensor",
-)
 
 
 def _cute_short_conv_configured_fwd_cuda(
@@ -2747,23 +3050,6 @@ def _forward_fake(
         activation,
     )
     return torch.empty_like(x)
-
-
-_CONFIGURED_BWD_ARGS = (
-    "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens, {initial_state},"
-    " int input_threads, int input_channels, int input_times,"
-    " int weight_threads, int weight_channels, int weight_times,"
-    " *, str? activation=None)"
-)
-torch.library.define(
-    "attn_gym::_cute_short_conv_configured_bwd",
-    _CONFIGURED_BWD_ARGS.format(initial_state="Tensor? initial_state") + " -> (Tensor, Tensor)",
-)
-torch.library.define(
-    "attn_gym::_cute_short_conv_configured_bwd_with_state_grad",
-    _CONFIGURED_BWD_ARGS.format(initial_state="Tensor initial_state")
-    + " -> (Tensor, Tensor, Tensor)",
-)
 
 
 def _cute_short_conv_configured_bwd_cuda(
@@ -2903,15 +3189,6 @@ def _backward_with_state_grad_fake(
     return torch.empty_like(x), torch.empty_like(weight), torch.empty_like(initial_state)
 
 
-_forward_op = torch.ops.attn_gym._cute_short_conv_fwd.default
-_backward_op = torch.ops.attn_gym._cute_short_conv_bwd.default
-_configured_forward_op = torch.ops.attn_gym._cute_short_conv_configured_fwd.default
-_configured_backward_op = torch.ops.attn_gym._cute_short_conv_configured_bwd.default
-_configured_backward_with_state_grad_op = (
-    torch.ops.attn_gym._cute_short_conv_configured_bwd_with_state_grad.default
-)
-
-
 class _ShortConv(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -2922,7 +3199,9 @@ class _ShortConv(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         activation: str | None,
     ) -> torch.Tensor:
-        output = _forward_op(x, weight, cu_seqlens, initial_state, activation=activation)
+        output = kda_ops.short_conv_forward_op(
+            x, weight, cu_seqlens, initial_state, activation=activation
+        )
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
         ctx.activation = activation
         return output
@@ -2933,7 +3212,7 @@ class _ShortConv(torch.autograd.Function):
         x, weight, cu_seqlens, initial_state = ctx.saved_tensors
         activation = ctx.activation
         if initial_state is None:
-            grad_x, grad_weight = _backward_op(
+            grad_x, grad_weight = kda_ops.short_conv_backward_op(
                 x, weight, grad_output, cu_seqlens, activation=activation
             )
             grad_initial_state = None
@@ -2953,17 +3232,19 @@ class _ShortConv(torch.autograd.Function):
                 weight_config.times_per_block,
             )
             if ctx.needs_input_grad[3]:
-                grad_x, grad_weight, grad_initial_state = _configured_backward_with_state_grad_op(
-                    x,
-                    weight,
-                    grad_output,
-                    cu_seqlens,
-                    initial_state,
-                    *configs,
-                    activation=activation,
+                grad_x, grad_weight, grad_initial_state = (
+                    kda_ops.short_conv_configured_backward_with_state_grad_op(
+                        x,
+                        weight,
+                        grad_output,
+                        cu_seqlens,
+                        initial_state,
+                        *configs,
+                        activation=activation,
+                    )
                 )
             else:
-                grad_x, grad_weight = _configured_backward_op(
+                grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
                     x,
                     weight,
                     grad_output,
@@ -2995,7 +3276,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         weight_channels: int,
         weight_times: int,
     ) -> torch.Tensor:
-        output = _configured_forward_op(
+        output = kda_ops.short_conv_configured_forward_op(
             x,
             weight,
             cu_seqlens,
@@ -3036,17 +3317,19 @@ class _ConfiguredShortConv(torch.autograd.Function):
             ctx.weight_times,
         )
         if initial_state is not None and ctx.needs_input_grad[3]:
-            grad_x, grad_weight, grad_initial_state = _configured_backward_with_state_grad_op(
-                x,
-                weight,
-                grad_output,
-                cu_seqlens,
-                initial_state,
-                *configs,
-                activation=ctx.activation,
+            grad_x, grad_weight, grad_initial_state = (
+                kda_ops.short_conv_configured_backward_with_state_grad_op(
+                    x,
+                    weight,
+                    grad_output,
+                    cu_seqlens,
+                    initial_state,
+                    *configs,
+                    activation=ctx.activation,
+                )
             )
         else:
-            grad_x, grad_weight = _configured_backward_op(
+            grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
                 x,
                 weight,
                 grad_output,
@@ -3248,9 +3531,73 @@ def causal_conv1d(
     )
 
 
+def causal_conv1d_decode(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    activation: str | None = None,
+    state_indices: torch.Tensor | None = None,
+    forward_config: ShortConvConfig | None = None,
+) -> torch.Tensor:
+    """Advance the convolution by one token per sequence over a paged history.
+
+    The decode counterpart to :func:`causal_conv1d`, fused: one program reads a slot's
+    history, convolves the new token in, and writes the shifted history back, so no
+    gather or scatter surrounds the call.
+
+    Args:
+        x: ``[num_sequences, C]`` input, one token per sequence, matching ``weight`` and
+            ``state`` in dtype.
+        weight: Contiguous depthwise weights ``[C, W]``. ``W >= 2``; a width-1
+            convolution carries no history and needs no update.
+        state: Causal history ``[num_slots, W - 1, C]`` holding each slot's trailing
+            ``W - 1`` inputs, oldest first -- the layout :func:`causal_conv1d` takes as
+            ``initial_state`` and returns as its final state. Advanced **in place**: the
+            rows shift left and ``x`` becomes the newest. Its storage must be contiguous
+            and 16-byte aligned, since the launcher cannot realign it without losing the
+            update.
+        activation: Any name registered with :func:`register_activation`, or ``None``.
+        state_indices: Optional contiguous int32 slot indices, one per sequence, selecting
+            rows of a paged ``state`` pool. Without them, sequence ``i`` uses slot ``i``.
+            Positive slots must be distinct. Non-positive entries produce zero output and
+            leave the pool untouched.
+        forward_config: Optional schedule specialization.
+
+    Returns:
+        The activated output ``[num_sequences, C]``, same dtype as ``x``.
+
+    Inference-only: the single-token step has no backward, so gradient-tracking inputs
+    are rejected when autograd is enabled.
+    """
+    resolve_activation(activation)
+    _validate_decode_inputs(x, weight, state, state_indices)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x, weight, state)):
+        raise RuntimeError(
+            "causal_conv1d_decode is inference-only and has no backward; use "
+            "causal_conv1d for training or call under torch.no_grad()"
+        )
+    default = ShortConvTunedConfig.default(x.dtype).forward
+    config = _compatible_config(default, x.shape[1]) if forward_config is None else forward_config
+    _validate_config(config, x.shape[1], "forward_config")
+    if forward_config is None and config == default:
+        return kda_ops.short_conv_decode_op(x, weight, state, state_indices, activation=activation)
+    return kda_ops.short_conv_configured_decode_op(
+        x,
+        weight,
+        state,
+        state_indices,
+        config.threads,
+        config.channels_per_thread,
+        config.times_per_block,
+        activation=activation,
+    )
+
+
 __all__ = [
     "ShortConvConfig",
     "ShortConvTunedConfig",
     "causal_conv1d",
+    "causal_conv1d_decode",
     "tune_causal_conv1d",
 ]

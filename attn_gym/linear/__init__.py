@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from attn_gym.linear.kda import (
         bounded_gate_cumsum,
         causal_conv1d,
+        causal_conv1d_decode,
         l2norm,
         register_activation,
     )
@@ -47,6 +48,7 @@ GENERIC_OPS = [
     "Impl",
     "active_token_mask",
     "causal_conv1d",
+    "causal_conv1d_decode",
     "l2norm",
     "mask_inactive_token_gradients",
     "mask_inactive_tokens",

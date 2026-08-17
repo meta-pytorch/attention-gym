@@ -52,3 +52,8 @@ def test_linear_base_import_keeps_cutedsl_lazy():
     """The optional CuTeDSL backend must never become an eager import."""
     script = "import sys, attn_gym.linear; assert 'cutlass' not in sys.modules"
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_short_conv_decode_uses_decode_name():
+    assert "causal_conv1d_decode" in attn_gym.linear.__all__
+    assert "causal_conv1d_update" not in attn_gym.linear.__all__

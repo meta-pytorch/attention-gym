@@ -24,6 +24,7 @@ from attn_gym.linear.kda.masking import (
 _BACKEND_EXPORTS = {
     "bounded_gate_cumsum": "attn_gym.linear.kda.fwd.triton.gate_fwd",
     "causal_conv1d": "attn_gym.linear.kda.short_conv",
+    "causal_conv1d_decode": "attn_gym.linear.kda.short_conv",
     "l2norm": "attn_gym.linear.kda.fwd.triton.l2norm_fwd",
     "register_activation": "attn_gym.linear.kda.short_conv",
 }
@@ -36,7 +37,7 @@ def __getattr__(name: str):
     try:
         module = importlib.import_module(module_name)
     except ImportError as error:
-        if name in {"causal_conv1d", "register_activation"}:
+        if name in {"causal_conv1d", "causal_conv1d_decode", "register_activation"}:
             message = f"{name} requires the optional CuTeDSL backend: pip install attn-gym[linear]"
         else:
             message = f"{name} requires CUDA with Triton support"
