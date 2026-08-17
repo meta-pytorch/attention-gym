@@ -1013,13 +1013,15 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
         else:
             row_start = chunk_block * BT
             valid = Int32(BT)
-        # Match Triton's default safe-gate normalization reference
-        # (causal_gate_normref=False): use the middle row of this BC subchunk,
-        # clamped for partial chunks. This keeps local diagonal dA scaling
-        # finite for dense causal dA without relying on a near-diagonal dA
-        # property.
+        # Match Triton's causal normalization reference (CAUSAL_NORMREF=True):
+        # the first row of this BC subchunk, clamped for partial chunks. A
+        # midpoint ref halves the exp2 range but reads a future token's gate
+        # (ulp-level causality/prefix-invariance break) and moves with T_local;
+        # the 16-token one-sided range is safe within the fp32 exponent budget
+        # (see "Notes: causality and gk scale" in attn_gym/linear/kda/intra/
+        # engine.py).
         ref_prev = cutlass.min(row_base, valid - 1)
-        ref_qk = cutlass.min(row_base + BC // 2, valid - 1)
+        ref_qk = cutlass.min(row_base, valid - 1)
         ref_future = cutlass.min(row_base + BC, valid) - 1
         daqk_row_stride = mdAqk.layout.stride[1]
         daqk_head_stride = mdAqk.layout.stride[2]

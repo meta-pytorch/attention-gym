@@ -297,7 +297,7 @@ def chunk_kda_fwd_intra_diagonal(
         BK=triton.next_power_of_2(key_dim),
         num_sequences=0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
         USE_GATHER=IS_GATHER_SUPPORTED,
-        CAUSAL_NORMREF=False,
+        CAUSAL_NORMREF=True,
         GRID_NT=grid_chunks,
         MAX_NT=capacity,
     )
