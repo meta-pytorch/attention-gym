@@ -23,9 +23,11 @@ exp2 factored as gq[i,d] = 2^(g-gref), gk[j,d] = 2^(gref-g), gref = g[row 0]:
                     dg2 = (dg_in + q*dq_s - k*dka_s + k*dkb_s - k*dkc_s) * ln2
                     db2 = db_in + rowsum(ak * S)
 
-TMEM phasing: dq [0,128) + dkb [128,256) + S [256,320) run first; after the
-phase-A drain the dka/dkc gemms reuse [0,256). The forward mode (Aqk/Akk) hangs
-off the same production/MMA/epilogue skeleton via ``mode`` (not yet wired).
+Safety status per mode: the forward class (KdaIntraFwdEngine) uses the
+per-16-column-strip rebase and is bounded at the training gate range; the
+backward class below still uses the single chunk-row-0 reference and OVERFLOWS
+at init-realistic gates (see the note below) -- do not wire it into training
+until it receives the same strip treatment.
 
 Notes: causality and gk scale
 -----------------------------
@@ -122,9 +124,13 @@ def _diag_neumann_inverse_kernel(
     tl.store(ptrs, b_p, mask=m_r)
 
 
-def kda_diag_neumann_inverse(akkd: torch.Tensor, metadata: RaggedChunkMetadata) -> torch.Tensor:
-    """In-place inv(I + strict(block)) over the engine's raw 16x16 diag blocks."""
+def _kda_diag_neumann_inverse(akkd: torch.Tensor, metadata: RaggedChunkMetadata) -> torch.Tensor:
+    """In-place inv(I + strict(block)) over the engine's raw 16x16 diag blocks.
+
+    The 3-squaring doubling covers exactly degree 15, so BC must be 16.
+    """
     _, _, heads, BC = akkd.shape
+    assert BC == 16, f"diag Neumann inverse requires 16x16 blocks, got BC={BC}"
     _diag_neumann_inverse_kernel[(metadata.capacity * 4, heads)](
         akkd,
         metadata.cu_seqlens,
@@ -1240,8 +1246,10 @@ class KdaIntraFwdEngine:
         Aqk[i, j] = scale * sum_d qg[i, d] * kgk[j, d]   (non-strict causal)
         Akk[i, j] = beta[i] * sum_d kgq[i, d] * kgk[j, d]  (strict lower)
 
-    Warp plan: CUDA(0-3) production + drain/store, LOAD(4) TMA, MMA(5).
-    The diagonal-block inverse (K4) remains a separate kernel.
+    Warp plan: CUDA(0-7) production + drain/store, LOAD(8) TMA, MMA(9),
+    idle(10-11) padding warp-group 3 for setmaxregister alignment. The 16x16
+    diagonal-block Neumann inverses (K4b's Akkd input) run in a separate tiny
+    Triton kernel invoked by the Python wrapper.
     """
 
     CUDA_WARP_IDS = (0, 1, 2, 3, 4, 5, 6, 7)
@@ -1928,7 +1936,10 @@ def kda_intra_engine_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward intra: Aqk (bf16), AkkOD (K3b blocked), Akkd (diag inverses).
 
-    Drop-in producer for the K4b assembly stage, replacing forloop + K3b.
+    Drop-in producer for the K4b assembly stage, replacing forloop + K3b. The
+    kernel emits raw beta-scaled strict diag blocks; their 16x16 Neumann
+    inverses run in a tiny standalone Triton launch here, so the returned Akkd
+    is exactly what K4b consumes.
     """
     batch, tokens, heads, head_dim = q.shape
     assert batch == 1 and head_dim == 128
@@ -1953,4 +1964,4 @@ def kda_intra_engine_fwd(
         heads,
         metadata.capacity,
     )
-    return aqk, akkod, akkd
+    return aqk, akkod, _kda_diag_neumann_inverse(akkd, metadata)
