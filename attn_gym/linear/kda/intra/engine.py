@@ -27,6 +27,31 @@ TMEM phasing: dq [0,128) + dkb [128,256) + S [256,320) run first; after the
 phase-A drain the dka/dkc gemms reuse [0,256). The forward mode (Aqk/Akk) hangs
 off the same production/MMA/epilogue skeleton via ``mode`` (not yet wired).
 
+Notes: causality and gk scale
+-----------------------------
+The per-channel decay 2^(g[i,d]-g[j,d]) sits inside the reduction over d, so it
+can only enter the MMA as gated operands split around a reference:
+gq = 2^(g-gref) on rows and gk = 2^(gref-g) on columns. gref cancels exactly in
+real arithmetic; in floating point the two exp2 roundings are independent, so
+outputs depend on gref at the ulp level. gref must therefore be causal (at or
+before every query row it serves) and independent of sequence length, or future
+gates perturb earlier outputs (~1.5e-5 bf16 measured for the midpoint variant)
+and prefix invariance breaks. This engine uses gref = g[chunk row 0]: causal
+and length-stable.
+
+The cost is one-sided intermediate scale: gk grows as 2^(drop since row 0), up
+to 2^R64 for the full-chunk drop R64. With the training gate bound of -5
+nats/token (7.21 log2 units), R64 reaches ~461 while the fp32/bf16 exponent
+budget is ~126: a channel sustaining more than ~2 log2 units/token of decay
+across a chunk overflows gk to inf (and flushes gq to 0), producing NaNs.
+Measured: finite at 1.0 log2/tok, NaN at >=3.6. The shipped kernels are safe by
+construction (16-token windows: midpoint <= 2^58, row-0 <= 2^115; K3b's
+between-blocks reference keeps both factors <= 1). Clamping cannot fix this
+(late-pair true values are O(1) but would compute as 0*inf); a real fix needs
+per-row-block operand rebasing (sandwiched block gemms) or dispatch on the
+per-chunk measured drop. Until then the engine requires max in-chunk decay
+< ~120 log2 units.
+
 Design + tradeoffs: ~/agent_notes/plans/attention_gym_intra_engine_tcgen05.md.
 """
 

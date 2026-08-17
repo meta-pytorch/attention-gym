@@ -52,6 +52,22 @@ The earlier prototype functions were replaced by the variant-level API:
 
 ## Kimi Delta Attention
 
+### Numerics: gate rebase references
+
+The per-channel decay `2^(g[i,d] - g[j,d])` is applied inside intra-chunk
+matmuls by splitting it around a reference gate: rows carry `2^(g - gref)` and
+columns carry `2^(gref - g)`. The reference cancels mathematically but not in
+floating point, so its placement carries two obligations: it must be **causal
+and length-stable** (a midpoint or future reference lets future gates perturb
+earlier outputs at the ulp level and breaks prefix invariance), and it bounds
+the **intermediate magnitude** (one factor grows as `2^(gate drop since the
+reference)` against the ~2^126 fp32/bf16 exponent budget). With the bounded
+gate activation (`lower_bound = -5` nats/token), any reference within a
+16-token subchunk is safe by construction; references spanning a full 64-token
+chunk can overflow once a channel sustains more than ~2 log2 units of decay
+per token. See `Notes: causality and gk scale` in
+`attn_gym/linear/kda/intra/engine.py` for the measured thresholds.
+
 The KDA references use token-major tensors: query, key, and per-channel gate are
 `[batch, sequence, heads, key_dimension]`; value is
 `[batch, sequence, heads, value_dimension]`; beta is
