@@ -18,6 +18,7 @@ from attn_gym.linear import recurrent_kda
 from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_no_state_op,
     _recurrent_fwd_op,
+    _recurrent_fwd_paged_op,
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
 
@@ -161,6 +162,78 @@ def test_recurrent_agrees_with_chunked_core():
     torch.testing.assert_close(recurrent_state, chunked_state, rtol=5e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_recurrent_paged_matches_gather_scatter(packed: bool):
+    """Slot indexing equals a native gather, dense scan, and scatter round trip."""
+    q, k, v, gate, beta, _ = _inputs(batch=1 if packed else 3, tokens=32, seed=8)
+    cu_seqlens = (
+        torch.tensor([0, 11, 27, 32], device="cuda", dtype=torch.int32) if packed else None
+    )
+    pool = torch.randn(7, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
+    before = pool.clone()
+
+    output, final_state = recurrent_kda(
+        q, k, v, gate, beta, pool, cu_seqlens=cu_seqlens, state_indices=slots
+    )
+
+    assert final_state is None
+    expected_pool = before.clone()
+    expected, expected_state = naive_recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state=before[slots.long()],
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    expected_pool[slots.long()] = expected_state
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
+    # Rows the indices never name stay bitwise untouched.
+    untouched = [row for row in range(pool.shape[0]) if row not in slots.tolist()]
+    torch.testing.assert_close(pool[untouched], before[untouched], rtol=0, atol=0)
+
+
+def test_recurrent_paged_decode_accumulates_in_place():
+    """Successive single-token steps advance each slot without a round trip."""
+    pool = torch.randn(4, 2, 64, 64, device="cuda")
+    slots = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
+    state = pool[slots.long()].clone()
+
+    for step in range(3):
+        q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=20 + step)
+        output, _ = recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots)
+        expected, state = naive_recurrent_kda(
+            q, k, v, gate, beta, initial_state=state, output_final_state=True
+        )
+        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(pool[slots.long()], state, rtol=1e-5, atol=1e-5)
+
+
+def test_recurrent_paged_validates_contract():
+    """Reject a malformed or unsafely aliased state pool before launching."""
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=4)
+    pool = torch.randn(5, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="requires initial_state"):
+        recurrent_kda(q, k, v, gate, beta, state_indices=slots)
+    with pytest.raises(ValueError, match="paged state pool must have shape"):
+        recurrent_kda(q, k, v, gate, beta, pool[:, :, :-1], state_indices=slots)
+    with pytest.raises(TypeError, match="contiguous float32"):
+        recurrent_kda(q, k, v, gate, beta, pool.bfloat16(), state_indices=slots)
+    with pytest.raises(TypeError, match="contiguous float32"):
+        recurrent_kda(q, k, v, gate, beta, pool.transpose(-1, -2), state_indices=slots)
+    with pytest.raises(ValueError, match="state_indices must be"):
+        recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots.long())
+    with pytest.raises(ValueError, match="state_indices must be"):
+        recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots[:1])
+    with pytest.raises(ValueError, match="drop output_final_state"):
+        recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots, output_final_state=True)
+
+
 def test_recurrent_validates_public_contract():
     """Reject malformed inputs at the public boundary before a kernel launch."""
     q, k, v, gate, beta, _ = _inputs(tokens=4)
@@ -228,6 +301,8 @@ def test_recurrent_custom_op_registration(packed: bool):
     state = torch.randn(num_sequences, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
     torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, cu_seqlens))
     torch.library.opcheck(_recurrent_fwd_no_state_op, (q, k, v, gate, beta, state, cu_seqlens))
+    slots = torch.arange(num_sequences, device="cuda", dtype=torch.int32)
+    torch.library.opcheck(_recurrent_fwd_paged_op, (q, k, v, gate, beta, state, slots, cu_seqlens))
 
 
 @pytest.mark.parametrize("output_final_state", [False, True])
