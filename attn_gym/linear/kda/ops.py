@@ -75,6 +75,19 @@ torch.library.define(
     "(Tensor cu_seqlens, SymInt tokens, int chunk_size) -> Tensor",
 )
 
+_DELTA_H_ARGS = (
+    "(Tensor k, Tensor w, Tensor u, Tensor gk, Tensor? initial_state, "
+    "Tensor? cu_seqlens, Tensor? chunk_offsets, SymInt capacity)"
+)
+torch.library.define(
+    "attn_gym::kda_delta_h",
+    f"{_DELTA_H_ARGS} -> (Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_delta_h_with_state",
+    f"{_DELTA_H_ARGS} -> (Tensor, Tensor, Tensor)",
+)
+
 
 def _chunk_backend():
     try:
@@ -93,6 +106,13 @@ def _recurrent_backend():
         raise ImportError(
             "recurrent_kda(impl='fused') requires CUDA with Triton support"
         ) from error
+
+
+def _delta_h_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.triton.chunk_delta_h")
+    except ImportError as error:
+        raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
 
 
 def _chunk_fwd_cuda(*args):
@@ -131,6 +151,14 @@ def _recurrent_fwd_paged_cuda(*args):
     return _recurrent_backend()._kda_recurrent_fwd_paged_cuda(*args)
 
 
+def _delta_h_cuda(*args):
+    return _delta_h_backend()._delta_h_cuda(*args)
+
+
+def _delta_h_with_state_cuda(*args):
+    return _delta_h_backend()._delta_h_with_state_cuda(*args)
+
+
 def _prepare_chunk_offsets_cuda(*args):
     from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
 
@@ -167,6 +195,8 @@ torch.library.impl(
     "CUDA",
     _prepare_chunk_offsets_cuda,
 )
+torch.library.impl("attn_gym::kda_delta_h", "CUDA", _delta_h_cuda)
+torch.library.impl("attn_gym::kda_delta_h_with_state", "CUDA", _delta_h_with_state_cuda)
 
 
 def _chunk_fwd_fake_common(q: torch.Tensor, v: torch.Tensor):
@@ -357,6 +387,48 @@ def _prepare_chunk_offsets_fake(
     return torch.empty_like(cu_seqlens)
 
 
+def _delta_h_fake_common(
+    k: torch.Tensor, u: torch.Tensor, capacity: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    h = k.new_empty(k.shape[0], capacity, k.shape[2], k.shape[3], u.shape[-1])
+    return h, u.new_empty(u.shape)
+
+
+@torch.library.register_fake("attn_gym::kda_delta_h")
+def _delta_h_fake(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del w, gk, initial_state, cu_seqlens, chunk_offsets
+    return _delta_h_fake_common(k, u, capacity)
+
+
+@torch.library.register_fake("attn_gym::kda_delta_h_with_state")
+def _delta_h_with_state_fake(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del w, gk, initial_state, chunk_offsets
+    h, v_new = _delta_h_fake_common(k, u, capacity)
+    state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    final_state = k.new_empty(
+        (state_batch, k.shape[2], k.shape[3], u.shape[-1]), dtype=torch.float32
+    )
+    return h, v_new, final_state
+
+
 chunk_fwd_op = torch.ops.attn_gym.kda_chunk_fwd.default
 chunk_fwd_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_with_state.default
 chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
@@ -367,6 +439,8 @@ recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
 prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
+delta_h_op = torch.ops.attn_gym.kda_delta_h.default
+delta_h_with_state_op = torch.ops.attn_gym.kda_delta_h_with_state.default
 
 
 def recurrent_forward(
@@ -416,6 +490,8 @@ __all__ = [
     "chunk_fwd_ragged_op",
     "chunk_fwd_ragged_with_state_op",
     "chunk_fwd_with_state_op",
+    "delta_h_op",
+    "delta_h_with_state_op",
     "prepare_chunk_offsets_op",
     "recurrent_forward",
     "recurrent_fwd_no_state_op",

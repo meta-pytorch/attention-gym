@@ -4,398 +4,314 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Inter-chunk KDA state recurrence.
+
+A single kernel (B=1, K=V=128, 64-token chunks, Blackwell) keeps the full
+[K, BV] state in one accumulator and overlaps next-chunk descriptor loads with
+the serially dependent state MMAs; 16-bit inputs run the tuned warp-specialized
+schedule and FP32 a smaller ordinarily pipelined one. Host-side tensor
+descriptors do not survive dynamo/inductor tracing, so the launch sits behind a
+compiler-opaque ``torch.library`` op pair.
+"""
+
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset, requires_int64_offsets
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
-
-
-def _requires_int64_offsets(args):
-    return requires_int64_offsets(
-        args["k"],
-        args["v"],
-        args["w"],
-        args["v_new"],
-        args["g"],
-        args["gk"],
-        args["h"],
-        args["h0"],
-        args["ht"],
-        args["cu_seqlens"],
-        args["chunk_offsets"],
-    )
+from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
+from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
+from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
+from attn_gym.linear.kda.utils import exp2
 
 
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "USE_GK": lambda args: args["gk"] is not None,
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_INT64_OFFSETS": _requires_int64_offsets,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BV": 16}, num_warps=4, num_stages=3),
-        triton.Config({"BV": 64}, num_warps=4, num_stages=3),
-    ],
-    key=["H", "K", "V", "BT"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T"])
-def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-    k,
-    v,
-    w,
-    v_new,
-    g,
-    gk,
-    h,
+def chunk_delta_h_kernel_k128_wsp(
+    k_desc,
+    w_desc,
+    u_desc,
+    vnew_desc,
+    h_desc,
+    decay_desc,
     h0,
     ht,
     cu_seqlens,
     chunk_offsets,
+    k,
+    w,
+    u,
+    v_new,
     T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    SAVE_NEW_VALUE: tl.constexpr,
-    USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
+    """Warp-specialized K=128 inter-chunk recurrence.
+
+    Holds the full [K, BV] state in one accumulator and walks full chunks with
+    a warp-specialized descriptor loop. A partial tail chunk uses masked
+    pointers because a descriptor load would cross the sequence boundary in
+    the token-major packed layout. ``decay_desc`` holds precomputed ``exp2``
+    of each chunk's last-row cumulative gate. Descriptor coordinates are
+    element indices and stay int32; the raw-pointer tail and state paths
+    promote to int64 when tensor sizes require it. Compute follows the
+    blockdim64 kernel it replaced: dots run in the input dtype with FP32
+    accumulation, and the state stays FP32.
+    """
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
-    if USE_INT64_OFFSETS:
-        i_nh = i_nh.to(tl.int64)
-        i_v = i_v.to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
+    if USE_INT64_OFFSETS:
+        i_state = i_nh.to(tl.int64)
+    else:
+        i_state = i_nh
     if IS_VARLEN:
-        bos, eos = (
-            tl.load(cu_seqlens + ptr_offset((i_n,), (1,))).to(tl.int32),
-            tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int32),
-        )
-        boh = tl.load(chunk_offsets + ptr_offset((i_n,), (1,))).to(tl.int32)
-        if USE_INT64_OFFSETS:
-            bos = bos.to(tl.int64)
-            eos = eos.to(tl.int64)
-            boh = boh.to(tl.int64)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
         T = eos - bos
-        NT = tl.cdiv(T, BT)
     else:
         bos = i_n * T
-        eos = bos + T
-        NT = tl.cdiv(T, BT)
-        boh = i_n * NT
+        boh = i_n * tl.cdiv(T, BT)
+    NT = tl.cdiv(T, BT)
+    NT_full = T // BT
 
-    # [BK, BV]
-    b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 64:
-        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 128:
-        b_h3 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 192:
-        b_h4 = tl.zeros([64, BV], dtype=tl.float32)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
 
-    # calculate offset
-    h += ptr_offset((boh, i_h), (H * K * V, K * V))
-    v += ptr_offset((bos, i_h), (H * V, V))
-    k += ptr_offset((bos, i_h), (H * K, K))
-    w += ptr_offset((bos, i_h), (H * K, K))
-    if SAVE_NEW_VALUE:
-        v_new += ptr_offset((bos, i_h), (H * V, V))
-
+    b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        h0 = h0 + ptr_offset((i_nh,), (K * V,))
-    if STORE_FINAL_STATE:
-        ht = ht + ptr_offset((i_nh,), (K * V,))
+        b_h += tl.load(h0 + i_state * K * V + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1))).to(
+            tl.float32
+        )
 
-    o_k1 = tl.arange(0, 64)
-    o_v = ptr_offset((i_v,), (BV,)) + tl.arange(0, BV)
-    m_v = o_v < V
-    if K > 64:
-        o_k2 = 64 + o_k1
-    if K > 128:
-        o_k3 = 128 + o_k1
-    if K > 192:
-        o_k4 = 192 + o_k1
+    for i_t in tl.range(0, NT_full, warp_specialize=WARP_SPECIALIZE, num_stages=NUM_STAGES):
+        chunk = boh + i_t
+        tok = bos + i_t * BT
+        h_desc.store(
+            [0, chunk, i_h, 0, i_v * BV],
+            tl.reshape(b_h.to(k.dtype.element_ty), [1, 1, 1, K, BV]),
+        )
+        b_w = tl.reshape(w_desc.load([0, tok, i_h, 0]), [BT, K])
+        b_u = tl.reshape(u_desc.load([0, tok, i_h, i_v * BV]), [BT, BV])
+        b_vnew = b_u.to(tl.float32) - tl.dot(b_w, b_h.to(k.dtype.element_ty))
+        vnew_desc.store(
+            [0, tok, i_h, i_v * BV],
+            tl.reshape(b_vnew.to(k.dtype.element_ty), [1, BT, 1, BV]),
+        )
+        b_decay = tl.reshape(decay_desc.load([chunk, i_h, 0]), [K])
+        b_h = b_h * b_decay[:, None]
+        b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
+        b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
-    # load initial state
-    if USE_INITIAL_STATE:
-        m_h0 = (o_k1[:, None] < K) & m_v[None, :]
-        b_h1 += tl.load(
-            h0 + ptr_offset((o_k1[:, None], o_v[None, :]), (V, 1)),
-            mask=m_h0,
-            other=0.0,
-        ).to(tl.float32)
-        if K > 64:
-            m_h0 = (o_k2[:, None] < K) & m_v[None, :]
-            b_h2 += tl.load(  # pyrefly: ignore[unbound-name]
-                h0 + ptr_offset((o_k2[:, None], o_v[None, :]), (V, 1)),
-                mask=m_h0,
-                other=0.0,
-            ).to(tl.float32)
-        if K > 128:
-            m_h0 = (o_k3[:, None] < K) & m_v[None, :]
-            b_h3 += tl.load(  # pyrefly: ignore[unbound-name]
-                h0 + ptr_offset((o_k3[:, None], o_v[None, :]), (V, 1)),
-                mask=m_h0,
-                other=0.0,
-            ).to(tl.float32)
-        if K > 192:
-            m_h0 = (o_k4[:, None] < K) & m_v[None, :]
-            b_h4 += tl.load(  # pyrefly: ignore[unbound-name]
-                h0 + ptr_offset((o_k4[:, None], o_v[None, :]), (V, 1)),
-                mask=m_h0,
-                other=0.0,
-            ).to(tl.float32)
-
-    # main recurrence
-    for i_t in range(NT):
-        i_t_offset = i_t
+    if NT_full < NT:
+        # Peeled partial tail chunk: masked pointers keep the loads and the
+        # v_new store inside this sequence's tokens.
+        chunk = boh + NT_full
+        h_desc.store(
+            [0, chunk, i_h, 0, i_v * BV],
+            tl.reshape(b_h.to(k.dtype.element_ty), [1, 1, 1, K, BV]),
+        )
+        o_t = bos + NT_full * BT + tl.arange(0, BT)
+        m_t = o_t < bos + T
         if USE_INT64_OFFSETS:
-            i_t_offset = i_t_offset.to(tl.int64)
-        h_t = h + ptr_offset((i_t_offset,), (H * K * V,))
-        m_h = (o_k1[:, None] < K) & m_v[None, :]
-        tl.store(
-            h_t + ptr_offset((o_k1[:, None], o_v[None, :]), (V, 1)),
-            b_h1.to(h.dtype.element_ty),
-            mask=m_h,
-        )
-        if K > 64:
-            m_h = (o_k2[:, None] < K) & m_v[None, :]
-            tl.store(
-                h_t + ptr_offset((o_k2[:, None], o_v[None, :]), (V, 1)),
-                b_h2.to(h.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_h,
-            )
-        if K > 128:
-            m_h = (o_k3[:, None] < K) & m_v[None, :]
-            tl.store(
-                h_t + ptr_offset((o_k3[:, None], o_v[None, :]), (V, 1)),
-                b_h3.to(h.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_h,
-            )
-        if K > 192:
-            m_h = (o_k4[:, None] < K) & m_v[None, :]
-            tl.store(
-                h_t + ptr_offset((o_k4[:, None], o_v[None, :]), (V, 1)),
-                b_h4.to(h.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_h,
-            )
-
-        o_t = ptr_offset((i_t_offset,), (BT,)) + tl.arange(0, BT)
-        m_t = o_t < T
-        m_w = m_t[:, None] & (o_k1[None, :] < K)
+            o_t = o_t.to(tl.int64)
         b_w = tl.load(
-            w + ptr_offset((o_t[:, None], o_k1[None, :]), (H * K, 1)),
-            mask=m_w,
+            w + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
+            mask=m_t[:, None],
             other=0.0,
         )
-        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
-        if K > 64:
-            m_w = m_t[:, None] & (o_k2[None, :] < K)
-            b_w = tl.load(
-                w + ptr_offset((o_t[:, None], o_k2[None, :]), (H * K, 1)),
-                mask=m_w,
-                other=0.0,
-            )
-            b_v += tl.dot(b_w, b_h2.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
-        if K > 128:
-            m_w = m_t[:, None] & (o_k3[None, :] < K)
-            b_w = tl.load(
-                w + ptr_offset((o_t[:, None], o_k3[None, :]), (H * K, 1)),
-                mask=m_w,
-                other=0.0,
-            )
-            b_v += tl.dot(b_w, b_h3.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
-        if K > 192:
-            m_w = m_t[:, None] & (o_k4[None, :] < K)
-            b_w = tl.load(
-                w + ptr_offset((o_t[:, None], o_k4[None, :]), (H * K, 1)),
-                mask=m_w,
-                other=0.0,
-            )
-            b_v += tl.dot(b_w, b_h4.to(b_w.dtype))  # pyrefly: ignore[unbound-name]
-
-        m_v_block = m_t[:, None] & m_v[None, :]
-        v_offset = ptr_offset((o_t[:, None], o_v[None, :]), (H * V, 1))
-        b_v = tl.load(v + v_offset, mask=m_v_block, other=0.0) - b_v
-
-        if SAVE_NEW_VALUE:
-            tl.store(
-                v_new + v_offset,
-                b_v.to(v_new.dtype.element_ty),
-                mask=m_v_block,
-            )
-
-        last_idx = min(ptr_offset((i_t_offset,), (BT,)) + BT, T) - 1
-        if USE_G:
-            b_g_last = tl.load(g + ptr_offset((bos, last_idx, i_h), (H, H, 1)))
-            b_g = tl.load(
-                g + ptr_offset((bos, o_t, i_h), (H, H, 1)),
-                mask=m_t,
-                other=0.0,
-            )
-            if USE_EXP2:  # pyrefly: ignore[unbound-name]
-                b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
-                b_g_last = exp2(b_g_last)
-            else:
-                b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
-                b_g_last = exp(b_g_last)
-            b_h1 *= b_g_last
-            if K > 64:
-                b_h2 *= b_g_last  # pyrefly: ignore[unbound-name]
-            if K > 128:
-                b_h3 *= b_g_last  # pyrefly: ignore[unbound-name,unsupported-operation]
-            if K > 192:
-                b_h4 *= b_g_last  # pyrefly: ignore[unbound-name,unsupported-operation]
-
-        if USE_GK:
-            b_gk_last1 = tl.load(
-                gk + ptr_offset((bos, last_idx, i_h, o_k1), (H * K, H * K, K, 1)),
-                mask=(o_k1 < K),
-                other=0.0,
-            )
-            if USE_EXP2:  # pyrefly: ignore[unbound-name,unsupported-operation]
-                b_h1 *= exp2(b_gk_last1)[
-                    :, None  # pyrefly: ignore[unbound-name,unsupported-operation]
-                ]  # pyrefly: ignore[unsupported-operation]
-            else:
-                b_h1 *= exp(b_gk_last1)[:, None]  # pyrefly: ignore[unsupported-operation]
-            if K > 64:
-                b_gk_last2 = tl.load(
-                    gk
-                    + ptr_offset(
-                        (bos, last_idx, i_h, o_k2),
-                        (H * K, H * K, K, 1),
-                    ),  # pyrefly: ignore[unbound-name,unsupported-operation]
-                    mask=(o_k2 < K),
-                    other=0.0,  # pyrefly: ignore[unbound-name,unsupported-operation]
-                )
-                if USE_EXP2:
-                    b_h2 *= exp2(b_gk_last2)[  # pyrefly: ignore[unbound-name]
-                        :, None
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-                else:
-                    b_h2 *= exp(b_gk_last2)[  # pyrefly: ignore[unbound-name]
-                        :, None
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-            if K > 128:
-                b_gk_last3 = tl.load(
-                    gk
-                    + ptr_offset(
-                        (bos, last_idx, i_h, o_k3),
-                        (H * K, H * K, K, 1),
-                    ),
-                    mask=(o_k3 < K),
-                    other=0.0,
-                )
-                if USE_EXP2:
-                    b_h3 *= exp2(b_gk_last3)[  # pyrefly: ignore[unbound-name]
-                        :, None
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-                else:
-                    b_h3 *= exp(b_gk_last3)[  # pyrefly: ignore[unbound-name]
-                        :, None
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-            if K > 192:
-                b_gk_last4 = tl.load(
-                    gk
-                    + ptr_offset(
-                        (bos, last_idx, i_h, o_k4),
-                        (H * K, H * K, K, 1),
-                    ),  # pyrefly: ignore[unbound-name]
-                    mask=(o_k4 < K),
-                    other=0.0,
-                )
-                if USE_EXP2:
-                    b_h4 *= exp2(b_gk_last4)[  # pyrefly: ignore[unbound-name]
-                        :, None  # pyrefly: ignore[unbound-name]
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-                else:
-                    b_h4 *= exp(b_gk_last4)[  # pyrefly: ignore[unbound-name]
-                        :, None
-                    ]  # pyrefly: ignore[unbound-name,unsupported-operation]
-        b_v = b_v.to(k.dtype.element_ty)
-
-        m_k = (o_k1[:, None] < K) & m_t[None, :]
+        b_u = tl.load(
+            u + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
+            mask=m_t[:, None],
+            other=0.0,
+        )
+        b_vnew = b_u.to(tl.float32) - tl.dot(b_w, b_h.to(k.dtype.element_ty))
+        tl.store(
+            v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
+            b_vnew.to(k.dtype.element_ty),
+            mask=m_t[:, None],
+        )
+        b_decay = tl.reshape(decay_desc.load([chunk, i_h, 0]), [K])
+        b_h = b_h * b_decay[:, None]
         b_k = tl.load(
-            k + ptr_offset((o_k1[:, None], o_t[None, :]), (1, H * K)),
-            mask=m_k,
+            k + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
+            mask=m_t[:, None],
             other=0.0,
         )
-        b_h1 += tl.dot(b_k, b_v)
-        if K > 64:
-            m_k = (o_k2[:, None] < K) & m_t[None, :]
-            b_k = tl.load(
-                k + ptr_offset((o_k2[:, None], o_t[None, :]), (1, H * K)),
-                mask=m_k,
-                other=0.0,
-            )
-            b_h2 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
-        if K > 128:
-            m_k = (o_k3[:, None] < K) & m_t[None, :]
-            b_k = tl.load(
-                k + ptr_offset((o_k3[:, None], o_t[None, :]), (1, H * K)),
-                mask=m_k,
-                other=0.0,
-            )
-            b_h3 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
-        if K > 192:
-            m_k = (o_k4[:, None] < K) & m_t[None, :]
-            b_k = tl.load(
-                k + ptr_offset((o_k4[:, None], o_t[None, :]), (1, H * K)),
-                mask=m_k,
-                other=0.0,
-            )
-            b_h4 += tl.dot(b_k, b_v)  # pyrefly: ignore[unbound-name]
+        b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
     if STORE_FINAL_STATE:
-        m_ht = (o_k1[:, None] < K) & m_v[None, :]
         tl.store(
-            ht + ptr_offset((o_k1[:, None], o_v[None, :]), (V, 1)),
-            b_h1.to(ht.dtype.element_ty),
-            mask=m_ht,
+            ht + i_state * K * V + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1)),
+            b_h,
         )
-        if K > 64:
-            m_ht = (o_k2[:, None] < K) & m_v[None, :]
-            tl.store(
-                ht + ptr_offset((o_k2[:, None], o_v[None, :]), (V, 1)),
-                b_h2.to(ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_ht,
-            )
-        if K > 128:
-            m_ht = (o_k3[:, None] < K) & m_v[None, :]
-            tl.store(
-                ht + ptr_offset((o_k3[:, None], o_v[None, :]), (V, 1)),
-                b_h3.to(ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_ht,
-            )
-        if K > 192:
-            m_ht = (o_k4[:, None] < K) & m_v[None, :]
-            tl.store(
-                ht + ptr_offset((o_k4[:, None], o_v[None, :]), (V, 1)),
-                b_h4.to(ht.dtype.element_ty),  # pyrefly: ignore[unbound-name]
-                mask=m_ht,
-            )
 
 
-_PINNED_FWD_H = PinnedConfigKernel(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
+@triton.jit(do_not_specialize=["num_sequences"])
+def _chunk_decay_last_kernel(
+    gk,
+    decay,
+    cu_seqlens,
+    chunk_offsets,
+    num_sequences,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Materialize exp2 of each chunk's last-row cumulative gate in one launch."""
+    global_chunk, i_h = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN:
+        if global_chunk >= tl.load(chunk_offsets + num_sequences):
+            return
+        _, _, token_start, valid_tokens = load_ragged_chunk_work(
+            cu_seqlens,
+            chunk_offsets,
+            global_chunk,
+            num_sequences,
+            BT,
+        )
+        last_idx = token_start + valid_tokens - 1
+    else:
+        last_idx = global_chunk * BT + BT - 1
+    o_k = tl.arange(0, K)
+    b_g = tl.load(gk + last_idx.to(tl.int64) * H * K + i_h * K + o_k)
+    tl.store(decay + global_chunk.to(tl.int64) * H * K + i_h * K + o_k, exp2(b_g))
+
+
+def _chunk_decay_last(
+    gk: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    chunks: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Per-chunk exp2 last-row decay factors for the recurrence kernel.
+
+    Kept as a Triton kernel so exp2 stays bitwise-identical to the previous
+    in-loop decay; torch.exp2 makes no such guarantee.
+    """
+    _, _, heads, key_dim = gk.shape
+    decay = torch.empty(chunks, heads, key_dim, dtype=torch.float32, device=gk.device)
+    _chunk_decay_last_kernel[(chunks, heads)](
+        gk,
+        decay,
+        cu_seqlens,
+        chunk_offsets,
+        num_sequences=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
+        H=heads,
+        K=key_dim,
+        BT=chunk_size,
+        IS_VARLEN=cu_seqlens is not None,
+        num_warps=1,
+    )
+    return decay
+
+
+# The op pair's schemas, fakes, and dispatch registrations live in
+# attn_gym.linear.kda.ops; this module provides the CUDA entry points.
+_CHUNK_SIZE = 64
+_BLOCK_VALUE_DIM = 64
+
+
+def _delta_h_launch(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+    final_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
+    batch, tokens, heads, key_dim = k.shape
+    value_dim = u.shape[-1]
+    h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
+    v_new = torch.empty_like(u)
+    decay = _chunk_decay_last(gk, cu_seqlens, chunk_offsets, capacity, _CHUNK_SIZE)
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    # FP32 tiles double the descriptor staging past the shared-memory limit
+    # at the 16-bit tile shape, and warp specialization pins its own stage
+    # count; for 4-byte inputs halve the value tile and use an ordinarily
+    # pipelined loop instead. 16-bit inputs keep the tuned contract schedule.
+    use_16bit_config = k.element_size() == 2
+    block_value_dim = _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2
+    chunk_delta_h_kernel_k128_wsp[(state_batch * heads, value_dim // block_value_dim)](
+        TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),
+        TensorDescriptor.from_tensor(w, [1, _CHUNK_SIZE, 1, key_dim]),
+        TensorDescriptor.from_tensor(u, [1, _CHUNK_SIZE, 1, block_value_dim]),
+        TensorDescriptor.from_tensor(v_new, [1, _CHUNK_SIZE, 1, block_value_dim]),
+        TensorDescriptor.from_tensor(h, [1, 1, 1, key_dim, block_value_dim]),
+        TensorDescriptor.from_tensor(decay, [1, 1, key_dim]),
+        initial_state,
+        final_state,
+        cu_seqlens,
+        chunk_offsets,
+        k,
+        w,
+        u,
+        v_new,
+        tokens,
+        H=heads,
+        K=key_dim,
+        V=value_dim,
+        BT=_CHUNK_SIZE,
+        BV=block_value_dim,
+        WARP_SPECIALIZE=use_16bit_config,
+        NUM_STAGES=3 if use_16bit_config else 2,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
+        IS_VARLEN=cu_seqlens is not None,
+        USE_INT64_OFFSETS=requires_int64_offsets(k, w, u, v_new, h, initial_state, final_state),
+        num_warps=4,
+    )
+    return h, v_new
+
+
+def _delta_h_cuda(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _delta_h_launch(k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, capacity, None)
+
+
+def _delta_h_with_state_cuda(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    final_state = torch.empty(
+        state_batch, k.shape[2], k.shape[3], u.shape[-1], dtype=torch.float32, device=k.device
+    )
+    h, v_new = _delta_h_launch(
+        k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, capacity, final_state
+    )
+    return h, v_new, final_state
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -410,7 +326,13 @@ def chunk_gated_delta_rule_fwd_h(
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Run the fixed-length or packed inter-chunk KDA state recurrence."""
+    """Run the fixed-length or packed inter-chunk KDA state recurrence.
+
+    ``autotune`` is accepted for launcher-ABI parity with the other stages;
+    the warp-specialized kernel has a single fixed configuration, so pinned
+    and autotuned launches are identical.
+    """
+    del autotune
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     if metadata is None:
@@ -426,14 +348,27 @@ def chunk_gated_delta_rule_fwd_h(
         raise ValueError(
             f"the inter-chunk state recurrence requires complete chunks, got T={tokens}"
         )
-    if key_dim > 256:
-        raise ValueError(f"the inter-chunk state recurrence requires K <= 256, got {key_dim}")
+    if (key_dim, value_dim, chunk_size) != (128, 128, _CHUNK_SIZE):
+        raise ValueError(
+            "the inter-chunk state recurrence requires K=V=128 with 64-token chunks, "
+            f"got K={key_dim}, V={value_dim}, chunk_size={chunk_size}"
+        )
+    if batch != 1:
+        raise ValueError("the inter-chunk state recurrence requires batch size one")
+    if not k.is_cuda:
+        raise ValueError("the inter-chunk state recurrence requires CUDA tensors")
+    if k.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError(
+            "the inter-chunk state recurrence requires bfloat16, float16, or float32 inputs"
+        )
+    if not (k.dtype == w.dtype == u.dtype):
+        raise TypeError("the inter-chunk state recurrence requires matching k, w, and u dtypes")
     if w.shape != k.shape or gk.shape != k.shape:
         raise ValueError("k, w, and gk must have the same shape")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
-    if cu_seqlens is not None and batch != 1:
-        raise ValueError("packed cu_seqlens require batch size one")
+    if torch.cuda.get_device_capability(k.device)[0] < 10:
+        raise ValueError("the inter-chunk state recurrence requires CUDA capability 10.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state_shape = (state_batch, heads, key_dim, value_dim)
     if initial_state is not None:
@@ -444,38 +379,32 @@ def chunk_gated_delta_rule_fwd_h(
             )
         initial_state = initial_state.contiguous()
 
-    h = k.new_empty(batch, chunks, heads, key_dim, value_dim)
-    v_new = torch.empty_like(u)
-    final_state = (
-        torch.empty(expected_state_shape, dtype=torch.float32, device=k.device)
-        if output_final_state
-        else None
-    )
+    if tokens == 0:
+        # Zero-size tensors cannot back descriptors; the recurrence is empty
+        # and the final state is the (possibly zero) initial state.
+        h = k.new_empty(batch, chunks, heads, key_dim, value_dim)
+        final_state = None
+        if output_final_state:
+            final_state = (
+                initial_state.float().clone()
+                if initial_state is not None
+                else torch.zeros(expected_state_shape, dtype=torch.float32, device=k.device)
+            )
+        return h, torch.empty_like(u), final_state
 
-    def grid(meta):
-        return (state_batch * heads, triton.cdiv(value_dim, meta["BV"]))
+    if not all(can_use_tma(t) for t in (k, w, u)):
+        raise ValueError(
+            "the inter-chunk state recurrence requires 16-byte-aligned, "
+            "last-dimension-contiguous k, w, and u"
+        )
 
-    kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64 if autotune else _PINNED_FWD_H
-    kernel[grid](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=None,
-        gk=gk,
-        h=h,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
-        T=tokens,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BT=chunk_size,
-        USE_EXP2=True,
-    )
-    return h, v_new, final_state
+    if output_final_state:
+        h, v_new, final_state = _delta_h_with_state_op(
+            k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks
+        )
+        return h, v_new, final_state
+    h, v_new = _delta_h_op(k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks)
+    return h, v_new, None
 
 
 __all__ = ["chunk_gated_delta_rule_fwd_h"]
