@@ -24,7 +24,14 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.chunk_schedule import (
+    RaggedChunkMetadata,
+    ResolvedSchedule,
+    ScheduleKind,
+    ScheduleRequest,
+    validate_schedule_request,
+)
+from attn_gym.linear.kda.chunk_scheduler import GridScheduler
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
 )
@@ -62,16 +69,45 @@ def _validate_specialization(head_dim: int, chunk_size: int, subchunk_size: int)
     return num_subchunks * (num_subchunks - 1) // 2
 
 
+def _resolve_ragged_execution(
+    tensor: torch.Tensor,
+    metadata: RaggedChunkMetadata,
+    request: ScheduleRequest,
+) -> ResolvedSchedule:
+    """Resolve a real launch or provide the unused fake-tensor placeholder plan."""
+    validate_schedule_request(request)
+    if isinstance(tensor, FakeTensor):
+        return ResolvedSchedule(ScheduleKind.STATIC, 0, metadata.capacity)
+    return GridScheduler(metadata).resolve_chunk(request, tensor.device)
+
+
+def _make_fake_chunk_index(
+    chunk_schedule: ChunkSchedule,
+    sequences: int,
+):
+    """Create one optional fake ``[N+1]`` routing tensor."""
+    if chunk_schedule is ChunkSchedule.DENSE:
+        return None
+    return make_fake_compact_tensor(
+        cutlass.Int32,
+        (sequences,),
+        stride_order=(0,),
+        assumed_align=4,
+    )
+
+
 @jit_cache
 def _compile_k3b(
     heads: int,
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
-    schedule: ChunkSchedule,
+    chunk_schedule: ChunkSchedule,
+    schedule_kind: ScheduleKind,
+    chunk_workers: int = 0,
     use_int64_offsets: bool = False,
 ):
-    """Compile one persistent K3b TVM-FFI scheduling specialization."""
+    """Compile K3b for independent layout and execution schedules."""
     _check_compile_target()
     offdiag_blocks = _validate_specialization(head_dim, chunk_size, subchunk_size)
     num_subchunks = chunk_size // subchunk_size
@@ -80,7 +116,9 @@ def _compile_k3b(
         D=head_dim,
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
-        schedule=schedule,
+        chunk_schedule=chunk_schedule,
+        schedule_kind=schedule_kind,
+        chunk_workers=chunk_workers,
         use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
@@ -121,26 +159,8 @@ def _compile_k3b(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    cu_seqlens = (
-        make_fake_compact_tensor(
-            cutlass.Int32,
-            (sequences,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if schedule is ChunkSchedule.RAGGED
-        else None
-    )
-    chunk_offsets = (
-        make_fake_compact_tensor(
-            cutlass.Int32,
-            (sequences,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if schedule is ChunkSchedule.RAGGED
-        else None
-    )
+    cu_seqlens = _make_fake_chunk_index(chunk_schedule, sequences)
+    chunk_offsets = _make_fake_chunk_index(chunk_schedule, sequences)
     return compile_tvm_ffi(
         op,
         q,
@@ -156,7 +176,8 @@ def _compile_k3b(
         chunk_offsets,
         name=(
             f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
-            f"_schedule_{schedule.value}_i64{int(use_int64_offsets)}"
+            f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
+            f"_cw{chunk_workers}_i64{int(use_int64_offsets)}"
         ),
     )
 
@@ -167,10 +188,12 @@ def _compile_k4b(
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
-    schedule: ChunkSchedule,
+    chunk_schedule: ChunkSchedule,
+    schedule_kind: ScheduleKind,
+    chunk_workers: int = 0,
     use_int64_offsets: bool = False,
 ):
-    """Compile one persistent K4b TVM-FFI scheduling specialization."""
+    """Compile K4b for independent layout and execution schedules."""
     _check_compile_target()
     offdiag_blocks = _validate_specialization(head_dim, chunk_size, subchunk_size)
     num_subchunks = chunk_size // subchunk_size
@@ -178,7 +201,9 @@ def _compile_k4b(
         BC=subchunk_size,
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
-        schedule=schedule,
+        chunk_schedule=chunk_schedule,
+        schedule_kind=schedule_kind,
+        chunk_workers=chunk_workers,
         use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
@@ -200,26 +225,8 @@ def _compile_k4b(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    cu_seqlens = (
-        make_fake_compact_tensor(
-            cutlass.Int32,
-            (sequences,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if schedule is ChunkSchedule.RAGGED
-        else None
-    )
-    chunk_offsets = (
-        make_fake_compact_tensor(
-            cutlass.Int32,
-            (sequences,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if schedule is ChunkSchedule.RAGGED
-        else None
-    )
+    cu_seqlens = _make_fake_chunk_index(chunk_schedule, sequences)
+    chunk_offsets = _make_fake_chunk_index(chunk_schedule, sequences)
     return compile_tvm_ffi(
         op,
         AkkOD,
@@ -231,7 +238,8 @@ def _compile_k4b(
         chunk_offsets,
         name=(
             f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
-            f"_schedule_{schedule.value}_i64{int(use_int64_offsets)}"
+            f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
+            f"_cw{chunk_workers}_i64{int(use_int64_offsets)}"
         ),
     )
 
@@ -244,10 +252,14 @@ def _chunk_kda_fwd_k3b_ragged_impl(
     Aqk: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
+    resolved: ResolvedSchedule,
     subchunk_size: int = _SUPPORTED_SUBCHUNK_SIZE,
     AkkOD: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute scheduler-routed K3 off-diagonal blocks without running K4."""
+    """Compute K3 with an execution plan shared by composed ragged stages.
+
+    Persistent execution defines only the active ``AkkOD`` rows.
+    """
     batch, tokens, heads, head_dim = k.shape
     chunk_size = _SUPPORTED_CHUNK_SIZE
     metadata.validate_chunk_size(chunk_size)
@@ -273,12 +285,15 @@ def _chunk_kda_fwd_k3b_ragged_impl(
     g_flat = gk.reshape(tokens, heads * head_dim).contiguous()
     beta_flat = beta.reshape(tokens, heads).contiguous()
     Aqk_flat = Aqk.reshape(tokens, heads * chunk_size)
+    chunk_workers = resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 0
     k3b = _compile_k3b(
         heads,
         head_dim,
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
+        resolved.kind,
+        chunk_workers,
         use_int64_offsets=requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
     )
     k3b(
@@ -305,18 +320,21 @@ def chunk_kda_fwd_k3b_ragged_cute(
     Aqk: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run eager ragged K3 with functional input semantics."""
-    return _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk.clone(), scale, metadata)
+    resolved = _resolve_ragged_execution(k, metadata, schedule)
+    return _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk.clone(), scale, metadata, resolved)
 
 
 def _chunk_kda_fwd_k4b_ragged_impl(
     AkkOD: torch.Tensor,
     Akkd: torch.Tensor,
     metadata: RaggedChunkMetadata,
+    resolved: ResolvedSchedule,
     subchunk_size: int = _SUPPORTED_SUBCHUNK_SIZE,
 ) -> torch.Tensor:
-    """Compute scheduler-routed K4 inverse blocks into a zero-initialized output."""
+    """Compute K4 with the same execution plan that produced ``AkkOD``."""
     if Akkd.ndim != 4:
         raise ValueError(f"Akkd must be 4D, got shape {tuple(Akkd.shape)}")
     batch, tokens, heads, diagonal_width = Akkd.shape
@@ -345,6 +363,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     if isinstance(Akkd, FakeTensor) or metadata.capacity == 0:
         return Akk
 
+    chunk_workers = resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 0
     akkd_flat = Akkd.reshape(tokens, heads * subchunk_size).contiguous()
     akk_flat = Akk.reshape(tokens, heads * chunk_size)
     k4b = _compile_k4b(
@@ -353,6 +372,8 @@ def _chunk_kda_fwd_k4b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
+        resolved.kind,
+        chunk_workers,
         use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
     )
     k4b(
@@ -371,9 +392,11 @@ def chunk_kda_fwd_k4b_ragged_cute(
     AkkOD: torch.Tensor,
     Akkd: torch.Tensor,
     metadata: RaggedChunkMetadata,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> torch.Tensor:
     """Run the eager ragged K4 inverse stage."""
-    return _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata)
+    resolved = _resolve_ragged_execution(Akkd, metadata, schedule)
+    return _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata, resolved)
 
 
 def chunk_kda_fwd_inter_solve_ragged_cute(
@@ -386,10 +409,10 @@ def chunk_kda_fwd_inter_solve_ragged_cute(
     scale: float,
     metadata: RaggedChunkMetadata,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the production K3+K4 inter-solve stages with ragged scheduling."""
-    metadata.validate_chunk_size(_SUPPORTED_CHUNK_SIZE)
-    Aqk, AkkOD = _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk, scale, metadata)
-    return Aqk, _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata)
+    """Run K3 and K4 with one shared automatic scheduling decision."""
+    resolved = _resolve_ragged_execution(k, metadata, ScheduleRequest.AUTO)
+    Aqk, AkkOD = _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk, scale, metadata, resolved)
+    return Aqk, _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata, resolved)
 
 
 def chunk_kda_fwd_inter_solve_cute(
@@ -465,6 +488,7 @@ def chunk_kda_fwd_inter_solve_cute(
             BT,
             BC,
             ChunkSchedule.DENSE,
+            ScheduleKind.STATIC,
             use_int64_offsets=requires_int64_abi(
                 q_flat, k_flat, g_flat, beta_flat, Aqk_flat, akk_od
             ),
@@ -491,6 +515,7 @@ def chunk_kda_fwd_inter_solve_cute(
             BT,
             BC,
             ChunkSchedule.DENSE,
+            ScheduleKind.STATIC,
             use_int64_offsets=requires_int64_abi(akk_od, akkd_flat, Akk_flat),
         )
         k4b(

@@ -8,7 +8,8 @@
 CuTe DSL K3b: Off-diagonal gated matmul, one pair per CTA, 4 warps.
 
 Matches NV C++ kernel_3b_offdiag_matmul.cu architecture:
-  Grid: (total_chunks * 6, H, 1) — one CTA per (pair, head)
+  Exact grid: (total_chunks * 6, H, 1) — one CTA per (chunk, pair, head)
+  Persistent grid: (chunk_workers * 6, H, 1) — each CTA strides over chunks
   128 threads (4 warps):
       All warps: Phase 1 — fused gating into SMEM
       Warp 0:    Phase 2 — Aqk = sQg @ sKn^T  (MMA)
@@ -29,8 +30,12 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
 
+from attn_gym.linear.kda.chunk_schedule import ScheduleKind
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
-from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+)
 
 
 class ChunkKDAFwdK3bOffdiagCuteDSL:
@@ -42,7 +47,9 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         D: int = 128,
         chunk_size: int = 64,
         num_subchunks: int = 4,
-        schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        chunk_schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        chunk_workers: int = 0,
         use_int64_offsets: bool = False,
     ):
         assert num_subchunks == 4, (
@@ -52,10 +59,18 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
             f"{num_subchunks} * {BC}"
         )
+        if schedule_kind is ScheduleKind.PERSISTENT:
+            assert chunk_schedule is ChunkSchedule.RAGGED and chunk_workers > 0, (
+                "persistent execution requires a positive ragged chunk-worker grid"
+            )
+        else:
+            assert chunk_workers == 0, "static execution does not use chunk workers"
+        self.schedule_kind = schedule_kind
+        self.chunk_workers = chunk_workers
         self.use_int64_offsets = use_int64_offsets
         self.BC = BC
         self.D = D
-        self.schedule = schedule
+        self.chunk_schedule = chunk_schedule
         self.BT = chunk_size
         self.num_offdiag_blocks = num_subchunks * (num_subchunks - 1) // 2
         self.num_threads = 128
@@ -84,7 +99,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mQ.element_type
-        grid = (total_chunks * self.num_offdiag_blocks, H, 1)
+        chunk_axis = (
+            self.chunk_workers
+            if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+            else total_chunks
+        )
+        grid = (chunk_axis * self.num_offdiag_blocks, H, 1)
 
         smem_k_block_size = 64
         swizzle_bits = 3
@@ -175,10 +195,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, head_idx, _ = cute.arch.block_idx()
-        warp_idx = tidx // self.WARP_SIZE
-        lane_idx = tidx % self.WARP_SIZE
 
-        # ── Decompose block_idx into chunk and pair ──
         chunk_idx = block_idx // self.num_offdiag_blocks
         pair_idx = block_idx % self.num_offdiag_blocks
 
@@ -189,7 +206,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             ri = 3
         ci = pair_idx - (ri * (ri - 1)) // 2
 
-        # ── Shared memory and work resolution ──
+        # ── Shared memory, allocated once and reused across persistent iterations ──
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQg = storage.sQg.get_tensor(sGated_layout)
@@ -198,9 +215,102 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         sGref = storage.sGref.get_tensor(sGref_layout)
         sBeta = storage.sBeta.get_tensor(sBeta_layout)
 
-        if cutlass.const_expr(self.schedule is ChunkSchedule.RAGGED):
-            num_sequences = Int32(cute.size(chunk_offsets)) - 1
-            active_chunks = Int32(chunk_offsets[num_sequences])
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            active_chunks = load_ragged_chunk_count(chunk_offsets)
+            # unroll=2 interleaves two chunks' gating loads, restoring the
+            # load->use distance the scheduler achieves in the static body
+            # (median 46 vs 14 instructions; long_scoreboard 25 -> ~12 cyc/inst).
+            # unroll=4 crosses a code-size/register cliff and loses it again.
+            for current_chunk in cutlass.range(
+                chunk_idx, active_chunks, self.chunk_workers, unroll=2
+            ):
+                self._process_chunk(
+                    mQ,
+                    mK,
+                    mG,
+                    mBeta,
+                    mAqk,
+                    mAkkOD,
+                    scale,
+                    cu_seqlens,
+                    chunk_offsets,
+                    sQg,
+                    sKp,
+                    sKn,
+                    sGref,
+                    sBeta,
+                    smem_copy_A,
+                    smem_copy_B,
+                    tiled_mma,
+                    current_chunk,
+                    pair_idx,
+                    ri,
+                    ci,
+                    head_idx,
+                    tidx,
+                )
+                # Synchronize all warps before the next chunk's gating reuses SMEM.
+                cute.arch.sync_threads()
+        else:
+            self._process_chunk(
+                mQ,
+                mK,
+                mG,
+                mBeta,
+                mAqk,
+                mAkkOD,
+                scale,
+                cu_seqlens,
+                chunk_offsets,
+                sQg,
+                sKp,
+                sKn,
+                sGref,
+                sBeta,
+                smem_copy_A,
+                smem_copy_B,
+                tiled_mma,
+                chunk_idx,
+                pair_idx,
+                ri,
+                ci,
+                head_idx,
+                tidx,
+            )
+
+    @cute.jit
+    def _process_chunk(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mG: cute.Tensor,
+        mBeta: cute.Tensor,
+        mAqk: cute.Tensor,
+        mAkkOD: cute.Tensor,
+        scale: cutlass.Float32,
+        cu_seqlens: cute.Tensor | None,
+        chunk_offsets: cute.Tensor | None,
+        sQg: cute.Tensor,
+        sKp: cute.Tensor,
+        sKn: cute.Tensor,
+        sGref: cute.Tensor,
+        sBeta: cute.Tensor,
+        smem_copy_A: cute.TiledCopy,
+        smem_copy_B: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        chunk_idx: Int32,
+        pair_idx: Int32,
+        ri: Int32,
+        ci: Int32,
+        head_idx: Int32,
+        tidx: Int32,
+    ):
+        """Gate, multiply, and store one (chunk, pair, head) off-diagonal tile."""
+        warp_idx = tidx // self.WARP_SIZE
+        lane_idx = tidx % self.WARP_SIZE
+
+        if cutlass.const_expr(self.chunk_schedule is ChunkSchedule.RAGGED):
+            active_chunks = load_ragged_chunk_count(chunk_offsets)
             chunk_base = Int32(0)
             eos = Int32(0)
             if chunk_idx < active_chunks:
@@ -225,7 +335,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         # ══════════════════════════════════════════════════════════
         # Phase 1: Gating into SMEM
         # ══════════════════════════════════════════════════════════
-        if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
+        if cutlass.const_expr(self.chunk_schedule is not ChunkSchedule.DENSE):
             col = tidx
             h_col = h_offset + col
             if chunk_base + self.BT <= eos:
@@ -373,7 +483,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
+                if cutlass.const_expr(self.chunk_schedule is not ChunkSchedule.DENSE):
                     if chunk_base + self.BT <= eos or ti_row + row < eos:
                         mAqk[ti_row + row, aqk_col + ci * self.BC + col] = out_dtype(
                             acc_Aqk[i] * scale
@@ -396,7 +506,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
+                if cutlass.const_expr(self.chunk_schedule is not ChunkSchedule.DENSE):
                     if ti_col + row < eos:
                         mAqk[ti_col + row, aqk_col + ri * self.BC + col] = out_dtype(0.0)
                 else:

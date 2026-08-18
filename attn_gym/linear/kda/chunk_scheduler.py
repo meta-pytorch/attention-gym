@@ -1,8 +1,91 @@
-"""Graph-safe logical chunk scheduling for packed variable-length KDA inputs."""
+"""Graph-safe chunk scheduling for packed variable-length KDA inputs.
+
+Coordinate system
+-----------------
+
+- **Sequence**: packed token range ``[cu_seqlens[i], cu_seqlens[i + 1])``.
+- **Local chunk**: chunk number within one sequence. Local chunk 0 begins at the
+  sequence start, not at a multiple of ``chunk_size`` in the packed buffer.
+- **Global chunk**: a dense index over all active local chunks from every
+  sequence. Kernels use this as their common chunk coordinate.
+- **Chunk capacity**: the fixed CUDA Graph upper bound on global chunks. Global
+  chunk slots beyond the runtime active count contain no work on that replay.
+
+Scheduling views
+----------------
+
+``GridScheduler`` supports two launch geometries; ``subtask`` is terminology for
+only the flattened one:
+
+1. **Flat-task scheduling** (Triton): a kernel supplies only its number of
+   kernel-specific work coordinates per chunk. The scheduler sees that count,
+   not whether the coordinate means a head, channel tile, or
+   ``(head, output-tile)`` pair. The kernel flattens and later decodes::
+
+       task = global_chunk * subtasks_per_chunk + subtask
+       global_chunk, subtask = divmod(task, subtasks_per_chunk)
+
+   A persistent worker CTA processes tasks
+   ``w, w + num_workers, w + 2 * num_workers, ...``. Here a subtask is CTA-level
+   parallel work, not an inner loop.
+
+2. **Chunk-axis scheduling** (CuTeDSL): the scheduler controls only the chunk
+   grid axis. Pair, head, and tile coordinates remain explicit grid axes, and
+   each CTA strides over chunks for one fixed combination of those coordinates.
+   This path neither passes nor decodes a ``subtasks_per_chunk`` value.
+
+The value three in the worked example below is therefore illustrative only for
+flat-task scheduling; it is not derived from ``cu_seqlens`` and does not describe
+the CuTeDSL grid.
+
+Shared routing metadata
+-----------------------
+
+``chunk_offsets`` has the same fixed ``[N + 1]`` shape as ``cu_seqlens``. During
+CUDA Graph capture its storage and shape become fixed, but one device operation
+rebuilds its values from the current ``cu_seqlens`` on every replay::
+
+    chunk_count[i] = ceil_div(cu_seqlens[i + 1] - cu_seqlens[i], chunk_size)
+    chunk_offsets = exclusive_prefix_sum(chunk_count)
+
+``KDAAttention`` prepares this prefix once, passes the same
+``RaggedChunkMetadata`` to the gate and core forward stages, and saves the same
+``cu_seqlens``/``chunk_offsets`` storage for backward. Each consumer still
+binary-searches ``chunk_offsets`` to map a global chunk to its sequence and local
+chunk, but it does not recompute every sequence's chunk count and prefix. This
+avoids duplicate metadata launches and guarantees one global-chunk coordinate
+system across stages. The motivating packed-step A/B moved from 4.650 to
+4.467 ms; that end-to-end result supports the ownership choice but does not
+isolate metadata preparation alone. The training-example tests explicitly
+enforce one preparation with shared consumers.
+
+Worked example
+--------------
+
+For ``cu_seqlens=[0, 5, 5, 12]`` and ``chunk_size=4``:
+
+- sequence 0 has length 5 and therefore 2 chunks;
+- sequence 1 is empty and therefore has 0 chunks;
+- sequence 2 has length 7 and therefore 2 chunks.
+
+The counts are ``[2, 0, 2]``. Their exclusive prefix sum is
+``chunk_offsets=[0, 2, 2, 4]``: sequence 0 owns global chunks ``[0, 2)``, sequence
+1 owns none, and sequence 2 owns ``[2, 4)``. Global chunk 2 is therefore local
+chunk 0 of sequence 2 and begins at packed token 5. If a flat-scheduled example
+kernel has three subtasks per chunk, task 7 maps to
+``(global_chunk, subtask) = divmod(7, 3) = (2, 1)``.
+
+Flat STATIC scheduling launches every capacity task. Chunk-axis STATIC
+scheduling launches the full chunk-capacity axis while retaining the other grid
+axes. Inactive CTAs return after reading the active count. PERSISTENT scheduling
+bounds the worker or chunk axis and strides only over runtime active work.
+"""
 
 from __future__ import annotations
 
+import functools
 import itertools
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -13,9 +96,125 @@ import triton.language as tl
 # launch through the registered scheduler op instead of tracing it directly.
 from attn_gym.linear.kda.chunk_schedule import (
     RaggedChunkMetadata,
+    ResolvedSchedule,
+    ScheduleKind,
+    ScheduleRequest,
     chunk_capacity,
     prepare_ragged_chunk_metadata,
+    validate_schedule_request,
 )
+
+# Default persistent worker cap; individual kernels can override it where measured.
+PERSISTENT_CTAS_PER_SM = 4
+
+# Auto policy: static launches pay only launch time for padding CTAs, so a
+# few waves of them are cheaper than the persistent stride loop's overhead.
+# Switch only after the capacity grid exceeds this many bounded-worker waves:
+# with 100 persistent workers, capacities through 400 tasks use the static grid.
+PERSISTENT_AUTO_WAVES = 4
+
+
+@functools.cache
+def _multiprocessor_count_for_index(device_index: int) -> int:
+    """Cache the SM count for one concrete CUDA device."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _multiprocessor_count(device: torch.device) -> int:
+    """Resolve unindexed CUDA devices before consulting the SM-count cache."""
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    return _multiprocessor_count_for_index(device_index)
+
+
+@dataclass(frozen=True)
+class GridScheduler:
+    """Map ragged chunk work onto launch grids for Triton and CuTeDSL kernels.
+
+    The runtime number of chunks depends on sequence lengths, but CUDA Graph
+    capture fixes the launch shape at ``metadata.capacity``. Static kernels
+    launch one CTA per capacity task; inactive CTAs read the active count and
+    return. Persistent kernels launch a bounded machine-derived worker grid and
+    stride over the active flat-task list, so capacity padding adds neither CTAs
+    nor loop iterations. Workers are independent and require no inter-CTA
+    synchronization; their count is an occupancy choice, not a co-residency
+    requirement.
+    """
+
+    metadata: RaggedChunkMetadata
+    ctas_per_sm: int = PERSISTENT_CTAS_PER_SM
+
+    @staticmethod
+    def _resolve(
+        request: ScheduleRequest,
+        eligible: bool,
+        capacity_tasks: int,
+        workers: int,
+        requirement: str,
+    ) -> ResolvedSchedule:
+        """Translate caller policy into one concrete schedule."""
+        validate_schedule_request(request)
+        if request is ScheduleRequest.PERSISTENT and not eligible:
+            raise ValueError(f"persistent scheduling requires {requirement}")
+        if capacity_tasks == 0:
+            return ResolvedSchedule(ScheduleKind.STATIC, workers, capacity_tasks)
+        if request is ScheduleRequest.AUTO:
+            persistent = eligible and capacity_tasks > PERSISTENT_AUTO_WAVES * workers
+        else:
+            persistent = request is ScheduleRequest.PERSISTENT
+        return ResolvedSchedule(
+            ScheduleKind.PERSISTENT if persistent else ScheduleKind.STATIC,
+            workers,
+            capacity_tasks,
+        )
+
+    def num_workers(self, subtasks_per_chunk: int, device: torch.device | str) -> int:
+        """Return the bounded worker count for a flat ``(chunk, subtask)`` list."""
+        sm_count = _multiprocessor_count(torch.device(device))
+        return min(self.metadata.capacity * subtasks_per_chunk, sm_count * self.ctas_per_sm)
+
+    def num_chunk_workers(self, device: torch.device | str) -> int:
+        """Determine the persistent grid size along the chunk axis for this device.
+
+        CuTeDSL kernels retain their natural grid dimensions for the remaining
+        axes (pair, head, ...), while this helper sizes only the chunk axis. These
+        small CTAs are latency bound, so measured performance improves as chunk
+        parallelism increases; cap that axis at one worker per SM, independently
+        of the number of subtasks per chunk.
+        """
+        sm_count = _multiprocessor_count(torch.device(device))
+        if self.metadata.capacity == 0:
+            return 0
+        # Power-of-two quantization keeps the TVM-FFI compile cache small when
+        # eager callers vary the capacity below the SM count.
+        return min(1 << (self.metadata.capacity - 1).bit_length(), sm_count)
+
+    def resolve_flat(
+        self,
+        request: ScheduleRequest,
+        subtasks_per_chunk: int,
+        device: torch.device | str,
+        *,
+        eligible: bool = True,
+        requirement: str = "a persistent kernel for this input layout",
+    ) -> ResolvedSchedule:
+        """Resolve scheduling for a flattened ``(chunk, subtask)`` work list."""
+        workers = self.num_workers(subtasks_per_chunk, device)
+        return self._resolve(
+            request,
+            eligible,
+            self.metadata.capacity * subtasks_per_chunk,
+            workers,
+            requirement,
+        )
+
+    def resolve_chunk(
+        self,
+        request: ScheduleRequest,
+        device: torch.device | str,
+    ) -> ResolvedSchedule:
+        """Resolve scheduling when only the chunk axis is persistent."""
+        workers = self.num_chunk_workers(device)
+        return self._resolve(request, True, self.metadata.capacity, workers, "a ragged kernel")
 
 
 class ChunkWork(NamedTuple):
@@ -78,6 +277,30 @@ def _prepare_ragged_chunk_offsets_kernel(
 
 
 @triton.jit
+def load_ragged_chunk_count(chunk_offsets, num_sequences):
+    """Load the terminal prefix-sum entry containing the active chunk count."""
+    return tl.load(chunk_offsets + num_sequences).to(tl.int64)
+
+
+@triton.jit
+def load_ragged_task_count(chunk_offsets, num_sequences, subtasks_per_chunk):
+    """Return the runtime number of active flattened chunk tasks.
+
+    ``num_sequences`` selects only the terminal prefix-sum entry; scheduling does
+    not stride over sequences. If each chunk has three subtasks, flat tasks 0--2
+    belong to global chunk 0 and tasks 3--5 belong to global chunk 1. Worker ``w``
+    handles ``w, w + num_workers, ...`` up to this returned bound.
+    """
+    return load_ragged_chunk_count(chunk_offsets, num_sequences) * subtasks_per_chunk
+
+
+@triton.jit
+def decode_ragged_task(task, subtasks_per_chunk):
+    """Decode one widened flat task into ``(global_chunk, subtask)``."""
+    return task // subtasks_per_chunk, task % subtasks_per_chunk
+
+
+@triton.jit
 def load_ragged_chunk_work(
     cu_seqlens,
     chunk_offsets,
@@ -120,7 +343,7 @@ def _decode_ragged_chunk_work_kernel(
     chunk_size: tl.constexpr,
 ):
     global_chunk = tl.program_id(0)
-    active_chunks = tl.load(chunk_offsets + num_sequences)
+    active_chunks = load_ragged_chunk_count(chunk_offsets, num_sequences)
     output = work + global_chunk * 5
 
     if global_chunk < active_chunks:
@@ -184,10 +407,14 @@ def decode_ragged_chunk_work(metadata: RaggedChunkMetadata) -> torch.Tensor:
 
 __all__ = [
     "ChunkWork",
+    "GridScheduler",
     "RaggedChunkMetadata",
     "chunk_capacity",
     "chunk_work_oracle",
     "decode_ragged_chunk_work",
+    "decode_ragged_task",
+    "load_ragged_chunk_count",
     "load_ragged_chunk_work",
+    "load_ragged_task_count",
     "prepare_ragged_chunk_metadata",
 ]

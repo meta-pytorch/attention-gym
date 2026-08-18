@@ -22,7 +22,16 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
+from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
+    RaggedChunkMetadata,
+    ScheduleKind,
+    ScheduleRequest,
+    decode_ragged_task,
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+    load_ragged_task_count,
+)
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
 
 
@@ -92,7 +101,7 @@ def chunk_gla_fwd_kernel_o(
         i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        if i_t >= tl.load(chunk_offsets + num_sequences):
+        if i_t >= load_ragged_chunk_count(chunk_offsets, num_sequences):
             return
         i_tg = i_t
         i_n, i_t, token_start, _ = load_ragged_chunk_work(
@@ -256,8 +265,8 @@ def chunk_gla_fwd_kernel_o_tma(
     )
 
 
-@triton.jit(do_not_specialize=["num_sequences"])
-def chunk_gla_fwd_kernel_o_ragged_tma(
+@triton.jit
+def _compose_ragged_output_task(
     q_desc,
     v_desc,
     g_desc,
@@ -275,6 +284,9 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     scale,
     q_stride_t,
     q_stride_h,
+    i_v,
+    global_chunk,
+    i_h,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -283,10 +295,10 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     BV: tl.constexpr,
     num_sequences,
 ):
-    """Compose full ragged chunks with TMA and partial tails with masked pointers."""
-    i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if global_chunk >= tl.load(chunk_offsets + num_sequences):
-        return
+    """Compose one active (value-tile, chunk, head) ragged output tile.
+
+    Full chunks go through TMA; partial tails use masked pointers.
+    """
     _, _, token_start, valid_tokens = load_ragged_chunk_work(
         cu_seqlens,
         chunk_offsets,
@@ -348,6 +360,140 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
         tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
+@triton.jit(do_not_specialize=["num_sequences"])
+def chunk_gla_fwd_kernel_o_ragged_tma(
+    q_desc,
+    v_desc,
+    g_desc,
+    h_desc,
+    o_desc,
+    A_desc,
+    q,
+    v,
+    g,
+    h,
+    o,
+    A,
+    cu_seqlens,
+    chunk_offsets,
+    scale,
+    q_stride_t,
+    q_stride_h,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    num_sequences,
+):
+    """Launch one CTA per capacity task; capacity-only CTAs exit immediately."""
+    i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if global_chunk >= load_ragged_chunk_count(chunk_offsets, num_sequences):
+        return
+    _compose_ragged_output_task(
+        q_desc,
+        v_desc,
+        g_desc,
+        h_desc,
+        o_desc,
+        A_desc,
+        q,
+        v,
+        g,
+        h,
+        o,
+        A,
+        cu_seqlens,
+        chunk_offsets,
+        scale,
+        q_stride_t,
+        q_stride_h,
+        i_v,
+        global_chunk,
+        i_h,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
+        num_sequences,
+    )
+
+
+@triton.jit(do_not_specialize=["num_sequences", "num_workers"])
+def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
+    q_desc,
+    v_desc,
+    g_desc,
+    h_desc,
+    o_desc,
+    A_desc,
+    q,
+    v,
+    g,
+    h,
+    o,
+    A,
+    cu_seqlens,
+    chunk_offsets,
+    scale,
+    q_stride_t,
+    q_stride_h,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    num_sequences,
+    num_workers,
+):
+    """Stride a bounded worker grid over active (chunk, head, value-tile) tasks."""
+    worker = tl.program_id(0)
+    num_value_tiles: tl.constexpr = tl.cdiv(V, BV)
+    subtasks: tl.constexpr = H * num_value_tiles
+    total_tasks = load_ragged_task_count(chunk_offsets, num_sequences, subtasks)
+    # num_stages=1 stops the software pipeliner from double-buffering the
+    # outer task loop; the extra SMEM stage costs a resident CTA per SM.
+    for task in tl.range(worker, total_tasks, num_workers, num_stages=1):
+        # TMA descriptor offsets are int32; chunk capacity and subtask indices
+        # each remain in range even when their flattened product needs int64.
+        global_chunk, remainder = decode_ragged_task(task, subtasks)
+        global_chunk = global_chunk.to(tl.int32)
+        remainder = remainder.to(tl.int32)
+        _compose_ragged_output_task(
+            q_desc,
+            v_desc,
+            g_desc,
+            h_desc,
+            o_desc,
+            A_desc,
+            q,
+            v,
+            g,
+            h,
+            o,
+            A,
+            cu_seqlens,
+            chunk_offsets,
+            scale,
+            q_stride_t,
+            q_stride_h,
+            remainder % num_value_tiles,
+            global_chunk,
+            remainder // num_value_tiles,
+            H,
+            K,
+            V,
+            BT,
+            BK,
+            BV,
+            num_sequences,
+        )
+
+
 def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
     """Return whether all fixed KDA tensors satisfy host TMA requirements."""
     return all(can_use_tma(tensor) for tensor in tensors)
@@ -367,8 +513,18 @@ def chunk_gla_fwd_o_gk(
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> torch.Tensor:
-    """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
+    """Compose fixed-length or packed KDA intra- and inter-chunk output terms.
+
+    Args:
+        schedule: Internal scheduling request for tests. Automatic selection is
+            the default and dense inputs keep their exact launch grid.
+
+    Raises:
+        ValueError: If persistent scheduling is forced for a packed input outside
+            the TMA path, where no persistent kernel exists to honor it.
+    """
     if metadata is not None:
         metadata.validate_chunk_size(chunk_size)
     batch, tokens, heads, key_dim = q.shape
@@ -389,12 +545,24 @@ def chunk_gla_fwd_o_gk(
         raise ValueError(f"h must have shape {expected_h_shape}, got {tuple(h.shape)}")
 
     output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    if chunks == 0:
+        return output
     ragged_tma = (
         metadata is not None
         and batch == 1
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
         and _can_use_tensor_descriptors(q, v, g, h, output, A)
     )
+    if metadata is not None:
+        subtasks = heads * triton.cdiv(value_dim, 64)  # 64 = the persistent kernel's BV tile
+        resolved = GridScheduler(metadata).resolve_flat(
+            schedule,
+            subtasks,
+            q.device,
+            eligible=ragged_tma,
+            requirement="the TMA path on packed inputs: batch=1, K=V=128, chunk_size=64, "
+            "and TMA-capable tensors",
+        )
     if (
         metadata is None
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
@@ -429,9 +597,8 @@ def chunk_gla_fwd_o_gk(
         if ragged_tma:
             block_key_dim = 32
             block_value_dim = 64
-            chunk_gla_fwd_kernel_o_ragged_tma[
-                (triton.cdiv(value_dim, block_value_dim), chunks, heads)
-            ](
+            value_tiles = triton.cdiv(value_dim, block_value_dim)
+            args = (
                 TensorDescriptor.from_tensor(q, [1, chunk_size, 1, block_key_dim]),
                 TensorDescriptor.from_tensor(v, [1, chunk_size, 1, block_value_dim]),
                 TensorDescriptor.from_tensor(g, [1, chunk_size, 1, block_key_dim]),
@@ -449,20 +616,29 @@ def chunk_gla_fwd_o_gk(
                 scale,
                 q.stride(1),
                 q.stride(2),
-                H=heads,
-                K=key_dim,
-                V=value_dim,
-                BT=chunk_size,
-                BK=block_key_dim,
-                BV=block_value_dim,
-                num_sequences=metadata.cu_seqlens.shape[0] - 1,
-                num_warps=2,
-                num_stages=3,
-                # The rarely taken partial-chunk pointer branch pushes this
-                # kernel to 180 registers vs the dense kernel's 134; cap at the
-                # dense budget so only tail CTAs pay with spills.
-                maxnreg=136,
             )
+            kwargs = {
+                "H": heads,
+                "K": key_dim,
+                "V": value_dim,
+                "BT": chunk_size,
+                "BK": block_key_dim,
+                "BV": block_value_dim,
+                "num_sequences": metadata.cu_seqlens.shape[0] - 1,
+                "num_warps": 2,
+                "num_stages": 3,
+                # The partial-tail pointer branch otherwise pushes this kernel
+                # past the dense register budget and loses a resident CTA.
+                "maxnreg": 136,
+            }
+            if resolved.kind is ScheduleKind.PERSISTENT:
+                chunk_gla_fwd_kernel_o_ragged_tma_persistent[(resolved.workers,)](
+                    *args, num_workers=resolved.workers, **kwargs
+                )
+            else:
+                chunk_gla_fwd_kernel_o_ragged_tma[(value_tiles, metadata.capacity, heads)](
+                    *args, **kwargs
+                )
             return output
 
         def grid(meta):

@@ -1,8 +1,89 @@
-"""Opt-in masking for fixed-capacity packed KDA tensors."""
+"""Opt-in masking for fixed-capacity packed KDA tensors.
+
+Masking is bandwidth-critical under CUDA Graph over-capture: it runs on the
+physical capacity buffer every step. On the eligible eager CUDA path the row
+kernel never reads padding rows (it write-only zeros them) and the gradient
+barrier aliases ``x`` in the forward. Compiled graphs and unsupported layouts
+keep the ``torch.where`` form so Inductor owns fusion.
+"""
 
 from __future__ import annotations
 
 import torch
+
+
+def _mask_inactive_rows(x: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+    """Use the optional Triton row kernel, falling back to ordinary ATen masking."""
+    try:
+        from attn_gym.linear.kda.fwd.triton.masking import mask_inactive_rows
+    except ModuleNotFoundError as error:
+        if error.name is None or error.name.split(".", 1)[0] != "triton":
+            raise
+        mask = active_mask.reshape(1, -1, *((1,) * (x.ndim - 2)))
+        return torch.where(mask, x, 0)
+
+    return mask_inactive_rows(x, active_mask)
+
+
+class _MaskRows(torch.autograd.Function):
+    """Row masking whose every derivative zeroes inactive tokens.
+
+    ``preserve_values=True`` is the gradient barrier: a zero-copy identity in
+    the forward (the result aliases ``x``) that still masks cotangents and
+    tangents.
+    """
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(x: torch.Tensor, active_mask: torch.Tensor, preserve_values: bool) -> torch.Tensor:
+        return x if preserve_values else _mask_inactive_rows(x, active_mask)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(inputs[1])
+        ctx.save_for_forward(inputs[1])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (active_mask,) = ctx.saved_tensors
+        return _MaskRows.apply(grad_output.contiguous(), active_mask, False), None, None
+
+    @staticmethod
+    def jvp(ctx, tangent: torch.Tensor, _mask_tangent, _preserve_tangent):
+        (active_mask,) = ctx.saved_for_forward
+        return _MaskRows.apply(tangent.contiguous(), active_mask, False)
+
+
+def _use_row_kernel(x: torch.Tensor, active_mask: torch.Tensor) -> bool:
+    """Gate the bandwidth-optimized path to layouts the row kernel supports.
+
+    Compiled graphs keep the where-form so Inductor owns fusion and traced
+    autograd sees ordinary aten semantics; non-contiguous or CPU inputs fall
+    back to the where-form as well.
+    """
+    return (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and x.dtype in {torch.float16, torch.bfloat16, torch.float32}
+        and x.is_contiguous()
+        and active_mask.is_contiguous()
+    )
+
+
+def _validate_packed_mask(x: torch.Tensor, active_mask: torch.Tensor) -> None:
+    """Validate one packed ``[1, T, ...]`` tensor against its token mask."""
+    if x.ndim < 2 or x.shape[0] != 1:
+        raise ValueError(f"x must have packed shape [1, T, ...], got {tuple(x.shape)}")
+    if active_mask.shape != (x.shape[1],):
+        raise ValueError(
+            f"active_mask must have shape [{x.shape[1]}], got {tuple(active_mask.shape)}"
+        )
+    if active_mask.dtype != torch.bool or active_mask.device != x.device:
+        raise ValueError(
+            f"active_mask must be torch.bool on {x.device}, "
+            f"got {active_mask.dtype} on {active_mask.device}"
+        )
 
 
 def active_token_mask(x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
@@ -39,12 +120,9 @@ def mask_inactive_tokens(
     """
     if active_mask is None:
         return x
-    if x.ndim < 2 or x.shape[0] != 1:
-        raise ValueError(f"x must have packed shape [1, T, ...], got {tuple(x.shape)}")
-    if active_mask.shape != (x.shape[1],):
-        raise ValueError(
-            f"active_mask must have shape [{x.shape[1]}], got {tuple(active_mask.shape)}"
-        )
+    _validate_packed_mask(x, active_mask)
+    if _use_row_kernel(x, active_mask):
+        return _MaskRows.apply(x, active_mask, False)
     mask = active_mask.reshape(1, -1, *((1,) * (x.ndim - 2)))
     return torch.where(mask, x, 0)
 
@@ -56,19 +134,18 @@ def mask_inactive_token_gradients(
     """Preserve values while blocking inactive automatic-differentiation paths.
 
     Place this barrier between a parameterized producer and a primitive that ignores
-    inactive forward rows but leaves their input-gradient suffix undefined. The
-    inactive branch is detached, so automatic-differentiation paths are zero there
-    and subsequent derivatives inherit the same mask. Passing ``None`` returns ``x``
-    unchanged.
+    inactive forward rows but leaves their input-gradient suffix undefined. Forward
+    values pass through unchanged while cotangents and tangents are row-masked, so
+    automatic-differentiation paths are zero on inactive tokens and subsequent
+    derivatives inherit the same mask. On the eligible eager CUDA path the result
+    aliases ``x`` storage; compiled and fallback paths materialize ``torch.where``.
+    Passing ``None`` returns ``x`` unchanged.
     """
     if active_mask is None:
         return x
-    if x.ndim < 2 or x.shape[0] != 1:
-        raise ValueError(f"x must have packed shape [1, T, ...], got {tuple(x.shape)}")
-    if active_mask.shape != (x.shape[1],):
-        raise ValueError(
-            f"active_mask must have shape [{x.shape[1]}], got {tuple(active_mask.shape)}"
-        )
+    _validate_packed_mask(x, active_mask)
+    if _use_row_kernel(x, active_mask):
+        return _MaskRows.apply(x, active_mask, True)
     mask = active_mask.reshape(1, -1, *((1,) * (x.ndim - 2)))
     return torch.where(mask, x, x.detach())
 

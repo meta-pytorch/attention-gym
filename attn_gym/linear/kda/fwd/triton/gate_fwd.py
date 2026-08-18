@@ -22,9 +22,15 @@ import triton.language as tl
 from attn_gym._backends.triton.utils import ptr_offset, storage_cosize
 from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_ragged
 from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
     RaggedChunkMetadata,
+    ScheduleKind,
+    ScheduleRequest,
     chunk_capacity,
+    decode_ragged_task,
+    load_ragged_chunk_count,
     load_ragged_chunk_work,
+    load_ragged_task_count,
     prepare_ragged_chunk_metadata,
 )
 from attn_gym.linear.kda.utils import RCP_LN2, exp, input_guard
@@ -154,8 +160,8 @@ def _bounded_gate_cumsum_dense(
     return output
 
 
-@triton.jit(do_not_specialize=["num_sequences"])
-def bounded_gate_chunk_cumsum_ragged_kernel(
+@triton.jit
+def _bounded_gate_cumsum_task(
     raw_gate,
     A_log,
     dt_bias,
@@ -165,6 +171,9 @@ def bounded_gate_chunk_cumsum_ragged_kernel(
     cu_seqlens,
     chunk_offsets,
     num_sequences,
+    global_chunk,
+    i_h,
+    i_d,
     G_STRIDES: tl.constexpr,
     A_LOG_STRIDES: tl.constexpr,
     DT_BIAS_STRIDES: tl.constexpr,
@@ -173,14 +182,8 @@ def bounded_gate_chunk_cumsum_ragged_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """Apply the bounded gate and prefix sum to one device-routed ragged chunk."""
-    global_chunk = tl.program_id(0)
-    i_h = tl.program_id(1).to(tl.int64)
-    i_d = tl.program_id(2).to(tl.int64)
-    if global_chunk >= tl.load(chunk_offsets + num_sequences):
-        return
-
-    _sequence, _local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
+    """Apply the bounded gate and prefix sum to one active (chunk, head, channel tile)."""
+    _, _, token_start, valid_tokens = load_ragged_chunk_work(
         cu_seqlens,
         chunk_offsets,
         global_chunk,
@@ -213,6 +216,107 @@ def bounded_gate_chunk_cumsum_ragged_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_sequences"])
+def bounded_gate_chunk_cumsum_ragged_kernel(
+    raw_gate,
+    A_log,
+    dt_bias,
+    output,
+    lower_bound,
+    scale,
+    cu_seqlens,
+    chunk_offsets,
+    num_sequences,
+    G_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Launch one CTA per capacity task; capacity-only CTAs exit immediately."""
+    global_chunk = tl.program_id(0)
+    i_h = tl.program_id(1).to(tl.int64)
+    i_d = tl.program_id(2).to(tl.int64)
+    if global_chunk >= load_ragged_chunk_count(chunk_offsets, num_sequences):
+        return
+    _bounded_gate_cumsum_task(
+        raw_gate,
+        A_log,
+        dt_bias,
+        output,
+        lower_bound,
+        scale,
+        cu_seqlens,
+        chunk_offsets,
+        num_sequences,
+        global_chunk,
+        i_h,
+        i_d,
+        G_STRIDES,
+        A_LOG_STRIDES,
+        DT_BIAS_STRIDES,
+        O_STRIDES,
+        D,
+        BT,
+        BD,
+    )
+
+
+@triton.jit(do_not_specialize=["num_sequences", "num_workers"])
+def bounded_gate_chunk_cumsum_ragged_kernel_persistent(
+    raw_gate,
+    A_log,
+    dt_bias,
+    output,
+    lower_bound,
+    scale,
+    cu_seqlens,
+    chunk_offsets,
+    num_sequences,
+    num_workers,
+    G_STRIDES: tl.constexpr,
+    A_LOG_STRIDES: tl.constexpr,
+    DT_BIAS_STRIDES: tl.constexpr,
+    O_STRIDES: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Stride a bounded worker grid over active (chunk, head, channel-tile) tasks."""
+    worker = tl.program_id(0)
+    num_channel_tiles: tl.constexpr = (D + BD - 1) // BD
+    subtasks: tl.constexpr = H * num_channel_tiles
+    total_tasks = load_ragged_task_count(chunk_offsets, num_sequences, subtasks)
+    # num_stages=1 stops the software pipeliner from double-buffering the
+    # outer task loop; the extra SMEM stage costs a resident CTA per SM.
+    for task in tl.range(worker, total_tasks, num_workers, num_stages=1):
+        global_chunk, subtask = decode_ragged_task(task, subtasks)
+        _bounded_gate_cumsum_task(
+            raw_gate,
+            A_log,
+            dt_bias,
+            output,
+            lower_bound,
+            scale,
+            cu_seqlens,
+            chunk_offsets,
+            num_sequences,
+            global_chunk,
+            (subtask // num_channel_tiles).to(tl.int64),
+            (subtask % num_channel_tiles).to(tl.int64),
+            G_STRIDES,
+            A_LOG_STRIDES,
+            DT_BIAS_STRIDES,
+            O_STRIDES,
+            D,
+            BT,
+            BD,
+        )
+
+
 @input_guard(no_guard_contiguous=True)
 def bounded_gate_cumsum_ragged(
     raw_gate: torch.Tensor,
@@ -221,14 +325,21 @@ def bounded_gate_cumsum_ragged(
     metadata: RaggedChunkMetadata,
     *,
     lower_bound: float,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> torch.Tensor:
-    """Run the graph-safe gate with an already prepared packed schedule."""
+    """Run the graph-safe gate with an already prepared packed schedule.
+
+    Args:
+        schedule: Internal scheduling request for tests; automatic selection is
+            the default.
+    """
     output = torch.empty_like(raw_gate, dtype=torch.float32)
+    if metadata.capacity == 0:
+        return output
     _, _, heads, head_dim = raw_gate.shape
     block_dim = 32
-    bounded_gate_chunk_cumsum_ragged_kernel[
-        (metadata.capacity, heads, triton.cdiv(head_dim, block_dim))
-    ](
+    channel_tiles = triton.cdiv(head_dim, block_dim)
+    args = (
         raw_gate,
         A_log,
         dt_bias,
@@ -238,16 +349,30 @@ def bounded_gate_cumsum_ragged(
         metadata.cu_seqlens,
         metadata.chunk_offsets,
         metadata.cu_seqlens.shape[0] - 1,
-        G_STRIDES=raw_gate.stride()[1:],
-        A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=dt_bias.stride(),
-        O_STRIDES=output.stride()[1:],
-        D=head_dim,
-        BT=metadata.chunk_size,
-        BD=block_dim,
-        num_warps=2,
-        num_stages=3,
     )
+    kwargs = {
+        "G_STRIDES": raw_gate.stride()[1:],
+        "A_LOG_STRIDES": A_log.stride(),
+        "DT_BIAS_STRIDES": dt_bias.stride(),
+        "O_STRIDES": output.stride()[1:],
+        "D": head_dim,
+        "BT": metadata.chunk_size,
+        "BD": block_dim,
+        "num_warps": 2,
+        "num_stages": 3,
+    }
+    # The gate kernel uses its measured 16-CTA/SM cap rather than the 4-CTA default.
+    resolved = GridScheduler(metadata, ctas_per_sm=16).resolve_flat(
+        schedule, heads * channel_tiles, raw_gate.device
+    )
+    if resolved.kind is ScheduleKind.PERSISTENT:
+        bounded_gate_chunk_cumsum_ragged_kernel_persistent[(resolved.workers,)](
+            *args, num_workers=resolved.workers, H=heads, **kwargs
+        )
+    else:
+        bounded_gate_chunk_cumsum_ragged_kernel[(metadata.capacity, heads, channel_tiles)](
+            *args, **kwargs
+        )
     return output
 
 

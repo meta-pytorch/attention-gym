@@ -15,6 +15,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_unsupported_row_kernel_dtype_uses_torch_fallback():
+    values = torch.tensor([[[1 + 2j], [3 + 4j]]], device="cuda", dtype=torch.complex64)
+    active_mask = torch.tensor([True, False], device="cuda")
+
+    sanitized = mask_inactive_tokens(values, active_mask)
+    protected = mask_inactive_token_gradients(values, active_mask)
+
+    torch.testing.assert_close(sanitized, torch.tensor([[[1 + 2j], [0j]]], device="cuda"))
+    torch.testing.assert_close(protected, values)
+
+
 def test_mask_inactive_tokens_fullgraph_autograd():
     values = torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 4, 2)
     values[:, 2:] = float("nan")

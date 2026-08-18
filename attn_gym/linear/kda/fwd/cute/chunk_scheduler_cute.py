@@ -13,6 +13,13 @@ from attn_gym._backends.cute.device import upper_bound
 
 
 @cute.jit
+def load_ragged_chunk_count(chunk_offsets: cute.Tensor):
+    """Load the terminal prefix-sum entry containing the active chunk count."""
+    num_sequences = Int32(cute.size(chunk_offsets)) - 1
+    return Int32(chunk_offsets[num_sequences])
+
+
+@cute.jit
 def load_ragged_chunk_work(
     cu_seqlens: cute.Tensor,
     chunk_offsets: cute.Tensor,
@@ -89,14 +96,13 @@ class ChunkSchedulerDiagnostic:
         global_chunk, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = tidx % cute.arch.WARP_SIZE
-        num_sequences = Int32(cute.size(chunk_offsets)) - 1
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         work = storage.work.get_tensor(cute.make_layout(self.fields))
 
         if tidx == 0:
-            active_chunks = Int32(chunk_offsets[num_sequences])
+            active_chunks = load_ragged_chunk_count(chunk_offsets)
             if global_chunk < active_chunks:
                 sequence, local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
                     cu_seqlens,
@@ -190,4 +196,8 @@ def decode_ragged_chunk_work_cute(
     return output
 
 
-__all__ = ["decode_ragged_chunk_work_cute", "load_ragged_chunk_work"]
+__all__ = [
+    "decode_ragged_chunk_work_cute",
+    "load_ragged_chunk_count",
+    "load_ragged_chunk_work",
+]

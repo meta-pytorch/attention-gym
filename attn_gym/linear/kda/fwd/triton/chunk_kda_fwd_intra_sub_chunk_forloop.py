@@ -20,6 +20,7 @@ import triton.language as tl
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
+    load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
 from attn_gym.linear.kda.utils import (
@@ -100,7 +101,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
         i_t_orig = i_t_start + _iter * GRID_NT
         _run = i_t_orig < MAX_NT
         if IS_VARLEN and _run:
-            _run = i_t_orig < tl.load(chunk_offsets + num_sequences)
+            _run = i_t_orig < load_ragged_chunk_count(chunk_offsets, num_sequences)
         if _run:
             if IS_VARLEN:
                 i_n, i_t, token_start, _ = load_ragged_chunk_work(

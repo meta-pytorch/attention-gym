@@ -29,6 +29,47 @@ def test_inter_solve_rejects_unsupported_specializations(
         _validate_specialization(head_dim, chunk_size, subchunk_size)
 
 
+def test_ragged_fake_tensors_reject_legacy_boolean_schedule():
+    pytest.importorskip("cutlass")
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
+    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
+        chunk_kda_fwd_k3b_ragged_cute,
+        chunk_kda_fwd_k4b_ragged_cute,
+    )
+
+    with FakeTensorMode():
+        q = torch.empty(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+        g = torch.empty(1, 64, 1, 128, device="cuda")
+        beta = torch.empty(1, 64, 1, device="cuda")
+        aqk = torch.empty(1, 64, 1, 64, device="cuda", dtype=torch.bfloat16)
+        offsets = torch.empty(2, device="cuda", dtype=torch.int32)
+        metadata = RaggedChunkMetadata(offsets, offsets, capacity=1, chunk_size=64)
+
+        with pytest.raises(TypeError, match="ScheduleRequest"):
+            chunk_kda_fwd_k3b_ragged_cute(
+                q,
+                q,
+                g,
+                beta,
+                aqk,
+                128**-0.5,
+                metadata,
+                schedule=True,
+            )
+
+        offdiagonal = torch.empty(6, 256, device="cuda")
+        diagonal = torch.empty(1, 64, 1, 16, device="cuda")
+        with pytest.raises(TypeError, match="ScheduleRequest"):
+            chunk_kda_fwd_k4b_ragged_cute(
+                offdiagonal,
+                diagonal,
+                metadata,
+                schedule=False,
+            )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="the CuTeDSL KDA inter-solve requires CUDA capability 10.0 or newer",

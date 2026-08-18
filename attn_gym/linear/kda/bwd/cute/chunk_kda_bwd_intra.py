@@ -25,7 +25,10 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+)
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -964,8 +967,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     # Ragged graph replays read the active count on-device; dense launches use
     # their shape-derived compile-time capacity.
     if cutlass.const_expr(ragged):
-        num_sequences = Int32(cute.size(mChunkOffsets)) - 1
-        active_chunks = Int32(mChunkOffsets[num_sequences])
+        active_chunks = load_ragged_chunk_count(mChunkOffsets)
     else:
         active_chunks = Int32(capacity)
     iters = (active_chunks - chunk_start + grid_chunks - 1) // grid_chunks

@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
+    ScheduleRequest,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_ragged_cute,
     chunk_kda_fwd_k4b_ragged_cute,
@@ -95,8 +99,16 @@ def test_ragged_k4_inactive_capacity_is_ignored_and_output_is_zero_extended():
 
 
 @pytest.mark.parametrize("lengths", [[0], [0, 0, 0]])
-def test_ragged_inter_solve_accepts_all_empty_sequences(lengths):
-    metadata, _, diagonal = _inputs(lengths)
+def test_ragged_inter_solve_accepts_all_empty_sequences(lengths, monkeypatch):
+    requests = []
+    resolve_chunk = GridScheduler.resolve_chunk
+
+    def record_resolve(self, request, device):
+        requests.append(request)
+        return resolve_chunk(self, request, device)
+
+    monkeypatch.setattr(GridScheduler, "resolve_chunk", record_resolve)
+    metadata, offdiagonal, diagonal = _inputs(lengths)
     q = torch.empty(1, 0, 1, 128, device="cuda", dtype=torch.bfloat16)
     g = torch.empty(1, 0, 1, 128, device="cuda")
     beta = torch.empty(1, 0, 1, device="cuda")
@@ -113,15 +125,59 @@ def test_ragged_inter_solve_accepts_all_empty_sequences(lengths):
         metadata,
     )
 
+    forced_akk = chunk_kda_fwd_k4b_ragged_cute(
+        offdiagonal,
+        diagonal,
+        metadata,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+
     assert actual_aqk.shape == Aqk.shape
     assert actual_akk.shape == (1, 0, 1, 64)
+    assert forced_akk.shape == actual_akk.shape
+    assert requests == [ScheduleRequest.AUTO, ScheduleRequest.PERSISTENT]
 
 
-def test_ragged_k4_replays_aligned_to_ragged():
+def test_ragged_inter_solve_nonempty_resolves_once(monkeypatch):
+    requests = []
+    resolve_chunk = GridScheduler.resolve_chunk
+
+    def record_resolve(self, request, device):
+        requests.append(request)
+        return resolve_chunk(self, request, device)
+
+    monkeypatch.setattr(GridScheduler, "resolve_chunk", record_resolve)
+    lengths = [65, 63]
+    metadata, _, diagonal = _inputs(lengths)
+    torch.manual_seed(37)
+    q = torch.randn(1, sum(lengths), 1, 128, device="cuda", dtype=torch.bfloat16) / 8
+    k = torch.randn_like(q) / 8
+    g = -torch.rand(1, sum(lengths), 1, 128, device="cuda")
+    beta = torch.rand(1, sum(lengths), 1, device="cuda")
+    Aqk = torch.zeros(1, sum(lengths), 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    actual_aqk, actual_akk = chunk_kda_fwd_inter_solve_ragged_cute(
+        q,
+        k,
+        g,
+        beta,
+        diagonal,
+        Aqk,
+        128**-0.5,
+        metadata,
+    )
+
+    assert actual_aqk.shape == Aqk.shape
+    assert actual_akk.shape == Aqk.shape
+    assert requests == [ScheduleRequest.AUTO]
+
+
+@pytest.mark.parametrize("schedule", [ScheduleRequest.STATIC, ScheduleRequest.PERSISTENT])
+def test_ragged_k4_replays_aligned_to_ragged(schedule):
     aligned_lengths = [64, 64]
     metadata, offdiagonal, diagonal = _inputs(aligned_lengths)
     cu_seqlens = metadata.cu_seqlens
-    chunk_kda_fwd_k4b_ragged_cute(offdiagonal, diagonal, metadata)
+    chunk_kda_fwd_k4b_ragged_cute(offdiagonal, diagonal, metadata, schedule=schedule)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -131,6 +187,7 @@ def test_ragged_k4_replays_aligned_to_ragged():
             offdiagonal,
             diagonal,
             captured_metadata,
+            schedule=schedule,
         )
 
     ragged_lengths = [65, 63]
@@ -142,3 +199,56 @@ def test_ragged_k4_replays_aligned_to_ragged():
     expected = _reference(offdiagonal, ragged_lengths)
     assert captured_metadata.chunk_offsets.tolist() == [0, 2, 3]
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_persistent_ragged_k4_matches_static_over_capacity():
+    """Stride a fixed chunk-worker grid over active chunks far below capacity."""
+    lengths = [65, 63]
+    offsets = cumulative_sequence_offsets(lengths)
+    capacity_tokens = 16 * sum(lengths)
+    metadata = prepare_ragged_chunk_metadata(offsets, capacity_tokens, 64)
+    torch.manual_seed(29)
+    offdiagonal = torch.randn(metadata.capacity * 6, 16 * 16, device="cuda") / 32
+    diagonal = torch.zeros(1, capacity_tokens, 1, 16, device="cuda")
+    token_start = 0
+    for length in lengths:
+        rows = torch.arange(length, device="cuda")
+        diagonal[0, token_start + rows, 0, rows % 16] = 1
+        token_start += length
+
+    static = chunk_kda_fwd_k4b_ragged_cute(
+        offdiagonal, diagonal, metadata, schedule=ScheduleRequest.STATIC
+    )
+    persistent = chunk_kda_fwd_k4b_ragged_cute(
+        offdiagonal, diagonal, metadata, schedule=ScheduleRequest.PERSISTENT
+    )
+
+    assert torch.equal(persistent, static)
+    active_tokens = sum(lengths)
+    torch.testing.assert_close(
+        persistent[0, :active_tokens].float(),
+        _reference(offdiagonal, lengths)[0].float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    # The zero-initialized output past the active tokens must stay untouched.
+    assert not persistent[0, active_tokens:].any()
+
+
+def test_persistent_ragged_k4_strides_multiple_chunks_per_worker(monkeypatch):
+    """Force fewer workers than active chunks so CTAs reuse SMEM across iterations."""
+    from attn_gym.linear.kda import chunk_scheduler
+
+    monkeypatch.setattr(chunk_scheduler.GridScheduler, "num_chunk_workers", lambda self, device: 2)
+    lengths = [65, 63, 130, 70]
+    metadata, offdiagonal, diagonal = _inputs(lengths)
+    assert metadata.chunk_offsets[-1].item() > 2
+
+    static = chunk_kda_fwd_k4b_ragged_cute(
+        offdiagonal, diagonal, metadata, schedule=ScheduleRequest.STATIC
+    )
+    persistent = chunk_kda_fwd_k4b_ragged_cute(
+        offdiagonal, diagonal, metadata, schedule=ScheduleRequest.PERSISTENT
+    )
+
+    assert torch.equal(persistent, static)

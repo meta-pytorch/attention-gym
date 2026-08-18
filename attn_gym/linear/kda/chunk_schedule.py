@@ -2,11 +2,48 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 from typing import NamedTuple
 
 import torch
 
 from attn_gym.linear.kda.ops import prepare_chunk_offsets_op
+
+
+class ScheduleRequest(Enum):
+    """Internal scheduling policy before eligibility and geometry are known."""
+
+    AUTO = "auto"
+    STATIC = "static"
+    PERSISTENT = "persistent"
+
+
+class ScheduleKind(Enum):
+    """Concrete internal work-distribution strategy for one launch."""
+
+    STATIC = "static"
+    PERSISTENT = "persistent"
+
+
+def validate_schedule_request(request: ScheduleRequest) -> None:
+    """Reject legacy booleans and other non-enum internal schedule requests."""
+    if not isinstance(request, ScheduleRequest):
+        raise TypeError(f"request must be a ScheduleRequest, got {request!r}")
+
+
+@dataclass(frozen=True)
+class ResolvedSchedule:
+    """Resolved execution kind and the geometry used to select it.
+
+    ``workers`` is the bounded persistent-grid candidate; STATIC kernels use
+    their natural capacity grid. ``capacity_tasks`` is the total number of
+    possible ``(chunk, subtask)`` slots used by the automatic policy.
+    """
+
+    kind: ScheduleKind
+    workers: int
+    capacity_tasks: int
 
 
 class RaggedChunkMetadata(NamedTuple):
