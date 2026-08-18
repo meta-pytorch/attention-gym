@@ -492,19 +492,15 @@ class _BoundedGateCumsum(torch.autograd.Function):
 
 
 # NOTE [Gate range ceiling]
-# The intra-chunk rebase splits 2^{g_i - g_j} into two separately rounded factors whose
-# operands must stay inside the FP32 exponent range. Because the gate map is
-# `lower_bound * sigmoid(...)` and sigmoid is in (0, 1), per-token log2 decay is hard
-# bounded by |lower_bound| * log2(e) independently of the data, so the worst case over a
-# subchunk is a closed form rather than something that must be measured:
+# The bounded gate lies in [lower_bound, 0], so one token contributes at most
+# |lower_bound| * log2(e) after conversion to log2 units. Across `span_steps`, the rebase
+# therefore needs this exponent budget:
 #
-#     |lower_bound|_max = 2^EXPONENT_BITS_LIMIT / (span_steps * log2(e))
+#     |lower_bound| * span_steps * log2(e) <= 128
 #
-# The causal reference spans BC-1 = 15 steps, giving 5.915. A saturated-gate bisection on
-# GB300 measured the boundary at 5.915, matching to three decimals. Only the *realized*
-# span is data dependent, which is why random gates underestimate the ceiling; the bound
-# above is sound for any input. Without this check the core returns NaNs with no error.
-# See NOTE [Causal gate reference] in the diagonal forward kernel.
+# The causal reference spans BC-1 = 15 steps, giving a data-independent 5.915 limit.
+# Validate it here because an overflowing rebase factor can otherwise produce non-finite
+# core outputs. See NOTE [Causal gate reference] in the diagonal forward kernel.
 GATE_SPAN_STEPS = 15
 FP32_EXPONENT_BUDGET = 128.0
 MAX_GATE_LOWER_BOUND_MAGNITUDE = FP32_EXPONENT_BUDGET / (GATE_SPAN_STEPS * math.log2(math.e))

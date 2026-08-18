@@ -216,28 +216,19 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
 
 
 # NOTE [Causal gate reference]
-# The intra-chunk rebase splits 2^{g_i - g_j} into two separately rounded factors, so the
-# reference row chosen for a BC-row subchunk changes results at the rounding level. Two
-# choices are available:
+# The rebase evaluates 2^{g_i - g_j} as 2^{g_i - g_r} * 2^{g_r - g_j}. The factors round
+# separately, so the reference row r affects floating-point results. Choosing row 0 keeps
+# the reference at or before every query; a midpoint reference reduces the exponent span
+# but makes early outputs depend on a future gate through rounding.
 #
-#   causal (row 0)   never in the future for any query in the subchunk, so a change to a
-#                    later token cannot perturb an earlier result. Spans BC-1 = 15 steps.
-#   midpoint         halves the span to BC/2 = 8 steps, buying exponent headroom, but the
-#                    reference itself moves when future tokens change, so causal-prefix
-#                    outputs drift at the rounding level.
+# A gate contributes at most |lower_bound| * log2(e) per token interval, so keeping the
+# factors within the FP32 exponent range requires
 #
-# Measured on GB300 (agent_space/probe_normref_*.py): both choices land at 1.14x the
-# irreducible BF16 output-rounding floor, identical to five significant figures, so the
-# midpoint buys no accuracy. Its only advantage is range. The span sets a hard ceiling on
-# the supported gate, because the operands must stay inside the FP32 exponent range:
+#     |lower_bound| <= 128 / (span_steps * log2(e)).
 #
-#   |lower_bound|_max = 128 / (span_steps * log2(e))
-#       causal   128 / (15 * log2 e) = 5.915
-#       midpoint 128 / ( 8 * log2 e) = 11.09
-#
-# Predicted and measured boundaries agree to three decimals. The default lower_bound of -5
-# needs 7.213 log2/token against the causal ceiling of 8.533, clearing it by 18%. The
-# public gate validates that ceiling; see GATE_SPAN_STEPS in gate_fwd.py.
+# For BC=16, row 0 spans 15 intervals and gives a 5.915 limit; the 8-interval midpoint
+# would give 11.09. The public gate enforces the causal bound; see GATE_SPAN_STEPS in
+# gate_fwd.py.
 def chunk_kda_fwd_intra_diagonal(
     q: torch.Tensor,
     k: torch.Tensor,
