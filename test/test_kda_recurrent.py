@@ -41,12 +41,12 @@ def _inputs(
     seed: int = 0,
 ):
     torch.manual_seed(seed)
-    # kda l2-normalizes q and k before the core; unnormalized keys make the
+    # KDA L2-normalizes q and k before the core; unnormalized keys make the
     # delta-rule recurrence exponentially unstable and useless for comparison.
     q = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1).to(dtype)
     v = torch.randn(batch, tokens, heads, value_dim, device="cuda", dtype=dtype)
-    # realistic bounded log2 decays keep the recurrence stable over the scan.
+    # Realistic bounded log2 decays keep the recurrence stable over the scan.
     gate = -torch.rand(batch, tokens, heads, key_dim, device="cuda") * 3.0
     beta = torch.rand(batch, tokens, heads, device="cuda")
     state = torch.randn(batch, heads, key_dim, value_dim, device="cuda") if initial_state else None
@@ -138,7 +138,7 @@ def test_recurrent_packed_capacity_and_empty_slots():
         output_final_state=True,
     )
     assert final_state is not None
-    # empty padding slots preserve their incoming state bitwise.
+    # Empty padding slots preserve their incoming state bitwise.
     torch.testing.assert_close(final_state[0], initial_state[0], rtol=0, atol=0)
     torch.testing.assert_close(final_state[3], initial_state[3], rtol=0, atol=0)
     for sequence, (start, end) in enumerate(pairwise(cu_seqlens.cpu().tolist())):
@@ -224,7 +224,7 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
     expected_pool[slots.long()] = expected_state
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
-    # rows the indices never name stay bitwise untouched.
+    # Rows the indices never name stay bitwise untouched.
     untouched = [row for row in range(pool.shape[0]) if row not in slots.tolist()]
     torch.testing.assert_close(pool[untouched], before[untouched], rtol=0, atol=0)
     state_elements = pool[0].numel()

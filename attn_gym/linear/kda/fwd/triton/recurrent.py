@@ -94,7 +94,7 @@ def kda_recurrent_fwd_kernel(
     i_n, i_h = i_nh // H, i_nh % H
 
     if IS_VARLEN:
-        # assumption: seqlens have been validated prior to call
+        # Assumption: seqlens have been validated prior to call
         bos = tl.load(cu_seqlens + i_n).to(tl.int64)
         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
     else:
@@ -247,7 +247,7 @@ def _launch_recurrent_fwd(
     num_sequences = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     output = torch.empty_like(v, dtype=q.dtype)
     if state_indices is not None:
-        # paged mode reads and writes one slot, so `h0` and `ht` alias the pool and
+        # Paged mode reads and writes one slot, so `h0` and `ht` alias the pool and
         # the scan needs no gather/scatter around it.
         final_state = initial_state
     elif store_final_state:
@@ -260,6 +260,10 @@ def _launch_recurrent_fwd(
         state_batch_stride = final_state.stride(0)
     else:
         state_batch_stride = heads * key_dim * value_dim
+    # BV=32 measured faster than 64 on B200 for both decode and prefill
+    # (smaller state tiles schedule better; state traffic is identical).
+    # One flat launch dimension: sequence-head counts can exceed the 65,535
+    # grid-Y limit, while grid-X is effectively unbounded.
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
     def launch(kernel, target_final_state, contiguous_final_state, launch_options):

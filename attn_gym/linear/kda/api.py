@@ -228,7 +228,7 @@ def recurrent_kda(
     separate launches, and speculative-decoding rollback is unsupported.
     """
     selected_impl = _resolve_impl(impl)
-    # a paged pool's leading dimension is the slot count, not the sequence count, so the
+    # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(
         q,
