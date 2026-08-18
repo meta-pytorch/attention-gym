@@ -43,15 +43,9 @@ def kda_recurrent_fwd_kernel(
     ht,
     cu_seqlens,
     state_indices,
-    A_log,
-    dt_bias,
-    lower_bound,
     scale,
     T,
     state_batch_stride: tl.constexpr,
-    qkv_token_stride: tl.constexpr,
-    gate_token_stride: tl.constexpr,
-    beta_token_stride: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -61,8 +55,6 @@ def kda_recurrent_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
-    FUSE_DECODE_PREPROCESSING: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -105,40 +97,13 @@ def kda_recurrent_fwd_kernel(
 
     for t in range(bos, eos):
         row = t * H + i_h
-        if FUSE_DECODE_PREPROCESSING:
-            head_offset = i_h * (2 * K + V)
-            p_qkv = q + t * qkv_token_stride + head_offset
-            b_q = tl.load(p_qkv + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_k = tl.load(p_qkv + K + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_v = tl.load(p_qkv + 2 * K + o_v, mask=m_v, other=0.0).to(tl.float32)
-            b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = tl.load(q + row * K + o_k, mask=m_k, other=0.0).to(tl.float32) * scale
+        b_k = tl.load(k + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+        b_g = tl.load(gate + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+        b_beta = tl.load(beta + row).to(tl.float32)
+        b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
 
-            p_gate = gate + t * gate_token_stride + i_h * K + o_k
-            b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
-            b_gate_input += tl.load(dt_bias + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
-            if USE_LOWER_BOUND:
-                b_gate = lower_bound * tl.sigmoid(b_a * b_gate_input)
-            else:
-                b_softplus = tl.where(
-                    b_gate_input > 20.0,
-                    b_gate_input,
-                    tl.log(1.0 + tl.exp(b_gate_input)),
-                )
-                b_gate = -b_a * b_softplus
-            b_decay = tl.exp(b_gate)
-            b_beta = tl.sigmoid(tl.load(beta + t * beta_token_stride + i_h).to(tl.float32))
-        else:
-            b_q = tl.load(q + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_k = tl.load(k + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_g = tl.load(gate + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-            b_beta = tl.load(beta + row).to(tl.float32)
-            b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
-            b_decay = tl.exp2(b_g)
-
-        b_q *= scale
-        b_state *= b_decay[:, None]
+        b_state *= tl.exp2(b_g)[:, None]
         b_delta = (b_v - tl.sum(b_k[:, None] * b_state, 0)) * b_beta
         b_state += b_k[:, None] * b_delta[None, :]
         b_o = tl.sum(b_q[:, None] * b_state, 0)
@@ -146,6 +111,82 @@ def kda_recurrent_fwd_kernel(
 
     if STORE_FINAL_STATE:
         tl.store(ht + p_state, b_state, mask=m_kv)
+
+
+@triton.jit
+def kda_recurrent_decode_kernel(
+    packed_qkv,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    output,
+    state_cache,
+    state_indices,
+    lower_bound,
+    scale,
+    state_batch_stride: tl.constexpr,
+    qkv_token_stride: tl.constexpr,
+    gate_token_stride: tl.constexpr,
+    beta_token_stride: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    NV = tl.cdiv(V, BV)
+    i_v = pid % NV
+    i_nh = pid // NV
+    i_n, i_h = i_nh // H, i_nh % H
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_kv = m_k[:, None] & m_v[None, :]
+
+    i_state = tl.load(state_indices + i_n).to(tl.int64)
+    row = i_n * H + i_h
+    if i_state <= 0:
+        tl.store(output + row * V + o_v, 0.0, mask=m_v)
+        return
+
+    p_state = i_state * state_batch_stride + i_h * K * V + o_k[:, None] * V + o_v[None, :]
+    b_state = tl.load(state_cache + p_state, mask=m_kv, other=0.0).to(tl.float32)
+
+    head_offset = i_h * (2 * K + V)
+    p_qkv = packed_qkv + i_n * qkv_token_stride + head_offset
+    b_q = tl.load(p_qkv + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_k = tl.load(p_qkv + K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_v = tl.load(p_qkv + 2 * K + o_v, mask=m_v, other=0.0).to(tl.float32)
+    b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
+    b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+
+    p_gate = raw_gate + i_n * gate_token_stride + i_h * K + o_k
+    b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
+    b_gate_input += tl.load(dt_bias + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+    if USE_LOWER_BOUND:
+        b_gate = lower_bound * tl.sigmoid(b_a * b_gate_input)
+    else:
+        b_softplus = tl.where(
+            b_gate_input > 20.0,
+            b_gate_input,
+            tl.log(1.0 + tl.exp(b_gate_input)),
+        )
+        b_gate = -b_a * b_softplus
+
+    b_state *= tl.exp(b_gate)[:, None]
+    b_delta = b_v - tl.sum(b_k[:, None] * b_state, 0)
+    b_beta = tl.sigmoid(tl.load(raw_beta + i_n * beta_token_stride + i_h).to(tl.float32))
+    b_delta *= b_beta
+    b_state += b_k[:, None] * b_delta[None, :]
+    b_o = tl.sum(b_q[:, None] * b_state, 0)
+    tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
+    tl.store(state_cache + p_state, b_state, mask=m_kv)
 
 
 def _launch_recurrent_fwd(
@@ -178,9 +219,10 @@ def _launch_recurrent_fwd(
         state_batch_stride = final_state.stride(0)
     else:
         state_batch_stride = heads * key_dim * value_dim
-    # BV=32 measured faster than 64 on B200 for both decode and prefill
-    # (smaller state tiles schedule better; state traffic is identical).
-    block_v = min(triton.next_power_of_2(value_dim), 32)
+    average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+    # smaller value tiles schedule scans of 32 or more tokens better on b200
+    block_v_limit = 16 if average_tokens >= 32 else 32
+    block_v = min(triton.next_power_of_2(value_dim), block_v_limit)
     # One flat launch dimension: sequence-head counts can exceed the 65,535
     # grid-Y limit, while grid-X is effectively unbounded.
     grid = (triton.cdiv(value_dim, block_v) * num_sequences * heads,)
@@ -195,15 +237,9 @@ def _launch_recurrent_fwd(
         final_state,
         cu_seqlens,
         state_indices,
-        None,
-        None,
-        0.0,
         scale=key_dim**-0.5,
         T=tokens,
         state_batch_stride=state_batch_stride,
-        qkv_token_stride=0,
-        gate_token_stride=0,
-        beta_token_stride=0,
         H=heads,
         K=key_dim,
         V=value_dim,
@@ -213,8 +249,6 @@ def _launch_recurrent_fwd(
         STORE_FINAL_STATE=final_state is not None,
         IS_VARLEN=cu_seqlens is not None,
         USE_STATE_INDICES=state_indices is not None,
-        FUSE_DECODE_PREPROCESSING=False,
-        USE_LOWER_BOUND=False,
         num_warps=4,
     )
     return output, final_state
@@ -290,22 +324,17 @@ def _kda_recurrent_decode_cuda(
     output = packed_qkv.new_empty(1, batch, heads, value_dim)
     block_v = min(triton.next_power_of_2(value_dim), 32)
     grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
-    kda_recurrent_fwd_kernel[grid](
-        packed_qkv,
-        packed_qkv,
+    kda_recurrent_decode_kernel[grid](
         packed_qkv,
         raw_gate,
         raw_beta,
-        output,
-        state_cache,
-        state_cache,
-        None,
-        state_indices,
         A_log,
         dt_bias,
+        output,
+        state_cache,
+        state_indices,
         lower_bound,
         scale=scale,
-        T=1,
         state_batch_stride=state_cache.stride(0),
         qkv_token_stride=packed_qkv.stride(0),
         gate_token_stride=raw_gate.stride(1),
@@ -315,11 +344,6 @@ def _kda_recurrent_decode_cuda(
         V=value_dim,
         BK=triton.next_power_of_2(key_dim),
         BV=block_v,
-        USE_INITIAL_STATE=True,
-        STORE_FINAL_STATE=True,
-        IS_VARLEN=False,
-        USE_STATE_INDICES=True,
-        FUSE_DECODE_PREPROCESSING=True,
         USE_LOWER_BOUND=use_lower_bound,
         num_warps=4,
     )
