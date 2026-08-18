@@ -3,9 +3,12 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -31,6 +34,11 @@ jobs:
           python-version: "3.12"
 
       - run: pip install -e ".[docs]"
+
+      - name: Generate CI health data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/generate_ci_health.py
 
       - run: mkdocs build --strict
 

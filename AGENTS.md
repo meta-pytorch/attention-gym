@@ -69,6 +69,8 @@ Line length: 99 chars. Python target: 3.10+. Formatter/linter: ruff.
 Repository-specific workflows live under `.agents/skills/`. Load the matching `SKILL.md`
 before changing the covered subsystem:
 
+- [`worktree-env-setup`](.agents/skills/worktree-env-setup/SKILL.md) —
+  isolated per-worktree `.venv` with nightly PyTorch via the CI-mirroring uv flow.
 - [`validating-pytorch-custom-ops`](.agents/skills/validating-pytorch-custom-ops/SKILL.md) —
   registration, fake implementations, autograd, `opcheck`, and `torch.compile` validation.
 - [`cutedsl-tunable-kernel-template`](.agents/skills/cutedsl-tunable-kernel-template/SKILL.md) —
