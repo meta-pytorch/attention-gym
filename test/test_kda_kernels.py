@@ -29,6 +29,7 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import
 )
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _bounded_gate_chunk_cumsum_dense_kernel,
+    _bounded_gate_cumsum_dense_op,
     _requires_int64_offsets,
 )
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
@@ -409,6 +410,22 @@ def test_bounded_gate_fwd_int64_offsets():
     )
     expected = -3.25 * torch.sigmoid(A_log.exp().view(1, 1, 1, 1) * (raw_gate + dt_bias))
     torch.testing.assert_close(output, expected * RCP_LN2)
+
+
+def test_bounded_gate_fwd_dense_op_registration():
+    """Validate the dense gate's functional schema, fake tensor, and AOT dispatch."""
+    torch.manual_seed(13)
+    # Strided views cover the stride-preserving real/fake metadata contract.
+    raw_gate = torch.randn(2, 96, 2, 128, device=DEV, dtype=torch.bfloat16)[..., ::2]
+    A_log = (0.25 * torch.randn(4, device=DEV, dtype=torch.float32))[::2]
+    dt_bias = (0.25 * torch.randn(2, 128, device=DEV, dtype=torch.float32))[..., ::2]
+    assert not any(tensor.is_contiguous() for tensor in (raw_gate, A_log, dt_bias))
+    # Autograd is intentionally owned by _BoundedGateCumsum rather than the raw operator.
+    torch.library.opcheck(
+        _bounded_gate_cumsum_dense_op,
+        (raw_gate, A_log, dt_bias, 64, -5.0),
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+    )
 
 
 def _bwd_dav_ref(v, A, do, scale, chunk_size=64):
