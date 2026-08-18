@@ -18,11 +18,27 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import input_guard
 
 
+_HEURISTICS = {
+    "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+        args["raw_gate"],
+        args["A_log"],
+        args["dt_bias"],
+        args["d_cumulative"],
+        args["dg"],
+        args["dA_partial"],
+        args["ddt_partial"],
+        args["cu_seqlens"],
+        args["chunk_offsets"],
+    )
+}
+
+
+@triton.heuristics(_HEURISTICS)
 @triton.jit(do_not_specialize=["num_sequences"])
 def kda_gate_bwd_ragged_kernel(
     raw_gate,
@@ -47,6 +63,7 @@ def kda_gate_bwd_ragged_kernel(
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Reverse-scan one ragged chunk and differentiate the bounded gate in place.
 
@@ -54,10 +71,14 @@ def kda_gate_bwd_ragged_kernel(
     without a full FP32 intermediate.
     """
     global_chunk = tl.program_id(0)
-    i_h = tl.program_id(1).to(tl.int64)
-    i_d = tl.program_id(2).to(tl.int64)
+    i_h = tl.program_id(1)
+    i_d = tl.program_id(2)
     if global_chunk >= tl.load(chunk_offsets + num_sequences):
         return
+    if USE_INT64_OFFSETS:
+        global_chunk = global_chunk.to(tl.int64)
+        i_h = i_h.to(tl.int64)
+        i_d = i_d.to(tl.int64)
 
     _sequence, _local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
         cu_seqlens,
@@ -66,8 +87,10 @@ def kda_gate_bwd_ragged_kernel(
         num_sequences,
         BT,
     )
+    if USE_INT64_OFFSETS:
+        token_start = token_start.to(tl.int64)
     token_offset = tl.arange(0, BT)
-    token = token_start.to(tl.int64) + token_offset
+    token = token_start + token_offset
     channel = i_d * BD + tl.arange(0, BD)
     mask = (token_offset[:, None] < valid_tokens) & (channel[None, :] < D)
     d_gate = tl.load(

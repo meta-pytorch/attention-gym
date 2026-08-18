@@ -38,6 +38,7 @@ from torch._guards import active_fake_mode
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi
+from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 
 # ============================================================================
@@ -78,6 +79,7 @@ class BlackwellDeltaHBwdV1:
         io_type=cutlass.BFloat16,
         varlen: bool = False,
         num_heads: int | None = None,
+        use_int64_offsets: bool = False,
     ):
         assert head_k == 128 and head_v == 128, (
             f"Only head_k=head_v=128 supported, got {head_k},{head_v}"
@@ -90,6 +92,7 @@ class BlackwellDeltaHBwdV1:
         self.io_type = io_type
         self.varlen = varlen
         self.num_heads = num_heads
+        self.use_int64_offsets = use_int64_offsets
 
         # Tile dimensions
         self.BT = chunk_size  # 64
@@ -139,6 +142,7 @@ class BlackwellDeltaHBwdV1:
         return (
             f"kda_bwd_dhu_v1_vl{int(self.varlen)}{head_tag}"
             f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}"
+            f"_i64{int(self.use_int64_offsets)}"
         )
 
     # ------------------------------------------------------------------
@@ -190,40 +194,44 @@ class BlackwellDeltaHBwdV1:
             dB = B
             NT = (T + self.BT - 1) // self.BT
 
+        def addr(value):
+            """Widen address strides in the large-offset specialization."""
+            return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
+
         # --- GMEM tensor construction ---
         # K: (T, K, (H, dB)) — K-contiguous for MMA1 A-operand (k is K-major)
         g_k = cute.make_tensor(
             kp,
-            cute.make_layout((T, K, (H, dB)), stride=(H * K, 1, (K, T * H * K))),
+            cute.make_layout((T, K, (H, dB)), stride=(addr(H * K), 1, (K, addr(T) * H * K))),
         )
         # Q^T: (K, T, (H, dB)) — K-contiguous, then transposed for MMA2 A-operand
         g_qt = cute.make_tensor(
             qp,
-            cute.make_layout((K, T, (H, dB)), stride=(1, H * K, (K, T * H * K))),
+            cute.make_layout((K, T, (H, dB)), stride=(1, addr(H * K), (K, addr(T) * H * K))),
         )
         # W: (K, T, (H, dB)) — K-contiguous for MMA3 A-operand (w^T)
         g_wt = cute.make_tensor(
             wp,
-            cute.make_layout((K, T, (H, dB)), stride=(1, H * K, (K, T * H * K))),
+            cute.make_layout((K, T, (H, dB)), stride=(1, addr(H * K), (K, addr(T) * H * K))),
         )
         # do transposed: (V, T, (H, dB)) — V-contiguous for MMA2 MN-major B-operand TMA
         g_do_vt = cute.make_tensor(
             dop,
-            cute.make_layout((V, T, (H, dB)), stride=(1, H * V, (V, T * H * V))),
+            cute.make_layout((V, T, (H, dB)), stride=(1, addr(H * V), (V, addr(T) * H * V))),
         )
         # dv_in: (T, V, (H, dB)) — V-contiguous
-        dv_lay = cute.make_layout((T, V, (H, dB)), stride=(H * V, 1, (V, T * H * V)))
+        dv_lay = cute.make_layout((T, V, (H, dB)), stride=(addr(H * V), 1, (V, addr(T) * H * V)))
         # dv_in transposed: (V, T, (H, dB))
         g_dv_in_t = cute.make_tensor(
             dvp,
-            cute.make_layout((V, T, (H, dB)), stride=(1, H * V, (V, T * H * V))),
+            cute.make_layout((V, T, (H, dB)), stride=(1, addr(H * V), (V, addr(T) * H * V))),
         )
         # dv2_out: (T, V, (H, dB))
         g_dv2 = cute.make_tensor(dv2p, dv_lay)
         # dv2_out transposed: (V, T, (H, dB))
         g_dv2_t = cute.make_tensor(
             dv2p,
-            cute.make_layout((V, T, (H, dB)), stride=(1, H * V, (V, T * H * V))),
+            cute.make_layout((V, T, (H, dB)), stride=(1, addr(H * V), (V, addr(T) * H * V))),
         )
 
         # dh_out transposed for TMA store: (V, K, (NT, H, dB))
@@ -231,25 +239,25 @@ class BlackwellDeltaHBwdV1:
             dhop,
             cute.make_layout(
                 (V, K, (NT, H, dB)),
-                stride=(1, V, (H * K * V, K * V, NT * H * K * V)),
+                stride=(1, V, (addr(H * K * V), K * V, addr(NT) * H * K * V)),
             ),
         )
 
         # dht: (K, V, (H, B)) — final state gradient input
         g_dht = cute.make_tensor(
             dhtp,
-            cute.make_layout((K, V, (H, B)), stride=(V, 1, (K * V, H * K * V))),
+            cute.make_layout((K, V, (H, B)), stride=(V, 1, (K * V, addr(H * K * V)))),
         )
         # dh0 transposed for store: (V, K, (H, B))
         g_dh0_t = cute.make_tensor(
             dh0p,
-            cute.make_layout((V, K, (H, B)), stride=(1, V, (K * V, H * K * V))),
+            cute.make_layout((V, K, (H, B)), stride=(1, V, (K * V, addr(H * K * V)))),
         )
 
         # gk K-contiguous: (K, T, (H, dB))
         g_gk_k = cute.make_tensor(
             gkp,
-            cute.make_layout((K, T, (H, dB)), stride=(1, H * K, (K, T * H * K))),
+            cute.make_layout((K, T, (H, dB)), stride=(1, addr(H * K), (K, addr(T) * H * K))),
         )
 
         # --- MMA configurations (SS-mode: both operands from SMEM) ---
@@ -1404,11 +1412,11 @@ class BlackwellDeltaHBwdV1:
                             tOr = cute.make_fragment_like(tOs, self.io_type)
                             cute.autovec_copy(tOs, tOr)
 
+                            vn_token = bos + rev_ct * BT
+                            if cutlass.const_expr(self.use_int64_offsets):
+                                vn_token = cutlass.Int64(vn_token)
                             vn_raw = (
-                                g_dv2.iterator
-                                + (bos + rev_ct * BT) * H * V
-                                + h_idx * V
-                                + v_tile * self.BV
+                                g_dv2.iterator + vn_token * H * V + h_idx * V + v_tile * self.BV
                             )
                             vn_ptr = cute.make_ptr(
                                 self.io_type,
@@ -1726,7 +1734,7 @@ class BlackwellDeltaHBwdV1:
 
 
 @jit_cache
-def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
+def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16, use_int64_offsets=False):
     """Compile one BlackwellDeltaHBwdV1 variant."""
     kern = BlackwellDeltaHBwdV1(
         chunk_size=chunk_size,
@@ -1735,8 +1743,10 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16):
         head_bv=bv,
         varlen=varlen,
         num_heads=H,
+        use_int64_offsets=use_int64_offsets,
     )
-    sa, sb, snt, sn, sns = (cute.sym_int() for _ in range(5))
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    sa, sb, snt, sn, sns = (sym_int() for _ in range(5))
 
     if varlen:
         qf = make_fake_compact_tensor(
@@ -1938,7 +1948,21 @@ def blackwell_delta_h_bwd_dhu_v1(
         dv2_k = dv2[0]
 
         ps = (Int32(N), Int32(T), Int32(H), Int32(K), Int32(V))
-        fn = _compile_bwd_dhu(True, H, K, V, chunk_size, bv)
+        use_int64_offsets = requires_int64_offsets(
+            q_k,
+            k_k,
+            w_k,
+            do_k,
+            dv_k,
+            gk_k,
+            dht_k,
+            dh0_k,
+            dho,
+            dv2_k,
+            metadata.cu_seqlens,
+            metadata.chunk_offsets,
+        )
+        fn = _compile_bwd_dhu(True, H, K, V, chunk_size, bv, use_int64_offsets)
         fn(
             q_k,
             k_k,
@@ -1966,7 +1990,21 @@ def blackwell_delta_h_bwd_dhu_v1(
         co_d = _get_dummy((2,), torch.int32, dev)
 
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
-        fn = _compile_bwd_dhu(False, H, K, V, chunk_size, bv)
+        use_int64_offsets = requires_int64_offsets(
+            q,
+            k,
+            w,
+            do,
+            dv,
+            gk_k,
+            dht_k,
+            dh0_k,
+            dh_out,
+            dv2,
+            cu_d,
+            co_d,
+        )
+        fn = _compile_bwd_dhu(False, H, K, V, chunk_size, bv, use_int64_offsets)
         fn(
             q,
             k,
