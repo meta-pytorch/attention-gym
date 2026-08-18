@@ -19,6 +19,7 @@ from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_no_state_op,
     _recurrent_fwd_op,
     _recurrent_fwd_paged_op,
+    kda_recurrent_fwd_kernel,
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
 
@@ -40,12 +41,12 @@ def _inputs(
     seed: int = 0,
 ):
     torch.manual_seed(seed)
-    # KDA L2-normalizes q and k before the core; unnormalized keys make the
+    # kda l2-normalizes q and k before the core; unnormalized keys make the
     # delta-rule recurrence exponentially unstable and useless for comparison.
     q = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1).to(dtype)
     v = torch.randn(batch, tokens, heads, value_dim, device="cuda", dtype=dtype)
-    # Realistic bounded log2 decays keep the recurrence stable over the scan.
+    # realistic bounded log2 decays keep the recurrence stable over the scan.
     gate = -torch.rand(batch, tokens, heads, key_dim, device="cuda") * 3.0
     beta = torch.rand(batch, tokens, heads, device="cuda")
     state = torch.randn(batch, heads, key_dim, value_dim, device="cuda") if initial_state else None
@@ -108,6 +109,18 @@ def test_recurrent_matches_naive_non_power_of_two(key_dim: int, value_dim: int):
     torch.testing.assert_close(final_state, expected_state, rtol=1e-5, atol=1e-5)
 
 
+def test_recurrent_autotunes_value_tile():
+    """Select the only valid candidate for a value dimension below the minimum tile."""
+    q, k, v, gate, beta, _ = _inputs(key_dim=7, value_dim=3, seed=2)
+
+    output, _ = recurrent_kda(q, k, v, gate, beta, autotune=True)
+    expected, _ = recurrent_kda(q, k, v, gate, beta, autotune=False)
+
+    assert kda_recurrent_fwd_kernel.best_config.kwargs["BV"] == 8
+    assert kda_recurrent_fwd_kernel.best_config.num_warps in (2, 4)
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_recurrent_packed_capacity_and_empty_slots():
     """Pass empty-slot state through and ignore rows past the terminal offset."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=3)
@@ -125,7 +138,7 @@ def test_recurrent_packed_capacity_and_empty_slots():
         output_final_state=True,
     )
     assert final_state is not None
-    # Empty padding slots preserve their incoming state bitwise.
+    # empty padding slots preserve their incoming state bitwise.
     torch.testing.assert_close(final_state[0], initial_state[0], rtol=0, atol=0)
     torch.testing.assert_close(final_state[3], initial_state[3], rtol=0, atol=0)
     for sequence, (start, end) in enumerate(pairwise(cu_seqlens.cpu().tolist())):
@@ -211,7 +224,7 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
     expected_pool[slots.long()] = expected_state
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
-    # Rows the indices never name stay bitwise untouched.
+    # rows the indices never name stay bitwise untouched.
     untouched = [row for row in range(pool.shape[0]) if row not in slots.tolist()]
     torch.testing.assert_close(pool[untouched], before[untouched], rtol=0, atol=0)
     state_elements = pool[0].numel()
@@ -359,12 +372,15 @@ def test_recurrent_custom_op_registration(packed: bool):
     cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32) if packed else None
     num_sequences = 3 if packed else batch
     state = torch.randn(num_sequences, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
-    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, cu_seqlens))
-    torch.library.opcheck(_recurrent_fwd_no_state_op, (q, k, v, gate, beta, state, cu_seqlens))
+    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, cu_seqlens, True))
+    torch.library.opcheck(
+        _recurrent_fwd_no_state_op, (q, k, v, gate, beta, state, cu_seqlens, True)
+    )
     _, state_pool = _strided_state_pool(num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
-        _recurrent_fwd_paged_op, (q, k, v, gate, beta, state_pool, slots, cu_seqlens)
+        _recurrent_fwd_paged_op,
+        (q, k, v, gate, beta, state_pool, slots, cu_seqlens, True),
     )
 
 
@@ -376,22 +392,39 @@ def test_recurrent_custom_op_registration_mixed_dtype():
     _, state_pool = _strided_state_pool(3, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
 
-    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None))
-    torch.library.opcheck(_recurrent_fwd_no_state_op, (q, k, v, gate, beta, state, None))
-    torch.library.opcheck(_recurrent_fwd_paged_op, (q, k, v, gate, beta, state_pool, slots, None))
+    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None, True))
+    torch.library.opcheck(_recurrent_fwd_no_state_op, (q, k, v, gate, beta, state, None, True))
+    torch.library.opcheck(
+        _recurrent_fwd_paged_op, (q, k, v, gate, beta, state_pool, slots, None, True)
+    )
 
 
 @pytest.mark.parametrize("output_final_state", [False, True])
-def test_recurrent_fullgraph_compile(output_final_state: bool):
+@pytest.mark.parametrize("autotune", [False, True])
+def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
     """Compile both optional-state branches of the public operation."""
     q, k, v, gate, beta, state = _inputs(initial_state=True)
 
     expected, expected_state = recurrent_kda(
-        q, k, v, gate, beta, state, output_final_state=output_final_state
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=output_final_state,
+        autotune=autotune,
     )
     compiled = torch.compile(recurrent_kda, fullgraph=True)
     output, final_state = compiled(
-        q, k, v, gate, beta, state, output_final_state=output_final_state
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=output_final_state,
+        autotune=autotune,
     )
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     if output_final_state:
@@ -426,13 +459,13 @@ def test_recurrent_cuda_graph_replay():
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=5)
     cu_seqlens = torch.tensor([0, 11, 27, 32], device="cuda", dtype=torch.int32)
     initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
-    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens)
+    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output, captured_state = _recurrent_fwd_op(
-            q, k, v, gate, beta, initial_state, cu_seqlens
+            q, k, v, gate, beta, initial_state, cu_seqlens, True
         )
 
     active_tokens = 23
@@ -447,7 +480,7 @@ def test_recurrent_cuda_graph_replay():
     torch.cuda.synchronize()
 
     expected_output, expected_state = _recurrent_fwd_op(
-        q, k, v, gate, beta, initial_state, cu_seqlens
+        q, k, v, gate, beta, initial_state, cu_seqlens, True
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens],
@@ -463,12 +496,12 @@ def test_recurrent_paged_cuda_graph_replay():
     q, k, v, gate, beta, _ = _inputs(batch=3, tokens=1, dtype=torch.bfloat16, seed=31)
     storage, pool = _strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
-    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None)
+    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None)
+        captured_output = _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, True)
 
     with torch.no_grad():
         storage.add_(0.25)
