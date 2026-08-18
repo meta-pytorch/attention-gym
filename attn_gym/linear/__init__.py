@@ -17,7 +17,7 @@ from attn_gym.linear.kda import (
     mask_inactive_tokens,
     recurrent_kda,
 )
-from attn_gym.linear.kda.api import Impl
+from attn_gym.linear.types import Impl
 
 # Note: Lazy Imports
 # Backend-backed names load on first use, keeping reference imports torch-only.

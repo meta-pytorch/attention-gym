@@ -12,7 +12,6 @@ inference prefill. Use ``impl`` to select fused kernels or the eager reference.
 
 from __future__ import annotations
 
-from enum import Enum
 from functools import partial
 
 import torch
@@ -22,19 +21,9 @@ from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda_from_cumulative, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import validate_kda_inputs
+from attn_gym.linear.types import Impl
 
 _CHUNK_SIZE = 64
-
-
-class Impl(str, Enum):
-    """Select a fused or reference KDA implementation.
-
-    The public operations validate shared inputs; fused backends validate their
-    extra hardware and shape requirements. There is no automatic fallback.
-    """
-
-    FUSED = "fused"
-    REFERENCE = "reference"
 
 
 def _resolve_impl(impl: Impl | str) -> Impl:
