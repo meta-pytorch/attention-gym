@@ -95,10 +95,10 @@ def source_fingerprint(
         if source.is_file():
             _hash_file(hasher, f"cutlass/{relative_path}", source)
 
+    # Architecture is keyed separately through CompileTarget.
     codegen_environment = tuple(
         (name, os.getenv(name))
         for name in (
-            "CUTE_DSL_ARCH",
             "CUTE_DSL_COMPILER_OPT",
             "CUTE_DSL_ENABLE_ASSERTIONS",
             "CUTE_DSL_ENABLE_TVM_FFI",
