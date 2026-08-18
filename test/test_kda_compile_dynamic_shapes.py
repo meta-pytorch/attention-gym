@@ -60,18 +60,23 @@ def test_compiled_gate_accepts_varying_head_geometry():
 
 
 def test_compiled_gate_backward_survives_varying_lower_bound():
-    """Varying the lower_bound float must keep backward compiling with eager parity."""
+    """Varying the lower_bound float must keep backward compiling with eager parity.
+
+    The values only need to be distinct so Dynamo stops specializing on the float; they
+    were -10.0 and -5.0 until the causal gate reference capped the supported range at
+    about -5.915. See NOTE [Gate range ceiling].
+    """
     raw, a_log, dt_bias = _gate_inputs()
     compiled = torch.compile(bounded_gate_cumsum, fullgraph=True, dynamic=True)
-    for lower_bound in (-10.0, -5.0):
+    for lower_bound in (-5.0, -3.25):
         expected = bounded_gate_cumsum(raw, a_log, dt_bias, lower_bound=lower_bound)
         output = compiled(raw, a_log, dt_bias, lower_bound=lower_bound)
         torch.testing.assert_close(output, expected)
 
     expected_inputs = tuple(tensor.detach().requires_grad_() for tensor in (raw, a_log, dt_bias))
     actual_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in expected_inputs)
-    expected = bounded_gate_cumsum(*expected_inputs, lower_bound=-10.0)
-    actual = compiled(*actual_inputs, lower_bound=-10.0)
+    expected = bounded_gate_cumsum(*expected_inputs, lower_bound=-5.0)
+    actual = compiled(*actual_inputs, lower_bound=-5.0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     cotangent = torch.randn_like(expected)

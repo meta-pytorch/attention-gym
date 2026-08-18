@@ -154,26 +154,12 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                     other=0.0,
                 )
 
-                # the kda gate is applied as a decay between 2 positions i, j
-                # and cumulative log gate is  2^{g[i] − g[j]}
-                # but you can do 2^{g[i]−g[j]}  =  2^{g[i]} * 2^{−g[j]} and this
-                # turns it into a matmul
-                # but then now you have g[i] and g[j] so what if they're really big
-                # and overflow?
-                # so the trick is you pick a rebase index and you do g[i] - rebase and
-                # rebase - g[j] so you always are within bounds because the number is
-                # smaller and also mathematically it cancels out
-                # when CAUSAL_NORMREF = True, we pick g[0] and when its False we pick
-                # the midpoint
-                # but the concern w/ the midpoint is that it breaks causality by whatever
-                # the rounding error is and also no BI because the midpoint changes
-                # so we are setting CAUSAL_NORMREF = True as default for now
-                # the only concern with doing topmost is what if the numbers are actually
-                # really big (but does this happen in practice? we will see)
-                if CAUSAL_NORMREF:
-                    normref_idx = 0
-                else:
-                    normref_idx = min(BC // 2, T_local - i_ti - 1)
+                # The gate decay between positions i and j is 2^{g[i] - g[j]}. Splitting it
+                # as 2^{g[i]-ref} * 2^{ref-g[j]} turns the decay into a matmul, and the
+                # reference cancels in exact arithmetic. It does not cancel in floating
+                # point: the two factors round separately, so the reference row is part of
+                # the numerics. See NOTE [Causal gate reference].
+                normref_idx = 0 if CAUSAL_NORMREF else min(BC // 2, T_local - i_ti - 1)
                 if USE_GATHER:
                     b_gn = gather(b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0)
                 else:
@@ -229,6 +215,20 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_store)
 
 
+# NOTE [Causal gate reference]
+# The rebase evaluates 2^{g_i - g_j} as 2^{g_i - g_r} * 2^{g_r - g_j}. The factors round
+# separately, so the reference row r affects floating-point results. Choosing row 0 keeps
+# the reference at or before every query; a midpoint reference reduces the exponent span
+# but makes early outputs depend on a future gate through rounding.
+#
+# A gate contributes at most |lower_bound| * log2(e) per token interval, so keeping the
+# factors within the FP32 exponent range requires
+#
+#     |lower_bound| <= 128 / (span_steps * log2(e)).
+#
+# For BC=16, row 0 spans 15 intervals and gives a 5.915 limit; the 8-interval midpoint
+# would give 11.09. The public gate enforces the causal bound; see GATE_SPAN_STEPS in
+# gate_fwd.py.
 def chunk_kda_fwd_intra_diagonal(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -289,7 +289,7 @@ def chunk_kda_fwd_intra_diagonal(
         BK=triton.next_power_of_2(key_dim),
         num_sequences=0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
         USE_GATHER=IS_GATHER_SUPPORTED,
-        CAUSAL_NORMREF=False,
+        CAUSAL_NORMREF=True,
         GRID_NT=grid_chunks,
         MAX_NT=capacity,
     )

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 
 import torch
@@ -490,6 +491,21 @@ class _BoundedGateCumsum(torch.autograd.Function):
         )
 
 
+# NOTE [Gate range ceiling]
+# The bounded gate lies in [lower_bound, 0], so one token contributes at most
+# |lower_bound| * log2(e) after conversion to log2 units. Across `span_steps`, the rebase
+# therefore needs this exponent budget:
+#
+#     |lower_bound| * span_steps * log2(e) <= 128
+#
+# The causal reference spans BC-1 = 15 steps, giving a data-independent 5.915 limit.
+# Validate it here because an overflowing rebase factor can otherwise produce non-finite
+# core outputs. See NOTE [Causal gate reference] in the diagonal forward kernel.
+GATE_SPAN_STEPS = 15
+FP32_EXPONENT_BUDGET = 128.0
+MAX_GATE_LOWER_BOUND_MAGNITUDE = FP32_EXPONENT_BUDGET / (GATE_SPAN_STEPS * math.log2(math.e))
+
+
 def _bounded_gate_cumsum(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
@@ -530,6 +546,18 @@ def _bounded_gate_cumsum(
         )
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
+    # Plain comparisons only: `math.isfinite` on a traced float lifts it into a graph
+    # operation, which breaks strict dynamic compilation. A chained comparison rejects
+    # NaN and both infinities without calling into `math`.
+    if not -MAX_GATE_LOWER_BOUND_MAGNITUDE <= lower_bound <= 0.0:
+        raise ValueError(
+            f"lower_bound must lie in "
+            f"[{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, 0] for the KDA intra-chunk gate "
+            f"rebase, got {lower_bound}. Past the lower end the per-token decay can "
+            f"exceed the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk, "
+            "and the core silently produces non-finite values. "
+            "See NOTE [Gate range ceiling]."
+        )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")
     if cu_seqlens is not None:
