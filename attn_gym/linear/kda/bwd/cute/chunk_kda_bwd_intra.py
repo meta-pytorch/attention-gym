@@ -2006,7 +2006,7 @@ def _compile_chunk_kda_bwd_intra(
         use_int64_offsets=use_int64_offsets,
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()
-    sym_stride = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def normal(dtype, shape):
         return make_fake_compact_tensor(
@@ -2031,8 +2031,8 @@ def _compile_chunk_kda_bwd_intra(
             (columns, tokens, heads),
             stride=(
                 1,
-                sym_stride(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
-                sym_stride(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
             ),
             assumed_align=_MIN_ALIGN_BYTES,
         )

@@ -8,8 +8,6 @@ from typing import Any
 
 import torch
 
-from attn_gym._backends.triton.utils import requires_int64_offsets
-
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 TMA_ALIGNMENT_BYTES = 16
 
@@ -39,18 +37,23 @@ def get_device_properties(device: torch.device) -> Any:
 
 
 def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
-    """Return whether any tensor needs the Int64 fake-signature specialization.
+    """Check both reachable cosize and every stride exposed through the CuTe ABI.
 
-    TVM-FFI must represent every declared runtime stride, including the outer
-    stride of a size-1 batch mode whose coordinate never leaves zero, so this
-    is stricter than the reachable-offset bound alone. Callers may omit the
-    contiguous ``[num_sequences + 1]`` int32 routing arrays: their extents are
-    bounded by ``MAX_NUM_SEQUENCES`` and cannot approach either limit.
+    Unlike cosize, TVM-FFI must represent a size-1 mode's unreachable stride.
+    Bounded int32 routing arrays may be omitted by callers.
     """
-    return requires_int64_offsets(*tensors) or any(
-        tensor is not None and any(abs(stride) > 2**31 - 1 for stride in tensor.stride())
-        for tensor in tensors
-    )
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        strides = tensor.stride()
+        if any(abs(stride) > 2**31 - 1 for stride in strides):
+            return True
+        if (
+            tensor.numel()
+            and 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, strides)) > 2**31
+        ):
+            return True
+    return False
 
 
 def tensor_supports_tma(tensor: torch.Tensor) -> bool:

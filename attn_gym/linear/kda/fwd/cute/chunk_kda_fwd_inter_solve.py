@@ -84,17 +84,17 @@ def _compile_k3b(
         use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
-    sym_stride = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     q = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride=(sym_stride(divisibility=8), 1),
+        stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     k = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride=(sym_stride(divisibility=8), 1),
+        stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     g = make_fake_compact_tensor(
@@ -279,7 +279,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
-        requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
+        use_int64_offsets=requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
     )
     k3b(
         q_flat,
@@ -353,7 +353,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
-        requires_int64_abi(AkkOD, akkd_flat, akk_flat),
+        use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
     )
     k4b(
         AkkOD,

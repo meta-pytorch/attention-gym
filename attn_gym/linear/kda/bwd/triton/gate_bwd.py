@@ -88,6 +88,7 @@ def kda_gate_bwd_ragged_kernel(
         BT,
     )
     if USE_INT64_OFFSETS:
+        global_chunk = global_chunk.to(tl.int64)
         token_start = token_start.to(tl.int64)
     token_offset = tl.arange(0, BT)
     token = token_start + token_offset

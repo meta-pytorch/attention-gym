@@ -32,8 +32,8 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
-from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
@@ -1873,8 +1873,6 @@ class ChunkKdaBwdWyDqkgFused:
         require_blackwell_target()
 
         self.use_fast_math = use_fast_math
-        # Widens token/chunk address strides to Int64 so crd2idx products cannot
-        # wrap once a tensor's reachable element offset exceeds INT32_MAX.
         self.use_int64_offsets = use_int64_offsets
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
@@ -1973,13 +1971,9 @@ class ChunkKdaBwdWyDqkgFused:
         return (grid_x, Int32(1), Int32(1))
 
     @cute.jit
-    def _token_row(self, row: Int32):
-        """Widen one token-row ordinal before it multiplies a row pitch.
-
-        Manual vector-store addresses bypass the typed layouts, so the cast must
-        happen before the first product that can exceed INT32_MAX.
-        """
-        return cutlass.Int64(row) if cutlass.const_expr(self.use_int64_offsets) else row
+    def upcast(self, value):
+        """Promote an address operand before its first overflowing multiply."""
+        return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
 
     @cute.jit
     def __call__(
@@ -2035,10 +2029,6 @@ class ChunkKdaBwdWyDqkgFused:
         data_B = Int32(1)
         NT = total_nt
 
-        def addr(value):
-            """Widen one address stride so coordinate products promote to i64."""
-            return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
-
         # ===================== GMEM layouts =====================
         # Token-indexed tensors: (T, dim, (H, data_B))
         def strided_token_layout(tensor: cute.Tensor, dim: Int32, head_count: Int32):
@@ -2060,7 +2050,7 @@ class ChunkKdaBwdWyDqkgFused:
 
         tv_layout = cute.make_layout(
             (T, V, (HV, data_B)),
-            stride=(addr(HV * V), 1, (V, addr(T) * HV * V)),
+            stride=(self.upcast(HV * V), 1, (V, self.upcast(T) * HV * V)),
         )
         v_new = cute.make_tensor(v_new_ptr, tv_layout)
         do = cute.make_tensor(do_ptr, tv_layout)
@@ -2070,14 +2060,14 @@ class ChunkKdaBwdWyDqkgFused:
         # g: (T, K, (HV, data_B)) fp32
         g_layout = cute.make_layout(
             (T, K, (HV, data_B)),
-            stride=(addr(HV * K), 1, (K, addr(T) * HV * K)),
+            stride=(self.upcast(HV * K), 1, (K, self.upcast(T) * HV * K)),
         )
         g = cute.make_tensor(g_ptr, g_layout)
 
         # beta: (T, (HV, data_B)) fp32
         beta_layout = cute.make_layout(
             (T, (HV, data_B)),
-            stride=(addr(HV), (1, addr(T) * HV)),
+            stride=(self.upcast(HV), (1, self.upcast(T) * HV)),
         )
         beta = cute.make_tensor(beta_ptr, beta_layout)
 
@@ -2085,14 +2075,14 @@ class ChunkKdaBwdWyDqkgFused:
         # NOTE: for A as operand A, A is loaded as transposed view to do MMA
         a_t_layout = cute.make_layout(
             (BT, T, (HV, data_B)),
-            stride=(1, addr(HV * BT), (BT, addr(T) * HV * BT)),
+            stride=(1, self.upcast(HV * BT), (BT, self.upcast(T) * HV * BT)),
         )
         A_T = cute.make_tensor(A_ptr, a_t_layout)
 
         # dq, dk: (T, K, (HV, data_B)) fp32
         dqk_layout = cute.make_layout(
             (T, K, (HV, data_B)),
-            stride=(addr(HV * K), 1, (K, addr(T) * HV * K)),
+            stride=(self.upcast(HV * K), 1, (K, self.upcast(T) * HV * K)),
         )
         dq = cute.make_tensor(dq_ptr, dqk_layout)
         dk = cute.make_tensor(dk_ptr, dqk_layout)
@@ -2106,7 +2096,7 @@ class ChunkKdaBwdWyDqkgFused:
         # dA: (T, BT, (HV, data_B)) fp32
         dA_layout = cute.make_layout(
             (T, BT, (HV, data_B)),
-            stride=(addr(HV * BT), 1, (BT, addr(T) * HV * BT)),
+            stride=(self.upcast(HV * BT), 1, (BT, self.upcast(T) * HV * BT)),
         )
         dA_out = cute.make_tensor(dA_ptr, dA_layout)
 
@@ -2115,7 +2105,7 @@ class ChunkKdaBwdWyDqkgFused:
         # h row-major: (K, V, (h_nt_total, HV)) as operand B
         h_layout = cute.make_layout(
             (K, V, (h_nt_total, HV)),
-            stride=(V, 1, (addr(HV * K * V), addr(K * V))),
+            stride=(V, 1, (self.upcast(HV * K * V), K * V)),
         )
         h = cute.make_tensor(h_ptr, h_layout)
         dh = cute.make_tensor(dh_ptr, h_layout)
@@ -3394,7 +3384,7 @@ class ChunkKdaBwdWyDqkgFused:
 
                     base_addr = (
                         dv2_gmem.iterator
-                        + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * V
+                        + self.upcast(tok_offset + tile_idx * self.BT + row) * HV * V
                         + i_hv * V
                         + v_iter * self.BV
                         + bv_col_base
@@ -3456,7 +3446,7 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.arch.fence_view_async_tmem_store()
                 dq_base_addr = (
                     dq_gmem.iterator
-                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * K
+                    + self.upcast(tok_offset + tile_idx * self.BT + row) * HV * K
                     + i_hv * K
                     + bk_col_base
                 ).toint()
@@ -3624,7 +3614,7 @@ class ChunkKdaBwdWyDqkgFused:
                 # 8 fp32 store each time for store_256b
                 dk_base_addr = (
                     dk_gmem.iterator
-                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * K
+                    + self.upcast(tok_offset + tile_idx * self.BT + row) * HV * K
                     + i_hv * K
                     + bk_col_base
                 ).toint()
@@ -3812,7 +3802,7 @@ class ChunkKdaBwdWyDqkgFused:
                 num_stores_dA = bt_num_cols_per_wg // 8
                 dA_base_addr = (
                     dA_gmem.iterator
-                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * BT
+                    + self.upcast(tok_offset + tile_idx * self.BT + row) * HV * BT
                     + i_hv * BT
                     + bt_col_base
                 ).toint()
@@ -4583,9 +4573,7 @@ class ChunkKdaBwdWyDqkgFused:
                             )
                             dg_base_addr = (
                                 dg_gmem.iterator
-                                + self._token_row(tok_offset + tile_idx * self.BT + store_row)
-                                * HV
-                                * K
+                                + self.upcast(tok_offset + tile_idx * self.BT + store_row) * HV * K
                                 + i_hv * K
                                 + store_col_base
                             ).toint()
@@ -4713,12 +4701,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     ragged: bool,
     use_int64_offsets: bool = False,
 ):
-    """Compile one persistent dense or ragged WY/dQKG specialization.
-
-    ``use_int64_offsets`` widens the symbolic Q/K/V strides and kernel address
-    layouts to Int64 for tensors whose reachable element offsets exceed
-    INT32_MAX; it must key the cache because the offset width is baked in.
-    """
+    """Compile one persistent dense or ragged WY/dQKG specialization."""
     op = ChunkKdaBwdWyDqkgFused(
         chunk_size=chunk_size,
         head_dim_k=head_dim,
@@ -4729,7 +4712,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
-    sym_stride = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def tensor(dtype, shape):
         return make_fake_compact_tensor(
@@ -4743,7 +4726,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         return make_fake_tensor(
             cutlass.BFloat16,
             shape,
-            stride=tuple(sym_stride(divisibility=_MIN_ALIGN_ELEMENTS_BF16) for _ in shape[:-1])
+            stride=tuple(sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16) for _ in shape[:-1])
             + (1,),
             assumed_align=_MIN_ALIGN_BYTES,
         )

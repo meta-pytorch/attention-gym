@@ -41,9 +41,8 @@ def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
     import attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 as delta_module
     import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra as intra_module
     import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused as wy_module
-    import attn_gym.linear.kda.bwd.cute.gate_bwd_fused as gate_module
     import attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve as inter_module
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import chunk_kda
+    from attn_gym.linear import chunk_kda
 
     def run():
         torch.manual_seed(13)
@@ -62,7 +61,7 @@ def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
         return (output, *grads)
 
     baseline = run()
-    for module in (delta_module, intra_module, wy_module, gate_module, inter_module):
+    for module in (delta_module, intra_module, wy_module, inter_module):
         monkeypatch.setattr(module, "requires_int64_abi", lambda *tensors: True)
     forced = run()
     for name, expected, actual in zip(
@@ -71,45 +70,85 @@ def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=lambda m, n=name: n)
 
 
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
+def test_chunk_kda_oversized_singleton_stride_matches_compact():
+    """Exercise automatic int64 ABI selection without allocating unreachable storage."""
+    from attn_gym.linear import chunk_kda
+
+    def run(oversized_batch_stride: bool):
+        torch.manual_seed(11)
+        tokens, heads = 192, 2
+        qkv = torch.randn(1, tokens, 3, heads, 128, device="cuda", dtype=torch.bfloat16) / 8
+        q, k, v = (qkv[:, :, index] for index in range(3))
+        if oversized_batch_stride:
+            q, k, v = (
+                tensor.as_strided(tensor.shape, (2**31, *tensor.stride()[1:]))
+                for tensor in (q, k, v)
+            )
+            assert requires_int64_abi(q, k, v)
+        q, k, v = (tensor.requires_grad_() for tensor in (q, k, v))
+        gate = (-torch.rand(1, tokens, heads, 128, device="cuda")).requires_grad_()
+        beta = torch.rand(1, tokens, heads, device="cuda").requires_grad_()
+        offsets = torch.tensor([0, 65, tokens], device="cuda", dtype=torch.int32)
+        output, _ = chunk_kda(q, k, v, gate, beta, cu_seqlens=offsets)
+        grads = torch.autograd.grad(output.float().square().sum(), (q, k, v, gate, beta))
+        return (output, *grads)
+
+    compact = run(False)
+    oversized = run(True)
+    for name, expected, actual in zip(
+        ("output", "dq", "dk", "dv", "dgate", "dbeta"), compact, oversized, strict=True
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=lambda m, n=name: n)
+
+
 @pytest.mark.skipif(
     not CUTE_CAPABLE or torch.cuda.get_device_properties(0).total_memory < 100 * 1024**3,
-    reason="the over-capture regression allocates ~60GB of capacity buffers",
+    reason="the executed-overflow regression allocates ~60GB of fully active buffers",
 )
-def test_chunk_kda_262144_token_packed_capacity_matches_exact():
-    """Run the full core at the first int64-requiring capacity with packed pitch."""
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import chunk_kda
+def test_chunk_kda_full_262144_tokens_executes_offsets_past_int32():
+    """Actually execute element offsets beyond INT32_MAX, not just accept the ABI.
 
-    heads, dim, active = 32, 128, 8192
+    A fully active 262144-token run with packed-projection pitch reaches
+    token offsets near 3.2e9 in Q/K/V; the same tokens through compact clones
+    stay below INT32_MAX and take the i32 specializations. Both must agree.
+    """
+    from attn_gym.linear import chunk_kda
 
-    def run(capacity):
-        torch.manual_seed(11)
-        qkv = torch.full(
-            (1, capacity, 3, heads, dim), float("nan"), device="cuda", dtype=torch.bfloat16
-        )
-        qkv[:, :active] = (
-            torch.randn(1, active, 3, heads, dim, device="cuda", dtype=torch.bfloat16) / 8
-        )
-        q, k, v = (qkv[:, :, i].requires_grad_() for i in range(3))
-        gate = torch.full((1, capacity, heads, dim), float("nan"), device="cuda")
-        gate[:, :active] = -torch.rand(1, active, heads, dim, device="cuda")
-        gate = gate.requires_grad_()
-        beta = torch.full((1, capacity, heads), float("nan"), device="cuda")
-        beta[:, :active] = torch.rand(1, active, heads, device="cuda")
-        beta = beta.requires_grad_()
-        grad = torch.zeros(1, capacity, heads, dim, device="cuda")
-        grad[:, :active] = torch.randn(1, active, heads, dim, device="cuda") / 8
+    heads, dim, tokens = 32, 128, 262144
+    torch.manual_seed(17)
+    qkv = torch.randn(1, tokens, 3, heads, dim, device="cuda", dtype=torch.bfloat16) / 8
+    packed = tuple(qkv[:, :, i] for i in range(3))
+    compact = tuple(view.contiguous() for view in packed)
+    assert requires_int64_abi(*packed) and not requires_int64_abi(*compact)
 
-        offsets = torch.tensor([0, active], device="cuda", dtype=torch.int32)
-        out, _ = chunk_kda(q, k, v, gate, beta, cu_seqlens=offsets, persistent=True)
-        loss = (out[:, :active].float() * grad[:, :active]).sum()
-        grads = torch.autograd.grad(loss, (q, k, v, gate, beta))
-        return (out[:, :active].clone(), *(g[:, :active].clone() for g in grads))
+    gate = -torch.rand(1, tokens, heads, dim, device="cuda")
+    beta = torch.rand(1, tokens, heads, device="cuda")
+    offsets = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
 
-    small = run(active)
-    torch.cuda.empty_cache()
-    large = run(262144)
-    for name, expected, actual in zip(
-        ("output", "dq", "dk", "dv", "dgate", "dbeta"), small, large, strict=True
-    ):
-        assert not actual.isnan().any(), name
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2, msg=lambda m, n=name: n)
+    with torch.no_grad():
+        wide, _ = chunk_kda(*packed, gate, beta, cu_seqlens=offsets)
+        narrow, _ = chunk_kda(*compact, gate, beta, cu_seqlens=offsets)
+    torch.testing.assert_close(wide, narrow, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
+def test_forced_int64_dense_gate_backward_matches_default(monkeypatch):
+    """Cover the dense fused gate backward's i64 specialization on small inputs."""
+    import attn_gym.linear.kda.bwd.cute.gate_bwd_fused as gate_module
+    from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import fused_gate_bwd
+
+    def run():
+        torch.manual_seed(19)
+        raw_gate = torch.randn(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16) / 8
+        A_log = torch.zeros(2, device="cuda")
+        dt_bias = torch.zeros(2, 128, device="cuda")
+        d_cumulative = torch.randn(1, 128, 2, 128, device="cuda") / 8
+        result = fused_gate_bwd(raw_gate, A_log, dt_bias, d_cumulative, lower_bound=-5.0)
+        return result.dg, result.dA_partial, result.d_dt_bias
+
+    baseline = run()
+    monkeypatch.setattr(gate_module, "requires_int64_abi", lambda *tensors: True)
+    forced = run()
+    for expected, actual in zip(baseline, forced, strict=True):
+        assert torch.equal(actual, expected)

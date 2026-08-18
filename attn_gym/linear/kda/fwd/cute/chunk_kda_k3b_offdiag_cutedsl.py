@@ -33,12 +33,6 @@ from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
 
-@cute.jit
-def _addr(value, use_int64_offsets):
-    """Widen a flattened tensor coordinate in the large-offset specialization."""
-    return cutlass.Int64(value) if cutlass.const_expr(use_int64_offsets) else value
-
-
 class ChunkKDAFwdK3bOffdiagCuteDSL:
     WARP_SIZE = 32
 
@@ -67,6 +61,11 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
+
+    @cute.jit
+    def upcast(self, value):
+        """Promote an address operand before its first overflowing multiply."""
+        return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
 
     @cute.jit
     def __call__(
@@ -216,12 +215,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             chunk_base = chunk_idx * self.BT
             eos = cute.size(mQ, mode=[0])
 
-        chunk_base = _addr(chunk_base, self.use_int64_offsets)
+        chunk_base = self.upcast(chunk_base)
         ti_row = chunk_base + ri * self.BC
         ti_col = chunk_base + ci * self.BC
-        h_offset = _addr(head_idx, self.use_int64_offsets) * self.D
-        aqk_col = _addr(head_idx, self.use_int64_offsets) * self.BT
-        akkod_col = _addr(head_idx, self.use_int64_offsets) * self.BC * self.BC
+        h_offset = head_idx * self.D
+        aqk_col = head_idx * self.BT
+        akkod_col = head_idx * self.BC * self.BC
 
         # ══════════════════════════════════════════════════════════
         # Phase 1: Gating into SMEM
@@ -367,7 +366,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         cC = cute.make_identity_tensor((self.BC, self.BC))
         tCcC = thr_mma.partition_C(cC)
 
-        od_row = _addr(chunk_idx, self.use_int64_offsets) * self.num_offdiag_blocks + pair_idx
+        od_row = self.upcast(chunk_idx) * self.num_offdiag_blocks + pair_idx
 
         if warp_idx == 0:
             out_dtype = mAqk.element_type

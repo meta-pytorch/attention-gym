@@ -126,18 +126,18 @@ def recompute_w_u_fwd_kernel(
         i_n, i_t, token_start, _ = load_ragged_chunk_work(
             cu_seqlens, chunk_offsets, i_c, num_sequences, BT
         )
-        if USE_INT64_OFFSETS:
-            i_n = i_n.to(tl.int64)
-            i_t = i_t.to(tl.int64)
-            token_start = token_start.to(tl.int64)
         # token_start == bos + i_t * BT; only eos still needs a load for masking.
-        bos = token_start - i_t * BT
         eos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int32)
         if USE_INT64_OFFSETS:
+            i_t = i_t.to(tl.int64)
+            token_start = token_start.to(tl.int64)
             eos = eos.to(tl.int64)
+        bos = token_start - i_t * BT
         T_local = eos - bos
     else:
         i_t = i_c
+        if USE_INT64_OFFSETS:
+            i_t = i_t.to(tl.int64)
         bos = 0
         T_local = T
 

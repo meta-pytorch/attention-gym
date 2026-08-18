@@ -373,7 +373,14 @@ def _compile_fused_gate_bwd(
     use_int64_offsets: bool = False,
 ):
     """Compile one fake-tensor TVM-FFI specialization."""
-    op = FusedGateBwdOp(heads, head_dim, chunk_size, lower_bound, fastmath, use_int64_offsets)
+    op = FusedGateBwdOp(
+        heads,
+        head_dim,
+        chunk_size,
+        lower_bound,
+        fastmath,
+        use_int64_offsets=use_int64_offsets,
+    )
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (9, 0):
         raise ValueError(
@@ -383,16 +390,16 @@ def _compile_fused_gate_bwd(
     batch = cute.sym_int()
     tokens = cute.sym_int()
     chunks = cute.sym_int()
-    sym_stride = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def strided_rows(dtype, alignment_elements: int):
         return cute.runtime.make_fake_tensor(
             dtype,
             (batch, tokens, heads, head_dim),
             stride=(
-                sym_stride(divisibility=alignment_elements),
-                sym_stride(divisibility=alignment_elements),
-                sym_stride(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
                 1,
             ),
             assumed_align=TMA_ALIGNMENT_BYTES,
@@ -532,7 +539,7 @@ def _fused_gate_bwd_cuda(
         op.chunk_size,
         op.lower_bound,
         op.fastmath,
-        requires_int64_abi(
+        use_int64_offsets=requires_int64_abi(
             g,
             A_log,
             dt_bias,
