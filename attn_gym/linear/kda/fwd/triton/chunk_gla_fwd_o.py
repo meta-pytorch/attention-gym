@@ -458,6 +458,10 @@ def chunk_gla_fwd_o_gk(
                 num_sequences=metadata.cu_seqlens.shape[0] - 1,
                 num_warps=2,
                 num_stages=3,
+                # The rarely taken partial-chunk pointer branch pushes this
+                # kernel to 180 registers vs the dense kernel's 134; cap at the
+                # dense budget so only tail CTAs pay with spills.
+                maxnreg=136,
             )
             return output
 
