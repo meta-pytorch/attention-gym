@@ -21,17 +21,9 @@ from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda_from_cumulative, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import validate_kda_inputs
-from attn_gym.linear.types import Impl
+from attn_gym.linear.types import Impl, resolve_impl
 
 _CHUNK_SIZE = 64
-
-
-def _resolve_impl(impl: Impl | str) -> Impl:
-    try:
-        return Impl(impl)
-    except ValueError:
-        valid = ", ".join(repr(member.value) for member in Impl)
-        raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
 
 
 def chunk_kda(
@@ -78,7 +70,7 @@ def chunk_kda(
         The output in ``q.dtype`` and either an FP32 final state with one entry
         per logical sequence or ``None``.
     """
-    selected_impl = _resolve_impl(impl)
+    selected_impl = resolve_impl(impl)
     if selected_impl is Impl.REFERENCE and fastmath:
         raise ValueError("fastmath applies only to impl='fused'")
     validate_kda_inputs(
@@ -210,7 +202,7 @@ def recurrent_kda(
     separate launches, and speculative-decoding rollback is unsupported.
     """
     del autotune
-    selected_impl = _resolve_impl(impl)
+    selected_impl = resolve_impl(impl)
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(

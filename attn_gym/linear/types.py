@@ -16,4 +16,13 @@ class Impl(str, Enum):
     REFERENCE = "reference"
 
 
-__all__ = ["Impl"]
+def resolve_impl(impl: Impl | str) -> Impl:
+    """Normalize an implementation selector and report the valid values."""
+    try:
+        return Impl(impl)
+    except ValueError:
+        valid = ", ".join(repr(member.value) for member in Impl)
+        raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
+
+
+__all__ = ["Impl", "resolve_impl"]

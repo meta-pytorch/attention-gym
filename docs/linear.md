@@ -4,9 +4,10 @@ Attention Gym provides functional linear-attention operators with eager referenc
 
 ## Gated Delta Rule
 
-`gated_delta_rule` uses the SDPA layout `[batch, heads, sequence, dimension]` and returns a
-structured result. For each token, its scalar natural-log gate decays the previous state before the
-delta update, and the query reads the updated state:
+`chunk_gdn` and `recurrent_gdn` use the SDPA layout
+`[batch, heads, sequence, dimension]` and return a structured result. For each token, the scalar
+natural-log gate decays the previous state before the delta update, and the query reads the updated
+state:
 
 ```text
 decayed_state = exp(gate) * state
@@ -15,20 +16,20 @@ state = decayed_state + outer(key, residual)
 output = scale * query @ state
 ```
 
-The eager reference includes recurrent and chunked formulations of this recurrence for correctness
-and state-carrying tests.
+`chunk_gdn` uses a chunk-parallel decomposition for training and prefill. `recurrent_gdn` consumes
+tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
+chooses the execution form explicitly; `impl="reference"` selects the eager PyTorch implementation.
 
 ```python
-from attn_gym.linear import gated_delta_rule
+from attn_gym.linear import chunk_gdn
 
-result = gated_delta_rule(
+result = chunk_gdn(
     query,
     key,
     value,
     gate,
     beta,
-    mode="chunked",
-    backend="eager",
+    impl="reference",
     return_final_state=True,
 )
 
@@ -39,24 +40,27 @@ final_state = result.final_state
 ### Supported capabilities
 
 - Fixed-length inputs in `[batch, heads, sequence, dimension]` layout.
-- Recurrent and chunked execution, including initial and final recurrent state.
+- Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
 - Autograd for inputs and initial state.
 
-Packed variable-length inputs and optimized backends are not implemented yet. Requesting an unsupported backend fails explicitly rather than changing execution semantics.
+Packed variable-length inputs and fused implementations are not implemented yet. Explicit
+`impl="fused"` calls fail rather than falling back to the reference.
 
 ### Migration from the prototype API
 
-The earlier prototype functions were replaced by the variant-level API:
+- `naive_recurrent_gated_delta_rule(...)` and `gated_delta_rule(..., mode="recurrent")` become
+  `recurrent_gdn(...)`.
+- `naive_chunk_gated_delta_rule(...)` and `gated_delta_rule(..., mode="chunked")` become
+  `chunk_gdn(...)`.
+- Inputs use `[batch, heads, sequence, dimension]`, matching SDPA and FlexAttention.
+- `output_final_state` is named `return_final_state`.
+- Both operations return `GatedDeltaRuleOutput`; access tensors through `.output` and
+  `.final_state`.
 
-- `naive_recurrent_gated_delta_rule(...)` becomes `gated_delta_rule(..., mode="recurrent")`.
-- `naive_chunk_gated_delta_rule(...)` becomes `gated_delta_rule(..., mode="chunked")`.
-- Inputs now use `[batch, heads, sequence, dimension]`, matching SDPA and FlexAttention.
-- `output_final_state` was renamed to `return_final_state`.
-- The return value is always `GatedDeltaRuleOutput`; access tensors through `.output` and `.final_state`.
-- The unimplemented fused recurrent stub was removed. Optimized backends will be selected through `backend=` when they are added.
+::: attn_gym.linear.chunk_gdn
 
-::: attn_gym.linear.gated_delta_rule
+::: attn_gym.linear.recurrent_gdn
 
 ::: attn_gym.linear.GatedDeltaRuleOutput
 

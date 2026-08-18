@@ -9,7 +9,7 @@
 import importlib
 from typing import TYPE_CHECKING
 
-from attn_gym.linear.gdn import GatedDeltaRuleOutput, gated_delta_rule
+from attn_gym.linear.gdn import GatedDeltaRuleOutput, chunk_gdn, recurrent_gdn
 from attn_gym.linear.kda import (
     active_token_mask,
     chunk_kda,
@@ -38,7 +38,8 @@ KDA_OPS = [
 
 GDN_OPS = [
     "GatedDeltaRuleOutput",
-    "gated_delta_rule",
+    "chunk_gdn",
+    "recurrent_gdn",
 ]
 
 # Model-agnostic building blocks; they currently ship from the KDA module.

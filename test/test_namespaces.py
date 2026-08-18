@@ -4,7 +4,7 @@ import sys
 import attn_gym
 import attn_gym.linear
 import attn_gym.sparse
-from attn_gym.linear import Impl
+from attn_gym.linear import Impl, chunk_gdn, recurrent_gdn
 from attn_gym.linear.kda.api import Impl as KDAImpl
 from attn_gym.linear.types import Impl as SharedImpl
 from attn_gym.masks import (
@@ -27,6 +27,12 @@ def test_attention_namespaces_are_exported():
 def test_linear_impl_uses_shared_owner():
     assert Impl is SharedImpl
     assert KDAImpl is SharedImpl
+
+
+def test_gdn_operations_are_exported():
+    assert callable(chunk_gdn)
+    assert callable(recurrent_gdn)
+    assert "gated_delta_rule" not in attn_gym.linear.__all__
 
 
 def test_documented_mask_and_score_mods_are_exported():

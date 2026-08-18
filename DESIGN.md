@@ -94,15 +94,15 @@ add in this repo, land in pytorch core and then replace our implementations here
 
 ### Separate semantics from implementation
 
-An operation name identifies mathematical behavior. Execution form and kernel backend are
-orthogonal choices:
+An operation name identifies mathematical behavior and execution form; ``impl`` selects its
+implementation:
 
-- **Operation:** gated delta rule, GLA, NSA, and so on.
-- **Execution form:** chunked, recurrent, or automatic selection.
-- **Backend:** eager/reference, Triton, CuTeDSL, another Python DSL, FLA, or automatic selection.
+- **Operation:** chunked or recurrent gated delta rule, GLA, NSA, and so on.
+- **Implementation:** fused kernels or the eager reference.
 
-A backend must not silently change the operation's documented semantics. Numerically different but
-mathematically equivalent execution forms must have explicit tolerance and invariance contracts.
+An implementation must not silently change the operation's documented semantics. Numerically
+different but mathematically equivalent execution forms must have explicit tolerance and invariance
+contracts.
 I am tempted to require bit exactness once we establish a trusted implementation for tweaks or new
 imps but that is tbd.
 
@@ -114,23 +114,15 @@ normalizations to justify a single public function with a large parameter union.
 Prefer:
 
 ```python
-from attn_gym.linear import gated_delta_rule
+from attn_gym.linear import chunk_gdn
 
-result = gated_delta_rule(
-    query,
-    key,
-    value,
-    gate,
-    beta,
-    mode="chunked",
-    backend="auto",
-)
+result = chunk_gdn(query, key, value, gate, beta, impl="reference")
 ```
 
 Do not begin with:
 
 ```python
-linear_attention(kind="gated_delta_rule", ..., algorithm_options={...})
+linear_attention(kind="chunk_gdn", ..., algorithm_options={...})
 ```
 
 Shared types and dispatch behavior should be extracted only when multiple operators use them.
@@ -386,21 +378,19 @@ works only when its private launcher is invoked directly does not satisfy the co
 Public functions are re-exported from the namespace root:
 
 ```python
-from attn_gym.linear import gated_delta_rule
+from attn_gym.linear import chunk_gdn, recurrent_gdn
 from attn_gym.sparse import compressed_sparse_attention
 ```
 
 Backend entry points are private and use a consistent internal name such as `forward`. A backend
 may additionally provide a small private capability check when dispatch needs one. Users select an
-implementation through the public `backend=` argument rather than importing implementation modules
+implementation through the public `impl=` argument rather than importing implementation modules
 directly.
 
-The initial dispatch should remain explicit and local to `api.py`: map a documented backend name to
-one lazily imported implementation, validate that implementation's capabilities, and call it. Do
-not introduce registration side effects or a repository-wide priority registry until several
-operations demonstrate that the same mechanism would remove meaningful duplication. Automatic
-selection should use an inspectable ordered policy and report why explicitly requested backends are
-unsupported.
+The initial dispatch should remain explicit and local to `api.py`: resolve `impl`, validate the
+selected implementation's capabilities, and call it. Do not introduce registration side effects or
+a repository-wide priority registry until several operations demonstrate that the same mechanism
+would remove meaningful duplication. Explicit implementation requests never fall back silently.
 
 ### Applying the structure to compressed sparse attention
 
@@ -485,41 +475,26 @@ layout.
 
 ### Execution form
 
-The proposed public argument is:
-
-```python
-mode: Literal["auto", "chunked", "recurrent"] = "auto"
-```
-
-Each operation documents the modes it supports. Unsupported modes fail clearly rather than falling
-back to a semantically different path.
-
-The expected policy is:
-
-- `chunked` for training and long prefill;
-- `recurrent` for token-by-token decoding and a correctness-oriented batch-invariant path;
-- `auto` for a documented shape- and autograd-aware choice.
+Chunked and recurrent formulations are separate public operations. The caller chooses `chunk_*` for
+training and long prefill or `recurrent_*` for decoding, inference prefill, and a
+correctness-oriented batch-invariant path. There is no automatic execution-form switch inside one
+public function.
 
 An operation may expose an additional parallel formulation when it has one, but that is
 operation-specific rather than part of the common contract.
 
-Whether `auto` belongs in the first public release is still open. Explicit-only mode selection is
-simpler for reproducibility and compilation; automatic selection is easier for model authors.
+### Implementation selection
 
-### Backend selection
-
-The proposed public argument is:
+Linear operations use the shared selector:
 
 ```python
-backend: Literal["auto", "eager", "triton", "cute"] = "auto"
+impl: Impl | str
 ```
 
-Backend selection rules must be deterministic and inspectable. `auto` may consider device,
-architecture, dtype, shape, execution mode, autograd requirements, and installed dependencies. It
-must not hide an unsupported input by changing mathematical behavior.
-
-The initial implementation should use straightforward dispatch rather than a general capability
-solver. If backend selection grows complex, supported capabilities can later be represented as data.
+`Impl.FUSED` selects optimized kernels and `Impl.REFERENCE` selects the eager correctness oracle.
+Selection is deterministic and explicit. An unsupported implementation fails clearly rather than
+falling back or changing execution form. The initial implementation should use straightforward
+local dispatch rather than a general capability solver.
 
 ### Variable-length inputs
 
@@ -595,8 +570,8 @@ implementations may advertise a weaker numerical contract if the distinction is 
 The exact first contract remains open: bitwise equality versus tolerance-based equality, whether it
 covers gradients and final recurrent state, and which dtypes and hardware are guaranteed. We should
 settle those details using the first operation rather than prematurely adding a public
-`batch_invariant` flag. Batch invariance should not be inferred solely from
-`mode="recurrent"`.
+`batch_invariant` flag. Batch invariance should not be inferred solely from choosing the recurrent
+operation.
 
 ## Backend and dependency policy
 
