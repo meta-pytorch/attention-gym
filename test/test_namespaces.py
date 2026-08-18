@@ -4,6 +4,9 @@ import sys
 import attn_gym
 import attn_gym.linear
 import attn_gym.sparse
+from attn_gym.linear import Impl
+from attn_gym.linear.kda.api import Impl as KDAImpl
+from attn_gym.linear.types import Impl as SharedImpl
 from attn_gym.masks import (
     batchify_mask_mod,
     generate_spatial_head_mask_mod,
@@ -19,6 +22,11 @@ def test_attention_namespaces_are_exported():
     assert "linear" in attn_gym.__all__
     assert "sparse" in attn_gym.__all__
     assert "paged_attention" not in attn_gym.__all__
+
+
+def test_linear_impl_uses_shared_owner():
+    assert Impl is SharedImpl
+    assert KDAImpl is SharedImpl
 
 
 def test_documented_mask_and_score_mods_are_exported():
