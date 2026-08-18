@@ -49,10 +49,19 @@ python attn_gym/masks/causal.py
 ## Development
 
 ```bash
-pytest                          # run tests
+pytest -n 6                     # run tests in parallel (strongly preferred)
+pytest -n 6 test/test_kda.py    # one file, same parallelism
+pytest test/test_kda.py::test_x # single test; -n adds only overhead here
 ruff check && ruff format       # lint + format
 prek                            # full pre-commit suite
 ```
+
+Use `pytest -n 6` (pytest-xdist, already in `[tests]`) for anything wider than a single
+test. Much of the suite is CuTeDSL and `torch.compile` work that is CPU-bound during
+compilation, so a serial run leaves the machine idle and takes minutes where a parallel one
+takes tens of seconds. The workers share one GPU, so raise the count only if the GPU has
+headroom, and drop back to `-n 0` when a failure needs a clean serial repro or readable
+output.
 
 ### Docs
 
