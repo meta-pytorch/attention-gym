@@ -899,6 +899,46 @@ def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+@pytest.mark.parametrize("cut", [5, 8, 37])
+def test_chunk_kda_forward_prefix_ignores_future_tokens(cut):
+    """Perturbing only future tokens must leave causal-prefix output bitwise unchanged.
+
+    The intra-chunk rebase splits ``2^{g_i - g_j}`` into two separately rounded factors,
+    so a reference row drawn from the future lets a later token perturb an earlier
+    result even though the reference cancels in exact arithmetic. The cuts land inside a
+    16-row subchunk, where a midpoint reference moves as the suffix changes. See
+    NOTE [Causal gate reference].
+    """
+    torch.manual_seed(11)
+    tokens, heads = 128, 2
+    shape = (1, tokens, heads, 128)
+    query = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
+    key = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
+    value = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    beta = torch.rand(1, tokens, heads, device="cuda")
+    increments = -torch.rand(shape, device="cuda")
+
+    def forward(tensors, gate_increments):
+        """Run the public core from per-token gate increments."""
+        output, _ = chunk_kda(*tensors, chunk_cumsum_ref(gate_increments, 64), beta)
+        return output
+
+    baseline = forward((query, key, value), increments)
+
+    # Rebuild the suffix of every operand, including the gate the reference is drawn from.
+    variant = [tensor.clone() for tensor in (query, key, value)]
+    for tensor in variant:
+        tensor[:, cut:] = torch.randn_like(tensor[:, cut:])
+    variant_increments = increments.clone()
+    variant_increments[:, cut:] = -torch.rand_like(variant_increments[:, cut:])
+    perturbed = forward(tuple(variant), variant_increments)
+
+    assert not torch.equal(baseline[:, cut:], perturbed[:, cut:]), (
+        "the suffix perturbation did not take effect, so the test proves nothing"
+    )
+    torch.testing.assert_close(perturbed[:, :cut], baseline[:, :cut], rtol=0, atol=0)
+
+
 def test_chunk_kda_validates_public_contract():
     """Reject malformed inputs at the opaque boundary before a kernel launch."""
     q, k, v, cumulative_gate, beta = (tensor.detach() for tensor in _inputs())

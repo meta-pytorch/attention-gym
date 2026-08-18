@@ -24,7 +24,10 @@ from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import (
     _fused_gate_bwd_op,
     fused_gate_bwd,
 )
-from attn_gym.linear.kda.fwd.triton.gate_fwd import bounded_gate_cumsum
+from attn_gym.linear.kda.fwd.triton.gate_fwd import (
+    MAX_GATE_LOWER_BOUND_MAGNITUDE,
+    bounded_gate_cumsum,
+)
 from attn_gym.linear.kda.naive import fused_gate_bwd_ref
 
 TMA_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (9, 0)
@@ -177,6 +180,31 @@ def test_fused_gate_bwd_reference_matches_forward_autograd(chunk_size):
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=2e-5, atol=3e-5)
     torch.testing.assert_close(actual[2], expected[2], rtol=2e-5, atol=3e-5)
+
+
+def test_bounded_gate_cumsum_rejects_gate_range_beyond_rebase_budget():
+    """Reject decay the intra-chunk rebase cannot represent instead of returning NaNs.
+
+    Past the ceiling the core silently produced non-finite output, so the boundary has to
+    fail fast. The ceiling is derived from the subchunk span and the FP32 exponent range;
+    see NOTE [Gate range ceiling].
+    """
+    raw_gate = torch.zeros(1, 64, 2, 128, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(2, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(2, 128, dtype=torch.float32, device="cuda")
+    ceiling = MAX_GATE_LOWER_BOUND_MAGNITUDE
+
+    # The shipped default must stay comfortably inside the supported range.
+    bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=-5.0)
+    bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=-(ceiling - 1e-3))
+
+    for rejected in (-(ceiling + 1e-3), -16.0, -32.0):
+        with pytest.raises(ValueError, match="intra-chunk gate rebase"):
+            bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=rejected)
+    with pytest.raises(ValueError, match="finite and non-positive"):
+        bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=float("nan"))
+    with pytest.raises(ValueError, match="finite and non-positive"):
+        bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=1.0)
 
 
 @pytest.mark.parametrize(

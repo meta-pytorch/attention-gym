@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 
 import torch
@@ -490,6 +491,25 @@ class _BoundedGateCumsum(torch.autograd.Function):
         )
 
 
+# NOTE [Gate range ceiling]
+# The intra-chunk rebase splits 2^{g_i - g_j} into two separately rounded factors whose
+# operands must stay inside the FP32 exponent range. Because the gate map is
+# `lower_bound * sigmoid(...)` and sigmoid is in (0, 1), per-token log2 decay is hard
+# bounded by |lower_bound| * log2(e) independently of the data, so the worst case over a
+# subchunk is a closed form rather than something that must be measured:
+#
+#     |lower_bound|_max = 2^EXPONENT_BITS_LIMIT / (span_steps * log2(e))
+#
+# The causal reference spans BC-1 = 15 steps, giving 5.915. A saturated-gate bisection on
+# GB300 measured the boundary at 5.915, matching to three decimals. Only the *realized*
+# span is data dependent, which is why random gates underestimate the ceiling; the bound
+# above is sound for any input. Without this check the core returns NaNs with no error.
+# See NOTE [Causal gate reference] in the diagonal forward kernel.
+GATE_SPAN_STEPS = 15
+FP32_EXPONENT_BUDGET = 128.0
+MAX_GATE_LOWER_BOUND_MAGNITUDE = FP32_EXPONENT_BUDGET / (GATE_SPAN_STEPS * math.log2(math.e))
+
+
 def _bounded_gate_cumsum(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
@@ -530,6 +550,16 @@ def _bounded_gate_cumsum(
         )
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
+    if not math.isfinite(lower_bound) or lower_bound > 0:
+        raise ValueError(f"lower_bound must be finite and non-positive, got {lower_bound}")
+    if -lower_bound > MAX_GATE_LOWER_BOUND_MAGNITUDE:
+        raise ValueError(
+            f"lower_bound must be >= {-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f} for the KDA "
+            f"intra-chunk gate rebase, got {lower_bound}. Beyond that the per-token decay "
+            f"can exceed the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk "
+            "and the core silently produces non-finite values. "
+            "See NOTE [Gate range ceiling]."
+        )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")
     if cu_seqlens is not None:
