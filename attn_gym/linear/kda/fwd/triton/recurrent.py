@@ -15,12 +15,11 @@ inference-only; use ``chunk_kda`` for training.
 
 from __future__ import annotations
 
-import threading
-
 import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.ops import recurrent_forward as forward
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
@@ -38,28 +37,8 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
-        for block_v in (32, 16, 8)
-        for num_warps in (2, 4)
-    ],
-    key=[
-        "T",
-        "N",
-        "H",
-        "K",
-        "V",
-        "USE_INITIAL_STATE",
-        "STORE_FINAL_STATE",
-        "IS_VARLEN",
-        "USE_STATE_INDICES",
-    ],
-    prune_configs_by={"early_config_prune": _prune_recurrent_configs},
-    **autotune_cache_kwargs,
-)
 @triton.jit
-def kda_recurrent_fwd_kernel(
+def _kda_recurrent_fwd_kernel(
     q,
     k,
     v,
@@ -83,7 +62,6 @@ def kda_recurrent_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
-    CONTIGUOUS_FINAL_STATE: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -118,7 +96,10 @@ def kda_recurrent_fwd_kernel(
             return
     else:
         i_state = i_n
-    p_state = i_state * state_batch_stride + i_h * K * V + o_k[:, None] * V + o_v[None, :]
+    p_state = ptr_offset(
+        (i_state, i_h, o_k[:, None], o_v[None, :]),
+        (state_batch_stride, K * V, V, 1),
+    )
     if USE_INITIAL_STATE:
         b_state = tl.load(h0 + p_state, mask=m_kv, other=0.0).to(tl.float32)
     else:
@@ -139,16 +120,30 @@ def kda_recurrent_fwd_kernel(
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
 
     if STORE_FINAL_STATE:
-        if CONTIGUOUS_FINAL_STATE:
-            p_final_state = i_n * H * K * V + i_h * K * V + o_k[:, None] * V + o_v[None, :]
-        else:
-            p_final_state = p_state
-        tl.store(ht + p_final_state, b_state, mask=m_kv)
+        tl.store(ht + p_state, b_state, mask=m_kv)
 
 
-_fixed_recurrent_fwd_kernel = kda_recurrent_fwd_kernel.fn
-_recurrent_autotune_configs: dict[tuple[object, ...], dict[str, object]] = {}
-_recurrent_autotune_lock = threading.Lock()
+kda_recurrent_fwd_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
+        for block_v in (32, 16, 8)
+        for num_warps in (2, 4)
+    ],
+    key=[
+        "T",
+        "N",
+        "H",
+        "K",
+        "V",
+        "USE_INITIAL_STATE",
+        "STORE_FINAL_STATE",
+        "IS_VARLEN",
+        "USE_STATE_INDICES",
+    ],
+    prune_configs_by={"early_config_prune": _prune_recurrent_configs},
+    restore_value=["h0"],
+    **autotune_cache_kwargs,
+)(_kda_recurrent_fwd_kernel)
 
 
 def _launch_recurrent_fwd(
@@ -188,7 +183,7 @@ def _launch_recurrent_fwd(
     # grid-Y limit, while grid-X is effectively unbounded.
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
-    def launch(kernel, target_final_state, contiguous_final_state, launch_options):
+    def launch(kernel, launch_options):
         kernel[grid](
             q,
             k,
@@ -197,7 +192,7 @@ def _launch_recurrent_fwd(
             beta,
             output,
             initial_state,
-            target_final_state,
+            final_state,
             cu_seqlens,
             state_indices,
             scale=key_dim**-0.5,
@@ -209,68 +204,25 @@ def _launch_recurrent_fwd(
             V=value_dim,
             BK=triton.next_power_of_2(key_dim),
             USE_INITIAL_STATE=initial_state is not None,
-            STORE_FINAL_STATE=target_final_state is not None,
+            STORE_FINAL_STATE=final_state is not None,
             IS_VARLEN=cu_seqlens is not None,
             USE_STATE_INDICES=state_indices is not None,
-            CONTIGUOUS_FINAL_STATE=contiguous_final_state,
             **launch_options,
         )
 
+    kernel = kda_recurrent_fwd_kernel
+    launch_options = {}
     if not autotune:
         average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
         # smaller value tiles schedule scans of 32 or more tokens better on b200
         block_v_limit = 16 if average_tokens >= 32 else 32
-        launch(
-            _fixed_recurrent_fwd_kernel,
-            final_state,
-            False,
-            {
-                "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
-                "num_warps": 4,
-                "num_stages": 3,
-            },
-        )
-        return output, final_state
-
-    tune_key = (
-        q.device.index,
-        tokens,
-        num_sequences,
-        heads,
-        key_dim,
-        value_dim,
-        initial_state is not None,
-        final_state is not None,
-        cu_seqlens is not None,
-        state_indices is not None,
-        q.dtype,
-        k.dtype,
-        v.dtype,
-        gate.dtype,
-        beta.dtype,
-        None if initial_state is None else initial_state.dtype,
-        None if cu_seqlens is None else cu_seqlens.dtype,
-        None if state_indices is None else state_indices.dtype,
-    )
-    launch_options = _recurrent_autotune_configs.get(tune_key)
-    result_is_ready = False
-    if launch_options is None:
-        with _recurrent_autotune_lock:
-            launch_options = _recurrent_autotune_configs.get(tune_key)
-            if launch_options is None:
-                tuning_final_state = final_state
-                contiguous_final_state = state_indices is not None
-                if contiguous_final_state:
-                    tuning_final_state = q.new_empty(
-                        num_sequences, heads, key_dim, value_dim, dtype=torch.float32
-                    )
-                launch(kda_recurrent_fwd_kernel, tuning_final_state, contiguous_final_state, {})
-                launch_options = dict(kda_recurrent_fwd_kernel.best_config.all_kwargs())
-                _recurrent_autotune_configs[tune_key] = launch_options
-                result_is_ready = not contiguous_final_state
-
-    if not result_is_ready:
-        launch(_fixed_recurrent_fwd_kernel, final_state, False, launch_options)
+        kernel = _kda_recurrent_fwd_kernel
+        launch_options = {
+            "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    launch(kernel, launch_options)
     return output, final_state
 
 

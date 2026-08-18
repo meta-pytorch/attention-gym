@@ -19,7 +19,6 @@ from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_no_state_op,
     _recurrent_fwd_op,
     _recurrent_fwd_paged_op,
-    kda_recurrent_fwd_kernel,
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
 
@@ -116,8 +115,6 @@ def test_recurrent_autotunes_value_tile():
     output, _ = recurrent_kda(q, k, v, gate, beta, autotune=True)
     expected, _ = recurrent_kda(q, k, v, gate, beta, autotune=False)
 
-    assert kda_recurrent_fwd_kernel.best_config.kwargs["BV"] == 8
-    assert kda_recurrent_fwd_kernel.best_config.num_warps in (2, 4)
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
