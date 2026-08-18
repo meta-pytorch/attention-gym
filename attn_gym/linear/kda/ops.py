@@ -17,7 +17,7 @@ _CHUNK_SIZE = 64
 # Fixed-arity schema pairs avoid optional outputs on hot paths.
 _CHUNK_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor? initial_state,"
-    " bool autotune)"
+    " bool autotune, bool fuse_q_l2norm)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd",
@@ -30,7 +30,8 @@ torch.library.define(
 
 _CHUNK_RAGGED_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
-    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, bool autotune)"
+    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, bool autotune, "
+    "bool fuse_q_l2norm)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd_ragged",
@@ -213,8 +214,9 @@ def _chunk_fwd_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
-    del k, cumulative_gate, beta, initial_state, autotune
+    del k, cumulative_gate, beta, initial_state, autotune, fuse_q_l2norm
     return _chunk_fwd_fake_common(q, v)
 
 
@@ -227,8 +229,9 @@ def _chunk_fwd_with_state_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
-    del k, cumulative_gate, beta, initial_state, autotune
+    del k, cumulative_gate, beta, initial_state, autotune, fuse_q_l2norm
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (q.shape[0], q.shape[2], q.shape[3], v.shape[-1]),
@@ -248,8 +251,10 @@ def _chunk_fwd_ragged_fake(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
     del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, autotune
+    del fuse_q_l2norm
     return _chunk_fwd_fake_common(q, v)
 
 
@@ -264,8 +269,9 @@ def _chunk_fwd_ragged_with_state_fake(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
-    del k, cumulative_gate, beta, initial_state, chunk_offsets, autotune
+    del k, cumulative_gate, beta, initial_state, chunk_offsets, autotune, fuse_q_l2norm
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (cu_seqlens.shape[0] - 1, q.shape[2], q.shape[3], v.shape[-1]),

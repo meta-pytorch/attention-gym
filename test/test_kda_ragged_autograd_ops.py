@@ -33,6 +33,7 @@ def test_ragged_custom_op_registrations():
         cu_seqlens,
         metadata.chunk_offsets,
         True,
+        False,
     )
     torch.library.opcheck(
         _chunk_kda_fwd_ragged_with_state_op,
@@ -77,6 +78,7 @@ def test_ragged_custom_op_registrations():
         cu_seqlens,
         metadata.chunk_offsets,
         True,
+        False,
     )
     with torch.no_grad():
         output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args)

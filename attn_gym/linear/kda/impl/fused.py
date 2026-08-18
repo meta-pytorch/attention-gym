@@ -49,16 +49,17 @@ class _ChunkKDA(torch.autograd.Function):
         output_final_state,
         fastmath,
         autotune,
+        fuse_q_l2norm,
     ):
         if cu_seqlens is None:
             assert chunk_offsets is None
             if output_final_state:
                 output, state, aqk, akk = chunk_fwd_with_state_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, autotune, fuse_q_l2norm
                 )
             else:
                 output, aqk, akk = chunk_fwd_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, autotune, fuse_q_l2norm
                 )
         elif output_final_state:
             assert chunk_offsets is not None
@@ -72,6 +73,7 @@ class _ChunkKDA(torch.autograd.Function):
                 cu_seqlens,
                 chunk_offsets,
                 autotune,
+                fuse_q_l2norm,
             )
         else:
             assert chunk_offsets is not None
@@ -85,6 +87,7 @@ class _ChunkKDA(torch.autograd.Function):
                 cu_seqlens,
                 chunk_offsets,
                 autotune,
+                fuse_q_l2norm,
             )
         ctx.save_for_backward(
             q,
@@ -141,7 +144,7 @@ class _ChunkKDA(torch.autograd.Function):
         else:
             dq, dk, dv, dg, db = chunk_bwd_op(*args)
             d_initial_state = None
-        return dq, dk, dv, dg, db, d_initial_state, None, None, None, None, None
+        return dq, dk, dv, dg, db, d_initial_state, None, None, None, None, None, None
 
 
 def chunk_forward(
@@ -157,8 +160,32 @@ def chunk_forward(
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
+    fuse_q_l2norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Normalize inputs and invoke the registered fused chunk operators."""
+    """Normalize inputs and invoke the registered fused chunk operators.
+
+    ``fuse_q_l2norm`` accepts unnormalized q and L2-normalizes each row
+    inside the fused core (default ``eps=1e-6``), skipping the standalone q
+    normalization pass; k must still be pre-normalized by the caller. It is
+    forward-only (gradient-tracking inputs are rejected while grad mode is
+    enabled) and eager-only. The intermediate grams then carry
+    raw-q magnitudes (about ``sqrt(K)`` larger), so this flag assumes the
+    bounded-gate contract (``bounded_gate_cumsum``); unbounded synthetic gates
+    can overflow the BF16 gram range.
+    """
+    if fuse_q_l2norm:
+        if torch.compiler.is_compiling():
+            raise NotImplementedError(
+                "fuse_q_l2norm is eager-only; it bypasses the compiler-opaque op"
+            )
+        needs_grad = torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad
+            for tensor in (q, k, v, cumulative_gate, beta, initial_state)
+        )
+        if needs_grad:
+            raise NotImplementedError(
+                "fuse_q_l2norm is forward-only; normalize q outside the kernel to keep gradients"
+            )
     if metadata is not None:
         assert cu_seqlens is None
         metadata.validate_chunk_size(_CHUNK_SIZE)
@@ -197,6 +224,7 @@ def chunk_forward(
             True,
             fastmath,
             autotune,
+            fuse_q_l2norm,
         )
     else:
         output = _ChunkKDA.apply(
@@ -211,6 +239,7 @@ def chunk_forward(
             False,
             fastmath,
             autotune,
+            fuse_q_l2norm,
         )
         state = None
     return output.reshape(output_shape).to(output_dtype), state

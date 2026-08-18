@@ -25,6 +25,9 @@ from attn_gym._backends.triton.utils import (
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
 
+# Must match l2norm's default eps so the fused route reproduces the standalone pass.
+_L2NORM_EPS = tl.constexpr(1e-6)
+
 
 @triton.heuristics(
     {
@@ -50,7 +53,7 @@ from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=4),
         triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
     ],
-    key=["H", "K", "V", "T", "BT"],
+    key=["H", "K", "V", "T", "BT", "FUSE_Q_L2NORM"],
     **autotune_cache_kwargs,
 )
 @triton.jit(
@@ -84,6 +87,7 @@ def chunk_gla_fwd_kernel_o(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FUSE_Q_L2NORM: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if USE_INT64_OFFSETS:
@@ -134,6 +138,7 @@ def chunk_gla_fwd_kernel_o(
     A += ptr_offset((bos, i_h), (H * BT, BT))
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_ssq = tl.zeros([BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
@@ -144,6 +149,9 @@ def chunk_gla_fwd_kernel_o(
 
         # [BT, BK]
         b_q = tl.load(p_q, mask=m_qg, other=0.0)
+        if FUSE_Q_L2NORM:
+            b_q32 = b_q.to(tl.float32)
+            b_ssq += tl.sum(b_q32 * b_q32, 1)
         # [BT, BK]
         b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
         # [BT, BK]
@@ -167,6 +175,10 @@ def chunk_gla_fwd_kernel_o(
     b_A = tl.load(p_A, mask=m_t[:, None], other=0.0)
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
+    if FUSE_Q_L2NORM:
+        # Both output terms are linear in the raw q row (Aqk carries the raw-q
+        # gram), so one row scale by 1/||q|| completes the deferred L2 norm.
+        b_o *= (1 / tl.sqrt(b_ssq + _L2NORM_EPS))[:, None]
     tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_tv)
 
 
@@ -188,13 +200,18 @@ def _compose_output_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FUSE_Q_L2NORM: tl.constexpr,
 ):
     """Compose one complete output tile with TMA-backed tensor descriptors."""
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_ssq = tl.zeros([BT], dtype=tl.float32)
     for key_tile in range(tl.cdiv(K, BK)):
         key_start = key_tile * BK
         b_q = q_desc.load([batch, token_start, head, key_start])
         b_q = tl.reshape(b_q, [BT, BK])
+        if FUSE_Q_L2NORM:
+            b_q32 = b_q.to(tl.float32)
+            b_ssq += tl.sum(b_q32 * b_q32, 1)
         b_g = g_desc.load([batch, token_start, head, key_start])
         b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
@@ -211,6 +228,10 @@ def _compose_output_tma(
     b_v = v_desc.load([batch, token_start, head, value_tile * BV])
     b_v = tl.reshape(b_v, [BT, BV])
     b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+    if FUSE_Q_L2NORM:
+        # Both accumulated terms are linear in the raw q row (Aqk carries the
+        # raw-q gram), so one row scale by 1/||q|| completes the deferred norm.
+        b_o *= (1 / tl.sqrt(b_ssq + _L2NORM_EPS))[:, None]
     o_desc.store(
         [batch, token_start, head, value_tile * BV],
         tl.reshape(b_o.to(b_v.dtype), [1, BT, 1, BV]),
@@ -232,6 +253,7 @@ def chunk_gla_fwd_kernel_o_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FUSE_Q_L2NORM: tl.constexpr = False,
 ):
     """Compose fixed KDA output tiles with TMA-backed tensor descriptors."""
     value_tile, chunk, batch_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -253,6 +275,7 @@ def chunk_gla_fwd_kernel_o_tma(
         BT,
         BK,
         BV,
+        FUSE_Q_L2NORM,
     )
 
 
@@ -282,6 +305,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     BK: tl.constexpr,
     BV: tl.constexpr,
     num_sequences,
+    FUSE_Q_L2NORM: tl.constexpr = False,
 ):
     """Compose full ragged chunks with TMA and partial tails with masked pointers."""
     i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -312,6 +336,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
             BT,
             BK,
             BV,
+            FUSE_Q_L2NORM,
         )
     else:
         o_i = tl.arange(0, BT)
@@ -321,6 +346,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
         m_v = o_v < V
         m_tv = m_t[:, None] & m_v[None, :]
         b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        b_ssq = tl.zeros([BT], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
             o_k = i_k * BK + tl.arange(0, BK)
             m_k = o_k < K
@@ -332,6 +358,9 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
                 (H * K * V, K * V, V, 1),
             )
             b_q = tl.load(p_q, mask=m_qg, other=0.0)
+            if FUSE_Q_L2NORM:
+                b_q32 = b_q.to(tl.float32)
+                b_ssq += tl.sum(b_q32 * b_q32, 1)
             b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
             b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
             b_h = tl.load(p_h, mask=m_k[:, None] & m_v[None, :], other=0.0)
@@ -344,6 +373,8 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
         b_A = tl.load(p_A, mask=m_t[:, None], other=0.0)
         b_A = tl.where(o_i[:, None] >= o_i[None, :], b_A, 0.0).to(b_v.dtype)
         b_o += tl.dot(b_A, b_v)
+        if FUSE_Q_L2NORM:
+            b_o *= (1 / tl.sqrt(b_ssq + _L2NORM_EPS))[:, None]
         p_o = o + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1))
         tl.store(p_o, b_o.to(o.dtype.element_ty), mask=m_tv)
 
@@ -367,8 +398,14 @@ def chunk_gla_fwd_o_gk(
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
+    fuse_q_l2norm: bool = False,
 ) -> torch.Tensor:
-    """Compose fixed-length or packed KDA intra- and inter-chunk output terms."""
+    """Compose fixed-length or packed KDA intra- and inter-chunk output terms.
+
+    ``fuse_q_l2norm`` applies the q L2 norm as an output row scale computed
+    in-kernel from the raw q rows; ``q`` and ``A`` must then carry the raw-q
+    basis.
+    """
     if metadata is not None:
         metadata.validate_chunk_size(chunk_size)
     batch, tokens, heads, key_dim = q.shape
@@ -422,6 +459,7 @@ def chunk_gla_fwd_o_gk(
             BT=chunk_size,
             BK=block_key_dim,
             BV=block_value_dim,
+            FUSE_Q_L2NORM=fuse_q_l2norm,
             num_warps=2,
             num_stages=3,
         )
@@ -456,12 +494,14 @@ def chunk_gla_fwd_o_gk(
                 BK=block_key_dim,
                 BV=block_value_dim,
                 num_sequences=metadata.cu_seqlens.shape[0] - 1,
+                FUSE_Q_L2NORM=fuse_q_l2norm,
                 num_warps=2,
                 num_stages=3,
                 # The rarely taken partial-chunk pointer branch pushes this
-                # kernel to 180 registers vs the dense kernel's 134; cap at the
-                # dense budget so only tail CTAs pay with spills.
-                maxnreg=136,
+                # kernel to 180 registers vs the dense kernel's 134; cap near
+                # the dense budget so only tail CTAs pay with spills. The
+                # fused q-norm accumulator needs a little extra headroom.
+                maxnreg=152 if fuse_q_l2norm else 136,
             )
             return output
 
@@ -488,6 +528,7 @@ def chunk_gla_fwd_o_gk(
             BT=chunk_size,
             num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
             USE_EXP2=True,
+            FUSE_Q_L2NORM=fuse_q_l2norm,
         )
     return output
 

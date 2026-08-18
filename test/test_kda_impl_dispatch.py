@@ -204,6 +204,13 @@ def test_chunk_reference_rejects_fastmath():
         chunk_kda(q, k, v, chunk_cumsum_ref(gate, 64), beta, fastmath=True, impl="reference")
 
 
+def test_chunk_reference_rejects_fuse_q_l2norm():
+    """Keep fused-only knobs from silently changing meaning."""
+    q, k, v, gate, beta = _inputs(tokens=8)
+    with pytest.raises(ValueError, match="fuse_q_l2norm"):
+        chunk_kda(q, k, v, chunk_cumsum_ref(gate, 64), beta, fuse_q_l2norm=True, impl="reference")
+
+
 @pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
 def test_chunk_autotune_flag_is_deterministic_and_accurate():
     """autotune=False pins fixed heuristic configs without changing the math contract."""

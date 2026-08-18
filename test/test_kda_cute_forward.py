@@ -339,12 +339,12 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
     module = importlib.import_module("attn_gym.linear.kda.impl.fused")
     routes = []
 
-    def dense_forward(q, _k, v, _gate, _beta, _state, _tune):
+    def dense_forward(q, _k, v, _gate, _beta, _state, _tune, _fuse):
         routes.append("dense")
         tape = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), tape, tape
 
-    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _tune):
+    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _tune, _fuse):
         routes.append("ragged")
         tape = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), tape, tape
@@ -628,6 +628,7 @@ def test_chunk_kda_op_registration():
         beta.detach(),
         initial_state.detach(),
         True,
+        False,
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
@@ -646,6 +647,7 @@ def test_chunk_kda_backward_op_registration():
             beta,
             initial_state,
             True,
+            False,
         )
     torch.library.opcheck(
         _chunk_kda_bwd_op,

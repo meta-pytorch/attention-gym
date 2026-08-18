@@ -87,8 +87,15 @@ def _chunk_kda_fwd(
     *,
     output_final_state: bool,
     autotune: bool,
+    fuse_q_l2norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """Run the optimized KDA core using an already selected chunk schedule."""
+    """Run the optimized KDA core using an already selected chunk schedule.
+
+    With ``fuse_q_l2norm`` the caller passes raw (unnormalized) q: the grams
+    stay in the raw-q basis and the output stage computes and applies each
+    row's inverse norm in-kernel, skipping the standalone q normalization
+    pass. Forward-only; the returned Aqk stays in the raw-q basis.
+    """
     scale = _HEAD_DIM**-0.5
 
     with profiler_range("kda/fused/chunk_kda_fwd_intra"):
@@ -127,6 +134,7 @@ def _chunk_kda_fwd(
             chunk_size=_CHUNK_SIZE,
             metadata=metadata,
             autotune=autotune,
+            fuse_q_l2norm=fuse_q_l2norm,
         )
     return output, final_state, Aqk, Akk
 
@@ -139,6 +147,7 @@ def _chunk_kda_fwd_shared(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     autotune: bool,
+    fuse_q_l2norm: bool,
     output_final_state: bool,
 ):
     """Keep the complete composed forward behind one compiler-opaque boundary."""
@@ -154,6 +163,7 @@ def _chunk_kda_fwd_shared(
         None,
         output_final_state=output_final_state,
         autotune=autotune,
+        fuse_q_l2norm=fuse_q_l2norm,
     )
 
 
@@ -165,6 +175,7 @@ def _chunk_kda_fwd_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, _final_state, Aqk, Akk = _chunk_kda_fwd_shared(
         q,
@@ -174,6 +185,7 @@ def _chunk_kda_fwd_cuda(
         beta,
         initial_state,
         autotune,
+        fuse_q_l2norm,
         False,
     )
     return output, Aqk, Akk
@@ -187,6 +199,7 @@ def _chunk_kda_fwd_with_state_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _chunk_kda_fwd_shared(
         q,
@@ -196,6 +209,7 @@ def _chunk_kda_fwd_with_state_cuda(
         beta,
         initial_state,
         autotune,
+        fuse_q_l2norm,
         True,
     )
 
@@ -210,6 +224,7 @@ def _chunk_kda_fwd_ragged_shared(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    fuse_q_l2norm: bool,
     output_final_state: bool,
 ):
     """Run ragged forward with caller-prepared routing and fixed-schema tape."""
@@ -231,6 +246,7 @@ def _chunk_kda_fwd_ragged_shared(
         metadata,
         output_final_state=output_final_state,
         autotune=autotune,
+        fuse_q_l2norm=fuse_q_l2norm,
     )
 
 
@@ -244,6 +260,7 @@ def _chunk_kda_fwd_ragged_cuda(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
     output, _state, Aqk, Akk = _chunk_kda_fwd_ragged_shared(
         q,
@@ -255,6 +272,7 @@ def _chunk_kda_fwd_ragged_cuda(
         cu_seqlens,
         chunk_offsets,
         autotune,
+        fuse_q_l2norm,
         False,
     )
     return output, Aqk, Akk
@@ -270,6 +288,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    fuse_q_l2norm: bool,
 ):
     return _chunk_kda_fwd_ragged_shared(
         q,
@@ -281,6 +300,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
         cu_seqlens,
         chunk_offsets,
         autotune,
+        fuse_q_l2norm,
         True,
     )
 

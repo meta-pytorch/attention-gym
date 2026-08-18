@@ -38,6 +38,7 @@ def chunk_kda(
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
+    fuse_q_l2norm: bool = False,
     impl: Impl | str = Impl.FUSED,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply chunk-parallel KDA for training and prefill.
@@ -62,6 +63,10 @@ def chunk_kda(
         autotune: Benchmark candidate kernel configurations when true (winners
             are cached and reused); use fixed heuristics when false for
             repeatable selection across machines and cache states.
+        fuse_q_l2norm: Accept unnormalized q and L2-normalize each row inside
+            the fused core (default ``eps=1e-6``), skipping the standalone
+            normalization pass; k must still be pre-normalized. Forward-only,
+            eager-only, and rejected with ``"reference"``.
         impl: ``"fused"`` uses the Blackwell kernels with first-order autograd;
             ``"reference"`` uses differentiable eager PyTorch in FP32, with no
             automatic fallback.
@@ -73,6 +78,8 @@ def chunk_kda(
     selected_impl = resolve_impl(impl)
     if selected_impl is Impl.REFERENCE and fastmath:
         raise ValueError("fastmath applies only to impl='fused'")
+    if selected_impl is Impl.REFERENCE and fuse_q_l2norm:
+        raise ValueError("fuse_q_l2norm applies only to impl='fused'")
     validate_kda_inputs(
         q,
         k,
@@ -96,6 +103,7 @@ def chunk_kda(
             output_final_state=output_final_state,
             fastmath=fastmath,
             autotune=autotune,
+            fuse_q_l2norm=fuse_q_l2norm,
         )
     return reference_kda(
         partial(naive_chunk_kda_from_cumulative, chunk_size=_CHUNK_SIZE),
