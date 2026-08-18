@@ -23,7 +23,7 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
-from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
@@ -2146,7 +2146,7 @@ class ChunkKdaBwdIntraTunable:
             args.capacity,
             config.grid_chunks,
             args.chunk_offsets is not None,
-            requires_int64_offsets(
+            requires_int64_abi(
                 _column_token_head(args.q),
                 _column_token_head(args.k),
                 _column_token_head(args.g),

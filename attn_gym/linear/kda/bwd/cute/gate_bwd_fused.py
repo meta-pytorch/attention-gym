@@ -39,7 +39,7 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 
 class WarpRole(IntEnum):
@@ -532,7 +532,7 @@ def _fused_gate_bwd_cuda(
         op.chunk_size,
         op.lower_bound,
         op.fastmath,
-        requires_int64_offsets(
+        requires_int64_abi(
             g,
             A_log,
             dt_bias,

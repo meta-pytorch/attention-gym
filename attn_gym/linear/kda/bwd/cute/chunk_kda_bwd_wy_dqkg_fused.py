@@ -32,7 +32,7 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
-from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
@@ -1973,6 +1973,15 @@ class ChunkKdaBwdWyDqkgFused:
         return (grid_x, Int32(1), Int32(1))
 
     @cute.jit
+    def _token_row(self, row: Int32):
+        """Widen one token-row ordinal before it multiplies a row pitch.
+
+        Manual vector-store addresses bypass the typed layouts, so the cast must
+        happen before the first product that can exceed INT32_MAX.
+        """
+        return cutlass.Int64(row) if cutlass.const_expr(self.use_int64_offsets) else row
+
+    @cute.jit
     def __call__(
         self,
         # ── Inputs ──
@@ -3385,7 +3394,7 @@ class ChunkKdaBwdWyDqkgFused:
 
                     base_addr = (
                         dv2_gmem.iterator
-                        + (tok_offset + tile_idx * self.BT + row) * HV * V
+                        + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * V
                         + i_hv * V
                         + v_iter * self.BV
                         + bv_col_base
@@ -3447,7 +3456,7 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.arch.fence_view_async_tmem_store()
                 dq_base_addr = (
                     dq_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * HV * K
+                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * K
                     + i_hv * K
                     + bk_col_base
                 ).toint()
@@ -3615,7 +3624,7 @@ class ChunkKdaBwdWyDqkgFused:
                 # 8 fp32 store each time for store_256b
                 dk_base_addr = (
                     dk_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * HV * K
+                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * K
                     + i_hv * K
                     + bk_col_base
                 ).toint()
@@ -3803,7 +3812,7 @@ class ChunkKdaBwdWyDqkgFused:
                 num_stores_dA = bt_num_cols_per_wg // 8
                 dA_base_addr = (
                     dA_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * HV * BT
+                    + self._token_row(tok_offset + tile_idx * self.BT + row) * HV * BT
                     + i_hv * BT
                     + bt_col_base
                 ).toint()
@@ -4574,7 +4583,9 @@ class ChunkKdaBwdWyDqkgFused:
                             )
                             dg_base_addr = (
                                 dg_gmem.iterator
-                                + (tok_offset + tile_idx * self.BT + store_row) * HV * K
+                                + self._token_row(tok_offset + tile_idx * self.BT + store_row)
+                                * HV
+                                * K
                                 + i_hv * K
                                 + store_col_base
                             ).toint()
@@ -4847,7 +4858,7 @@ class ChunkKdaBwdWyDqkgTunable:
             args.fastmath,
             config.grid_waves,
             args.chunk_offsets is not None,
-            requires_int64_offsets(
+            requires_int64_abi(
                 args.q,
                 args.k,
                 args.v,

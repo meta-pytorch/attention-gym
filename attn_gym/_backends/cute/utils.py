@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from attn_gym._backends.triton.utils import requires_int64_offsets
+
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 TMA_ALIGNMENT_BYTES = 16
 
@@ -34,6 +36,21 @@ def _contains_torch_tensor(value: Any) -> bool:
 def get_device_properties(device: torch.device) -> Any:
     """Return cached CUDA properties for a device."""
     return torch.cuda.get_device_properties(device)
+
+
+def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
+    """Return whether any tensor needs the Int64 fake-signature specialization.
+
+    TVM-FFI must represent every declared runtime stride, including the outer
+    stride of a size-1 batch mode whose coordinate never leaves zero, so this
+    is stricter than the reachable-offset bound alone. Callers may omit the
+    contiguous ``[num_sequences + 1]`` int32 routing arrays: their extents are
+    bounded by ``MAX_NUM_SEQUENCES`` and cannot approach either limit.
+    """
+    return requires_int64_offsets(*tensors) or any(
+        tensor is not None and any(abs(stride) > 2**31 - 1 for stride in tensor.stride())
+        for tensor in tensors
+    )
 
 
 def tensor_supports_tma(tensor: torch.Tensor) -> bool:

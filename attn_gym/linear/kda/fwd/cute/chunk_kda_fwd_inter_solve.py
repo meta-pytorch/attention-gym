@@ -23,7 +23,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
@@ -279,7 +279,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
-        requires_int64_offsets(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
+        requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
     )
     k3b(
         q_flat,
@@ -353,7 +353,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
-        requires_int64_offsets(AkkOD, akkd_flat, akk_flat),
+        requires_int64_abi(AkkOD, akkd_flat, akk_flat),
     )
     k4b(
         AkkOD,
@@ -465,7 +465,7 @@ def chunk_kda_fwd_inter_solve_cute(
             BT,
             BC,
             ChunkSchedule.DENSE,
-            use_int64_offsets=requires_int64_offsets(
+            use_int64_offsets=requires_int64_abi(
                 q_flat, k_flat, g_flat, beta_flat, Aqk_flat, akk_od
             ),
         )
@@ -491,7 +491,7 @@ def chunk_kda_fwd_inter_solve_cute(
             BT,
             BC,
             ChunkSchedule.DENSE,
-            use_int64_offsets=requires_int64_offsets(akk_od, akkd_flat, Akk_flat),
+            use_int64_offsets=requires_int64_abi(akk_od, akkd_flat, Akk_flat),
         )
         k4b(
             akk_od,

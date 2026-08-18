@@ -38,7 +38,7 @@ from torch._guards import active_fake_mode
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi
-from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 
 # ============================================================================
@@ -1948,7 +1948,7 @@ def blackwell_delta_h_bwd_dhu_v1(
         dv2_k = dv2[0]
 
         ps = (Int32(N), Int32(T), Int32(H), Int32(K), Int32(V))
-        use_int64_offsets = requires_int64_offsets(
+        use_int64_offsets = requires_int64_abi(
             q_k,
             k_k,
             w_k,
@@ -1990,7 +1990,7 @@ def blackwell_delta_h_bwd_dhu_v1(
         co_d = _get_dummy((2,), torch.int32, dev)
 
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
-        use_int64_offsets = requires_int64_offsets(
+        use_int64_offsets = requires_int64_abi(
             q,
             k,
             w,
