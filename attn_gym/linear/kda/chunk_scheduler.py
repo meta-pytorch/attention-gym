@@ -9,7 +9,13 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata, chunk_capacity
+# The op-wrapped metadata builder is re-exported so every caller routes the offsets
+# launch through the registered scheduler op instead of tracing it directly.
+from attn_gym.linear.kda.chunk_schedule import (
+    RaggedChunkMetadata,
+    chunk_capacity,
+    prepare_ragged_chunk_metadata,
+)
 
 
 class ChunkWork(NamedTuple):
@@ -155,25 +161,6 @@ def _prepare_ragged_chunk_offsets(
         num_warps=min(8, max(1, block // 32)),
     )
     return chunk_offsets
-
-
-def prepare_ragged_chunk_metadata(
-    cu_seqlens: torch.Tensor,
-    tokens: int,
-    chunk_size: int,
-) -> RaggedChunkMetadata:
-    """Build fixed-shape, graph-replayable packed chunk offsets on the GPU."""
-    if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
-        raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
-    if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
-        raise ValueError("cu_seqlens must be contiguous int32")
-    if not cu_seqlens.is_cuda:
-        raise ValueError("cu_seqlens must be a CUDA tensor")
-
-    num_sequences = cu_seqlens.shape[0] - 1
-    capacity = chunk_capacity(tokens, num_sequences, chunk_size)
-    chunk_offsets = _prepare_ragged_chunk_offsets(cu_seqlens, tokens, chunk_size)
-    return RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, chunk_size)
 
 
 def decode_ragged_chunk_work(metadata: RaggedChunkMetadata) -> torch.Tensor:
