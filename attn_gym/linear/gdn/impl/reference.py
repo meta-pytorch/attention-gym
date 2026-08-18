@@ -6,46 +6,6 @@ import torch
 import torch.nn.functional as F
 
 
-def forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    log_decay: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    scale: float | None,
-    initial_state: torch.Tensor | None,
-    return_final_state: bool,
-    mode: str,
-    chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the selected eager gated delta rule execution form."""
-    if mode == "recurrent":
-        return recurrent_forward(
-            query,
-            key,
-            value,
-            log_decay,
-            beta,
-            scale=scale,
-            initial_state=initial_state,
-            return_final_state=return_final_state,
-        )
-    if mode == "chunked":
-        return chunked_forward(
-            query,
-            key,
-            value,
-            log_decay,
-            beta,
-            scale=scale,
-            initial_state=initial_state,
-            return_final_state=return_final_state,
-            chunk_size=chunk_size,
-        )
-    raise AssertionError(f"API validation allowed unexpected mode {mode!r}")
-
-
 def recurrent_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -78,7 +38,7 @@ def recurrent_forward(
     return output, state if return_final_state else None
 
 
-def chunked_forward(
+def chunk_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -169,3 +129,6 @@ def chunked_forward(
     output = output.reshape(batch, heads, padded_length, value_dimension)[:, :, :sequence]
     final_state = state.to(output_dtype) if return_final_state else None
     return output.to(output_dtype), final_state
+
+
+__all__ = ["chunk_forward", "recurrent_forward"]

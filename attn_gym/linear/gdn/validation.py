@@ -1,23 +1,19 @@
-"""Validation for the public gated delta rule contract."""
+"""Validation shared by public gated delta rule operations."""
 
 from __future__ import annotations
 
 import torch
 
 
-def validate_gated_delta_rule_inputs(
+def validate_gdn_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
-    *,
-    mode: str,
-    backend: str,
-    chunk_size: int,
 ) -> None:
-    """Validate shared tensor invariants and public execution options."""
+    """Validate backend-independent gated delta rule tensor invariants."""
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError(
             "query, key, and value must have shape [batch, heads, sequence, dimension]"
@@ -42,12 +38,6 @@ def validate_gated_delta_rule_inputs(
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, got {initial_state.shape}"
             )
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be greater than zero, got {chunk_size}")
-    if mode not in ("auto", "chunked", "recurrent"):
-        raise ValueError(f"Unsupported mode {mode!r}; expected 'auto', 'chunked', or 'recurrent'")
-    if backend not in ("auto", "eager"):
-        raise ValueError(f"Unsupported backend {backend!r}; expected 'auto' or 'eager'")
 
     tensors = (query, key, value, gate, beta)
     if initial_state is not None:
@@ -60,4 +50,4 @@ def validate_gated_delta_rule_inputs(
         raise ValueError("all inputs must have the same dtype")
 
 
-__all__ = ["validate_gated_delta_rule_inputs"]
+__all__ = ["validate_gdn_inputs"]
