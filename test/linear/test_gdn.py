@@ -9,6 +9,8 @@ from attn_gym.linear import (
     recurrent_gdn,
 )
 
+REFERENCE_CASES = [(recurrent_gdn, {}), (chunk_gdn, {"chunk_size": 4})]
+
 
 def make_inputs(sequence: int) -> tuple[torch.Tensor, ...]:
     """Create stable gated delta rule inputs with normalized keys."""
@@ -21,6 +23,11 @@ def make_inputs(sequence: int) -> tuple[torch.Tensor, ...]:
     beta = torch.sigmoid(torch.randn(batch, heads, sequence))
     initial_state = torch.randn(batch, heads, key_dimension, value_dimension)
     return query, key, value, gate, beta, initial_state
+
+
+def run_with_state(function, inputs, kwargs):
+    """Run one GDN form with its initial and final recurrent state."""
+    return function(*inputs[:5], initial_state=inputs[5], return_final_state=True, **kwargs)
 
 
 @pytest.mark.parametrize("sequence,chunk_size", [(1, 4), (7, 4), (8, 4), (17, 8)])
@@ -78,7 +85,7 @@ def test_recurrent_execution_is_batch_invariant():
 def test_chunk_gradients_match_recurrent():
     inputs = make_inputs(sequence=7)[:-1]
     gradients = []
-    for function, kwargs in ((recurrent_gdn, {}), (chunk_gdn, {"chunk_size": 4})):
+    for function, kwargs in REFERENCE_CASES:
         differentiable_inputs = [value.clone().requires_grad_() for value in inputs]
         result = function(
             *differentiable_inputs,
@@ -94,6 +101,104 @@ def test_chunk_gradients_match_recurrent():
 
     for chunk_gradient, recurrent_gradient in zip(gradients[1], gradients[0]):
         torch.testing.assert_close(chunk_gradient, recurrent_gradient, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("function,kwargs", REFERENCE_CASES)
+@pytest.mark.parametrize("qkv_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fp32_gate", [False, True])
+def test_low_precision_compute_and_gradient_dtypes(function, kwargs, qkv_dtype, fp32_gate):
+    query, key, value, gate, beta, initial_state = make_inputs(sequence=7)
+    gate_dtype = torch.float32 if fp32_gate else qkv_dtype
+    inputs = [
+        query.to(qkv_dtype),
+        key.to(qkv_dtype),
+        value.to(qkv_dtype),
+        gate.to(gate_dtype),
+        beta.to(gate_dtype),
+        initial_state,
+    ]
+    inputs = [tensor.requires_grad_() for tensor in inputs]
+    expected_inputs = [tensor.detach().float() for tensor in inputs]
+
+    result = run_with_state(function, inputs, kwargs)
+    expected = run_with_state(function, expected_inputs, kwargs)
+    assert result.output.dtype == qkv_dtype
+    assert result.final_state.dtype == torch.float32
+    torch.testing.assert_close(
+        result.output.float(),
+        expected.output,
+        rtol=torch.finfo(qkv_dtype).eps,
+        atol=torch.finfo(qkv_dtype).eps,
+    )
+    torch.testing.assert_close(result.final_state, expected.final_state, rtol=0, atol=0)
+
+    gradients = torch.autograd.grad(
+        result.output.float().square().mean() + result.final_state.square().mean(), inputs
+    )
+    assert tuple(gradient.dtype for gradient in gradients) == (
+        qkv_dtype,
+        qkv_dtype,
+        qkv_dtype,
+        gate_dtype,
+        gate_dtype,
+        torch.float32,
+    )
+
+
+@pytest.mark.parametrize(
+    "function,kwargs,device_type,autocast_dtype",
+    [
+        (recurrent_gdn, {}, "cpu", torch.bfloat16),
+        (chunk_gdn, {"chunk_size": 4}, "cpu", torch.bfloat16),
+        (recurrent_gdn, {}, "cuda", torch.float16),
+        (recurrent_gdn, {}, "cuda", torch.bfloat16),
+    ],
+)
+def test_reference_disables_autocast(function, kwargs, device_type, autocast_dtype):
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA autocast requires CUDA")
+
+    expected_inputs = [
+        tensor.to(device_type).requires_grad_() for tensor in make_inputs(sequence=7)
+    ]
+    actual_inputs = [tensor.detach().clone().requires_grad_() for tensor in expected_inputs]
+    expected = run_with_state(function, expected_inputs, kwargs)
+    with torch.autocast(device_type=device_type, dtype=autocast_dtype):
+        actual = run_with_state(function, actual_inputs, kwargs)
+
+    torch.testing.assert_close(actual.output, expected.output, rtol=0, atol=0)
+    torch.testing.assert_close(actual.final_state, expected.final_state, rtol=0, atol=0)
+    expected_gradients = torch.autograd.grad(
+        expected.output.square().mean() + expected.final_state.square().mean(), expected_inputs
+    )
+    actual_gradients = torch.autograd.grad(
+        actual.output.square().mean() + actual.final_state.square().mean(), actual_inputs
+    )
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])
+def test_low_precision_default_state_is_fp32(function):
+    query, key, value, gate, beta, _initial_state = make_inputs(sequence=3)
+    result = function(
+        query.bfloat16(),
+        key.bfloat16(),
+        value.bfloat16(),
+        gate,
+        beta,
+        return_final_state=True,
+    )
+    assert result.output.dtype == torch.bfloat16
+    assert result.final_state.dtype == torch.float32
+
+
+@pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])
+def test_fp64_preserves_compute_and_state_dtype(function):
+    inputs = [tensor.double() for tensor in make_inputs(sequence=3)]
+    result = function(*inputs[:5], initial_state=inputs[5], return_final_state=True)
+    assert result.output.dtype == torch.float64
+    assert result.final_state.dtype == torch.float64
 
 
 @pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])
@@ -122,18 +227,38 @@ def test_invalid_initial_state_shape_fails_clearly(function):
         function(*inputs[:-1], initial_state=inputs[-1][..., :-1])
 
 
-@pytest.mark.parametrize("mismatch_initial_state", [False, True])
-def test_mismatched_dtypes_fail_clearly(mismatch_initial_state):
+def test_mismatched_qkv_dtypes_fail_clearly():
     inputs = list(make_inputs(sequence=2))
-    if mismatch_initial_state:
-        inputs[-1] = inputs[-1].double()
-        kwargs = {"initial_state": inputs[-1]}
-    else:
-        inputs[2] = inputs[2].double()
-        kwargs = {}
+    inputs[2] = inputs[2].double()
+    with pytest.raises(ValueError, match="query, key, and value must have the same dtype"):
+        recurrent_gdn(*inputs[:-1])
 
-    with pytest.raises(ValueError, match="all inputs must have the same dtype"):
-        recurrent_gdn(*inputs[:-1], **kwargs)
+
+def test_gate_and_beta_accept_independent_floating_dtypes():
+    query, key, value, gate, beta, _initial_state = make_inputs(sequence=2)
+    result = recurrent_gdn(
+        query.bfloat16(),
+        key.bfloat16(),
+        value.bfloat16(),
+        gate.half(),
+        beta.double(),
+        return_final_state=True,
+    )
+    assert result.output.dtype == torch.bfloat16
+    assert result.final_state.dtype == torch.float32
+
+
+def test_invalid_initial_state_dtype_fails_clearly():
+    query, key, value, gate, beta, initial_state = make_inputs(sequence=2)
+    with pytest.raises(ValueError, match="initial_state must have dtype torch.float32"):
+        recurrent_gdn(
+            query.bfloat16(),
+            key.bfloat16(),
+            value.bfloat16(),
+            gate,
+            beta,
+            initial_state=initial_state.bfloat16(),
+        )
 
 
 def test_mismatched_devices_fail_clearly():

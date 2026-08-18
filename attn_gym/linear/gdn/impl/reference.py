@@ -6,6 +6,39 @@ import torch
 import torch.nn.functional as F
 
 
+def reference_gdn(
+    dense_op,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None,
+    initial_state: torch.Tensor | None,
+    return_final_state: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run a dense GDN reference operation in the documented compute dtype."""
+    output_dtype = query.dtype
+    compute_dtype = torch.promote_types(query.dtype, torch.float32)
+    query, key, value, log_decay, beta = (
+        tensor.to(compute_dtype) for tensor in (query, key, value, log_decay, beta)
+    )
+    # Explicit casts do not stop autocast from selecting low-precision contractions.
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        output, state = dense_op(
+            query,
+            key,
+            value,
+            log_decay,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+    return output.to(output_dtype), state
+
+
 def recurrent_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -34,8 +67,7 @@ def recurrent_forward(
         state = state + torch.einsum("bhk,bhv->bhkv", key[:, :, token], residual)
         outputs.append(torch.einsum("bhk,bhkv->bhv", query[:, :, token], state))
 
-    output = torch.stack(outputs, dim=2)
-    return output, state if return_final_state else None
+    return torch.stack(outputs, dim=2), state if return_final_state else None
 
 
 def chunk_forward(
@@ -53,13 +85,7 @@ def chunk_forward(
     """Evaluate the gated delta rule with a naive chunk-parallel decomposition."""
     batch, heads, sequence, key_dimension = query.shape
     value_dimension = value.shape[-1]
-    output_dtype = query.dtype
     scale = key_dimension**-0.5 if scale is None else scale
-    compute_dtype = torch.float32 if query.dtype != torch.float64 else torch.float64
-
-    query, key, value, beta, log_decay = (
-        tensor.to(compute_dtype) for tensor in (query, key, value, beta, log_decay)
-    )
     padding = (-sequence) % chunk_size
     if padding:
         query, key, value = (F.pad(tensor, (0, 0, 0, padding)) for tensor in (query, key, value))
@@ -92,14 +118,14 @@ def chunk_forward(
             transition[..., row, :row, None].clone() * transition[..., :row, :row].clone()
         ).sum(-2)
 
-    transition = transition + torch.eye(chunk_size, dtype=torch.float, device=query.device)
+    transition = transition + torch.eye(chunk_size, dtype=query.dtype, device=query.device)
     value = transition @ value
     decayed_key = transition @ (beta_key * cumulative_decay.exp()[..., None])
 
     state = (
         query.new_zeros(batch, heads, key_dimension, value_dimension)
         if initial_state is None
-        else initial_state.to(compute_dtype)
+        else initial_state
     )
     output = torch.zeros_like(value)
     strictly_upper = torch.triu(
@@ -127,8 +153,7 @@ def chunk_forward(
         )
 
     output = output.reshape(batch, heads, padded_length, value_dimension)[:, :, :sequence]
-    final_state = state.to(output_dtype) if return_final_state else None
-    return output.to(output_dtype), final_state
+    return output, state if return_final_state else None
 
 
-__all__ = ["chunk_forward", "recurrent_forward"]
+__all__ = ["chunk_forward", "recurrent_forward", "reference_gdn"]

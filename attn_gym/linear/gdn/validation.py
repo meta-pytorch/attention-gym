@@ -46,8 +46,15 @@ def validate_gdn_inputs(
         raise ValueError("all inputs must have floating-point dtypes")
     if any(tensor.device != query.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")
-    if any(tensor.dtype != query.dtype for tensor in tensors[1:]):
-        raise ValueError("all inputs must have the same dtype")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype")
+
+    compute_dtype = torch.promote_types(query.dtype, torch.float32)
+    if initial_state is not None and initial_state.dtype != compute_dtype:
+        raise ValueError(
+            f"initial_state must have dtype {compute_dtype} for {query.dtype} query, "
+            f"got {initial_state.dtype}"
+        )
 
 
 __all__ = ["validate_gdn_inputs"]

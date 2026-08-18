@@ -43,6 +43,11 @@ final_state = result.final_state
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
 - Autograd for inputs and initial state.
+- Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
+  output in the Q dtype.
+- Gate and beta may use independent floating dtypes and are converted to the recurrence compute
+  dtype. A provided initial state uses FP32 for low-precision QKV.
+- FP64 reference inputs retain FP64 recurrence math and state.
 
 Packed variable-length inputs and fused implementations are not implemented yet. Explicit
 `impl="fused"` calls fail rather than falling back to the reference.
