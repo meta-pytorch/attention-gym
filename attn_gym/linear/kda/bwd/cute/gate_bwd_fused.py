@@ -39,6 +39,7 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 
 class WarpRole(IntEnum):
@@ -68,6 +69,7 @@ class FusedGateBwdOp:
         chunk_size: int,
         lower_bound: float,
         fastmath: bool,
+        use_int64_offsets: bool = False,
     ):
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
@@ -93,6 +95,7 @@ class FusedGateBwdOp:
         self.chunk_size = chunk_size
         self.lower_bound = lower_bound
         self.fastmath = fastmath
+        self.use_int64_offsets = use_int64_offsets
         self.tokens_per_stage = next(tokens for tokens in (4, 2, 1) if chunk_size % tokens == 0)
         subtiles = chunk_size // self.tokens_per_stage
         # Every TMA stage must begin at a 128-byte-aligned shared address.
@@ -105,7 +108,7 @@ class FusedGateBwdOp:
         return (
             f"kda_fused_gate_bwd_h{self.heads}_d{self.head_dim}_bt{self.chunk_size}"
             f"_lb{lower_bound}_tma_tps{self.tokens_per_stage}_s{self.stages}"
-            f"_fm{int(self.fastmath)}"
+            f"_fm{int(self.fastmath)}_i64{int(self.use_int64_offsets)}"
         )
 
     def _staged_layout(self):
@@ -367,9 +370,17 @@ def _compile_fused_gate_bwd(
     chunk_size: int,
     lower_bound: float,
     fastmath: bool,
+    use_int64_offsets: bool = False,
 ):
     """Compile one fake-tensor TVM-FFI specialization."""
-    op = FusedGateBwdOp(heads, head_dim, chunk_size, lower_bound, fastmath)
+    op = FusedGateBwdOp(
+        heads,
+        head_dim,
+        chunk_size,
+        lower_bound,
+        fastmath,
+        use_int64_offsets=use_int64_offsets,
+    )
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (9, 0):
         raise ValueError(
@@ -379,15 +390,16 @@ def _compile_fused_gate_bwd(
     batch = cute.sym_int()
     tokens = cute.sym_int()
     chunks = cute.sym_int()
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def strided_rows(dtype, alignment_elements: int):
         return cute.runtime.make_fake_tensor(
             dtype,
             (batch, tokens, heads, head_dim),
             stride=(
-                cute.sym_int(divisibility=alignment_elements),
-                cute.sym_int(divisibility=alignment_elements),
-                cute.sym_int(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
+                sym_int(divisibility=alignment_elements),
                 1,
             ),
             assumed_align=TMA_ALIGNMENT_BYTES,
@@ -527,6 +539,15 @@ def _fused_gate_bwd_cuda(
         op.chunk_size,
         op.lower_bound,
         op.fastmath,
+        use_int64_offsets=requires_int64_abi(
+            g,
+            A_log,
+            dt_bias,
+            d_cumulative,
+            dg,
+            dA_partial,
+            d_dt_bias_partial,
+        ),
     )
     compiled(g, A_log, dt_bias, d_cumulative, dg, dA_partial, d_dt_bias_partial)
     # Reducing the per-chunk partials keeps the post-pass off the full [B, T, H, D] tensors.

@@ -230,6 +230,28 @@ def compile(config: MyConfig):
 
 `compile_tvm_ffi` owns the typed TVM-FFI option and fake environment stream. Do not append another stream or pass string compiler options at call sites. `compile_call(...)` returns exactly one tuple of positional static arguments; use `(config,)` when `compile(...)` accepts only a config.
 
+### Int64 offset specialization
+
+Keep ordinary layouts on the int32 address path. At the parent wrapper, call
+`attn_gym._backends.cute.requires_int64_abi` on every ABI-visible input, output, and optional tensor,
+then pass the result through `compile_call(...)` as a static `use_int64_offsets` argument. The CuTe
+predicate is intentionally stricter than reachable cosize: TVM-FFI must represent every declared
+stride, including a stride larger than `INT32_MAX` on a size-one mode that cannot reach it.
+
+The width bool must participate in the `jit_cache` key and profiler/artifact name. In the wide
+specialization, use `cute.sym_int64` for each dynamic fake-tensor dimension or stride involved in
+addressing; the fake signature and runtime tensor ABI must agree. Inside the op, widen each dynamic
+index or origin before its first potentially overflowing multiply or addition. Casting the final
+layout stride, iterator offset, or pointer is too late. Audit manually rebuilt layouts, iterator
+addition, chunk/program indices, and stores as well as ordinary tensor loads. Bounded routing arrays
+may remain int32 when their values and their own addressing are independently proven safe.
+
+Do not infer width from `numel()` and do not make int64 unconditional: wider arithmetic can add
+instructions and register pressure. Validate predicate-only oversized singleton strides, force the
+i64 specialization on small inputs and compare it with i32, and, when memory permits, execute an
+active offset beyond `INT32_MAX` against an equivalent compact layout. See
+`test/test_kda_int64_offsets.py` for the project pattern.
+
 Validate reachable inputs and static semantics once at the eager boundary used by each path: the
 public tune path or the private custom-op implementation. Validate again in `compile(...)`, because
 cache/compiler-worker calls can bypass both wrappers; downstream launch helpers may then rely on the
@@ -279,3 +301,4 @@ Read or run [copy_reads_example.py](copy_reads_example.py) for a complete toy ke
 - Verify all cold candidates produce distinct artifacts and a warm run launches no compiler process.
 - Keep real GPU coverage tiny: compile a toy kernel, benchmark with Inductor's GPU benchmarker, launch the winner, and compare output with an independent reference.
 - Measure cold and warm wall time locally, but do not make noisy scaling timing a correctness assertion.
+- For address-width-specialized kernels, verify the compile projection/cache/name distinguish i32 and i64, ordinary inputs retain i32, and every generated config is correct under both widths.

@@ -250,6 +250,41 @@ Keep cross-variant Triton infrastructure in `attn_gym._backends.triton` only aft
 callers. Variant-specific kernels, schemas, fake behavior, and autograd remain in the variant
 backend.
 
+## Large-layout address width
+
+Optimized kernels must preserve an int32 default path and select a separate int64 specialization
+when relative element offsets can exceed signed int32. Inventory every input, output, optional
+tensor, manually reconstructed view, and manual load/store offset; checking only the primary input
+or `numel()` is insufficient.
+
+For Triton, use `attn_gym._backends.triton.requires_int64_offsets` in a
+`@triton.heuristics` `USE_INT64_OFFSETS` constexpr. It checks reachable storage cosize for the
+project's nonnegative-strided layouts. In the wide branch, cast program IDs, loaded token/chunk
+origins, and other address indices to `tl.int64` before the first potentially overflowing multiply
+or addition. Casting a completed offset or pointer is too late. Bounded routing arrays may stay
+int32, but widen their loaded values before using them in wide pointer arithmetic.
+
+For CuTeDSL TVM-FFI, use `attn_gym._backends.cute.requires_int64_abi`. In addition to reachable
+cosize, it checks every declared ABI stride because a size-one dimension can carry an unreachable
+stride larger than `INT32_MAX` that the compiled signature must still represent. Carry
+`use_int64_offsets` through the op, compile-cache key, and stable kernel name; use matching
+`cute.sym_int64` fake-signature fields in the wide variant. Widen values before multiplication when
+constructing layouts or adding to iterators.
+
+Required validation has three layers:
+
+1. Predicate tests on meta/fake tensors, including an oversized singleton stride without allocating
+   the unreachable storage.
+2. Forced-int64 equivalence with the normal int32 specialization on small forward and backward
+   inputs.
+3. When hardware memory permits, execution of an active offset beyond `INT32_MAX`, compared with an
+   equivalent compact layout. Singleton-stride tests prove ABI routing but not wide device pointer
+   arithmetic.
+
+Also assert ordinary layouts select int32 and measure both variants before claiming no regression;
+int64 address arithmetic can increase instructions and registers. Use `test/test_kda_int64_offsets.py`
+as the project reference.
+
 ## Validate registration with `opcheck`
 
 `torch.library.opcheck` validates operator registration. Its default utilities are:

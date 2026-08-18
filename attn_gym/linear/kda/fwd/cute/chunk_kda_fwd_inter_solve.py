@@ -23,6 +23,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
@@ -68,6 +69,7 @@ def _compile_k3b(
     chunk_size: int,
     subchunk_size: int,
     schedule: ChunkSchedule,
+    use_int64_offsets: bool = False,
 ):
     """Compile one persistent K3b TVM-FFI scheduling specialization."""
     _check_compile_target()
@@ -79,18 +81,20 @@ def _compile_k3b(
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
         schedule=schedule,
+        use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     q = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride=(cute.sym_int(divisibility=8), 1),
+        stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     k = make_fake_tensor(
         cutlass.BFloat16,
         (tokens, heads * head_dim),
-        stride=(cute.sym_int(divisibility=8), 1),
+        stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     g = make_fake_compact_tensor(
@@ -151,7 +155,8 @@ def _compile_k3b(
         cu_seqlens,
         chunk_offsets,
         name=(
-            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_schedule_{schedule.value}"
+            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
+            f"_schedule_{schedule.value}_i64{int(use_int64_offsets)}"
         ),
     )
 
@@ -163,6 +168,7 @@ def _compile_k4b(
     chunk_size: int,
     subchunk_size: int,
     schedule: ChunkSchedule,
+    use_int64_offsets: bool = False,
 ):
     """Compile one persistent K4b TVM-FFI scheduling specialization."""
     _check_compile_target()
@@ -173,6 +179,7 @@ def _compile_k4b(
         chunk_size=chunk_size,
         num_subchunks=num_subchunks,
         schedule=schedule,
+        use_int64_offsets=use_int64_offsets,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     AkkOD = make_fake_compact_tensor(
@@ -223,7 +230,8 @@ def _compile_k4b(
         cu_seqlens,
         chunk_offsets,
         name=(
-            f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_schedule_{schedule.value}"
+            f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
+            f"_schedule_{schedule.value}_i64{int(use_int64_offsets)}"
         ),
     )
 
@@ -271,6 +279,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
+        use_int64_offsets=requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
     )
     k3b(
         q_flat,
@@ -336,17 +345,20 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     if isinstance(Akkd, FakeTensor) or metadata.capacity == 0:
         return Akk
 
+    akkd_flat = Akkd.reshape(tokens, heads * subchunk_size).contiguous()
+    akk_flat = Akk.reshape(tokens, heads * chunk_size)
     k4b = _compile_k4b(
         heads,
         _SUPPORTED_HEAD_DIM,
         chunk_size,
         subchunk_size,
         ChunkSchedule.RAGGED,
+        use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
     )
     k4b(
         AkkOD,
-        Akkd.reshape(tokens, heads * subchunk_size).contiguous(),
-        Akk.reshape(tokens, heads * chunk_size),
+        akkd_flat,
+        akk_flat,
         heads,
         metadata.capacity,
         metadata.cu_seqlens,
@@ -447,7 +459,16 @@ def chunk_kda_fwd_inter_solve_cute(
     with (
         torch.profiler.record_function("kda/cute/k3b_offdiag") if profile_ranges else nullcontext()
     ):
-        k3b = _compile_k3b(H, K, BT, BC, ChunkSchedule.DENSE)
+        k3b = _compile_k3b(
+            H,
+            K,
+            BT,
+            BC,
+            ChunkSchedule.DENSE,
+            use_int64_offsets=requires_int64_abi(
+                q_flat, k_flat, g_flat, beta_flat, Aqk_flat, akk_od
+            ),
+        )
         k3b(
             q_flat,
             k_flat,
@@ -464,7 +485,14 @@ def chunk_kda_fwd_inter_solve_cute(
     with (
         torch.profiler.record_function("kda/cute/k4b_inverse") if profile_ranges else nullcontext()
     ):
-        k4b = _compile_k4b(H, K, BT, BC, ChunkSchedule.DENSE)
+        k4b = _compile_k4b(
+            H,
+            K,
+            BT,
+            BC,
+            ChunkSchedule.DENSE,
+            use_int64_offsets=requires_int64_abi(akk_od, akkd_flat, Akk_flat),
+        )
         k4b(
             akk_od,
             akkd_flat,

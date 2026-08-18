@@ -43,6 +43,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         chunk_size: int = 64,
         num_subchunks: int = 4,
         schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        use_int64_offsets: bool = False,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK3bOffdiagCuteDSL only supports four subchunks, got {num_subchunks}"
@@ -51,6 +52,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
             f"{num_subchunks} * {BC}"
         )
+        self.use_int64_offsets = use_int64_offsets
         self.BC = BC
         self.D = D
         self.schedule = schedule
@@ -59,6 +61,11 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
+
+    @cute.jit
+    def upcast(self, value):
+        """Promote an address operand before its first overflowing multiply."""
+        return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
 
     @cute.jit
     def __call__(
@@ -208,9 +215,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             chunk_base = chunk_idx * self.BT
             eos = cute.size(mQ, mode=[0])
 
+        chunk_base = self.upcast(chunk_base)
         ti_row = chunk_base + ri * self.BC
         ti_col = chunk_base + ci * self.BC
         h_offset = head_idx * self.D
+        aqk_col = head_idx * self.BT
+        akkod_col = head_idx * self.BC * self.BC
 
         # ══════════════════════════════════════════════════════════
         # Phase 1: Gating into SMEM
@@ -356,7 +366,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         cC = cute.make_identity_tensor((self.BC, self.BC))
         tCcC = thr_mma.partition_C(cC)
 
-        od_row = chunk_idx * self.num_offdiag_blocks + pair_idx
+        od_row = self.upcast(chunk_idx) * self.num_offdiag_blocks + pair_idx
 
         if warp_idx == 0:
             out_dtype = mAqk.element_type
@@ -365,11 +375,11 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 col = tCcC[i][1]
                 if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
                     if chunk_base + self.BT <= eos or ti_row + row < eos:
-                        mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
+                        mAqk[ti_row + row, aqk_col + ci * self.BC + col] = out_dtype(
                             acc_Aqk[i] * scale
                         )
                 else:
-                    mAqk[ti_row + row, head_idx * self.BT + ci * self.BC + col] = out_dtype(
+                    mAqk[ti_row + row, aqk_col + ci * self.BC + col] = out_dtype(
                         acc_Aqk[i] * scale
                     )
         elif warp_idx == 1:
@@ -377,9 +387,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 beta_val = sBeta[row]
-                mAkkOD[od_row, head_idx * self.BC * self.BC + row * self.BC + col] = (
-                    acc_Akk[i] * beta_val
-                )
+                mAkkOD[od_row, akkod_col + row * self.BC + col] = acc_Akk[i] * beta_val
         elif warp_idx == 2:
             # Define the noncausal block while this CTA already owns the
             # corresponding lower block. Aqk is exposed as custom-op tape, so
@@ -390,8 +398,6 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 col = tCcC[i][1]
                 if cutlass.const_expr(self.schedule is not ChunkSchedule.DENSE):
                     if ti_col + row < eos:
-                        mAqk[ti_col + row, head_idx * self.BT + ri * self.BC + col] = out_dtype(
-                            0.0
-                        )
+                        mAqk[ti_col + row, aqk_col + ri * self.BC + col] = out_dtype(0.0)
                 else:
-                    mAqk[ti_col + row, head_idx * self.BT + ri * self.BC + col] = out_dtype(0.0)
+                    mAqk[ti_col + row, aqk_col + ri * self.BC + col] = out_dtype(0.0)

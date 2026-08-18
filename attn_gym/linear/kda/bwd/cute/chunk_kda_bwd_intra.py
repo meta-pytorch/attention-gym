@@ -23,6 +23,7 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
@@ -943,6 +944,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     capacity: Constexpr,
     grid_chunks: Constexpr,
     ragged: Constexpr,
+    use_int64_offsets: Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
@@ -1013,6 +1015,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
         else:
             row_start = chunk_block * BT
             valid = Int32(BT)
+        if cutlass.const_expr(use_int64_offsets):
+            row_start = cutlass.Int64(row_start)
         # Match Triton's default safe-gate normalization reference
         # (causal_gate_normref=False): use the middle row of this BC subchunk,
         # clamped for partial chunks. This keeps local diagonal dA scaling
@@ -1918,10 +1922,17 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
 class ChunkKdaBwdIntraHmmaGrid:
     """Launch the persistent dense or ragged-scheduler kernel."""
 
-    def __init__(self, capacity: int, grid_chunks: int, ragged: bool):
+    def __init__(
+        self,
+        capacity: int,
+        grid_chunks: int,
+        ragged: bool,
+        use_int64_offsets: bool = False,
+    ):
         self.capacity = capacity
         self.grid_chunks = grid_chunks
         self.ragged = ragged
+        self.use_int64_offsets = use_int64_offsets
 
     @cute.jit
     def __call__(
@@ -1963,6 +1974,7 @@ class ChunkKdaBwdIntraHmmaGrid:
             self.capacity,
             self.grid_chunks,
             self.ragged,
+            self.use_int64_offsets,
         ).launch(
             grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),
@@ -1982,6 +1994,7 @@ def _compile_chunk_kda_bwd_intra(
     capacity: int,
     grid_chunks: int,
     ragged: bool,
+    use_int64_offsets: bool = False,
 ):
     """Compile one persistent intra-chunk backward specialization."""
     if not 1 <= grid_chunks <= capacity:
@@ -1990,8 +2003,10 @@ def _compile_chunk_kda_bwd_intra(
         capacity=capacity,
         grid_chunks=grid_chunks,
         ragged=ragged,
+        use_int64_offsets=use_int64_offsets,
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def normal(dtype, shape):
         return make_fake_compact_tensor(
@@ -2016,8 +2031,8 @@ def _compile_chunk_kda_bwd_intra(
             (columns, tokens, heads),
             stride=(
                 1,
-                cute.sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
-                cute.sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
             ),
             assumed_align=_MIN_ALIGN_BYTES,
         )
@@ -2054,7 +2069,10 @@ def _compile_chunk_kda_bwd_intra(
         dg2,
         cu_seqlens,
         chunk_offsets,
-        name=f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_rg{int(ragged)}",
+        name=(
+            f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_rg{int(ragged)}"
+            f"_i64{int(use_int64_offsets)}"
+        ),
     )
 
 
@@ -2122,8 +2140,28 @@ class ChunkKdaBwdIntraTunable:
     def compile_call(
         config: ChunkKdaBwdIntraConfig,
         args: Args,
-    ) -> tuple[int, int, int, bool]:
-        return args.q.shape[2], args.capacity, config.grid_chunks, args.chunk_offsets is not None
+    ) -> tuple[int, int, int, bool, bool]:
+        return (
+            args.q.shape[2],
+            args.capacity,
+            config.grid_chunks,
+            args.chunk_offsets is not None,
+            requires_int64_abi(
+                _column_token_head(args.q),
+                _column_token_head(args.k),
+                _column_token_head(args.g),
+                args.beta,
+                _column_token_head(args.dAqk),
+                _column_token_head(args.dAkk),
+                _column_token_head(args.dq),
+                _column_token_head(args.dk),
+                args.db_partial,
+                _column_token_head(args.dg),
+                _column_token_head(args.dq2),
+                _column_token_head(args.dk2),
+                _column_token_head(args.dg2),
+            ),
+        )
 
     compile = staticmethod(_compile_chunk_kda_bwd_intra)
 

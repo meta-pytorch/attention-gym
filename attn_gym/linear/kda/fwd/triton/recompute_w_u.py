@@ -36,7 +36,11 @@ import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset
+from attn_gym._backends.triton.utils import (
+    PinnedConfigKernel,
+    ptr_offset,
+    requires_int64_offsets,
+)
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 
@@ -49,6 +53,20 @@ _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
         "STORE_QG": lambda args: args["q"] is not None,
         "HAS_GK": lambda args: args["gk"] is not None,
         "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
+        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+            args["q"],
+            args["k"],
+            args["qg"],
+            args["kg"],
+            args["v"],
+            args["beta"],
+            args["w"],
+            args["u"],
+            args["A"],
+            args["gk"],
+            args["cu_seqlens"],
+            args["chunk_offsets"],
+        ),
     }
 )
 @triton.autotune(
@@ -94,9 +112,13 @@ def recompute_w_u_fwd_kernel(
     STORE_QG: tl.constexpr,
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Recompute one chunk's W/U (and optional QG/KG) with register-operand dots."""
-    i_c, i_hv = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    i_c, i_hv = tl.program_id(0), tl.program_id(1)
+    if USE_INT64_OFFSETS:
+        i_c = i_c.to(tl.int64)
+        i_hv = i_hv.to(tl.int64)
     i_h = i_hv // (HV // H)
     if IS_RAGGED:
         if i_c >= tl.load(chunk_offsets + num_sequences):
@@ -105,22 +127,28 @@ def recompute_w_u_fwd_kernel(
             cu_seqlens, chunk_offsets, i_c, num_sequences, BT
         )
         # token_start == bos + i_t * BT; only eos still needs a load for masking.
-        bos = (token_start - i_t * BT).to(tl.int64)
-        eos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int64)
-        T_local = (eos - bos).to(tl.int32)
+        eos = tl.load(cu_seqlens + ptr_offset((i_n,), (1,)) + 1).to(tl.int32)
+        if USE_INT64_OFFSETS:
+            i_t = i_t.to(tl.int64)
+            token_start = token_start.to(tl.int64)
+            eos = eos.to(tl.int64)
+        bos = token_start - i_t * BT
+        T_local = eos - bos
     else:
         i_t = i_c
+        if USE_INT64_OFFSETS:
+            i_t = i_t.to(tl.int64)
         bos = 0
         T_local = T
 
-    o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
+    o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T_local
     token = bos + o_t
 
     b_b = tl.load(beta + ptr_offset((token, i_hv), (HV, 1)), mask=m_t, other=0.0).to(tl.float32)
 
     o_A = tl.arange(0, BT)
-    valid = T_local - i_t.to(tl.int32) * BT
+    valid = T_local - i_t * BT
     # Inclusive tril + row/col validity, matching the CuTe kernel's A masking.
     m_A = m_t[:, None] & (o_A[None, :] <= o_A[:, None]) & (o_A[None, :] < valid)
     b_A_raw = tl.load(

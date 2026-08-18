@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 from torch._inductor import config as inductor_config
@@ -337,3 +339,29 @@ def test_bounded_gate_cumsum_rejects_packed_batch_and_fastmath():
             cu_seqlens=cumulative_sequence_offsets([64]),
             fastmath=True,
         )
+
+
+def test_kda_gate_bwd_offset_width_specializations_match(monkeypatch):
+    """Keep the normal int32 and forced int64 gate-backward paths equivalent."""
+    module = importlib.import_module("attn_gym.linear.kda.bwd.triton.gate_bwd")
+    raw_gate, A_log, dt_bias, d_cumulative = _inputs(64, head_dim=96)
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([33, 31]), 64, 64)
+
+    def run():
+        return module.kda_gate_bwd_ragged(
+            raw_gate,
+            A_log,
+            dt_bias,
+            d_cumulative,
+            metadata,
+            lower_bound=LOWER_BOUND,
+            scale=RCP_LN2,
+        )
+
+    monkeypatch.setattr(module, "requires_int64_offsets", lambda *_tensors: False)
+    outputs32 = run()
+    monkeypatch.setattr(module, "requires_int64_offsets", lambda *_tensors: True)
+    outputs64 = run()
+
+    for output64, output32 in zip(outputs64, outputs32, strict=True):
+        torch.testing.assert_close(output64, output32, rtol=0, atol=0)

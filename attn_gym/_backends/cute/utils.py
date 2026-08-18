@@ -36,6 +36,26 @@ def get_device_properties(device: torch.device) -> Any:
     return torch.cuda.get_device_properties(device)
 
 
+def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
+    """Check both reachable cosize and every stride exposed through the CuTe ABI.
+
+    Unlike cosize, TVM-FFI must represent a size-1 mode's unreachable stride.
+    Bounded int32 routing arrays may be omitted by callers.
+    """
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        strides = tensor.stride()
+        if any(abs(stride) > 2**31 - 1 for stride in strides):
+            return True
+        if (
+            tensor.numel()
+            and 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, strides)) > 2**31
+        ):
+            return True
+    return False
+
+
 def tensor_supports_tma(tensor: torch.Tensor) -> bool:
     """Return whether a CUDA tensor has a TMA-compatible aligned strided layout.
 

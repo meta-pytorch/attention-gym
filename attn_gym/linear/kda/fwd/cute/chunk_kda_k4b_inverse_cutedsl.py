@@ -43,6 +43,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         chunk_size: int = 64,
         num_subchunks: int = 4,
         schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        use_int64_offsets: bool = False,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK4bInverseCuteDSL only supports four subchunks, got {num_subchunks}"
@@ -51,6 +52,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
             f"{num_subchunks} * {BC}"
         )
+        self.use_int64_offsets = use_int64_offsets
         self.BC = BC
         self.BT = chunk_size
         self.num_offdiag_blocks = num_subchunks * (num_subchunks - 1) // 2
@@ -58,6 +60,11 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
         self.schedule = schedule
+
+    @cute.jit
+    def upcast(self, value):
+        """Promote an address operand before its first overflowing multiply."""
+        return cutlass.Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
 
     @cute.jit
     def _load_diagonal_inverse_block(
@@ -218,6 +225,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             eos = cute.size(mAkk, mode=[0])
             is_active = Int32(1)
 
+        chunk_base = self.upcast(chunk_base)
         i_tc0 = chunk_base
         i_tc1 = chunk_base + self.BC
         i_tc2 = chunk_base + 2 * self.BC
@@ -225,6 +233,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
 
         h_akkd_col = head_idx * self.BC
         h_akk_col = head_idx * self.BT
+        h_akkod_col = head_idx * self.BC * self.BC
 
         vr0 = cutlass.min(cutlass.max(eos - i_tc0, 0), self.BC)
         vr1 = cutlass.min(cutlass.max(eos - i_tc1, 0), self.BC)
@@ -267,13 +276,13 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         # ══════════════════════════════════════════════════════════
         # PHASE 1: Per-warp OD loading + preinverted diagonal-block loading
         # ══════════════════════════════════════════════════════════
-        od_base_row = chunk_idx * self.num_offdiag_blocks
+        od_base_row = self.upcast(chunk_idx) * self.num_offdiag_blocks
 
         if is_active and warp_idx == 0:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                rc = h_akkod_col + row * self.BC + col
                 acc_od0[i] = mAkkOD[od_base_row + 0, rc]
                 acc_od1[i] = mAkkOD[od_base_row + 1, rc]
                 acc_od2[i] = mAkkOD[od_base_row + 2, rc]
@@ -286,7 +295,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                rc = h_akkod_col + row * self.BC + col
                 acc_od2[i] = mAkkOD[od_base_row + 2, rc]
                 acc_od4[i] = mAkkOD[od_base_row + 4, rc]
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
@@ -296,7 +305,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_od0)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
-                rc = head_idx * self.BC * self.BC + row * self.BC + col
+                rc = h_akkod_col + row * self.BC + col
                 acc_od5[i] = mAkkOD[od_base_row + 5, rc]
             self._load_diagonal_inverse_block(mAkkd, sAi2, i_tc2, lane_idx, h_akkd_col, vr2)
 
