@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym.linear.kda.ops import recurrent_decode_forward as decode_forward
+from attn_gym.linear.kda.ops import recurrent_decode_op as _recurrent_decode_op
 from attn_gym.linear.kda.ops import recurrent_forward as forward
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
@@ -41,9 +43,15 @@ def kda_recurrent_fwd_kernel(
     ht,
     cu_seqlens,
     state_indices,
+    A_log,
+    dt_bias,
+    lower_bound,
     scale,
     T,
     state_batch_stride: tl.constexpr,
+    qkv_token_stride: tl.constexpr,
+    gate_token_stride: tl.constexpr,
+    beta_token_stride: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -53,6 +61,8 @@ def kda_recurrent_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
+    FUSE_DECODE_PREPROCESSING: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -96,13 +106,40 @@ def kda_recurrent_fwd_kernel(
 
     for t in range(bos, eos):
         row = t * H + i_h
-        b_q = tl.load(q + row * K + o_k, mask=m_k, other=0.0).to(tl.float32) * scale
-        b_k = tl.load(k + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-        b_g = tl.load(gate + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-        b_beta = tl.load(beta + row).to(tl.float32)
-        b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
+        if FUSE_DECODE_PREPROCESSING:
+            head_offset = i_h * (2 * K + V)
+            p_qkv = q + t * qkv_token_stride + head_offset
+            b_q = tl.load(p_qkv + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_k = tl.load(p_qkv + K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_v = tl.load(p_qkv + 2 * K + o_v, mask=m_v, other=0.0).to(tl.float32)
+            b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
 
-        b_state *= tl.exp2(b_g)[:, None]
+            p_gate = gate + t * gate_token_stride + i_h * K + o_k
+            b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
+            b_gate_input += tl.load(dt_bias + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+            if USE_LOWER_BOUND:
+                b_gate = lower_bound * tl.sigmoid(b_a * b_gate_input)
+            else:
+                b_softplus = tl.where(
+                    b_gate_input > 20.0,
+                    b_gate_input,
+                    tl.log(1.0 + tl.exp(b_gate_input)),
+                )
+                b_gate = -b_a * b_softplus
+            b_decay = tl.exp(b_gate)
+            b_beta = tl.sigmoid(tl.load(beta + t * beta_token_stride + i_h).to(tl.float32))
+        else:
+            b_q = tl.load(q + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_k = tl.load(k + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_g = tl.load(gate + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_beta = tl.load(beta + row).to(tl.float32)
+            b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
+            b_decay = tl.exp2(b_g)
+
+        b_q *= scale
+        b_state *= b_decay[:, None]
         b_delta = (b_v - tl.sum(b_k[:, None] * b_state, 0)) * b_beta
         b_state += b_k[:, None] * b_delta[None, :]
         b_o = tl.sum(b_q[:, None] * b_state, 0)
@@ -159,9 +196,15 @@ def _launch_recurrent_fwd(
         final_state,
         cu_seqlens,
         state_indices,
+        None,
+        None,
+        0.0,
         scale=key_dim**-0.5,
         T=tokens,
         state_batch_stride=state_batch_stride,
+        qkv_token_stride=0,
+        gate_token_stride=0,
+        beta_token_stride=0,
         H=heads,
         K=key_dim,
         V=value_dim,
@@ -171,6 +214,8 @@ def _launch_recurrent_fwd(
         STORE_FINAL_STATE=final_state is not None,
         IS_VARLEN=cu_seqlens is not None,
         USE_STATE_INDICES=state_indices is not None,
+        FUSE_DECODE_PREPROCESSING=False,
+        USE_LOWER_BOUND=False,
         num_warps=4,
     )
     return output, final_state
@@ -229,9 +274,64 @@ def _kda_recurrent_fwd_paged_cuda(
     )[0]
 
 
+def _kda_recurrent_decode_cuda(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    lower_bound: float,
+    use_lower_bound: bool,
+    scale: float,
+) -> torch.Tensor:
+    batch = packed_qkv.shape[0]
+    heads, key_dim, value_dim = state_cache.shape[1:]
+    output = packed_qkv.new_empty(1, batch, heads, value_dim)
+    block_v = min(triton.next_power_of_2(value_dim), 32)
+    grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
+    kda_recurrent_fwd_kernel[grid](
+        packed_qkv,
+        packed_qkv,
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        output,
+        state_cache,
+        state_cache,
+        None,
+        state_indices,
+        A_log,
+        dt_bias,
+        lower_bound,
+        scale=scale,
+        T=1,
+        state_batch_stride=state_cache.stride(0),
+        qkv_token_stride=packed_qkv.stride(0),
+        gate_token_stride=raw_gate.stride(1),
+        beta_token_stride=raw_beta.stride(1),
+        H=heads,
+        K=key_dim,
+        V=value_dim,
+        BK=triton.next_power_of_2(key_dim),
+        BV=block_v,
+        USE_INITIAL_STATE=True,
+        STORE_FINAL_STATE=True,
+        IS_VARLEN=False,
+        USE_STATE_INDICES=True,
+        FUSE_DECODE_PREPROCESSING=True,
+        USE_LOWER_BOUND=use_lower_bound,
+        num_warps=4,
+    )
+    return output
+
+
 __all__ = [
+    "_recurrent_decode_op",
     "_recurrent_fwd_no_state_op",
     "_recurrent_fwd_op",
     "_recurrent_fwd_paged_op",
+    "decode_forward",
     "forward",
 ]
