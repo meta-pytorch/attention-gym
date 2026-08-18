@@ -253,23 +253,24 @@ def _launch_recurrent_fwd(
         None if state_indices is None else state_indices.dtype,
     )
     launch_options = _recurrent_autotune_configs.get(tune_key)
+    result_is_ready = False
     if launch_options is None:
         with _recurrent_autotune_lock:
             launch_options = _recurrent_autotune_configs.get(tune_key)
             if launch_options is None:
-                if state_indices is None:
-                    launch(kda_recurrent_fwd_kernel, final_state, False, {})
-                else:
-                    tuning_state = q.new_empty(
+                tuning_final_state = final_state
+                contiguous_final_state = state_indices is not None
+                if contiguous_final_state:
+                    tuning_final_state = q.new_empty(
                         num_sequences, heads, key_dim, value_dim, dtype=torch.float32
                     )
-                    launch(kda_recurrent_fwd_kernel, tuning_state, True, {})
+                launch(kda_recurrent_fwd_kernel, tuning_final_state, contiguous_final_state, {})
                 launch_options = dict(kda_recurrent_fwd_kernel.best_config.all_kwargs())
                 _recurrent_autotune_configs[tune_key] = launch_options
-                if state_indices is None:
-                    return output, final_state
+                result_is_ready = not contiguous_final_state
 
-    launch(_fixed_recurrent_fwd_kernel, final_state, False, launch_options)
+    if not result_is_ready:
+        launch(_fixed_recurrent_fwd_kernel, final_state, False, launch_options)
     return output, final_state
 
 
