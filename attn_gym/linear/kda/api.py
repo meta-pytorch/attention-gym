@@ -78,17 +78,7 @@ def chunk_kda(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
-        output_final_state: Return the final recurrent state with the output. Rejected
-            together with ``state_indices``, which advances the pool in place instead.
-        state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
-            selecting rows of a paged ``initial_state`` pool shaped
-            ``[num_slots, H, K, V]``. Each sequence reads and advances
-            ``initial_state[state_indices[i]]`` **in place**, so a caller serving a paged
-            cache needs no gather before the scan or scatter after it. The routing is an
-            unchecked precondition, since verifying it would cost a device sync: every
-            nonempty sequence's slot must lie in ``[0, num_slots)`` and differ from every
-            other nonempty sequence's slot. Empty packed sequences touch no state, so
-            padding entries may repeat any index. ``"fused"`` only.
+        output_final_state: Return the final recurrent state with the output.
         fastmath: Allow less precise fused math for speed; rejected with
             ``"reference"``.
         autotune: Benchmark candidate kernel configurations when true (winners

@@ -210,3 +210,697 @@
 [data-md-color-scheme="default"] .md-typeset img[alt="Attention Gym"] {
   border-color: #d0ccc4;
 }
+
+/* ── CI health dashboard ── */
+
+.ci-health {
+  --ci-surface: #151515;
+  --ci-surface-raised: #1a1a1a;
+  --ci-border: #292929;
+  --ci-muted: #929292;
+  --ci-success: #71a982;
+  --ci-warning: #d0a85c;
+  --ci-failure: #d36b62;
+  margin-top: 1.8rem;
+}
+
+[data-md-color-scheme="default"] .ci-health {
+  --ci-surface: #ede9e1;
+  --ci-surface-raised: #f8f5ef;
+  --ci-border: #d7d1c6;
+  --ci-muted: #657068;
+  --ci-success: #4f7f5e;
+  --ci-warning: #9a6a22;
+  --ci-failure: #aa413a;
+}
+
+.ci-health-intro {
+  max-width: 46rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.ci-health-loading,
+.ci-health-error,
+.ci-empty {
+  display: grid;
+  gap: 0.35rem;
+  padding: 1.2rem;
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+}
+
+.ci-health-error {
+  border-left: 3px solid var(--ci-failure);
+}
+
+.ci-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.ci-stat,
+.ci-workflow {
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+}
+
+.ci-stat {
+  position: relative;
+  display: flex;
+  min-height: 8.5rem;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.15rem;
+  padding: 1rem;
+  overflow: hidden;
+}
+
+.ci-stat::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--ci-border);
+  content: "";
+}
+
+.ci-stat--success::before {
+  background: var(--ci-success);
+}
+
+.ci-stat--warning::before {
+  background: var(--ci-warning);
+}
+
+.ci-stat--failure::before {
+  background: var(--ci-failure);
+}
+
+.ci-stat strong {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: clamp(1.25rem, 2vw, 1.75rem);
+  line-height: 1.15;
+}
+
+.ci-stat .ci-stat__date {
+  font-size: 1rem;
+}
+
+.ci-stat > span:last-child,
+.ci-stat__label,
+.ci-eyebrow,
+.ci-section-heading > span,
+.ci-workflow__header span,
+.ci-workflow__latest {
+  color: var(--ci-muted);
+  font-size: 0.72rem;
+}
+
+.ci-stat__label,
+.ci-eyebrow {
+  font-family: "IBM Plex Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.ci-section-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 3rem 0 1rem;
+}
+
+.md-typeset .ci-section-heading h2 {
+  margin: 0.15rem 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.ci-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.ci-legend i {
+  width: 0.55rem;
+  height: 0.55rem;
+  margin-left: 0.4rem;
+  border-radius: 50%;
+}
+
+.ci-workflows {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.ci-workflow {
+  padding: 1rem;
+  border-top: 2px solid var(--ci-border);
+}
+
+.ci-workflow--success {
+  border-top-color: var(--ci-success);
+}
+
+.ci-workflow--warning {
+  border-top-color: var(--ci-warning);
+}
+
+.ci-workflow--failure {
+  border-top-color: var(--ci-failure);
+}
+
+.ci-workflow__header,
+.ci-failure__job {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.md-typeset .ci-workflow h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.ci-workflow__header > strong {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 1.15rem;
+}
+
+.ci-timeline {
+  display: flex;
+  height: 1.5rem;
+  align-items: stretch;
+  gap: 3px;
+  margin: 1rem 0;
+}
+
+.ci-timeline__run {
+  min-width: 3px;
+  flex: 1;
+  border-radius: 1px;
+  background: var(--ci-muted);
+  opacity: 0.85;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.ci-timeline__run:hover {
+  opacity: 1;
+  transform: scaleY(1.18);
+}
+
+.ci-status--success {
+  background-color: var(--ci-success);
+}
+
+.ci-status--failure {
+  background-color: var(--ci-failure);
+}
+
+.ci-status--ignored {
+  background-color: var(--ci-muted);
+}
+
+.ci-workflow__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  margin: 0 0 0.8rem;
+}
+
+.ci-workflow__metrics div {
+  padding-right: 0.35rem;
+  border-right: 1px solid var(--ci-border);
+}
+
+.ci-workflow__metrics div:last-child {
+  border: 0;
+}
+
+.ci-workflow__metrics dt {
+  color: var(--ci-muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+}
+
+.ci-workflow__metrics dd {
+  margin: 0.15rem 0 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+}
+
+.ci-workflow__latest {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ci-trend-picker {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.7rem;
+  padding-bottom: 0.25rem;
+  overflow-x: auto;
+}
+
+.ci-trend-picker button {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--ci-border);
+  border-radius: 999px;
+  background: var(--ci-surface);
+  color: var(--ci-muted);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.65rem;
+}
+
+.ci-trend-picker button:hover,
+.ci-trend-picker button.is-selected {
+  border-color: var(--ci-success);
+  color: var(--md-default-fg-color);
+}
+
+.ci-trend-picker button.is-selected {
+  background: color-mix(in srgb, var(--ci-success) 16%, var(--ci-surface));
+}
+
+.ci-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.ci-chart-card {
+  padding: 1rem;
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+}
+
+.ci-chart-card > div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.6rem;
+}
+
+.md-typeset .ci-chart-card h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.ci-chart-card span {
+  color: var(--ci-muted);
+  font-size: 0.65rem;
+}
+
+.ci-chart {
+  position: relative;
+  height: 15rem;
+}
+
+.ci-job-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ci-muted);
+  font-size: 0.72rem;
+}
+
+.ci-job-filter input {
+  width: min(15rem, 40vw);
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--ci-border);
+  border-radius: 2px;
+  outline: 0;
+  background: var(--ci-surface);
+  color: var(--md-default-fg-color);
+  font: inherit;
+}
+
+.ci-job-filter input:focus {
+  border-color: var(--ci-success);
+}
+
+.ci-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--ci-border);
+}
+
+.md-typeset .ci-job-table {
+  width: 100%;
+  margin: 0;
+  border: 0;
+  background: var(--ci-surface);
+  font-size: 0.74rem;
+}
+
+.ci-job-table tbody tr:hover {
+  background: var(--ci-surface-raised);
+}
+
+.ci-job-table td:first-child span,
+.ci-job-table td:first-child strong {
+  display: block;
+}
+
+.ci-job-table td:first-child span {
+  color: var(--ci-muted);
+  font-size: 0.65rem;
+}
+
+.ci-result {
+  display: inline-block;
+  padding: 0.15rem 0.4rem;
+  border-radius: 999px;
+  color: #fff !important;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.63rem;
+}
+
+.ci-failures {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.ci-failure {
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+}
+
+.md-typeset .ci-failure summary {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.8rem 1rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ci-failure summary::-webkit-details-marker {
+  display: none;
+}
+
+.ci-failure summary small {
+  display: block;
+  margin-top: 0.1rem;
+  color: var(--ci-muted);
+  font-size: 0.68rem;
+}
+
+.ci-failure__icon {
+  display: grid;
+  width: 1.4rem;
+  height: 1.4rem;
+  place-items: center;
+  border: 1px solid var(--ci-failure);
+  border-radius: 50%;
+  color: var(--ci-failure);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.ci-failure__body {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0 1rem 1rem 3.15rem;
+}
+
+.ci-failure__body article {
+  padding: 0.75rem;
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface-raised);
+}
+
+.ci-failure__body p {
+  margin: 0.5rem 0;
+  font-size: 0.73rem;
+}
+
+.ci-tests {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.md-typeset .ci-tests code {
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+  font-size: 0.68rem;
+}
+
+.ci-muted {
+  color: var(--ci-muted);
+}
+
+.ci-run-link {
+  justify-self: start;
+  font-size: 0.72rem;
+}
+
+.ci-dashboard-meta,
+.ci-panel-heading,
+.ci-trend-toolbar,
+.ci-chart-card--large > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.ci-dashboard-meta {
+  margin-bottom: 0.6rem;
+  color: var(--ci-muted);
+  font-size: 0.68rem;
+}
+
+.ci-view-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin: 2.5rem 0 1rem;
+  border-bottom: 1px solid var(--ci-border);
+}
+
+.ci-view-tabs button {
+  position: relative;
+  padding: 0.65rem 0.9rem;
+  border: 0;
+  background: transparent;
+  color: var(--ci-muted);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.ci-view-tabs button::after {
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  background: transparent;
+  content: "";
+}
+
+.ci-view-tabs button:hover,
+.ci-view-tabs button[aria-selected="true"] {
+  color: var(--md-default-fg-color);
+}
+
+.ci-view-tabs button[aria-selected="true"]::after {
+  background: var(--ci-success);
+}
+
+.ci-view-tabs button span {
+  display: inline-grid;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  margin-left: 0.25rem;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--ci-surface-raised);
+  font-size: 0.6rem;
+}
+
+.ci-view-panel[hidden] {
+  display: none;
+}
+
+.ci-trend-toolbar {
+  align-items: end;
+  margin-bottom: 0.7rem;
+}
+
+.ci-trend-toolbar label,
+.ci-job-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ci-muted);
+  font-size: 0.68rem;
+}
+
+.ci-trend-toolbar select,
+.ci-job-filter input {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--ci-border);
+  border-radius: 2px;
+  outline: 0;
+  background: var(--ci-surface);
+  color: var(--md-default-fg-color);
+  font: inherit;
+}
+
+.ci-trend-toolbar select:focus,
+.ci-job-filter input:focus {
+  border-color: var(--ci-success);
+}
+
+.ci-metric-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border: 1px solid var(--ci-border);
+  background: var(--ci-surface);
+}
+
+.ci-metric-tabs button {
+  padding: 0.35rem 0.6rem;
+  border: 0;
+  background: transparent;
+  color: var(--ci-muted);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.65rem;
+}
+
+.ci-metric-tabs button:hover,
+.ci-metric-tabs button.is-selected {
+  background: var(--ci-surface-raised);
+  color: var(--md-default-fg-color);
+}
+
+.ci-chart-card--large > div:first-child {
+  align-items: baseline;
+  margin-bottom: 0.8rem;
+}
+
+.ci-chart-card--large > div:first-child > span {
+  white-space: nowrap;
+}
+
+.ci-chart-card--large h2 {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: 1rem;
+}
+
+.ci-chart-card--large .ci-chart {
+  height: 22rem;
+}
+
+.ci-failure-point,
+.ci-chart-failures i {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-right: 0.25rem;
+  background: var(--ci-failure);
+  transform: rotate(45deg);
+}
+
+.ci-chart-failures {
+  display: flex;
+  min-height: 1.5rem;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.ci-chart-failures a {
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--ci-border);
+  color: var(--ci-muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.62rem;
+}
+
+.ci-chart-failures a:hover {
+  border-color: var(--ci-failure);
+  color: var(--md-default-fg-color);
+}
+
+.ci-panel-heading {
+  align-items: end;
+  margin-bottom: 0.8rem;
+}
+
+.ci-panel-heading h2 {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.ci-panel-heading span {
+  color: var(--ci-muted);
+  font-size: 0.68rem;
+}
+
+@media screen and (max-width: 52rem) {
+  .ci-summary,
+  .ci-workflows {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ci-chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ci-section-heading,
+  .ci-trend-toolbar,
+  .ci-panel-heading,
+  .ci-chart-card--large > div:first-child {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .ci-chart-card--large > div:first-child > span {
+    white-space: normal;
+  }
+}
+
+@media screen and (max-width: 35rem) {
+  .ci-summary,
+  .ci-workflows {
+    grid-template-columns: 1fr;
+  }
+
+  .ci-stat {
+    min-height: 7rem;
+  }
+
+  .ci-legend {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .ci-failure summary {
+    grid-template-columns: auto 1fr;
+  }
+
+  .ci-failure summary code {
+    display: none;
+  }
+
+  .ci-failure__body {
+    padding-left: 1rem;
+  }
+}
