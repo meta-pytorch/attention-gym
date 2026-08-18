@@ -20,16 +20,6 @@ def forward(
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the selected eager gated delta rule execution form."""
-    tensors = (query, key, value, log_decay, beta)
-    if initial_state is not None:
-        tensors += (initial_state,)
-    if not all(tensor.is_floating_point() for tensor in tensors):
-        raise ValueError("all inputs must have floating-point dtypes")
-    if any(tensor.device != query.device for tensor in tensors[1:]):
-        raise ValueError("all inputs must be on the same device")
-    if any(tensor.dtype != query.dtype for tensor in tensors[1:]):
-        raise ValueError("all inputs must have the same dtype")
-
     if mode == "recurrent":
         return recurrent_forward(
             query,
