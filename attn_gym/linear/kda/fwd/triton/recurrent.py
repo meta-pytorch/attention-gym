@@ -141,9 +141,10 @@ def _launch_recurrent_fwd(
         state_batch_stride = final_state.stride(0)
     else:
         state_batch_stride = heads * key_dim * value_dim
-    # BV=32 measured faster than 64 on B200 for both decode and prefill
-    # (smaller state tiles schedule better; state traffic is identical).
-    block_v = min(triton.next_power_of_2(value_dim), 32)
+    average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+    # smaller value tiles schedule scans of 32 or more tokens better on b200
+    block_v_limit = 16 if average_tokens >= 32 else 32
+    block_v = min(triton.next_power_of_2(value_dim), block_v_limit)
     # One flat launch dimension: sequence-head counts can exceed the 65,535
     # grid-Y limit, while grid-X is effectively unbounded.
     grid = (triton.cdiv(value_dim, block_v) * num_sequences * heads,)
