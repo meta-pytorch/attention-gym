@@ -75,7 +75,9 @@ def compile_test_variant(config: CompileConfig) -> FakeCompiled:
     log_path = os.getenv(_DRIVER_LOG_ENV)
     if log_path:
         with Path(log_path).open("a") as log:
-            log.write(f"{os.getpid()},{os.getppid()},{config.variant}\n")
+            log.write(
+                f"{os.getpid()},{os.getppid()},{config.variant},{os.getenv('CUTE_DSL_ARCH', '')}\n"
+            )
     return FakeCompiled(config.variant)
 
 
@@ -956,6 +958,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
     assert len(worker_pids) == len(configs)
     assert len(driver_pids) == 1
     assert os.getpid() not in driver_pids
+    assert {record[3] for record in records} == {"sm_100a"}
     assert len(list(cache_directory.rglob("*.o"))) == len(configs) + 1
 
     def unexpected_driver(*args, **kwargs):
