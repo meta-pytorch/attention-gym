@@ -550,15 +550,16 @@ def _bounded_gate_cumsum(
         )
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a positive power of two, got {chunk_size}")
-    if not math.isfinite(lower_bound) or lower_bound > 0:
-        raise ValueError(f"lower_bound must be finite and non-positive, got {lower_bound}")
-    if -lower_bound > MAX_GATE_LOWER_BOUND_MAGNITUDE:
+    # Plain comparisons only: `math.isfinite` on a traced float lifts it into a graph
+    # operation, which breaks strict dynamic compilation. A chained comparison rejects
+    # NaN and both infinities without calling into `math`.
+    if not -MAX_GATE_LOWER_BOUND_MAGNITUDE <= lower_bound <= 0.0:
         raise ValueError(
-            f"lower_bound must be >= {-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f} for the KDA "
-            f"intra-chunk gate rebase, got {lower_bound}. Beyond that the per-token decay "
-            f"can exceed the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk "
-            "and the core silently produces non-finite values. "
-            "See NOTE [Gate range ceiling]."
+            f"lower_bound must lie in "
+            f"[{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, 0] for the KDA intra-chunk gate "
+            f"rebase, got {lower_bound}. Below that bound the per-token decay can exceed "
+            f"the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk and the "
+            "core silently produces non-finite values. See NOTE [Gate range ceiling]."
         )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")
