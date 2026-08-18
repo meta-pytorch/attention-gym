@@ -557,9 +557,10 @@ def _bounded_gate_cumsum(
         raise ValueError(
             f"lower_bound must lie in "
             f"[{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, 0] for the KDA intra-chunk gate "
-            f"rebase, got {lower_bound}. Below that bound the per-token decay can exceed "
-            f"the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk and the "
-            "core silently produces non-finite values. See NOTE [Gate range ceiling]."
+            f"rebase, got {lower_bound}. Past the lower end the per-token decay can "
+            f"exceed the FP32 exponent budget over a {GATE_SPAN_STEPS + 1}-row subchunk, "
+            "and the core silently produces non-finite values. "
+            "See NOTE [Gate range ceiling]."
         )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bounded_gate_cumsum inputs must be on the same device")

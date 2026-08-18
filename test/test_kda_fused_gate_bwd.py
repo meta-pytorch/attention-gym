@@ -198,13 +198,19 @@ def test_bounded_gate_cumsum_rejects_gate_range_beyond_rebase_budget():
     bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=-5.0)
     bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=-(ceiling - 1e-3))
 
-    for rejected in (-(ceiling + 1e-3), -16.0, -32.0):
-        with pytest.raises(ValueError, match="intra-chunk gate rebase"):
+    # One chained comparison covers every rejection reason, so they share a message:
+    # past the ceiling, non-finite, and positive.
+    rejected_values = (
+        -(ceiling + 1e-3),
+        -16.0,
+        -32.0,
+        float("nan"),
+        float("-inf"),
+        1.0,
+    )
+    for rejected in rejected_values:
+        with pytest.raises(ValueError, match="lower_bound must lie in"):
             bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=rejected)
-    with pytest.raises(ValueError, match="finite and non-positive"):
-        bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=float("nan"))
-    with pytest.raises(ValueError, match="finite and non-positive"):
-        bounded_gate_cumsum(raw_gate, A_log, dt_bias, lower_bound=1.0)
 
 
 @pytest.mark.parametrize(
