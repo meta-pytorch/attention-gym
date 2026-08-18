@@ -37,7 +37,20 @@ def gated_delta_rule(
     """Apply gated delta rule attention.
 
     Inputs use the SDPA layout ``[batch, heads, sequence, dimension]``. The recurrent state has
-    shape ``[batch, heads, key_dimension, value_dimension]``.
+    shape ``[batch, heads, key_dimension, value_dimension]``. For each token, the scalar natural-log
+    gate first decays the previous state, then the beta-scaled delta rule updates it, and the query
+    reads the updated state:
+
+    ``decayed_state = exp(gate) * state``
+
+    ``residual = beta * (value - key @ decayed_state)``
+
+    ``state = decayed_state + outer(key, residual)``
+
+    ``output = scale * query @ state``
+
+    Execution mode changes the decomposition of this recurrence; backend selection changes only its
+    implementation.
 
     Args:
         query: Query tensor with shape ``[B, H, T, K]``.
