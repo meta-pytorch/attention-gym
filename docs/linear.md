@@ -4,7 +4,19 @@ Attention Gym provides functional linear-attention operators with eager referenc
 
 ## Gated Delta Rule
 
-`gated_delta_rule` uses the SDPA layout `[batch, heads, sequence, dimension]` and returns a structured result. Its eager backend supports recurrent execution for decoding and chunked execution for training or prefill.
+`gated_delta_rule` uses the SDPA layout `[batch, heads, sequence, dimension]` and returns a
+structured result. For each token, its scalar natural-log gate decays the previous state before the
+delta update, and the query reads the updated state:
+
+```text
+decayed_state = exp(gate) * state
+residual = beta * (value - key @ decayed_state)
+state = decayed_state + outer(key, residual)
+output = scale * query @ state
+```
+
+The eager reference includes recurrent and chunked formulations of this recurrence for correctness
+and state-carrying tests.
 
 ```python
 from attn_gym.linear import gated_delta_rule
@@ -23,8 +35,6 @@ result = gated_delta_rule(
 output = result.output
 final_state = result.final_state
 ```
-
-`mode="auto"` selects recurrent execution for a one-token sequence and chunked execution otherwise. `backend="auto"` currently selects the eager reference implementation.
 
 ### Supported capabilities
 
