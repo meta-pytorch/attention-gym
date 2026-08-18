@@ -75,7 +75,17 @@ def chunk_kda(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
-        output_final_state: Return the final recurrent state with the output.
+        output_final_state: Return the final recurrent state with the output. Rejected
+            together with ``state_indices``, which advances the pool in place instead.
+        state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
+            selecting rows of a paged ``initial_state`` pool shaped
+            ``[num_slots, H, K, V]``. Each sequence reads and advances
+            ``initial_state[state_indices[i]]`` **in place**, so a caller serving a paged
+            cache needs no gather before the scan or scatter after it. The routing is an
+            unchecked precondition, since verifying it would cost a device sync: every
+            nonempty sequence's slot must lie in ``[0, num_slots)`` and differ from every
+            other nonempty sequence's slot. Empty packed sequences touch no state, so
+            padding entries may repeat any index. ``"fused"`` only.
         fastmath: Allow less precise fused math for speed; rejected with
             ``"reference"``.
         autotune: Benchmark candidate kernel configurations when true (winners
@@ -129,6 +139,45 @@ def chunk_kda(
     )
 
 
+def _validate_paged_state(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    state_indices: torch.Tensor,
+    output_final_state: bool,
+) -> None:
+    """Validate the paged state pool and its slot indices."""
+    if initial_state is None:
+        raise ValueError("state_indices requires initial_state as the paged state pool")
+    if output_final_state:
+        raise ValueError("state_indices advances the pool in place; drop output_final_state")
+    if initial_state.ndim != 4 or initial_state.shape[1:] != (*q.shape[2:], v.shape[-1]):
+        raise ValueError(
+            "the paged state pool must have shape "
+            f"[num_slots, {q.shape[2]}, {q.shape[3]}, {v.shape[-1]}], "
+            f"got {tuple(initial_state.shape)}"
+        )
+    if initial_state.dtype != torch.float32:
+        raise TypeError("the paged state pool must use float32")
+    expected_inner_strides = (q.shape[3] * v.shape[-1], v.shape[-1], 1)
+    if initial_state.stride()[1:] != expected_inner_strides:
+        raise TypeError("the paged state pool must be contiguous within each [H, K, V] slot")
+    if initial_state.stride(0) < q.shape[2] * q.shape[3] * v.shape[-1]:
+        raise ValueError("paged state pool slots must not overlap")
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    if (
+        tuple(state_indices.shape) != (num_sequences,)
+        or state_indices.dtype != torch.int32
+        or not state_indices.is_contiguous()
+        or state_indices.device != q.device
+    ):
+        raise ValueError(
+            f"state_indices must be a contiguous int32 tensor of shape ({num_sequences},) "
+            f"on q.device, got {tuple(state_indices.shape)} of {state_indices.dtype}"
+        )
+
+
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -139,6 +188,7 @@ def recurrent_kda(
     *,
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
+    state_indices: torch.Tensor | None = None,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -158,7 +208,17 @@ def recurrent_kda(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
-        output_final_state: Return the final recurrent state with the output.
+        output_final_state: Return the final recurrent state with the output. Rejected
+            together with ``state_indices``, which advances the pool in place instead.
+        state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
+            selecting rows of a paged ``initial_state`` pool shaped
+            ``[num_slots, H, K, V]``. Each sequence reads and advances
+            ``initial_state[state_indices[i]]`` **in place**, so a caller serving a paged
+            cache needs no gather before the scan or scatter after it. The routing is an
+            unchecked precondition, since verifying it would cost a device sync: every
+            active slot must lie in ``[1, num_slots)`` and differ from every other active
+            slot. Non-positive indices are padding: they produce zero output and leave the
+            pool untouched. Empty packed sequences touch no state. ``"fused"`` only.
         autotune: Reserved for implementation parity with ``chunk_kda``. The
             current recurrent kernel uses the same fixed launch policy for both
             values.
@@ -170,16 +230,29 @@ def recurrent_kda(
         The output in ``q.dtype`` and either an FP32 final state with one entry
         per logical sequence or ``None``.
 
-    Serving limitations: state rows map directly to logical sequences (no
-    state-pool indexing), final states are written out of place, decode
-    preprocessing and scan are separate launches, and speculative-decoding
-    rollback is unsupported.
+    Serving limitations: without ``state_indices`` state rows map directly to logical
+    sequences and final states are written out of place, decode preprocessing and scan are
+    separate launches, and speculative-decoding rollback is unsupported.
     """
     del autotune
     selected_impl = _resolve_impl(impl)
+    # A paged pool's leading dimension is the slot count, not the sequence count, so the
+    # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(
-        q, k, v, gate, beta, initial_state, cu_seqlens, op_name="recurrent_kda", gate_name="gate"
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        None if state_indices is not None else initial_state,
+        cu_seqlens,
+        op_name="recurrent_kda",
+        gate_name="gate",
     )
+    if state_indices is not None:
+        _validate_paged_state(q, v, initial_state, cu_seqlens, state_indices, output_final_state)
+        if selected_impl is not Impl.FUSED:
+            raise ValueError("state_indices requires impl='fused'")
     if selected_impl is Impl.FUSED:
         return _fused_recurrent_forward(
             q,
@@ -190,6 +263,7 @@ def recurrent_kda(
             initial_state,
             cu_seqlens=cu_seqlens,
             output_final_state=output_final_state,
+            state_indices=state_indices,
         )
     return reference_kda(
         naive_recurrent_kda, q, k, v, gate, beta, initial_state, cu_seqlens, output_final_state

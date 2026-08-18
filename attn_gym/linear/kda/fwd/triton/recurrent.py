@@ -24,6 +24,9 @@ from attn_gym.linear.kda.ops import (
     recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
 )
 from attn_gym.linear.kda.ops import recurrent_fwd_op as _recurrent_fwd_op
+from attn_gym.linear.kda.ops import (
+    recurrent_fwd_paged_op as _recurrent_fwd_paged_op,
+)
 
 
 @triton.jit
@@ -37,8 +40,10 @@ def kda_recurrent_fwd_kernel(
     h0,
     ht,
     cu_seqlens,
+    state_indices,
     scale,
     T,
+    state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -47,6 +52,7 @@ def kda_recurrent_fwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -62,13 +68,27 @@ def kda_recurrent_fwd_kernel(
         bos = i_n * T
         eos = bos + T
 
+    if USE_STATE_INDICES and bos == eos:
+        return
+
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     m_k = o_k < K
     m_v = o_v < V
     m_kv = m_k[:, None] & m_v[None, :]
 
-    p_state = i_n * H * K * V + i_h * K * V + o_k[:, None] * V + o_v[None, :]
+    if USE_STATE_INDICES:
+        i_state = tl.load(state_indices + i_n).to(tl.int64)
+        # vLLM reserves non-positive slots for CUDA-graph padding. They produce zero
+        # outputs and must not touch the cache.
+        if i_state <= 0:
+            for t in range(bos, eos):
+                row = t * H + i_h
+                tl.store(output + row * V + o_v, 0.0, mask=m_v)
+            return
+    else:
+        i_state = i_n
+    p_state = i_state * state_batch_stride + i_h * K * V + o_k[:, None] * V + o_v[None, :]
     if USE_INITIAL_STATE:
         b_state = tl.load(h0 + p_state, mask=m_kv, other=0.0).to(tl.float32)
     else:
@@ -101,17 +121,27 @@ def _launch_recurrent_fwd(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     store_final_state: bool,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Allocate outputs and launch the sequential scan over token spans."""
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     num_sequences = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     output = torch.empty_like(v, dtype=q.dtype)
-    final_state = (
-        q.new_empty(num_sequences, heads, key_dim, value_dim, dtype=torch.float32)
-        if store_final_state
-        else None
-    )
+    if state_indices is not None:
+        # Paged mode reads and writes one slot, so `h0` and `ht` alias the pool and
+        # the scan needs no gather/scatter around it.
+        final_state = initial_state
+    elif store_final_state:
+        final_state = q.new_empty(num_sequences, heads, key_dim, value_dim, dtype=torch.float32)
+    else:
+        final_state = None
+    if initial_state is not None:
+        state_batch_stride = initial_state.stride(0)
+    elif final_state is not None:
+        state_batch_stride = final_state.stride(0)
+    else:
+        state_batch_stride = heads * key_dim * value_dim
     # BV=32 measured faster than 64 on B200 for both decode and prefill
     # (smaller state tiles schedule better; state traffic is identical).
     block_v = min(triton.next_power_of_2(value_dim), 32)
@@ -128,16 +158,19 @@ def _launch_recurrent_fwd(
         initial_state,
         final_state,
         cu_seqlens,
+        state_indices,
         scale=key_dim**-0.5,
         T=tokens,
+        state_batch_stride=state_batch_stride,
         H=heads,
         K=key_dim,
         V=value_dim,
         BK=triton.next_power_of_2(key_dim),
         BV=block_v,
         USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=store_final_state,
+        STORE_FINAL_STATE=final_state is not None,
         IS_VARLEN=cu_seqlens is not None,
+        USE_STATE_INDICES=state_indices is not None,
         num_warps=4,
     )
     return output, final_state
@@ -173,4 +206,32 @@ def _kda_recurrent_fwd_no_state_cuda(
     )[0]
 
 
-__all__ = ["_recurrent_fwd_no_state_op", "_recurrent_fwd_op", "forward"]
+def _kda_recurrent_fwd_paged_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    return _launch_recurrent_fwd(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        cu_seqlens,
+        store_final_state=True,
+        state_indices=state_indices,
+    )[0]
+
+
+__all__ = [
+    "_recurrent_fwd_no_state_op",
+    "_recurrent_fwd_op",
+    "_recurrent_fwd_paged_op",
+    "forward",
+]

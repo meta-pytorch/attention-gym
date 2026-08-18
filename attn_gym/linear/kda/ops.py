@@ -63,6 +63,13 @@ _RECURRENT_FWD_ARGS = (
 )
 torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
+# Separate schema: the paged variant advances the state pool in place, so the final state
+# is not an output and the alias annotation has to declare the mutation.
+torch.library.define(
+    "attn_gym::kda_recurrent_fwd_paged",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache,"
+    " Tensor state_indices, Tensor? cu_seqlens) -> Tensor",
+)
 torch.library.define(
     "attn_gym::kda_prepare_chunk_offsets",
     "(Tensor cu_seqlens, SymInt tokens, int chunk_size) -> Tensor",
@@ -120,6 +127,10 @@ def _recurrent_fwd_no_state_cuda(*args):
     return _recurrent_backend()._kda_recurrent_fwd_no_state_cuda(*args)
 
 
+def _recurrent_fwd_paged_cuda(*args):
+    return _recurrent_backend()._kda_recurrent_fwd_paged_cuda(*args)
+
+
 def _prepare_chunk_offsets_cuda(*args):
     from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
 
@@ -145,6 +156,11 @@ torch.library.impl(
     "attn_gym::kda_recurrent_fwd_no_state",
     "CUDA",
     _recurrent_fwd_no_state_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_recurrent_fwd_paged",
+    "CUDA",
+    _recurrent_fwd_paged_cuda,
 )
 torch.library.impl(
     "attn_gym::kda_prepare_chunk_offsets",
@@ -312,8 +328,23 @@ def _recurrent_fwd_no_state_fake(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    del q, k, gate, beta, initial_state, cu_seqlens
-    return torch.empty_like(v)
+    del k, gate, beta, initial_state, cu_seqlens
+    return torch.empty_like(v, dtype=q.dtype)
+
+
+@torch.library.register_fake("attn_gym::kda_recurrent_fwd_paged")
+def _recurrent_fwd_paged_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    del k, gate, beta, state_cache, state_indices, cu_seqlens
+    return torch.empty_like(v, dtype=q.dtype)
 
 
 @torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
@@ -334,6 +365,7 @@ chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
+recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
 prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
 
 
@@ -347,6 +379,7 @@ def recurrent_forward(
     *,
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and invoke the lazily loaded fused recurrent implementation."""
     if q.shape[-1] > 256:
@@ -363,6 +396,12 @@ def recurrent_forward(
         )
 
     q, k, v, gate, beta = (tensor.contiguous() for tensor in (q, k, v, gate, beta))
+    if state_indices is not None:
+        # `.contiguous()` on the pool would copy and silently drop the in-place advance.
+        assert initial_state is not None
+        return recurrent_fwd_paged_op(
+            q, k, v, gate, beta, initial_state, state_indices, cu_seqlens
+        ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
     if output_final_state:
@@ -381,4 +420,5 @@ __all__ = [
     "recurrent_forward",
     "recurrent_fwd_no_state_op",
     "recurrent_fwd_op",
+    "recurrent_fwd_paged_op",
 ]
