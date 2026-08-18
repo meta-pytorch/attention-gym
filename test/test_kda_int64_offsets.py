@@ -103,8 +103,8 @@ def test_chunk_kda_oversized_singleton_stride_matches_compact():
 
 
 @pytest.mark.skipif(
-    not CUTE_CAPABLE or torch.cuda.get_device_properties(0).total_memory < 100 * 1024**3,
-    reason="the executed-overflow regression allocates ~60GB of fully active buffers",
+    not CUTE_CAPABLE or torch.cuda.get_device_properties(0).total_memory < 60 * 1024**3,
+    reason="the executed-overflow regression peaks near 38 GiB of reserved memory",
 )
 def test_chunk_kda_full_262144_tokens_executes_offsets_past_int32():
     """Actually execute element offsets beyond INT32_MAX, not just accept the ABI.
