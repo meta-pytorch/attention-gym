@@ -22,7 +22,6 @@ from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
 from attn_gym.linear.kda.utils import input_guard
 
-
 _HEURISTICS = {
     "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
         args["raw_gate"],
