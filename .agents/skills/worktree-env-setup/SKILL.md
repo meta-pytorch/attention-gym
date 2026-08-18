@@ -15,15 +15,16 @@ From the worktree root (mirrors `.github/workflows/test.yml`):
 
 ```bash
 uv venv --python 3.13
+source .venv/bin/activate
 uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
 uv pip install --prerelease allow -e '.[tests,linear,dev]'
-source .venv/bin/activate
 ```
 
 Notes:
 
 - uv hard-links wheels from its cache, so after the first nightly download this
   takes seconds and costs almost no extra disk per worktree.
+- Activate `.venv` before installing so an already-active foreign environment is not modified.
 - `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`.
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
