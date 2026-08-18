@@ -119,7 +119,6 @@ def _bounded_gate_cumsum_dense(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
-    *,
     chunk_size: int,
     lower_bound: float,
 ) -> torch.Tensor:
@@ -252,6 +251,10 @@ def bounded_gate_cumsum_ragged(
 
 
 torch.library.define(
+    "attn_gym::kda_bounded_gate_fwd_dense",
+    "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, int chunk_size, float lower_bound) -> Tensor",
+)
+torch.library.define(
     "attn_gym::kda_bounded_gate_fwd_ragged",
     "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, Tensor cu_seqlens, "
     "Tensor chunk_offsets, int chunk_size, float lower_bound) -> Tensor",
@@ -323,12 +326,26 @@ def _bounded_gate_cumsum_ragged_bwd_cuda(
         )
 
 
+torch.library.impl("attn_gym::kda_bounded_gate_fwd_dense", "CUDA", _bounded_gate_cumsum_dense)
 torch.library.impl(
     "attn_gym::kda_bounded_gate_fwd_ragged", "CUDA", _bounded_gate_cumsum_ragged_fwd_cuda
 )
 torch.library.impl(
     "attn_gym::kda_bounded_gate_bwd_ragged", "CUDA", _bounded_gate_cumsum_ragged_bwd_cuda
 )
+
+
+@torch.library.register_fake("attn_gym::kda_bounded_gate_fwd_dense")
+def _bounded_gate_cumsum_dense_fake(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    chunk_size: int,
+    lower_bound: float,
+) -> torch.Tensor:
+    """Describe the dense gate output."""
+    del A_log, dt_bias, chunk_size, lower_bound
+    return torch.empty_like(raw_gate, dtype=torch.float32)
 
 
 @torch.library.register_fake("attn_gym::kda_bounded_gate_fwd_ragged")
@@ -367,6 +384,7 @@ def _bounded_gate_cumsum_ragged_bwd_fake(
     )
 
 
+_bounded_gate_cumsum_dense_op = torch.ops.attn_gym.kda_bounded_gate_fwd_dense.default
 _bounded_gate_cumsum_ragged_fwd_op = torch.ops.attn_gym.kda_bounded_gate_fwd_ragged.default
 _bounded_gate_cumsum_ragged_bwd_op = torch.ops.attn_gym.kda_bounded_gate_bwd_ragged.default
 
@@ -406,12 +424,12 @@ class _BoundedGateCumsum(torch.autograd.Function):
 
         assert chunk_offsets is None
         ctx.save_for_backward(raw_gate, A_log, dt_bias)
-        return _bounded_gate_cumsum_dense(
+        return _bounded_gate_cumsum_dense_op(
             raw_gate,
             A_log,
             dt_bias,
-            chunk_size=chunk_size,
-            lower_bound=lower_bound,
+            chunk_size,
+            lower_bound,
         )
 
     @staticmethod
