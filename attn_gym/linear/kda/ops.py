@@ -14,7 +14,7 @@ import torch
 _CHUNK_SIZE = 64
 
 
-# fixed-arity schema pairs avoid optional outputs on hot paths.
+# Fixed-arity schema pairs avoid optional outputs on hot paths.
 _CHUNK_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor? initial_state,"
     " bool autotune)"
@@ -63,7 +63,7 @@ _RECURRENT_FWD_ARGS = (
 )
 torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
-# separate schema: the paged variant advances the state pool in place, so the final state
+# Separate schema: the paged variant advances the state pool in place, so the final state
 # is not an output and the alias annotation has to declare the mutation.
 torch.library.define(
     "attn_gym::kda_recurrent_fwd_paged",
