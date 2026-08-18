@@ -79,8 +79,7 @@ def kda_recurrent_fwd_kernel(
 
     if USE_STATE_INDICES:
         i_state = tl.load(state_indices + i_n).to(tl.int64)
-        # vLLM reserves non-positive slots for CUDA-graph padding. They produce zero
-        # outputs and must not touch the cache.
+        # ignore vllm padded entries
         if i_state <= 0:
             for t in range(bos, eos):
                 row = t * H + i_h
