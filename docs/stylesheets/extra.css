@@ -211,6 +211,20 @@
   border-color: #d0ccc4;
 }
 
+/* ── Tutorial widgets ── */
+
+.tutorial-widget {
+  width: 100%;
+  min-height: 32rem;
+  border: 1px solid #1a1a1a;
+  border-radius: 2px;
+  background: var(--md-code-bg-color);
+}
+
+[data-md-color-scheme="default"] .tutorial-widget {
+  border-color: #d0ccc4;
+}
+
 /* ── CI health dashboard ── */
 
 .ci-health {
