@@ -62,6 +62,7 @@ viz = [
 
 docs = [
     "mkdocs-material==9.7.7",
+    "mkdocs-macros-plugin==1.5.0",
     "mkdocstrings[python]==1.0.6",
     "mkdocstrings-python==2.0.5",
     "numpy>=2,<3",

@@ -1,0 +1,799 @@
+{
+  "contract": {
+    "scope": "isolated CUDA graph allocator-memory microbenchmark",
+    "workload": "BF16 silu(x @ weight_in) @ weight_out",
+    "weights": "one fixed parameter set per fresh worker; allocated before history",
+    "history": "projection kernels prewarmed, allocator history covers static buffers and graph recording",
+    "memory": "live allocated/reserved bytes plus total segment bytes grouped by segment_pool_id",
+    "final_empty_cache": "reclaims validation temporaries; live graph pools and static buffers remain",
+    "output_liveness": "captured or tree-managed outputs retained through the final checkpoint",
+    "timing": "no latency claims; capture and replay are not timed"
+  },
+  "environment": {
+    "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+    "platform": "Linux-6.12.95-124.187.amzn2023.x86_64-x86_64-with-glibc2.39",
+    "torch": "2.15.0.dev20260819+cu132",
+    "cuda_runtime": "13.2",
+    "gpu": {
+      "name": "NVIDIA B200",
+      "uuid": "3327fe31-e6e6-29cf-b95e-39ec668c644c",
+      "total_memory": 191490555904,
+      "sm_count": 148
+    },
+    "git_commit": "442ab1a307fcfe1f5d1c074fe3b6980136eeafe3"
+  },
+  "modes": {
+    "max-graph": {
+      "capacities": [
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 150994944,
+          "reserved_bytes": 176160768,
+          "default_pool_segment_bytes": 121634816,
+          "graph_private_segment_bytes": 54525952,
+          "graph_private_pool_totals_bytes": {
+            "1:0": 54525952
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 50331648,
+          "reserved_bytes": 75497472,
+          "default_pool_segment_bytes": 20971520
+        }
+      },
+      "routing_proof": {
+        "kind": "named_host_profiler_ranges",
+        "ranges": [
+          "cuda_graph_bucket_memory/max-graph/tokens_1024"
+        ],
+        "graph_data": [
+          {
+            "capacity": 1024,
+            "pools": [
+              [
+                1,
+                0
+              ]
+            ],
+            "exec_graph_id": 2,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          }
+        ],
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/max-graph_routes.pftrace"
+      }
+    },
+    "python-buckets-2": {
+      "capacities": [
+        512,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 159383552,
+          "reserved_bytes": 197132288,
+          "default_pool_segment_bytes": 121634816,
+          "graph_private_segment_bytes": 75497472,
+          "graph_private_pool_totals_bytes": {
+            "1:0": 54525952,
+            "2:0": 20971520
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 58720256,
+          "reserved_bytes": 96468992,
+          "default_pool_segment_bytes": 20971520
+        }
+      },
+      "routing_proof": {
+        "kind": "named_host_profiler_ranges",
+        "ranges": [
+          "cuda_graph_bucket_memory/python-buckets-2/tokens_512",
+          "cuda_graph_bucket_memory/python-buckets-2/tokens_1024"
+        ],
+        "graph_data": [
+          {
+            "capacity": 512,
+            "pools": [
+              [
+                1,
+                0
+              ]
+            ],
+            "exec_graph_id": 2,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 1024,
+            "pools": [
+              [
+                2,
+                0
+              ]
+            ],
+            "exec_graph_id": 5,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          }
+        ],
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/python-buckets-2_routes.pftrace"
+      }
+    },
+    "python-buckets-4": {
+      "capacities": [
+        256,
+        512,
+        768,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 176160768,
+          "reserved_bytes": 239075328,
+          "default_pool_segment_bytes": 121634816,
+          "graph_private_segment_bytes": 117440512,
+          "graph_private_pool_totals_bytes": {
+            "1:0": 54525952,
+            "2:0": 20971520,
+            "3:0": 20971520,
+            "4:0": 20971520
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 75497472,
+          "reserved_bytes": 138412032,
+          "default_pool_segment_bytes": 20971520
+        }
+      },
+      "routing_proof": {
+        "kind": "named_host_profiler_ranges",
+        "ranges": [
+          "cuda_graph_bucket_memory/python-buckets-4/tokens_256",
+          "cuda_graph_bucket_memory/python-buckets-4/tokens_512",
+          "cuda_graph_bucket_memory/python-buckets-4/tokens_768",
+          "cuda_graph_bucket_memory/python-buckets-4/tokens_1024"
+        ],
+        "graph_data": [
+          {
+            "capacity": 256,
+            "pools": [
+              [
+                1,
+                0
+              ]
+            ],
+            "exec_graph_id": 2,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 512,
+            "pools": [
+              [
+                2,
+                0
+              ]
+            ],
+            "exec_graph_id": 5,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 768,
+            "pools": [
+              [
+                3,
+                0
+              ]
+            ],
+            "exec_graph_id": 8,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 1024,
+            "pools": [
+              [
+                4,
+                0
+              ]
+            ],
+            "exec_graph_id": 11,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          }
+        ],
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/python-buckets-4_routes.pftrace"
+      }
+    },
+    "python-buckets-4-shared": {
+      "capacities": [
+        256,
+        512,
+        768,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 150994944,
+          "reserved_bytes": 176160768,
+          "default_pool_segment_bytes": 121634816,
+          "graph_private_segment_bytes": 54525952,
+          "graph_private_pool_totals_bytes": {
+            "0:1": 54525952
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 50331648,
+          "reserved_bytes": 75497472,
+          "default_pool_segment_bytes": 20971520
+        }
+      },
+      "routing_proof": {
+        "kind": "host_bucket_dispatch_with_shared_prefix_buffers_and_pool",
+        "ranges": [
+          "cuda_graph_bucket_memory/python-buckets-4-shared/tokens_256",
+          "cuda_graph_bucket_memory/python-buckets-4-shared/tokens_512",
+          "cuda_graph_bucket_memory/python-buckets-4-shared/tokens_768",
+          "cuda_graph_bucket_memory/python-buckets-4-shared/tokens_1024"
+        ],
+        "shared_input_data_ptr": 140392339079168,
+        "shared_output_data_ptr": 140392347467776,
+        "shared_pool": [
+          0,
+          1
+        ],
+        "graphs": [
+          {
+            "capacity": 256,
+            "input_data_ptr": 140392339079168,
+            "input_storage_offset": 0,
+            "output_data_ptr": 140392347467776,
+            "output_storage_offset": 0,
+            "pools": [
+              [
+                0,
+                1
+              ]
+            ],
+            "exec_graph_id": 2,
+            "node_count": 4,
+            "node_type_counts": {
+              "kernel": 3,
+              "memcpy": 1
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 512,
+            "input_data_ptr": 140392339079168,
+            "input_storage_offset": 0,
+            "output_data_ptr": 140392347467776,
+            "output_storage_offset": 0,
+            "pools": [
+              [
+                0,
+                1
+              ]
+            ],
+            "exec_graph_id": 5,
+            "node_count": 4,
+            "node_type_counts": {
+              "kernel": 3,
+              "memcpy": 1
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 768,
+            "input_data_ptr": 140392339079168,
+            "input_storage_offset": 0,
+            "output_data_ptr": 140392347467776,
+            "output_storage_offset": 0,
+            "pools": [
+              [
+                0,
+                1
+              ]
+            ],
+            "exec_graph_id": 8,
+            "node_count": 4,
+            "node_type_counts": {
+              "kernel": 3,
+              "memcpy": 1
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 1024,
+            "input_data_ptr": 140392339079168,
+            "input_storage_offset": 0,
+            "output_data_ptr": 140392347467776,
+            "output_storage_offset": 0,
+            "pools": [
+              [
+                0,
+                1
+              ]
+            ],
+            "exec_graph_id": 11,
+            "node_count": 4,
+            "node_type_counts": {
+              "kernel": 3,
+              "memcpy": 1
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          }
+        ],
+        "lifetime_contract": "bucket graphs are independent, mutually exclusive, and never replay concurrently; the shared external output is consumed before the next replay",
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/python-buckets-4-shared_routes.pftrace"
+      }
+    },
+    "python-buckets-8": {
+      "capacities": [
+        128,
+        256,
+        384,
+        512,
+        640,
+        768,
+        896,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 209715200,
+          "reserved_bytes": 327155712,
+          "default_pool_segment_bytes": 144703488,
+          "graph_private_segment_bytes": 182452224,
+          "graph_private_pool_totals_bytes": {
+            "1:0": 35651584,
+            "2:0": 20971520,
+            "3:0": 20971520,
+            "4:0": 20971520,
+            "5:0": 20971520,
+            "6:0": 20971520,
+            "7:0": 20971520,
+            "8:0": 20971520
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 109051904,
+          "reserved_bytes": 226492416,
+          "default_pool_segment_bytes": 44040192
+        }
+      },
+      "routing_proof": {
+        "kind": "named_host_profiler_ranges",
+        "ranges": [
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_128",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_256",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_384",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_512",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_640",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_768",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_896",
+          "cuda_graph_bucket_memory/python-buckets-8/tokens_1024"
+        ],
+        "graph_data": [
+          {
+            "capacity": 128,
+            "pools": [
+              [
+                1,
+                0
+              ]
+            ],
+            "exec_graph_id": 2,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_64x64_64x16_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_64x64_64x16_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 256,
+            "pools": [
+              [
+                2,
+                0
+              ]
+            ],
+            "exec_graph_id": 5,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 384,
+            "pools": [
+              [
+                3,
+                0
+              ]
+            ],
+            "exec_graph_id": 8,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x96_64x9_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x96_64x9_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 512,
+            "pools": [
+              [
+                4,
+                0
+              ]
+            ],
+            "exec_graph_id": 11,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x128_64x8_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 640,
+            "pools": [
+              [
+                5,
+                0
+              ]
+            ],
+            "exec_graph_id": 14,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x160_64x8_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x160_64x8_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 768,
+            "pools": [
+              [
+                6,
+                0
+              ]
+            ],
+            "exec_graph_id": 17,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_192x128_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 896,
+            "pools": [
+              [
+                7,
+                0
+              ]
+            ],
+            "exec_graph_id": 20,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          },
+          {
+            "capacity": 1024,
+            "pools": [
+              [
+                8,
+                0
+              ]
+            ],
+            "exec_graph_id": 23,
+            "node_count": 3,
+            "node_type_counts": {
+              "kernel": 3
+            },
+            "kernel_names": [
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT",
+              "_ZN2at6native29vectorized_elementwise_kernelILi8EZZZNS0_62_GLOBAL__N__e7db5ad4_23_ActivationSiluKernel_cu_cd6da9b0_4164711silu_kernelERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE4_clEvEUlN3c108BFloat16EE_St5arrayIPcLm2EELb0EEEviT0_T1_",
+              "nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT"
+            ]
+          }
+        ],
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/python-buckets-8_routes.pftrace"
+      }
+    },
+    "inductor-trees": {
+      "capacities": [
+        256,
+        512,
+        768,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 121634816,
+          "reserved_bytes": 243269632,
+          "default_pool_segment_bytes": 121634816,
+          "graph_private_segment_bytes": 121634816,
+          "graph_private_pool_totals_bytes": {
+            "0:1": 121634816
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 20971520,
+          "reserved_bytes": 142606336,
+          "default_pool_segment_bytes": 20971520
+        }
+      },
+      "routing_proof": {
+        "kind": "host_shape_dispatch_plus_tree_manager_inspection",
+        "ranges": [
+          "cuda_graph_bucket_memory/inductor-trees/tokens_256",
+          "cuda_graph_bucket_memory/inductor-trees/tokens_512",
+          "cuda_graph_bucket_memory/inductor-trees/tokens_768",
+          "cuda_graph_bucket_memory/inductor-trees/tokens_1024"
+        ],
+        "tree_roots": [
+          {
+            "graph_id": "GraphID(id=0)",
+            "pool": [
+              0,
+              1
+            ],
+            "output_sizes": [
+              [
+                256,
+                4096
+              ]
+            ]
+          },
+          {
+            "graph_id": "GraphID(id=1)",
+            "pool": [
+              0,
+              1
+            ],
+            "output_sizes": [
+              [
+                512,
+                4096
+              ]
+            ]
+          },
+          {
+            "graph_id": "GraphID(id=2)",
+            "pool": [
+              0,
+              1
+            ],
+            "output_sizes": [
+              [
+                768,
+                4096
+              ]
+            ]
+          },
+          {
+            "graph_id": "GraphID(id=3)",
+            "pool": [
+              0,
+              1
+            ],
+            "output_sizes": [
+              [
+                1024,
+                4096
+              ]
+            ]
+          }
+        ],
+        "shared_pool_ids": [
+          [
+            0,
+            1
+          ]
+        ],
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/inductor-trees_routes.pftrace"
+      }
+    },
+    "conditional-nodes": {
+      "capacities": [
+        512,
+        1024
+      ],
+      "memory_breakdown": {
+        "model_only_baseline": {
+          "allocated_bytes": 100663296,
+          "reserved_bytes": 100663296,
+          "default_pool_segment_bytes": 100663296
+        },
+        "final": {
+          "allocated_bytes": 192939008,
+          "reserved_bytes": 255852544,
+          "default_pool_segment_bytes": 144703488,
+          "graph_private_segment_bytes": 111149056,
+          "graph_private_pool_totals_bytes": {
+            "1:0": 111149056
+          }
+        },
+        "growth_after_model_baseline": {
+          "allocated_bytes": 92275712,
+          "reserved_bytes": 155189248,
+          "default_pool_segment_bytes": 44040192
+        }
+      },
+      "routing_proof": {
+        "kind": "device_scalar_replay_plus_parent_graph_data",
+        "predicate": "active_tokens <= small_capacity (CUDA int32 scalar; no .item())",
+        "selections": [
+          {
+            "device_active_tokens": 512,
+            "selected_branch": "small",
+            "max_error": 0.0
+          },
+          {
+            "device_active_tokens": 1024,
+            "selected_branch": "large",
+            "max_error": 0.0
+          },
+          {
+            "device_active_tokens": 512,
+            "selected_branch": "small",
+            "max_error": 0.0
+          }
+        ],
+        "branch_body_python_invocations_during_capture": {
+          "small": 1,
+          "large": 1
+        },
+        "parent_node_type_counts": {
+          "conditional": 2,
+          "kernel": 4
+        },
+        "graph_data": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/conditional-nodes_graph_data.json",
+        "trace": "/home/dev/meta/attention-gym-persistent/agent_space/cuda_graph_bucket_memory_nightly/conditional-nodes_routes.pftrace"
+      }
+    }
+  },
+  "dispatch_claims": {
+    "ordinary_torch_cond_existing_cudagraphs": {
+      "status": "failed_as_expected",
+      "exception_type": "UncapturedHigherOrderOpError",
+      "message": "This higher order operator doesn't work unless it is captured completely with torch.compile. Got graph break/error:\n\nAttempted to inline function marked as skipped\n  Higher Order Operator: torch.cond\n  Explanation: Dynamo developers have intentionally marked that the function `CUDAGraph.replay` should not be traced.\n  Hint: Avoid calling the function `CUDAGraph.replay`.\n  Hint: Apply `@torch._dynamo.dont_skip_tracing` to the function `CUDAGraph.replay` to force tracing into the function. More graph breaks may occur as a result of attempting to trace into the function.\n  Hint: Please file an issue to PyTorch.\n\n  Developer debug context: qualname: CUDAGraph.replay, name: replay, filename: `/home/dev/meta/attention-gym-persistent/.venv/lib/python3.13/site-packages/torch/cuda/graphs.py`, skip reason: file matches MOD_SKIPLIST (/home/dev/meta/attention-gym-persistent/.venv/lib/python3.13/site-packages/torch/cuda)\n\n For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0008.html\n\nfrom user code:\n   File \"/home/dev/meta/attention-gym-persistent/.venv/lib/python3.13/site-packages/torch/_higher_order_ops/cond.py\", line 241, in _cond_op_wrapper\n    return cond_op(*args, **kwargs)\n  File \"/home/dev/meta/attention-gym-persistent/benchmarks/cuda_graph_bucket_memory.py\", line 493, in branch_a\n    graph_a.replay()\n    ~~~~~~~~~~~~~~^^\n\nSet TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS=\"+dynamo\"\n"
+    },
+    "private_conditional_body_existing_cudagraphs": {
+      "status": "failed_as_expected",
+      "exception_type": "RuntimeError",
+      "message": "Capture must end on the same stream it began on."
+    },
+    "claim": "ordinary torch.cond cannot trace CUDAGraph.replay; the private mode also rejects replaying existing graph execs while capturing a parent, so its successful mode captures branch operations instead."
+  }
+}

@@ -175,3 +175,5 @@ CLAUDE.local.md
 site/
 
 data/
+!docs/assets/data/
+!docs/assets/data/**

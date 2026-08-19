@@ -33,8 +33,8 @@ KDA operator.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from functools import wraps
 from itertools import accumulate
@@ -45,6 +45,7 @@ import torch
 import torch.nn.functional as F
 import typer
 from torch import nn
+from torch.cuda.graph_annotations import mark_kernels
 
 from attn_gym.linear.kda import (
     active_token_mask,
@@ -73,15 +74,36 @@ def _record_function(enabled: bool, name: str):
     return torch.profiler.record_function(name) if enabled else nullcontext()
 
 
+@contextmanager
+def _profile_region(
+    enabled: bool,
+    name: str,
+    *,
+    graph_annotations: bool,
+) -> Iterator[None]:
+    """Label eager profiler work and optionally annotate captured CUDA Graph kernels."""
+    if graph_annotations:
+        with mark_kernels(name), _record_function(enabled, name):
+            yield
+    else:
+        with _record_function(enabled, name):
+            yield
+
+
 def record_function(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Label a KDA stage when the module has profiling ranges enabled."""
+    """Label a KDA stage in eager profiles and annotated CUDA Graph captures."""
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(function)
         def profiled(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not self.profile_ranges:
+            if not self.profile_ranges and not self.enable_graph_annotations:
                 return function(self, *args, **kwargs)
-            with torch.profiler.record_function(name.format(backend=self.backend)):
+            range_name = name.format(backend=self.backend)
+            with _profile_region(
+                self.profile_ranges,
+                range_name,
+                graph_annotations=self.enable_graph_annotations,
+            ):
                 return function(self, *args, **kwargs)
 
         return profiled
@@ -125,6 +147,9 @@ class KDAAttention(nn.Module):
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
     without changing the physical shape. Leave the option disabled for dense or
     exact-packed inputs to avoid masking work.
+
+    Set ``enable_graph_annotations=True`` only for an explicit CUDA Graph capture;
+    leave it disabled for ``torch.compile``.
     """
 
     def __init__(
@@ -142,6 +167,7 @@ class KDAAttention(nn.Module):
         compute_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         profile_ranges: bool = False,
+        enable_graph_annotations: bool = False,
         mask_inactive_capacity: bool = False,
     ) -> None:
         super().__init__()
@@ -169,6 +195,7 @@ class KDAAttention(nn.Module):
         self.fastmath = fastmath
         self.rms_norm_eps = rms_norm_eps
         self.profile_ranges = profile_ranges
+        self.enable_graph_annotations = enable_graph_annotations
         self.mask_inactive_capacity = mask_inactive_capacity
         self.compute_dtype = (
             (torch.bfloat16 if backend == "fused" else torch.float32)
@@ -232,18 +259,20 @@ class KDAAttention(nn.Module):
                 )
             initial_state = initial_state.to(device=hidden_states.device, dtype=torch.float32)
 
+        # --8<-- [start:kda-fixed-capacity-masking]
         # Keep the endpoint on-device: a captured graph rebuilds this one mask on
         # replay, then every value mask and gradient barrier below reuses it.
-        active_mask = (
+        active_mask = (  # (1)!
             active_token_mask(hidden_states, cu_seqlens)
             if self.mask_inactive_capacity and cu_seqlens is not None
             else None
         )
         # A zero cotangent cannot neutralize a NaN activation in a weight reduction.
-        hidden_states = mask_inactive_tokens(hidden_states, active_mask)
+        hidden_states = mask_inactive_tokens(hidden_states, active_mask)  # (2)!
         hidden_states_compute, qkv = self.qkv_projection(hidden_states)
         # The short-convolution dInput suffix is undefined; keep it out of qkv_proj dW.
-        qkv = mask_inactive_token_gradients(qkv, active_mask)
+        qkv = mask_inactive_token_gradients(qkv, active_mask)  # (3)!
+        # --8<-- [end:kda-fixed-capacity-masking]
         qkv, final_conv_state = self.short_convolution(
             qkv,
             initial_conv_state,
@@ -258,11 +287,15 @@ class KDAAttention(nn.Module):
         # These barriers exclude undefined primitive dInputs from projection dW.
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
         beta = mask_inactive_token_gradients(beta, active_mask)
-        metadata = (
-            None
-            if cu_seqlens is None
-            else prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
-        )
+        if cu_seqlens is None:
+            metadata = None
+        else:
+            with _profile_region(
+                self.profile_ranges,
+                "kda/chunk_metadata",
+                graph_annotations=self.enable_graph_annotations,
+            ):
+                metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
         if metadata is None:
             cumulative_gate = self.gate_prefix_sum(raw_gate)
             output, final_state = self.kda_core(
@@ -275,7 +308,11 @@ class KDAAttention(nn.Module):
                 return_final_state=return_final_state,
             )
         else:
-            with _record_function(self.profile_ranges, "kda/gate_prefix_sum/fused"):
+            with _profile_region(
+                self.profile_ranges,
+                "kda/gate_prefix_sum/fused",
+                graph_annotations=self.enable_graph_annotations,
+            ):
                 cumulative_gate = _bounded_gate_cumsum(
                     raw_gate,
                     self.A_log,
@@ -286,7 +323,11 @@ class KDAAttention(nn.Module):
                     profile_ranges=self.profile_ranges,
                     metadata=metadata,
                 )
-            with _record_function(self.profile_ranges, "kda/core/fused"):
+            with _profile_region(
+                self.profile_ranges,
+                "kda/core/fused",
+                graph_annotations=self.enable_graph_annotations,
+            ):
                 output, final_state = _chunk_kda(
                     q,
                     k,

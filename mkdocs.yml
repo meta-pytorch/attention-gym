@@ -34,8 +34,21 @@ theme:
 extra_css:
   - stylesheets/extra.css
 
+extra_javascript:
+  - assets/javascripts/perfetto-trace-embed.js
+  - assets/javascripts/plotly-theme.js
+  - assets/javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+watch:
+  - examples
+
+exclude_docs: |
+  AGENTS.md
+
 plugins:
   - search
+  - macros
   - mkdocstrings:
       handlers:
         python:
@@ -49,7 +62,8 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Concepts: concepts.md
-  - Tutorials: tutorials/index.md
+  - Tutorials:
+      - CUDA Graphs: tutorials/cuda-graphs.md
   - Determinism: determinism.md
   - Masks: masks.md
   - Score Mods: mods.md
@@ -72,6 +86,8 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
   - admonition
   - pymdownx.details
   - pymdownx.snippets

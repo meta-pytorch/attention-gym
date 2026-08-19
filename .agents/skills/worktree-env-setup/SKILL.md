@@ -16,12 +16,14 @@ From the worktree root (mirrors `.github/workflows/test.yml`):
 ```bash
 uv venv --python 3.13
 source .venv/bin/activate
-uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
+uv pip install --upgrade --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
 uv pip install --prerelease allow -e '.[tests,linear,dev]'
 ```
 
 Notes:
 
+- `--upgrade` is required when repairing an existing worktree environment; without it,
+  `uv pip install --pre torch` can retain an older stable torch already present in the venv.
 - uv hard-links wheels from its cache, so after the first nightly download this
   takes seconds and costs almost no extra disk per worktree.
 - Activate `.venv` before installing so an already-active foreign environment is not modified.
