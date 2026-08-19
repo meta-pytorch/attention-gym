@@ -203,12 +203,18 @@ def recurrent_kda(
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
             selecting rows of a paged ``initial_state`` pool shaped
             ``[num_slots, H, K, V]``. Each sequence reads and advances
-            ``initial_state[state_indices[i]]`` **in place**, so a caller serving a paged
-            cache needs no gather before the scan or scatter after it. The routing is an
-            unchecked precondition, since verifying it would cost a device sync: every
-            active slot must lie in ``[1, num_slots)`` and differ from every other active
-            slot. Non-positive indices are padding: they produce zero output and leave the
-            pool untouched. Empty packed sequences touch no state. ``"fused"`` only.
+            ``initial_state[state_indices[i]]`` **in place**. An index not in
+            [1, num_slots) implies padding and are ignored by the kernel. The active
+            indices also have to be unique to prevent two sequences from writing
+            the same slot concurrently.
+            Example:
+                num_slots = 6
+                state_indices = [3, -1, 5, 0]
+
+                seq 0 reads and updates initial_state[3]
+                seq 1 is padding (index is -1) so this is ignored
+                seq 2 reads and updates initial_state[5]
+                seq 3 is padding bc 0
         autotune: Reserved for implementation parity with ``chunk_kda``. The
             current recurrent kernel uses the same fixed launch policy for both
             values.

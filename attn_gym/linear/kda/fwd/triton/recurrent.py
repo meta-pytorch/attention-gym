@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.ops import recurrent_forward as forward
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
@@ -77,17 +78,28 @@ def kda_recurrent_fwd_kernel(
     m_v = o_v < V
     m_kv = m_k[:, None] & m_v[None, :]
 
+    # Paged mode addresses the state pool by slot instead of by sequence position.
+    # we are assuming that every nonempty sequence's slot must lie in
+    # [1, num_slots) and differ from every other nonempty sequence's slot
+    # we can figure out where to put the right checker kernel later
     if USE_STATE_INDICES:
         i_state = tl.load(state_indices + i_n).to(tl.int64)
         # ignore vllm padded entries
         if i_state <= 0:
             for t in range(bos, eos):
                 row = t * H + i_h
-                tl.store(output + row * V + o_v, 0.0, mask=m_v)
+                p_output = ptr_offset((row, o_v), (V, 1))
+                tl.store(output + p_output, 0.0, mask=m_v)
             return
+        p_state = ptr_offset(
+            (i_state, i_h, o_k[:, None], o_v[None, :]),
+            (state_batch_stride, K * V, V, 1),
+        )
     else:
-        i_state = i_n
-    p_state = i_state * state_batch_stride + i_h * K * V + o_k[:, None] * V + o_v[None, :]
+        p_state = ptr_offset(
+            (i_n, i_h, o_k[:, None], o_v[None, :]),
+            (state_batch_stride, K * V, V, 1),
+        )
     if USE_INITIAL_STATE:
         b_state = tl.load(h0 + p_state, mask=m_kv, other=0.0).to(tl.float32)
     else:
@@ -135,12 +147,9 @@ def _launch_recurrent_fwd(
         final_state = q.new_empty(num_sequences, heads, key_dim, value_dim, dtype=torch.float32)
     else:
         final_state = None
-    if initial_state is not None:
-        state_batch_stride = initial_state.stride(0)
-    elif final_state is not None:
-        state_batch_stride = final_state.stride(0)
-    else:
-        state_batch_stride = heads * key_dim * value_dim
+    state_batch_stride = (
+        initial_state.stride(0) if initial_state is not None else heads * key_dim * value_dim
+    )
     # BV=32 measured faster than 64 on B200 for both decode and prefill
     # (smaller state tiles schedule better; state traffic is identical).
     block_v = min(triton.next_power_of_2(value_dim), 32)
