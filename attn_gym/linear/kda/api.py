@@ -148,13 +148,9 @@ def _validate_paged_state(
             f"[num_slots, {q.shape[2]}, {q.shape[3]}, {v.shape[-1]}], "
             f"got {tuple(initial_state.shape)}"
         )
-    if initial_state.dtype != torch.float32:
-        raise TypeError("the paged state pool must use float32")
-    expected_inner_strides = (q.shape[3] * v.shape[-1], v.shape[-1], 1)
-    if initial_state.stride()[1:] != expected_inner_strides:
-        raise TypeError("the paged state pool must be contiguous within each [H, K, V] slot")
-    if initial_state.stride(0) < q.shape[2] * q.shape[3] * v.shape[-1]:
-        raise ValueError("paged state pool slots must not overlap")
+    # The pool is advanced in place, so a copy would silently drop the update.
+    if initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+        raise TypeError("the paged state pool must be contiguous float32")
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     if (
         tuple(state_indices.shape) != (num_sequences,)
@@ -203,18 +199,12 @@ def recurrent_kda(
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
             selecting rows of a paged ``initial_state`` pool shaped
             ``[num_slots, H, K, V]``. Each sequence reads and advances
-            ``initial_state[state_indices[i]]`` **in place**. An index not in
-            [1, num_slots) implies padding and are ignored by the kernel. The active
-            indices also have to be unique to prevent two sequences from writing
-            the same slot concurrently.
-            Example:
-                num_slots = 6
-                state_indices = [3, -1, 5, 0]
-
-                seq 0 reads and updates initial_state[3]
-                seq 1 is padding (index is -1) so this is ignored
-                seq 2 reads and updates initial_state[5]
-                seq 3 is padding bc 0
+            ``initial_state[state_indices[i]]`` **in place**, so a caller serving a paged
+            cache needs no gather before the scan or scatter after it. The routing is an
+            unchecked precondition, since verifying it would cost a device sync: every
+            nonempty sequence's slot must lie in ``[0, num_slots)`` and differ from every
+            other nonempty sequence's slot. Empty packed sequences touch no state, so
+            padding entries may repeat any index. ``"fused"`` only.
         autotune: Reserved for implementation parity with ``chunk_kda``. The
             current recurrent kernel uses the same fixed launch policy for both
             values.

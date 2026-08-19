@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.ops import recurrent_forward as forward
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
@@ -44,7 +43,6 @@ def kda_recurrent_fwd_kernel(
     state_indices,
     scale,
     T,
-    state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -78,28 +76,14 @@ def kda_recurrent_fwd_kernel(
     m_v = o_v < V
     m_kv = m_k[:, None] & m_v[None, :]
 
-    # Paged mode addresses the state pool by slot instead of by sequence position.
-    # we are assuming that every nonempty sequence's slot must lie in
-    # [1, num_slots) and differ from every other nonempty sequence's slot
-    # we can figure out where to put the right checker kernel later
-    if USE_STATE_INDICES:
-        i_state = tl.load(state_indices + i_n).to(tl.int64)
-        # ignore vllm padded entries
-        if i_state <= 0:
-            for t in range(bos, eos):
-                row = t * H + i_h
-                p_output = ptr_offset((row, o_v), (V, 1))
-                tl.store(output + p_output, 0.0, mask=m_v)
-            return
-        p_state = ptr_offset(
-            (i_state, i_h, o_k[:, None], o_v[None, :]),
-            (state_batch_stride, K * V, V, 1),
-        )
-    else:
-        p_state = ptr_offset(
-            (i_n, i_h, o_k[:, None], o_v[None, :]),
-            (state_batch_stride, K * V, V, 1),
-        )
+    # Paged mode addresses the state pool by slot instead of by sequence position. Routing
+    # invariant, assumed rather than checked: every nonempty sequence's slot must lie in
+    # [0, num_slots) and differ from every other nonempty sequence's slot, so the map is
+    # injective over active sequences and rows nobody names stay untouched. Empty packed
+    # sequences are exempt -- they returned above. Assumption for tests we dont want sync
+    # on and we can figure out where to put the right checker kernel later.
+    i_state = tl.load(state_indices + i_n).to(tl.int64) if USE_STATE_INDICES else i_n
+    p_state = i_state * H * K * V + i_h * K * V + o_k[:, None] * V + o_v[None, :]
     if USE_INITIAL_STATE:
         b_state = tl.load(h0 + p_state, mask=m_kv, other=0.0).to(tl.float32)
     else:
@@ -147,9 +131,6 @@ def _launch_recurrent_fwd(
         final_state = q.new_empty(num_sequences, heads, key_dim, value_dim, dtype=torch.float32)
     else:
         final_state = None
-    state_batch_stride = (
-        initial_state.stride(0) if initial_state is not None else heads * key_dim * value_dim
-    )
     # BV=32 measured faster than 64 on B200 for both decode and prefill
     # (smaller state tiles schedule better; state traffic is identical).
     block_v = min(triton.next_power_of_2(value_dim), 32)
@@ -169,7 +150,6 @@ def _launch_recurrent_fwd(
         state_indices,
         scale=key_dim**-0.5,
         T=tokens,
-        state_batch_stride=state_batch_stride,
         H=heads,
         K=key_dim,
         V=value_dim,
