@@ -1,0 +1,55 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+.trace-viewer,
+.trace-viewer iframe {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: #111;
+}
+
+.trace-viewer {
+  position: relative;
+}
+
+.trace-viewer iframe {
+  display: block;
+  border: 0;
+}
+
+.trace-viewer__status {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  padding: 0.7rem 1rem;
+  border: 1px solid #35443a;
+  border-radius: 3px;
+  background: #151a17;
+  color: #b9c7be;
+  font-size: 0.85rem;
+  transform: translate(-50%, -50%);
+}
+
+.trace-viewer__status[hidden] {
+  display: none;
+}
+
+.trace-viewer__status--error {
+  border-color: #9d4b44;
+  color: #efb1ab;
+}

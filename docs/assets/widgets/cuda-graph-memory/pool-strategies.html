@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Graph memory pool strategies</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0e0e0e;
+  --surface: #161616;
+  --surface-raised: #1d1d1d;
+  --text: #d4d4d4;
+  --muted: #999;
+  --line: #303030;
+  --blue: #68b5e6;
+  --orange: #e3a15f;
+  --green: #6f8f7b;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+body { font: 14px/1.4 "IBM Plex Sans", system-ui, sans-serif; }
+button { font: inherit; }
+.shell { height: 400px; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; padding: 12px; gap: 10px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+.tabs button { min-height: 36px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 2px; background: transparent; color: var(--muted); cursor: pointer; font: 600 11px "IBM Plex Mono", monospace; }
+.tabs button:hover { color: var(--text); }
+.tabs button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.tabs button[aria-selected="true"] { border-color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); }
+.diagram { display: grid; grid-template-columns: minmax(160px, 0.72fr) 62px minmax(300px, 1.5fr); gap: 10px; align-items: stretch; min-height: 215px; }
+.pool { border: 1px solid var(--line); border-radius: 3px; background: var(--surface); padding: 14px; min-width: 0; }
+.pool-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 12px; font: 600 12px "IBM Plex Mono", monospace; text-transform: uppercase; letter-spacing: .04em; }
+.pool-title small { color: var(--muted); font: 10px "IBM Plex Mono", monospace; text-transform: none; letter-spacing: 0; }
+.default-pool { border-color: color-mix(in srgb, var(--blue) 55%, var(--line)); }
+.default-pool .pool-title { color: var(--blue); }
+.blocks { display: grid; gap: 7px; }
+.block { min-height: 33px; display: flex; align-items: center; padding: 7px 9px; border: 1px solid var(--line); background: var(--surface-raised); font-size: 11px; }
+.no-borrow { display: grid; place-content: center; text-align: center; color: var(--muted); font: 9px/1.3 "IBM Plex Mono", monospace; }
+.no-borrow::before { content: "↛"; color: var(--orange); font-size: 27px; line-height: 1; margin-bottom: 4px; }
+.private-area { min-width: 0; }
+.private-pool { height: 100%; border: 1px dashed color-mix(in srgb, var(--orange) 72%, var(--line)); background: color-mix(in srgb, var(--orange) 5%, var(--surface)); }
+.private-pool .pool-title { color: var(--orange); }
+.islands { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.island { min-height: 62px; border: 1px dashed color-mix(in srgb, var(--orange) 65%, var(--line)); background: var(--surface-raised); padding: 8px; }
+.island strong { display: block; font: 600 11px "IBM Plex Mono", monospace; color: var(--orange); }
+.island span { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+.graph-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 15px 0 10px; }
+.graph-chip { padding: 6px 9px; border: 1px solid color-mix(in srgb, var(--green) 70%, var(--line)); background: color-mix(in srgb, var(--green) 10%, transparent); color: var(--green); font: 600 11px "IBM Plex Mono", monospace; }
+.high-water { height: 62px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--orange) 12%, transparent) 0 8px, transparent 8px 16px); color: var(--orange); font: 600 12px "IBM Plex Mono", monospace; }
+.warning { margin-top: 7px; color: var(--muted); font-size: 10px; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.metric { padding: 9px 11px; border-top: 1px solid var(--line); background: var(--surface); }
+.metric span { display: block; color: var(--muted); font: 10px "IBM Plex Mono", monospace; text-transform: uppercase; letter-spacing: .04em; }
+.metric strong { display: block; margin-top: 3px; font-size: 20px; font-weight: 500; }
+@media (max-width: 700px) {
+  .shell { height: auto; min-height: 650px; grid-template-rows: auto auto auto; }
+  .diagram { grid-template-columns: 1fr; grid-template-rows: auto 58px auto; min-height: 0; }
+  .private-area { min-height: 250px; }
+  .no-borrow::before { content: "↛"; transform: rotate(90deg); }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="tabs" role="tablist" aria-label="CUDA Graph memory strategy">
+    <button type="button" role="tab" aria-selected="true" tabindex="0" data-mode="one">1 max graph</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" data-mode="independent">4 separate graphs</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" data-mode="shared">4 shared-pool graphs</button>
+  </div>
+  <div class="diagram">
+    <section class="pool default-pool">
+      <div class="pool-title">default pool <small>ordinary allocator</small></div>
+      <div class="blocks">
+        <div class="block">parameters + weights</div>
+        <div class="block" id="external-storage">external input</div>
+        <div class="block">eager work</div>
+      </div>
+    </section>
+    <div class="no-borrow">no borrowing</div>
+    <div class="private-area" id="private-area"></div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><span>final allocated</span><strong id="allocated"></strong></div>
+    <div class="metric"><span>final reserved</span><strong id="reserved"></strong></div>
+    <div class="metric"><span>private reserved</span><strong id="private"></strong></div>
+  </div>
+</div>
+<script>
+const THEMES = {
+  slate: {bg:'#0e0e0e',surface:'#161616',raised:'#1d1d1d',text:'#d4d4d4',muted:'#999',line:'#303030',blue:'#68b5e6',orange:'#e3a15f',green:'#6f8f7b'},
+  default: {bg:'#f4f0e8',surface:'#eae6de',raised:'#f4f0e8',text:'#1a2e22',muted:'#6a7a6e',line:'#d0ccc4',blue:'#176d9c',orange:'#97551c',green:'#5f7f67'}
+};
+const MODES = {
+  one: {
+    allocated:144,reserved:168,private:52,
+    html:`<section class="pool private-pool"><div class="pool-title">graph-private pool <small>one graph</small></div><div class="high-water">52 MiB peak private reserved</div></section>`
+  },
+  independent: {
+    allocated:168,reserved:228,private:112,
+    html:`<section class="pool private-pool"><div class="pool-title">graph-private pools <small>four graphs</small></div><div class="islands"><div class="island"><strong>G1</strong></div><div class="island"><strong>G2</strong></div><div class="island"><strong>G3</strong></div><div class="island"><strong>G4</strong></div></div><div class="warning">8 graphs → 174 MiB private · 312 MiB reserved</div></section>`
+  },
+  shared: {
+    allocated:144,reserved:168,private:52,
+    html:`<section class="pool private-pool"><div class="pool-title">shared graph pool <small>non-overlapping</small></div><div class="graph-chips"><span class="graph-chip">256</span><span class="graph-chip">512</span><span class="graph-chip">768</span><span class="graph-chip">1024</span></div><div class="high-water">one 52 MiB peak private reserved</div><div class="warning">next replay may overwrite outputs</div></section>`
+  }
+};
+let mode='one';
+const buttons=[...document.querySelectorAll('[data-mode]')];
+function parentScheme(){try{return parent.document.body.dataset.mdColorScheme||parent.document.documentElement.dataset.mdColorScheme||'slate'}catch{return'slate'}}
+function applyTheme(){const theme=THEMES[parentScheme()]||THEMES.slate;const root=document.documentElement.style;for(const [key,value] of Object.entries(theme))root.setProperty(`--${key==='raised'?'surface-raised':key}`,value);root.colorScheme=parentScheme()==='default'?'light':'dark'}
+function render(){const data=MODES[mode];document.getElementById('private-area').innerHTML=data.html;document.getElementById('external-storage').textContent=mode==='shared'?'external input / output':'external input';document.getElementById('allocated').textContent=`${data.allocated} MiB`;document.getElementById('reserved').textContent=`${data.reserved} MiB`;document.getElementById('private').textContent=`${data.private} MiB`;buttons.forEach(button=>{const active=button.dataset.mode===mode;button.setAttribute('aria-selected',active);button.tabIndex=active?0:-1})}
+buttons.forEach((button,index)=>{button.addEventListener('click',()=>{mode=button.dataset.mode;render()});button.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight'].includes(event.key))return;event.preventDefault();const delta=event.key==='ArrowRight'?1:-1;const next=buttons[(index+delta+buttons.length)%buttons.length];next.focus();next.click()})});
+applyTheme();render();try{new MutationObserver(()=>{applyTheme();render()}).observe(parent.document.documentElement,{attributes:true,subtree:true,attributeFilter:['data-md-color-scheme']})}catch{}
+try{const fontLink=parent.document.querySelector('link[href*="fonts.googleapis.com"]');if(fontLink)document.head.append(fontLink.cloneNode())}catch{}
+</script>
+</body>
+</html>

@@ -254,18 +254,20 @@ class KDAAttention(nn.Module):
                 )
             initial_state = initial_state.to(device=hidden_states.device, dtype=torch.float32)
 
+        # --8<-- [start:kda-fixed-capacity-masking]
         # Keep the endpoint on-device: a captured graph rebuilds this one mask on
         # replay, then every value mask and gradient barrier below reuses it.
-        active_mask = (
+        active_mask = (  # (1)!
             active_token_mask(hidden_states, cu_seqlens)
             if self.mask_inactive_capacity and cu_seqlens is not None
             else None
         )
-        # A zero cotangent cannot neutralize a NaN activation in a weight reduction.
-        hidden_states = mask_inactive_tokens(hidden_states, active_mask)
+        # A zero `grad` cannot neutralize a NaN activation in a weight reduction.
+        hidden_states = mask_inactive_tokens(hidden_states, active_mask)  # (2)!
         hidden_states_compute, qkv = self.qkv_projection(hidden_states)
         # The short-convolution dInput suffix is undefined; keep it out of qkv_proj dW.
-        qkv = mask_inactive_token_gradients(qkv, active_mask)
+        qkv = mask_inactive_token_gradients(qkv, active_mask)  # (3)!
+        # --8<-- [end:kda-fixed-capacity-masking]
         qkv, final_conv_state = self.short_convolution(
             qkv,
             initial_conv_state,
