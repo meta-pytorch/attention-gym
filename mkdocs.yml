@@ -22,7 +22,9 @@ theme:
     text: IBM Plex Sans
     code: IBM Plex Mono
   features:
+    - content.code.annotate
     - content.code.copy
+    - navigation.footer
     - navigation.top
     - toc.follow
   logo: assets/hero.png
@@ -47,6 +49,7 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Concepts: concepts.md
+  - Tutorials: tutorials/index.md
   - Determinism: determinism.md
   - Masks: masks.md
   - Score Mods: mods.md
@@ -54,16 +57,25 @@ nav:
   - Examples: examples.md
   - Utilities: utilities.md
   - Developers:
+      - Documentation Authoring: developers/documentation.md
       - CI Health: developers/ci-health.md
 
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
-  - pymdownx.superfences
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
   - admonition
   - pymdownx.details
+  - pymdownx.snippets
   - attr_list
+  - md_in_html
   - toc:
       permalink: "#"

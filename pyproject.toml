@@ -61,9 +61,10 @@ viz = [
 ]
 
 docs = [
-    "mkdocs-material",
-    "mkdocstrings[python]",
-    "numpy",
+    "mkdocs-material==9.7.7",
+    "mkdocstrings[python]==1.0.6",
+    "mkdocstrings-python==2.0.5",
+    "numpy>=2,<3",
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------
