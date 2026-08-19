@@ -26,6 +26,9 @@ from attn_gym.linear.kda.ops import (
     chunk_fwd_ragged_op as _chunk_kda_fwd_ragged_op,
 )
 from attn_gym.linear.kda.ops import (
+    chunk_fwd_ragged_paged_op as _chunk_kda_fwd_ragged_paged_op,
+)
+from attn_gym.linear.kda.ops import (
     chunk_fwd_ragged_with_state_op as _chunk_kda_fwd_ragged_with_state_op,
 )
 from attn_gym.linear.kda.ops import (
@@ -86,6 +89,45 @@ def _validate_private_abi(
         raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
 
 
+def _validate_paged_private_abi(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    _validate_private_abi(q, k, v, cumulative_gate, beta, None)
+    heads, key_dim, value_dim = q.shape[2], q.shape[3], v.shape[-1]
+    if state_cache.dtype != torch.float32:
+        raise TypeError("the paged chunk state pool must use float32")
+    if state_cache.ndim != 4 or state_cache.shape[1:] != (heads, value_dim, key_dim):
+        raise ValueError(
+            "the paged chunk state pool must have shape "
+            f"[num_slots, {heads}, {value_dim}, {key_dim}]"
+        )
+    if state_cache.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+        raise ValueError("the paged chunk state pool must have dense [H, V, K] slots")
+    if state_cache.stride(0) < heads * key_dim * value_dim:
+        raise ValueError("paged chunk state slots must not overlap")
+    if state_cache.device != q.device or state_indices.device != q.device:
+        raise ValueError("the paged chunk state pool and indices must be on the QKV device")
+    if state_indices.dtype != torch.int32 or not state_indices.is_contiguous():
+        raise ValueError("paged chunk state indices must be contiguous int32")
+    if state_indices.shape != (cu_seqlens.shape[0] - 1,):
+        raise ValueError("paged chunk state indices must have one entry per sequence")
+    if has_initial_state is not None and (
+        has_initial_state.shape != state_indices.shape
+        or has_initial_state.dtype != torch.bool
+        or not has_initial_state.is_contiguous()
+        or has_initial_state.device != q.device
+    ):
+        raise ValueError("has_initial_state must be contiguous bool with one entry per sequence")
+
+
 def _chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -93,6 +135,8 @@ def _chunk_kda_fwd(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     *,
     output_final_state: bool,
@@ -121,6 +165,8 @@ def _chunk_kda_fwd(
             u,
             cumulative_gate,
             initial_state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
             chunk_size=_CHUNK_SIZE,
             output_final_state=output_final_state,
             metadata=metadata,
@@ -161,6 +207,8 @@ def _chunk_kda_fwd_shared(
         cumulative_gate,
         beta,
         initial_state,
+        None,
+        None,
         None,
         output_final_state=output_final_state,
         autotune=autotune,
@@ -238,6 +286,8 @@ def _chunk_kda_fwd_ragged_shared(
         cumulative_gate,
         beta,
         initial_state,
+        None,
+        None,
         metadata,
         output_final_state=output_final_state,
         autotune=autotune,
@@ -293,6 +343,53 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
         autotune,
         True,
     )
+
+
+def _chunk_kda_fwd_ragged_paged_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    autotune: bool,
+) -> torch.Tensor:
+    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    _validate_paged_private_abi(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+    )
+    metadata = RaggedChunkMetadata(
+        cu_seqlens,
+        chunk_offsets,
+        chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
+        _CHUNK_SIZE,
+    )
+    output, _state, _aqk, _akk = _chunk_kda_fwd(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        metadata,
+        output_final_state=False,
+        autotune=autotune,
+    )
+    return output
 
 
 def _prepare_chunk_kda_backward(
@@ -465,6 +562,7 @@ __all__ = [
     "_chunk_kda_bwd_with_state_grad_op",
     "_chunk_kda_fwd_op",
     "_chunk_kda_fwd_ragged_op",
+    "_chunk_kda_fwd_ragged_paged_op",
     "_chunk_kda_fwd_ragged_with_state_op",
     "_chunk_kda_fwd_with_state_op",
 ]

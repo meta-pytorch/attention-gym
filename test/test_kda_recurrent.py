@@ -66,9 +66,9 @@ def _strided_state_pool(
     storage = torch.randn(
         num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
     )
-    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, key_dim, value_dim)
+    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
     assert not state.is_contiguous()
-    assert state.stride()[1:] == (key_dim * value_dim, value_dim, 1)
+    assert state.stride()[1:] == (value_dim * key_dim, key_dim, 1)
     return storage, state
 
 
@@ -222,11 +222,11 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
         v,
         gate * LOG2_E,
         beta,
-        initial_state=before[slots.long()],
+        initial_state=before[slots.long()].transpose(-1, -2).contiguous(),
         output_final_state=True,
         cu_seqlens=cu_seqlens,
     )
-    expected_pool[slots.long()] = expected_state
+    expected_pool[slots.long()] = expected_state.transpose(-1, -2)
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
     # Rows the indices never name stay bitwise untouched.
@@ -246,7 +246,7 @@ def test_recurrent_paged_decode_accumulates_in_place():
     """Successive single-token steps advance each slot without a round trip."""
     _, pool = _strided_state_pool(5, 2, 64, 64)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    state = pool[slots.long()].clone()
+    state = pool[slots.long()].transpose(-1, -2).contiguous()
 
     for step in range(3):
         q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=20 + step)
@@ -255,7 +255,9 @@ def test_recurrent_paged_decode_accumulates_in_place():
             q, k, v, gate * LOG2_E, beta, initial_state=state, output_final_state=True
         )
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(pool[slots.long()], state, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            pool[slots.long()], state.transpose(-1, -2), rtol=1e-5, atol=1e-5
+        )
 
 
 @pytest.mark.parametrize("padding_slot", [0, -1])
@@ -275,19 +277,21 @@ def test_recurrent_paged_padding_slot_is_ignored(padding_slot: int):
         v[active],
         gate[active] * LOG2_E,
         beta[active],
-        initial_state=before[slots[active].long()],
+        initial_state=before[slots[active].long()].transpose(-1, -2).contiguous(),
         output_final_state=True,
     )
     torch.testing.assert_close(output[active], expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]), rtol=0, atol=0)
-    torch.testing.assert_close(pool[slots[active].long()], expected_state, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        pool[slots[active].long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
+    )
     torch.testing.assert_close(pool[0], before[0], rtol=0, atol=0)
 
 
 def test_recurrent_paged_validates_contract():
     """Reject a malformed or unsafely aliased state pool before launching."""
     q, k, v, gate, beta, _ = _inputs(batch=2, tokens=4)
-    pool = torch.randn(5, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    pool = torch.randn(5, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="requires initial_state"):
         recurrent_kda(q, k, v, gate, beta, state_indices=slots)

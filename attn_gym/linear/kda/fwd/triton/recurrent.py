@@ -102,8 +102,8 @@ def _kda_recurrent_fwd_kernel(
                 tl.store(output + p_output, 0.0, mask=m_v)
             return
         p_state = ptr_offset(
-            (i_state, i_h, o_k[:, None], o_v[None, :]),
-            (state_batch_stride, K * V, V, 1),
+            (i_state, i_h, o_v[None, :], o_k[:, None]),
+            (state_batch_stride, V * K, K, 1),
         )
     else:
         p_state = ptr_offset(
