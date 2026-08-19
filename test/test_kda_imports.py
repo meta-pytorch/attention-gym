@@ -35,7 +35,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
 
         builtins.__import__ = reject_optional_backends
 
-        from attn_gym.linear import chunk_kda, recurrent_kda
+        from attn_gym.linear import chunk_kda, recurrent_kda, recurrent_kda_decode
 
         shape = (1, 3, 1, 2)
         q = torch.randn(shape)
@@ -45,6 +45,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
         beta = torch.rand(shape[:3])
         recurrent_kda(q, k, v, gate, beta, impl='reference')
         chunk_kda(q, k, v, gate, beta, impl='reference')
+        assert callable(recurrent_kda_decode)
         """
     )
 
