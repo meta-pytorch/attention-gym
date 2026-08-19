@@ -17,9 +17,8 @@ triton = pytest.importorskip("triton")
 from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_kernel_dAv
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
-from attn_gym.linear.kda.fwd.triton.chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-)
+from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
     chunk_gla_fwd_kernel_o,
     chunk_gla_fwd_o_gk,
@@ -606,7 +605,7 @@ def test_chunk_gla_fwd_o_gk_tma(dtype, T):
 
 
 def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
-    """Reference for ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` (USE_GK + USE_EXP2).
+    """Reference for ``chunk_gated_delta_rule_fwd_h``.
 
     Per chunk, with state ``S`` in ``[K, V]``::
 
@@ -648,6 +647,10 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     ],
     ids=["single-fp16", "multi-state-bf16", "tail-bf16"],
 )
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="the KDA recurrence requires CUDA capability 10.0",
+)
 def test_chunk_delta_h_fwd(dtype, T, use_h0):
     torch.manual_seed(12)
     B, H, K, V = 1, 2, 128, 128
@@ -663,33 +666,51 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     )
     rh, rvn, rht = _fwd_h_ref(k, w, v, gk, h0)
 
-    h = torch.empty(B * triton.cdiv(T, 64), H, K, V, device="cuda", dtype=dtype)
-    v_new = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
-    ht = torch.empty(B, H, K, V, device="cuda", dtype=torch.float32)
-    grid = lambda meta: (B * H, triton.cdiv(V, meta["BV"]))
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
-        k,
-        v,
-        w,
-        v_new,
-        None,
-        gk,
-        h,
-        h0,
-        ht,
-        None,
-        None,
-        T,
-        H=H,
-        K=K,
-        V=V,
-        BT=64,
-        USE_EXP2=True,
-    )
+    # The dense path requires complete chunks; partial tails go through the
+    # packed schedule like production ragged batches do.
+    metadata = None
+    if T % 64:
+        cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+        metadata = prepare_ragged_chunk_metadata(cu_seqlens, T, 64)
+    h, v_new, ht = chunk_gated_delta_rule_fwd_h(k, w, v, gk, h0, metadata=metadata)
+
+    num_chunks = triton.cdiv(T, 64)
     tag = f"T={T} h0={use_h0}"
-    assert_golden(h, gh, rh, dtype, f"delta_h h {tag}")
+    assert_golden(
+        h[:, :num_chunks].reshape(B * num_chunks, H, K, V), gh, rh, dtype, f"delta_h h {tag}"
+    )
     assert_golden(v_new, gvn, rvn, dtype, f"delta_h v_new {tag}")
     assert_golden(ht, ght, rht, dtype, f"delta_h ht {tag}")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="the KDA recurrence requires CUDA capability 10.0",
+)
+def test_chunk_delta_h_fwd_fp32_path():
+    """FP32 takes the non-warp-specialized BV=32 launch; dots still run in TF32."""
+    torch.manual_seed(12)
+    B, T, H, K, V = 1, 66, 2, 128, 128
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32)
+    w = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.float32)
+    gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
+
+    gh, gvn, ght = _fwd_h_ref(k.double(), w.double(), v.double(), gk.double(), None)
+    cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, T, 64)
+    h, v_new, ht = chunk_gated_delta_rule_fwd_h(k, w, v, gk, None, metadata=metadata)
+
+    num_chunks = triton.cdiv(T, 64)
+    # TF32 mantissa error compounds through the sequential state updates, so
+    # this is a path-coverage check at TF32 tolerances, not a precision
+    # guarantee (the dots ran in TF32 before this kernel, too).
+    tf32 = dict(atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(
+        h[:, :num_chunks].reshape(B * num_chunks, H, K, V).double(), gh, **tf32
+    )
+    torch.testing.assert_close(v_new.double(), gvn, **tf32)
+    torch.testing.assert_close(ht.double(), ght, **tf32)
 
 
 def _fwd_intra_ref(q, k, gk, beta, scale, chunk_size=64, BC=16, causal_normref=True):

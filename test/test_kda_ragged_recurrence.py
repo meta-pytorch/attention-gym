@@ -10,8 +10,8 @@ from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="the KDA recurrence kernel requires CUDA",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="the KDA recurrence kernel requires CUDA capability 10.0",
 )
 
 
@@ -100,7 +100,8 @@ def test_ragged_recurrence_rejects_mismatched_metadata_chunk_size():
         )
 
 
-def test_ragged_recurrence_fullgraph():
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_ragged_recurrence_fullgraph(output_final_state: bool):
     torch.manual_seed(3)
     lengths = [65, 63]
     tokens = sum(lengths)
@@ -114,10 +115,14 @@ def test_ragged_recurrence_fullgraph():
 
     def operation(k, w, u, gk, initial_state, cu_seqlens):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-        return chunk_gated_delta_rule_fwd_h(k, w, u, gk, initial_state, metadata=metadata)
+        return chunk_gated_delta_rule_fwd_h(
+            k, w, u, gk, initial_state, metadata=metadata, output_final_state=output_final_state
+        )
 
     expected = operation(k, w, u, gk, initial_state, cu_seqlens)
     actual = torch.compile(operation, fullgraph=True)(k, w, u, gk, initial_state, cu_seqlens)
+    if not output_final_state:
+        assert actual[2] is None and expected[2] is None
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -163,3 +168,34 @@ def test_ragged_recurrence_replays_aligned_to_ragged():
     torch.testing.assert_close(v_new, expected_v, rtol=0, atol=0)
     torch.testing.assert_close(h[:, :3], expected_h[:, :3], rtol=0, atol=0)
     torch.testing.assert_close(final_state, expected_final, rtol=0, atol=0)
+
+
+def test_delta_h_opcheck():
+    """Schema/fake consistency for the registered op pair, dense and ragged."""
+    from attn_gym.linear.kda.ops import delta_h_op, delta_h_with_state_op
+
+    torch.manual_seed(5)
+    lengths = [65, 63]
+    tokens = sum(lengths)
+    shape = (1, tokens, 1, 128)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    w = torch.randn_like(k) / 8
+    u = torch.randn_like(k) / 8
+    gk = -torch.rand(shape, device="cuda")
+    initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    ragged_args = (
+        k,
+        w,
+        u,
+        gk,
+        initial_state,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        metadata.capacity,
+    )
+    torch.library.opcheck(delta_h_op, ragged_args)
+    torch.library.opcheck(delta_h_with_state_op, ragged_args)
+    dense_args = (k, w, u, gk, None, None, None, tokens // 64)
+    torch.library.opcheck(delta_h_op, dense_args)
+    torch.library.opcheck(delta_h_with_state_op, dense_args)
