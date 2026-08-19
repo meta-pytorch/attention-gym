@@ -358,8 +358,8 @@ def _recurrent_fwd_no_state_fake(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    del q, k, gate, beta, initial_state, cu_seqlens
-    return torch.empty_like(v)
+    del k, gate, beta, initial_state, cu_seqlens
+    return torch.empty_like(v, dtype=q.dtype)
 
 
 @torch.library.register_fake("attn_gym::kda_recurrent_fwd_paged")
@@ -373,8 +373,8 @@ def _recurrent_fwd_paged_fake(
     state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    del q, k, gate, beta, state_cache, state_indices, cu_seqlens
-    return torch.empty_like(v)
+    del k, gate, beta, state_cache, state_indices, cu_seqlens
+    return torch.empty_like(v, dtype=q.dtype)
 
 
 @torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
