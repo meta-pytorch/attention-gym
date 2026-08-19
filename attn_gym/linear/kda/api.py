@@ -196,9 +196,9 @@ def recurrent_kda(
                 seq 1 is padding (index is -1) so this is ignored
                 seq 2 reads and updates initial_state[5]
                 seq 3 is padding bc 0
-        autotune: Reserved for implementation parity with ``chunk_kda``. The
-            current recurrent kernel uses the same fixed launch policy for both
-            values.
+        autotune: Benchmark candidate value-tile sizes for non-paged execution
+            when true; winners are cached and reused. Paged execution and false
+            use a deterministic sequence-length heuristic.
         impl: ``"fused"`` uses the inference-only optimized scan; ``"reference"``
             uses differentiable eager PyTorch in FP32, with no automatic
             fallback.
@@ -211,7 +211,6 @@ def recurrent_kda(
     sequences and final states are written out of place, decode preprocessing and scan are
     separate launches, and speculative-decoding rollback is unsupported.
     """
-    del autotune
     selected_impl = resolve_impl(impl)
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
@@ -241,6 +240,7 @@ def recurrent_kda(
             cu_seqlens=cu_seqlens,
             output_final_state=output_final_state,
             state_indices=state_indices,
+            autotune=autotune,
         )
     return reference_kda(
         naive_recurrent_kda, q, k, v, gate, beta, initial_state, cu_seqlens, output_final_state

@@ -59,7 +59,7 @@ torch.library.define(
 
 _RECURRENT_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
-    " Tensor? initial_state, Tensor? cu_seqlens)"
+    " Tensor? initial_state, Tensor? cu_seqlens, bool autotune)"
 )
 torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
@@ -68,7 +68,7 @@ torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS
 torch.library.define(
     "attn_gym::kda_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache,"
-    " Tensor state_indices, Tensor? cu_seqlens) -> Tensor",
+    " Tensor state_indices, Tensor? cu_seqlens, bool autotune) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_prepare_chunk_offsets",
@@ -339,8 +339,9 @@ def _recurrent_fwd_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del k, gate, beta, initial_state
+    del k, gate, beta, initial_state, autotune
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = q.new_empty(
         num_sequences, q.shape[2], q.shape[3], v.shape[-1], dtype=torch.float32
@@ -357,8 +358,9 @@ def _recurrent_fwd_no_state_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, initial_state, cu_seqlens
+    del k, gate, beta, initial_state, cu_seqlens, autotune
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -372,8 +374,9 @@ def _recurrent_fwd_paged_fake(
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, state_cache, state_indices, cu_seqlens
+    del k, gate, beta, state_cache, state_indices, cu_seqlens, autotune
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -454,6 +457,7 @@ def recurrent_forward(
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and invoke the lazily loaded fused recurrent implementation."""
     if q.shape[-1] > 256:
@@ -474,13 +478,15 @@ def recurrent_forward(
         # `.contiguous()` on the pool would copy and silently drop the in-place advance.
         assert initial_state is not None
         return recurrent_fwd_paged_op(
-            q, k, v, gate, beta, initial_state, state_indices, cu_seqlens
+            q, k, v, gate, beta, initial_state, state_indices, cu_seqlens, autotune
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
     if output_final_state:
-        return recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens)
-    return recurrent_fwd_no_state_op(q, k, v, gate, beta, initial_state, cu_seqlens), None
+        return recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, autotune)
+    return recurrent_fwd_no_state_op(
+        q, k, v, gate, beta, initial_state, cu_seqlens, autotune
+    ), None
 
 
 __all__ = [
