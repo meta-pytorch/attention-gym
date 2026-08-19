@@ -258,12 +258,15 @@ dimension, and stays differentiable. There is no automatic fallback between the 
 the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly
 32 tokens per sequence).
 
-The serving limitations listed under `recurrent_kda` below are deliberate and
-the contract is otherwise stable to build against; CUDA-graph capture amortizes
-the multi-launch decode step.
+`recurrent_kda_decode` is the serving-specific one-token path. It consumes
+head-interleaved post-convolution QKV, raw gate and beta projections, and a paged
+state cache. Q/K normalization, gate activation, beta sigmoid, recurrence, output,
+and state-cache update run in one Triton kernel.
 
 ::: attn_gym.linear.chunk_kda
 
 ::: attn_gym.linear.recurrent_kda
+
+::: attn_gym.linear.recurrent_kda_decode
 
 ::: attn_gym.linear.Impl

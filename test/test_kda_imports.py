@@ -45,6 +45,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
             mask_inactive_token_gradients,
             mask_inactive_tokens,
             recurrent_kda,
+            recurrent_kda_decode,
         )
         from attn_gym.linear.kda import bound_gate
 
@@ -75,6 +76,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
         assert not hasattr(linear, 'bounded_gate_cumsum')
         recurrent_kda(q, k, v, gate, beta, impl='reference')
         chunk_kda(q, k, v, gate, beta, impl='reference')
+        assert callable(recurrent_kda_decode)
         """
     )
 
