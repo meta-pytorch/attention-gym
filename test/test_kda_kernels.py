@@ -705,7 +705,7 @@ def test_chunk_delta_h_fwd_fp32_path():
     # TF32 mantissa error compounds through the sequential state updates, so
     # this is a path-coverage check at TF32 tolerances, not a precision
     # guarantee (the dots ran in TF32 before this kernel, too).
-    tf32 = dict(atol=1e-1, rtol=5e-2)
+    tf32 = {"atol": 1e-1, "rtol": 5e-2}
     torch.testing.assert_close(
         h[:, :num_chunks].reshape(B * num_chunks, H, K, V).double(), gh, **tf32
     )
