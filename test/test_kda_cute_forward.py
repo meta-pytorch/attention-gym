@@ -29,6 +29,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,
     _chunk_kda_fwd_op,
+    _chunk_kda_fwd_ragged_paged_op,
     _chunk_kda_fwd_with_state_op,
 )
 
@@ -94,6 +95,22 @@ def _head_major_view(tensor: torch.Tensor) -> torch.Tensor:
     storage = tensor.detach().permute(0, 2, 1, 3).contiguous()
     storage.requires_grad_(tensor.requires_grad)
     return storage.permute(0, 2, 1, 3)
+
+
+def _strided_state_pool(
+    num_slots: int,
+    heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state_elements = heads * 128 * 128
+    storage = torch.randn(
+        num_slots,
+        state_elements + 29,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    pool = storage[:, :state_elements].view(num_slots, heads, 128, 128)
+    assert not pool.is_contiguous()
+    return storage, pool
 
 
 def _assert_golden(
@@ -321,6 +338,125 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
             torch.bfloat16,
             f"packed input gradient {index}",
         )
+
+
+def test_optimized_chunk_kda_paged_updates_strided_pool():
+    """Read and advance routed cache slots without touching page padding."""
+    torch.manual_seed(29)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=192, heads=2))
+    q, k, v, cumulative_gate, beta = inputs
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    storage, pool = _strided_state_pool(6, q.shape[2])
+    expected_storage = storage.clone()
+    state_elements = pool[0].numel()
+    expected_pool = expected_storage[:, :state_elements].view_as(pool)
+
+    expected_output, expected_state = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        expected_pool[slots.long()].clone(),
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    assert expected_state is not None
+    expected_pool[slots.long()] = expected_state
+
+    output, final_state = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+    )
+
+    assert final_state is None
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
+
+
+def test_optimized_chunk_kda_paged_ignores_padding_slots():
+    """Zero padding outputs and leave non-positive cache routes untouched."""
+    torch.manual_seed(31)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=128, heads=2))
+    q, k, v, cumulative_gate, beta = inputs
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
+    storage, pool = _strided_state_pool(5, q.shape[2])
+    before = storage.clone()
+
+    output, final_state = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+    )
+
+    expected, expected_state = chunk_kda(
+        q[:, :64],
+        k[:, :64],
+        v[:, :64],
+        cumulative_gate[:, :64],
+        beta[:, :64],
+        before[3:4, : pool[0].numel()].view(1, q.shape[2], 128, 128),
+        output_final_state=True,
+    )
+    assert final_state is None and expected_state is not None
+    torch.testing.assert_close(output[:, :64], expected, rtol=0, atol=0)
+    torch.testing.assert_close(output[:, 64:], torch.zeros_like(output[:, 64:]), rtol=0, atol=0)
+    torch.testing.assert_close(pool[3], expected_state[0], rtol=0, atol=0)
+    torch.testing.assert_close(storage[0], before[0], rtol=0, atol=0)
+
+
+def test_optimized_chunk_kda_paged_zero_initializes_new_slots():
+    torch.manual_seed(47)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=128, heads=2))
+    q, k, v, cumulative_gate, beta = inputs
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([True, False], device="cuda")
+    storage, pool = _strided_state_pool(5, q.shape[2])
+    before = storage.clone()
+
+    output, _ = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+        has_initial_state=has_initial_state,
+    )
+    state_elements = pool[0].numel()
+    original_slot = before[4, :state_elements].view_as(pool[4])
+    expected_initial = torch.stack((original_slot, torch.zeros_like(pool[2])))
+    expected_output, expected_state = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        expected_initial,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+
+    assert expected_state is not None
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool[2], expected_state[1], rtol=0, atol=0)
+    torch.testing.assert_close(storage[0], before[0], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -633,6 +769,36 @@ def test_chunk_kda_op_registration():
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
 
 
+def test_chunk_kda_paged_op_registration():
+    """Validate the mutating paged schema, fake tensor, and AOT behavior."""
+    torch.manual_seed(37)
+    q, k, v, cumulative_gate, beta = (tensor.detach() for tensor in _inputs(tokens=128, heads=2))
+    cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
+    _storage, pool = _strided_state_pool(5, q.shape[2])
+    slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([True, False], device="cuda")
+
+    torch.library.opcheck(
+        _chunk_kda_fwd_ragged_paged_op,
+        (
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            pool,
+            slots,
+            has_initial_state,
+            cu_seqlens,
+            metadata.chunk_offsets,
+            True,
+        ),
+        rtol=2e-2,
+        atol=2e-3,
+    )
+
+
 def test_chunk_kda_backward_op_registration():
     """Validate the intentionally first-order backward operator registrations."""
     torch.manual_seed(6)
@@ -788,6 +954,31 @@ def test_chunk_kda_packed_fullgraph_forward_and_backward():
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+def test_chunk_kda_paged_fullgraph_compile():
+    """Compile the public paged path while preserving in-place cache updates."""
+    torch.manual_seed(41)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=192, heads=2))
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    eager_storage, eager_pool = _strided_state_pool(6, inputs[0].shape[2])
+    compiled_storage, compiled_pool = _strided_state_pool(6, inputs[0].shape[2])
+    compiled_storage.copy_(eager_storage)
+
+    def operation(state_pool):
+        return chunk_kda(
+            *inputs,
+            state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+        )[0]
+
+    expected = operation(eager_pool)
+    output = torch.compile(operation, fullgraph=True)(compiled_pool)
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(compiled_storage, eager_storage, rtol=0, atol=0)
+
+
 def test_chunk_kda_fullgraph_unaligned_qkv_fallback():
     """Apply the same runtime alignment fallback in eager and compiled execution."""
     torch.manual_seed(31)
@@ -900,6 +1091,65 @@ def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+def test_chunk_kda_paged_cuda_graph_replay():
+    """Replay changed cache routing, values, and packed boundaries."""
+    torch.manual_seed(43)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=192, heads=2))
+    q, k, v, cumulative_gate, beta = inputs
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    storage, pool = _strided_state_pool(7, q.shape[2])
+    chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = chunk_kda(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+        )
+
+    with torch.no_grad():
+        storage.add_(0.25)
+        slots.copy_(torch.tensor([6, 1], device="cuda", dtype=torch.int32))
+        cu_seqlens.copy_(torch.tensor([0, 128, 192], device="cuda", dtype=torch.int32))
+        v.mul_(0.9)
+    expected_storage = storage.clone()
+    state_elements = pool[0].numel()
+    expected_pool = expected_storage[:, :state_elements].view_as(pool)
+    expected, _ = chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        expected_pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+    )
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("cut", [5, 8, 37])
 def test_chunk_kda_forward_prefix_ignores_future_tokens(cut):
     """Perturbing only future tokens must leave causal-prefix output bitwise unchanged.
@@ -956,3 +1206,30 @@ def test_chunk_kda_validates_public_contract():
         chunk_kda(q, k, v, cumulative_gate, beta.cpu())
     with pytest.raises(TypeError, match="inputs must use one of"):
         chunk_kda(q.double(), k, v, cumulative_gate, beta)
+
+    _storage, pool = _strided_state_pool(3, q.shape[2])
+    slots = torch.tensor([2], device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="drop output_final_state"):
+        chunk_kda(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            pool,
+            state_indices=slots,
+            output_final_state=True,
+        )
+    with pytest.raises(ValueError, match="requires impl='fused'"):
+        chunk_kda(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            pool,
+            state_indices=slots,
+            impl="reference",
+        )
+    with pytest.raises(RuntimeError, match="inference-only"):
+        chunk_kda(q.requires_grad_(), k, v, cumulative_gate, beta, pool, state_indices=slots)

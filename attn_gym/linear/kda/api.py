@@ -36,6 +36,8 @@ def chunk_kda(
     *,
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     fastmath: bool = False,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
@@ -57,6 +59,15 @@ def chunk_kda(
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
         output_final_state: Return the final recurrent state with the output.
+            Rejected together with ``state_indices``, which advances a paged
+            state pool in place.
+        state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
+            selecting rows of a paged ``initial_state`` pool shaped
+            ``[num_slots, H, K, V]``. Positive slots are advanced in place;
+            non-positive slots produce zero output and leave the pool untouched.
+            ``"fused"`` inference only.
+        has_initial_state: Optional contiguous boolean mask, one per logical sequence.
+            False entries start from zero before their selected slot is advanced.
         fastmath: Allow less precise fused math for speed; rejected with
             ``"reference"``.
         autotune: Benchmark candidate kernel configurations when true (winners
@@ -79,11 +90,25 @@ def chunk_kda(
         v,
         cumulative_gate,
         beta,
-        initial_state,
+        None if state_indices is not None else initial_state,
         cu_seqlens,
         op_name="chunk_kda",
         gate_name="cumulative_gate",
     )
+    if state_indices is not None:
+        _validate_paged_state(
+            q,
+            v,
+            initial_state,
+            cu_seqlens,
+            state_indices,
+            output_final_state,
+            has_initial_state,
+        )
+        if selected_impl is not Impl.FUSED:
+            raise ValueError("state_indices requires impl='fused'")
+    elif has_initial_state is not None:
+        raise ValueError("has_initial_state requires state_indices")
     if selected_impl is Impl.FUSED:
         return _fused_chunk_forward(
             q,
@@ -94,6 +119,8 @@ def chunk_kda(
             initial_state,
             cu_seqlens=cu_seqlens,
             output_final_state=output_final_state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
             fastmath=fastmath,
             autotune=autotune,
         )
@@ -117,6 +144,7 @@ def _validate_paged_state(
     cu_seqlens: torch.Tensor | None,
     state_indices: torch.Tensor,
     output_final_state: bool,
+    has_initial_state: torch.Tensor | None = None,
 ) -> None:
     """Validate the paged state pool and its slot indices."""
     if initial_state is None:
@@ -146,6 +174,16 @@ def _validate_paged_state(
         raise ValueError(
             f"state_indices must be a contiguous int32 tensor of shape ({num_sequences},) "
             f"on q.device, got {tuple(state_indices.shape)} of {state_indices.dtype}"
+        )
+    if has_initial_state is not None and (
+        tuple(has_initial_state.shape) != (num_sequences,)
+        or has_initial_state.dtype != torch.bool
+        or not has_initial_state.is_contiguous()
+        or has_initial_state.device != q.device
+    ):
+        raise ValueError(
+            "has_initial_state must be a contiguous bool tensor with one entry "
+            "per sequence on q.device"
         )
 
 

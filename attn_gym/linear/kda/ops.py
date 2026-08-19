@@ -40,6 +40,13 @@ torch.library.define(
     "attn_gym::kda_chunk_fwd_ragged_with_state",
     f"{_CHUNK_RAGGED_FWD_ARGS} -> (Tensor, Tensor, Tensor, Tensor)",
 )
+torch.library.define(
+    "attn_gym::kda_chunk_fwd_ragged_paged",
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
+    "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
+    "Tensor cu_seqlens, "
+    "Tensor chunk_offsets, bool autotune) -> Tensor",
+)
 
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
@@ -87,6 +94,13 @@ torch.library.define(
     "attn_gym::kda_delta_h_with_state",
     f"{_DELTA_H_ARGS} -> (Tensor, Tensor, Tensor)",
 )
+torch.library.define(
+    "attn_gym::kda_delta_h_paged",
+    "(Tensor k, Tensor w, Tensor u, Tensor gk, Tensor(a!) state_cache, "
+    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, "
+    "Tensor? chunk_offsets, "
+    "SymInt capacity) -> (Tensor, Tensor)",
+)
 
 
 def _chunk_backend():
@@ -131,6 +145,10 @@ def _chunk_fwd_ragged_with_state_cuda(*args):
     return _chunk_backend()._chunk_kda_fwd_ragged_with_state_cuda(*args)
 
 
+def _chunk_fwd_ragged_paged_cuda(*args):
+    return _chunk_backend()._chunk_kda_fwd_ragged_paged_cuda(*args)
+
+
 def _chunk_bwd_cuda(*args):
     return _chunk_backend()._chunk_kda_bwd_cuda(*args)
 
@@ -159,6 +177,10 @@ def _delta_h_with_state_cuda(*args):
     return _delta_h_backend()._delta_h_with_state_cuda(*args)
 
 
+def _delta_h_paged_cuda(*args):
+    return _delta_h_backend()._delta_h_paged_cuda(*args)
+
+
 def _prepare_chunk_offsets_cuda(*args):
     from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
 
@@ -172,6 +194,11 @@ torch.library.impl(
     "attn_gym::kda_chunk_fwd_ragged_with_state",
     "CUDA",
     _chunk_fwd_ragged_with_state_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_fwd_ragged_paged",
+    "CUDA",
+    _chunk_fwd_ragged_paged_cuda,
 )
 torch.library.impl("attn_gym::kda_chunk_bwd", "CUDA", _chunk_bwd_cuda)
 torch.library.impl(
@@ -197,6 +224,7 @@ torch.library.impl(
 )
 torch.library.impl("attn_gym::kda_delta_h", "CUDA", _delta_h_cuda)
 torch.library.impl("attn_gym::kda_delta_h_with_state", "CUDA", _delta_h_with_state_cuda)
+torch.library.impl("attn_gym::kda_delta_h_paged", "CUDA", _delta_h_paged_cuda)
 
 
 def _chunk_fwd_fake_common(q: torch.Tensor, v: torch.Tensor):
@@ -272,6 +300,34 @@ def _chunk_fwd_ragged_with_state_fake(
         dtype=torch.float32,
     )
     return output, state, aqk, akk
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_fwd_ragged_paged")
+def _chunk_fwd_ragged_paged_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    autotune: bool,
+) -> torch.Tensor:
+    del (
+        k,
+        cumulative_gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        chunk_offsets,
+        autotune,
+    )
+    return v.new_empty(v.shape, dtype=q.dtype)
 
 
 def _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta):
@@ -429,10 +485,28 @@ def _delta_h_with_state_fake(
     return h, v_new, final_state
 
 
+@torch.library.register_fake("attn_gym::kda_delta_h_paged")
+def _delta_h_paged_fake(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del w, gk, state_cache, state_indices, has_initial_state, cu_seqlens, chunk_offsets
+    return _delta_h_fake_common(k, u, capacity)
+
+
 chunk_fwd_op = torch.ops.attn_gym.kda_chunk_fwd.default
 chunk_fwd_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_with_state.default
 chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
 chunk_fwd_ragged_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_with_state.default
+chunk_fwd_ragged_paged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_paged.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
@@ -441,6 +515,7 @@ recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
 prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
 delta_h_op = torch.ops.attn_gym.kda_delta_h.default
 delta_h_with_state_op = torch.ops.attn_gym.kda_delta_h_with_state.default
+delta_h_paged_op = torch.ops.attn_gym.kda_delta_h_paged.default
 
 
 def recurrent_forward(
@@ -488,9 +563,11 @@ __all__ = [
     "chunk_bwd_with_state_grad_op",
     "chunk_fwd_op",
     "chunk_fwd_ragged_op",
+    "chunk_fwd_ragged_paged_op",
     "chunk_fwd_ragged_with_state_op",
     "chunk_fwd_with_state_op",
     "delta_h_op",
+    "delta_h_paged_op",
     "delta_h_with_state_op",
     "prepare_chunk_offsets_op",
     "recurrent_forward",
