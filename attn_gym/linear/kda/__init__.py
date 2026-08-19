@@ -13,7 +13,7 @@ lazily on first fused call, and the naive oracles in
 
 import importlib
 
-from attn_gym.linear.kda.api import chunk_kda, recurrent_kda
+from attn_gym.linear.kda.api import chunk_kda, recurrent_kda, recurrent_kda_decode
 from attn_gym.linear.kda.masking import (
     active_token_mask,
     mask_inactive_token_gradients,
@@ -51,6 +51,7 @@ __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
         "mask_inactive_token_gradients",
         "mask_inactive_tokens",
         "recurrent_kda",
+        "recurrent_kda_decode",
         *_BACKEND_EXPORTS,
     ]
 )

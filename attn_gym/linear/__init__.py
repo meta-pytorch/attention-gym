@@ -16,6 +16,7 @@ from attn_gym.linear.kda import (
     mask_inactive_token_gradients,
     mask_inactive_tokens,
     recurrent_kda,
+    recurrent_kda_decode,
 )
 from attn_gym.linear.kda.api import Impl
 
@@ -34,6 +35,7 @@ KDA_OPS = [
     "bounded_gate_cumsum",
     "chunk_kda",
     "recurrent_kda",
+    "recurrent_kda_decode",
 ]
 
 GDN_OPS = [
