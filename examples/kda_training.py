@@ -33,10 +33,12 @@ KDA operator.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from functools import wraps
+from importlib import import_module
+from importlib.util import find_spec
 from itertools import accumulate
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
@@ -45,6 +47,7 @@ import torch
 import torch.nn.functional as F
 import typer
 from torch import nn
+from torch.cuda.graph_annotations import mark_kernels
 
 from attn_gym.linear.kda import (
     active_token_mask,
@@ -73,18 +76,45 @@ def _record_function(enabled: bool, name: str):
     return torch.profiler.record_function(name) if enabled else nullcontext()
 
 
-def record_function(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Label a KDA stage when the module has profiling ranges enabled."""
+@contextmanager
+def _profile_trace(
+    enabled: bool,
+    path: Path,
+    activities: list[torch.profiler.ProfilerActivity],
+) -> Iterator[torch.profiler.profile | None]:
+    """Export an enhanced trace when transformer-nuggets is installed."""
+    if not enabled:
+        yield None
+        return
+
+    if find_spec("transformer_nuggets") is not None:
+        profiler = import_module("transformer_nuggets.utils.benchmark").profiler
+        with profiler(path, record_shapes=True, trace_format="chrome_json") as active_profiler:
+            yield active_profiler
+        return
+
+    with torch.profiler.profile(activities=activities) as active_profiler:
+        yield active_profiler
+    active_profiler.export_chrome_trace(str(path))
+
+
+def _kernel_annotation(enabled: bool, name: str):
+    """Annotate captured CUDA Graph nodes only when explicitly enabled."""
+    return mark_kernels(name) if enabled else nullcontext()
+
+
+def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Label one KDA stage during annotation-enabled CUDA Graph capture."""
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(function)
-        def profiled(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not self.profile_ranges:
+        def annotated(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if not self.enable_graph_annotations:
                 return function(self, *args, **kwargs)
-            with torch.profiler.record_function(name.format(backend=self.backend)):
+            with mark_kernels(name.format(backend=self.backend)):
                 return function(self, *args, **kwargs)
 
-        return profiled
+        return annotated
 
     return decorate
 
@@ -125,6 +155,10 @@ class KDAAttention(nn.Module):
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
     without changing the physical shape. Leave the option disabled for dense or
     exact-packed inputs to avoid masking work.
+
+    Set ``enable_graph_annotations=True`` only when calling the module inside
+    ``torch.cuda.graph(..., enable_annotations=True)``. Leave it disabled for
+    ``torch.compile`` because ``mark_kernels`` is intentionally not traceable.
     """
 
     def __init__(
@@ -141,7 +175,7 @@ class KDAAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         compute_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
-        profile_ranges: bool = False,
+        enable_graph_annotations: bool = False,
         mask_inactive_capacity: bool = False,
     ) -> None:
         super().__init__()
@@ -168,7 +202,7 @@ class KDAAttention(nn.Module):
         self.backend = backend
         self.fastmath = fastmath
         self.rms_norm_eps = rms_norm_eps
-        self.profile_ranges = profile_ranges
+        self.enable_graph_annotations = enable_graph_annotations
         self.mask_inactive_capacity = mask_inactive_capacity
         self.compute_dtype = (
             (torch.bfloat16 if backend == "fused" else torch.float32)
@@ -258,11 +292,14 @@ class KDAAttention(nn.Module):
         # These barriers exclude undefined primitive dInputs from projection dW.
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
         beta = mask_inactive_token_gradients(beta, active_mask)
-        metadata = (
-            None
-            if cu_seqlens is None
-            else prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
-        )
+        if cu_seqlens is None:
+            metadata = None
+        else:
+            with _kernel_annotation(
+                self.enable_graph_annotations,
+                "kda/chunk_metadata",
+            ):
+                metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
         if metadata is None:
             cumulative_gate = self.gate_prefix_sum(raw_gate)
             output, final_state = self.kda_core(
@@ -275,7 +312,10 @@ class KDAAttention(nn.Module):
                 return_final_state=return_final_state,
             )
         else:
-            with _record_function(self.profile_ranges, "kda/gate_prefix_sum/fused"):
+            with _kernel_annotation(
+                self.enable_graph_annotations,
+                "kda/gate_prefix_sum/fused",
+            ):
                 cumulative_gate = _bounded_gate_cumsum(
                     raw_gate,
                     self.A_log,
@@ -283,10 +323,12 @@ class KDAAttention(nn.Module):
                     chunk_size=self.chunk_size,
                     lower_bound=self.lower_bound,
                     fastmath=self.fastmath,
-                    profile_ranges=self.profile_ranges,
                     metadata=metadata,
                 )
-            with _record_function(self.profile_ranges, "kda/core/fused"):
+            with _kernel_annotation(
+                self.enable_graph_annotations,
+                "kda/core/fused",
+            ):
                 output, final_state = _chunk_kda(
                     q,
                     k,
@@ -311,13 +353,13 @@ class KDAAttention(nn.Module):
             final_conv_state,
         )
 
-    @record_function("kda/qkv_projection")
+    @annotate_kernels("kda/qkv_projection")
     def qkv_projection(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.to(self.compute_dtype)
         qkv = F.linear(hidden_states, self.qkv_proj.weight.to(self.compute_dtype))
         return hidden_states, qkv
 
-    @record_function("kda/short_convolution")
+    @annotate_kernels("kda/short_convolution")
     def short_convolution(
         self,
         qkv: torch.Tensor,
@@ -361,7 +403,7 @@ class KDAAttention(nn.Module):
         final_state = conv_input[:, tokens:].clone() if return_final_state else None
         return qkv, final_state
 
-    @record_function("kda/qk_normalization")
+    @annotate_kernels("kda/qk_normalization")
     def qk_normalization(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -370,7 +412,7 @@ class KDAAttention(nn.Module):
 
         return l2norm(q), l2norm(k)
 
-    @record_function("kda/gate_projections")
+    @annotate_kernels("kda/gate_projections")
     def gate_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, tokens, _ = hidden_states.shape
         gate_features = F.linear(
@@ -392,7 +434,7 @@ class KDAAttention(nn.Module):
         )
         return raw_gate.contiguous(), beta
 
-    @record_function("kda/gate_prefix_sum/{backend}")
+    @annotate_kernels("kda/gate_prefix_sum/{backend}")
     def gate_prefix_sum(
         self,
         raw_gate: torch.Tensor,
@@ -418,11 +460,10 @@ class KDAAttention(nn.Module):
             chunk_size=self.chunk_size,
             lower_bound=self.lower_bound,
             fastmath=self.fastmath,
-            profile_ranges=self.profile_ranges,
             cu_seqlens=cu_seqlens,
         )
 
-    @record_function("kda/core/{backend}")
+    @annotate_kernels("kda/core/{backend}")
     def kda_core(
         self,
         q: torch.Tensor,
@@ -459,7 +500,7 @@ class KDAAttention(nn.Module):
             fastmath=self.fastmath,
         )
 
-    @record_function("kda/output_normalization")
+    @annotate_kernels("kda/output_normalization")
     def output_normalization(self, output: torch.Tensor) -> torch.Tensor:
         # TODO: Consider a cu_seqlens-aware RMSNorm for fixed-capacity CUDA Graph
         # replay. Masking makes the inactive suffix numerically inert, but native
@@ -471,7 +512,7 @@ class KDAAttention(nn.Module):
             eps=self.rms_norm_eps,
         )
 
-    @record_function("kda/output_gate")
+    @annotate_kernels("kda/output_gate")
     def output_gate(self, hidden_states: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         gate_features = F.linear(
             hidden_states,
@@ -486,7 +527,7 @@ class KDAAttention(nn.Module):
             .sigmoid()
         )
 
-    @record_function("kda/output_projection")
+    @annotate_kernels("kda/output_projection")
     def output_projection(self, output: torch.Tensor, output_gate: torch.Tensor) -> torch.Tensor:
         return F.linear(
             (output * output_gate).flatten(-2).to(self.compute_dtype),
@@ -521,7 +562,12 @@ def main(
     ),
     profile: Annotated[
         bool,
-        typer.Option(help="Export a named Chrome trace with forward/backward ranges."),
+        typer.Option(
+            help=(
+                "Export a named Chrome trace with forward/backward ranges and optional "
+                "transformer-nuggets postprocessing."
+            )
+        ),
     ] = False,
     compile_model: Annotated[
         bool,
@@ -550,7 +596,6 @@ def main(
         short_conv_kernel_size=short_conv_kernel_size,
         backend=backend.value,
         device=device,
-        profile_ranges=profile and not compile_model,
     )
     if compile_model:
         model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
@@ -598,17 +643,15 @@ def main(
     activities = [torch.profiler.ProfilerActivity.CPU]
     if hidden_states.is_cuda:
         activities.append(torch.profiler.ProfilerActivity.CUDA)
-    profile_context = torch.profiler.profile(activities=activities) if profile else nullcontext()
-    with profile_context as active_profiler:
+    profile_path = Path(f"{profile_name}.json")
+    with _profile_trace(profile, profile_path, activities) as active_profiler:
         for step in range(steps):
             loss = train_step()
             if active_profiler is not None:
                 active_profiler.step()
             print(f"step={step} loss={loss.item():.6f}")
 
-    if active_profiler is not None:
-        profile_path = Path(f"{profile_name}.json")
-        active_profiler.export_chrome_trace(str(profile_path))
+    if profile:
         print(f"profile={profile_path.resolve()}")
 
 

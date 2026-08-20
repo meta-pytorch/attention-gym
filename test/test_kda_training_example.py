@@ -1,5 +1,6 @@
 """Integration tests for the fused KDA training example."""
 
+from contextlib import contextmanager
 from itertools import pairwise
 
 import pytest
@@ -118,6 +119,43 @@ def test_kda_example_builds_packed_sequence_metadata():
         packed_sequence_metadata(2, 96, 64, padded=True)
     with pytest.raises(ValueError, match="at least one"):
         packed_sequence_metadata(3, 0, 64)
+
+
+def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
+    labels = []
+
+    @contextmanager
+    def record_mark_kernels(annotation, *, backward=True):
+        assert backward
+        labels.append(annotation)
+        yield
+
+    monkeypatch.setattr(kda_training, "mark_kernels", record_mark_kernels)
+    model = KDAAttention(
+        hidden_size=32,
+        num_heads=1,
+        head_dim=128,
+        backend="fused",
+        device="cuda",
+        enable_graph_annotations=True,
+    )
+    hidden = torch.randn(1, 64, 32, device="cuda")
+    offsets = torch.tensor([0, 33, 64], device="cuda", dtype=torch.int32)
+
+    model(hidden, cu_seqlens=offsets)
+
+    assert labels == [
+        "kda/qkv_projection",
+        "kda/short_convolution",
+        "kda/qk_normalization",
+        "kda/gate_projections",
+        "kda/chunk_metadata",
+        "kda/gate_prefix_sum/fused",
+        "kda/core/fused",
+        "kda/output_normalization",
+        "kda/output_gate",
+        "kda/output_projection",
+    ]
 
 
 def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
