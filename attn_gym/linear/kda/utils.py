@@ -26,18 +26,14 @@ from typing import Any
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.libdevice as tldevice
 from packaging import version
 
+from attn_gym._backends.triton import utils as triton_utils
+
+SUPPORTS_AUTOTUNE_CACHE = triton_utils.SUPPORTS_AUTOTUNE_CACHE
+autotune_cache_kwargs = triton_utils.autotune_cache_kwargs
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Env flags / autotune caching
-# ---------------------------------------------------------------------------
-FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
-
-SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
-autotune_cache_kwargs = {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +103,6 @@ IS_AMD = device_platform == "hip"
 IS_NVIDIA = device_platform == "cuda"
 IS_NVIDIA_BLACKWELL = IS_NVIDIA and torch.cuda.get_device_capability()[0] in (10, 12)
 IS_TF32_SUPPORTED = IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8
-IS_TMA_SUPPORTED = (
-    IS_NVIDIA
-    and torch.cuda.get_device_capability(0)[0] >= 9
-    and os.environ.get("FLA_USE_TMA", "0") == "1"
-    and (
-        hasattr(triton.language, "_experimental_make_tensor_descriptor")
-        or hasattr(triton.language, "make_tensor_descriptor")
-    )
-)
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 
 if IS_NVIDIA and not IS_TF32_SUPPORTED:
@@ -123,30 +110,15 @@ if IS_NVIDIA and not IS_TF32_SUPPORTED:
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
 
 
-def _default_alloc_fn(size: int, alignment: int, stream: int | None):
-    return torch.empty(
-        size, device=torch.device(device_name, device_torch_lib.current_device()), dtype=torch.int8
-    )
-
-
-if IS_TMA_SUPPORTED:
-    logger.info("TMA is supported, using TMA by default.")
-    triton.set_allocator(_default_alloc_fn)
-elif IS_NVIDIA_BLACKWELL:
-    # Blackwell (SM100 datacenter / SM120 consumer): Triton compiler may emit global_scratch for
-    # autotuned kernels even without TMA. Register a default allocator to prevent NullAllocator
-    # crashes. See triton-lang/triton#10002.
+if IS_NVIDIA_BLACKWELL:
     logger.info("Blackwell detected: registering default global_scratch allocator.")
-    triton.set_allocator(_default_alloc_fn)
+triton_utils.configure_triton_allocator()
 
 
 # ---------------------------------------------------------------------------
 # Triton math ops
 # ---------------------------------------------------------------------------
-if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
-    exp2 = tldevice.exp2
-else:
-    exp2 = tl.math.exp2
+exp2 = tl.math.exp2
 
 
 @triton.jit

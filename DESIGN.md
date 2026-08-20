@@ -291,6 +291,8 @@ Use the narrowest ownership level that fits the behavior:
 
 - mathematical behavior shared by two implementations of one variant belongs in
   `<variant>/impl/common.py`;
+- private mathematical kernels shared by multiple variants belong in a semantic namespace such as
+  `attn_gym/linear/_delta_rule/`, not in a backend-infrastructure package;
 - Triton infrastructure shared by different variants belongs in `attn_gym/_backends/triton/`;
 - CuTeDSL infrastructure shared by different variants belongs in `attn_gym/_backends/cute/`;
 - public types shared by multiple linear or sparse operations belong in a namespace-level module
