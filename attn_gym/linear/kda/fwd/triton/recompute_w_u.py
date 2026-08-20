@@ -41,49 +41,59 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
+from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
+    RaggedChunkMetadata,
+    ScheduleKind,
+    ScheduleRequest,
+    decode_ragged_task,
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+    load_ragged_task_count,
+)
 from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 
 # Compile-time dot-precision selector shared with the launch wrapper.
 _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
 
 
-@triton.heuristics(
-    {
-        "STORE_QG": lambda args: args["q"] is not None,
-        "HAS_GK": lambda args: args["gk"] is not None,
-        "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
-        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            args["q"],
-            args["k"],
-            args["qg"],
-            args["kg"],
-            args["v"],
-            args["beta"],
-            args["w"],
-            args["u"],
-            args["A"],
-            args["gk"],
-            args["cu_seqlens"],
-            args["chunk_offsets"],
-        ),
-    }
-)
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=w, num_stages=s) for w in [4, 8] for s in [2, 3]],
-    key=["H", "HV", "K", "V", "BT", "BK", "BV", "IS_RAGGED", "HAS_GK", "STORE_QG", "PRECISION"],
-    **autotune_cache_kwargs,
-)
-@triton.jit(
-    do_not_specialize=[
-        "T",
-        "num_sequences",
-        "q_stride_t",
-        "k_stride_t",
-        "v_stride_t",
-    ]
-)
-def recompute_w_u_fwd_kernel(
+_AUTOTUNE_CONFIGS = [triton.Config({}, num_warps=w, num_stages=s) for w in [4, 8] for s in [2, 3]]
+_AUTOTUNE_KEY = [
+    "H",
+    "HV",
+    "K",
+    "V",
+    "BT",
+    "BK",
+    "BV",
+    "IS_RAGGED",
+    "HAS_GK",
+    "STORE_QG",
+    "PRECISION",
+]
+_HEURISTICS = {
+    "STORE_QG": lambda args: args["q"] is not None,
+    "HAS_GK": lambda args: args["gk"] is not None,
+    "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
+    "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
+        args["q"],
+        args["k"],
+        args["qg"],
+        args["kg"],
+        args["v"],
+        args["beta"],
+        args["w"],
+        args["u"],
+        args["A"],
+        args["gk"],
+        args["cu_seqlens"],
+        args["chunk_offsets"],
+    ),
+}
+
+
+@triton.jit
+def _recompute_w_u_task(
     q,
     k,
     qg,
@@ -100,6 +110,8 @@ def recompute_w_u_fwd_kernel(
     q_stride_t,
     k_stride_t,
     v_stride_t,
+    i_c,
+    i_hv,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -115,14 +127,11 @@ def recompute_w_u_fwd_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Recompute one chunk's W/U (and optional QG/KG) with register-operand dots."""
-    i_c, i_hv = tl.program_id(0), tl.program_id(1)
     if USE_INT64_OFFSETS:
         i_c = i_c.to(tl.int64)
         i_hv = i_hv.to(tl.int64)
     i_h = i_hv // (HV // H)
     if IS_RAGGED:
-        if i_c >= tl.load(chunk_offsets + num_sequences):
-            return
         i_n, i_t, token_start, _ = load_ragged_chunk_work(
             cu_seqlens, chunk_offsets, i_c, num_sequences, BT
         )
@@ -234,7 +243,178 @@ def recompute_w_u_fwd_kernel(
         )
 
 
+@triton.heuristics(_HEURISTICS)
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY, **autotune_cache_kwargs)
+@triton.jit(
+    do_not_specialize=[
+        "T",
+        "num_sequences",
+        "q_stride_t",
+        "k_stride_t",
+        "v_stride_t",
+    ]
+)
+def recompute_w_u_fwd_kernel(
+    q,
+    k,
+    qg,
+    kg,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    gk,
+    cu_seqlens,
+    chunk_offsets,
+    T,
+    q_stride_t,
+    k_stride_t,
+    v_stride_t,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    PRECISION: tl.constexpr,
+    num_sequences,
+    STORE_QG: tl.constexpr,
+    HAS_GK: tl.constexpr,
+    IS_RAGGED: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Launch one CTA per chunk task; ragged capacity-only CTAs exit immediately."""
+    i_c, i_hv = tl.program_id(0), tl.program_id(1)
+    # Not merged with `and`: the constexpr guard must fold away before the
+    # load traces `chunk_offsets`, which is a None pointer on the dense path.
+    if IS_RAGGED:  # noqa: SIM102
+        if i_c >= load_ragged_chunk_count(chunk_offsets, num_sequences):
+            return
+    _recompute_w_u_task(
+        q,
+        k,
+        qg,
+        kg,
+        v,
+        beta,
+        w,
+        u,
+        A,
+        gk,
+        cu_seqlens,
+        chunk_offsets,
+        T,
+        q_stride_t,
+        k_stride_t,
+        v_stride_t,
+        i_c,
+        i_hv,
+        H,
+        HV,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
+        PRECISION,
+        num_sequences,
+        STORE_QG,
+        HAS_GK,
+        IS_RAGGED,
+        USE_INT64_OFFSETS,
+    )
+
+
+@triton.heuristics(_HEURISTICS)
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY, **autotune_cache_kwargs)
+@triton.jit(
+    do_not_specialize=[
+        "T",
+        "num_sequences",
+        "num_workers",
+        "q_stride_t",
+        "k_stride_t",
+        "v_stride_t",
+    ]
+)
+def recompute_w_u_fwd_kernel_persistent(
+    q,
+    k,
+    qg,
+    kg,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    gk,
+    cu_seqlens,
+    chunk_offsets,
+    T,
+    q_stride_t,
+    k_stride_t,
+    v_stride_t,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    PRECISION: tl.constexpr,
+    num_sequences,
+    num_workers,
+    STORE_QG: tl.constexpr,
+    HAS_GK: tl.constexpr,
+    IS_RAGGED: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Stride a bounded worker grid over active (chunk, value-head) tasks."""
+    worker = tl.program_id(0)
+    total_tasks = load_ragged_task_count(chunk_offsets, num_sequences, HV)
+    # num_stages=1 stops the software pipeliner from double-buffering the
+    # outer task loop; the extra SMEM stage costs a resident CTA per SM.
+    for task in tl.range(worker, total_tasks, num_workers, num_stages=1):
+        global_chunk, value_head = decode_ragged_task(task, HV)
+        _recompute_w_u_task(
+            q,
+            k,
+            qg,
+            kg,
+            v,
+            beta,
+            w,
+            u,
+            A,
+            gk,
+            cu_seqlens,
+            chunk_offsets,
+            T,
+            q_stride_t,
+            k_stride_t,
+            v_stride_t,
+            global_chunk,
+            value_head,
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BK,
+            BV,
+            PRECISION,
+            num_sequences,
+            STORE_QG,
+            HAS_GK,
+            IS_RAGGED,
+            USE_INT64_OFFSETS,
+        )
+
+
 _PINNED_W_U = PinnedConfigKernel(recompute_w_u_fwd_kernel)
+_PINNED_W_U_PERSISTENT = PinnedConfigKernel(recompute_w_u_fwd_kernel_persistent)
 
 
 def recompute_w_u_fwd_triton(
@@ -249,8 +429,14 @@ def recompute_w_u_fwd_triton(
     chunk_size: int = 64,
     dot_precision: str = "bf16",
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Launch the register-operand recompute for packed B=1 inputs."""
+    """Launch the register-operand recompute for packed B=1 inputs.
+
+    Args:
+        schedule: Internal scheduling request for tests; automatic selection is
+            the default and dense inputs keep their exact launch grid.
+    """
     batch, tokens, key_heads, key_dim = k.shape
     value_heads, value_dim = v.shape[2], v.shape[3]
     if batch != 1:
@@ -316,35 +502,47 @@ def recompute_w_u_fwd_triton(
     if isinstance(k, FakeTensor):
         return w, u, qg, kg
     chunks = metadata.capacity if metadata is not None else tokens // chunk_size
-    if chunks:
-        kernel = recompute_w_u_fwd_kernel if autotune else _PINNED_W_U
-        kernel[(chunks, value_heads)](
-            q=q if has_q else None,
-            k=k,
-            qg=qg,
-            kg=kg,
-            v=v,
-            beta=beta,
-            w=w,
-            u=u,
-            A=A,
-            gk=gk,
-            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
-            chunk_offsets=None if metadata is None else metadata.chunk_offsets,
-            T=tokens,
-            q_stride_t=q.stride(1) if has_q else 0,
-            k_stride_t=k.stride(1),
-            v_stride_t=v.stride(1),
-            H=key_heads,
-            HV=value_heads,
-            K=key_dim,
-            V=value_dim,
-            BT=chunk_size,
-            BK=64,
-            BV=64,
-            PRECISION=_PRECISION_MODES[dot_precision],
-            num_sequences=0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
+    kernel_kwargs = {
+        "q": q if has_q else None,
+        "k": k,
+        "qg": qg,
+        "kg": kg,
+        "v": v,
+        "beta": beta,
+        "w": w,
+        "u": u,
+        "A": A,
+        "gk": gk,
+        "cu_seqlens": None if metadata is None else metadata.cu_seqlens,
+        "chunk_offsets": None if metadata is None else metadata.chunk_offsets,
+        "T": tokens,
+        "q_stride_t": q.stride(1) if has_q else 0,
+        "k_stride_t": k.stride(1),
+        "v_stride_t": v.stride(1),
+        "H": key_heads,
+        "HV": value_heads,
+        "K": key_dim,
+        "V": value_dim,
+        "BT": chunk_size,
+        "BK": 64,
+        "BV": 64,
+        "PRECISION": _PRECISION_MODES[dot_precision],
+        "num_sequences": 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
+    }
+    kernel = recompute_w_u_fwd_kernel if autotune else _PINNED_W_U
+    if chunks == 0:
+        return w, u, qg, kg
+    if metadata is None:
+        kernel[(chunks, value_heads)](**kernel_kwargs)
+        return w, u, qg, kg
+    resolved = GridScheduler(metadata).resolve_flat(schedule, value_heads, k.device)
+    if resolved.kind is ScheduleKind.PERSISTENT:
+        persistent_kernel = (
+            recompute_w_u_fwd_kernel_persistent if autotune else _PINNED_W_U_PERSISTENT
         )
+        persistent_kernel[(resolved.workers,)](num_workers=resolved.workers, **kernel_kwargs)
+    else:
+        kernel[(chunks, value_heads)](**kernel_kwargs)
     return w, u, qg, kg
 
 

@@ -23,7 +23,16 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
+from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
+    RaggedChunkMetadata,
+    ScheduleKind,
+    ScheduleRequest,
+    decode_ragged_task,
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+    load_ragged_task_count,
+)
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
@@ -131,7 +140,7 @@ def chunk_kda_bwd_kernel_dAv(
         i_b, i_h = i_bh // H, i_bh % H
 
         if IS_VARLEN:
-            if i_t >= tl.load(chunk_offsets + num_sequences):
+            if i_t >= load_ragged_chunk_count(chunk_offsets, num_sequences):
                 return
             i_n, i_t, token_start, _ = load_ragged_chunk_work(
                 cu_seqlens,
@@ -213,8 +222,8 @@ def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
     return all(can_use_tma(tensor) for tensor in tensors)
 
 
-@triton.jit(do_not_specialize=["num_sequences"])
-def chunk_kda_bwd_kernel_dAv_ragged_tma(
+@triton.jit
+def _compose_dav_ragged_task(
     v_desc,
     A_desc,
     do_desc,
@@ -228,16 +237,18 @@ def chunk_kda_bwd_kernel_dAv_ragged_tma(
     cu_seqlens,
     chunk_offsets,
     scale,
+    global_chunk,
+    i_h,
     H: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
     num_sequences,
 ):
-    """Differentiate full ragged value chunks with TMA and partial tails with masked pointers."""
-    global_chunk, i_h = tl.program_id(0), tl.program_id(1)
-    if global_chunk >= tl.load(chunk_offsets + num_sequences):
-        return
+    """Differentiate one active (chunk, head) ragged value tile.
+
+    Full chunks go through TMA; partial tails use masked pointers.
+    """
     _, _, token_start, valid_tokens = load_ragged_chunk_work(
         cu_seqlens,
         chunk_offsets,
@@ -292,6 +303,108 @@ def chunk_kda_bwd_kernel_dAv_ragged_tma(
         )
 
 
+@triton.jit(do_not_specialize=["num_sequences"])
+def chunk_kda_bwd_kernel_dAv_ragged_tma(
+    v_desc,
+    A_desc,
+    do_desc,
+    dv_desc,
+    dA_desc,
+    v,
+    A,
+    do,
+    dv,
+    dA,
+    cu_seqlens,
+    chunk_offsets,
+    scale,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    num_sequences,
+):
+    """Launch one CTA per capacity task; capacity-only CTAs exit immediately."""
+    global_chunk, i_h = tl.program_id(0), tl.program_id(1)
+    if global_chunk >= load_ragged_chunk_count(chunk_offsets, num_sequences):
+        return
+    _compose_dav_ragged_task(
+        v_desc,
+        A_desc,
+        do_desc,
+        dv_desc,
+        dA_desc,
+        v,
+        A,
+        do,
+        dv,
+        dA,
+        cu_seqlens,
+        chunk_offsets,
+        scale,
+        global_chunk,
+        i_h,
+        H,
+        V,
+        BT,
+        BV,
+        num_sequences,
+    )
+
+
+@triton.jit(do_not_specialize=["num_sequences", "num_workers"])
+def chunk_kda_bwd_kernel_dAv_ragged_tma_persistent(
+    v_desc,
+    A_desc,
+    do_desc,
+    dv_desc,
+    dA_desc,
+    v,
+    A,
+    do,
+    dv,
+    dA,
+    cu_seqlens,
+    chunk_offsets,
+    scale,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    num_sequences,
+    num_workers,
+):
+    """Stride a bounded worker grid over active (chunk, head) tasks."""
+    worker = tl.program_id(0)
+    total_tasks = load_ragged_task_count(chunk_offsets, num_sequences, H)
+    # num_stages=1 stops the software pipeliner from double-buffering the
+    # outer task loop; the extra SMEM stage costs a resident CTA per SM.
+    for task in tl.range(worker, total_tasks, num_workers, num_stages=1):
+        global_chunk, head = decode_ragged_task(task, H)
+        _compose_dav_ragged_task(
+            v_desc,
+            A_desc,
+            do_desc,
+            dv_desc,
+            dA_desc,
+            v,
+            A,
+            do,
+            dv,
+            dA,
+            cu_seqlens,
+            chunk_offsets,
+            scale,
+            global_chunk.to(tl.int32),
+            head.to(tl.int32),
+            H,
+            V,
+            BT,
+            BV,
+            num_sequences,
+        )
+
+
 def _launch_dav_ragged(
     v: torch.Tensor,
     A: torch.Tensor,
@@ -300,6 +413,7 @@ def _launch_dav_ragged(
     chunk_size: int,
     metadata: RaggedChunkMetadata,
     autotune: bool,
+    schedule: ScheduleRequest,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the packed dAv kernel with TMA descriptors when the layout allows."""
     _, tokens, heads, value_dim = v.shape
@@ -307,10 +421,20 @@ def _launch_dav_ragged(
     dA = torch.empty_like(A, dtype=torch.float32)
     if metadata.capacity == 0:
         return dv, dA
+    ragged_tma = (value_dim, chunk_size) == (128, 64) and _can_use_tensor_descriptors(
+        v, A, do, dv, dA
+    )
+    resolved = GridScheduler(metadata).resolve_flat(
+        schedule,
+        heads,
+        v.device,
+        eligible=ragged_tma,
+        requirement="the packed TMA path: V=128, chunk_size=64, and TMA-capable tensors",
+    )
 
     block_value_dim = 64
-    if (value_dim, chunk_size) == (128, 64) and _can_use_tensor_descriptors(v, A, do, dv, dA):
-        chunk_kda_bwd_kernel_dAv_ragged_tma[(metadata.capacity, heads)](
+    if ragged_tma:
+        args = (
             TensorDescriptor.from_tensor(v, [1, chunk_size, 1, block_value_dim]),
             TensorDescriptor.from_tensor(A, [1, chunk_size, 1, chunk_size]),
             TensorDescriptor.from_tensor(do, [1, chunk_size, 1, block_value_dim]),
@@ -324,14 +448,22 @@ def _launch_dav_ragged(
             metadata.cu_seqlens,
             metadata.chunk_offsets,
             scale,
-            H=heads,
-            V=value_dim,
-            BT=chunk_size,
-            BV=block_value_dim,
-            num_sequences=metadata.cu_seqlens.shape[0] - 1,
-            num_warps=2,
-            num_stages=3,
         )
+        kwargs = {
+            "H": heads,
+            "V": value_dim,
+            "BT": chunk_size,
+            "BV": block_value_dim,
+            "num_sequences": metadata.cu_seqlens.shape[0] - 1,
+            "num_warps": 2,
+            "num_stages": 3,
+        }
+        if resolved.kind is ScheduleKind.PERSISTENT:
+            chunk_kda_bwd_kernel_dAv_ragged_tma_persistent[(resolved.workers,)](
+                *args, num_workers=resolved.workers, **kwargs
+            )
+        else:
+            chunk_kda_bwd_kernel_dAv_ragged_tma[(metadata.capacity, heads)](*args, **kwargs)
     else:
         kernel = chunk_kda_bwd_kernel_dAv if autotune else _PINNED_DAV
         kernel[(metadata.capacity, heads)](
@@ -365,12 +497,21 @@ def chunk_kda_bwd_dav(
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Differentiate the fixed-length or packed KDA intra-chunk value term.
 
     This is an eager stage: the ragged launcher mixes TMA descriptors with aliased raw
     pointers, so call it standalone only outside ``torch.compile`` regions. The composed
     ``chunk_kda`` custom op is the supported compiler boundary.
+
+    Args:
+        schedule: Internal scheduling request for tests. Automatic selection is
+            the default and dense inputs keep their exact launch grid.
+
+    Raises:
+        ValueError: If persistent scheduling is forced for a packed input outside
+            the TMA path, where no persistent kernel exists to honor it.
     """
     batch, tokens, heads, value_dim = v.shape
     if A.shape != (batch, tokens, heads, chunk_size):
@@ -381,7 +522,7 @@ def chunk_kda_bwd_dav(
         metadata.validate_chunk_size(chunk_size)
         if batch != 1:
             raise ValueError("ragged KDA dAv metadata requires batch size 1")
-        return _launch_dav_ragged(v, A, do, scale, chunk_size, metadata, autotune)
+        return _launch_dav_ragged(v, A, do, scale, chunk_size, metadata, autotune, schedule)
     if tokens % chunk_size:
         raise ValueError(f"the KDA dAv kernel requires complete chunks, got T={tokens}")
 

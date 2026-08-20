@@ -9,6 +9,7 @@ import torch
 
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
+    ScheduleRequest,
     prepare_ragged_chunk_metadata,
 )
 
@@ -242,3 +243,93 @@ def test_recompute_supports_grouped_value_heads():
     torch.testing.assert_close(kg, kg_c, rtol=0, atol=0)
     torch.testing.assert_close(w.float(), w_c.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(u.float(), u_c.float(), rtol=2e-2, atol=2e-2)
+
+
+def _chunkwise_reference(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    gk: torch.Tensor,
+    bounds: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate W/U in fp32 over the active sequence-local 64-token chunks."""
+    w = torch.zeros_like(k, dtype=torch.float32)
+    u = torch.zeros_like(v, dtype=torch.float32)
+    for start, end in pairwise(bounds):
+        for chunk_start in range(start, end, 64):
+            chunk_end = min(chunk_start + 64, end)
+            rows = chunk_end - chunk_start
+            a = A[0, chunk_start:chunk_end, :, :rows].float().permute(1, 0, 2).tril()
+            scaled_beta = beta[0, chunk_start:chunk_end, :, None].float()
+            gate = torch.exp2(gk[0, chunk_start:chunk_end].float())
+            kb = (k[0, chunk_start:chunk_end].float() * scaled_beta * gate).permute(1, 0, 2)
+            vb = (v[0, chunk_start:chunk_end].float() * scaled_beta).permute(1, 0, 2)
+            w[0, chunk_start:chunk_end] = (a @ kb).permute(1, 0, 2)
+            u[0, chunk_start:chunk_end] = (a @ vb).permute(1, 0, 2)
+    return w, u
+
+
+def test_recompute_persistent_matches_static_over_capacity():
+    """Persistent scheduling must be bit-identical to static scheduling."""
+    from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
+
+    torch.manual_seed(9)
+    lengths = [65, 0, 63]
+    active = sum(lengths)
+    capacity_tokens = 16 * active
+    bounds = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+    offsets = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+    metadata = prepare_ragged_chunk_metadata(offsets, capacity_tokens, 64)
+    assert metadata.capacity >= 8 * ((active + 63) // 64)
+
+    heads = 2
+    k = torch.randn(1, capacity_tokens, heads, 128, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn_like(k) / 8
+    q = torch.randn_like(k) / 8
+    gk = -torch.rand(1, capacity_tokens, heads, 128, device="cuda", dtype=torch.float32)
+    beta = torch.rand(1, capacity_tokens, heads, device="cuda")
+    A = torch.randn(1, capacity_tokens, heads, 64, device="cuda", dtype=torch.float32) / 8
+
+    # Pin the config so bit-equality does not depend on two independent
+    # autotune winners choosing the same accumulation shape.
+    static = recompute_w_u_fwd_triton(k, v, beta, A, metadata, q=q, gk=gk, autotune=False)
+    persistent = recompute_w_u_fwd_triton(
+        k,
+        v,
+        beta,
+        A,
+        metadata,
+        q=q,
+        gk=gk,
+        autotune=False,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+    for static_tensor, persistent_tensor in zip(static, persistent, strict=True):
+        assert torch.equal(persistent_tensor[:, :active], static_tensor[:, :active])
+
+    expected_w, expected_u = _chunkwise_reference(k, v, beta, A, gk, bounds)
+    torch.testing.assert_close(
+        persistent[0][:, :active].float(), expected_w[:, :active], rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        persistent[1][:, :active].float(), expected_u[:, :active], rtol=2e-2, atol=2e-2
+    )
+
+
+def test_recompute_persistent_is_noop_for_dense():
+    """Dense launch grids are already exact, so the request is trivially satisfied."""
+    from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
+
+    torch.manual_seed(5)
+    k = torch.randn(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn_like(k) / 8
+    beta = torch.rand(1, 64, 1, device="cuda")
+    A = torch.randn(1, 64, 1, 64, device="cuda", dtype=torch.bfloat16).tril() / 8
+
+    dense = recompute_w_u_fwd_triton(k, v, beta, A, None)
+    dense_persistent = recompute_w_u_fwd_triton(
+        k, v, beta, A, None, schedule=ScheduleRequest.PERSISTENT
+    )
+    for actual, other in zip(dense_persistent, dense, strict=True):
+        assert (actual is None and other is None) or torch.equal(actual, other)

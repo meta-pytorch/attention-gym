@@ -22,7 +22,11 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_chunk_work
+from attn_gym.linear.kda.chunk_scheduler import (
+    RaggedChunkMetadata,
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+)
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
 from attn_gym.linear.kda.utils import exp2
@@ -173,7 +177,7 @@ def _chunk_decay_last_kernel(
     """Materialize exp2 of each chunk's last-row cumulative gate in one launch."""
     global_chunk, i_h = tl.program_id(0), tl.program_id(1)
     if IS_VARLEN:
-        if global_chunk >= tl.load(chunk_offsets + num_sequences):
+        if global_chunk >= load_ragged_chunk_count(chunk_offsets, num_sequences):
             return
         _, _, token_start, valid_tokens = load_ragged_chunk_work(
             cu_seqlens,

@@ -79,7 +79,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 
@@ -1511,6 +1511,7 @@ def recompute_w_u_fwd(
     chunk_size: int = BT,
     dot_precision: str | MmaPrecision = "bf16",
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1545,6 +1546,7 @@ def recompute_w_u_fwd(
         chunk_size=chunk_size,
         dot_precision=precision.value,
         autotune=autotune,
+        schedule=schedule,
     )
 
 

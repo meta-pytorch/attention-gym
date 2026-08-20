@@ -125,6 +125,15 @@ The repeated ranges are ordinary empty sequences. Stateful APIs therefore retain
 state rows even when only `M` sequences are nonempty. Both `L` and `M` may change on
 replay, but physical token capacity `T` and metadata capacity `N` may not.
 
+Scheduling for this over-capture regime is automatic and selected independently for
+each eligible chunk-parallel ragged kernel: a kernel switches to a bounded persistent
+worker grid only when its capacity task count exceeds a few waves of that grid.
+Persistent workers stride over the active chunk count built on device from
+`cu_seqlens`, so chunk-compute launch overhead tracks active work rather than captured
+capacity. Capacity-sized initialization and reduction work may remain. Exact or mildly
+padded shapes keep capacity-sized STATIC grids whose padding CTAs return immediately; there is no
+user-facing scheduling knob.
+
 Callers that use dynamic active lengths within fixed-capacity tensors must opt in to
 masking. Ragged primitives read only `[0, cu_seqlens[-1])` from token-shaped inputs,
 including output cotangents, and leave the suffix of token-shaped outputs and input
@@ -161,11 +170,13 @@ output = output_projection(output)
 output = mask_inactive_token_gradients(output, active_mask)  # Model boundary.
 ```
 
-`mask_inactive_token_gradients(x, active_mask)` broadcasts the predicate as
-`[1, T, 1, ...]` and evaluates `torch.where(mask, x, x.detach())`. It preserves forward
-values but materializes an elementwise result; its purpose is masked automatic-
-differentiation semantics, not a free forward identity. Automatic-differentiation paths
-are zero on inactive rows, and subsequent derivatives inherit the same mask. Recurrent
+`mask_inactive_token_gradients(x, active_mask)` preserves forward values while zeroing
+inactive automatic-differentiation paths. For contiguous packed CUDA tensors in eager
+mode its autograd path aliases `x` in the forward and row-masks tangents and
+cotangents; compiled graphs and unsupported layouts keep the
+`torch.where(mask, x, x.detach())` form (which materializes an elementwise result) so
+Inductor can own fusion. Automatic-differentiation paths are zero on inactive rows,
+and subsequent derivatives inherit the same mask. Recurrent
 and convolution states have one row per logical sequence rather than one row per physical
 token, so token masks must not be applied to them.
 
@@ -203,9 +214,9 @@ corrected-value intermediates instead of retaining them across the forward/backw
 boundary.
 
 Graph-safe active-token replay does not by itself make complete model time proportional
-to `L`. The ragged short convolution, gate scan, and KDA core can skip inactive token
-work, but the example's projections, output normalization, output gate, and output
-projection still process physical capacity `T`. An end-to-end integration needs
+to `L`. The ragged short convolution, gate scan, and KDA core avoid reading inactive
+token values, but the example's projections, output normalization, output gate, and
+output projection still process physical capacity `T`. An end-to-end integration needs
 active-prefix-aware surrounding operations to turn smaller `L` into a comparable step-time
 reduction. Million-token training also requires model-level activation checkpointing and
 context parallelism; this single-device example implements neither distributed policy.

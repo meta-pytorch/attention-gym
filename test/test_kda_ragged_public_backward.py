@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -485,3 +487,76 @@ def test_dense_tail_batch_gradients_match_explicit_packed_lowering():
             atol=3e-2,
         )
     torch.testing.assert_close(dense_gradients[-1], packed_gradients[-1], rtol=3e-2, atol=3e-2)
+
+
+def test_public_auto_persistent_matches_static_composition(monkeypatch):
+    """Route the complete public forward/backward through AUTO persistent plans."""
+    from attn_gym.linear.kda import chunk_scheduler
+    from attn_gym.linear.kda.chunk_schedule import ScheduleKind
+
+    capacity = 4096
+    active_lengths = [321, 0, 63, 128, 488]
+    active_tokens = sum(active_lengths)
+    inputs = make_kda_test_inputs(capacity, requires_grad=True)
+    output_grad = torch.randn_like(inputs[0])
+    with torch.no_grad():
+        for tensor in inputs:
+            tensor[:, active_tokens:].fill_(float("nan"))
+        output_grad[:, active_tokens:].zero_()
+    offsets = cumulative_sequence_offsets(active_lengths)
+
+    kinds = []
+    resolve_flat = chunk_scheduler.GridScheduler.resolve_flat
+    resolve_chunk = chunk_scheduler.GridScheduler.resolve_chunk
+
+    def record_flat(self, *args, **kwargs):
+        resolved = resolve_flat(self, *args, **kwargs)
+        kinds.append(resolved.kind)
+        return resolved
+
+    def record_chunk(self, *args, **kwargs):
+        resolved = resolve_chunk(self, *args, **kwargs)
+        kinds.append(resolved.kind)
+        return resolved
+
+    monkeypatch.setattr(chunk_scheduler.GridScheduler, "resolve_flat", record_flat)
+    monkeypatch.setattr(chunk_scheduler.GridScheduler, "resolve_chunk", record_chunk)
+    monkeypatch.setattr(chunk_scheduler, "PERSISTENT_AUTO_WAVES", 1 << 30)
+    static = _run_gradients(
+        clone_kda_inputs(inputs),
+        None,
+        offsets,
+        output_grad,
+        None,
+        output_final_state=False,
+    )
+    assert set(kinds) == {ScheduleKind.STATIC}
+
+    kinds.clear()
+    monkeypatch.setattr(chunk_scheduler, "PERSISTENT_AUTO_WAVES", 0)
+    persistent = _run_gradients(
+        clone_kda_inputs(inputs),
+        None,
+        offsets,
+        output_grad,
+        None,
+        output_final_state=False,
+    )
+    assert ScheduleKind.PERSISTENT in kinds
+    torch.testing.assert_close(
+        persistent[0][:, :active_tokens], static[0][:, :active_tokens], rtol=0, atol=0
+    )
+    assert persistent[1] is static[1] is None
+    for persistent_gradient, static_gradient in zip(persistent[2], static[2], strict=True):
+        torch.testing.assert_close(
+            persistent_gradient[:, :active_tokens],
+            static_gradient[:, :active_tokens],
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+
+def test_public_api_has_no_scheduling_knob():
+    parameters = inspect.signature(chunk_kda).parameters
+    assert "persistent" not in parameters
+    assert "schedule" not in parameters

@@ -16,11 +16,13 @@ from torch._inductor import config as inductor_config
 
 pytest.importorskip("triton")
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.bwd.triton.gate_bwd import kda_gate_bwd_ragged
+from attn_gym.linear.kda.chunk_scheduler import ScheduleRequest, prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.triton.gate_fwd import (
     _bounded_gate_cumsum_ragged_bwd_op,
     _bounded_gate_cumsum_ragged_fwd_op,
     bounded_gate_cumsum,
+    bounded_gate_cumsum_ragged,
 )
 from attn_gym.linear.kda.utils import RCP_LN2
 from attn_gym.testing.kda import clone_kda_inputs, cumulative_sequence_offsets
@@ -339,6 +341,151 @@ def test_bounded_gate_cumsum_rejects_packed_batch_and_fastmath():
             cu_seqlens=cumulative_sequence_offsets([64]),
             fastmath=True,
         )
+
+
+def _gate_bwd(
+    inputs: tuple[torch.Tensor, ...],
+    d_cumulative: torch.Tensor,
+    metadata,
+    *,
+    schedule: ScheduleRequest,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiate the packed gate directly, bypassing the autograd composition."""
+    return kda_gate_bwd_ragged(
+        *inputs,
+        d_cumulative,
+        metadata,
+        lower_bound=LOWER_BOUND,
+        scale=RCP_LN2,
+        schedule=schedule,
+    )
+
+
+@pytest.mark.parametrize("head_dim", (128, 1024))
+def test_kda_gate_bwd_ragged_persistent_matches_static_over_capacity(head_dim):
+    """Stay bit-identical to static scheduling when capacity dwarfs active work."""
+    lengths = [65, 0, 63]
+    active_tokens = sum(lengths)
+    raw_gate, A_log, dt_bias, d_cumulative = _inputs(16 * active_tokens, head_dim=head_dim)
+    _poison_inactive_suffix(raw_gate, d_cumulative, active_tokens)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, raw_gate.shape[1], 64)
+    assert metadata.capacity >= 8 * metadata.chunk_offsets[-1].item()
+
+    inputs = (raw_gate, A_log, dt_bias)
+    static = _gate_bwd(inputs, d_cumulative, metadata, schedule=ScheduleRequest.STATIC)
+    persistent = _gate_bwd(inputs, d_cumulative, metadata, schedule=ScheduleRequest.PERSISTENT)
+
+    assert torch.equal(persistent[0][:, :active_tokens], static[0][:, :active_tokens])
+    for actual, other in zip(persistent[1:], static[1:], strict=True):
+        assert torch.equal(actual, other)
+
+    leaves = _leaves(*inputs)
+    expected_output = _active_reference(*leaves, lengths, 64)
+    expected = torch.autograd.grad(expected_output, leaves, d_cumulative[:, :active_tokens])
+    torch.testing.assert_close(
+        persistent[0][:, :active_tokens], expected[0][:, :active_tokens], rtol=BF16_EPS, atol=1e-6
+    )
+    for actual, reference in zip(persistent[1:], expected[1:], strict=True):
+        torch.testing.assert_close(actual, reference, rtol=5e-5, atol=7e-4)
+
+
+def test_kda_gate_bwd_ragged_persistent_handles_zero_capacity():
+    """Reduce capacity-sized partials to zero parameter gradients with nothing launched."""
+    raw_gate, A_log, dt_bias, d_cumulative = _inputs(0)
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([0]), 0, 64)
+    assert metadata.capacity == 0
+
+    dg, dA_log, ddt_bias = _gate_bwd(
+        (raw_gate, A_log, dt_bias),
+        d_cumulative,
+        metadata,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+
+    assert dg.shape == raw_gate.shape
+    torch.testing.assert_close(dA_log, torch.zeros_like(A_log), rtol=0, atol=0)
+    torch.testing.assert_close(ddt_bias, torch.zeros_like(dt_bias), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", (96, 128, 1024))
+def test_bounded_gate_cumsum_persistent_matches_static_over_capacity(head_dim):
+    """Stride a fixed worker grid over the active chunks far below capacity."""
+    lengths = [65, 0, 63]
+    active_tokens = sum(lengths)
+    capacity_tokens = 16 * active_tokens
+    raw_gate, A_log, dt_bias, _ = _inputs(capacity_tokens, head_dim=head_dim)
+    with torch.no_grad():
+        raw_gate[:, active_tokens:].fill_(torch.nan)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, capacity_tokens, 64)
+    assert metadata.capacity >= 8 * ((active_tokens + 63) // 64)
+
+    static = bounded_gate_cumsum_ragged(
+        raw_gate,
+        A_log,
+        dt_bias,
+        metadata,
+        lower_bound=LOWER_BOUND,
+        schedule=ScheduleRequest.STATIC,
+    )
+    persistent = bounded_gate_cumsum_ragged(
+        raw_gate,
+        A_log,
+        dt_bias,
+        metadata,
+        lower_bound=LOWER_BOUND,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+    expected = _active_reference(raw_gate, A_log, dt_bias, lengths, 64)
+
+    assert torch.equal(persistent[:, :active_tokens], static[:, :active_tokens])
+    torch.testing.assert_close(persistent[:, :active_tokens], expected, rtol=1e-6, atol=8e-5)
+
+
+def test_bounded_gate_cumsum_persistent_handles_zero_capacity():
+    """Skip the launch entirely when the schedule holds no chunks."""
+    raw_gate, A_log, dt_bias, _ = _inputs(0)
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([0]), 0, 64)
+    assert metadata.capacity == 0
+
+    output = bounded_gate_cumsum_ragged(
+        raw_gate,
+        A_log,
+        dt_bias,
+        metadata,
+        lower_bound=LOWER_BOUND,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+
+    assert output.shape == raw_gate.shape
+
+
+def test_kda_gate_bwd_ragged_persistent_strides_multiple_tasks_per_worker(monkeypatch):
+    """Force fewer workers than tasks so the stride loop iterates repeatedly."""
+    from attn_gym.linear.kda import chunk_scheduler
+
+    monkeypatch.setattr(chunk_scheduler.GridScheduler, "num_workers", lambda self, s, d: 2)
+    lengths = [65, 0, 63, 130]
+    raw_gate, A_log, dt_bias, d_cumulative = _inputs(sum(lengths))
+    metadata = prepare_ragged_chunk_metadata(
+        cumulative_sequence_offsets(lengths), raw_gate.shape[1], 64
+    )
+
+    static = _gate_bwd(
+        (raw_gate, A_log, dt_bias),
+        d_cumulative,
+        metadata,
+        schedule=ScheduleRequest.STATIC,
+    )
+    persistent = _gate_bwd(
+        (raw_gate, A_log, dt_bias),
+        d_cumulative,
+        metadata,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+    for actual, other in zip(persistent, static, strict=True):
+        assert torch.equal(actual, other)
 
 
 def test_kda_gate_bwd_offset_width_specializations_match(monkeypatch):

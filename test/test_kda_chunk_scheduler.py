@@ -9,11 +9,23 @@ from pathlib import Path
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from attn_gym.linear.kda.chunk_scheduler import (
+    PERSISTENT_AUTO_WAVES,
+    PERSISTENT_CTAS_PER_SM,
+    GridScheduler,
+    RaggedChunkMetadata,
+    ResolvedSchedule,
+    ScheduleKind,
+    ScheduleRequest,
     chunk_capacity,
     chunk_work_oracle,
     decode_ragged_chunk_work,
+    decode_ragged_task,
+    load_ragged_chunk_count,
+    load_ragged_task_count,
     prepare_ragged_chunk_metadata,
 )
 
@@ -21,6 +33,23 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="the KDA chunk scheduler requires CUDA",
 )
+
+
+@triton.jit
+def _load_ragged_task_count_kernel(chunk_offsets, output, subtasks_per_chunk):
+    tl.store(output, load_ragged_task_count(chunk_offsets, 0, subtasks_per_chunk))
+
+
+@triton.jit
+def _decode_ragged_task_kernel(task, subtasks_per_chunk, output):
+    global_chunk, subtask = decode_ragged_task(task, subtasks_per_chunk)
+    tl.store(output, global_chunk)
+    tl.store(output + 1, subtask)
+
+
+@triton.jit
+def _load_ragged_chunk_count_kernel(chunk_offsets, output):
+    tl.store(output, load_ragged_chunk_count(chunk_offsets, 0))
 
 
 def _expected_tensor(lengths: list[int], chunk_size: int) -> tuple[torch.Tensor, list[int]]:
@@ -275,3 +304,114 @@ def test_cute_chunk_scheduler_cuda_graph_replays_boundaries():
             actual[expected.shape[0] :, warp].cpu(),
             torch.full_like(actual[expected.shape[0] :, warp].cpu(), -1),
         )
+
+
+def test_grid_scheduler_persistent_grid_is_machine_derived():
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    metadata = RaggedChunkMetadata(None, None, capacity=1 << 20, chunk_size=64)
+    scheduler = GridScheduler(metadata)
+    assert scheduler.num_workers(6, "cuda") == sm_count * PERSISTENT_CTAS_PER_SM
+    # Tiny capacity never over-launches workers, and zero capacity launches nothing.
+    assert GridScheduler(metadata._replace(capacity=2)).num_workers(3, "cuda") == 6
+    assert GridScheduler(metadata._replace(capacity=0)).num_workers(3, "cuda") == 0
+
+
+def test_grid_scheduler_chunk_workers_cap_at_sm_count():
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    metadata = RaggedChunkMetadata(None, None, capacity=1 << 20, chunk_size=64)
+    scheduler = GridScheduler(metadata)
+    assert scheduler.num_chunk_workers("cuda") == sm_count
+    # Sub-SM capacities quantize up to the next power of two to bound the
+    # TVM-FFI compile cache; extra workers idle in the stride loop.
+    assert GridScheduler(metadata._replace(capacity=3)).num_chunk_workers("cuda") == 4
+    assert GridScheduler(metadata._replace(capacity=0)).num_chunk_workers("cuda") == 0
+
+
+def test_persistent_task_count_promotes_before_multiplication():
+    chunk_offsets = torch.tensor([1_500_000_000], device="cuda", dtype=torch.int32)
+    output = torch.empty((), device="cuda", dtype=torch.int64)
+    _load_ragged_task_count_kernel[(1,)](chunk_offsets, output, 2)
+    assert output.item() == 3_000_000_000
+
+
+def test_ragged_task_helpers_load_and_decode_flat_work():
+    chunk_offsets = torch.tensor([4], device="cuda", dtype=torch.int32)
+    count = torch.empty((), device="cuda", dtype=torch.int64)
+    decoded = torch.empty(2, device="cuda", dtype=torch.int64)
+
+    _load_ragged_chunk_count_kernel[(1,)](chunk_offsets, count)
+    _decode_ragged_task_kernel[(1,)](3_000_000_001, 3, decoded)
+
+    assert count.item() == 4
+    assert decoded.tolist() == [1_000_000_000, 1]
+
+
+@pytest.mark.parametrize(
+    ("schedule_request", "eligible", "capacity_tasks", "expected_kind", "raises"),
+    (
+        (ScheduleRequest.AUTO, True, 400, ScheduleKind.STATIC, False),
+        (ScheduleRequest.AUTO, True, 401, ScheduleKind.PERSISTENT, False),
+        (ScheduleRequest.AUTO, False, 401, ScheduleKind.STATIC, False),
+        (ScheduleRequest.STATIC, True, 401, ScheduleKind.STATIC, False),
+        (ScheduleRequest.STATIC, False, 401, ScheduleKind.STATIC, False),
+        (ScheduleRequest.PERSISTENT, True, 1, ScheduleKind.PERSISTENT, False),
+        (ScheduleRequest.PERSISTENT, True, 0, ScheduleKind.STATIC, False),
+        (ScheduleRequest.PERSISTENT, False, 401, None, True),
+        (ScheduleRequest.PERSISTENT, False, 0, None, True),
+    ),
+)
+def test_grid_scheduler_resolves_flat_plan_contract(
+    monkeypatch,
+    schedule_request,
+    eligible,
+    capacity_tasks,
+    expected_kind,
+    raises,
+):
+    workers = 100
+    assert PERSISTENT_AUTO_WAVES * workers == 400
+    metadata = RaggedChunkMetadata(None, None, capacity_tasks, 64)
+    scheduler = GridScheduler(metadata)
+    monkeypatch.setattr(GridScheduler, "num_workers", lambda self, subtasks, device: workers)
+
+    if raises:
+        with pytest.raises(ValueError, match="persistent scheduling requires"):
+            scheduler.resolve_flat(schedule_request, 1, "cuda", eligible=eligible)
+        return
+
+    resolved = scheduler.resolve_flat(schedule_request, 1, "cuda", eligible=eligible)
+    assert resolved == ResolvedSchedule(expected_kind, workers, capacity_tasks)
+
+
+def test_grid_scheduler_rejects_legacy_boolean_requests(monkeypatch):
+    metadata = RaggedChunkMetadata(None, None, capacity=1, chunk_size=64)
+    monkeypatch.setattr(GridScheduler, "num_workers", lambda self, subtasks, device: 1)
+
+    with pytest.raises(TypeError, match="ScheduleRequest"):
+        GridScheduler(metadata).resolve_flat(True, 1, "cuda")
+
+
+@pytest.mark.parametrize(
+    ("schedule_request", "capacity", "expected_kind"),
+    (
+        (ScheduleRequest.AUTO, 256, ScheduleKind.STATIC),
+        (ScheduleRequest.AUTO, 257, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.STATIC, 512, ScheduleKind.STATIC),
+        (ScheduleRequest.PERSISTENT, 512, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.PERSISTENT, 0, ScheduleKind.STATIC),
+    ),
+)
+def test_grid_scheduler_chunk_plan_uses_the_same_resolved_type(
+    monkeypatch, schedule_request, capacity, expected_kind
+):
+    metadata = RaggedChunkMetadata(None, None, capacity=capacity, chunk_size=64)
+    monkeypatch.setattr(
+        GridScheduler,
+        "num_chunk_workers",
+        lambda self, device: 0 if self.metadata.capacity == 0 else 64,
+    )
+
+    resolved = GridScheduler(metadata).resolve_chunk(schedule_request, "cuda")
+
+    expected_workers = 0 if capacity == 0 else 64
+    assert resolved == ResolvedSchedule(expected_kind, expected_workers, capacity)

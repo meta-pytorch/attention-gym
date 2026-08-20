@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.chunk_scheduler import ScheduleRequest, prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_k3b_ragged_cute,
 )
@@ -29,7 +29,11 @@ def _inputs(tokens: int):
     return q, k, g, beta, Aqk
 
 
-def _run(inputs, lengths: list[int]):
+def _run(
+    inputs,
+    lengths: list[int],
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
+):
     tokens = sum(lengths)
     cu_seqlens = cumulative_sequence_offsets(lengths)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
@@ -37,6 +41,7 @@ def _run(inputs, lengths: list[int]):
         *inputs,
         scale=128**-0.5,
         metadata=metadata,
+        schedule=schedule,
     )
     return metadata, Aqk, AkkOD
 
@@ -136,8 +141,9 @@ def test_ragged_k3_matches_pytorch_reference(lengths):
 
 
 @pytest.mark.parametrize("lengths", [[0], [0, 0, 0]])
-def test_ragged_k3_accepts_all_empty_sequences(lengths):
-    metadata, Aqk, AkkOD = _run(_inputs(0), lengths)
+@pytest.mark.parametrize("schedule", [ScheduleRequest.AUTO, ScheduleRequest.PERSISTENT])
+def test_ragged_k3_accepts_all_empty_sequences(lengths, schedule):
+    metadata, Aqk, AkkOD = _run(_inputs(0), lengths, schedule)
 
     assert Aqk.shape == (1, 0, 1, 64)
     assert AkkOD.shape == (metadata.capacity * 6, 256)
@@ -171,7 +177,8 @@ def test_ragged_k3_rejects_mismatched_metadata_chunk_size():
         )
 
 
-def test_ragged_k3_replays_aligned_to_ragged():
+@pytest.mark.parametrize("schedule", [ScheduleRequest.STATIC, ScheduleRequest.PERSISTENT])
+def test_ragged_k3_replays_aligned_to_ragged(schedule):
     inputs = _inputs(128)
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
@@ -179,6 +186,7 @@ def test_ragged_k3_replays_aligned_to_ragged():
         *inputs,
         scale=128**-0.5,
         metadata=warm_metadata,
+        schedule=schedule,
     )
     torch.cuda.synchronize()
 
@@ -189,6 +197,7 @@ def test_ragged_k3_replays_aligned_to_ragged():
             *inputs,
             scale=128**-0.5,
             metadata=metadata,
+            schedule=schedule,
         )
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
@@ -198,3 +207,72 @@ def test_ragged_k3_replays_aligned_to_ragged():
     expected_aqk, expected_akk_od = _k3_reference(inputs, [65, 63])
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     _assert_matches_reference(actual_aqk, actual_akk_od, expected_aqk, expected_akk_od)
+
+
+def test_persistent_ragged_k3_matches_static_over_capacity():
+    """Stride a fixed chunk-worker grid over active chunks far below capacity."""
+    lengths = [65, 63]
+    active_tokens = sum(lengths)
+    capacity_tokens = 16 * active_tokens
+    inputs = _inputs(capacity_tokens)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, capacity_tokens, 64)
+    active_rows = metadata.chunk_offsets[-1].item() * 6
+
+    static = chunk_kda_fwd_k3b_ragged_cute(
+        *inputs,
+        scale=128**-0.5,
+        metadata=metadata,
+        schedule=ScheduleRequest.STATIC,
+    )
+    persistent = chunk_kda_fwd_k3b_ragged_cute(
+        *inputs,
+        scale=128**-0.5,
+        metadata=metadata,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+
+    assert torch.equal(persistent[0][:, :active_tokens], static[0][:, :active_tokens])
+    # Persistent scheduling leaves AkkOD capacity padding undefined; only the
+    # active rows are contractually meaningful (persistent K4 reads only those).
+    assert torch.equal(persistent[1][:active_rows], static[1][:active_rows])
+
+    expected_aqk, expected_akk_od = _k3_reference(inputs, lengths)
+    _assert_matches_reference(
+        persistent[0][:, :active_tokens],
+        persistent[1][:active_rows],
+        expected_aqk[:, :active_tokens],
+        expected_akk_od,
+    )
+
+
+def test_persistent_ragged_k3_strides_multiple_chunks_per_worker(monkeypatch):
+    """Force fewer workers than active chunks so CTAs reuse SMEM across iterations."""
+    from attn_gym.linear.kda import chunk_scheduler
+
+    monkeypatch.setattr(chunk_scheduler.GridScheduler, "num_chunk_workers", lambda self, device: 2)
+    lengths = [65, 63, 130, 70]
+    tokens = sum(lengths)
+    inputs = _inputs(tokens)
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    assert metadata.chunk_offsets[-1].item() > 2
+
+    static = chunk_kda_fwd_k3b_ragged_cute(
+        *inputs,
+        scale=128**-0.5,
+        metadata=metadata,
+        schedule=ScheduleRequest.STATIC,
+    )
+    persistent = chunk_kda_fwd_k3b_ragged_cute(
+        *inputs,
+        scale=128**-0.5,
+        metadata=metadata,
+        schedule=ScheduleRequest.PERSISTENT,
+    )
+
+    # Capacity exceeds the active count even for exact inputs (the shape-derived
+    # bound is conservative for multiple sequences), so AkkOD padding rows are
+    # undefined under persistent scheduling; compare the active rows.
+    active_rows = metadata.chunk_offsets[-1].item() * 6
+    assert torch.equal(persistent[0], static[0])
+    assert torch.equal(persistent[1][:active_rows], static[1][:active_rows])

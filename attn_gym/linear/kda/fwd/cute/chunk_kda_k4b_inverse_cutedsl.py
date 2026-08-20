@@ -7,7 +7,8 @@
 """
 CuTe DSL K4b: 4×4 block lower-triangular matrix inverse.
 
-Grid: (total_chunks, H, 1) — one CTA per (chunk, head).
+Exact grid: (total_chunks, H, 1) — one CTA per (chunk, head).
+Persistent grid: (chunk_workers, H, 1) — each CTA strides over chunks.
 128 threads (4 warps):
     Phase 1: Per-warp OD register load + preinverted diagonal-block load
     Phase 2a: Warps 0-2 parallel Schur L1 (Ai10, Ai21, Ai32), Warp 3 stores diags
@@ -30,8 +31,12 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
 
+from attn_gym.linear.kda.chunk_schedule import ScheduleKind
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
-from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
+    load_ragged_chunk_count,
+    load_ragged_chunk_work,
+)
 
 
 class ChunkKDAFwdK4bInverseCuteDSL:
@@ -42,7 +47,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         BC: int = 16,
         chunk_size: int = 64,
         num_subchunks: int = 4,
-        schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        chunk_schedule: ChunkSchedule = ChunkSchedule.DENSE,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        chunk_workers: int = 0,
         use_int64_offsets: bool = False,
     ):
         assert num_subchunks == 4, (
@@ -52,6 +59,14 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
             f"{num_subchunks} * {BC}"
         )
+        if schedule_kind is ScheduleKind.PERSISTENT:
+            assert chunk_schedule is ChunkSchedule.RAGGED and chunk_workers > 0, (
+                "persistent execution requires a positive ragged chunk-worker grid"
+            )
+        else:
+            assert chunk_workers == 0, "static execution does not use chunk workers"
+        self.schedule_kind = schedule_kind
+        self.chunk_workers = chunk_workers
         self.use_int64_offsets = use_int64_offsets
         self.BC = BC
         self.BT = chunk_size
@@ -59,7 +74,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         self.num_threads = 128
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (1, 1, 1)
-        self.schedule = schedule
+        self.chunk_schedule = chunk_schedule
 
     @cute.jit
     def upcast(self, value):
@@ -94,7 +109,12 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mAkk.element_type
-        grid = (total_chunks, H, 1)
+        chunk_axis = (
+            self.chunk_workers
+            if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+            else total_chunks
+        )
+        grid = (chunk_axis, H, 1)
 
         sSchurA_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC + 8, 1))
         sAi_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC, 1))
@@ -182,9 +202,8 @@ class ChunkKDAFwdK4bInverseCuteDSL:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         chunk_idx, head_idx, _ = cute.arch.block_idx()
-        warp_idx = tidx // self.WARP_SIZE
-        lane_idx = tidx % self.WARP_SIZE
 
+        # ── Shared memory, allocated once and reused across persistent iterations ──
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         work = storage.work.get_tensor(cute.make_layout(3))
@@ -198,11 +217,93 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         sSchurB1 = storage.sSchurB1.get_tensor(sSchurB_layout)
         sSchurA2 = storage.sSchurA2.get_tensor(sSchurA_layout)
         sSchurB2 = storage.sSchurB2.get_tensor(sSchurB_layout)
+        smem_tensors = (
+            work,
+            sAi0,
+            sAi1,
+            sAi2,
+            sAi3,
+            sSchurA0,
+            sSchurB0,
+            sSchurA1,
+            sSchurB1,
+            sSchurA2,
+            sSchurB2,
+        )
 
-        if cutlass.const_expr(self.schedule is ChunkSchedule.RAGGED):
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            active_chunks = load_ragged_chunk_count(chunk_offsets)
+            # No unroll: K4b's register-heavy Schur body regresses under
+            # unroll=2 (0.97x -> 0.87x measured vs the static grid).
+            for current_chunk in cutlass.range(chunk_idx, active_chunks, self.chunk_workers):
+                self._process_chunk(
+                    mAkkOD,
+                    mAkkd,
+                    mAkk,
+                    cu_seqlens,
+                    chunk_offsets,
+                    smem_tensors,
+                    smem_copy_A,
+                    smem_copy_B,
+                    tiled_mma,
+                    current_chunk,
+                    head_idx,
+                    tidx,
+                )
+                # Synchronize all warps before the next chunk's loads reuse SMEM.
+                cute.arch.sync_threads()
+        else:
+            self._process_chunk(
+                mAkkOD,
+                mAkkd,
+                mAkk,
+                cu_seqlens,
+                chunk_offsets,
+                smem_tensors,
+                smem_copy_A,
+                smem_copy_B,
+                tiled_mma,
+                chunk_idx,
+                head_idx,
+                tidx,
+            )
+
+    @cute.jit
+    def _process_chunk(
+        self,
+        mAkkOD: cute.Tensor,
+        mAkkd: cute.Tensor,
+        mAkk: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        chunk_offsets: cute.Tensor | None,
+        smem_tensors,
+        smem_copy_A: cute.TiledCopy,
+        smem_copy_B: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        chunk_idx: Int32,
+        head_idx: Int32,
+        tidx: Int32,
+    ):
+        """Invert one chunk's 4x4 block lower-triangular system."""
+        warp_idx = tidx // self.WARP_SIZE
+        lane_idx = tidx % self.WARP_SIZE
+        (
+            work,
+            sAi0,
+            sAi1,
+            sAi2,
+            sAi3,
+            sSchurA0,
+            sSchurB0,
+            sSchurA1,
+            sSchurB1,
+            sSchurA2,
+            sSchurB2,
+        ) = smem_tensors
+
+        if cutlass.const_expr(self.chunk_schedule is ChunkSchedule.RAGGED):
             if tidx == 0:
-                num_sequences = Int32(cute.size(chunk_offsets)) - 1
-                active_chunks = Int32(chunk_offsets[num_sequences])
+                active_chunks = load_ragged_chunk_count(chunk_offsets)
                 work[0] = Int32(0)
                 work[1] = Int32(0)
                 work[2] = Int32(0)
@@ -317,6 +418,9 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         # ══════════════════════════════════════════════════════════
         # PHASE 2: Parallel Schur Complement + Overlapped Stores
         # ══════════════════════════════════════════════════════════
+        # Each compute warp owns one sSchurA/B pair and writes then reads it in
+        # converged warp order. The CTA barriers protect cross-warp diagonal
+        # handoff above and SMEM reuse between persistent iterations.
 
         # ── WARP 0: 9 GEMMs (reordered for B-fragment reuse) ──
         if is_active and warp_idx == 0:
