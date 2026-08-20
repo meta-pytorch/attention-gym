@@ -245,9 +245,11 @@ fallback between the two, and the chunk-versus-recurrent switch is caller policy
 (on B200 the scan wins below roughly 32 tokens per sequence).
 
 `recurrent_kda_decode` is the serving-specific one-token path. It consumes
-head-interleaved post-convolution QKV, raw gate and beta projections, and a paged
-state cache. Q/K normalization, gate activation, beta sigmoid, recurrence, output,
-and state-cache update run in one Triton kernel.
+channel-major post-convolution QKV (`[Q for all heads | K for all heads | V for all
+heads]`), raw gate and beta projections, and a paged state cache. Q/K normalization,
+gate activation, beta sigmoid, recurrence, output, and state-cache update run in one
+Triton kernel. Callers may provide a stable output buffer for allocation-free CUDA
+Graph replay.
 
 ::: attn_gym.linear.chunk_kda
 

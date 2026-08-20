@@ -73,8 +73,8 @@ torch.library.define(
 torch.library.define(
     "attn_gym::kda_recurrent_decode",
     "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
-    " Tensor(a!) state_cache, Tensor state_indices, float lower_bound, bool use_lower_bound,"
-    " float scale) -> Tensor",
+    " Tensor(a!) state_cache, Tensor state_indices, Tensor(b!) out, float lower_bound,"
+    " bool use_lower_bound, float scale) -> ()",
 )
 torch.library.define(
     "attn_gym::kda_prepare_chunk_offsets",
@@ -401,12 +401,24 @@ def _recurrent_decode_fake(
     dt_bias: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    out: torch.Tensor,
     lower_bound: float,
     use_lower_bound: bool,
     scale: float,
-) -> torch.Tensor:
-    del raw_gate, raw_beta, A_log, dt_bias, state_indices, lower_bound, use_lower_bound, scale
-    return packed_qkv.new_empty(1, packed_qkv.shape[0], state_cache.shape[1], state_cache.shape[3])
+) -> None:
+    del (
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        out,
+        lower_bound,
+        use_lower_bound,
+        scale,
+    )
 
 
 @torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
@@ -524,6 +536,7 @@ def recurrent_decode_forward(
     dt_bias: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    out: torch.Tensor,
     lower_bound: float,
     use_lower_bound: bool,
     scale: float,
@@ -531,13 +544,13 @@ def recurrent_decode_forward(
     """Invoke the lazily loaded fused decode implementation."""
     if not packed_qkv.is_cuda:
         raise ValueError("recurrent_kda_decode requires CUDA tensors")
-    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache)
+    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
         raise RuntimeError(
             "recurrent_kda_decode is inference-only and has no backward; "
             "call under torch.no_grad() / torch.inference_mode()"
         )
-    return recurrent_decode_op(
+    recurrent_decode_op(
         packed_qkv,
         raw_gate,
         raw_beta,
@@ -545,10 +558,12 @@ def recurrent_decode_forward(
         dt_bias,
         state_cache,
         state_indices,
+        out,
         lower_bound,
         use_lower_bound,
         scale,
     )
+    return out
 
 
 __all__ = [

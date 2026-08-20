@@ -34,7 +34,7 @@ def _strided_state_pool(
     storage = torch.randn(
         num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
     )
-    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, key_dim, value_dim)
+    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
     assert not state.is_contiguous()
     return storage, state
 
@@ -49,13 +49,10 @@ def _decode_inputs(
     seed: int = 0,
 ):
     torch.manual_seed(seed)
-    packed_qkv = torch.randn(
-        batch,
-        heads,
-        2 * key_dim + value_dim,
-        device="cuda",
-        dtype=dtype,
-    ).flatten(1)
+    q = torch.randn(batch, heads, key_dim, device="cuda", dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, heads, value_dim, device="cuda", dtype=dtype)
+    packed_qkv = torch.cat((q.flatten(1), k.flatten(1), v.flatten(1)), dim=1)
     raw_gate = torch.randn(1, batch, heads, key_dim, device="cuda", dtype=dtype)
     raw_beta = torch.randn(1, batch, heads, device="cuda", dtype=dtype)
     A_log = 0.1 * torch.randn(heads, device="cuda", dtype=torch.float32)
@@ -86,11 +83,13 @@ def _reference_decode(
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch = packed_qkv.shape[0]
-    heads, key_dim, value_dim = state_cache.shape[1:]
-    per_head = packed_qkv.view(batch, heads, 2 * key_dim + value_dim)
-    q = per_head[..., :key_dim].unsqueeze(1).float()
-    k = per_head[..., key_dim : 2 * key_dim].unsqueeze(1).float()
-    v = per_head[..., 2 * key_dim :].unsqueeze(1)
+    heads, value_dim, key_dim = state_cache.shape[1:]
+    q_flat, k_flat, v_flat = packed_qkv.split(
+        (heads * key_dim, heads * key_dim, heads * value_dim), dim=1
+    )
+    q = q_flat.view(batch, heads, key_dim).unsqueeze(1).float()
+    k = k_flat.view(batch, heads, key_dim).unsqueeze(1).float()
+    v = v_flat.view(batch, heads, value_dim).unsqueeze(1)
     q *= torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
     k *= torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
 
@@ -115,11 +114,11 @@ def _reference_decode(
             gate[:, active].transpose(0, 1),
             beta[:, active].transpose(0, 1),
             scale=scale,
-            initial_state=state_cache[active_indices],
+            initial_state=state_cache[active_indices].transpose(-1, -2).contiguous(),
             output_final_state=True,
         )
         output[:, active] = active_output.transpose(0, 1).to(output.dtype)
-        expected_cache[active_indices] = active_state
+        expected_cache[active_indices] = active_state.transpose(-1, -2)
     return output, expected_cache
 
 
@@ -178,6 +177,43 @@ def test_recurrent_decode_padding_slot_is_ignored(padding_slot: int):
     torch.testing.assert_close(state_cache[0], before[0], rtol=0, atol=0)
 
 
+def test_recurrent_decode_writes_and_returns_caller_owned_out():
+    inputs = _decode_inputs(batch=2)
+    packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
+    before = state_cache.clone()
+    expected, expected_cache = _reference_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        before,
+        state_indices,
+        -5.0,
+    )
+    out = torch.full(
+        (1, 2, state_cache.shape[1], state_cache.shape[2]),
+        torch.nan,
+        device="cuda",
+        dtype=packed_qkv.dtype,
+    )
+
+    result = recurrent_kda_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        out=out,
+    )
+
+    assert result is out
+    torch.testing.assert_close(out.float(), expected.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(state_cache, expected_cache, rtol=3e-2, atol=3e-2)
+
+
 def test_recurrent_decode_validates_contract():
     inputs = list(_decode_inputs(batch=2))
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
@@ -222,6 +258,35 @@ def test_recurrent_decode_validates_contract():
             state_indices,
             lower_bound=1.0,
         )
+    with pytest.raises(ValueError, match="out must have shape"):
+        recurrent_kda_decode(
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            out=packed_qkv.new_empty(1, 2, state_cache.shape[1], state_cache.shape[2] - 1),
+        )
+    with pytest.raises(TypeError, match="out must use packed_qkv.dtype"):
+        recurrent_kda_decode(
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            out=torch.empty(
+                1,
+                2,
+                state_cache.shape[1],
+                state_cache.shape[2],
+                device="cuda",
+                dtype=torch.float32,
+            ),
+        )
 
 
 def test_recurrent_decode_rejects_gradient_tracking():
@@ -237,6 +302,7 @@ def test_recurrent_decode_rejects_gradient_tracking():
 def test_recurrent_decode_custom_op_registration(lower_bound: float | None):
     inputs = _decode_inputs(batch=2)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
+    out = packed_qkv.new_empty(1, 2, state_cache.shape[1], state_cache.shape[2])
     torch.library.opcheck(
         recurrent_decode_op,
         (
@@ -247,21 +313,27 @@ def test_recurrent_decode_custom_op_registration(lower_bound: float | None):
             dt_bias,
             state_cache,
             state_indices,
+            out,
             0.0 if lower_bound is None else lower_bound,
             lower_bound is not None,
-            state_cache.shape[2] ** -0.5,
+            state_cache.shape[3] ** -0.5,
         ),
     )
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
-def test_recurrent_decode_fullgraph_compile(lower_bound: float | None):
+@pytest.mark.parametrize("use_out", [False, True])
+def test_recurrent_decode_fullgraph_compile(lower_bound: float | None, use_out: bool):
     inputs = _decode_inputs(batch=2)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, eager_cache, state_indices = inputs
     _, compiled_cache = _strided_state_pool(
-        eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[2], eager_cache.shape[3]
+        eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[3], eager_cache.shape[2]
     )
     compiled_cache.copy_(eager_cache)
+    eager_out = (
+        packed_qkv.new_empty(1, 2, eager_cache.shape[1], eager_cache.shape[2]) if use_out else None
+    )
+    compiled_out = torch.empty_like(eager_out) if eager_out is not None else None
 
     expected = recurrent_kda_decode(
         packed_qkv,
@@ -272,6 +344,7 @@ def test_recurrent_decode_fullgraph_compile(lower_bound: float | None):
         eager_cache,
         state_indices,
         lower_bound=lower_bound,
+        out=eager_out,
     )
     compiled = torch.compile(recurrent_kda_decode, fullgraph=True)
     output = compiled(
@@ -283,8 +356,11 @@ def test_recurrent_decode_fullgraph_compile(lower_bound: float | None):
         compiled_cache,
         state_indices,
         lower_bound=lower_bound,
+        out=compiled_out,
     )
 
+    if compiled_out is not None:
+        assert output is compiled_out
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     torch.testing.assert_close(compiled_cache, eager_cache, rtol=0, atol=0)
 
@@ -292,16 +368,25 @@ def test_recurrent_decode_fullgraph_compile(lower_bound: float | None):
 def test_recurrent_decode_cuda_graph_replay():
     inputs = _decode_inputs(batch=3, seed=4)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, storage, state_cache, state_indices = inputs
+    out = packed_qkv.new_empty(1, 3, state_cache.shape[1], state_cache.shape[2])
     recurrent_kda_decode(
-        packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, state_indices
+        packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, state_indices, out=out
     )
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output = recurrent_kda_decode(
-            packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, state_indices
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            out=out,
         )
+    assert captured_output is out
 
     with torch.no_grad():
         state_cache.add_(0.25)
