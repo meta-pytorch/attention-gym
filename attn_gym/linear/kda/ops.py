@@ -71,6 +71,12 @@ torch.library.define(
     " Tensor state_indices, Tensor? cu_seqlens) -> Tensor",
 )
 torch.library.define(
+    "attn_gym::kda_recurrent_decode",
+    "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
+    " Tensor(a!) state_cache, Tensor state_indices, float lower_bound, bool use_lower_bound,"
+    " float scale) -> Tensor",
+)
+torch.library.define(
     "attn_gym::kda_prepare_chunk_offsets",
     "(Tensor cu_seqlens, SymInt tokens, int chunk_size) -> Tensor",
 )
@@ -159,6 +165,10 @@ def _delta_h_with_state_cuda(*args):
     return _delta_h_backend()._delta_h_with_state_cuda(*args)
 
 
+def _recurrent_decode_cuda(*args):
+    return _recurrent_backend()._kda_recurrent_decode_cuda(*args)
+
+
 def _prepare_chunk_offsets_cuda(*args):
     from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
 
@@ -189,6 +199,11 @@ torch.library.impl(
     "attn_gym::kda_recurrent_fwd_paged",
     "CUDA",
     _recurrent_fwd_paged_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_recurrent_decode",
+    "CUDA",
+    _recurrent_decode_cuda,
 )
 torch.library.impl(
     "attn_gym::kda_prepare_chunk_offsets",
@@ -377,6 +392,23 @@ def _recurrent_fwd_paged_fake(
     return torch.empty_like(v, dtype=q.dtype)
 
 
+@torch.library.register_fake("attn_gym::kda_recurrent_decode")
+def _recurrent_decode_fake(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    lower_bound: float,
+    use_lower_bound: bool,
+    scale: float,
+) -> torch.Tensor:
+    del raw_gate, raw_beta, A_log, dt_bias, state_indices, lower_bound, use_lower_bound, scale
+    return packed_qkv.new_empty(1, packed_qkv.shape[0], state_cache.shape[1], state_cache.shape[2])
+
+
 @torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
 def _prepare_chunk_offsets_fake(
     cu_seqlens: torch.Tensor,
@@ -438,6 +470,7 @@ chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
+recurrent_decode_op = torch.ops.attn_gym.kda_recurrent_decode.default
 prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
 delta_h_op = torch.ops.attn_gym.kda_delta_h.default
 delta_h_with_state_op = torch.ops.attn_gym.kda_delta_h_with_state.default
@@ -483,6 +516,41 @@ def recurrent_forward(
     return recurrent_fwd_no_state_op(q, k, v, gate, beta, initial_state, cu_seqlens), None
 
 
+def recurrent_decode_forward(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    lower_bound: float,
+    use_lower_bound: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Invoke the lazily loaded fused decode implementation."""
+    if not packed_qkv.is_cuda:
+        raise ValueError("recurrent_kda_decode requires CUDA tensors")
+    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
+        raise RuntimeError(
+            "recurrent_kda_decode is inference-only and has no backward; "
+            "call under torch.no_grad() / torch.inference_mode()"
+        )
+    return recurrent_decode_op(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        lower_bound,
+        use_lower_bound,
+        scale,
+    )
+
+
 __all__ = [
     "chunk_bwd_op",
     "chunk_bwd_with_state_grad_op",
@@ -493,6 +561,8 @@ __all__ = [
     "delta_h_op",
     "delta_h_with_state_op",
     "prepare_chunk_offsets_op",
+    "recurrent_decode_forward",
+    "recurrent_decode_op",
     "recurrent_forward",
     "recurrent_fwd_no_state_op",
     "recurrent_fwd_op",
