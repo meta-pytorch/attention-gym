@@ -271,8 +271,8 @@ def recurrent_kda_decode(
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
         A_log: Per-head log decay parameter shaped ``[H]``.
         dt_bias: Per-head/channel gate bias shaped ``[H, K]``.
-        state_cache: FP32 paged state pool shaped ``[num_slots, H, K, V]``. Slots
-            may have padding between them but each ``[H, K, V]`` row must be dense.
+        state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots
+            may have padding between them but each ``[H, V, K]`` row must be dense.
         state_indices: Contiguous int32 slot indices shaped ``[B]``. Positive slots
             are updated in place; non-positive entries produce zero output and leave
             the state cache untouched.
@@ -290,8 +290,8 @@ def recurrent_kda_decode(
     if packed_qkv.ndim != 2 or packed_qkv.shape[0] < 1 or packed_qkv.stride(1) != 1:
         raise ValueError("packed_qkv must have shape [B, C] and be contiguous within each token")
     if state_cache.ndim != 4:
-        raise ValueError("state_cache must have shape [num_slots, H, K, V]")
-    num_slots, heads, key_dim, value_dim = state_cache.shape
+        raise ValueError("state_cache must have shape [num_slots, H, V, K]")
+    num_slots, heads, value_dim, key_dim = state_cache.shape
     batch = packed_qkv.shape[0]
     if num_slots < 1 or heads < 1 or key_dim < 1 or value_dim < 1:
         raise ValueError(
@@ -315,9 +315,9 @@ def recurrent_kda_decode(
         raise ValueError(f"dt_bias must be contiguous with shape ({heads}, {key_dim})")
     if state_cache.dtype != torch.float32:
         raise TypeError("state_cache must use float32")
-    expected_state_strides = (key_dim * value_dim, value_dim, 1)
+    expected_state_strides = (value_dim * key_dim, key_dim, 1)
     if state_cache.stride()[1:] != expected_state_strides:
-        raise TypeError("state_cache must be contiguous within each [H, K, V] slot")
+        raise TypeError("state_cache must be contiguous within each [H, V, K] slot")
     if state_cache.stride(0) < heads * key_dim * value_dim:
         raise ValueError("state_cache slots must not overlap")
     if (

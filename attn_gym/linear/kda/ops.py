@@ -406,7 +406,7 @@ def _recurrent_decode_fake(
     scale: float,
 ) -> torch.Tensor:
     del raw_gate, raw_beta, A_log, dt_bias, state_indices, lower_bound, use_lower_bound, scale
-    return packed_qkv.new_empty(1, packed_qkv.shape[0], state_cache.shape[1], state_cache.shape[3])
+    return packed_qkv.new_empty(1, packed_qkv.shape[0], state_cache.shape[1], state_cache.shape[2])
 
 
 @torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")

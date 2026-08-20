@@ -34,7 +34,7 @@ def _strided_state_pool(
     storage = torch.randn(
         num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
     )
-    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, key_dim, value_dim)
+    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
     assert not state.is_contiguous()
     return storage, state
 
@@ -86,7 +86,7 @@ def _reference_decode(
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch = packed_qkv.shape[0]
-    heads, key_dim, value_dim = state_cache.shape[1:]
+    heads, value_dim, key_dim = state_cache.shape[1:]
     per_head = packed_qkv.view(batch, heads, 2 * key_dim + value_dim)
     q = per_head[..., :key_dim].unsqueeze(1).float()
     k = per_head[..., key_dim : 2 * key_dim].unsqueeze(1).float()
@@ -115,11 +115,11 @@ def _reference_decode(
             gate[:, active].transpose(0, 1),
             beta[:, active].transpose(0, 1),
             scale=scale,
-            initial_state=state_cache[active_indices],
+            initial_state=state_cache[active_indices].transpose(-1, -2).contiguous(),
             output_final_state=True,
         )
         output[:, active] = active_output.transpose(0, 1).to(output.dtype)
-        expected_cache[active_indices] = active_state
+        expected_cache[active_indices] = active_state.transpose(-1, -2)
     return output, expected_cache
 
 
@@ -249,7 +249,7 @@ def test_recurrent_decode_custom_op_registration(lower_bound: float | None):
             state_indices,
             0.0 if lower_bound is None else lower_bound,
             lower_bound is not None,
-            state_cache.shape[2] ** -0.5,
+            state_cache.shape[3] ** -0.5,
         ),
     )
 
@@ -259,7 +259,7 @@ def test_recurrent_decode_fullgraph_compile(lower_bound: float | None):
     inputs = _decode_inputs(batch=2)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, eager_cache, state_indices = inputs
     _, compiled_cache = _strided_state_pool(
-        eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[2], eager_cache.shape[3]
+        eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[3], eager_cache.shape[2]
     )
     compiled_cache.copy_(eager_cache)
 
