@@ -154,6 +154,9 @@ kda_recurrent_fwd_kernel = triton.autotune(
 )(_kda_recurrent_fwd_kernel)
 
 
+# Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
+# (batch row, head, V tile), processes all K channels for that tile, and gets
+# contiguous K-dimension accesses from the [V, K] state layout.
 @triton.jit
 def kda_recurrent_decode_kernel(
     packed_qkv,
@@ -187,7 +190,7 @@ def kda_recurrent_decode_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     m_k = o_k < K
     m_v = o_v < V
-    m_kv = m_k[:, None] & m_v[None, :]
+    m_vk = m_v[:, None] & m_k[None, :]
 
     i_state = tl.load(state_indices + i_n).to(tl.int64)
     row = i_n * H + i_h
@@ -195,14 +198,13 @@ def kda_recurrent_decode_kernel(
         tl.store(output + row * V + o_v, 0.0, mask=m_v)
         return
 
-    p_state = i_state * state_batch_stride + i_h * K * V + o_k[:, None] * V + o_v[None, :]
-    b_state = tl.load(state_cache + p_state, mask=m_kv, other=0.0).to(tl.float32)
+    p_state = i_state * state_batch_stride + i_h * V * K + o_v[:, None] * K + o_k[None, :]
+    b_state = tl.load(state_cache + p_state, mask=m_vk, other=0.0).to(tl.float32)
 
-    head_offset = i_h * (2 * K + V)
-    p_qkv = packed_qkv + i_n * qkv_token_stride + head_offset
-    b_q = tl.load(p_qkv + o_k, mask=m_k, other=0.0).to(tl.float32)
-    b_k = tl.load(p_qkv + K + o_k, mask=m_k, other=0.0).to(tl.float32)
-    b_v = tl.load(p_qkv + 2 * K + o_v, mask=m_v, other=0.0).to(tl.float32)
+    p_qkv = packed_qkv + i_n * qkv_token_stride
+    b_q = tl.load(p_qkv + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_k = tl.load(p_qkv + H * K + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_v = tl.load(p_qkv + 2 * H * K + i_h * V + o_v, mask=m_v, other=0.0).to(tl.float32)
     b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
     b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
 
@@ -216,18 +218,22 @@ def kda_recurrent_decode_kernel(
         b_softplus = tl.where(
             b_gate_input > 20.0,
             b_gate_input,
-            tl.log(1.0 + tl.exp(b_gate_input)),
+            tl.where(
+                b_gate_input < -10.0,
+                tl.exp(b_gate_input),
+                tl.log(1.0 + tl.exp(b_gate_input)),
+            ),
         )
         b_gate = -b_a * b_softplus
 
-    b_state *= tl.exp(b_gate)[:, None]
-    b_delta = b_v - tl.sum(b_k[:, None] * b_state, 0)
+    b_state *= tl.exp(b_gate)[None, :]
+    b_delta = b_v - tl.sum(b_state * b_k[None, :], axis=1)
     b_beta = tl.sigmoid(tl.load(raw_beta + i_n * beta_token_stride + i_h).to(tl.float32))
     b_delta *= b_beta
-    b_state += b_k[:, None] * b_delta[None, :]
-    b_o = tl.sum(b_q[:, None] * b_state, 0)
+    b_state += b_delta[:, None] * b_k[None, :]
+    b_o = tl.sum(b_state * b_q[None, :], axis=1)
     tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
-    tl.store(state_cache + p_state, b_state, mask=m_kv)
+    tl.store(state_cache + p_state, b_state, mask=m_vk)
 
 
 def _launch_recurrent_fwd(
@@ -400,14 +406,25 @@ def _kda_recurrent_decode_cuda(
     dt_bias: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    output: torch.Tensor,
     lower_bound: float,
     use_lower_bound: bool,
     scale: float,
-) -> torch.Tensor:
+) -> None:
+    read_only_inputs = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_indices)
+    if any(torch._C._overlaps(output, tensor) for tensor in (*read_only_inputs, state_cache)):
+        raise ValueError("out must not alias any recurrent_kda_decode input")
+    if any(torch._C._overlaps(state_cache, tensor) for tensor in read_only_inputs):
+        raise ValueError("state_cache must not alias recurrent_kda_decode read-only inputs")
+
     batch = packed_qkv.shape[0]
-    heads, key_dim, value_dim = state_cache.shape[1:]
-    output = packed_qkv.new_empty(1, batch, heads, value_dim)
-    block_v = min(triton.next_power_of_2(value_dim), 32)
+    heads, value_dim, key_dim = state_cache.shape[1:]
+    if value_dim <= 32:
+        block_v, num_warps = min(triton.next_power_of_2(value_dim), 8), 4
+    elif batch * heads <= 8:
+        block_v, num_warps = min(triton.next_power_of_2(value_dim), 16), 2
+    else:
+        block_v, num_warps = min(triton.next_power_of_2(value_dim), 16), 1
     grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
     kda_recurrent_decode_kernel[grid](
         packed_qkv,
@@ -430,9 +447,8 @@ def _kda_recurrent_decode_cuda(
         BK=triton.next_power_of_2(key_dim),
         BV=block_v,
         USE_LOWER_BOUND=use_lower_bound,
-        num_warps=4,
+        num_warps=num_warps,
     )
-    return output
 
 
 __all__ = [
