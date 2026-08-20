@@ -19,9 +19,12 @@ from attn_gym.linear.kda.short_conv.cute import (
     _candidate_configs,
     _configured_backward_op,
     _configured_backward_with_state_grad_op,
+    _configured_decode_op,
     _configured_forward_op,
+    _decode_op,
     _forward_op,
     causal_conv1d,
+    causal_conv1d_decode,
     tune_causal_conv1d,
 )
 
@@ -89,6 +92,44 @@ def _packed_state_reference(
     return output, torch.cat(final_states, dim=0)
 
 
+def _misaligned_inputs(tokens: int = 17, channels: int = 12, width: int = 4):
+    """Build contiguous views whose storage starts off a 16-byte boundary."""
+    x_storage = torch.randn(tokens * channels + 1, device="cuda", dtype=torch.bfloat16)
+    weight_storage = torch.randn(channels * width + 1, device="cuda", dtype=torch.bfloat16)
+    x = x_storage[1:].view(1, tokens, channels).requires_grad_()
+    weight = weight_storage[1:].view(channels, width).requires_grad_()
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    assert weight.is_contiguous() and weight.data_ptr() % 16 != 0
+    return x, weight
+
+
+def _decode_conv(x, weight, activation="silu"):
+    """Walk the same sequence through the one-token step, one slot per batch row.
+
+    Repeated decode steps from a zero history equal a single dense call, so both
+    entry points share every reference below. The update is inference-only, hence
+    the detach.
+    """
+    x, weight = x.detach(), weight.detach()
+    state = x.new_zeros(x.shape[0], weight.shape[1] - 1, x.shape[2])
+    return torch.stack(
+        [
+            causal_conv1d_decode(x[:, t].contiguous(), weight, state, activation=activation)
+            for t in range(x.shape[1])
+        ],
+        dim=1,
+    )
+
+
+def _assert_conv_matches(run, x, weight, activation="silu", rtol=2e-2, atol=2e-2):
+    """Compare an entry point against the reference and return both tensors."""
+    actual = run(x, weight, activation=activation)
+    convolve = _reference if activation == "silu" else _plain_conv_reference
+    expected = convolve(x, weight)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    return actual, expected
+
+
 @pytest.mark.parametrize("width", [1, 4, 5])
 def test_short_conv_forward_and_backward_match_pytorch(width: int):
     """Check generic widths and partial first and last time tiles."""
@@ -96,9 +137,7 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     x, weight = _inputs(width=width)
     grad_output = torch.randn_like(x)
 
-    actual = causal_conv1d(x, weight, activation="silu")
-    expected = _reference(x, weight)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    actual, expected = _assert_conv_matches(causal_conv1d, x, weight)
 
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
@@ -259,9 +298,7 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
     x, weight = _inputs(tokens=19, channels=channels)
     grad_output = torch.randn_like(x)
 
-    actual = causal_conv1d(x, weight, activation="silu")
-    expected = _reference(x, weight)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    actual, expected = _assert_conv_matches(causal_conv1d, x, weight)
 
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
@@ -722,17 +759,9 @@ def test_short_conv_packed_state_forward_and_backward(width: int):
 
 def test_short_conv_accepts_misaligned_contiguous_storage():
     """Materialize alignment inside the opaque launcher when a view starts off-boundary."""
-    tokens, channels = 17, 12
-    x_storage = torch.randn(1 * tokens * channels + 1, device="cuda", dtype=torch.bfloat16)
-    weight_storage = torch.randn(channels * 4 + 1, device="cuda", dtype=torch.bfloat16)
-    x = x_storage[1:].view(1, tokens, channels).requires_grad_()
-    weight = weight_storage[1:].view(channels, 4).requires_grad_()
-    assert x.is_contiguous() and x.data_ptr() % 16 != 0
-    assert weight.is_contiguous() and weight.data_ptr() % 16 != 0
+    x, weight = _misaligned_inputs()
 
-    actual = causal_conv1d(x, weight, activation="silu")
-    expected = _reference(x, weight)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    _assert_conv_matches(causal_conv1d, x, weight)
 
 
 def test_short_conv_explicit_config_and_tuning_flow():
@@ -1200,9 +1229,7 @@ def test_short_conv_identity_activation_matches_plain_conv():
     x, weight = _inputs()
     grad_output = torch.randn_like(x)
 
-    actual = causal_conv1d(x, weight)
-    expected = _plain_conv_reference(x, weight)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    actual, expected = _assert_conv_matches(causal_conv1d, x, weight, None)
 
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
@@ -1431,3 +1458,199 @@ def test_function_cache_key_covers_defaults_and_nested_functions():
     # No closure, real module, but <locals>: must not claim process crossing.
     activation = activations.Activation("nested", nested_activation, nested_activation)
     assert not activation.crosses_process_boundary
+
+
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    [(torch.float16, 2e-2, 2e-2), (torch.bfloat16, 2e-2, 2e-2), (torch.float32, 2e-5, 2e-5)],
+)
+def test_short_conv_decode_supported_dtypes(dtype: torch.dtype, rtol: float, atol: float):
+    """Specialize storage while retaining FP32 convolution accumulation."""
+    torch.manual_seed(5)
+    x, weight = _inputs(tokens=9, channels=12, width=4, batch=2, dtype=dtype)
+    _assert_conv_matches(_decode_conv, x, weight, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("channels", [5, 6])
+def test_short_conv_decode_supports_any_positive_channel_count(channels: int):
+    """Select a compatible channel width without requiring an explicit config."""
+    torch.manual_seed(1)
+    x, weight = _inputs(tokens=19, channels=channels)
+    _assert_conv_matches(_decode_conv, x, weight)
+
+
+def test_short_conv_decode_accepts_misaligned_contiguous_storage():
+    """Materialize alignment inside the opaque launcher for off-boundary views."""
+    x, weight = _misaligned_inputs()
+    _assert_conv_matches(_decode_conv, x, weight)
+
+
+def test_short_conv_decode_registered_custom_activation():
+    """Fuse a user-registered CuTeDSL activation into the one-token step."""
+    activations.register_activation("tanh", _tanh_activation, _tanh_activation_derivative)
+    torch.manual_seed(7)
+    x, weight = _inputs()
+    actual = _decode_conv(x, weight, "tanh")
+    expected = torch.tanh(_plain_conv_reference(x, weight))
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_short_conv_decode_activation_registration_contract():
+    """Reject unknown activation names on the one-token path."""
+    x, weight = (tensor.detach() for tensor in _inputs())
+    with pytest.raises(ValueError, match="unknown activation"):
+        causal_conv1d_decode(x[:, 0], weight, x.new_zeros(1, 3, x.shape[2]), activation="missing")
+
+
+def test_short_conv_decode_fullgraph_forward(paged_short_conv_inputs):
+    """Keep the opaque forward and the in-place history write in a strict graph."""
+    torch.manual_seed(4)
+    x, weight, state, slots = paged_short_conv_inputs()
+    expected = causal_conv1d_decode(x, weight, state.clone(), state_indices=slots)
+    compiled = torch.compile(causal_conv1d_decode, fullgraph=True)
+    actual = compiled(x, weight, state, state_indices=slots)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_short_conv_decode_configured_fullgraph_forward(paged_short_conv_inputs):
+    """Keep explicit scalar schedules behind the configured opaque operator."""
+    torch.manual_seed(6)
+    x, weight, state, slots = paged_short_conv_inputs(channels=6)
+    config = ShortConvConfig(64, 2, 8)
+    expected_state = state.clone()
+    expected = causal_conv1d_decode(
+        x,
+        weight,
+        expected_state,
+        state_indices=slots,
+        forward_config=config,
+    )
+    compiled = torch.compile(causal_conv1d_decode, fullgraph=True)
+    actual = compiled(
+        x,
+        weight,
+        state,
+        state_indices=slots,
+        forward_config=config,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+def test_short_conv_decode_configured_dynamic_shapes(paged_short_conv_inputs):
+    """Reuse one configured full graph across different sequence counts."""
+    config = ShortConvConfig(64, 2, 8)
+    compiled = torch.compile(causal_conv1d_decode, fullgraph=True, dynamic=True)
+    for sequences in (2, 4):
+        x, weight, state, slots = paged_short_conv_inputs(
+            sequences=sequences,
+            channels=6,
+        )
+        expected_state = state.clone()
+        actual_state = state.clone()
+        expected = causal_conv1d_decode(
+            x,
+            weight,
+            expected_state,
+            state_indices=slots,
+            forward_config=config,
+        )
+        actual = compiled(
+            x,
+            weight,
+            actual_state,
+            state_indices=slots,
+            forward_config=config,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs):
+    """Address a paged pool by slot and leave the other rows untouched."""
+    torch.manual_seed(1)
+    x, weight, state, slots = paged_short_conv_inputs()
+    initial_state = state.clone()
+    history = torch.cat([initial_state[slots.long()], x.unsqueeze(1)], dim=1)
+    expected_final = initial_state.clone()
+    expected_final[slots.long()] = history[:, 1:]
+
+    actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
+    # Absence of a write, not a numeric claim: unnamed rows must be bitwise intact.
+    torch.testing.assert_close(state, expected_final, rtol=0, atol=0)
+
+
+def test_short_conv_decode_ignores_padding_slots(paged_short_conv_inputs):
+    x, weight, state, slots = paged_short_conv_inputs()
+    slots.copy_(torch.tensor([3, 0, -1], device="cuda", dtype=torch.int32))
+    initial_state = state.clone()
+
+    output = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    history = torch.cat([initial_state[3:4], x[:1].unsqueeze(1)], dim=1)
+    torch.testing.assert_close(
+        output[:1], _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(output[1:], torch.zeros_like(output[1:]), rtol=0, atol=0)
+    torch.testing.assert_close(state[0], initial_state[0], rtol=0, atol=0)
+
+
+def test_short_conv_decode_custom_op_registration(paged_short_conv_inputs):
+    """Exercise default and configured mutation schemas with fake and dynamic tensors."""
+    x, weight, state, slots = paged_short_conv_inputs(channels=6)
+    torch.library.opcheck(_decode_op, (x, weight, state.clone(), slots))
+    torch.library.opcheck(
+        _configured_decode_op,
+        (x, weight, state.clone(), slots, 64, 2, 8),
+    )
+
+
+def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
+    """Reject malformed tensor contracts and channel-incompatible schedules."""
+    x, weight, state, slots = paged_short_conv_inputs(channels=6)
+    with pytest.raises(ValueError, match="positive sequence and channel"):
+        causal_conv1d_decode(x[:0], weight, state, state_indices=slots[:0])
+    with pytest.raises(ValueError, match="weight must have shape"):
+        causal_conv1d_decode(x, weight[:-1], state, state_indices=slots)
+    with pytest.raises(ValueError, match="contiguous CUDA FP16, BF16, or FP32"):
+        causal_conv1d_decode(x.double(), weight, state, state_indices=slots)
+    with pytest.raises(ValueError, match="weight must match x dtype"):
+        causal_conv1d_decode(x, weight.cpu(), state, state_indices=slots)
+    with pytest.raises(ValueError, match="state must match x dtype"):
+        causal_conv1d_decode(x, weight, state.cpu(), state_indices=slots)
+    with pytest.raises(ValueError, match="C must be divisible"):
+        causal_conv1d_decode(
+            x,
+            weight,
+            state,
+            state_indices=slots,
+            forward_config=ShortConvConfig(64, 4, 8),
+        )
+
+
+def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs):
+    """Capture the one-token step and replay it from a reset history."""
+    torch.manual_seed(8)
+    x, weight, state, slots = paged_short_conv_inputs()
+    initial_state = state.clone()
+    causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    state.copy_(initial_state)
+    with torch.cuda.graph(graph):
+        captured = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    # Replay advances the pool in place, so both runs must start from the same history.
+    x.add_(0.25)
+    state.copy_(initial_state)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed, replayed_state = captured.clone(), state.clone()
+
+    state.copy_(initial_state)
+    expected = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+    torch.testing.assert_close(replayed_state, state, rtol=0, atol=0)
