@@ -23,17 +23,21 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import (
+    GridScheduler,
     RaggedChunkMetadata,
+    ScheduleKind,
+    ScheduleRequest,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
+    load_ragged_sequence_extent,
 )
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
 from attn_gym.linear.kda.utils import exp2
 
 
-@triton.jit(do_not_specialize=["T"])
-def chunk_delta_h_kernel_k128_wsp(
+@triton.jit
+def _run_chunk_delta_h_sequence(
     k_desc,
     w_desc,
     u_desc,
@@ -49,6 +53,8 @@ def chunk_delta_h_kernel_k128_wsp(
     u,
     v_new,
     T,
+    i_nh,
+    i_v,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -61,19 +67,13 @@ def chunk_delta_h_kernel_k128_wsp(
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    """Warp-specialized K=128 inter-chunk recurrence.
+    """Process one sequence, head, and value tile through the state recurrence.
 
-    Holds the full [K, BV] state in one accumulator and walks full chunks with
-    a warp-specialized descriptor loop. A partial tail chunk uses masked
-    pointers because a descriptor load would cross the sequence boundary in
-    the token-major packed layout. ``decay_desc`` holds precomputed ``exp2``
-    of each chunk's last-row cumulative gate. Descriptor coordinates are
-    element indices and stay int32; the raw-pointer tail and state paths
-    promote to int64 when tensor sizes require it. Compute follows the
-    blockdim64 kernel it replaced: dots run in the input dtype with FP32
-    accumulation, and the state stays FP32.
+    The full ``[K, BV]`` state stays in one FP32 accumulator while complete
+    chunks use tensor descriptors and a partial tail uses masked pointers.
+    Descriptor coordinates remain int32; raw-pointer state and tail paths widen
+    when the reachable layout requires int64 offsets.
     """
-    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if USE_INT64_OFFSETS:
         i_state = i_nh.to(tl.int64)
@@ -162,6 +162,137 @@ def chunk_delta_h_kernel_k128_wsp(
         )
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_delta_h_kernel_k128_wsp(
+    k_desc,
+    w_desc,
+    u_desc,
+    vnew_desc,
+    h_desc,
+    decay_desc,
+    h0,
+    ht,
+    cu_seqlens,
+    chunk_offsets,
+    k,
+    w,
+    u,
+    v_new,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Warp-specialized K=128 inter-chunk recurrence."""
+    _run_chunk_delta_h_sequence(
+        k_desc,
+        w_desc,
+        u_desc,
+        vnew_desc,
+        h_desc,
+        decay_desc,
+        h0,
+        ht,
+        cu_seqlens,
+        chunk_offsets,
+        k,
+        w,
+        u,
+        v_new,
+        T,
+        tl.program_id(0),
+        tl.program_id(1),
+        H,
+        K,
+        V,
+        BT,
+        BV,
+        WARP_SPECIALIZE,
+        NUM_STAGES,
+        USE_INITIAL_STATE,
+        STORE_FINAL_STATE,
+        IS_VARLEN,
+        USE_INT64_OFFSETS,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
+def chunk_delta_h_kernel_k128_persistent(
+    k_desc,
+    w_desc,
+    u_desc,
+    vnew_desc,
+    h_desc,
+    decay_desc,
+    h0,
+    ht,
+    cu_seqlens,
+    chunk_offsets,
+    k,
+    w,
+    u,
+    v_new,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+    NUM_SEQUENCES: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+):
+    """Stride persistent workers over sequence recurrences after the first wave."""
+    worker = tl.program_id(0)
+    i_v = tl.program_id(1)
+    sequence_extent = load_ragged_sequence_extent(cu_seqlens, NUM_SEQUENCES)
+    active_tasks = sequence_extent * H
+    task_end = NUM_SEQUENCES * H if STORE_FINAL_STATE else active_tasks
+    for i_nh in tl.range(NUM_WORKERS + worker, task_end, NUM_WORKERS):
+        _run_chunk_delta_h_sequence(
+            k_desc,
+            w_desc,
+            u_desc,
+            vnew_desc,
+            h_desc,
+            decay_desc,
+            h0,
+            ht,
+            cu_seqlens,
+            chunk_offsets,
+            k,
+            w,
+            u,
+            v_new,
+            T,
+            i_nh,
+            i_v,
+            H,
+            K,
+            V,
+            BT,
+            BV,
+            WARP_SPECIALIZE,
+            NUM_STAGES,
+            USE_INITIAL_STATE,
+            STORE_FINAL_STATE,
+            True,
+            USE_INT64_OFFSETS,
+        )
+
+
 @triton.jit(do_not_specialize=["num_sequences"])
 def _chunk_decay_last_kernel(
     gk,
@@ -227,6 +358,35 @@ def _chunk_decay_last(
 # attn_gym.linear.kda.ops; this module provides the CUDA entry points.
 _CHUNK_SIZE = 64
 _BLOCK_VALUE_DIM = 64
+_MIN_PERSISTENT_SEQUENCES = 32
+_MIN_PERSISTENT_HEADS = 8
+_AUTO_PERSISTENT_MAX_AVERAGE_TOKENS = _CHUNK_SIZE
+
+
+def _persistent_sequence_workers(
+    metadata: RaggedChunkMetadata,
+    tokens: int,
+    heads: int,
+    value_tiles: int,
+    device: torch.device,
+    schedule: ScheduleRequest,
+) -> int:
+    """Return the sequence-head workers for the selected recurrence schedule."""
+    num_sequences = metadata.cu_seqlens.shape[0] - 1
+    resolved = GridScheduler(metadata, ctas_per_sm=1).resolve_sequences(
+        schedule, heads * value_tiles, device
+    )
+    if resolved.kind is ScheduleKind.STATIC:
+        return 0
+    # Longer capacity-average recurrences favor the fully warp-specialized grid;
+    # explicit PERSISTENT remains available for targeted tuning experiments.
+    if schedule is ScheduleRequest.AUTO and (
+        num_sequences < _MIN_PERSISTENT_SEQUENCES
+        or heads < _MIN_PERSISTENT_HEADS
+        or tokens > num_sequences * _AUTO_PERSISTENT_MAX_AVERAGE_TOKENS
+    ):
+        return 0
+    return max(1, resolved.workers // value_tiles)
 
 
 def _delta_h_launch(
@@ -239,6 +399,7 @@ def _delta_h_launch(
     chunk_offsets: torch.Tensor | None,
     capacity: int,
     final_state: torch.Tensor | None,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
     batch, tokens, heads, key_dim = k.shape
@@ -253,13 +414,16 @@ def _delta_h_launch(
     # pipelined loop instead. 16-bit inputs keep the tuned contract schedule.
     use_16bit_config = k.element_size() == 2
     block_value_dim = _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2
-    chunk_delta_h_kernel_k128_wsp[(state_batch * heads, value_dim // block_value_dim)](
+    descriptors = (
         TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),
         TensorDescriptor.from_tensor(w, [1, _CHUNK_SIZE, 1, key_dim]),
         TensorDescriptor.from_tensor(u, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(v_new, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(h, [1, 1, 1, key_dim, block_value_dim]),
         TensorDescriptor.from_tensor(decay, [1, 1, key_dim]),
+    )
+    kernel_args = (
+        *descriptors,
         initial_state,
         final_state,
         cu_seqlens,
@@ -269,19 +433,57 @@ def _delta_h_launch(
         u,
         v_new,
         tokens,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BT=_CHUNK_SIZE,
-        BV=block_value_dim,
-        WARP_SPECIALIZE=use_16bit_config,
-        NUM_STAGES=3 if use_16bit_config else 2,
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        USE_INT64_OFFSETS=requires_int64_offsets(k, w, u, v_new, h, initial_state, final_state),
-        num_warps=4,
     )
+    kernel_options = {
+        "H": heads,
+        "K": key_dim,
+        "V": value_dim,
+        "BT": _CHUNK_SIZE,
+        "BV": block_value_dim,
+        "WARP_SPECIALIZE": use_16bit_config,
+        "NUM_STAGES": 3 if use_16bit_config else 2,
+        "USE_INITIAL_STATE": initial_state is not None,
+        "STORE_FINAL_STATE": final_state is not None,
+        "USE_INT64_OFFSETS": requires_int64_offsets(k, w, u, v_new, h, initial_state, final_state),
+        "num_warps": 4,
+    }
+    value_tiles = value_dim // block_value_dim
+    sequence_workers = 0
+    if cu_seqlens is not None:
+        assert chunk_offsets is not None
+        sequence_workers = _persistent_sequence_workers(
+            RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, _CHUNK_SIZE),
+            tokens,
+            heads,
+            value_tiles,
+            k.device,
+            schedule,
+        )
+    if sequence_workers:
+        # Keep one machine-sized wave warp-specialized, then stride persistent workers
+        # over the remaining work; Triton cannot warp-specialize the nested loop. This
+        # reduced N=512, M=32 graph replay from 1.22 ms to 0.68 ms on B200.
+        chunk_delta_h_kernel_k128_wsp[(sequence_workers, value_tiles)](
+            *kernel_args,
+            **kernel_options,
+            IS_VARLEN=True,
+        )
+        persistent_options = kernel_options | {
+            "WARP_SPECIALIZE": False,
+            "NUM_STAGES": 2,
+        }
+        chunk_delta_h_kernel_k128_persistent[(sequence_workers, value_tiles)](
+            *kernel_args,
+            **persistent_options,
+            NUM_SEQUENCES=state_batch,
+            NUM_WORKERS=sequence_workers,
+        )
+    else:
+        chunk_delta_h_kernel_k128_wsp[(state_batch * heads, value_tiles)](
+            *kernel_args,
+            **kernel_options,
+            IS_VARLEN=cu_seqlens is not None,
+        )
     return h, v_new
 
 

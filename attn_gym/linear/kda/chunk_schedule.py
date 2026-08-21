@@ -38,7 +38,7 @@ class ResolvedSchedule:
 
     ``workers`` is the bounded persistent-grid candidate; STATIC kernels use
     their natural capacity grid. ``capacity_tasks`` is the total number of
-    possible ``(chunk, subtask)`` slots used by the automatic policy.
+    possible logical work slots used by the automatic policy.
     """
 
     kind: ScheduleKind
