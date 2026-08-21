@@ -13,7 +13,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd_cute_bf16
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.utils import profiler_range
 
@@ -56,7 +56,7 @@ def chunk_kda_bwd(
     # reconstruct the large W/U, gated Q/K, state, and corrected-value
     # intermediates here instead of retaining them for the lifetime of the graph.
     with profiler_range("kda/cute/backward_recompute_w_u"):
-        w, u, qg, kg = recompute_w_u_fwd(
+        w, u, qg, kg = recompute_w_u_fwd_cute_bf16(
             q=q,
             k=k,
             v=v,
@@ -64,7 +64,6 @@ def chunk_kda_bwd(
             A=Akk,
             gk=g,
             metadata=metadata,
-            chunk_size=chunk_size,
             autotune=autotune,
         )
     assert qg is not None and kg is not None

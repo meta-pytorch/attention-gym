@@ -41,8 +41,7 @@ def test_recompute_ignores_upper_triangle_and_reuses_compilation(tmp_path, monke
     def run_recompute():
         return recompute_w_u_fwd(k, v, beta, A, metadata=None)
 
-    # Compile-cache reuse contract lives on the CuTe kernel, which the public
-    # API no longer reaches; call the internal entry to keep it compiling.
+    # Exercise the checked CuTe entry directly so its full compile-cache contract is visible.
     w_cute, u_cute, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=None)
     first_cache_info = _compile_recompute_w_u.cache_info()
     repeated_w, repeated_u, _, _ = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=None)
@@ -99,6 +98,62 @@ def test_recompute_uses_optional_q_and_gate_arguments():
     torch.testing.assert_close(both_w.float(), expected_w, rtol=2e-2, atol=0.2)
 
 
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("use_q", [False, True])
+def test_production_recompute_matches_checked_cute(use_q: bool, ragged: bool):
+    """Keep the compact production ABI bitwise-equivalent across persistent iterations."""
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
+        _recompute_w_u_fwd_cute,
+        recompute_w_u_fwd_cute_bf16,
+    )
+
+    torch.manual_seed(9)
+    tokens = 257 if ragged else 2048
+    metadata = None
+    if ragged:
+        offsets = torch.tensor([0, 65, tokens], device="cuda", dtype=torch.int32)
+        metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
+    shape = (1, tokens, 16, 128)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    v = torch.randn_like(k) / 8
+    q = torch.randn_like(k) / 8 if use_q else None
+    gk = -torch.rand(shape, device="cuda", dtype=torch.float32)
+    beta = torch.rand(shape[:3], device="cuda")
+    A = torch.randn(1, tokens, 16, 64, device="cuda", dtype=torch.bfloat16) / 8
+
+    expected = _recompute_w_u_fwd_cute(k, v, beta, A, metadata=metadata, q=q, gk=gk)
+    actual = recompute_w_u_fwd_cute_bf16(k, v, beta, A, gk, metadata=metadata, q=q)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        if actual_tensor is None or expected_tensor is None:
+            assert actual_tensor is expected_tensor
+        else:
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+def test_production_compile_memo_keys_complete_target(monkeypatch):
+    """Do not reuse a production artifact after the process compile target changes."""
+    from unittest.mock import Mock
+
+    from attn_gym._backends.cute.target import CompileTarget
+    from attn_gym.linear.kda.fwd.cute import recompute_w_u_fwd as module
+
+    target_a = CompileTarget("cuda", capability=(10, 0), sm_count=152)
+    target_b = CompileTarget("cuda", capability=(10, 3), sm_count=144)
+    current_target = [target_a]
+    compile_mock = Mock(side_effect=(object(), object()))
+    module._compile_bf16_recompute_w_u.cache_clear()
+    monkeypatch.setattr(module, "get_compile_target", lambda: current_target[0])
+    monkeypatch.setattr(module, "_compile_recompute_w_u", compile_mock)
+    try:
+        first = module._compile_bf16_recompute_w_u(1, target_a, 2, 2, False, False, False)
+        current_target[0] = target_b
+        second = module._compile_bf16_recompute_w_u(1, target_b, 2, 2, False, False, False)
+        assert first is not second
+        assert compile_mock.call_count == 2
+    finally:
+        module._compile_bf16_recompute_w_u.cache_clear()
+
+
 def test_recompute_rejects_mismatched_ragged_chunk_size():
     """Reject offsets whose logical chunks do not match the fixed CuTe specialization."""
     from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
@@ -119,7 +174,10 @@ def test_recompute_fake_tensors_reach_no_launch():
     """Fake tracing must stop at output metadata on every dispatch path."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
+        recompute_w_u_fwd,
+        recompute_w_u_fwd_cute_bf16,
+    )
 
     with FakeTensorMode():
         k = torch.empty(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16)
@@ -132,9 +190,51 @@ def test_recompute_fake_tensors_reach_no_launch():
         chunk_offsets = torch.empty(2, device="cuda", dtype=torch.int32)
         ragged = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity=2, chunk_size=64)
         for metadata in (None, ragged):
-            w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk)
-            assert w.shape == k.shape and u.shape == v.shape
-            assert qg.shape == k.shape and kg.shape == k.shape
+            results = (
+                recompute_w_u_fwd(k, v, beta, A, metadata=metadata, q=q, gk=gk),
+                recompute_w_u_fwd_cute_bf16(k, v, beta, A, gk, metadata=metadata, q=q),
+            )
+            for w, u, qg, kg in results:
+                assert w.shape == k.shape and u.shape == v.shape
+                assert qg.shape == k.shape and kg.shape == k.shape
+
+
+def test_production_recompute_uses_triton_on_sm120(monkeypatch):
+    """Keep consumer Blackwell on the portable Triton production path."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from attn_gym.linear.kda.fwd.cute import recompute_w_u_fwd as module
+
+    shape = (1, 64, 1, 128)
+    q = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    gk = torch.empty(shape, device="cuda")
+    beta = torch.empty(shape[:3], device="cuda")
+    A = torch.empty(1, 64, 1, 64, device="cuda", dtype=torch.bfloat16)
+    expected = (torch.empty_like(k), torch.empty_like(v), torch.empty_like(q), torch.empty_like(k))
+    fallback = Mock(return_value=expected)
+    monkeypatch.setattr(
+        module, "get_device_properties", lambda _device: SimpleNamespace(major=12, minor=0)
+    )
+    monkeypatch.setattr(module, "recompute_w_u_fwd_triton", fallback)
+
+    actual = module.recompute_w_u_fwd_cute_bf16(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        gk=gk,
+        q=q,
+        autotune=False,
+    )
+
+    assert all(
+        actual_tensor is expected_tensor
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True)
+    )
+    assert fallback.call_args.kwargs["autotune"] is False
 
 
 def test_recompute_triton_matches_cute_on_ragged_partial_chunks():
