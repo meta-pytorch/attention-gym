@@ -28,10 +28,17 @@ from attn_gym.linear.kda.ops import recurrent_fwd_op as _recurrent_fwd_op
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_paged_op as _recurrent_fwd_paged_op,
 )
+from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
-@triton.jit
-def kda_recurrent_fwd_kernel(
+def _prune_recurrent_configs(configs, _named_args, V, **_):
+    """drop value tiles wider than the padded value dimension"""
+    max_block_v = max(8, triton.next_power_of_2(V))
+    return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+
+
+@triton.jit(do_not_specialize=["N"])
+def _kda_recurrent_fwd_kernel(
     q,
     k,
     v,
@@ -44,6 +51,7 @@ def kda_recurrent_fwd_kernel(
     state_indices,
     scale,
     T,
+    N,
     state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -123,6 +131,27 @@ def kda_recurrent_fwd_kernel(
         tl.store(ht + p_state, b_state, mask=m_kv)
 
 
+kda_recurrent_fwd_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
+        for block_v in (32, 16, 8)
+        for num_warps in (2, 4)
+    ],
+    key=[
+        "T",
+        "N",
+        "H",
+        "K",
+        "V",
+        "USE_INITIAL_STATE",
+        "STORE_FINAL_STATE",
+        "IS_VARLEN",
+    ],
+    prune_configs_by={"early_config_prune": _prune_recurrent_configs},
+    **autotune_cache_kwargs,
+)(_kda_recurrent_fwd_kernel)
+
+
 def _launch_recurrent_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -133,6 +162,7 @@ def _launch_recurrent_fwd(
     cu_seqlens: torch.Tensor | None,
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Allocate outputs and launch the sequential scan over token spans."""
     batch, tokens, heads, key_dim = q.shape
@@ -152,35 +182,62 @@ def _launch_recurrent_fwd(
     )
     # BV=32 measured faster than 64 on B200 for both decode and prefill
     # (smaller state tiles schedule better; state traffic is identical).
-    block_v = min(triton.next_power_of_2(value_dim), 32)
     # One flat launch dimension: sequence-head counts can exceed the 65,535
     # grid-Y limit, while grid-X is effectively unbounded.
-    grid = (triton.cdiv(value_dim, block_v) * num_sequences * heads,)
-    kda_recurrent_fwd_kernel[grid](
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        output,
-        initial_state,
-        final_state,
-        cu_seqlens,
-        state_indices,
-        scale=key_dim**-0.5,
-        T=tokens,
-        state_batch_stride=state_batch_stride,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BK=triton.next_power_of_2(key_dim),
-        BV=block_v,
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        USE_STATE_INDICES=state_indices is not None,
-        num_warps=4,
-    )
+    grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
+
+    def launch(kernel, launch_options):
+        kernel[grid](
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            output,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            state_indices,
+            scale=key_dim**-0.5,
+            T=tokens,
+            N=num_sequences,
+            state_batch_stride=state_batch_stride,
+            H=heads,
+            K=key_dim,
+            V=value_dim,
+            BK=triton.next_power_of_2(key_dim),
+            USE_INITIAL_STATE=initial_state is not None,
+            STORE_FINAL_STATE=final_state is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            USE_STATE_INDICES=state_indices is not None,
+            **launch_options,
+        )
+
+    use_autotune = autotune and state_indices is None
+    kernel = kda_recurrent_fwd_kernel if use_autotune else _kda_recurrent_fwd_kernel
+    launch_options = {}
+    if not use_autotune:
+        average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+        sequence_heads = num_sequences * heads
+        # offline b200 sweeps favor small tiles for long scans and low-occupancy decode
+        if average_tokens >= 32:
+            block_v_limit, num_warps = 8, 4
+        elif average_tokens > 1:
+            block_v_limit, num_warps = 32, 2
+        elif value_dim >= 128:
+            block_v_limit, num_warps = 16, 4
+        elif sequence_heads <= 8:
+            block_v_limit, num_warps = 8, 4
+        elif sequence_heads < 1024:
+            block_v_limit, num_warps = 16, 2
+        else:
+            block_v_limit, num_warps = 32, 2
+        launch_options = {
+            "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
+            "num_warps": num_warps,
+            "num_stages": 3,
+        }
+    launch(kernel, launch_options)
     return output, final_state
 
 
@@ -192,9 +249,18 @@ def _kda_recurrent_fwd_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = _launch_recurrent_fwd(
-        q, k, v, gate, beta, initial_state, cu_seqlens, store_final_state=True
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        store_final_state=True,
+        autotune=autotune,
     )
     assert final_state is not None
     return output, final_state
@@ -208,9 +274,18 @@ def _kda_recurrent_fwd_no_state_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> torch.Tensor:
     return _launch_recurrent_fwd(
-        q, k, v, gate, beta, initial_state, cu_seqlens, store_final_state=False
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        store_final_state=False,
+        autotune=autotune,
     )[0]
 
 
@@ -223,6 +298,7 @@ def _kda_recurrent_fwd_paged_cuda(
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    autotune: bool,
 ) -> torch.Tensor:
     return _launch_recurrent_fwd(
         q,
@@ -234,6 +310,7 @@ def _kda_recurrent_fwd_paged_cuda(
         cu_seqlens,
         store_final_state=True,
         state_indices=state_indices,
+        autotune=autotune,
     )[0]
 
 
