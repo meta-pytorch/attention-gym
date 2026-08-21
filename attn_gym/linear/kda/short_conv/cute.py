@@ -27,7 +27,13 @@ import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
+from attn_gym._backends.cute import (
+    ceildiv,
+    compile_tvm_ffi,
+    get_device_properties,
+    jit_cache,
+    tune,
+)
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym.linear.kda import ops as kda_ops
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
@@ -54,6 +60,28 @@ SHORT_CONV_DTYPES = {
     torch.bfloat16: ShortConvDType(BFloat16, "bf16"),
     torch.float32: ShortConvDType(Float32, "fp32"),
 }
+
+
+# Measured packed worker budget: preserve full-capacity parallelism through 16K tokens
+# while bounding larger 2D grids and skipping inactive replay tiles before tile setup.
+_PERSISTENT_TIME_CTAS_PER_SM = 8
+
+
+def _persistent_time_workers(
+    tokens: int,
+    channels: int,
+    config: ShortConvConfig,
+    device: torch.device,
+) -> int:
+    """Bound the packed time axis so the complete 2D grid stays machine-sized."""
+    channel_blocks = ceildiv(channels, config.threads * config.channels_per_thread)
+    device_workers = (
+        get_device_properties(device).multi_processor_count * _PERSISTENT_TIME_CTAS_PER_SM
+    )
+    return min(
+        ceildiv(tokens, config.times_per_block),
+        max(1, ceildiv(device_workers, channel_blocks)),
+    )
 
 
 @dataclass(frozen=True)
@@ -259,6 +287,7 @@ class ShortConvKernel:
         width: int,
         config: ShortConvConfig,
         dtype: ShortConvDType,
+        persistent_time_workers: int = 0,
     ):
         self.sequences = sequences
         self.tokens = tokens
@@ -268,6 +297,7 @@ class ShortConvKernel:
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
         self.dtype = dtype
+        self.persistent_time_workers = persistent_time_workers
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
@@ -277,6 +307,8 @@ class ShortConvKernel:
         )
         if self.time_tiled:
             name += f"_bt{self.times_per_block}"
+        if self.persistent_time_workers:
+            name += f"_ptw{self.persistent_time_workers}"
         name += f"_v{self.channels_per_thread}"
         if self.tma_stage_tokens:
             name += f"_tma{self.tma_stage_tokens}"
@@ -297,10 +329,116 @@ class CausalConv1dSiluForward(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
+        persistent_time_workers: int = 0,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            persistent_time_workers,
+        )
         self.batches = batches
         self.activation = activation
+
+    @cute.jit
+    def run_tile(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+        channel_group: Int32,
+        channel: Int32,
+        time_block: Int32,
+        batch: Int32,
+        active_endpoint: Int32,
+    ):
+        """Compute one independent physical time tile for a channel group."""
+        time_start = time_block * self.times_per_block
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+            for tap in cutlass.range_constexpr(self.width):
+                weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
+        if cutlass.const_expr(initial_state is not None):
+            initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
+        inputs = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.times_per_block + self.width - 1),
+            self.dtype.cute_type,
+        )
+        inputs.fill(self.dtype.cute_type(0.0))
+        for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
+            input_time = time_start + input_offset - (self.width - 1)
+            if input_time >= 0 and input_time < active_endpoint:
+                inputs[(None, input_offset)].store(
+                    x_groups[((0, None), (batch * self.tokens + input_time, channel_group))].load()
+                )
+
+        tile_sequence, tile_sequence_start, tile_sequence_end = tile_sequence_bounds(
+            cu_seqlens,
+            Int32(time_start),
+            Int32(batch),
+            self.tokens,
+        )
+        for time_offset in cutlass.range_constexpr(self.times_per_block):
+            time = time_start + time_offset
+            sequence = tile_sequence
+            sequence_start = tile_sequence_start
+            if time < active_endpoint:
+                if cutlass.const_expr(cu_seqlens is not None):
+                    sequence, sequence_start, _ = advance_sequence_bounds(
+                        cu_seqlens,
+                        tile_sequence,
+                        tile_sequence_start,
+                        tile_sequence_end,
+                        Int32(time),
+                    )
+                else:
+                    sequence_start = Int32(0)
+
+                if cutlass.const_expr(initial_state is not None):
+                    value = unrolled_dot(inputs, weights, time_offset, self.width)
+                    if time - (self.width - 1) < sequence_start:
+                        value = history_dot(
+                            inputs,
+                            weights,
+                            initial_groups,
+                            sequence,
+                            Int32(time),
+                            sequence_start,
+                            time_offset,
+                            channel_group,
+                            self.channels_per_thread,
+                            self.width,
+                        )
+                elif cutlass.const_expr(cu_seqlens is None):
+                    value = unrolled_dot(inputs, weights, time_offset, self.width)
+                else:
+                    last_tap = self.width - 1
+                    value = (
+                        inputs[(None, time_offset + last_tap)].load().to(Float32)
+                        * weights[(None, last_tap)].load()
+                    )
+                    if time - last_tap >= sequence_start:
+                        value = unrolled_dot(inputs, weights, time_offset, self.width)
+                    else:
+                        for step in cutlass.range_constexpr(self.width - 1):
+                            tap = self.width - 2 - step
+                            if time + tap - last_tap >= sequence_start:
+                                value = (
+                                    value
+                                    + inputs[(None, time_offset + tap)].load().to(Float32)
+                                    * weights[(None, tap)].load()
+                                )
+                output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
+                    self.activation(value).to(self.dtype.cute_type)
+                )
 
     @cute.kernel
     def kernel(
@@ -311,97 +449,75 @@ class CausalConv1dSiluForward(ShortConvKernel):
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
     ):
-        """Compute one packed channel group and eight output tokens."""
+        """Compute one channel group over static or persistent time tiles."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        channel_block, worker, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
-        time_start = time_block * self.times_per_block
-
         if channel < self.channels:
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
-
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
-            output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
-            if cutlass.const_expr(initial_state is not None):
-                initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
-            inputs = cute.make_rmem_tensor(
-                (self.channels_per_thread, self.times_per_block + self.width - 1),
-                self.dtype.cute_type,
-            )
-            inputs.fill(self.dtype.cute_type(0.0))
-            for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
-                input_time = time_start + input_offset - (self.width - 1)
-                if input_time >= 0 and input_time < self.tokens:
-                    inputs[(None, input_offset)].store(
-                        x_groups[
-                            ((0, None), (batch * self.tokens + input_time, channel_group))
-                        ].load()
-                    )
-
-            tile_sequence, tile_sequence_start, tile_sequence_end = tile_sequence_bounds(
-                cu_seqlens,
-                Int32(time_start),
-                Int32(batch),
-                self.tokens,
-            )
-
-            for time_offset in cutlass.range_constexpr(self.times_per_block):
-                time = time_start + time_offset
-                sequence = tile_sequence
-                sequence_start = tile_sequence_start
-                if time < self.tokens:
-                    if cutlass.const_expr(cu_seqlens is not None):
-                        sequence, sequence_start, _ = advance_sequence_bounds(
+            if cutlass.const_expr(self.persistent_time_workers > 0):
+                active_endpoint = Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
+                active_time_blocks = (
+                    active_endpoint + self.times_per_block - 1
+                ) // self.times_per_block
+                if cutlass.const_expr(
+                    self.persistent_time_workers == ceildiv(self.tokens, self.times_per_block)
+                ):
+                    if active_endpoint == self.tokens:
+                        self.run_tile(
+                            x,
+                            weight,
+                            output,
                             cu_seqlens,
-                            tile_sequence,
-                            tile_sequence_start,
-                            tile_sequence_end,
-                            Int32(time),
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(worker),
+                            Int32(batch),
+                            Int32(self.tokens),
                         )
-                    else:
-                        sequence_start = Int32(0)
-
-                    if cutlass.const_expr(initial_state is not None):
-                        value = unrolled_dot(inputs, weights, time_offset, self.width)
-                        if time - (self.width - 1) < sequence_start:
-                            value = history_dot(
-                                inputs,
-                                weights,
-                                initial_groups,
-                                sequence,
-                                Int32(time),
-                                sequence_start,
-                                time_offset,
-                                channel_group,
-                                self.channels_per_thread,
-                                self.width,
-                            )
-                    elif cutlass.const_expr(cu_seqlens is None):
-                        value = unrolled_dot(inputs, weights, time_offset, self.width)
-                    else:
-                        last_tap = self.width - 1
-                        value = (
-                            inputs[(None, time_offset + last_tap)].load().to(Float32)
-                            * weights[(None, last_tap)].load()
+                    elif worker < active_time_blocks:
+                        self.run_tile(
+                            x,
+                            weight,
+                            output,
+                            cu_seqlens,
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(worker),
+                            Int32(batch),
+                            active_endpoint,
                         )
-                        if time - last_tap >= sequence_start:
-                            value = unrolled_dot(inputs, weights, time_offset, self.width)
-                        else:
-                            for step in cutlass.range_constexpr(self.width - 1):
-                                tap = self.width - 2 - step
-                                if time + tap - last_tap >= sequence_start:
-                                    value = (
-                                        value
-                                        + inputs[(None, time_offset + tap)].load().to(Float32)
-                                        * weights[(None, tap)].load()
-                                    )
-                    output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        self.activation(value).to(self.dtype.cute_type)
-                    )
+                else:
+                    for time_block in cutlass.range(
+                        worker, active_time_blocks, self.persistent_time_workers
+                    ):
+                        self.run_tile(
+                            x,
+                            weight,
+                            output,
+                            cu_seqlens,
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(time_block),
+                            Int32(batch),
+                            active_endpoint,
+                        )
+            else:
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    initial_state,
+                    Int32(channel_group),
+                    Int32(channel),
+                    Int32(worker),
+                    Int32(batch),
+                    Int32(self.tokens),
+                )
 
     @cute.jit
     def __call__(
@@ -424,7 +540,11 @@ class CausalConv1dSiluForward(ShortConvKernel):
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.ceil_div(self.tokens, self.times_per_block),
+                (
+                    self.persistent_time_workers
+                    if cutlass.const_expr(self.persistent_time_workers > 0)
+                    else cute.ceil_div(self.tokens, self.times_per_block)
+                ),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -558,10 +678,171 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        persistent_time_workers: int = 0,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            persistent_time_workers,
+        )
         self.batches = batches
         self.d_activation = d_activation
+
+    @cute.jit
+    def run_tile(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        grad_x: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+        channel_group: Int32,
+        channel: Int32,
+        time_block: Int32,
+        batch: Int32,
+        active_endpoint: Int32,
+    ):
+        """Compute one independent physical time tile for a channel group."""
+        time_start = time_block * self.times_per_block
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
+        dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
+        if cutlass.const_expr(initial_state is not None):
+            initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+            for tap in cutlass.range_constexpr(self.width):
+                weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+
+        inputs = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.times_per_block + 2 * (self.width - 1)),
+            self.dtype.cute_type,
+        )
+        inputs.fill(self.dtype.cute_type(0.0))
+        for input_offset in cutlass.range_constexpr(self.times_per_block + 2 * (self.width - 1)):
+            input_time = time_start + input_offset - (self.width - 1)
+            if input_time >= 0 and input_time < active_endpoint:
+                inputs[(None, input_offset)].store(
+                    x_groups[((0, None), (batch * self.tokens + input_time, channel_group))].load()
+                )
+
+        grad_z = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.times_per_block + self.width - 1),
+            Float32,
+        )
+        grad_z.fill(Float32(0.0))
+        output_sequence, output_sequence_start, output_sequence_end = tile_sequence_bounds(
+            cu_seqlens,
+            Int32(time_start),
+            Int32(batch),
+            self.tokens,
+        )
+        for output_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
+            output_time = time_start + output_offset
+            if output_time < active_endpoint:
+                if cutlass.const_expr(cu_seqlens is not None):
+                    (
+                        output_sequence,
+                        output_sequence_start,
+                        output_sequence_end,
+                    ) = advance_sequence_bounds(
+                        cu_seqlens,
+                        output_sequence,
+                        output_sequence_start,
+                        output_sequence_end,
+                        Int32(output_time),
+                    )
+                if cutlass.const_expr(initial_state is not None):
+                    value = unrolled_dot(inputs, weights, output_offset, self.width)
+                    if output_time - (self.width - 1) < output_sequence_start:
+                        value = history_dot(
+                            inputs,
+                            weights,
+                            initial_groups,
+                            output_sequence,
+                            Int32(output_time),
+                            output_sequence_start,
+                            output_offset,
+                            channel_group,
+                            self.channels_per_thread,
+                            self.width,
+                        )
+                else:
+                    products = cute.make_rmem_tensor(
+                        (self.channels_per_thread, self.width), Float32
+                    )
+                    products.fill(Float32(0.0))
+                    for tap in cutlass.range_constexpr(self.width):
+                        input_time = output_time + tap - (self.width - 1)
+                        if (
+                            cutlass.const_expr(cu_seqlens is None)
+                            or input_time >= output_sequence_start
+                        ):
+                            products[(None, tap)].store(
+                                inputs[(None, output_offset + tap)].load().to(Float32)
+                                * weights[(None, tap)].load()
+                            )
+                    value = products.load().reduce(
+                        cute.ReductionOp.ADD,
+                        Float32(0.0),
+                        reduction_profile=(None, 1),
+                    )
+                derivative = self.d_activation(value)
+                incoming = (
+                    dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                    .load()
+                    .to(Float32)
+                )
+                grad_z[(None, output_offset)].store(incoming * derivative)
+
+        input_sequence, input_sequence_start, input_sequence_end = tile_sequence_bounds(
+            cu_seqlens,
+            Int32(time_start),
+            Int32(batch),
+            self.tokens,
+        )
+        for time_offset in cutlass.range_constexpr(self.times_per_block):
+            time = time_start + time_offset
+            if time < active_endpoint:
+                if cutlass.const_expr(cu_seqlens is not None):
+                    (
+                        input_sequence,
+                        input_sequence_start,
+                        input_sequence_end,
+                    ) = advance_sequence_bounds(
+                        cu_seqlens,
+                        input_sequence,
+                        input_sequence_start,
+                        input_sequence_end,
+                        Int32(time),
+                    )
+                products = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+                products.fill(Float32(0.0))
+                for future_offset in cutlass.range_constexpr(self.width):
+                    if cutlass.const_expr(cu_seqlens is None):
+                        products[(None, future_offset)].store(
+                            grad_z[(None, time_offset + future_offset)].load()
+                            * weights[(None, self.width - 1 - future_offset)].load()
+                        )
+                    else:
+                        if time + future_offset < input_sequence_end:
+                            products[(None, future_offset)].store(
+                                grad_z[(None, time_offset + future_offset)].load()
+                                * weights[(None, self.width - 1 - future_offset)].load()
+                            )
+                value = products.load().reduce(
+                    cute.ReductionOp.ADD,
+                    Float32(0.0),
+                    reduction_profile=(None, 1),
+                )
+                dx_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
+                    value.to(self.dtype.cute_type)
+                )
 
     @cute.kernel
     def kernel(
@@ -573,154 +854,79 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
     ):
-        """Compute one packed channel group and ten input-gradient tokens."""
+        """Compute one channel group over static or persistent time tiles."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        channel_block, worker, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
-        time_start = time_block * self.times_per_block
-
         if channel < self.channels:
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
-            dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
-            dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
-            if cutlass.const_expr(initial_state is not None):
-                initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
-
-            inputs = cute.make_rmem_tensor(
-                (self.channels_per_thread, self.times_per_block + 2 * (self.width - 1)),
-                self.dtype.cute_type,
-            )
-            inputs.fill(self.dtype.cute_type(0.0))
-            for input_offset in cutlass.range_constexpr(
-                self.times_per_block + 2 * (self.width - 1)
-            ):
-                input_time = time_start + input_offset - (self.width - 1)
-                if input_time >= 0 and input_time < self.tokens:
-                    inputs[(None, input_offset)].store(
-                        x_groups[
-                            ((0, None), (batch * self.tokens + input_time, channel_group))
-                        ].load()
-                    )
-
-            grad_z = cute.make_rmem_tensor(
-                (self.channels_per_thread, self.times_per_block + self.width - 1),
-                Float32,
-            )
-            grad_z.fill(Float32(0.0))
-            output_sequence, output_sequence_start, output_sequence_end = tile_sequence_bounds(
-                cu_seqlens,
-                Int32(time_start),
-                Int32(batch),
-                self.tokens,
-            )
-            for output_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
-                output_time = time_start + output_offset
-                if output_time < self.tokens:
-                    if cutlass.const_expr(cu_seqlens is not None):
-                        (
-                            output_sequence,
-                            output_sequence_start,
-                            output_sequence_end,
-                        ) = advance_sequence_bounds(
+            if cutlass.const_expr(self.persistent_time_workers > 0):
+                active_endpoint = Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
+                active_time_blocks = (
+                    active_endpoint + self.times_per_block - 1
+                ) // self.times_per_block
+                if cutlass.const_expr(
+                    self.persistent_time_workers == ceildiv(self.tokens, self.times_per_block)
+                ):
+                    if active_endpoint == self.tokens:
+                        self.run_tile(
+                            x,
+                            weight,
+                            grad_output,
+                            grad_x,
                             cu_seqlens,
-                            output_sequence,
-                            output_sequence_start,
-                            output_sequence_end,
-                            Int32(output_time),
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(worker),
+                            Int32(batch),
+                            Int32(self.tokens),
                         )
-                    if cutlass.const_expr(initial_state is not None):
-                        value = unrolled_dot(inputs, weights, output_offset, self.width)
-                        if output_time - (self.width - 1) < output_sequence_start:
-                            value = history_dot(
-                                inputs,
-                                weights,
-                                initial_groups,
-                                output_sequence,
-                                Int32(output_time),
-                                output_sequence_start,
-                                output_offset,
-                                channel_group,
-                                self.channels_per_thread,
-                                self.width,
-                            )
-                    else:
-                        products = cute.make_rmem_tensor(
-                            (self.channels_per_thread, self.width), Float32
-                        )
-                        products.fill(Float32(0.0))
-                        for tap in cutlass.range_constexpr(self.width):
-                            input_time = output_time + tap - (self.width - 1)
-                            if (
-                                cutlass.const_expr(cu_seqlens is None)
-                                or input_time >= output_sequence_start
-                            ):
-                                products[(None, tap)].store(
-                                    inputs[(None, output_offset + tap)].load().to(Float32)
-                                    * weights[(None, tap)].load()
-                                )
-                        value = products.load().reduce(
-                            cute.ReductionOp.ADD,
-                            Float32(0.0),
-                            reduction_profile=(None, 1),
-                        )
-                    derivative = self.d_activation(value)
-                    incoming = (
-                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
-                        .load()
-                        .to(Float32)
-                    )
-                    grad_z[(None, output_offset)].store(incoming * derivative)
-
-            input_sequence, input_sequence_start, input_sequence_end = tile_sequence_bounds(
-                cu_seqlens,
-                Int32(time_start),
-                Int32(batch),
-                self.tokens,
-            )
-            for time_offset in cutlass.range_constexpr(self.times_per_block):
-                time = time_start + time_offset
-                if time < self.tokens:
-                    if cutlass.const_expr(cu_seqlens is not None):
-                        (
-                            input_sequence,
-                            input_sequence_start,
-                            input_sequence_end,
-                        ) = advance_sequence_bounds(
+                    elif worker < active_time_blocks:
+                        self.run_tile(
+                            x,
+                            weight,
+                            grad_output,
+                            grad_x,
                             cu_seqlens,
-                            input_sequence,
-                            input_sequence_start,
-                            input_sequence_end,
-                            Int32(time),
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(worker),
+                            Int32(batch),
+                            active_endpoint,
                         )
-                    products = cute.make_rmem_tensor(
-                        (self.channels_per_thread, self.width), Float32
-                    )
-                    products.fill(Float32(0.0))
-                    for future_offset in cutlass.range_constexpr(self.width):
-                        if cutlass.const_expr(cu_seqlens is None):
-                            products[(None, future_offset)].store(
-                                grad_z[(None, time_offset + future_offset)].load()
-                                * weights[(None, self.width - 1 - future_offset)].load()
-                            )
-                        else:
-                            if time + future_offset < input_sequence_end:
-                                products[(None, future_offset)].store(
-                                    grad_z[(None, time_offset + future_offset)].load()
-                                    * weights[(None, self.width - 1 - future_offset)].load()
-                                )
-                    value = products.load().reduce(
-                        cute.ReductionOp.ADD,
-                        Float32(0.0),
-                        reduction_profile=(None, 1),
-                    )
-                    dx_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        value.to(self.dtype.cute_type)
-                    )
+                else:
+                    for time_block in cutlass.range(
+                        worker, active_time_blocks, self.persistent_time_workers
+                    ):
+                        self.run_tile(
+                            x,
+                            weight,
+                            grad_output,
+                            grad_x,
+                            cu_seqlens,
+                            initial_state,
+                            Int32(channel_group),
+                            Int32(channel),
+                            Int32(time_block),
+                            Int32(batch),
+                            active_endpoint,
+                        )
+            else:
+                self.run_tile(
+                    x,
+                    weight,
+                    grad_output,
+                    grad_x,
+                    cu_seqlens,
+                    initial_state,
+                    Int32(channel_group),
+                    Int32(channel),
+                    Int32(worker),
+                    Int32(batch),
+                    Int32(self.tokens),
+                )
 
     @cute.jit
     def __call__(
@@ -745,7 +951,11 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.ceil_div(self.tokens, self.times_per_block),
+                (
+                    self.persistent_time_workers
+                    if cutlass.const_expr(self.persistent_time_workers > 0)
+                    else cute.ceil_div(self.tokens, self.times_per_block)
+                ),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -2127,11 +2337,19 @@ def _compile_forward(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    persistent_time_workers: int = 0,
 ):
-    """Compile one static forward specialization."""
+    """Compile one static or packed-persistent forward specialization."""
     activation_fn = activation.forward
     operation = CausalConv1dSiluForward(
-        batches, tokens, channels, width, config, dtype, activation_fn
+        batches,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        activation_fn,
+        persistent_time_workers,
     )
     return compile_tvm_ffi(
         operation,
@@ -2182,6 +2400,25 @@ def supports_tma(
     )
 
 
+def _input_gradient_uses_tma(
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    num_sequences: int | None,
+    channels: int,
+    width: int,
+) -> bool:
+    """Select the unchanged staged input-gradient path when its schedule supports it."""
+    return supports_tma(
+        CausalConv1dSiluInputGradientTma,
+        config,
+        None
+        if dtype.name == "fp32" and num_sequences is None
+        else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
+        channels,
+        width,
+    )
+
+
 @jit_cache
 def _compile_input_gradient(
     batches: int,
@@ -2193,20 +2430,27 @@ def _compile_input_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    persistent_time_workers: int = 0,
 ):
-    """Compile one static input-gradient specialization."""
+    """Compile one static, TMA, or packed-persistent input-gradient specialization."""
     derivative = activation.derivative
-    use_tma = supports_tma(
-        CausalConv1dSiluInputGradientTma,
-        config,
-        None
-        if dtype.name == "fp32" and num_sequences is None
-        else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
-        channels,
-        width,
-    )
-    operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
-    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
+    use_tma = _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
+    if use_tma:
+        assert persistent_time_workers == 0
+        operation = CausalConv1dSiluInputGradientTma(
+            batches, tokens, channels, width, config, dtype, derivative
+        )
+    else:
+        operation = CausalConv1dSiluInputGradient(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            derivative,
+            persistent_time_workers,
+        )
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2414,6 +2658,7 @@ def _launch_forward(
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = torch.empty_like(x)
+    num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     compiled = _compile_forward(
         batches,
         tokens,
@@ -2421,9 +2666,14 @@ def _launch_forward(
         width,
         dtype,
         config,
-        None if cu_seqlens is None else cu_seqlens.shape[0] - 1,
+        num_sequences,
         initial_state is not None,
         resolved_activation,
+        (
+            0
+            if num_sequences is None
+            else _persistent_time_workers(tokens, channels, config, x.device)
+        ),
     )
     compiled(
         x.view(batches * tokens, channels),
@@ -2458,6 +2708,13 @@ def _launch_backward(
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
+    input_persistent_time_workers = 0
+    if num_sequences is not None and not _input_gradient_uses_tma(
+        dtype, input_config, num_sequences, channels, width
+    ):
+        input_persistent_time_workers = _persistent_time_workers(
+            tokens, channels, input_config, x.device
+        )
     _compile_input_gradient(
         batches,
         tokens,
@@ -2468,6 +2725,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        input_persistent_time_workers,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2661,6 +2919,11 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
+            (
+                0
+                if num_sequences is None
+                else _persistent_time_workers(tokens, channels, config, x.device)
+            ),
         ),
         parallel_compile=parallel_compile,
     )
@@ -2689,6 +2952,12 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
+            (
+                0
+                if num_sequences is None
+                or _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
+                else _persistent_time_workers(tokens, channels, config, x.device)
+            ),
         ),
         parallel_compile=parallel_compile,
     )
