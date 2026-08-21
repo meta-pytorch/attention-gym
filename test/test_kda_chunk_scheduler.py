@@ -316,6 +316,20 @@ def test_grid_scheduler_persistent_grid_is_machine_derived():
     assert GridScheduler(metadata._replace(capacity=0)).num_workers(3, "cuda") == 0
 
 
+def test_grid_scheduler_sequence_workers_use_sequence_capacity():
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    cu_seqlens = torch.empty(513, device="cuda", dtype=torch.int32)
+    metadata = RaggedChunkMetadata(cu_seqlens, None, capacity=1, chunk_size=64)
+    scheduler = GridScheduler(metadata, ctas_per_sm=1)
+
+    resolved = scheduler.resolve_sequences(ScheduleRequest.PERSISTENT, 6, "cuda")
+    assert resolved == ResolvedSchedule(
+        ScheduleKind.PERSISTENT,
+        min(512 * 6, sm_count),
+        512 * 6,
+    )
+
+
 def test_grid_scheduler_chunk_workers_cap_at_sm_count():
     sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
     metadata = RaggedChunkMetadata(None, None, capacity=1 << 20, chunk_size=64)

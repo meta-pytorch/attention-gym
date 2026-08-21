@@ -14,8 +14,8 @@ Coordinate system
 Scheduling views
 ----------------
 
-``GridScheduler`` supports two launch geometries; ``subtask`` is terminology for
-only the flattened one:
+``GridScheduler`` supports three launch geometries; ``subtask`` is terminology
+for only the flattened one:
 
 1. **Flat-task scheduling** (Triton): a kernel supplies only its number of
    kernel-specific work coordinates per chunk. The scheduler sees that count,
@@ -33,6 +33,10 @@ only the flattened one:
    grid axis. Pair, head, and tile coordinates remain explicit grid axes, and
    each CTA strides over chunks for one fixed combination of those coordinates.
    This path neither passes nor decodes a ``subtasks_per_chunk`` value.
+
+3. **Sequence-axis scheduling**: recurrence kernels persist the sequence-head
+   axis while retaining the value tile as an explicit grid axis. Kernels derive
+   the active sequence extent from ``cu_seqlens`` during replay.
 
 The value three in the worked example below is therefore illustrative only for
 flat-task scheduling; it is not derived from ``cu_seqlens`` and does not describe
@@ -78,7 +82,7 @@ kernel has three subtasks per chunk, task 7 maps to
 Flat STATIC scheduling launches every capacity task. Chunk-axis STATIC
 scheduling launches the full chunk-capacity axis while retaining the other grid
 axes. Inactive CTAs return after reading the active count. PERSISTENT scheduling
-bounds the worker or chunk axis and strides only over runtime active work.
+bounds the flat, chunk, or sequence axis and strides only over runtime active work.
 """
 
 from __future__ import annotations
@@ -128,9 +132,9 @@ def _multiprocessor_count(device: torch.device) -> int:
 
 @dataclass(frozen=True)
 class GridScheduler:
-    """Map ragged chunk work onto launch grids for Triton and CuTeDSL kernels.
+    """Map ragged work onto launch grids for Triton and CuTeDSL kernels.
 
-    The runtime number of chunks depends on sequence lengths, but CUDA Graph
+    The runtime work count depends on sequence lengths, but CUDA Graph
     capture fixes the launch shape at ``metadata.capacity``. Static kernels
     launch one CTA per capacity task; inactive CTAs read the active count and
     return. Persistent kernels launch a bounded machine-derived worker grid and
@@ -205,6 +209,24 @@ class GridScheduler:
             self.metadata.capacity * subtasks_per_chunk,
             workers,
             requirement,
+        )
+
+    def resolve_sequences(
+        self,
+        request: ScheduleRequest,
+        subtasks_per_sequence: int,
+        device: torch.device | str,
+    ) -> ResolvedSchedule:
+        """Resolve scheduling for flattened sequence-level recurrence work."""
+        num_sequences = self.metadata.cu_seqlens.shape[0] - 1
+        sm_count = _multiprocessor_count(torch.device(device))
+        workers = min(num_sequences * subtasks_per_sequence, sm_count * self.ctas_per_sm)
+        return self._resolve(
+            request,
+            True,
+            num_sequences * subtasks_per_sequence,
+            workers,
+            "a sequence-persistent kernel",
         )
 
     def resolve_chunk(
@@ -292,6 +314,21 @@ def load_ragged_task_count(chunk_offsets, num_sequences, subtasks_per_chunk):
     handles ``w, w + num_workers, ...`` up to this returned bound.
     """
     return load_ragged_chunk_count(chunk_offsets, num_sequences) * subtasks_per_chunk
+
+
+@triton.jit
+def load_ragged_sequence_extent(cu_seqlens, num_sequences: tl.constexpr):
+    """Return one past the last sequence slot that may contain tokens."""
+    active_tokens = tl.load(cu_seqlens + num_sequences)
+    low = 0
+    high = num_sequences
+    while low < high:
+        middle = (low + high) // 2
+        if tl.load(cu_seqlens + middle) < active_tokens:
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 @triton.jit
@@ -415,6 +452,7 @@ __all__ = [
     "decode_ragged_task",
     "load_ragged_chunk_count",
     "load_ragged_chunk_work",
+    "load_ragged_sequence_extent",
     "load_ragged_task_count",
     "prepare_ragged_chunk_metadata",
 ]
