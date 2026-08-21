@@ -14,6 +14,7 @@ from attn_gym.linear.kda.ops import (
     chunk_bwd_with_state_grad_op,
     chunk_fwd_op,
     chunk_fwd_ragged_op,
+    chunk_fwd_ragged_paged_op,
     chunk_fwd_ragged_with_state_op,
     chunk_fwd_with_state_op,
 )
@@ -155,6 +156,8 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     metadata: RaggedChunkMetadata | None = None,
     output_final_state: bool = False,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     fastmath: bool = False,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -180,11 +183,40 @@ def chunk_forward(
         beta = beta.reshape(packed_shape[:3])
         cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
-    if initial_state is not None:
+    if state_indices is not None and metadata is None:
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
+    if state_indices is None and initial_state is not None:
         initial_state = initial_state.float().contiguous()
     cu_seqlens = None if metadata is None else metadata.cu_seqlens
     chunk_offsets = None if metadata is None else metadata.chunk_offsets
-    if output_final_state:
+    if state_indices is not None:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad
+            for tensor in (q, k, v, cumulative_gate, beta, initial_state)
+            if tensor is not None
+        ):
+            raise RuntimeError(
+                "paged chunk_kda is inference-only; call under torch.no_grad() or "
+                "torch.inference_mode()"
+            )
+        assert initial_state is not None
+        assert cu_seqlens is not None and chunk_offsets is not None
+        output = chunk_fwd_ragged_paged_op(
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            initial_state,
+            state_indices,
+            has_initial_state,
+            cu_seqlens,
+            chunk_offsets,
+            autotune,
+        )
+        state = None
+    elif output_final_state:
         output, state = _ChunkKDA.apply(
             q,
             k,
