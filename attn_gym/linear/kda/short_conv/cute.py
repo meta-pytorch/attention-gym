@@ -30,6 +30,7 @@ from cutlass.cute.nvgpu import cpasync
 from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym.linear.kda import ops as kda_ops
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
 
 _forward_op = kda_ops.short_conv_forward_op
@@ -283,6 +284,15 @@ class ShortConvKernel:
         return name
 
 
+# NOTE [Packed forward active endpoint]
+# CUDA Graph capture fixes the physical token capacity T, while cu_seqlens[-1]
+# supplies the runtime active token count L. Keep the natural capacity launch grid
+# for full-length throughput, but let CTAs whose tile begins at or beyond L return
+# before loading weights or allocating tile-local registers. Active CTAs also clamp
+# their input window and stores to L. The inactive output suffix is intentionally
+# undefined and is masked by the KDA wrapper before another operation consumes it.
+
+
 class CausalConv1dSiluForward(ShortConvKernel):
     """Compute causal depthwise convolution followed by a compile-time activation."""
 
@@ -302,23 +312,28 @@ class CausalConv1dSiluForward(ShortConvKernel):
         self.batches = batches
         self.activation = activation
 
-    @cute.kernel
-    def kernel(
+    @cute.jit
+    def run_tile(
         self,
         x: cute.Tensor,
         weight: cute.Tensor,
         output: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
+        full_endpoint: cutlass.Constexpr,
     ):
-        """Compute one packed channel group and eight output tokens."""
+        """Compute the physical time tile owned by this CTA."""
         thread_idx, _, _ = cute.arch.thread_idx()
         channel_block, time_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
+        active_endpoint = Int32(self.tokens)
+        if cutlass.const_expr(not full_endpoint):
+            active_endpoint = load_ragged_token_count(cu_seqlens)
 
-        if channel < self.channels:
+        # See NOTE [Packed forward active endpoint].
+        if channel < self.channels and time_start < active_endpoint:
             weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
@@ -335,7 +350,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
             inputs.fill(self.dtype.cute_type(0.0))
             for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
                 input_time = time_start + input_offset - (self.width - 1)
-                if input_time >= 0 and input_time < self.tokens:
+                if input_time >= 0 and input_time < active_endpoint:
                     inputs[(None, input_offset)].store(
                         x_groups[
                             ((0, None), (batch * self.tokens + input_time, channel_group))
@@ -353,7 +368,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 time = time_start + time_offset
                 sequence = tile_sequence
                 sequence_start = tile_sequence_start
-                if time < self.tokens:
+                if time < active_endpoint:
                     if cutlass.const_expr(cu_seqlens is not None):
                         sequence, sequence_start, _ = advance_sequence_bounds(
                             cu_seqlens,
@@ -402,6 +417,26 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
                         self.activation(value).to(self.dtype.cute_type)
                     )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+    ):
+        """Dispatch one capacity tile using the runtime packed endpoint."""
+        _, time_block, _ = cute.arch.block_idx()
+        if cutlass.const_expr(cu_seqlens is not None):
+            active_endpoint = load_ragged_token_count(cu_seqlens)
+            if active_endpoint == self.tokens:
+                self.run_tile(x, weight, output, cu_seqlens, initial_state, True)
+            elif time_block * self.times_per_block < active_endpoint:
+                self.run_tile(x, weight, output, cu_seqlens, initial_state, False)
+        else:
+            self.run_tile(x, weight, output, cu_seqlens, initial_state, True)
 
     @cute.jit
     def __call__(

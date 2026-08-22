@@ -522,6 +522,27 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
         torch.testing.assert_close(actual_gradient, fallback_gradient, rtol=3e-2, atol=atol)
 
 
+def test_short_conv_packed_forward_active_endpoint_is_bitwise_exact():
+    """Skip inactive capacity without changing any active forward value."""
+    tokens, active_tokens = 257, 63
+    x, weight = _inputs(tokens=tokens, channels=512, width=4)
+    cu_seqlens = torch.tensor(
+        [0, 7, active_tokens, active_tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    expected = causal_conv1d(
+        x[:, :active_tokens].detach().clone(),
+        weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+    )
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+    actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("stateful", "tokens", "channels", "width", "boundaries"),
     [
