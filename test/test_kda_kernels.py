@@ -215,6 +215,7 @@ def test_l2norm_fwd(dtype, T, D, strided):
         rstd,
         eps,
         T,
+        None,
         X_STRIDES=(0, x.stride(0), 0, x.stride(1)),
         Y_STRIDES=y.stride(),
         RSTD_STRIDES=rstd.stride(),
@@ -223,6 +224,8 @@ def test_l2norm_fwd(dtype, T, D, strided):
         D=D,
         BD=BD,
         NB=triton.cdiv(T, 16),
+        NUM_SEQUENCES=0,
+        IS_VARLEN=False,
     )
     assert_golden(y, golden, ref, dtype, f"l2norm_fwd_kernel T={T} D={D}")
     assert_golden(rstd, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel rstd T={T} D={D}")
@@ -250,7 +253,9 @@ def test_l2norm_autograd_wrapper(dtype):
 
 def test_l2norm_op_registration():
     x = torch.randn(1, 17, 3, 128, device=DEV, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 9, 17, 17], device=DEV, dtype=torch.int32)
     torch.library.opcheck(_l2norm_fwd_op, (x, 1e-6))
+    torch.library.opcheck(_l2norm_fwd_op, (x, 1e-6, cu_seqlens))
 
     output, rstd = _l2norm_fwd_op(x, 1e-6)
     d_output = torch.randn_like(output)
@@ -258,6 +263,46 @@ def test_l2norm_op_registration():
         _l2norm_bwd_op,
         (output.view(-1, output.shape[-1]), rstd, d_output),
     )
+    ragged_output, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
+    torch.library.opcheck(
+        _l2norm_bwd_op,
+        (
+            ragged_output.view(-1, ragged_output.shape[-1]),
+            ragged_rstd,
+            d_output,
+            cu_seqlens,
+        ),
+    )
+
+
+def test_l2norm_ragged_matches_exact_active_prefix():
+    """Packed normalization ignores NaN-poisoned physical capacity in both passes."""
+    torch.manual_seed(2)
+    tokens, active_tokens, heads, head_dim = 128, 65, 3, 128
+    x = torch.randn(
+        1,
+        tokens,
+        heads,
+        head_dim,
+        device=DEV,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    d_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, 33, 65, 65], device=DEV, dtype=torch.int32)
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+        d_output[:, active_tokens:].fill_(float("nan"))
+
+    output = l2norm(x, cu_seqlens=cu_seqlens)
+    gradient = torch.autograd.grad(output, x, d_output)[0]
+    exact_x = x[:, :active_tokens].detach().clone().requires_grad_()
+    exact_d_output = d_output[:, :active_tokens].detach().clone()
+    exact_output = l2norm(exact_x)
+    exact_gradient = torch.autograd.grad(exact_output, exact_x, exact_d_output)[0]
+
+    torch.testing.assert_close(output[:, :active_tokens], exact_output, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(gradient[:, :active_tokens], exact_gradient, rtol=2e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize(
@@ -295,6 +340,73 @@ def test_l2norm_compile_matches_eager(layout):
     lower = torch.nextafter(expected_gradient, torch.full_like(expected_gradient, -torch.inf))
     upper = torch.nextafter(expected_gradient, torch.full_like(expected_gradient, torch.inf))
     assert ((actual_gradient >= lower) & (actual_gradient <= upper)).all()
+
+
+def test_l2norm_ragged_compile_matches_eager():
+    """Compile the public packed forward and backward without reading its endpoint."""
+    torch.manual_seed(3)
+    tokens, active_tokens = 128, 65
+    x = torch.randn(1, tokens, 2, 128, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    d_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, 33, 65, 65], device=DEV, dtype=torch.int32)
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+        d_output[:, active_tokens:].fill_(float("nan"))
+
+    def operation(x, cu_seqlens):
+        return l2norm(x, cu_seqlens=cu_seqlens)
+
+    expected = operation(x, cu_seqlens)
+    actual = torch.compile(operation, fullgraph=True, dynamic=True)(x, cu_seqlens)
+    expected_gradient = torch.autograd.grad(expected, x, d_output)[0]
+    actual_gradient = torch.autograd.grad(actual, x, d_output)[0]
+
+    torch.testing.assert_close(
+        actual[:, :active_tokens], expected[:, :active_tokens], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual_gradient[:, :active_tokens],
+        expected_gradient[:, :active_tokens],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_l2norm_ragged_cuda_graph_replays_smaller_endpoint():
+    """Replay updates the active row bound from static metadata."""
+    torch.manual_seed(4)
+    tokens, active_tokens = 1024, 65
+    x = torch.randn(1, tokens, 3, 128, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    d_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, 512, 1024], device=DEV, dtype=torch.int32)
+
+    def operation():
+        output = l2norm(x, cu_seqlens=cu_seqlens)
+        return output, torch.autograd.grad(output, x, d_output)[0]
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        operation()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        output, gradient = operation()
+
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+        d_output[:, active_tokens:].fill_(float("nan"))
+        cu_seqlens.copy_(torch.tensor([0, 33, 65], device=DEV, dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    exact_x = x[:, :active_tokens].detach().clone().requires_grad_()
+    exact_d_output = d_output[:, :active_tokens].detach().clone()
+    exact_output = l2norm(exact_x)
+    exact_gradient = torch.autograd.grad(exact_output, exact_x, exact_d_output)[0]
+    torch.testing.assert_close(output[:, :active_tokens], exact_output, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(gradient[:, :active_tokens], exact_gradient, rtol=2e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.int32], ids=["fp64", "int32"])
@@ -347,6 +459,7 @@ def test_l2norm_bwd(dtype, T, D, strided):
         dy,
         dx,
         T,
+        None,
         Y_STRIDES=y.stride(),
         RSTD_STRIDES=rstd.stride(),
         DY_STRIDES=dy_strides,
@@ -356,6 +469,8 @@ def test_l2norm_bwd(dtype, T, D, strided):
         D=D,
         BD=BD,
         NB=triton.cdiv(T, 16),
+        NUM_SEQUENCES=0,
+        IS_VARLEN=False,
     )
     assert_golden(dx, golden, ref, dtype, f"l2norm_bwd_kernel T={T} D={D}")
 
