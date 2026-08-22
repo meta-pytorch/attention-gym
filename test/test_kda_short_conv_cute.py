@@ -179,8 +179,8 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
         )
 
 
-def test_short_conv_time_schedule_bounds_the_complete_2d_grid(monkeypatch):
-    """Resolve static capacity grids or persistent grids across channel blocks."""
+def test_short_conv_persistent_workers_bound_the_complete_2d_grid(monkeypatch):
+    """Return zero for static execution or a bounded persistent time grid."""
     monkeypatch.setattr(
         cute_backend,
         "get_device_properties",
@@ -189,21 +189,21 @@ def test_short_conv_time_schedule_bounds_the_complete_2d_grid(monkeypatch):
     config = ShortConvConfig(128, 4, 16)
     device = torch.device("cuda", 0)
 
-    static = cute_backend._resolve_time_schedule(
-        4096, 384, config, device, persistent_eligible=True
+    assert (
+        cute_backend._persistent_time_workers(4096, 384, config, device, persistent_eligible=True)
+        == 0
     )
-    assert static == cute_backend.ResolvedSchedule(
-        cute_backend.ScheduleKind.STATIC,
-        workers=0,
-        capacity_tasks=256,
+    assert (
+        cute_backend._persistent_time_workers(
+            4096, 12_288, config, device, persistent_eligible=True
+        )
+        == 50
     )
-    persistent = cute_backend._resolve_time_schedule(
-        4096, 12_288, config, device, persistent_eligible=True
-    )
-    assert persistent == cute_backend.ResolvedSchedule(
-        cute_backend.ScheduleKind.PERSISTENT,
-        workers=50,
-        capacity_tasks=256,
+    assert (
+        cute_backend._persistent_time_workers(
+            4096, 12_288, config, device, persistent_eligible=False
+        )
+        == 0
     )
 
 
@@ -1121,17 +1121,15 @@ def test_short_conv_cuda_graph_replay():
 
 
 def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_workers():
-    """Replay non-TMA forward/dx workers across several active packed time tiles."""
-    forward_config = ShortConvConfig(128, 4, 8)
-    input_config = ShortConvConfig(128, 4, 8)
-    weight_config = ShortConvConfig(128, 4, 8)
+    """Replay non-TMA forward and backward workers across several active tiles."""
+    config = ShortConvConfig(128, 4, 8)
     device = torch.device("cuda", torch.cuda.current_device())
     workers = (
         cute_backend.get_device_properties(device).multi_processor_count
         * cute_backend._SHORT_CONV_CTAS_PER_SM
     )
-    tokens = (workers + 3) * forward_config.times_per_block
-    active_tokens = (workers + 1) * forward_config.times_per_block - 3
+    tokens = (workers + 3) * config.times_per_block
+    active_tokens = (workers + 1) * config.times_per_block - 3
     x, weight = _inputs(tokens=tokens, channels=4, width=4)
     grad_output = torch.randn_like(x)
     cu_seqlens = torch.tensor(
@@ -1139,50 +1137,37 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
         device="cuda",
         dtype=torch.int32,
     )
-    forward_args = (
-        forward_config.threads,
-        forward_config.channels_per_thread,
-        forward_config.times_per_block,
-        input_config.threads,
-        input_config.channels_per_thread,
-        input_config.times_per_block,
-        weight_config.threads,
-        weight_config.channels_per_thread,
-        weight_config.times_per_block,
-    )
-    backward_args = forward_args[3:]
+    config_args = (config.threads, config.channels_per_thread, config.times_per_block)
+    forward_args = config_args * 3
+    backward_args = config_args * 2
 
-    forward_schedule = cute_backend._resolve_time_schedule(
-        tokens,
-        x.shape[2],
-        forward_config,
-        x.device,
-        persistent_eligible=True,
+    assert (
+        cute_backend._persistent_time_workers(
+            tokens,
+            x.shape[2],
+            config,
+            x.device,
+            persistent_eligible=True,
+        )
+        == workers
     )
-    assert forward_schedule.kind is cute_backend.ScheduleKind.PERSISTENT
-    assert forward_schedule.workers == workers
+    descriptor = cute_backend.SHORT_CONV_DTYPES[x.dtype]
+    num_sequences = cu_seqlens.shape[0] - 1
     assert not cute_backend._input_gradient_uses_tma(
-        cute_backend.SHORT_CONV_DTYPES[x.dtype],
-        input_config,
-        cu_seqlens.shape[0] - 1,
+        descriptor,
+        config,
+        num_sequences,
         x.shape[2],
         weight.shape[1],
     )
-    assert (
-        active_tokens + forward_config.times_per_block - 1
-    ) // forward_config.times_per_block > workers
-    weight_schedule = cute_backend._resolve_time_schedule(
-        tokens,
+    assert not cute_backend._weight_gradient_uses_tma(
+        descriptor,
+        config,
+        num_sequences,
         x.shape[2],
-        weight_config,
-        x.device,
-        persistent_eligible=True,
+        weight.shape[1],
     )
-    assert weight_schedule.kind is cute_backend.ScheduleKind.PERSISTENT
-    weight_workers = weight_schedule.workers
-    assert (
-        active_tokens + weight_config.times_per_block - 1
-    ) // weight_config.times_per_block > weight_workers
+    assert (active_tokens + config.times_per_block - 1) // config.times_per_block > workers
     _configured_forward_op(x, weight, cu_seqlens, None, *forward_args, activation="silu")
     _configured_backward_op(
         x, weight, grad_output, cu_seqlens, None, *backward_args, activation="silu"

@@ -36,7 +36,6 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym.linear.kda import ops as kda_ops
-from attn_gym.linear.kda.chunk_schedule import ResolvedSchedule, ScheduleKind
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
 
 _forward_op = kda_ops.short_conv_forward_op
@@ -64,33 +63,29 @@ SHORT_CONV_DTYPES = {
 
 
 # NOTE [Short-convolution time scheduling]
-# Match the shared GridScheduler contract: STATIC launches the capacity time axis and
-# lets inactive CTAs return from a device active-count check; PERSISTENT launches a
-# bounded worker axis and strides over active tiles. Short convolution needs no chunk
-# metadata because its active tile count is ceil_div(cu_seqlens[-1], times_per_block).
-# The measured eight-CTA/SM override preserves full-capacity throughput through 16K.
+# Match the shared scheduler's concrete launch convention: zero time workers means a
+# static capacity grid whose inactive CTAs return from a device check; a positive count
+# means a bounded grid that strides over active tiles. The measured short-convolution
+# policy uses eight CTAs per SM across the complete channel/time grid.
 _SHORT_CONV_CTAS_PER_SM = 8
 
 
-def _resolve_time_schedule(
+def _persistent_time_workers(
     tokens: int,
     channels: int,
     config: ShortConvConfig,
     device: torch.device,
     *,
     persistent_eligible: bool,
-    ctas_per_sm: int = _SHORT_CONV_CTAS_PER_SM,
-) -> ResolvedSchedule:
-    """Resolve static or machine-bounded execution for one time-tiled kernel."""
-    capacity = ceildiv(tokens, config.times_per_block)
+) -> int:
+    """Return a bounded packed time grid, or zero for static execution."""
     if not persistent_eligible:
-        return ResolvedSchedule(ScheduleKind.STATIC, 0, capacity)
+        return 0
+    capacity = ceildiv(tokens, config.times_per_block)
     channel_blocks = ceildiv(channels, config.threads * config.channels_per_thread)
-    device_workers = get_device_properties(device).multi_processor_count * ctas_per_sm
-    workers = min(capacity, max(1, ceildiv(device_workers, channel_blocks)))
-    if workers < capacity:
-        return ResolvedSchedule(ScheduleKind.PERSISTENT, workers, capacity)
-    return ResolvedSchedule(ScheduleKind.STATIC, 0, capacity)
+    device_workers = get_device_properties(device).multi_processor_count * _SHORT_CONV_CTAS_PER_SM
+    workers = ceildiv(device_workers, channel_blocks)
+    return workers if workers < capacity else 0
 
 
 @dataclass(frozen=True)
@@ -296,13 +291,8 @@ class ShortConvKernel:
         width: int,
         config: ShortConvConfig,
         dtype: ShortConvDType,
-        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         time_workers: int = 0,
     ):
-        if schedule_kind is ScheduleKind.PERSISTENT:
-            assert time_workers > 0, "persistent execution requires a positive time-worker grid"
-        else:
-            assert time_workers == 0, "static execution does not use time workers"
         self.sequences = sequences
         self.tokens = tokens
         self.channels = channels
@@ -311,7 +301,6 @@ class ShortConvKernel:
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
         self.dtype = dtype
-        self.schedule_kind = schedule_kind
         self.time_workers = time_workers
 
     def get_name(self) -> str:
@@ -322,7 +311,7 @@ class ShortConvKernel:
         )
         if self.time_tiled:
             name += f"_bt{self.times_per_block}"
-        if self.schedule_kind is ScheduleKind.PERSISTENT:
+        if self.time_workers:
             name += f"_execution_persistent_tw{self.time_workers}"
         name += f"_v{self.channels_per_thread}"
         if self.tma_stage_tokens:
@@ -344,19 +333,9 @@ class CausalConv1dSiluForward(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
-        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         time_workers: int = 0,
     ):
-        super().__init__(
-            batches,
-            tokens,
-            channels,
-            width,
-            config,
-            dtype,
-            schedule_kind,
-            time_workers,
-        )
+        super().__init__(batches, tokens, channels, width, config, dtype, time_workers)
         self.batches = batches
         self.activation = activation
 
@@ -477,7 +456,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 active_time_blocks = (
                     active_endpoint + self.times_per_block - 1
                 ) // self.times_per_block
-                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
+                if cutlass.const_expr(self.time_workers == 0):
                     if active_endpoint == self.tokens:
                         self.run_tile(
                             x,
@@ -555,7 +534,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 (
                     self.time_workers
-                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+                    if cutlass.const_expr(self.time_workers > 0)
                     else cute.ceil_div(self.tokens, self.times_per_block)
                 ),
                 self.batches,
@@ -691,19 +670,9 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
-        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         time_workers: int = 0,
     ):
-        super().__init__(
-            batches,
-            tokens,
-            channels,
-            width,
-            config,
-            dtype,
-            schedule_kind,
-            time_workers,
-        )
+        super().__init__(batches, tokens, channels, width, config, dtype, time_workers)
         self.batches = batches
         self.d_activation = d_activation
 
@@ -880,7 +849,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                 active_time_blocks = (
                     active_endpoint + self.times_per_block - 1
                 ) // self.times_per_block
-                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
+                if cutlass.const_expr(self.time_workers == 0):
                     if active_endpoint == self.tokens:
                         self.run_tile(
                             x,
@@ -964,7 +933,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 (
                     self.time_workers
-                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+                    if cutlass.const_expr(self.time_workers > 0)
                     else cute.ceil_div(self.tokens, self.times_per_block)
                 ),
                 self.batches,
@@ -988,19 +957,9 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
-        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         time_workers: int = 0,
     ):
-        super().__init__(
-            batches,
-            tokens,
-            channels,
-            width,
-            config,
-            dtype,
-            schedule_kind,
-            time_workers,
-        )
+        super().__init__(batches, tokens, channels, width, config, dtype, time_workers)
         self.batches = batches
         self.d_activation = d_activation
 
@@ -1118,7 +1077,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                 active_time_blocks = (
                     active_endpoint + self.times_per_block - 1
                 ) // self.times_per_block
-                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
+                if cutlass.const_expr(self.time_workers == 0):
                     if active_endpoint == self.tokens:
                         self.accumulate_tile(
                             x,
@@ -1204,7 +1163,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 (
                     self.time_workers
-                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+                    if cutlass.const_expr(self.time_workers > 0)
                     else cute.ceil_div(self.tokens, self.times_per_block)
                 ),
                 self.batches,
@@ -2437,8 +2396,7 @@ def _compile_forward(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
-    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
-    time_workers: int = 0,
+    time_workers: int,
 ):
     """Compile one dense, packed-static, or packed-persistent forward specialization."""
     activation_fn = activation.forward
@@ -2450,7 +2408,6 @@ def _compile_forward(
         config,
         dtype,
         activation_fn,
-        schedule_kind,
         time_workers,
     )
     return compile_tvm_ffi(
@@ -2549,14 +2506,13 @@ def _compile_input_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
-    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
-    time_workers: int = 0,
+    time_workers: int,
 ):
     """Compile one static, TMA, or packed-persistent input-gradient specialization."""
     derivative = activation.derivative
     use_tma = _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
     if use_tma:
-        assert schedule_kind is ScheduleKind.STATIC and time_workers == 0
+        assert time_workers == 0
         operation = CausalConv1dSiluInputGradientTma(
             batches, tokens, channels, width, config, dtype, derivative
         )
@@ -2569,7 +2525,6 @@ def _compile_input_gradient(
             config,
             dtype,
             derivative,
-            schedule_kind,
             time_workers,
         )
     return compile_tvm_ffi(
@@ -2600,17 +2555,12 @@ def _compile_weight_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
-    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
-    time_workers: int = 0,
+    time_workers: int,
 ):
     """Compile one static, TMA, or packed-persistent weight-gradient specialization."""
     derivative = activation.derivative
     use_tma = _weight_gradient_uses_tma(dtype, config, num_sequences, channels, width)
-    num_partials = (
-        time_workers
-        if schedule_kind is ScheduleKind.PERSISTENT
-        else ceildiv(tokens, config.times_per_block)
-    )
+    num_partials = time_workers or ceildiv(tokens, config.times_per_block)
     partials = cute.runtime.make_fake_compact_tensor(
         Float32,
         (batches, num_partials, channels, width),
@@ -2618,7 +2568,7 @@ def _compile_weight_gradient(
         assumed_align=16,
     )
     if use_tma:
-        assert schedule_kind is ScheduleKind.STATIC and time_workers == 0
+        assert time_workers == 0
         operation = CausalConv1dSiluWeightGradientPartialsTma(
             batches, tokens, channels, width, config, dtype, derivative
         )
@@ -2631,7 +2581,6 @@ def _compile_weight_gradient(
             config,
             dtype,
             derivative,
-            schedule_kind,
             time_workers,
         )
     return compile_tvm_ffi(
@@ -2791,13 +2740,6 @@ def _launch_forward(
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = torch.empty_like(x)
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    schedule = _resolve_time_schedule(
-        tokens,
-        channels,
-        config,
-        x.device,
-        persistent_eligible=num_sequences is not None,
-    )
     compiled = _compile_forward(
         batches,
         tokens,
@@ -2808,8 +2750,13 @@ def _launch_forward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
-        schedule.kind,
-        schedule.workers,
+        _persistent_time_workers(
+            tokens,
+            channels,
+            config,
+            x.device,
+            persistent_eligible=num_sequences is not None,
+        ),
     )
     compiled(
         x.view(batches * tokens, channels),
@@ -2844,14 +2791,6 @@ def _launch_backward(
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
-    input_schedule = _resolve_time_schedule(
-        tokens,
-        channels,
-        input_config,
-        x.device,
-        persistent_eligible=num_sequences is not None
-        and not _input_gradient_uses_tma(dtype, input_config, num_sequences, channels, width),
-    )
     _compile_input_gradient(
         batches,
         tokens,
@@ -2862,8 +2801,14 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
-        input_schedule.kind,
-        input_schedule.workers,
+        _persistent_time_workers(
+            tokens,
+            channels,
+            input_config,
+            x.device,
+            persistent_eligible=num_sequences is not None
+            and not _input_gradient_uses_tma(dtype, input_config, num_sequences, channels, width),
+        ),
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2873,7 +2818,7 @@ def _launch_backward(
         None if initial_state is None else initial_state.flatten(0, 1),
     )
 
-    weight_schedule = _resolve_time_schedule(
+    weight_workers = _persistent_time_workers(
         tokens,
         channels,
         weight_config,
@@ -2881,11 +2826,7 @@ def _launch_backward(
         persistent_eligible=num_sequences is not None
         and not _weight_gradient_uses_tma(dtype, weight_config, num_sequences, channels, width),
     )
-    num_partials = (
-        weight_schedule.workers
-        if weight_schedule.kind is ScheduleKind.PERSISTENT
-        else weight_schedule.capacity_tasks
-    )
+    num_partials = weight_workers or ceildiv(tokens, weight_config.times_per_block)
     if initial_state is None or not compute_initial_state_grad:
         grad_initial_state = None
     elif width == 1:
@@ -2907,8 +2848,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
-        weight_schedule.kind,
-        weight_schedule.workers,
+        weight_workers,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -3050,16 +2990,6 @@ def tune_causal_conv1d(
     )
     for config in forward_candidates:
         _validate_config(config, channels, "forward_configs")
-    forward_schedules = {
-        config: _resolve_time_schedule(
-            tokens,
-            channels,
-            config,
-            x.device,
-            persistent_eligible=num_sequences is not None,
-        )
-        for config in forward_candidates
-    }
     forward_output = torch.empty_like(x).view(batches * tokens, channels)
     forward = tune(
         forward_candidates,
@@ -3081,8 +3011,13 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
-            forward_schedules[config].kind,
-            forward_schedules[config].workers,
+            _persistent_time_workers(
+                tokens,
+                channels,
+                config,
+                x.device,
+                persistent_eligible=num_sequences is not None,
+            ),
         ),
         parallel_compile=parallel_compile,
     )
@@ -3094,17 +3029,6 @@ def tune_causal_conv1d(
     )
     for config in input_candidates:
         _validate_config(config, channels, "input_grad_configs")
-    input_schedules = {
-        config: _resolve_time_schedule(
-            tokens,
-            channels,
-            config,
-            x.device,
-            persistent_eligible=num_sequences is not None
-            and not _input_gradient_uses_tma(dtype, config, num_sequences, channels, width),
-        )
-        for config in input_candidates
-    }
     grad_x = torch.empty_like(x).view(batches * tokens, channels)
     input_gradient = tune(
         input_candidates,
@@ -3122,8 +3046,14 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
-            input_schedules[config].kind,
-            input_schedules[config].workers,
+            _persistent_time_workers(
+                tokens,
+                channels,
+                config,
+                x.device,
+                persistent_eligible=num_sequences is not None
+                and not _input_gradient_uses_tma(dtype, config, num_sequences, channels, width),
+            ),
         ),
         parallel_compile=parallel_compile,
     )
@@ -3135,8 +3065,8 @@ def tune_causal_conv1d(
     )
     for config in weight_candidates:
         _validate_config(config, channels, "weight_grad_configs")
-    weight_schedules = {
-        config: _resolve_time_schedule(
+    weight_workers = {
+        config: _persistent_time_workers(
             tokens,
             channels,
             config,
@@ -3149,17 +3079,13 @@ def tune_causal_conv1d(
     partials = {
         config: torch.empty(
             batches,
-            (
-                schedule.workers
-                if schedule.kind is ScheduleKind.PERSISTENT
-                else schedule.capacity_tasks
-            ),
+            workers or ceildiv(tokens, config.times_per_block),
             channels,
             width,
             dtype=torch.float32,
             device=x.device,
         )
-        for config, schedule in weight_schedules.items()
+        for config, workers in weight_workers.items()
     }
     weight_gradient = tune(
         weight_candidates,
@@ -3182,8 +3108,7 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
-            weight_schedules[config].kind,
-            weight_schedules[config].workers,
+            weight_workers[config],
         ),
         parallel_compile=parallel_compile,
     )
