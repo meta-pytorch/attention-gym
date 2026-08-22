@@ -27,7 +27,13 @@ import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym._backends.cute import ceildiv, compile_tvm_ffi, jit_cache, tune
+from attn_gym._backends.cute import (
+    ceildiv,
+    compile_tvm_ffi,
+    get_device_properties,
+    jit_cache,
+    tune,
+)
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym.linear.kda import ops as kda_ops
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
@@ -55,6 +61,24 @@ SHORT_CONV_DTYPES = {
     torch.bfloat16: ShortConvDType(BFloat16, "bf16"),
     torch.float32: ShortConvDType(Float32, "fp32"),
 }
+
+
+_PERSISTENT_TMA_DX_CTAS_PER_SM = 8
+
+
+def _persistent_tma_dx_workers(
+    tokens: int,
+    channels: int,
+    config: ShortConvConfig,
+    device: torch.device,
+) -> int:
+    """Return the explicit persistent TMA input-gradient worker axis."""
+    capacity = ceildiv(tokens, config.times_per_block)
+    channel_blocks = ceildiv(channels, config.threads * config.channels_per_thread)
+    device_workers = (
+        get_device_properties(device).multi_processor_count * _PERSISTENT_TMA_DX_CTAS_PER_SM
+    )
+    return min(capacity, ceildiv(device_workers, channel_blocks))
 
 
 @dataclass(frozen=True)
@@ -1183,6 +1207,29 @@ class CausalConv1dSiluInputGradientTma(
 ):
     """Stream boundary-aware input gradients from TMA-staged physical tiles."""
 
+    def __init__(
+        self,
+        batches: int,
+        tokens: int,
+        channels: int,
+        width: int,
+        config: ShortConvConfig,
+        dtype: ShortConvDType,
+        d_activation,
+        time_workers: int = 0,
+    ):
+        super().__init__(batches, tokens, channels, width, config, dtype, d_activation)
+        if time_workers:
+            assert config.times_per_block >= self.stages * self.tma_stage_tokens, (
+                "persistent TMA input gradients require at least one full pipeline cycle"
+            )
+        self.time_workers = time_workers
+
+    def get_name(self) -> str:
+        """Include the explicit persistent worker count in the artifact name."""
+        name = super().get_name()
+        return f"{name}_tw{self.time_workers}" if self.time_workers else name
+
     @cute.jit
     def emit_input_gradient(
         self,
@@ -1312,11 +1359,12 @@ class CausalConv1dSiluInputGradientTma(
         grad_x: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
+        time_block: Int32,
         skip_sequence_boundaries: cutlass.Constexpr,
     ):
-        """Run the staged recurrence with an optional single-sequence fast path."""
+        """Run one staged logical time tile with an optional sequence fast path."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        channel_block, _, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
         time_start = time_block * self.times_per_block
@@ -1587,6 +1635,7 @@ class CausalConv1dSiluInputGradientTma(
                 grad_x,
                 cu_seqlens,
                 initial_state,
+                Int32(time_block),
                 False,
             )
         elif cutlass.const_expr(cute.size(cu_seqlens) == 2):
@@ -1610,6 +1659,7 @@ class CausalConv1dSiluInputGradientTma(
                     grad_x,
                     cu_seqlens,
                     initial_state,
+                    Int32(time_block),
                     True,
                 )
             else:
@@ -1631,6 +1681,7 @@ class CausalConv1dSiluInputGradientTma(
                     grad_x,
                     cu_seqlens,
                     initial_state,
+                    Int32(time_block),
                     False,
                 )
         else:
@@ -1652,6 +1703,89 @@ class CausalConv1dSiluInputGradientTma(
                 grad_x,
                 cu_seqlens,
                 initial_state,
+                Int32(time_block),
+                False,
+            )
+
+    @cute.kernel
+    def persistent_tma_kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        grad_output: cute.Tensor,
+        grad_x: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        initial_state: cute.Tensor | None,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tma_tensor_dy: cute.Tensor,
+    ):
+        """Stride a fixed TMA worker grid over runtime-active input-gradient tiles."""
+        tidx, _, _ = cute.arch.thread_idx()
+        channel_block, worker, batch = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        (
+            tile_pipeline,
+            producer_state,
+            consumer_state,
+            sX,
+            sD,
+            tXsX,
+            tXgX,
+            tDsD,
+            tDgD,
+        ) = self.make_pipeline(
+            tidx,
+            Int32(batch),
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+        )
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_x)
+            cpasync.prefetch_descriptor(tma_atom_dy)
+
+        active_endpoint = load_ragged_token_count(cu_seqlens)
+        active_time_blocks = cute.ceil_div(active_endpoint, self.times_per_block)
+        stages_per_tile = self.times_per_block // self.tma_stage_tokens
+        for time_block in cutlass.range(worker, active_time_blocks, self.time_workers):
+            first_time_tile = time_block * stages_per_tile
+            if warp_idx == 0:
+                for issued in cutlass.range_constexpr(self.stages):
+                    self.issue_stage(
+                        tile_pipeline,
+                        producer_state,
+                        tma_atom_x,
+                        tXgX,
+                        tXsX,
+                        tma_atom_dy,
+                        tDgD,
+                        tDsD,
+                        Int32(first_time_tile + issued),
+                        Int32(channel_block),
+                    )
+                    producer_state.advance()
+            producer_state, consumer_state = self.run_mainloop(
+                tile_pipeline,
+                producer_state,
+                consumer_state,
+                sX,
+                sD,
+                tma_atom_x,
+                tXgX,
+                tXsX,
+                tma_atom_dy,
+                tDgD,
+                tDsD,
+                x,
+                weight,
+                grad_output,
+                grad_x,
+                cu_seqlens,
+                initial_state,
+                Int32(time_block),
                 False,
             )
 
@@ -1671,27 +1805,50 @@ class CausalConv1dSiluInputGradientTma(
             x,
             grad_output,
         )
-        self.tma_kernel.set_name_prefix(self.get_name())
-        self.tma_kernel(
-            x,
-            weight,
-            grad_output,
-            grad_x,
-            cu_seqlens,
-            initial_state,
-            tma_atom_x,
-            tma_tensor_x,
-            tma_atom_dy,
-            tma_tensor_dy,
-        ).launch(
-            grid=(
-                self.channels // (self.threads * self.channels_per_thread),
-                cute.ceil_div(self.tokens, self.times_per_block),
-                self.batches,
-            ),
-            block=(self.threads, 1, 1),
-            stream=stream,
-        )
+        if cutlass.const_expr(self.time_workers > 0):
+            self.persistent_tma_kernel.set_name_prefix(self.get_name())
+            self.persistent_tma_kernel(
+                x,
+                weight,
+                grad_output,
+                grad_x,
+                cu_seqlens,
+                initial_state,
+                tma_atom_x,
+                tma_tensor_x,
+                tma_atom_dy,
+                tma_tensor_dy,
+            ).launch(
+                grid=(
+                    self.channels // (self.threads * self.channels_per_thread),
+                    self.time_workers,
+                    self.batches,
+                ),
+                block=(self.threads, 1, 1),
+                stream=stream,
+            )
+        else:
+            self.tma_kernel.set_name_prefix(self.get_name())
+            self.tma_kernel(
+                x,
+                weight,
+                grad_output,
+                grad_x,
+                cu_seqlens,
+                initial_state,
+                tma_atom_x,
+                tma_tensor_x,
+                tma_atom_dy,
+                tma_tensor_dy,
+            ).launch(
+                grid=(
+                    self.channels // (self.threads * self.channels_per_thread),
+                    cute.ceil_div(self.tokens, self.times_per_block),
+                    self.batches,
+                ),
+                block=(self.threads, 1, 1),
+                stream=stream,
+            )
 
 
 class CausalConv1dSiluWeightGradientPartialsTma(
@@ -2217,6 +2374,25 @@ def supports_tma(
     )
 
 
+def _input_gradient_uses_tma(
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    num_sequences: int | None,
+    channels: int,
+    width: int,
+) -> bool:
+    """Return whether this specialization uses the staged input-gradient kernel."""
+    return supports_tma(
+        CausalConv1dSiluInputGradientTma,
+        config,
+        None
+        if dtype.name == "fp32" and num_sequences is None
+        else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
+        channels,
+        width,
+    )
+
+
 @jit_cache
 def _compile_input_gradient(
     batches: int,
@@ -2228,20 +2404,31 @@ def _compile_input_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    time_workers: int = 0,
 ):
-    """Compile one static input-gradient specialization."""
+    """Compile one static or explicitly persistent TMA input-gradient specialization."""
     derivative = activation.derivative
-    use_tma = supports_tma(
-        CausalConv1dSiluInputGradientTma,
-        config,
-        None
-        if dtype.name == "fp32" and num_sequences is None
-        else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
-        channels,
-        width,
+    use_tma = _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
+    if time_workers:
+        assert use_tma and num_sequences is not None, (
+            "persistent input-gradient scheduling requires a packed TMA specialization"
+        )
+    operation = (
+        CausalConv1dSiluInputGradientTma(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            derivative,
+            time_workers,
+        )
+        if use_tma
+        else CausalConv1dSiluInputGradient(
+            batches, tokens, channels, width, config, dtype, derivative
+        )
     )
-    operation_type = CausalConv1dSiluInputGradientTma if use_tma else CausalConv1dSiluInputGradient
-    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2480,6 +2667,7 @@ def _launch_backward(
     initial_state: torch.Tensor | None = None,
     compute_initial_state_grad: bool = True,
     *,
+    persistent_tma_input_gradient: bool = False,
     activation: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Launch configured gradient kernels and reduce FP32 partials."""
@@ -2491,6 +2679,19 @@ def _launch_backward(
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    input_time_workers = 0
+    if persistent_tma_input_gradient:
+        if num_sequences is None or not _input_gradient_uses_tma(
+            dtype,
+            input_config,
+            num_sequences,
+            channels,
+            width,
+        ):
+            raise ValueError(
+                "persistent TMA input gradients require a packed staged specialization"
+            )
+        input_time_workers = _persistent_tma_dx_workers(tokens, channels, input_config, x.device)
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
     _compile_input_gradient(
@@ -2503,6 +2704,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        input_time_workers,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -3099,6 +3301,7 @@ def _cute_short_conv_configured_bwd_cuda(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    persistent_tma_input_gradient: bool,
     *,
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3116,6 +3319,7 @@ def _cute_short_conv_configured_bwd_cuda(
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=False,
+        persistent_tma_input_gradient=persistent_tma_input_gradient,
         activation=activation,
     )
     return grad_x, grad_weight
@@ -3133,6 +3337,7 @@ def _cute_short_conv_configured_bwd_with_state_grad_cuda(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    persistent_tma_input_gradient: bool,
     *,
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3146,6 +3351,7 @@ def _cute_short_conv_configured_bwd_with_state_grad_cuda(
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=True,
+        persistent_tma_input_gradient=persistent_tma_input_gradient,
         activation=activation,
     )
     return grad_x, grad_weight, grad_initial_state
@@ -3174,6 +3380,7 @@ def _backward_fake(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    persistent_tma_input_gradient: bool,
     *,
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3188,6 +3395,7 @@ def _backward_fake(
         weight_threads,
         weight_channels,
         weight_times,
+        persistent_tma_input_gradient,
         activation,
     )
     return torch.empty_like(x), torch.empty_like(weight)
@@ -3206,6 +3414,7 @@ def _backward_with_state_grad_fake(
     weight_threads: int,
     weight_channels: int,
     weight_times: int,
+    persistent_tma_input_gradient: bool,
     *,
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3219,6 +3428,7 @@ def _backward_with_state_grad_fake(
         weight_threads,
         weight_channels,
         weight_times,
+        persistent_tma_input_gradient,
         activation,
     )
     return torch.empty_like(x), torch.empty_like(weight), torch.empty_like(initial_state)
@@ -3265,6 +3475,7 @@ class _ShortConv(torch.autograd.Function):
                 weight_config.threads,
                 weight_config.channels_per_thread,
                 weight_config.times_per_block,
+                0,
             )
             if ctx.needs_input_grad[3]:
                 grad_x, grad_weight, grad_initial_state = (
@@ -3310,6 +3521,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         weight_threads: int,
         weight_channels: int,
         weight_times: int,
+        persistent_tma_input_gradient: bool,
     ) -> torch.Tensor:
         output = kda_ops.short_conv_configured_forward_op(
             x,
@@ -3330,12 +3542,15 @@ class _ConfiguredShortConv(torch.autograd.Function):
         # Save inputs and backward specializations for preactivation recomputation.
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
         ctx.activation = activation
-        ctx.input_threads = input_threads
-        ctx.input_channels = input_channels
-        ctx.input_times = input_times
-        ctx.weight_threads = weight_threads
-        ctx.weight_channels = weight_channels
-        ctx.weight_times = weight_times
+        ctx.backward_config = (
+            input_threads,
+            input_channels,
+            input_times,
+            weight_threads,
+            weight_channels,
+            weight_times,
+            persistent_tma_input_gradient,
+        )
         return output
 
     @staticmethod
@@ -3343,14 +3558,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Dispatch the registered first-order backward operator."""
         x, weight, cu_seqlens, initial_state = ctx.saved_tensors
-        configs = (
-            ctx.input_threads,
-            ctx.input_channels,
-            ctx.input_times,
-            ctx.weight_threads,
-            ctx.weight_channels,
-            ctx.weight_times,
-        )
+        configs = ctx.backward_config
         if initial_state is not None and ctx.needs_input_grad[3]:
             grad_x, grad_weight, grad_initial_state = (
                 kda_ops.short_conv_configured_backward_with_state_grad_op(
@@ -3379,6 +3587,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
             grad_weight,
             None,
             grad_initial_state,
+            None,
             None,
             None,
             None,
@@ -3472,6 +3681,7 @@ def causal_conv1d(
     forward_config: ShortConvConfig | None = None,
     input_grad_config: ShortConvConfig | None = None,
     weight_grad_config: ShortConvConfig | None = None,
+    persistent_tma_input_gradient: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply causal depthwise convolution with an optional fused activation.
 
@@ -3501,6 +3711,9 @@ def causal_conv1d(
         forward_config: Optional forward schedule specialization.
         input_grad_config: Optional input-gradient schedule specialization.
         weight_grad_config: Optional weight-gradient schedule specialization.
+        persistent_tma_input_gradient: Use an explicit machine-bounded persistent
+            worker grid for packed TMA input gradients. Disabled by default because it
+            favors overcaptured replays and can regress full-capacity backward.
 
     Returns:
         A contiguous tensor with the same shape, dtype, and device as ``x``. For packed
@@ -3528,10 +3741,25 @@ def causal_conv1d(
         ("weight_grad_config", weight_grad),
     ):
         _validate_config(config, channels, name)
+    if persistent_tma_input_gradient:
+        if cu_seqlens is None:
+            raise ValueError("persistent TMA input gradients require packed cu_seqlens")
+        descriptor = SHORT_CONV_DTYPES[x.dtype]
+        if not _input_gradient_uses_tma(
+            descriptor,
+            input_grad,
+            cu_seqlens.shape[0] - 1,
+            channels,
+            weight.shape[1],
+        ):
+            raise ValueError(
+                "persistent TMA input gradients require the staged input-gradient specialization"
+            )
     if (
         forward_config is None
         and input_grad_config is None
         and weight_grad_config is None
+        and not persistent_tma_input_gradient
         and forward == default_forward
         and input_grad == default_input_grad
         and weight_grad == default_weight_grad
@@ -3553,6 +3781,7 @@ def causal_conv1d(
             weight_grad.threads,
             weight_grad.channels_per_thread,
             weight_grad.times_per_block,
+            persistent_tma_input_gradient,
         )
     if initial_state is not None and weight.shape[1] == 1:
         output = output + initial_state.sum()
