@@ -36,6 +36,7 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym.linear.kda import ops as kda_ops
+from attn_gym.linear.kda.chunk_schedule import ResolvedSchedule, ScheduleKind
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
 
 _forward_op = kda_ops.short_conv_forward_op
@@ -62,26 +63,34 @@ SHORT_CONV_DTYPES = {
 }
 
 
-# Measured packed worker budget: preserve full-capacity parallelism through 16K tokens
-# while bounding larger 2D grids and skipping inactive replay tiles before tile setup.
-_PERSISTENT_TIME_CTAS_PER_SM = 8
+# NOTE [Short-convolution time scheduling]
+# Match the shared GridScheduler contract: STATIC launches the capacity time axis and
+# lets inactive CTAs return from a device active-count check; PERSISTENT launches a
+# bounded worker axis and strides over active tiles. Short convolution needs no chunk
+# metadata because its active tile count is ceil_div(cu_seqlens[-1], times_per_block).
+# The measured eight-CTA/SM override preserves full-capacity throughput through 16K.
+_SHORT_CONV_CTAS_PER_SM = 8
 
 
-def _persistent_time_workers(
+def _resolve_time_schedule(
     tokens: int,
     channels: int,
     config: ShortConvConfig,
     device: torch.device,
-) -> int:
-    """Bound the packed time axis so the complete 2D grid stays machine-sized."""
+    *,
+    persistent_eligible: bool,
+    ctas_per_sm: int = _SHORT_CONV_CTAS_PER_SM,
+) -> ResolvedSchedule:
+    """Resolve static or machine-bounded execution for one time-tiled kernel."""
+    capacity = ceildiv(tokens, config.times_per_block)
+    if not persistent_eligible:
+        return ResolvedSchedule(ScheduleKind.STATIC, 0, capacity)
     channel_blocks = ceildiv(channels, config.threads * config.channels_per_thread)
-    device_workers = (
-        get_device_properties(device).multi_processor_count * _PERSISTENT_TIME_CTAS_PER_SM
-    )
-    return min(
-        ceildiv(tokens, config.times_per_block),
-        max(1, ceildiv(device_workers, channel_blocks)),
-    )
+    device_workers = get_device_properties(device).multi_processor_count * ctas_per_sm
+    workers = min(capacity, max(1, ceildiv(device_workers, channel_blocks)))
+    if workers < capacity:
+        return ResolvedSchedule(ScheduleKind.PERSISTENT, workers, capacity)
+    return ResolvedSchedule(ScheduleKind.STATIC, 0, capacity)
 
 
 @dataclass(frozen=True)
@@ -287,8 +296,13 @@ class ShortConvKernel:
         width: int,
         config: ShortConvConfig,
         dtype: ShortConvDType,
-        persistent_time_workers: int = 0,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        time_workers: int = 0,
     ):
+        if schedule_kind is ScheduleKind.PERSISTENT:
+            assert time_workers > 0, "persistent execution requires a positive time-worker grid"
+        else:
+            assert time_workers == 0, "static execution does not use time workers"
         self.sequences = sequences
         self.tokens = tokens
         self.channels = channels
@@ -297,7 +311,8 @@ class ShortConvKernel:
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
         self.dtype = dtype
-        self.persistent_time_workers = persistent_time_workers
+        self.schedule_kind = schedule_kind
+        self.time_workers = time_workers
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
@@ -307,8 +322,8 @@ class ShortConvKernel:
         )
         if self.time_tiled:
             name += f"_bt{self.times_per_block}"
-        if self.persistent_time_workers:
-            name += f"_ptw{self.persistent_time_workers}"
+        if self.schedule_kind is ScheduleKind.PERSISTENT:
+            name += f"_execution_persistent_tw{self.time_workers}"
         name += f"_v{self.channels_per_thread}"
         if self.tma_stage_tokens:
             name += f"_tma{self.tma_stage_tokens}"
@@ -329,7 +344,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
-        persistent_time_workers: int = 0,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        time_workers: int = 0,
     ):
         super().__init__(
             batches,
@@ -338,7 +354,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
             width,
             config,
             dtype,
-            persistent_time_workers,
+            schedule_kind,
+            time_workers,
         )
         self.batches = batches
         self.activation = activation
@@ -455,14 +472,12 @@ class CausalConv1dSiluForward(ShortConvKernel):
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         if channel < self.channels:
-            if cutlass.const_expr(self.persistent_time_workers > 0):
+            if cutlass.const_expr(cu_seqlens is not None):
                 active_endpoint = Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
                 active_time_blocks = (
                     active_endpoint + self.times_per_block - 1
                 ) // self.times_per_block
-                if cutlass.const_expr(
-                    self.persistent_time_workers == ceildiv(self.tokens, self.times_per_block)
-                ):
+                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
                     if active_endpoint == self.tokens:
                         self.run_tile(
                             x,
@@ -490,9 +505,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                             active_endpoint,
                         )
                 else:
-                    for time_block in cutlass.range(
-                        worker, active_time_blocks, self.persistent_time_workers
-                    ):
+                    for time_block in cutlass.range(worker, active_time_blocks, self.time_workers):
                         self.run_tile(
                             x,
                             weight,
@@ -541,8 +554,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 (
-                    self.persistent_time_workers
-                    if cutlass.const_expr(self.persistent_time_workers > 0)
+                    self.time_workers
+                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
                     else cute.ceil_div(self.tokens, self.times_per_block)
                 ),
                 self.batches,
@@ -678,7 +691,8 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
-        persistent_time_workers: int = 0,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        time_workers: int = 0,
     ):
         super().__init__(
             batches,
@@ -687,7 +701,8 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             width,
             config,
             dtype,
-            persistent_time_workers,
+            schedule_kind,
+            time_workers,
         )
         self.batches = batches
         self.d_activation = d_activation
@@ -860,14 +875,12 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         if channel < self.channels:
-            if cutlass.const_expr(self.persistent_time_workers > 0):
+            if cutlass.const_expr(cu_seqlens is not None):
                 active_endpoint = Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
                 active_time_blocks = (
                     active_endpoint + self.times_per_block - 1
                 ) // self.times_per_block
-                if cutlass.const_expr(
-                    self.persistent_time_workers == ceildiv(self.tokens, self.times_per_block)
-                ):
+                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
                     if active_endpoint == self.tokens:
                         self.run_tile(
                             x,
@@ -897,9 +910,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                             active_endpoint,
                         )
                 else:
-                    for time_block in cutlass.range(
-                        worker, active_time_blocks, self.persistent_time_workers
-                    ):
+                    for time_block in cutlass.range(worker, active_time_blocks, self.time_workers):
                         self.run_tile(
                             x,
                             weight,
@@ -952,8 +963,8 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 (
-                    self.persistent_time_workers
-                    if cutlass.const_expr(self.persistent_time_workers > 0)
+                    self.time_workers
+                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
                     else cute.ceil_div(self.tokens, self.times_per_block)
                 ),
                 self.batches,
@@ -964,7 +975,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
 
 
 class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
-    """Compute FP32 batch/time-tile partial sums for the weight gradient."""
+    """Compute FP32 worker partial sums for the weight gradient."""
 
     kernel_kind = "dw"
 
@@ -977,10 +988,106 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+        time_workers: int = 0,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            schedule_kind,
+            time_workers,
+        )
         self.batches = batches
         self.d_activation = d_activation
+
+    @cute.jit
+    def accumulate_tile(
+        self,
+        x: cute.Tensor,
+        grad_output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        initial_state: cute.Tensor | None,
+        weights: cute.Tensor,
+        accumulators: cute.Tensor,
+        channel_group: Int32,
+        time_block: Int32,
+        batch: Int32,
+        active_endpoint: Int32,
+    ):
+        """Accumulate one logical time tile into a worker-local FP32 partial."""
+        time_start = time_block * self.times_per_block
+        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+        dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
+        if cutlass.const_expr(initial_state is not None):
+            initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
+        sequence, sequence_start, sequence_end = tile_sequence_bounds(
+            cu_seqlens,
+            Int32(time_start),
+            Int32(batch),
+            self.tokens,
+        )
+        for time_offset in cutlass.range(self.times_per_block, unroll_full=True):
+            time = time_start + time_offset
+            if time < active_endpoint:
+                active_time = True
+                if cutlass.const_expr(cu_seqlens is not None):
+                    sequence, sequence_start, sequence_end = advance_sequence_bounds(
+                        cu_seqlens,
+                        sequence,
+                        sequence_start,
+                        sequence_end,
+                        Int32(time),
+                    )
+                    active_time = time < sequence_end
+                if active_time:
+                    input_taps = cute.make_rmem_tensor(
+                        (self.channels_per_thread, self.width), Float32
+                    )
+                    input_taps.fill(Float32(0.0))
+                    for tap in cutlass.range_constexpr(self.width):
+                        input_time = time + tap - (self.width - 1)
+                        if input_time >= sequence_start:
+                            input_taps[(None, tap)].store(
+                                x_groups[
+                                    (
+                                        (0, None),
+                                        (batch * self.tokens + input_time, channel_group),
+                                    )
+                                ]
+                                .load()
+                                .to(Float32)
+                            )
+                        elif cutlass.const_expr(initial_state is not None):
+                            input_taps[(None, tap)].store(
+                                load_history(
+                                    initial_groups,
+                                    sequence,
+                                    input_time,
+                                    sequence_start,
+                                    channel_group,
+                                    self.width,
+                                )
+                            )
+                    value = (input_taps.load() * weights.load()).reduce(
+                        cute.ReductionOp.ADD,
+                        Float32(0.0),
+                        reduction_profile=(None, 1),
+                    )
+                    incoming = (
+                        dy_groups[((0, None), (batch * self.tokens + time, channel_group))]
+                        .load()
+                        .to(Float32)
+                    )
+                    grad_z = incoming * self.d_activation(value)
+                    for tap in cutlass.range_constexpr(self.width):
+                        accumulators[(None, tap)].store(
+                            accumulators[(None, tap)].load()
+                            + grad_z * input_taps[(None, tap)].load()
+                        )
 
     @cute.kernel
     def kernel(
@@ -992,18 +1099,13 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
     ):
-        """Compute one FP32 weight-gradient partial per tap and owned channel."""
+        """Accumulate static tiles or a strided active-tile list into one worker partial."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        channel_block, worker, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
-        time_start = time_block * self.times_per_block
 
         if channel < self.channels:
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
-            dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
-            if cutlass.const_expr(initial_state is not None):
-                initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             accumulators = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             accumulators.fill(Float32(0.0))
@@ -1011,75 +1113,69 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                 for tap in cutlass.range_constexpr(self.width):
                     weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
 
-            sequence, sequence_start, sequence_end = tile_sequence_bounds(
-                cu_seqlens,
-                Int32(time_start),
-                Int32(batch),
-                self.tokens,
-            )
-            for time_offset in cutlass.range(self.times_per_block, unroll_full=True):
-                time = time_start + time_offset
-                if time < self.tokens:
-                    active_time = True
-                    if cutlass.const_expr(cu_seqlens is not None):
-                        sequence, sequence_start, sequence_end = advance_sequence_bounds(
+            if cutlass.const_expr(cu_seqlens is not None):
+                active_endpoint = Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
+                active_time_blocks = (
+                    active_endpoint + self.times_per_block - 1
+                ) // self.times_per_block
+                if cutlass.const_expr(self.schedule_kind is ScheduleKind.STATIC):
+                    if active_endpoint == self.tokens:
+                        self.accumulate_tile(
+                            x,
+                            grad_output,
                             cu_seqlens,
-                            sequence,
-                            sequence_start,
-                            sequence_end,
-                            Int32(time),
+                            initial_state,
+                            weights,
+                            accumulators,
+                            Int32(channel_group),
+                            Int32(worker),
+                            Int32(batch),
+                            Int32(self.tokens),
                         )
-                        active_time = time < sequence_end
-                    if active_time:
-                        input_taps = cute.make_rmem_tensor(
-                            (self.channels_per_thread, self.width), Float32
+                    elif worker < active_time_blocks:
+                        self.accumulate_tile(
+                            x,
+                            grad_output,
+                            cu_seqlens,
+                            initial_state,
+                            weights,
+                            accumulators,
+                            Int32(channel_group),
+                            Int32(worker),
+                            Int32(batch),
+                            active_endpoint,
                         )
-                        input_taps.fill(Float32(0.0))
-                        for tap in cutlass.range_constexpr(self.width):
-                            input_time = time + tap - (self.width - 1)
-                            if input_time >= sequence_start:
-                                input_taps[(None, tap)].store(
-                                    x_groups[
-                                        (
-                                            (0, None),
-                                            (batch * self.tokens + input_time, channel_group),
-                                        )
-                                    ]
-                                    .load()
-                                    .to(Float32)
-                                )
-                            elif cutlass.const_expr(initial_state is not None):
-                                input_taps[(None, tap)].store(
-                                    load_history(
-                                        initial_groups,
-                                        sequence,
-                                        input_time,
-                                        sequence_start,
-                                        channel_group,
-                                        self.width,
-                                    )
-                                )
-                        value = (input_taps.load() * weights.load()).reduce(
-                            cute.ReductionOp.ADD,
-                            Float32(0.0),
-                            reduction_profile=(None, 1),
+                else:
+                    for time_block in cutlass.range(worker, active_time_blocks, self.time_workers):
+                        self.accumulate_tile(
+                            x,
+                            grad_output,
+                            cu_seqlens,
+                            initial_state,
+                            weights,
+                            accumulators,
+                            Int32(channel_group),
+                            Int32(time_block),
+                            Int32(batch),
+                            active_endpoint,
                         )
-                        derivative = self.d_activation(value)
-                        incoming = (
-                            dy_groups[((0, None), (batch * self.tokens + time, channel_group))]
-                            .load()
-                            .to(Float32)
-                        )
-                        grad_z = incoming * derivative
-                        for tap in cutlass.range_constexpr(self.width):
-                            accumulators[(None, tap)].store(
-                                accumulators[(None, tap)].load()
-                                + grad_z * input_taps[(None, tap)].load()
-                            )
+            else:
+                self.accumulate_tile(
+                    x,
+                    grad_output,
+                    cu_seqlens,
+                    initial_state,
+                    weights,
+                    accumulators,
+                    Int32(channel_group),
+                    Int32(worker),
+                    Int32(batch),
+                    Int32(self.tokens),
+                )
 
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
-                    partials[batch, time_block, channel + channel_offset, tap] = accumulators[
+                    partials[batch, worker, channel + channel_offset, tap] = accumulators[
                         channel_offset, tap
                     ]
 
@@ -1106,7 +1202,11 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         ).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.ceil_div(self.tokens, self.times_per_block),
+                (
+                    self.time_workers
+                    if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
+                    else cute.ceil_div(self.tokens, self.times_per_block)
+                ),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -2337,9 +2437,10 @@ def _compile_forward(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
-    persistent_time_workers: int = 0,
+    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+    time_workers: int = 0,
 ):
-    """Compile one static or packed-persistent forward specialization."""
+    """Compile one dense, packed-static, or packed-persistent forward specialization."""
     activation_fn = activation.forward
     operation = CausalConv1dSiluForward(
         batches,
@@ -2349,7 +2450,8 @@ def _compile_forward(
         config,
         dtype,
         activation_fn,
-        persistent_time_workers,
+        schedule_kind,
+        time_workers,
     )
     return compile_tvm_ffi(
         operation,
@@ -2419,6 +2521,23 @@ def _input_gradient_uses_tma(
     )
 
 
+def _weight_gradient_uses_tma(
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    num_sequences: int | None,
+    channels: int,
+    width: int,
+) -> bool:
+    """Select the unchanged staged weight-gradient path when its schedule supports it."""
+    return supports_tma(
+        CausalConv1dSiluWeightGradientPartialsTma,
+        config,
+        tuned_config(dtype, packed=num_sequences is not None).weight_gradient,
+        channels,
+        width,
+    )
+
+
 @jit_cache
 def _compile_input_gradient(
     batches: int,
@@ -2430,13 +2549,14 @@ def _compile_input_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
-    persistent_time_workers: int = 0,
+    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+    time_workers: int = 0,
 ):
     """Compile one static, TMA, or packed-persistent input-gradient specialization."""
     derivative = activation.derivative
     use_tma = _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
     if use_tma:
-        assert persistent_time_workers == 0
+        assert schedule_kind is ScheduleKind.STATIC and time_workers == 0
         operation = CausalConv1dSiluInputGradientTma(
             batches, tokens, channels, width, config, dtype, derivative
         )
@@ -2449,7 +2569,8 @@ def _compile_input_gradient(
             config,
             dtype,
             derivative,
-            persistent_time_workers,
+            schedule_kind,
+            time_workers,
         )
     return compile_tvm_ffi(
         operation,
@@ -2479,29 +2600,40 @@ def _compile_weight_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    schedule_kind: ScheduleKind = ScheduleKind.STATIC,
+    time_workers: int = 0,
 ):
-    """Compile one static weight-gradient specialization."""
+    """Compile one static, TMA, or packed-persistent weight-gradient specialization."""
     derivative = activation.derivative
-    num_time_blocks = ceildiv(tokens, config.times_per_block)
+    use_tma = _weight_gradient_uses_tma(dtype, config, num_sequences, channels, width)
+    num_partials = (
+        time_workers
+        if schedule_kind is ScheduleKind.PERSISTENT
+        else ceildiv(tokens, config.times_per_block)
+    )
     partials = cute.runtime.make_fake_compact_tensor(
         Float32,
-        (batches, num_time_blocks, channels, width),
+        (batches, num_partials, channels, width),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    use_tma = supports_tma(
-        CausalConv1dSiluWeightGradientPartialsTma,
-        config,
-        tuned_config(dtype, packed=num_sequences is not None).weight_gradient,
-        channels,
-        width,
-    )
-    operation_type = (
-        CausalConv1dSiluWeightGradientPartialsTma
-        if use_tma
-        else CausalConv1dSiluWeightGradientPartials
-    )
-    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
+    if use_tma:
+        assert schedule_kind is ScheduleKind.STATIC and time_workers == 0
+        operation = CausalConv1dSiluWeightGradientPartialsTma(
+            batches, tokens, channels, width, config, dtype, derivative
+        )
+    else:
+        operation = CausalConv1dSiluWeightGradientPartials(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            derivative,
+            schedule_kind,
+            time_workers,
+        )
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2659,6 +2791,13 @@ def _launch_forward(
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = torch.empty_like(x)
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    schedule = _resolve_time_schedule(
+        tokens,
+        channels,
+        config,
+        x.device,
+        persistent_eligible=num_sequences is not None,
+    )
     compiled = _compile_forward(
         batches,
         tokens,
@@ -2669,11 +2808,8 @@ def _launch_forward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
-        (
-            0
-            if num_sequences is None
-            else _persistent_time_workers(tokens, channels, config, x.device)
-        ),
+        schedule.kind,
+        schedule.workers,
     )
     compiled(
         x.view(batches * tokens, channels),
@@ -2708,13 +2844,14 @@ def _launch_backward(
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     grad_output = _aligned(grad_output.contiguous())
     grad_x = torch.empty_like(x)
-    input_persistent_time_workers = 0
-    if num_sequences is not None and not _input_gradient_uses_tma(
-        dtype, input_config, num_sequences, channels, width
-    ):
-        input_persistent_time_workers = _persistent_time_workers(
-            tokens, channels, input_config, x.device
-        )
+    input_schedule = _resolve_time_schedule(
+        tokens,
+        channels,
+        input_config,
+        x.device,
+        persistent_eligible=num_sequences is not None
+        and not _input_gradient_uses_tma(dtype, input_config, num_sequences, channels, width),
+    )
     _compile_input_gradient(
         batches,
         tokens,
@@ -2725,7 +2862,8 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
-        input_persistent_time_workers,
+        input_schedule.kind,
+        input_schedule.workers,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2735,7 +2873,19 @@ def _launch_backward(
         None if initial_state is None else initial_state.flatten(0, 1),
     )
 
-    num_time_blocks = ceildiv(tokens, weight_config.times_per_block)
+    weight_schedule = _resolve_time_schedule(
+        tokens,
+        channels,
+        weight_config,
+        x.device,
+        persistent_eligible=num_sequences is not None
+        and not _weight_gradient_uses_tma(dtype, weight_config, num_sequences, channels, width),
+    )
+    num_partials = (
+        weight_schedule.workers
+        if weight_schedule.kind is ScheduleKind.PERSISTENT
+        else weight_schedule.capacity_tasks
+    )
     if initial_state is None or not compute_initial_state_grad:
         grad_initial_state = None
     elif width == 1:
@@ -2743,7 +2893,7 @@ def _launch_backward(
     else:
         grad_initial_state = torch.empty_like(initial_state)
     partials = torch.empty(
-        (batches, num_time_blocks, channels, width),
+        (batches, num_partials, channels, width),
         dtype=torch.float32,
         device=x.device,
     )
@@ -2757,6 +2907,8 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        weight_schedule.kind,
+        weight_schedule.workers,
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2898,6 +3050,16 @@ def tune_causal_conv1d(
     )
     for config in forward_candidates:
         _validate_config(config, channels, "forward_configs")
+    forward_schedules = {
+        config: _resolve_time_schedule(
+            tokens,
+            channels,
+            config,
+            x.device,
+            persistent_eligible=num_sequences is not None,
+        )
+        for config in forward_candidates
+    }
     forward_output = torch.empty_like(x).view(batches * tokens, channels)
     forward = tune(
         forward_candidates,
@@ -2919,11 +3081,8 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
-            (
-                0
-                if num_sequences is None
-                else _persistent_time_workers(tokens, channels, config, x.device)
-            ),
+            forward_schedules[config].kind,
+            forward_schedules[config].workers,
         ),
         parallel_compile=parallel_compile,
     )
@@ -2935,6 +3094,17 @@ def tune_causal_conv1d(
     )
     for config in input_candidates:
         _validate_config(config, channels, "input_grad_configs")
+    input_schedules = {
+        config: _resolve_time_schedule(
+            tokens,
+            channels,
+            config,
+            x.device,
+            persistent_eligible=num_sequences is not None
+            and not _input_gradient_uses_tma(dtype, config, num_sequences, channels, width),
+        )
+        for config in input_candidates
+    }
     grad_x = torch.empty_like(x).view(batches * tokens, channels)
     input_gradient = tune(
         input_candidates,
@@ -2952,12 +3122,8 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
-            (
-                0
-                if num_sequences is None
-                or _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
-                else _persistent_time_workers(tokens, channels, config, x.device)
-            ),
+            input_schedules[config].kind,
+            input_schedules[config].workers,
         ),
         parallel_compile=parallel_compile,
     )
@@ -2969,16 +3135,31 @@ def tune_causal_conv1d(
     )
     for config in weight_candidates:
         _validate_config(config, channels, "weight_grad_configs")
+    weight_schedules = {
+        config: _resolve_time_schedule(
+            tokens,
+            channels,
+            config,
+            x.device,
+            persistent_eligible=num_sequences is not None
+            and not _weight_gradient_uses_tma(dtype, config, num_sequences, channels, width),
+        )
+        for config in weight_candidates
+    }
     partials = {
         config: torch.empty(
             batches,
-            ceildiv(tokens, config.times_per_block),
+            (
+                schedule.workers
+                if schedule.kind is ScheduleKind.PERSISTENT
+                else schedule.capacity_tasks
+            ),
             channels,
             width,
             dtype=torch.float32,
             device=x.device,
         )
-        for config in weight_candidates
+        for config, schedule in weight_schedules.items()
     }
     weight_gradient = tune(
         weight_candidates,
@@ -3001,6 +3182,8 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
+            weight_schedules[config].kind,
+            weight_schedules[config].workers,
         ),
         parallel_compile=parallel_compile,
     )

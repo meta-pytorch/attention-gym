@@ -179,8 +179,8 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
         )
 
 
-def test_short_conv_persistent_time_workers_bound_the_complete_2d_grid(monkeypatch):
-    """Divide the machine worker budget across independent channel blocks."""
+def test_short_conv_time_schedule_bounds_the_complete_2d_grid(monkeypatch):
+    """Resolve static capacity grids or persistent grids across channel blocks."""
     monkeypatch.setattr(
         cute_backend,
         "get_device_properties",
@@ -189,8 +189,22 @@ def test_short_conv_persistent_time_workers_bound_the_complete_2d_grid(monkeypat
     config = ShortConvConfig(128, 4, 16)
     device = torch.device("cuda", 0)
 
-    assert cute_backend._persistent_time_workers(4096, 384, config, device) == 256
-    assert cute_backend._persistent_time_workers(4096, 12_288, config, device) == 50
+    static = cute_backend._resolve_time_schedule(
+        4096, 384, config, device, persistent_eligible=True
+    )
+    assert static == cute_backend.ResolvedSchedule(
+        cute_backend.ScheduleKind.STATIC,
+        workers=0,
+        capacity_tasks=256,
+    )
+    persistent = cute_backend._resolve_time_schedule(
+        4096, 12_288, config, device, persistent_eligible=True
+    )
+    assert persistent == cute_backend.ResolvedSchedule(
+        cute_backend.ScheduleKind.PERSISTENT,
+        workers=50,
+        capacity_tasks=256,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -1110,11 +1124,11 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
     """Replay non-TMA forward/dx workers across several active packed time tiles."""
     forward_config = ShortConvConfig(128, 4, 8)
     input_config = ShortConvConfig(128, 4, 8)
-    weight_config = ShortConvConfig(128, 4, 128)
+    weight_config = ShortConvConfig(128, 4, 8)
     device = torch.device("cuda", torch.cuda.current_device())
     workers = (
         cute_backend.get_device_properties(device).multi_processor_count
-        * cute_backend._PERSISTENT_TIME_CTAS_PER_SM
+        * cute_backend._SHORT_CONV_CTAS_PER_SM
     )
     tokens = (workers + 3) * forward_config.times_per_block
     active_tokens = (workers + 1) * forward_config.times_per_block - 3
@@ -1138,10 +1152,15 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
     )
     backward_args = forward_args[3:]
 
-    assert (
-        cute_backend._persistent_time_workers(tokens, x.shape[2], forward_config, x.device)
-        == workers
+    forward_schedule = cute_backend._resolve_time_schedule(
+        tokens,
+        x.shape[2],
+        forward_config,
+        x.device,
+        persistent_eligible=True,
     )
+    assert forward_schedule.kind is cute_backend.ScheduleKind.PERSISTENT
+    assert forward_schedule.workers == workers
     assert not cute_backend._input_gradient_uses_tma(
         cute_backend.SHORT_CONV_DTYPES[x.dtype],
         input_config,
@@ -1152,6 +1171,18 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
     assert (
         active_tokens + forward_config.times_per_block - 1
     ) // forward_config.times_per_block > workers
+    weight_schedule = cute_backend._resolve_time_schedule(
+        tokens,
+        x.shape[2],
+        weight_config,
+        x.device,
+        persistent_eligible=True,
+    )
+    assert weight_schedule.kind is cute_backend.ScheduleKind.PERSISTENT
+    weight_workers = weight_schedule.workers
+    assert (
+        active_tokens + weight_config.times_per_block - 1
+    ) // weight_config.times_per_block > weight_workers
     _configured_forward_op(x, weight, cu_seqlens, None, *forward_args, activation="silu")
     _configured_backward_op(
         x, weight, grad_output, cu_seqlens, None, *backward_args, activation="silu"
@@ -1163,7 +1194,7 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
         captured_output = _configured_forward_op(
             x, weight, cu_seqlens, None, *forward_args, activation="silu"
         )
-        captured_dx, _ = _configured_backward_op(
+        captured_dx, captured_dw = _configured_backward_op(
             x, weight, grad_output, cu_seqlens, None, *backward_args, activation="silu"
         )
 
@@ -1182,15 +1213,16 @@ def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_
     reference_x = x[:, :active_tokens].detach().clone().requires_grad_()
     reference_weight = weight.detach().clone().requires_grad_()
     expected_output = _packed_reference(reference_x, reference_weight, replay_seqlens)
-    (expected_dx,) = torch.autograd.grad(
+    expected_dx, expected_dw = torch.autograd.grad(
         expected_output,
-        (reference_x,),
+        (reference_x, reference_weight),
         grad_output[:, :active_tokens],
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens], expected_output, rtol=2e-2, atol=2e-2
     )
     torch.testing.assert_close(captured_dx[:, :active_tokens], expected_dx, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(captured_dw, expected_dw, rtol=3e-2, atol=2e-1)
 
 
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
