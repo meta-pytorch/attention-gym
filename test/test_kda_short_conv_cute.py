@@ -2,7 +2,7 @@
 
 import sys
 from itertools import pairwise
-from types import FunctionType, SimpleNamespace
+from types import FunctionType
 
 import pytest
 import torch
@@ -177,34 +177,6 @@ def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
         assert defaults.weight_gradient in _candidate_configs(
             "weight_gradient", 512, dtype, packed=True
         )
-
-
-def test_short_conv_persistent_workers_bound_the_complete_2d_grid(monkeypatch):
-    """Return zero for static execution or a bounded persistent time grid."""
-    monkeypatch.setattr(
-        cute_backend,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=148),
-    )
-    config = ShortConvConfig(128, 4, 16)
-    device = torch.device("cuda", 0)
-
-    assert (
-        cute_backend._persistent_time_workers(4096, 384, config, device, persistent_eligible=True)
-        == 0
-    )
-    assert (
-        cute_backend._persistent_time_workers(
-            4096, 12_288, config, device, persistent_eligible=True
-        )
-        == 50
-    )
-    assert (
-        cute_backend._persistent_time_workers(
-            4096, 12_288, config, device, persistent_eligible=False
-        )
-        == 0
-    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -548,6 +520,27 @@ def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback(
         atol = 2e-1 if index == 1 else 3e-2
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=atol)
         torch.testing.assert_close(actual_gradient, fallback_gradient, rtol=3e-2, atol=atol)
+
+
+def test_short_conv_packed_forward_active_endpoint_is_bitwise_exact():
+    """Skip inactive capacity without changing any active forward value."""
+    tokens, active_tokens = 257, 63
+    x, weight = _inputs(tokens=tokens, channels=512, width=4)
+    cu_seqlens = torch.tensor(
+        [0, 7, active_tokens, active_tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    expected = causal_conv1d(
+        x[:, :active_tokens].detach().clone(),
+        weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+    )
+    with torch.no_grad():
+        x[:, active_tokens:].fill_(float("nan"))
+    actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(actual[:, :active_tokens], expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -1118,96 +1111,6 @@ def test_short_conv_cuda_graph_replay():
     torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
     torch.testing.assert_close(captured_gradients[0], expected_gradients[0], rtol=0, atol=0)
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1], rtol=0, atol=0)
-
-
-def test_short_conv_packed_persistent_cuda_graph_skips_nan_capacity_and_strides_workers():
-    """Replay non-TMA forward and backward workers across several active tiles."""
-    config = ShortConvConfig(128, 4, 8)
-    device = torch.device("cuda", torch.cuda.current_device())
-    workers = (
-        cute_backend.get_device_properties(device).multi_processor_count
-        * cute_backend._SHORT_CONV_CTAS_PER_SM
-    )
-    tokens = (workers + 3) * config.times_per_block
-    active_tokens = (workers + 1) * config.times_per_block - 3
-    x, weight = _inputs(tokens=tokens, channels=4, width=4)
-    grad_output = torch.randn_like(x)
-    cu_seqlens = torch.tensor(
-        [0, 0, tokens // 3, tokens // 2, tokens, tokens],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    config_args = (config.threads, config.channels_per_thread, config.times_per_block)
-    forward_args = config_args * 3
-    backward_args = config_args * 2
-
-    assert (
-        cute_backend._persistent_time_workers(
-            tokens,
-            x.shape[2],
-            config,
-            x.device,
-            persistent_eligible=True,
-        )
-        == workers
-    )
-    descriptor = cute_backend.SHORT_CONV_DTYPES[x.dtype]
-    num_sequences = cu_seqlens.shape[0] - 1
-    assert not cute_backend._input_gradient_uses_tma(
-        descriptor,
-        config,
-        num_sequences,
-        x.shape[2],
-        weight.shape[1],
-    )
-    assert not cute_backend._weight_gradient_uses_tma(
-        descriptor,
-        config,
-        num_sequences,
-        x.shape[2],
-        weight.shape[1],
-    )
-    assert (active_tokens + config.times_per_block - 1) // config.times_per_block > workers
-    _configured_forward_op(x, weight, cu_seqlens, None, *forward_args, activation="silu")
-    _configured_backward_op(
-        x, weight, grad_output, cu_seqlens, None, *backward_args, activation="silu"
-    )
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output = _configured_forward_op(
-            x, weight, cu_seqlens, None, *forward_args, activation="silu"
-        )
-        captured_dx, captured_dw = _configured_backward_op(
-            x, weight, grad_output, cu_seqlens, None, *backward_args, activation="silu"
-        )
-
-    replay_seqlens = torch.tensor(
-        [0, 0, 7, active_tokens // 2, active_tokens, active_tokens],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    with torch.no_grad():
-        cu_seqlens.copy_(replay_seqlens)
-        x[:, active_tokens:].fill_(float("nan"))
-        grad_output[:, active_tokens:].fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    reference_x = x[:, :active_tokens].detach().clone().requires_grad_()
-    reference_weight = weight.detach().clone().requires_grad_()
-    expected_output = _packed_reference(reference_x, reference_weight, replay_seqlens)
-    expected_dx, expected_dw = torch.autograd.grad(
-        expected_output,
-        (reference_x, reference_weight),
-        grad_output[:, :active_tokens],
-    )
-    torch.testing.assert_close(
-        captured_output[:, :active_tokens], expected_output, rtol=2e-2, atol=2e-2
-    )
-    torch.testing.assert_close(captured_dx[:, :active_tokens], expected_dx, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(captured_dw, expected_dw, rtol=3e-2, atol=2e-1)
 
 
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
