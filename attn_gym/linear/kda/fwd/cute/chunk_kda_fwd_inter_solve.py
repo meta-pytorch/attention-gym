@@ -45,9 +45,11 @@ _SUPPORTED_HEAD_DIM = 128
 _SUPPORTED_CHUNK_SIZE = 64
 _SUPPORTED_SUBCHUNK_SIZE = 16
 _SUPPORTED_NUM_SUBCHUNKS = 4
-# K3/K4 persistent execution wins beyond three chunk-worker waves; the shared
-# four-wave threshold leaves the N=512, T=2048 graph on the 5.4x slower static path.
-_INTER_SOLVE_AUTO_WAVES = 3
+# Short average sequences benefit from persistence as soon as the capacity grid
+# exceeds one machine-sized wave. Longer recurrences retain the conservative
+# three-wave crossover because the persistent chunk loop can otherwise lose.
+_INTER_SOLVE_SHORT_AUTO_WAVES = 1
+_INTER_SOLVE_LONG_AUTO_WAVES = 3
 
 
 def _check_compile_target() -> None:
@@ -82,10 +84,13 @@ def _resolve_ragged_execution(
     if isinstance(tensor, FakeTensor):
         return ResolvedSchedule(ScheduleKind.STATIC, 0, metadata.capacity)
     resolved = GridScheduler(metadata).resolve_chunk(request, tensor.device)
+    num_sequences = metadata.cu_seqlens.shape[0] - 1
+    short_average = tensor.shape[1] <= num_sequences * _SUPPORTED_CHUNK_SIZE
+    auto_waves = _INTER_SOLVE_SHORT_AUTO_WAVES if short_average else _INTER_SOLVE_LONG_AUTO_WAVES
     if (
         request is ScheduleRequest.AUTO
         and resolved.kind is ScheduleKind.STATIC
-        and metadata.capacity > _INTER_SOLVE_AUTO_WAVES * resolved.workers
+        and metadata.capacity > auto_waves * resolved.workers
     ):
         return ResolvedSchedule(ScheduleKind.PERSISTENT, resolved.workers, metadata.capacity)
     return resolved
