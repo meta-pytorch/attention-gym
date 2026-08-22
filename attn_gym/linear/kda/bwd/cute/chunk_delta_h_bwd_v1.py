@@ -39,6 +39,7 @@ from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_sequence_extent
 
 # ============================================================================
 # BlackwellDeltaHBwdV1 — warp-specialized backward inter-chunk recurrence
@@ -79,6 +80,7 @@ class BlackwellDeltaHBwdV1:
         varlen: bool = False,
         num_heads: int | None = None,
         use_int64_offsets: bool = False,
+        bound_sequence_extent: bool = False,
     ):
         assert head_k == 128 and head_v == 128, (
             f"Only head_k=head_v=128 supported, got {head_k},{head_v}"
@@ -92,6 +94,8 @@ class BlackwellDeltaHBwdV1:
         self.varlen = varlen
         self.num_heads = num_heads
         self.use_int64_offsets = use_int64_offsets
+        self.bound_sequence_extent = bound_sequence_extent
+        assert not bound_sequence_extent or varlen, "sequence extent applies only to varlen inputs"
 
         # Tile dimensions
         self.BT = chunk_size  # 64
@@ -146,7 +150,7 @@ class BlackwellDeltaHBwdV1:
         return (
             f"kda_bwd_dhu_v1_vl{int(self.varlen)}{head_tag}"
             f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}"
-            f"_i64{int(self.use_int64_offsets)}"
+            f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
         )
 
     # ------------------------------------------------------------------
@@ -737,6 +741,7 @@ class BlackwellDeltaHBwdV1:
     ):
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        lane = tid % self.WARP_SZ
 
         # Prefetch TMA descriptors (load warp)
         if warp_id == self.LOAD_WARP_ID:
@@ -986,7 +991,13 @@ class BlackwellDeltaHBwdV1:
         gdx = cute.arch.grid_dim()[0]
         n_vtiles = (V + self.BV - 1) // self.BV
 
-        w_tiles = n_vtiles * H * B
+        sequence_extent = B
+        if cutlass.const_expr(self.bound_sequence_extent):
+            if lane == 0:
+                sequence_extent = load_ragged_sequence_extent(cu_seqlens)
+            sequence_extent = Int32(cute.arch.shuffle_sync(sequence_extent, 0))
+
+        w_tiles = n_vtiles * H * sequence_extent
 
         n_iters = (w_tiles - bx + gdx - 1) // gdx
         w_idx = Int32(0)
@@ -1760,7 +1771,16 @@ class BlackwellDeltaHBwdV1:
 
 
 @jit_cache
-def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16, use_int64_offsets=False):
+def _compile_bwd_dhu(
+    varlen,
+    H,
+    K,
+    V,
+    chunk_size,
+    bv=16,
+    use_int64_offsets=False,
+    bound_sequence_extent=False,
+):
     """Compile one BlackwellDeltaHBwdV1 variant."""
     kern = BlackwellDeltaHBwdV1(
         chunk_size=chunk_size,
@@ -1770,6 +1790,7 @@ def _compile_bwd_dhu(varlen, H, K, V, chunk_size, bv=16, use_int64_offsets=False
         varlen=varlen,
         num_heads=H,
         use_int64_offsets=use_int64_offsets,
+        bound_sequence_extent=bound_sequence_extent,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     sa, sb, snt, sn, sns = (sym_int() for _ in range(5))
@@ -1910,6 +1931,25 @@ def _is_fake_mode() -> bool:
 # Public API wrapper
 # ============================================================================
 
+_MIN_SEQUENCE_EXTENT_SEQUENCES = 32
+_MIN_SEQUENCE_EXTENT_HEADS = 8
+
+
+def _should_bound_sequence_extent(
+    tokens: int,
+    sequences: int,
+    heads: int,
+    chunk_size: int,
+    has_initial_state: bool,
+) -> bool:
+    """Select the measured graph-overcapture region for sequence-bounded dHU."""
+    return (
+        not has_initial_state
+        and sequences >= _MIN_SEQUENCE_EXTENT_SEQUENCES
+        and heads >= _MIN_SEQUENCE_EXTENT_HEADS
+        and tokens <= sequences * chunk_size
+    )
+
 
 def _get_dummy(shape, dtype, device) -> torch.Tensor:
     """Create an invocation-local placeholder for an unused kernel argument."""
@@ -1986,7 +2026,22 @@ def blackwell_delta_h_bwd_dhu_v1(
             dho,
             dv2_k,
         )
-        fn = _compile_bwd_dhu(True, H, K, V, chunk_size, bv, use_int64_offsets=use_int64_offsets)
+        fn = _compile_bwd_dhu(
+            True,
+            H,
+            K,
+            V,
+            chunk_size,
+            bv,
+            use_int64_offsets=use_int64_offsets,
+            bound_sequence_extent=_should_bound_sequence_extent(
+                T,
+                N,
+                H,
+                chunk_size,
+                h0 is not None,
+            ),
+        )
         fn(
             q_k,
             k_k,
