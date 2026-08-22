@@ -25,6 +25,7 @@ def l2norm_fwd_kernel(
     rstd,
     eps,
     N_ROWS,
+    cu_seqlens,
     X_STRIDES: tl.constexpr,
     Y_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
@@ -33,9 +34,16 @@ def l2norm_fwd_kernel(
     D: tl.constexpr,
     BD: tl.constexpr,
     NB,
+    NUM_SEQUENCES: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
 ):
     i_row = tl.program_id(0).to(tl.int64)
+    if IS_VARLEN:
+        active_rows = tl.load(cu_seqlens + NUM_SEQUENCES).to(tl.int64) * H
+        if i_row * BT >= active_rows:
+            return
+        N_ROWS = active_rows
     o_row = i_row * BT + tl.arange(0, BT)
     o_bt = o_row // H
     o_d = tl.arange(0, BD).to(tl.int64)
@@ -73,11 +81,18 @@ def l2norm_fwd_kernel(
     )
 
 
-torch.library.define("attn_gym::kda_l2norm_fwd", "(Tensor x, float eps) -> (Tensor, Tensor)")
+torch.library.define(
+    "attn_gym::kda_l2norm_fwd",
+    "(Tensor x, float eps, Tensor? cu_seqlens=None) -> (Tensor, Tensor)",
+)
 
 
-def _l2norm_fwd_cuda(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch L2Norm using runtime shape and stride metadata."""
+def _l2norm_fwd_cuda(
+    x: torch.Tensor,
+    eps: float,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch L2Norm using runtime shape, strides, and optional packed metadata."""
     _, tokens, heads, head_dim = x.shape
     # Compact outputs enumerate rows in the same batch-token-head order reconstructed by
     # the kernel, regardless of the input's physical strides.
@@ -92,6 +107,7 @@ def _l2norm_fwd_cuda(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.T
         rstd,
         eps,
         rows,
+        cu_seqlens,
         X_STRIDES=x.stride(),
         Y_STRIDES=output.stride(),
         RSTD_STRIDES=rstd.stride(),
@@ -100,6 +116,8 @@ def _l2norm_fwd_cuda(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.T
         D=head_dim,
         BD=block_dim,
         NB=triton.cdiv(rows, 16),
+        NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return output.view_as(x), rstd
 
@@ -108,9 +126,13 @@ torch.library.impl("attn_gym::kda_l2norm_fwd", "CUDA", _l2norm_fwd_cuda)
 
 
 @torch.library.register_fake("attn_gym::kda_l2norm_fwd")
-def _l2norm_fwd_fake(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Describe compact output metadata without launching Triton."""
-    del eps
+def _l2norm_fwd_fake(
+    x: torch.Tensor,
+    eps: float,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe compact output metadata without reading the packed endpoint."""
+    del eps, cu_seqlens
     rows = x.numel() // x.shape[-1]
     return (
         torch.empty_like(x, memory_format=torch.contiguous_format),
@@ -120,7 +142,7 @@ def _l2norm_fwd_fake(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.T
 
 torch.library.define(
     "attn_gym::kda_l2norm_bwd",
-    "(Tensor output, Tensor rstd, Tensor d_output) -> Tensor",
+    "(Tensor output, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None) -> Tensor",
 )
 
 
@@ -128,6 +150,7 @@ def _l2norm_bwd_cuda(
     output: torch.Tensor,
     rstd: torch.Tensor,
     d_output: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
     from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
@@ -143,6 +166,7 @@ def _l2norm_bwd_cuda(
         d_output,
         d_input,
         rows,
+        cu_seqlens,
         Y_STRIDES=output.stride(),
         RSTD_STRIDES=rstd.stride(),
         DY_STRIDES=d_output.stride(),
@@ -152,6 +176,8 @@ def _l2norm_bwd_cuda(
         D=head_dim,
         BD=block_dim,
         NB=triton.cdiv(rows, 16),
+        NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return d_input
 
@@ -164,9 +190,10 @@ def _l2norm_bwd_fake(
     output: torch.Tensor,
     rstd: torch.Tensor,
     d_output: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Describe the compact input-gradient metadata."""
-    del rstd, d_output
+    """Describe input-gradient metadata without reading the packed endpoint."""
+    del rstd, d_output, cu_seqlens
     return torch.empty_like(output)
 
 
@@ -176,22 +203,43 @@ _l2norm_bwd_op = torch.ops.attn_gym.kda_l2norm_bwd.default
 
 class _L2Norm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, eps: float) -> torch.Tensor:
-        output, rstd = _l2norm_fwd_op(x, eps)
-        ctx.save_for_backward(output.view(-1, x.shape[-1]), rstd)
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        eps: float,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        output, rstd = _l2norm_fwd_op(x, eps, cu_seqlens)
+        output_2d = output.view(-1, x.shape[-1])
+        if cu_seqlens is None:
+            ctx.save_for_backward(output_2d, rstd)
+        else:
+            ctx.save_for_backward(output_2d, rstd, cu_seqlens)
         ctx.input_shape = x.shape
+        ctx.is_ragged = cu_seqlens is not None
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_output: torch.Tensor):
-        output, rstd = ctx.saved_tensors
-        d_input = _l2norm_bwd_op(output, rstd, d_output)
-        return d_input.view(ctx.input_shape), None
+        output, rstd, *metadata = ctx.saved_tensors
+        cu_seqlens = metadata[0] if ctx.is_ragged else None
+        d_input = _l2norm_bwd_op(output, rstd, d_output, cu_seqlens)
+        return d_input.view(ctx.input_shape), None, None
 
 
-def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Normalize each final-dimension row of a KDA ``[B, T, H, D]`` tensor."""
+def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize rows, optionally stopping at a packed device endpoint.
+
+    With ``cu_seqlens``, only rows before ``cu_seqlens[-1]`` are defined in the
+    output and input gradient. Packed callers must hide the inactive suffix from
+    later consumers and parameter reductions.
+    """
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -202,7 +250,16 @@ def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         raise ValueError(f"x must have a nonempty final dimension, got {tuple(x.shape)}")
     if x.numel() == 0:
         raise ValueError(f"x must contain at least one row, got {tuple(x.shape)}")
-    return _L2Norm.apply(x, eps)
+    if cu_seqlens is not None:
+        if x.shape[0] != 1:
+            raise ValueError("cu_seqlens require packed x with batch size one")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
+        if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
+            raise ValueError("cu_seqlens must be contiguous int32")
+        if cu_seqlens.device != x.device:
+            raise ValueError("cu_seqlens must be on the same device as x")
+    return _L2Norm.apply(x, eps, cu_seqlens)
 
 
 __all__ = ["l2norm"]

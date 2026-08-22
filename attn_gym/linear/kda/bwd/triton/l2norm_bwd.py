@@ -40,6 +40,7 @@ def l2norm_bwd_kernel(
     dy,
     dx,
     N_ROWS,
+    cu_seqlens,
     Y_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
     DY_STRIDES: tl.constexpr,
@@ -49,10 +50,17 @@ def l2norm_bwd_kernel(
     D: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
+    NUM_SEQUENCES: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
 ):
     # One program per [BT] block of rows; each row is normalized over [BD].
     i_row = tl.program_id(0).to(tl.int64)
+    if IS_VARLEN:
+        active_rows = tl.load(cu_seqlens + NUM_SEQUENCES).to(tl.int64) * HEADS
+        if i_row * BT >= active_rows:
+            return
+        N_ROWS = active_rows
     o_row = i_row * BT + tl.arange(0, BT)
     o_bt = o_row // HEADS
     o_d = tl.arange(0, BD).to(tl.int64)

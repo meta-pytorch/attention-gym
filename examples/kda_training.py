@@ -287,7 +287,8 @@ class KDAAttention(nn.Module):
         # Ordinary Q/K normalization reads and saves every physical row.
         qkv = mask_inactive_tokens(qkv, active_mask)
         q, k, v = qkv.view(batch, tokens, 3, self.num_heads, self.head_dim).unbind(2)
-        q, k = self.qk_normalization(q, k)
+        norm_cu_seqlens = cu_seqlens if active_mask is not None else None
+        q, k = self.qk_normalization(q, k, norm_cu_seqlens)
         raw_gate, beta = self.gate_projections(hidden_states_compute)
         # These barriers exclude undefined primitive dInputs from projection dW.
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
@@ -405,12 +406,15 @@ class KDAAttention(nn.Module):
 
     @annotate_kernels("kda/qk_normalization")
     def qk_normalization(
-        self, q: torch.Tensor, k: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.backend == "reference":
             return l2norm_fwd_ref(q.float()), l2norm_fwd_ref(k.float())
 
-        return l2norm(q), l2norm(k)
+        return l2norm(q, cu_seqlens=cu_seqlens), l2norm(k, cu_seqlens=cu_seqlens)
 
     @annotate_kernels("kda/gate_projections")
     def gate_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
