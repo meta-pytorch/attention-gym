@@ -7,10 +7,13 @@ import torch
 
 from attn_gym.linear.kda.chunk_scheduler import (
     GridScheduler,
+    RaggedChunkMetadata,
+    ScheduleKind,
     ScheduleRequest,
     prepare_ragged_chunk_metadata,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
+    _resolve_ragged_execution,
     chunk_kda_fwd_inter_solve_ragged_cute,
     chunk_kda_fwd_k4b_ragged_cute,
 )
@@ -136,6 +139,36 @@ def test_ragged_inter_solve_accepts_all_empty_sequences(lengths, monkeypatch):
     assert actual_akk.shape == (1, 0, 1, 64)
     assert forced_akk.shape == actual_akk.shape
     assert requests == [ScheduleRequest.AUTO, ScheduleRequest.PERSISTENT]
+
+
+@pytest.mark.parametrize(
+    ("schedule_request", "capacity", "expected_kind"),
+    (
+        (ScheduleRequest.AUTO, 300, ScheduleKind.STATIC),
+        (ScheduleRequest.AUTO, 301, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.STATIC, 301, ScheduleKind.STATIC),
+        (ScheduleRequest.PERSISTENT, 1, ScheduleKind.PERSISTENT),
+    ),
+)
+def test_ragged_inter_solve_uses_three_wave_auto_threshold(
+    monkeypatch, schedule_request, capacity, expected_kind
+):
+    monkeypatch.setattr(
+        GridScheduler,
+        "num_chunk_workers",
+        lambda self, device: min(self.metadata.capacity, 100),
+    )
+    metadata = RaggedChunkMetadata(
+        torch.empty(2, device="cuda", dtype=torch.int32),
+        torch.empty(2, device="cuda", dtype=torch.int32),
+        capacity,
+        64,
+    )
+    resolved = _resolve_ragged_execution(torch.empty(1, device="cuda"), metadata, schedule_request)
+
+    assert resolved.kind is expected_kind
+    assert resolved.workers == min(capacity, 100)
+    assert resolved.capacity_tasks == capacity
 
 
 def test_ragged_inter_solve_nonempty_resolves_once(monkeypatch):

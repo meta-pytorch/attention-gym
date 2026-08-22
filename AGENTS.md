@@ -73,6 +73,11 @@ mkdocs build                    # static site in site/
 
 Line length: 99 chars. Python target: 3.10+. Formatter/linter: ruff.
 
+### Stacked PRs
+
+Do not use `ghstack` in this repository. For commit stacks, use `stack-pr` or GitHub's
+native stacked-PR support through `gh stack`.
+
 ## Project-local Agent Skills
 
 Repository-specific workflows live under `.agents/skills/`. Load the matching `SKILL.md`

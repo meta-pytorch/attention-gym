@@ -45,6 +45,9 @@ _SUPPORTED_HEAD_DIM = 128
 _SUPPORTED_CHUNK_SIZE = 64
 _SUPPORTED_SUBCHUNK_SIZE = 16
 _SUPPORTED_NUM_SUBCHUNKS = 4
+# K3/K4 persistent execution wins beyond three chunk-worker waves; the shared
+# four-wave threshold leaves the N=512, T=2048 graph on the 5.4x slower static path.
+_INTER_SOLVE_AUTO_WAVES = 3
 
 
 def _check_compile_target() -> None:
@@ -78,7 +81,14 @@ def _resolve_ragged_execution(
     validate_schedule_request(request)
     if isinstance(tensor, FakeTensor):
         return ResolvedSchedule(ScheduleKind.STATIC, 0, metadata.capacity)
-    return GridScheduler(metadata).resolve_chunk(request, tensor.device)
+    resolved = GridScheduler(metadata).resolve_chunk(request, tensor.device)
+    if (
+        request is ScheduleRequest.AUTO
+        and resolved.kind is ScheduleKind.STATIC
+        and metadata.capacity > _INTER_SOLVE_AUTO_WAVES * resolved.workers
+    ):
+        return ResolvedSchedule(ScheduleKind.PERSISTENT, resolved.workers, metadata.capacity)
+    return resolved
 
 
 def _make_fake_chunk_index(
