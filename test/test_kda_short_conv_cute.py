@@ -880,7 +880,7 @@ def test_short_conv_custom_op_registration(packed: bool):
         )
         torch.library.opcheck(
             _configured_backward_op,
-            (x, weight, grad_output, cu_seqlens, None, *configs[3:]),
+            (x, weight, grad_output, cu_seqlens, None, *configs[3:], False),
             test_utils=("test_schema", "test_faketensor"),
         )
 
@@ -900,7 +900,7 @@ def test_short_conv_stateful_custom_op_registration():
     )
     grad_output = torch.randn_like(x)
     torch.library.opcheck(_forward_op, (x, weight, cu_seqlens, initial_state))
-    config = (128, 4, 10, 128, 4, 128)
+    config = (128, 4, 10, 128, 4, 128, False)
     torch.library.opcheck(
         _configured_backward_op,
         (x, weight, grad_output, cu_seqlens, initial_state, *config),
@@ -1113,6 +1113,163 @@ def test_short_conv_cuda_graph_replay():
     torch.testing.assert_close(captured_gradients[1], expected_gradients[1], rtol=0, atol=0)
 
 
+def test_short_conv_persistent_tma_input_gradient_replays_phase_wrap():
+    """Carry TMA pipeline phases across worker tiles and changing graph endpoints."""
+    defaults = ShortConvTunedConfig.default(torch.bfloat16, packed=True)
+    input_config = defaults.input_gradient
+    weight_config = defaults.weight_gradient
+    device = torch.device("cuda", torch.cuda.current_device())
+    channels = input_config.threads * input_config.channels_per_thread
+    workers = cute_backend._persistent_tma_dx_workers(
+        32_768,
+        channels,
+        input_config,
+        device,
+    )
+    tokens = (workers + 3) * input_config.times_per_block
+    x, weight = _inputs(tokens=tokens, channels=channels, width=4)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor(
+        [0, tokens // 4, tokens // 2, tokens, tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    base_args = (
+        input_config.threads,
+        input_config.channels_per_thread,
+        input_config.times_per_block,
+        weight_config.threads,
+        weight_config.channels_per_thread,
+        weight_config.times_per_block,
+    )
+    persistent_args = (*base_args, True)
+    static_args = (*base_args, False)
+
+    _configured_backward_op(
+        x,
+        weight,
+        grad_output,
+        cu_seqlens,
+        None,
+        *persistent_args,
+        activation="silu",
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        persistent_dx, persistent_dw = _configured_backward_op(
+            x,
+            weight,
+            grad_output,
+            cu_seqlens,
+            None,
+            *persistent_args,
+            activation="silu",
+        )
+
+    second_worker_tile = workers * input_config.times_per_block
+    replay_cases = (
+        (
+            (workers + 1) * input_config.times_per_block - 3,
+            [0, 7, second_worker_tile - 1, second_worker_tile + 5],
+        ),
+        (7, [0, 0, 3, 7]),
+    )
+    for active_tokens, prefix in replay_cases:
+        with torch.no_grad():
+            cu_seqlens.copy_(
+                torch.tensor([*prefix, active_tokens], device="cuda", dtype=torch.int32)
+            )
+            x[:, active_tokens:].fill_(float("nan"))
+            grad_output[:, active_tokens:].zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        static_dx, static_dw = _configured_backward_op(
+            x,
+            weight,
+            grad_output,
+            cu_seqlens,
+            None,
+            *static_args,
+            activation="silu",
+        )
+        torch.testing.assert_close(
+            persistent_dx[:, :active_tokens],
+            static_dx[:, :active_tokens],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(persistent_dw, static_dw, rtol=0, atol=0)
+
+
+def test_short_conv_public_persistent_tma_input_gradient_matches_static():
+    """Compile stateful persistent TMA dx without changing any defined result."""
+    tokens, channels = 1024, 1536
+    static_x, static_weight = _inputs(tokens=tokens, channels=channels, width=4)
+    persistent_x = static_x.detach().clone().requires_grad_()
+    persistent_weight = static_weight.detach().clone().requires_grad_()
+    grad_output = torch.randn_like(static_x)
+    cu_seqlens = torch.arange(0, tokens + 1, tokens // 16, device="cuda", dtype=torch.int32)
+    static_state = torch.randn(
+        cu_seqlens.shape[0] - 1,
+        static_weight.shape[1] - 1,
+        channels,
+        device="cuda",
+        dtype=static_x.dtype,
+        requires_grad=True,
+    )
+    persistent_state = static_state.detach().clone().requires_grad_()
+
+    static_output = causal_conv1d(
+        static_x,
+        static_weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+        initial_state=static_state,
+    )
+    compiled = torch.compile(
+        lambda x, weight, state: causal_conv1d(
+            x,
+            weight,
+            activation="silu",
+            cu_seqlens=cu_seqlens,
+            initial_state=state,
+            persistent_tma_input_gradient=True,
+        ),
+        fullgraph=True,
+    )
+    persistent_output = compiled(persistent_x, persistent_weight, persistent_state)
+    static_gradients = torch.autograd.grad(
+        static_output,
+        (static_x, static_weight, static_state),
+        grad_output,
+    )
+    persistent_gradients = torch.autograd.grad(
+        persistent_output,
+        (persistent_x, persistent_weight, persistent_state),
+        grad_output,
+    )
+    torch.testing.assert_close(persistent_output, static_output, rtol=0, atol=0)
+    for actual, expected in zip(persistent_gradients, static_gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_short_conv_persistent_tma_input_gradient_validates_route():
+    """Reject the explicit option when no packed TMA input-gradient route exists."""
+    x, weight = _inputs(tokens=32, channels=12)
+    with pytest.raises(ValueError, match="require packed cu_seqlens"):
+        causal_conv1d(x, weight, persistent_tma_input_gradient=True)
+
+    cu_seqlens = torch.tensor([0, 32], device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="require the staged input-gradient"):
+        causal_conv1d(
+            x,
+            weight,
+            cu_seqlens=cu_seqlens,
+            persistent_tma_input_gradient=True,
+        )
+
+
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
     """Replay fallback kernels after changing boundaries, active length, and history."""
     x, weight = _inputs(tokens=31)
@@ -1125,7 +1282,7 @@ def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
         device="cuda",
         dtype=torch.bfloat16,
     )
-    config = (128, 4, 10, 128, 4, 128)
+    config = (128, 4, 10, 128, 4, 128, False)
     _forward_op(x, weight, cu_seqlens, initial_state, activation="silu")
     _configured_backward_with_state_grad_op(
         x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"
@@ -1195,6 +1352,7 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         defaults.weight_gradient.threads,
         defaults.weight_gradient.channels_per_thread,
         defaults.weight_gradient.times_per_block,
+        False,
     )
     _configured_backward_with_state_grad_op(
         x, weight, grad_output, cu_seqlens, initial_state, *config, activation="silu"

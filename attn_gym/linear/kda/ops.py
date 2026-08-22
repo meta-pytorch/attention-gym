@@ -122,7 +122,7 @@ _SHORT_CONV_CONFIGURED_BWD_ARGS = (
     "(Tensor x, Tensor weight, Tensor grad_output, Tensor? cu_seqlens, {initial_state},"
     " int input_threads, int input_channels, int input_times,"
     " int weight_threads, int weight_channels, int weight_times,"
-    " *, str? activation=None)"
+    " bool persistent_tma_input_gradient, *, str? activation=None)"
 )
 torch.library.define(
     "attn_gym::_cute_short_conv_configured_bwd",
