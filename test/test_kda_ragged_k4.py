@@ -142,16 +142,18 @@ def test_ragged_inter_solve_accepts_all_empty_sequences(lengths, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("schedule_request", "capacity", "expected_kind"),
+    ("schedule_request", "tokens", "num_sequences", "capacity", "expected_kind"),
     (
-        (ScheduleRequest.AUTO, 300, ScheduleKind.STATIC),
-        (ScheduleRequest.AUTO, 301, ScheduleKind.PERSISTENT),
-        (ScheduleRequest.STATIC, 301, ScheduleKind.STATIC),
-        (ScheduleRequest.PERSISTENT, 1, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.AUTO, 6400, 100, 100, ScheduleKind.STATIC),
+        (ScheduleRequest.AUTO, 6400, 100, 101, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.AUTO, 6401, 100, 300, ScheduleKind.STATIC),
+        (ScheduleRequest.AUTO, 6401, 100, 301, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.STATIC, 6400, 100, 301, ScheduleKind.STATIC),
+        (ScheduleRequest.PERSISTENT, 6401, 100, 1, ScheduleKind.PERSISTENT),
     ),
 )
-def test_ragged_inter_solve_uses_three_wave_auto_threshold(
-    monkeypatch, schedule_request, capacity, expected_kind
+def test_ragged_inter_solve_uses_average_length_auto_threshold(
+    monkeypatch, schedule_request, tokens, num_sequences, capacity, expected_kind
 ):
     monkeypatch.setattr(
         GridScheduler,
@@ -159,12 +161,13 @@ def test_ragged_inter_solve_uses_three_wave_auto_threshold(
         lambda self, device: min(self.metadata.capacity, 100),
     )
     metadata = RaggedChunkMetadata(
-        torch.empty(2, device="cuda", dtype=torch.int32),
-        torch.empty(2, device="cuda", dtype=torch.int32),
+        torch.empty(num_sequences + 1, device="cuda", dtype=torch.int32),
+        torch.empty(num_sequences + 1, device="cuda", dtype=torch.int32),
         capacity,
         64,
     )
-    resolved = _resolve_ragged_execution(torch.empty(1, device="cuda"), metadata, schedule_request)
+    tensor = torch.empty(1, tokens, device="cuda")
+    resolved = _resolve_ragged_execution(tensor, metadata, schedule_request)
 
     assert resolved.kind is expected_kind
     assert resolved.workers == min(capacity, 100)
