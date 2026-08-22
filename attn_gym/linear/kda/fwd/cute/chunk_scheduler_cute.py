@@ -20,6 +20,22 @@ def load_ragged_chunk_count(chunk_offsets: cute.Tensor):
 
 
 @cute.jit
+def load_ragged_sequence_extent(cu_seqlens: cute.Tensor):
+    """Return one past the last sequence slot that may contain tokens."""
+    num_sequences = Int32(cute.size(cu_seqlens)) - 1
+    active_tokens = Int32(cu_seqlens[num_sequences])
+    sequence_extent = num_sequences
+    if Int32(cu_seqlens[num_sequences - 1]) >= active_tokens:
+        sequence_extent = upper_bound(
+            cu_seqlens,
+            active_tokens - 1,
+            Int32(0),
+            num_sequences,
+        )
+    return sequence_extent
+
+
+@cute.jit
 def load_ragged_chunk_work(
     cu_seqlens: cute.Tensor,
     chunk_offsets: cute.Tensor,
@@ -200,4 +216,5 @@ __all__ = [
     "decode_ragged_chunk_work_cute",
     "load_ragged_chunk_count",
     "load_ragged_chunk_work",
+    "load_ragged_sequence_extent",
 ]
