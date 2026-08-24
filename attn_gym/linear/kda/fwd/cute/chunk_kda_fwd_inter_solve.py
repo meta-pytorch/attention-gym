@@ -370,7 +370,9 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     if AkkOD.shape != akk_od_shape:
         raise ValueError(f"AkkOD must have shape {akk_od_shape}, got {tuple(AkkOD.shape)}")
 
-    Akk = torch.zeros(
+    # Only rows owned by active ragged chunks are defined; downstream ragged consumers route from
+    # metadata and must not read capacity slack.
+    Akk = torch.empty(
         (batch, tokens, heads, chunk_size),
         dtype=torch.bfloat16,
         device=Akkd.device,
@@ -412,6 +414,49 @@ def chunk_kda_fwd_k4b_ragged_cute(
     """Run the eager ragged K4 inverse stage."""
     resolved = _resolve_ragged_execution(Akkd, metadata, schedule)
     return _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata, resolved)
+
+
+def chunk_kda_fwd_k4b_dense_cute(
+    AkkOD: torch.Tensor,
+    Akkd: torch.Tensor,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Assemble dense BT=64 inverse blocks from precomputed K3-compatible factors."""
+    if Akkd.ndim != 4:
+        raise ValueError(f"Akkd must be 4D, got shape {tuple(Akkd.shape)}")
+    batch, tokens, heads, subchunk_size = Akkd.shape
+    offdiag_blocks = _validate_specialization(
+        _SUPPORTED_HEAD_DIM,
+        chunk_size,
+        subchunk_size,
+    )
+    if batch != 1 or tokens % chunk_size:
+        raise ValueError("dense K4 requires B=1 and complete chunks")
+    chunks = tokens // chunk_size
+    expected_od = (chunks * offdiag_blocks, heads * subchunk_size**2)
+    if AkkOD.shape != expected_od:
+        raise ValueError(f"AkkOD must have shape {expected_od}, got {tuple(AkkOD.shape)}")
+
+    Akk = torch.empty(
+        (batch, tokens, heads, chunk_size),
+        dtype=torch.bfloat16,
+        device=Akkd.device,
+    )
+    if isinstance(Akkd, FakeTensor) or chunks == 0:
+        return Akk
+    akkd_flat = Akkd.reshape(tokens, heads * subchunk_size).contiguous()
+    akk_flat = Akk.reshape(tokens, heads * chunk_size)
+    k4b = _compile_k4b(
+        heads,
+        _SUPPORTED_HEAD_DIM,
+        chunk_size,
+        subchunk_size,
+        ChunkSchedule.DENSE,
+        ScheduleKind.STATIC,
+        use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
+    )
+    k4b(AkkOD, akkd_flat, akk_flat, heads, chunks, None, None)
+    return Akk
 
 
 def chunk_kda_fwd_inter_solve_ragged_cute(
@@ -467,13 +512,12 @@ def chunk_kda_fwd_inter_solve_cute(
         Aqk_flat = Aqk.reshape(B * T, H * BT)
 
     if Akk is None:
-        Akk_flat = torch.zeros(B * T, H * BT, device=k.device, dtype=k.dtype)
+        Akk_flat = torch.empty(B * T, H * BT, device=k.device, dtype=k.dtype)
         Akk = Akk_flat.reshape(B, T, H, BT)
     else:
         assert Akk.shape == (B, T, H, BT), (
             f"Akk must have shape {(B, T, H, BT)}, got {tuple(Akk.shape)}"
         )
-        Akk.zero_()
         Akk_flat = Akk.reshape(B * T, H * BT)
 
     if isinstance(k, FakeTensor):
@@ -549,5 +593,6 @@ __all__ = [
     "chunk_kda_fwd_inter_solve_cute",
     "chunk_kda_fwd_inter_solve_ragged_cute",
     "chunk_kda_fwd_k3b_ragged_cute",
+    "chunk_kda_fwd_k4b_dense_cute",
     "chunk_kda_fwd_k4b_ragged_cute",
 ]

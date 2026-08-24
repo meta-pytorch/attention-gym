@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import torch
 
-from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1_dispatch import (
-    blackwell_delta_h_bwd_dhu_dispatch,
+from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+    blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
 )
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import chunk_kda_bwd_intra
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
-from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_dav
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -51,8 +51,9 @@ def chunk_kda_bwd(
         raise ValueError(f"the composed KDA backward requires chunk_size=64, got {chunk_size}")
     if tokens % chunk_size and metadata is None:
         raise ValueError("the composed KDA backward requires complete chunks")
+    scale = head_dim**-0.5
 
-    # Forward deliberately saves only the minimal backward tape. Always
+    # Forward deliberately saves only the minimal backward factors. Always
     # reconstruct the large W/U, gated Q/K, state, and corrected-value
     # intermediates here instead of retaining them for the lifetime of the graph.
     with profiler_range("kda/cute/backward_recompute_w_u"):
@@ -82,31 +83,29 @@ def chunk_kda_bwd(
         )
     del u
 
-    with profiler_range("kda/triton/backward_dav"):
-        dv_intra, dAqk = chunk_kda_bwd_dav(
+    with profiler_range("kda/triton/backward_daqk"):
+        dAqk = chunk_kda_bwd_daqk(
             v_new,
-            Aqk,
             do,
-            head_dim**-0.5,
+            scale,
             chunk_size=chunk_size,
             metadata=metadata,
-            autotune=autotune,
         )
     with profiler_range("kda/cute/backward_delta_h"):
-        dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dispatch(
+        dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
             qg,
             kg,
             w,
             do,
-            dv_intra,
+            Aqk,
             gk=g,
             h0=initial_state,
             dht=d_final_state,
-            scale=head_dim**-0.5,
+            scale=scale,
             chunk_size=chunk_size,
             metadata=metadata,
         )
-    del w, qg, kg, dv_intra
+    del w, qg, kg
     with profiler_range("kda/cute/backward_wy_dqkg"):
         dq, dk, dv, dg, db, dAkk = chunk_kda_bwd_wy_dqkg(
             q,

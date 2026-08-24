@@ -60,6 +60,22 @@ torch.library.define(
     + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
+_CHUNK_BWD_RECOMPUTE_ARGS = (
+    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
+    "Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
+    "Tensor? d_final_state, {initial_state}, bool fastmath, bool autotune)"
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd_recompute_factors",
+    _CHUNK_BWD_RECOMPUTE_ARGS.format(initial_state="Tensor? initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad",
+    _CHUNK_BWD_RECOMPUTE_ARGS.format(initial_state="Tensor initial_state")
+    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+
 torch.library.define(
     "attn_gym::_kda_plain_gate_scan",
     "(Tensor values, Tensor? cu_seqlens, Tensor? chunk_offsets, bool reverse) -> Tensor",
@@ -230,6 +246,14 @@ def _chunk_bwd_with_state_grad_cuda(*args):
     return _chunk_backend()._chunk_kda_bwd_with_state_grad_cuda(*args)
 
 
+def _chunk_bwd_recompute_factors_cuda(*args):
+    return _chunk_backend()._chunk_kda_bwd_recompute_factors_cuda(*args)
+
+
+def _chunk_bwd_recompute_factors_with_state_grad_cuda(*args):
+    return _chunk_backend()._chunk_kda_bwd_recompute_factors_with_state_grad_cuda(*args)
+
+
 def _plain_gate_scan_cuda(*args):
     return _plain_gate_backend()._plain_gate_scan_cuda(*args)
 
@@ -282,6 +306,16 @@ torch.library.impl(
     "CUDA",
     _chunk_bwd_with_state_grad_cuda,
 )
+torch.library.impl(
+    "attn_gym::kda_chunk_bwd_recompute_factors",
+    "CUDA",
+    _chunk_bwd_recompute_factors_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad",
+    "CUDA",
+    _chunk_bwd_recompute_factors_with_state_grad_cuda,
+)
 torch.library.impl("attn_gym::_kda_plain_gate_scan", "CUDA", _plain_gate_scan_cuda)
 torch.library.impl("attn_gym::_kda_bound_gate_fwd", "CUDA", _bound_gate_fwd_cuda)
 torch.library.impl("attn_gym::_kda_bound_gate_bwd", "CUDA", _bound_gate_bwd_cuda)
@@ -306,8 +340,8 @@ torch.library.impl("attn_gym::kda_delta_h_with_state", "CUDA", _delta_h_with_sta
 
 
 def _chunk_fwd_fake_common(q: torch.Tensor, v: torch.Tensor):
-    tape_shape = (q.shape[0], q.shape[1], q.shape[2], _CHUNK_SIZE)
-    return v.new_empty(v.shape), q.new_empty(tape_shape), q.new_empty(tape_shape)
+    factor_shape = (q.shape[0], q.shape[1], q.shape[2], _CHUNK_SIZE)
+    return v.new_empty(v.shape), q.new_empty(factor_shape), q.new_empty(factor_shape)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_fwd")
@@ -430,6 +464,47 @@ def _chunk_bwd_with_state_grad_fake(
     autotune: bool,
 ):
     del aqk, akk, cu_seqlens, chunk_offsets, d_output, d_final_state, fastmath, autotune
+    return (
+        *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
+        torch.empty_like(initial_state),
+    )
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_bwd_recompute_factors")
+def _chunk_bwd_recompute_factors_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    fastmath: bool,
+    autotune: bool,
+):
+    del cu_seqlens, chunk_offsets, d_output, d_final_state, initial_state, fastmath, autotune
+    return _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad")
+def _chunk_bwd_recompute_factors_with_state_grad_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor,
+    fastmath: bool,
+    autotune: bool,
+):
+    del cu_seqlens, chunk_offsets, d_output, d_final_state, fastmath, autotune
     return (
         *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
         torch.empty_like(initial_state),
@@ -592,6 +667,10 @@ chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
 chunk_fwd_ragged_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_with_state.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
+chunk_bwd_recompute_factors_op = torch.ops.attn_gym.kda_chunk_bwd_recompute_factors.default
+chunk_bwd_recompute_factors_with_state_grad_op = (
+    torch.ops.attn_gym.kda_chunk_bwd_recompute_factors_with_state_grad.default
+)
 _plain_gate_scan_op = torch.ops.attn_gym._kda_plain_gate_scan.default
 _bound_gate_fwd_op = torch.ops.attn_gym._kda_bound_gate_fwd.default
 _bound_gate_bwd_op = torch.ops.attn_gym._kda_bound_gate_bwd.default
@@ -657,6 +736,8 @@ def recurrent_forward(
 
 __all__ = [
     "chunk_bwd_op",
+    "chunk_bwd_recompute_factors_op",
+    "chunk_bwd_recompute_factors_with_state_grad_op",
     "chunk_bwd_with_state_grad_op",
     "chunk_fwd_op",
     "chunk_fwd_ragged_op",

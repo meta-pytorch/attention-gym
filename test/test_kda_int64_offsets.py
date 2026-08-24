@@ -38,10 +38,11 @@ def test_requires_int64_abi_covers_oversized_singleton_strides():
 @pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
 def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
     """Force the i64 specializations on small inputs and match the i32 pipeline."""
-    import attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 as delta_module
+    import attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd as delta_module
     import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra as intra_module
     import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused as wy_module
     import attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve as inter_module
+    import attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine as fwd_intra_module
     from attn_gym.linear import chunk_kda
 
     def run():
@@ -61,13 +62,47 @@ def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
         return (output, *grads)
 
     baseline = run()
-    for module in (delta_module, intra_module, wy_module, inter_module):
+    for module in (delta_module, intra_module, wy_module, inter_module, fwd_intra_module):
         monkeypatch.setattr(module, "requires_int64_abi", lambda *tensors: True)
     forced = run()
     for name, expected, actual in zip(
         ("output", "dq", "dk", "dv", "dgate", "dbeta"), baseline, forced, strict=True
     ):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=lambda m, n=name: n)
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
+def test_forced_int64_dense_delta_h_fusion_matches_default_path(monkeypatch):
+    """Force the dense fused delta-H kernel's wide ABI on a small workload."""
+    import attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd as delta_module
+    from attn_gym.linear import chunk_kda
+
+    def run():
+        torch.manual_seed(17)
+        shape = (1, 128, 2, 128)
+        q, k, v = (
+            (torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8).requires_grad_()
+            for _ in range(3)
+        )
+        gate = (-torch.rand(shape, device="cuda") / 16).requires_grad_()
+        beta = torch.rand(shape[:3], device="cuda").requires_grad_()
+        output, _ = chunk_kda(q, k, v, gate, beta, autotune=False)
+        gradients = torch.autograd.grad(output.float().square().sum(), (q, k, v, gate, beta))
+        return (output, *gradients)
+
+    baseline = run()
+    calls = 0
+
+    def force_int64(*_tensors):
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(delta_module, "requires_int64_abi", force_int64)
+    forced = run()
+    assert calls > 0
+    for expected, actual in zip(baseline, forced, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")

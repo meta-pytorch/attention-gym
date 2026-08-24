@@ -343,13 +343,13 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
 
     def dense_forward(q, _k, v, _gate, _beta, _state, _tune):
         routes.append("dense")
-        tape = q.new_empty((*q.shape[:3], 64))
-        return torch.empty_like(v), tape, tape
+        factors = q.new_empty((*q.shape[:3], 64))
+        return torch.empty_like(v), factors, factors
 
     def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _tune):
         routes.append("ragged")
-        tape = q.new_empty((*q.shape[:3], 64))
-        return torch.empty_like(v), tape, tape
+        factors = q.new_empty((*q.shape[:3], 64))
+        return torch.empty_like(v), factors, factors
 
     monkeypatch.setattr(module, "chunk_fwd_op", dense_forward)
     monkeypatch.setattr(module, "chunk_fwd_ragged_op", ragged_forward)
@@ -490,12 +490,12 @@ def test_kda_tensor_descriptor_and_pointer_paths_match(monkeypatch):
     assert state is None
     descriptor_gradients = torch.autograd.grad(descriptor_output, descriptor_inputs, d_output)
 
-    for module_name in (
-        "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
-        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+    for module_name, attribute in (
+        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "_can_use_tensor_descriptors"),
+        ("attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk", "can_use_tensor_descriptors"),
     ):
         module = importlib.import_module(module_name)
-        monkeypatch.setattr(module, "_can_use_tensor_descriptors", lambda *_tensors: False)
+        monkeypatch.setattr(module, attribute, lambda *_tensors: False)
 
     pointer_inputs = _clone_inputs(descriptor_inputs)
     pointer_output, state = chunk_kda(*pointer_inputs)
@@ -517,12 +517,12 @@ def test_kda_offset_width_specializations_match(monkeypatch):
     inputs = _inputs(heads=2)
     d_output = torch.randn_like(inputs[0])
 
-    for module_name in (
-        "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
-        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+    for module_name, attribute in (
+        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "_can_use_tensor_descriptors"),
+        ("attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk", "can_use_tensor_descriptors"),
     ):
         module = importlib.import_module(module_name)
-        monkeypatch.setattr(module, "_can_use_tensor_descriptors", lambda *_tensors: False)
+        monkeypatch.setattr(module, attribute, lambda *_tensors: False)
 
     output32, state = chunk_kda(*inputs)
     assert state is None
@@ -533,7 +533,7 @@ def test_kda_offset_width_specializations_match(monkeypatch):
         "attn_gym.linear.kda.fwd.triton.chunk_delta_h",
         "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
         "attn_gym.linear.kda.fwd.triton.recompute_w_u",
-        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
+        "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk",
     ):
         module = importlib.import_module(module_name)
         monkeypatch.setattr(module, "requires_int64_offsets", lambda *_tensors: True)
@@ -582,26 +582,28 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
 
 def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
     """Choose BV from logical rather than physical packed batch size."""
-    dispatch = importlib.import_module(
-        "attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1_dispatch"
-    )
+    dispatch = importlib.import_module("attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd")
     captured = {}
     result = tuple(torch.empty(0, device="cuda") for _ in range(3))
 
-    def fake_delta_h(**kwargs):
-        captured["bv"] = kwargs["bv"]
-        captured["metadata"] = kwargs["metadata"]
+    def fake_delta_h(*args, bv, **kwargs):
+        captured["bv"] = bv
+        captured["metadata"] = args[5]
         return result
 
     class DeviceProperties:
         multi_processor_count = 100
 
-    monkeypatch.setattr(dispatch, "blackwell_delta_h_bwd_dhu_v1", fake_delta_h)
-    monkeypatch.setattr(dispatch, "get_device_properties", lambda _device: DeviceProperties())
+    monkeypatch.setattr(dispatch, "_blackwell_delta_h_bwd_dhu_dv_fused_packed", fake_delta_h)
+    monkeypatch.setattr(
+        dispatch,
+        "get_device_properties",
+        lambda _device: DeviceProperties(),
+    )
     tensor = torch.empty(1, 7, 2, 128, device="cuda")
     cu_seqlens = torch.arange(8, dtype=torch.int32, device="cuda")
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, tensor.shape[1], 64)
-    actual = dispatch.blackwell_delta_h_bwd_dhu_dispatch(
+    actual = dispatch.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
         tensor,
         tensor,
         tensor,

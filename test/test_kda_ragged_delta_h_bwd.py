@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 import pytest
 import torch
 
 pytest.importorskip("cutlass")
 
-from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd_v1
-from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import (
-    _should_bound_sequence_extent,
-    blackwell_delta_h_bwd_dhu_v1,
-)
-from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1_dispatch import (
-    blackwell_delta_h_bwd_dhu_dispatch,
+from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_module
+from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+    _blackwell_delta_h_bwd_dhu_dv_fused_packed,
+    blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
+    should_bound_sequence_extent,
 )
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, prepare_ragged_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
@@ -26,18 +22,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inputs(tokens: int, sequences: int, heads: int = 1) -> tuple[torch.Tensor, ...]:
+def _inputs(
+    tokens: int,
+    sequences: int,
+    heads: int = 1,
+    lengths: list[int] | None = None,
+) -> tuple[torch.Tensor, ...]:
     torch.manual_seed(37)
     shape = (1, tokens, heads, 128)
     q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
     k = torch.randn_like(q) / 8
     w = torch.randn_like(q) / 8
     do = torch.randn_like(q) / 8
-    dv = torch.randn_like(q) / 8
+    aqk = torch.randn(1, tokens, heads, 64, device="cuda", dtype=torch.bfloat16) / 8
+    begin = 0
+    for sequence_length in lengths or [tokens]:
+        for offset in range(0, sequence_length, 64):
+            length = min(64, sequence_length - offset)
+            token = slice(begin + offset, begin + offset + length)
+            aqk[:, token, :, :length] *= torch.ones(
+                length, length, device="cuda", dtype=torch.bool
+            ).tril()[None, :, None, :]
+        begin += sequence_length
     gk = -torch.rand(shape, device="cuda")
     h0 = torch.randn(sequences, heads, 128, 128, device="cuda") / 8
     dht = torch.randn_like(h0) / 8
-    return q, k, w, do, dv, gk, h0, dht
+    return q, k, w, do, aqk, gk, h0, dht
 
 
 def _run_ragged(
@@ -46,15 +56,26 @@ def _run_ragged(
     cu_seqlens: torch.Tensor | None = None,
     bv: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, w, do, dv, gk, h0, dht = inputs
+    q, k, w, do, aqk, gk, h0, dht = inputs
     offsets = cumulative_sequence_offsets(lengths) if cu_seqlens is None else cu_seqlens
     metadata = prepare_ragged_chunk_metadata(offsets, q.shape[1], 64)
-    operation = (
-        blackwell_delta_h_bwd_dhu_dispatch
-        if bv is None
-        else partial(blackwell_delta_h_bwd_dhu_v1, bv=bv)
+    if bv is None:
+        return blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
+            q, k, w, do, aqk, gk=gk, h0=h0, dht=dht, scale=128**-0.5, metadata=metadata
+        )
+    return _blackwell_delta_h_bwd_dhu_dv_fused_packed(
+        q,
+        k,
+        w,
+        do,
+        aqk,
+        metadata,
+        gk=gk,
+        h0=h0,
+        dht=dht,
+        scale=128**-0.5,
+        bv=bv,
     )
-    return operation(q, k, w, do, dv, gk=gk, h0=h0, dht=dht, scale=128**-0.5, metadata=metadata)
 
 
 @pytest.mark.parametrize(
@@ -69,7 +90,7 @@ def _run_ragged(
 )
 def test_delta_h_sequence_extent_selector(tokens, sequences, heads, has_initial_state, expected):
     assert (
-        _should_bound_sequence_extent(tokens, sequences, heads, 64, has_initial_state) is expected
+        should_bound_sequence_extent(tokens, sequences, heads, 64, has_initial_state) is expected
     )
 
 
@@ -81,13 +102,13 @@ def _run_without_initial_state(
     dht: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, None, torch.Tensor]:
     """Run dHU without materializing an initial-state gradient."""
-    return blackwell_delta_h_bwd_dhu_v1(
+    return _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         *inputs[:5],
+        metadata,
         gk=inputs[5],
         h0=None,
         dht=dht,
         scale=128**-0.5,
-        metadata=metadata,
         bv=bv,
     )
 
@@ -107,7 +128,7 @@ def test_ragged_delta_h_without_initial_state_handles_zero_sequence_extent():
 
     assert dh.shape == (1, metadata.capacity, 8, 128, 128)
     assert dh0 is None
-    assert dv.shape == inputs[4].shape
+    assert dv.shape == inputs[3].shape
 
 
 def test_ragged_delta_h_handles_all_empty_sequences():
@@ -115,7 +136,7 @@ def test_ragged_delta_h_handles_all_empty_sequences():
     dh, dh0, dv = _run_ragged(inputs, [0, 0])
 
     assert dh.shape == (1, 0, 1, 128, 128)
-    assert dv.shape == inputs[4].shape
+    assert dv.shape == inputs[3].shape
     torch.testing.assert_close(dh0, inputs[-1], rtol=0, atol=0)
 
 
@@ -124,7 +145,7 @@ def test_ragged_delta_h_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([128]), 128, 128)
 
     with pytest.raises(ValueError, match="metadata chunk size"):
-        blackwell_delta_h_bwd_dhu_dispatch(
+        blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
             *inputs[:5],
             gk=inputs[5],
             h0=inputs[6],
@@ -136,7 +157,7 @@ def test_ragged_delta_h_rejects_mismatched_chunk_size():
 
 def test_ragged_delta_h_matches_independent_sequences():
     lengths = [65, 0, 63]
-    inputs = _inputs(sum(lengths), len(lengths))
+    inputs = _inputs(sum(lengths), len(lengths), lengths=lengths)
     dh, dh0, dv = _run_ragged(inputs, lengths)
 
     expected_dh = []
@@ -182,7 +203,7 @@ def test_ragged_delta_h_matches_independent_sequences():
 def test_ragged_delta_h_ignores_nan_poisoned_physical_suffix(bv, lengths):
     physical_tokens = 256
     active_tokens = sum(lengths)
-    inputs = _inputs(physical_tokens, len(lengths))
+    inputs = _inputs(physical_tokens, len(lengths), lengths=lengths)
     active_inputs = tuple(value[:, :active_tokens].clone() for value in inputs[:6]) + tuple(
         value.clone() for value in inputs[6:]
     )
@@ -248,13 +269,13 @@ def test_ragged_delta_h_replays_aligned_boundaries(replayed_lengths):
 
 def test_ragged_delta_h_sequence_extent_forced_int64_matches_default(monkeypatch):
     lengths = [65, 0, 63] + [0] * 77
-    inputs = _inputs(sum(lengths), len(lengths), heads=8)
+    inputs = _inputs(sum(lengths), len(lengths), heads=8, lengths=lengths)
     metadata = prepare_ragged_chunk_metadata(
         cumulative_sequence_offsets(lengths), sum(lengths), 64
     )
 
     expected_dh, expected_dh0, expected_dv = _run_without_initial_state(inputs, metadata)
-    monkeypatch.setattr(chunk_delta_h_bwd_v1, "requires_int64_abi", lambda *_tensors: True)
+    monkeypatch.setattr(delta_h_module, "requires_int64_abi", lambda *_tensors: True)
     actual_dh, actual_dh0, actual_dv = _run_without_initial_state(inputs, metadata)
     assert actual_dh0 is None and expected_dh0 is None
     active_chunks = metadata.chunk_offsets[-1].item()
@@ -279,21 +300,21 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
     physical_tokens = 256
     num_sequences = 80
     inputs = _inputs(physical_tokens, num_sequences, heads=8)
-    q, k, w, do, dv, gk = inputs[:6]
+    q, k, w, do, aqk, gk = inputs[:6]
     cu_seqlens = cumulative_sequence_offsets([4] * 64 + [0] * 16)
 
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, physical_tokens, 64)
-    blackwell_delta_h_bwd_dhu_v1(
+    _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         q,
         k,
         w,
         do,
-        dv,
+        aqk,
+        warm_metadata,
         gk=gk,
         h0=None,
         dht=inputs[7] if use_dht else None,
         scale=128**-0.5,
-        metadata=warm_metadata,
         bv=bv,
     )
     torch.cuda.synchronize()
@@ -301,24 +322,24 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, physical_tokens, 64)
-        actual_dh, actual_dh0, actual_dv = blackwell_delta_h_bwd_dhu_v1(
+        actual_dh, actual_dh0, actual_dv = _blackwell_delta_h_bwd_dhu_dv_fused_packed(
             q,
             k,
             w,
             do,
-            dv,
+            aqk,
+            metadata,
             gk=gk,
             h0=None,
             dht=inputs[7] if use_dht else None,
             scale=128**-0.5,
-            metadata=metadata,
             bv=bv,
         )
     assert actual_dh0 is None
 
     active_tokens = sum(replay_lengths)
     cu_seqlens.copy_(cumulative_sequence_offsets(replay_lengths))
-    for tensor in (q, k, w, do, dv, gk):
+    for tensor in (q, k, w, do, aqk, gk):
         tensor[:, active_tokens:].fill_(torch.nan)
     graph.replay()
     torch.cuda.synchronize()
@@ -328,13 +349,13 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
     compact_metadata = prepare_ragged_chunk_metadata(
         cumulative_sequence_offsets(replay_lengths[:sequence_extent]), active_tokens, 64
     )
-    expected_dh, expected_dh0, expected_dv = blackwell_delta_h_bwd_dhu_v1(
+    expected_dh, expected_dh0, expected_dv = _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         *compact_inputs[:5],
+        compact_metadata,
         gk=compact_inputs[5],
         h0=None,
         dht=inputs[7][:sequence_extent].clone() if use_dht else None,
         scale=128**-0.5,
-        metadata=compact_metadata,
         bv=bv,
     )
     assert expected_dh0 is None

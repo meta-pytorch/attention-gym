@@ -156,9 +156,11 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
         torch.testing.assert_close(packed, sequence_local, rtol=0, atol=0)
 
 
-def test_ragged_bwd_intra_accepts_all_empty_sequences():
+@pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
+def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)
-    dq, dk, dg, db = _run(inputs, [0, 0])
+    outputs = chunk_kda_bwd_intra(*inputs, None) if metadata is None else _run(inputs, [0, 0])
+    dq, dk, dg, db = outputs
 
     assert dq.shape == dk.shape == dg.shape == (1, 0, 1, 128)
     assert dq.dtype == dk.dtype == torch.bfloat16

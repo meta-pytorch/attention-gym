@@ -84,6 +84,30 @@ def test_ragged_recurrence_matches_independent_sequences():
     torch.testing.assert_close(final_state, torch.stack(expected_final), rtol=0, atol=0)
 
 
+def test_recurrence_normalizes_misaligned_compact_gate():
+    from attn_gym._backends.triton.utils import can_use_tma
+
+    torch.manual_seed(3)
+    shape = (1, 128, 1, 128)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    w = torch.randn_like(k) / 8
+    u = torch.randn_like(k) / 8
+    gate_storage = torch.empty(k.numel() + 1, device="cuda")
+    gk = gate_storage[1:].view(shape)
+    gk.copy_(-torch.rand(shape, device="cuda"))
+    assert gk.is_contiguous() and not can_use_tma(gk)
+
+    expected = chunk_gated_delta_rule_fwd_h(k, w, u, gk.clone(), None)
+    results = (
+        chunk_gated_delta_rule_fwd_h(k, w, u, gk, None),
+        torch.compile(chunk_gated_delta_rule_fwd_h, fullgraph=True)(k, w, u, gk, None),
+    )
+    for actual in results:
+        for result, reference in zip(actual, expected, strict=True):
+            assert result is not None and reference is not None
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 def _persistent_overflow_case(
     dtype: torch.dtype,
 ) -> tuple[tuple[torch.Tensor, ...], RaggedChunkMetadata, list[int]]:

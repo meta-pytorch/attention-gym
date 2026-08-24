@@ -141,6 +141,83 @@ def test_public_ragged_preserves_state_for_all_empty_sequences():
     torch.testing.assert_close(final_state, initial_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layout", ["outer_strided", "misaligned"])
+def test_public_packed_backward_normalizes_cotangents(layout):
+    lengths = [256, 256]
+    inputs = make_kda_test_inputs(sum(lengths), heads=16, seed=37, requires_grad=True)
+    actual_inputs = clone_kda_inputs(inputs)
+    initial_state = torch.randn(2, 16, 128, 128, device="cuda", requires_grad=True)
+    actual_state = initial_state.detach().clone().requires_grad_()
+    offsets = cumulative_sequence_offsets(lengths)
+    expected_output, expected_final_state = chunk_kda(
+        *inputs,
+        initial_state,
+        cu_seqlens=offsets,
+        output_final_state=True,
+        autotune=False,
+    )
+    actual_output, actual_final_state = chunk_kda(
+        *actual_inputs,
+        actual_state,
+        cu_seqlens=offsets,
+        output_final_state=True,
+        autotune=False,
+    )
+    assert expected_final_state is not None and actual_final_state is not None
+    output_grad = torch.randn_like(expected_output)
+    state_grad = torch.randn_like(expected_final_state)
+    match layout:
+        case "outer_strided":
+            output_storage = torch.empty(
+                expected_output.shape[0],
+                2 * expected_output.shape[1],
+                *expected_output.shape[2:],
+                device="cuda",
+                dtype=expected_output.dtype,
+            )
+            actual_output_grad = output_storage[:, ::2]
+            state_storage = torch.empty(
+                *state_grad.shape[:-1],
+                2,
+                state_grad.shape[-1],
+                device="cuda",
+                dtype=state_grad.dtype,
+            )
+            actual_state_grad = state_storage[..., 0, :]
+            assert not actual_output_grad.is_contiguous()
+            assert not actual_state_grad.is_contiguous()
+        case "misaligned":
+            output_storage = torch.empty(
+                output_grad.numel() + 1,
+                device="cuda",
+                dtype=output_grad.dtype,
+            )
+            actual_output_grad = output_storage[1:].view_as(output_grad)
+            state_storage = torch.empty(
+                state_grad.numel() + 1,
+                device="cuda",
+                dtype=state_grad.dtype,
+            )
+            actual_state_grad = state_storage[1:].view_as(state_grad)
+            assert actual_output_grad.data_ptr() % 16
+            assert actual_state_grad.data_ptr() % 16
+    actual_output_grad.copy_(output_grad)
+    actual_state_grad.copy_(state_grad)
+
+    expected = torch.autograd.grad(
+        (expected_output, expected_final_state),
+        (*inputs, initial_state),
+        (output_grad, state_grad),
+    )
+    actual = torch.autograd.grad(
+        (actual_output, actual_final_state),
+        (*actual_inputs, actual_state),
+        (actual_output_grad, actual_state_grad),
+    )
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 def test_public_ragged_backward_matches_independent_sequences():
     lengths = [65, 0, 63]
     tokens = sum(lengths)
