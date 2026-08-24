@@ -103,4 +103,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
 ## ⚖️ License
 
-attention-gym is released under the BSD 3-Clause License.
+Attention Gym-authored code is released under the BSD 3-Clause License. Vendored third-party
+components retain the licenses and notices included alongside their source.
