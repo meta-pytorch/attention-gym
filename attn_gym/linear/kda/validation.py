@@ -12,11 +12,36 @@ here once; implementation-specific constraints stay with the implementation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Literal
+
 import torch
 
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward"})
+
+
+def resolve_kernel_options(
+    kernel_options: Mapping[str, object] | None,
+) -> tuple[Literal["fused", "mega"], bool]:
+    """Validate chunk backend options and resolve their defaults."""
+    if kernel_options is None:
+        return "fused", False
+    unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported chunk_kda kernel options: {names}")
+    backend = kernel_options.get("backend", "fused")
+    if backend not in ("fused", "mega"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    split_backward = kernel_options.get("split_backward", False)
+    if not isinstance(split_backward, bool):
+        raise TypeError("kernel_options['split_backward'] must be a bool")
+    if split_backward and backend != "mega":
+        raise ValueError("split_backward requires kernel_options['backend']='mega'")
+    return backend, split_backward
 
 
 def validate_kda_inputs(
@@ -60,4 +85,4 @@ def validate_kda_inputs(
         raise TypeError(f"{op_name} inputs must use one of {supported}")
 
 
-__all__ = ["SUPPORTED_INPUT_DTYPES", "validate_kda_inputs"]
+__all__ = ["SUPPORTED_INPUT_DTYPES", "resolve_kernel_options", "validate_kda_inputs"]

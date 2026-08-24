@@ -101,56 +101,57 @@ def _plain_gate_scan_cuda(
     reverse: bool,
 ) -> torch.Tensor:
     """Launch the internal dense or packed gate scan."""
-    _, tokens, heads, head_dim = values.shape
-    is_ragged = cu_seqlens is not None
-    # Packed reverse scans do not visit inactive capacity; its gradient must be zero
-    # before upstream parameter reductions consume it.
-    factory = torch.zeros_like if is_ragged and reverse else torch.empty_like
-    output = factory(values, memory_format=torch.contiguous_format)
-    block_dim = 32
-    if is_ragged:
-        assert chunk_offsets is not None
-        num_sequences = cu_seqlens.shape[0] - 1
-        chunks = chunk_capacity(tokens, num_sequences, DEFAULT_CHUNK_SIZE)
-        _plain_gate_scan_ragged_kernel[(chunks, heads, triton.cdiv(head_dim, block_dim))](
-            values,
-            output,
-            cu_seqlens,
-            chunk_offsets,
-            num_sequences,
-            LOG2_E,
-            X_STRIDES=(0, *values.stride()[1:]),
-            Y_STRIDES=(0, *output.stride()[1:]),
-            D=head_dim,
-            BT=DEFAULT_CHUNK_SIZE,
-            BD=block_dim,
-            REVERSE=reverse,
-            num_warps=2,
-            num_stages=3,
-        )
-    else:
-        assert chunk_offsets is None and values.shape[0] == 1
-        _plain_gate_scan_dense_kernel[
-            (
-                triton.cdiv(tokens, DEFAULT_CHUNK_SIZE),
-                heads,
-                triton.cdiv(head_dim, block_dim),
+    with torch.cuda.device(values.device):
+        _, tokens, heads, head_dim = values.shape
+        is_ragged = cu_seqlens is not None
+        # Packed reverse scans do not visit inactive capacity; its gradient must be zero
+        # before upstream parameter reductions consume it.
+        factory = torch.zeros_like if is_ragged and reverse else torch.empty_like
+        output = factory(values, memory_format=torch.contiguous_format)
+        block_dim = 32
+        if is_ragged:
+            assert chunk_offsets is not None
+            num_sequences = cu_seqlens.shape[0] - 1
+            chunks = chunk_capacity(tokens, num_sequences, DEFAULT_CHUNK_SIZE)
+            _plain_gate_scan_ragged_kernel[(chunks, heads, triton.cdiv(head_dim, block_dim))](
+                values,
+                output,
+                cu_seqlens,
+                chunk_offsets,
+                num_sequences,
+                LOG2_E,
+                X_STRIDES=(0, *values.stride()[1:]),
+                Y_STRIDES=(0, *output.stride()[1:]),
+                D=head_dim,
+                BT=DEFAULT_CHUNK_SIZE,
+                BD=block_dim,
+                REVERSE=reverse,
+                num_warps=2,
+                num_stages=3,
             )
-        ](
-            values,
-            output,
-            tokens,
-            LOG2_E,
-            X_STRIDES=(0, *values.stride()[1:]),
-            Y_STRIDES=(0, *output.stride()[1:]),
-            D=head_dim,
-            BT=DEFAULT_CHUNK_SIZE,
-            BD=block_dim,
-            REVERSE=reverse,
-            num_warps=2,
-            num_stages=3,
-        )
-    return output
+        else:
+            assert chunk_offsets is None and values.shape[0] == 1
+            _plain_gate_scan_dense_kernel[
+                (
+                    triton.cdiv(tokens, DEFAULT_CHUNK_SIZE),
+                    heads,
+                    triton.cdiv(head_dim, block_dim),
+                )
+            ](
+                values,
+                output,
+                tokens,
+                LOG2_E,
+                X_STRIDES=(0, *values.stride()[1:]),
+                Y_STRIDES=(0, *output.stride()[1:]),
+                D=head_dim,
+                BT=DEFAULT_CHUNK_SIZE,
+                BD=block_dim,
+                REVERSE=reverse,
+                num_warps=2,
+                num_stages=3,
+            )
+        return output
 
 
 __all__ = ["_plain_gate_scan_cuda"]

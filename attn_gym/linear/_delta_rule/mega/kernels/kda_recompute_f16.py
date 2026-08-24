@@ -84,7 +84,7 @@ Requires the public CuTeDSL 4.7 API, including `cutlass.experimental.*`.
 """
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -92,8 +92,9 @@ import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
+from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.mega.kernels.common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from attn_gym.linear._delta_rule.mega.kernels.common.host import get_dtype
 from attn_gym.linear._delta_rule.mega.kernels.compat import (
@@ -107,6 +108,15 @@ from attn_gym.linear._delta_rule.mega.kernels.common.thd import (
     TENSOR_MAP_QWORDS,
     emit_checkpoint_seq_descs,
     emit_seq_load_descs,
+)
+from attn_gym.linear._delta_rule.mega.kernels.common.tvm_ffi import (
+    make_compact_signature_tensor,
+    make_counter_signature,
+    make_cu_seqlens_signature,
+    make_strided_signature_tensor,
+    make_work_items_signature,
+    make_workspace_signature,
+    validate_cu_seqlens,
 )
 from .kda_recompute_config import CFG
 
@@ -1660,8 +1670,9 @@ def compute1_warp_group(
 class KdaRecomputeOp:
     """Compile and launch one static mega KDA recompute configuration."""
 
-    def __init__(self, cfg: "KdaRecomputeCfg"):
+    def __init__(self, cfg: "KdaRecomputeCfg", use_int64_offsets: bool = False):
         self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
 
     def get_name(self) -> str:
         cfg = self.cfg
@@ -1680,7 +1691,7 @@ class KdaRecomputeOp:
             f"_i{int(cfg.use_initial_state)}f{int(cfg.store_final_state)}"
             f"c{int(cfg.enable_checkpoints)}l{int(cfg.l2norm)}"
             f"g{int(cfg.safe_gate)}b{int(cfg.beta_sigmoid)}d{int(cfg.dyn_sched)}"
-            f"_sm{cfg.max_active_clusters}{gate_scale}"
+            f"_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}{gate_scale}"
         )
 
     @cute.jit
@@ -2198,10 +2209,10 @@ def build_descs_body(
     gate: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     n_batch: cutlass.Int32,
-    k_row_stride: cutlass.Int32,
-    v_row_stride: cutlass.Int32,
-    gate_row_stride: cutlass.Int32,
-    checkpoint_row_stride: cutlass.Int32,
+    k_row_stride: cutlass.Int64,
+    v_row_stride: cutlass.Int64,
+    gate_row_stride: cutlass.Int64,
+    checkpoint_row_stride: cutlass.Int64,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array. Runs inside the
@@ -2267,10 +2278,10 @@ def prologue_kernel(
     mWorkItems: cute.Tensor | None,
     mSched: cute.Tensor | None,
     n_batch: cutlass.Int32,
-    k_row_stride: cutlass.Int32,
-    v_row_stride: cutlass.Int32,
-    gate_row_stride: cutlass.Int32,
-    checkpoint_row_stride: cutlass.Int32,
+    k_row_stride: cutlass.Int64,
+    v_row_stride: cutlass.Int64,
+    gate_row_stride: cutlass.Int64,
+    checkpoint_row_stride: cutlass.Int64,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
     """Single-CTA prologue. Under ``run_order`` this kernel is the first
@@ -2397,10 +2408,10 @@ def prologue(
         work_items,
         sched_all,
         cutlass.Int32(batch_size),
-        cutlass.Int32(k.stride[0]),
-        cutlass.Int32(v.stride[0]),
-        cutlass.Int32(gate.stride[0]),
-        cutlass.Int32(state_checkpoints.stride[0] if state_checkpoints is not None else 0),
+        cutlass.Int64(k.stride[0]),
+        cutlass.Int64(v.stride[0]),
+        cutlass.Int64(gate.stride[0]),
+        cutlass.Int64(state_checkpoints.stride[0] if state_checkpoints is not None else 0),
         checkpoint_every_n,
     ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
 
@@ -2412,7 +2423,6 @@ def prologue(
 def get_compiled_cache(
     io_dtype_str: str,
     state_dtype_str: str,
-    cu_dtype_str: str,
     HO: int,
     HK: int,
     HV: int,
@@ -2426,6 +2436,7 @@ def get_compiled_cache(
     dyn_sched: bool,
     run_order: bool,
     order_gen: bool,
+    use_int64_offsets: bool,
     device_index: int,
     device_major: int,
     device_minor: int,
@@ -2449,25 +2460,12 @@ def compile(
     v_ratio: int,
     n_heads_out: int,
     dyn_sched: bool = False,
+    use_int64_offsets: bool = False,
     *,
     num_sm: int,
-    k_cute,
-    v_cute,
-    gate_cute,
-    a_log_cute,
-    dt_bias_cute,
-    beta_cute,
-    cu_seqlens_cute,
-    state_in_cute,
-    state_out_cute,
-    work_items_cute=None,
-    work_count_cute=None,
-    sched_ctr_cute=None,
-    tensormap_ws_cute,
-    checkpoint_every_n_tokens,
-    stream,
+    checkpoint_every_n_tokens: int,
 ):
-    """JIT-compile the chunked KDA recompute kernel for one static config."""
+    """JIT-compile one fake-tensor TVM-FFI recompute signature."""
     cfg = build_cfg(
         io_dtype,
         state_dtype,
@@ -2484,27 +2482,45 @@ def compile(
         max_active_clusters=num_sm,
         dyn_sched=dyn_sched,
     )
+    op = KdaRecomputeOp(cfg, use_int64_offsets)
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
 
-    op = KdaRecomputeOp(cfg)
-    op.__call__.set_name_prefix(op.get_name())
-    return cute.compile(
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    beta_dtype = io_dtype if beta_sigmoid else cutlass.Float32
+    return compile_tvm_ffi(
         op,
-        k_cute,
-        v_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        beta_cute,
-        cu_seqlens_cute,
-        state_in_cute,
-        state_out_cute,
-        work_items_cute,
-        work_count_cute,
-        sched_ctr_cute,
-        tensormap_ws_cute,
-        checkpoint_every_n_tokens,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
+        tma_tensor(io_dtype, (tokens, n_heads_out // k_ratio, 128)),
+        tma_tensor(io_dtype, (tokens, n_heads_out // v_ratio, 128)),
+        tma_tensor(cutlass.Float32, (tokens, n_heads_out, 128)),
+        make_compact_signature_tensor(
+            cutlass.Float32,
+            (n_heads_out,),
+            assumed_align=4,
+        )
+        if safe_gate
+        else None,
+        tma_tensor(cutlass.Float32, (n_heads_out, 128)) if safe_gate else None,
+        make_strided_signature_tensor(
+            beta_dtype,
+            (tokens, n_heads_out),
+            assumed_align=beta_dtype.width // 8,
+            use_int64_offsets=use_int64_offsets,
+        ),
+        make_cu_seqlens_signature(sequence_entries),
+        tma_tensor(state_dtype, (sequences, n_heads_out, 128, 128)) if use_initial_state else None,
+        tma_tensor(state_dtype, (sequences, n_heads_out, 128, 128)) if store_final_state else None,
+        make_work_items_signature(work_rows),
+        make_counter_signature(),
+        make_counter_signature(sched_entries) if dyn_sched else None,
+        make_workspace_signature(workspace_words),
+        cutlass.Int32(checkpoint_every_n_tokens),
     )
 
 
@@ -2532,7 +2548,6 @@ def chunk_kda_recompute_sm100(
     order_in_prologue: bool = False,
     *,
     tensormap_workspace,
-    stream,
 ) -> None:
     """Execute the Blackwell BT=16 chunked KDA recompute (state/checkpoints-only)
     kernel.
@@ -2584,8 +2599,9 @@ def chunk_kda_recompute_sm100(
     ):
         if tensor is not None:
             validate_tma_tensor(name, tensor)
-    if cu_seqlens.data_ptr() % 8:
-        raise ValueError("cu_seqlens data pointer must be 8-byte aligned")
+    validate_cu_seqlens(cu_seqlens, assumed_align=8)
+    if tensormap_workspace.data_ptr() % 128:
+        raise ValueError("tensormap_workspace data pointer must be 128-byte aligned")
 
     tokens, HK, d_k = k.shape
     HV, HO = v.shape[1], gate.shape[1]
@@ -2620,6 +2636,7 @@ def chunk_kda_recompute_sm100(
     dyn_sched = sched_ctr is not None
     run_order = order_in_prologue
     order_gen = order_in_prologue and work_item_scratch is None
+    has_sched = run_order
     if run_order and sched_all is None:
         raise ValueError("order in the prologue requires sched_all (the prologue zeroes both consumers' sched rings)")
 
@@ -2644,7 +2661,25 @@ def chunk_kda_recompute_sm100(
     if not safe_gate:
         a_log = None
         dt_bias = None
-    cu_stream = cuda_driver.CUstream(int(stream))
+    state_checkpoints_for_descs = output_state_checkpoints if enable_checkpoints else None
+    use_int64_offsets = requires_int64_abi(
+        k,
+        v,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        cu_seqlens,
+        initial_state,
+        output_state,
+        state_checkpoints_for_descs,
+        work_item_scratch,
+        work_items,
+        work_count,
+        sched_ctr,
+        sched_all,
+        tensormap_workspace,
+    )
     device_index = tensor_device_index(k)
     if current_device() != device_index:
         raise ValueError("the active CUDA device must match k.device")
@@ -2654,7 +2689,6 @@ def chunk_kda_recompute_sm100(
     cache = get_compiled_cache(
         str(k.dtype),
         str(state_dtype_src),
-        str(cu_seqlens.dtype),
         HO,
         HK,
         HV,
@@ -2668,44 +2702,18 @@ def chunk_kda_recompute_sm100(
         dyn_sched,
         run_order,
         order_gen,
+        use_int64_offsets,
         device_index,
         device_properties.major,
         device_properties.minor,
         num_sm,
     )
 
+    io_dtype = get_dtype(k.dtype)
     if "compiled" not in cache:
-        io_dtype = get_dtype(k.dtype)
-        state_dtype = get_dtype(state_dtype_src)
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16) if dt_bias is not None else None
-        beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-
-        state_in_cute = None
-        if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        state_out_cute = None
-        if store_final_state:
-            state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        work_items_cute = from_dlpack(work_items, assumed_align=16)
-        work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-
-        sched_ctr_cute = None
-        if dyn_sched:
-            sched_ctr_cute = from_dlpack(sched_ctr, assumed_align=4).mark_layout_dynamic()
-
-        tensormap_ws_cute = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-
         cache["compiled"] = compile(
             io_dtype,
-            state_dtype,
+            get_dtype(state_dtype_src),
             use_initial_state,
             store_final_state,
             enable_checkpoints,
@@ -2717,66 +2725,49 @@ def chunk_kda_recompute_sm100(
             v_ratio,
             HO,
             dyn_sched,
+            use_int64_offsets,
             num_sm=num_sm,
-            k_cute=k_cute,
-            v_cute=v_cute,
-            gate_cute=gate_cute,
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            beta_cute=beta_cute,
-            cu_seqlens_cute=cu_seqlens_cute,
-            state_in_cute=state_in_cute,
-            state_out_cute=state_out_cute,
-            work_items_cute=work_items_cute,
-            work_count_cute=work_count_cute,
-            sched_ctr_cute=sched_ctr_cute,
-            tensormap_ws_cute=tensormap_ws_cute,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            stream=cu_stream,
         )
 
-    compiled = cache["compiled"]
-    state_checkpoints_for_descs = output_state_checkpoints if enable_checkpoints else None
     if "prologue" not in cache:
-        io_dtype = get_dtype(k.dtype)
-        k_pl = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_pl = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_pl = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_pl = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-        ws_pl = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-        state_checkpoints_pl = None
-        if state_checkpoints_for_descs is not None:
-            state_checkpoints_pl = from_dlpack(state_checkpoints_for_descs, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        staging_pl = None
-        if run_order and not order_gen:
-            staging_pl = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_pl = from_dlpack(work_items, assumed_align=16)
-        work_items_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_pl = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        sched_pl = None
-        if run_order:
-            sched_pl = from_dlpack(sched_all, assumed_align=4).mark_layout_dynamic()
-        cache["prologue"] = cute.compile(
+        sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+        tokens, sequence_entries, checkpoint_rows, work_rows, sched_entries, workspace_words = (
+            sym_int() for _ in range(6)
+        )
+
+        tma_tensor = partial(
+            make_strided_signature_tensor,
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+        )
+        work_items_signature = make_work_items_signature(work_rows)
+        cache["prologue"] = compile_tvm_ffi(
             prologue,
             io_dtype,
             CFG.B_T,
             run_order,
             order_gen,
-            run_order,
-            k_pl,
-            v_pl,
-            gate_pl,
-            state_checkpoints_pl,
-            cu_pl,
-            staging_pl,
-            work_count_pl,
-            work_items_pl,
-            sched_pl,
-            ws_pl,
+            has_sched,
+            tma_tensor(io_dtype, (tokens, HK, 128)),
+            tma_tensor(io_dtype, (tokens, HV, 128)),
+            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+            tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128))
+            if state_checkpoints_for_descs is not None
+            else None,
+            make_cu_seqlens_signature(sequence_entries),
+            work_items_signature if run_order and not order_gen else None,
+            make_counter_signature(),
+            work_items_signature,
+            make_counter_signature(sched_entries) if has_sched else None,
+            make_workspace_signature(workspace_words),
             cutlass.Int32(checkpoint_every_n_tokens),
-            cu_stream,
-            options="--enable-tvm-ffi",
+            name=(
+                f"kda_mega_recompute_prologue_{io_dtype.__name__.lower()}"
+                f"_hk{HK}_hv{HV}_ho{HO}_c{int(enable_checkpoints)}"
+                f"_r{int(run_order)}o{int(order_gen)}d{int(dyn_sched)}"
+                f"_i64{int(use_int64_offsets)}"
+            ),
         )
     cache["prologue"](
         k,
@@ -2790,9 +2781,8 @@ def chunk_kda_recompute_sm100(
         sched_all if run_order else None,
         tensormap_workspace,
         checkpoint_every_n_tokens,
-        cu_stream,
     )
-    compiled(
+    cache["compiled"](
         k,
         v,
         gate,
@@ -2807,5 +2797,4 @@ def chunk_kda_recompute_sm100(
         sched_ctr,
         tensormap_workspace,
         checkpoint_every_n_tokens,
-        cu_stream,
     )

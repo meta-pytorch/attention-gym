@@ -57,8 +57,15 @@ def _normalize_qkv_layout(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_packed_cotangent(tensor: torch.Tensor) -> torch.Tensor:
-    """Provide the compact 128-byte-aligned ABI required by packed delta-H."""
+    """Provide the compact 128-byte-aligned ABI required by packed token gradients."""
     if tensor.is_contiguous() and tensor_supports_contiguous_dim(tensor, alignment_bytes=128):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+def _normalize_state_cotangent(tensor: torch.Tensor) -> torch.Tensor:
+    """Preserve supported state strides and materialize broadcast cotangents."""
+    if tensor.stride(-1) == 1 and all(stride >= 0 for stride in tensor.stride()):
         return tensor
     return tensor.clone(memory_format=torch.contiguous_format)
 
@@ -72,8 +79,6 @@ def _validate_private_abi(
     initial_state: torch.Tensor | None,
 ) -> None:
     contiguous_tensors = (cumulative_gate, beta)
-    if initial_state is not None:
-        contiguous_tensors += (initial_state,)
     if q.dtype not in (torch.float16, torch.bfloat16) or (k.dtype, v.dtype) != (
         q.dtype,
         q.dtype,
@@ -83,8 +88,12 @@ def _validate_private_abi(
         raise TypeError("the private chunk_kda ABI requires float32 cumulative_gate and beta")
     if initial_state is not None and initial_state.dtype != torch.float32:
         raise TypeError("the private chunk_kda ABI requires a float32 initial_state")
+    if initial_state is not None and (
+        initial_state.stride(-1) != 1 or any(stride < 0 for stride in initial_state.stride())
+    ):
+        raise ValueError("the private chunk_kda ABI requires a contiguous state key mode")
     if not all(tensor.is_contiguous() for tensor in contiguous_tensors):
-        raise ValueError("the private chunk_kda ABI requires contiguous gate, beta, and state")
+        raise ValueError("the private chunk_kda ABI requires contiguous gate and beta")
     if not all(_has_supported_qkv_layout(tensor) for tensor in (q, k, v)):
         raise ValueError(
             "the private chunk_kda ABI requires QKV to have contiguous heads and "
@@ -509,12 +518,7 @@ def _prepare_chunk_kda_backward(
     else:
         d_output = _normalize_qkv_layout(d_output)
     if d_final_state is not None:
-        d_final_state = d_final_state.float()
-        d_final_state = (
-            _normalize_packed_cotangent(d_final_state)
-            if metadata is not None
-            else _normalize_qkv_layout(d_final_state)
-        )
+        d_final_state = _normalize_state_cotangent(d_final_state.float())
     return q, k, v, metadata, d_output, d_final_state
 
 

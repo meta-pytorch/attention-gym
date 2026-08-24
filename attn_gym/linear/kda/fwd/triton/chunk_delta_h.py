@@ -56,7 +56,9 @@ def _run_chunk_delta_h_sequence(
     T,
     i_nh,
     i_v,
-    state_batch_stride: tl.constexpr,
+    H0_STRIDES,
+    HT_STRIDES,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -119,8 +121,14 @@ def _run_chunk_delta_h_sequence(
         i_state = i_n.to(tl.int64)
     else:
         i_state = i_n
-    p_state = i_state * state_batch_stride + i_h * V * K
-    p_state += ptr_offset((o_v[None, :], o_k[:, None]), (K, 1))
+    if DYNAMIC_STATE_LAYOUT:
+        state_indices_4d = (i_state, i_h, o_v[None, :], o_k[:, None])
+        p_h0 = ptr_offset(state_indices_4d, H0_STRIDES)
+        p_ht = ptr_offset(state_indices_4d, HT_STRIDES)
+    else:
+        p_h0 = i_state * H * V * K + i_h * V * K
+        p_h0 += ptr_offset((o_v[None, :], o_k[:, None]), (K, 1))
+        p_ht = p_h0
 
     b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -128,7 +136,7 @@ def _run_chunk_delta_h_sequence(
         if USE_HAS_INITIAL_STATE:
             m_state &= tl.load(has_initial_state + i_n)
         b_h += tl.load(
-            h0 + p_state,
+            h0 + p_h0,
             mask=m_state,
             other=0.0,
         ).to(
@@ -193,7 +201,7 @@ def _run_chunk_delta_h_sequence(
 
     if STORE_FINAL_STATE:
         tl.store(
-            ht + p_state,
+            ht + p_ht,
             b_h,
         )
 
@@ -217,7 +225,15 @@ def chunk_delta_h_kernel_k128_wsp(
     u,
     v_new,
     T,
-    state_batch_stride: tl.constexpr,
+    h0_stride_0,
+    h0_stride_1,
+    h0_stride_2,
+    h0_stride_3,
+    ht_stride_0,
+    ht_stride_1,
+    ht_stride_2,
+    ht_stride_3,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -253,7 +269,9 @@ def chunk_delta_h_kernel_k128_wsp(
         T,
         tl.program_id(0),
         tl.program_id(1),
-        state_batch_stride,
+        (h0_stride_0, h0_stride_1, h0_stride_2, h0_stride_3),
+        (ht_stride_0, ht_stride_1, ht_stride_2, ht_stride_3),
+        DYNAMIC_STATE_LAYOUT,
         H,
         K,
         V,
@@ -289,7 +307,15 @@ def chunk_delta_h_kernel_k128_persistent(
     u,
     v_new,
     T,
-    state_batch_stride: tl.constexpr,
+    h0_stride_0,
+    h0_stride_1,
+    h0_stride_2,
+    h0_stride_3,
+    ht_stride_0,
+    ht_stride_1,
+    ht_stride_2,
+    ht_stride_3,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -332,7 +358,9 @@ def chunk_delta_h_kernel_k128_persistent(
             T,
             i_nh,
             i_v,
-            state_batch_stride,
+            (h0_stride_0, h0_stride_1, h0_stride_2, h0_stride_3),
+            (ht_stride_0, ht_stride_1, ht_stride_2, ht_stride_3),
+            DYNAMIC_STATE_LAYOUT,
             H,
             K,
             V,
@@ -406,9 +434,9 @@ def _delta_h_launch(
     if not can_use_tma(gk):
         gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    state_batch_stride = (
-        initial_state.stride(0) if initial_state is not None else heads * key_dim * value_dim
-    )
+    compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
+    h0_strides = initial_state.stride() if initial_state is not None else compact_state_strides
+    ht_strides = final_state.stride() if final_state is not None else compact_state_strides
     # FP32 tiles double the descriptor staging past the shared-memory limit
     # at the 16-bit tile shape, and warp specialization pins its own stage
     # count; for 4-byte inputs halve the value tile and use an ordinarily
@@ -436,9 +464,12 @@ def _delta_h_launch(
         u,
         v_new,
         tokens,
+        *h0_strides,
+        *ht_strides,
     )
     kernel_options = {
-        "state_batch_stride": state_batch_stride,
+        "DYNAMIC_STATE_LAYOUT": (initial_state is not None and not initial_state.is_contiguous())
+        or (final_state is not None and not final_state.is_contiguous()),
         "H": heads,
         "K": key_dim,
         "V": value_dim,
@@ -667,8 +698,8 @@ def chunk_gated_delta_rule_fwd_h(
                 f"initial_state must have shape {expected_state_shape}, "
                 f"got {tuple(initial_state.shape)}"
             )
-        if initial_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
-            raise TypeError("initial_state must be contiguous within each [H, V, K] row")
+        if initial_state.stride(-1) != 1 or any(stride < 0 for stride in initial_state.stride()):
+            raise TypeError("initial_state requires a contiguous key mode")
 
     if tokens == 0:
         # Zero-size tensors cannot back descriptors; the recurrence is empty

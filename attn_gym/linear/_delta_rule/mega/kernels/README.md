@@ -1,9 +1,10 @@
 # Mega delta-rule CuTeDSL kernels
 
-This package vendors the SM100/SM103 prefill, checkpoint-recompute, and bprop kernels adapted from
-NVIDIA's Frost KDA implementation. It is the shared donor-derived kernel unit for delta-rule
-variants. The current KDA adapter owns public API selection, validation, gate preparation, and
-autograd; a future GDN adapter can reuse the same implementation boundary.
+This package contains the shared SM100/SM103 Mega kernels for delta-rule variants. The prefill,
+checkpoint-recompute, and bprop core is adapted from NVIDIA's Frost KDA implementation;
+`kda_plain_gate_bwd.py` is an Attention Gym-authored dense gate-gradient helper. The current KDA
+adapter owns public API selection, validation, and autograd, while a future GDN adapter can reuse
+the same implementation boundary.
 
 ## Raw specialization
 
@@ -36,9 +37,9 @@ runs.
 
 ## Source and licensing
 
-The kernels and required `common/` and `tile_dsl/` helpers are adapted from NVIDIA
+The Frost-derived kernels and required `common/` and `tile_dsl/` helpers are adapted from NVIDIA
 `cudnn-frontend` commit `085d50b33691f06e2309f8e6724741a021985649`. Runtime imports were moved
 into the Attention Gym namespace, and `compat.py` replaces cuDNN host utilities. There is no
-`cudnn.frost` runtime dependency.
+`cudnn.frost` runtime dependency. `kda_plain_gate_bwd.py` remains BSD-3-Clause Attention Gym code.
 
 See `NOTICE.md`, `LICENSE.Apache-2.0`, and `LICENSE.MIT`.
