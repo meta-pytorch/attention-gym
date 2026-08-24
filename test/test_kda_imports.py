@@ -35,6 +35,8 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
 
         builtins.__import__ = reject_optional_backends
 
+        import attn_gym.linear as linear
+
         from attn_gym.linear import (
             active_token_mask,
             chunk_kda,
@@ -53,8 +55,10 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
         q = torch.randn(shape)
         k = torch.randn(shape)
         v = torch.randn(shape)
-        gate = -torch.rand(shape)
         beta = torch.rand(shape[:3])
+        gate = -torch.rand(shape)
+        assert not hasattr(linear, 'bounded_gate')
+        assert not hasattr(linear, 'bounded_gate_cumsum')
         recurrent_kda(q, k, v, gate, beta, impl='reference')
         chunk_kda(q, k, v, gate, beta, impl='reference')
         """
@@ -101,13 +105,11 @@ def test_chunk_kda_cold_public_fullgraph_compile():
         import torch.nn.functional as F
 
         from attn_gym.linear import chunk_kda
-        from attn_gym.linear.kda.naive import chunk_cumsum_ref
-
         shape = (1, 64, 1, 128)
         q = F.normalize(torch.randn(shape, device='cuda'), dim=-1).to(torch.bfloat16)
         k = F.normalize(torch.randn(shape, device='cuda'), dim=-1).to(torch.bfloat16)
         v = torch.randn(shape, device='cuda', dtype=torch.bfloat16)
-        gate = chunk_cumsum_ref(-torch.rand(shape, device='cuda'), 64)
+        gate = -torch.rand(shape, device='cuda')
         beta = torch.rand(shape[:3], device='cuda')
 
         compiled = torch.compile(chunk_kda, fullgraph=True)

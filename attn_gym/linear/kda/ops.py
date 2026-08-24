@@ -11,6 +11,9 @@ import importlib
 
 import torch
 
+from attn_gym.utils import ceildiv
+
+_BOUND_GATE_TILE_TOKENS = 32
 _CHUNK_SIZE = 64
 
 
@@ -55,6 +58,20 @@ torch.library.define(
     "attn_gym::kda_chunk_bwd_with_state_grad",
     _CHUNK_BWD_ARGS.format(initial_state="Tensor initial_state")
     + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+
+torch.library.define(
+    "attn_gym::_kda_plain_gate_scan",
+    "(Tensor values, Tensor? cu_seqlens, Tensor? chunk_offsets, bool reverse) -> Tensor",
+)
+torch.library.define(
+    "attn_gym::_kda_bound_gate_fwd",
+    "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, float lower_bound, bool fastmath) -> Tensor",
+)
+torch.library.define(
+    "attn_gym::_kda_bound_gate_bwd",
+    "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, Tensor d_gate, "
+    "float lower_bound, bool fastmath) -> (Tensor, Tensor, Tensor)",
 )
 
 _RECURRENT_FWD_ARGS = (
@@ -146,6 +163,33 @@ def _chunk_backend():
         ) from error
 
 
+def _bound_gate_fwd_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.cute.gate_fwd")
+    except ImportError as error:
+        raise ImportError(
+            "bound_gate(impl='fused') requires the optional CuTeDSL backend: "
+            "pip install attn-gym[linear]"
+        ) from error
+
+
+def _bound_gate_bwd_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.bwd.cute.gate_bwd")
+    except ImportError as error:
+        raise ImportError(
+            "bound_gate(impl='fused') requires the optional CuTeDSL backend: "
+            "pip install attn-gym[linear]"
+        ) from error
+
+
+def _plain_gate_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.triton.plain_gate")
+    except ImportError as error:
+        raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
+
+
 def _recurrent_backend():
     try:
         return importlib.import_module("attn_gym.linear.kda.fwd.triton.recurrent")
@@ -184,6 +228,18 @@ def _chunk_bwd_cuda(*args):
 
 def _chunk_bwd_with_state_grad_cuda(*args):
     return _chunk_backend()._chunk_kda_bwd_with_state_grad_cuda(*args)
+
+
+def _plain_gate_scan_cuda(*args):
+    return _plain_gate_backend()._plain_gate_scan_cuda(*args)
+
+
+def _bound_gate_fwd_cuda(*args):
+    return _bound_gate_fwd_backend()._bound_gate_fwd_cuda(*args)
+
+
+def _bound_gate_bwd_cuda(*args):
+    return _bound_gate_bwd_backend()._bound_gate_bwd_cuda(*args)
 
 
 def _recurrent_fwd_cuda(*args):
@@ -226,6 +282,9 @@ torch.library.impl(
     "CUDA",
     _chunk_bwd_with_state_grad_cuda,
 )
+torch.library.impl("attn_gym::_kda_plain_gate_scan", "CUDA", _plain_gate_scan_cuda)
+torch.library.impl("attn_gym::_kda_bound_gate_fwd", "CUDA", _bound_gate_fwd_cuda)
+torch.library.impl("attn_gym::_kda_bound_gate_bwd", "CUDA", _bound_gate_bwd_cuda)
 torch.library.impl("attn_gym::kda_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
 torch.library.impl(
     "attn_gym::kda_recurrent_fwd_no_state",
@@ -377,6 +436,54 @@ def _chunk_bwd_with_state_grad_fake(
     )
 
 
+@torch.library.register_fake("attn_gym::_kda_plain_gate_scan")
+def _plain_gate_scan_fake(
+    values: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    reverse: bool,
+) -> torch.Tensor:
+    """Describe the compact internal gate scan output."""
+    del cu_seqlens, chunk_offsets, reverse
+    return torch.empty_like(values, memory_format=torch.contiguous_format)
+
+
+@torch.library.register_fake("attn_gym::_kda_bound_gate_fwd")
+def _bound_gate_fwd_fake(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    fastmath: bool,
+) -> torch.Tensor:
+    """Describe the compact FP32 gate output."""
+    del A_log, dt_bias, lower_bound, fastmath
+    return torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
+
+
+@torch.library.register_fake("attn_gym::_kda_bound_gate_bwd")
+def _bound_gate_bwd_fake(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    d_gate: torch.Tensor,
+    lower_bound: float,
+    fastmath: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Describe raw and reduced parameter-gradient metadata."""
+    del A_log, lower_bound, fastmath
+    partial_shape = (
+        raw_gate.shape[0],
+        ceildiv(raw_gate.shape[1], _BOUND_GATE_TILE_TOKENS),
+        raw_gate.shape[2],
+    )
+    return (
+        raw_gate.new_empty(raw_gate.shape),
+        d_gate.new_empty(partial_shape),
+        dt_bias.new_empty(dt_bias.shape),
+    )
+
+
 @torch.library.register_fake("attn_gym::kda_recurrent_fwd")
 def _recurrent_fwd_fake(
     q: torch.Tensor,
@@ -485,6 +592,9 @@ chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
 chunk_fwd_ragged_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_with_state.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
+_plain_gate_scan_op = torch.ops.attn_gym._kda_plain_gate_scan.default
+_bound_gate_fwd_op = torch.ops.attn_gym._kda_bound_gate_fwd.default
+_bound_gate_bwd_op = torch.ops.attn_gym._kda_bound_gate_bwd.default
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default

@@ -228,8 +228,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
 #     |lower_bound| <= 128 / (span_steps * log2(e)).
 #
 # For BC=16, row 0 spans 15 intervals and gives a 5.915 limit; the 8-interval midpoint
-# would give 11.09. The public gate enforces the causal bound; see GATE_SPAN_STEPS in
-# gate_fwd.py.
+# would give 11.09. The fused training integration enforces the bound derived in
+# ``constants.py``; custom gate producers must honor the same limit.
 def chunk_kda_fwd_intra_diagonal(
     q: torch.Tensor,
     k: torch.Tensor,

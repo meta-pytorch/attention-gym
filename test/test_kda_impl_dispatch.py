@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym.linear import Impl, chunk_kda, recurrent_kda
-from attn_gym.linear.kda.naive import chunk_cumsum_ref
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
 
@@ -114,11 +113,9 @@ def test_recurrent_reference_packed_capacity_and_empty_slots():
 def test_reference_impls_run_on_cpu():
     """The reference contract promises any hardware; pin the CPU boundary."""
     q, k, v, gate, beta = _inputs(tokens=70, device="cpu")
-    cumulative_gate = chunk_cumsum_ref(gate, 64)
-
     output, state = recurrent_kda(q, k, v, gate, beta, output_final_state=True, impl="reference")
     chunk_output, chunk_state = chunk_kda(
-        q, k, v, cumulative_gate, beta, output_final_state=True, impl="reference"
+        q, k, v, gate, beta, output_final_state=True, impl="reference"
     )
     for tensor in (output, state, chunk_output, chunk_state):
         assert tensor.device.type == "cpu"
@@ -138,15 +135,11 @@ def test_recurrent_reference_is_differentiable():
 
 @pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
 def test_chunk_reference_matches_fused():
-    """Agree across implementations through the cumulative-gate contract."""
+    """Agree across implementations through the per-token gate contract."""
     q, k, v, gate, beta = _inputs(tokens=100, head_dim=128, dtype=torch.bfloat16, seed=2)
-    cumulative_gate = chunk_cumsum_ref(gate, 64)
-
-    fused, fused_state = chunk_kda(
-        q, k, v, cumulative_gate, beta, output_final_state=True, impl="fused"
-    )
+    fused, fused_state = chunk_kda(q, k, v, gate, beta, output_final_state=True, impl="fused")
     reference, reference_state = chunk_kda(
-        q, k, v, cumulative_gate, beta, output_final_state=True, impl="reference"
+        q, k, v, gate, beta, output_final_state=True, impl="reference"
     )
     assert reference.dtype == q.dtype and reference_state.dtype == torch.float32
     torch.testing.assert_close(fused.float(), reference.float(), rtol=2e-2, atol=2e-2)
@@ -158,13 +151,11 @@ def test_chunk_reference_packed_matches_fused():
     """Match the fused ragged path per sequence, including empty slots."""
     q, k, v, gate, beta = _inputs(batch=1, tokens=150, head_dim=128, dtype=torch.bfloat16, seed=3)
     cu_seqlens = torch.tensor([0, 0, 70, 150], device="cuda", dtype=torch.int32)
-    cumulative_gate = chunk_cumsum_ref(gate, 64, cu_seqlens=cu_seqlens)
-
     fused, fused_state = chunk_kda(
         q,
         k,
         v,
-        cumulative_gate,
+        gate,
         beta,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
@@ -174,7 +165,7 @@ def test_chunk_reference_packed_matches_fused():
         q,
         k,
         v,
-        cumulative_gate,
+        gate,
         beta,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
@@ -187,34 +178,27 @@ def test_chunk_reference_packed_matches_fused():
 def test_chunk_reference_supports_any_head_dim():
     """Lift the fused K=V=128 constraint without changing the contract."""
     q, k, v, gate, beta = _inputs(tokens=70, head_dim=48, seed=4)
-    cumulative_gate = chunk_cumsum_ref(gate, 64)
-
-    output, state = chunk_kda(
-        q, k, v, cumulative_gate, beta, output_final_state=True, impl="reference"
-    )
+    output, state = chunk_kda(q, k, v, gate, beta, output_final_state=True, impl="reference")
     assert output.shape == v.shape and state.shape == (2, 2, 48, 48)
     with pytest.raises(ValueError, match="128"):
-        chunk_kda(q, k, v, cumulative_gate, beta, impl="fused")
+        chunk_kda(q, k, v, gate, beta, impl="fused")
 
 
 def test_chunk_reference_rejects_fastmath():
     """Keep fused-only knobs from silently changing meaning."""
     q, k, v, gate, beta = _inputs(tokens=8)
     with pytest.raises(ValueError, match="fastmath"):
-        chunk_kda(q, k, v, chunk_cumsum_ref(gate, 64), beta, fastmath=True, impl="reference")
+        chunk_kda(q, k, v, gate, beta, fastmath=True, impl="reference")
 
 
 @pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
 def test_chunk_autotune_flag_is_deterministic_and_accurate():
     """autotune=False pins fixed heuristic configs without changing the math contract."""
     q, k, v, gate, beta = _inputs(tokens=128, head_dim=128, dtype=torch.bfloat16, seed=5)
-    cumulative_gate = chunk_cumsum_ref(gate, 64)
     q, v = q.requires_grad_(), v.requires_grad_()
 
     def run():
-        output, state = chunk_kda(
-            q, k, v, cumulative_gate, beta, output_final_state=True, autotune=False
-        )
+        output, state = chunk_kda(q, k, v, gate, beta, output_final_state=True, autotune=False)
         grads = torch.autograd.grad(output.float().square().mean() + state.square().mean(), (q, v))
         return output, state, *grads
 
@@ -224,7 +208,7 @@ def test_chunk_autotune_flag_is_deterministic_and_accurate():
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     tuned_output, tuned_state = chunk_kda(
-        q.detach(), k, v.detach(), cumulative_gate, beta, output_final_state=True
+        q.detach(), k, v.detach(), gate, beta, output_final_state=True
     )
     torch.testing.assert_close(first[0], tuned_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(first[1], tuned_state, rtol=2e-2, atol=2e-2)
@@ -237,11 +221,11 @@ def test_reference_stays_fp32_under_autocast():
         output, state = recurrent_kda(
             q, k, v, gate, beta, output_final_state=True, impl="reference"
         )
-        chunk_output, _ = chunk_kda(q, k, v, chunk_cumsum_ref(gate, 64), beta, impl="reference")
+        chunk_output, _ = chunk_kda(q, k, v, gate, beta, impl="reference")
     expected, expected_state = recurrent_kda(
         q, k, v, gate, beta, output_final_state=True, impl="reference"
     )
-    chunk_expected, _ = chunk_kda(q, k, v, chunk_cumsum_ref(gate, 64), beta, impl="reference")
+    chunk_expected, _ = chunk_kda(q, k, v, gate, beta, impl="reference")
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
     torch.testing.assert_close(chunk_output, chunk_expected, rtol=0, atol=0)

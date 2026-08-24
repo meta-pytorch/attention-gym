@@ -183,6 +183,45 @@ Registration must exist before graph capture. Keep registration deterministic an
 not rely on registration side effects occurring inside a compiled region. Continue importing
 optional kernel dependencies lazily.
 
+## CuTeDSL layout and alignment contracts
+
+Expose the weakest layout contract the kernel actually needs. Do not require full contiguity when
+only one mode must be contiguous, and do not treat alignment as a runtime repair mechanism:
+`assumed_align` is a promise to codegen that may enable wide loads.
+
+Use the shared helpers in `attn_gym._backends.cute`:
+
+- `tensor_supports_contiguous_dim(tensor, dim=-1, alignment_bytes=...)` checks that one mode has
+  stride 1 and that every slice origin satisfies the promised byte alignment;
+- `make_fake_strided_tensor(dtype, shape, contiguous_dim=-1, ...)` creates the matching TVM-FFI
+  fake signature with dynamic other strides and honest minimum alignment;
+- `tensor_supports_tma(tensor)` is the 16-byte CUDA/TMA specialization of the same predicate;
+- `requires_int64_abi(...)` still selects the independent wide-stride/address specialization.
+
+Prefer two measured signatures when vectorization needs stronger assumptions:
+
+1. a compact/aligned fast signature advertising the vector width;
+2. a general signature with the required contiguous mode, dynamic outer strides, and only
+   element-size alignment.
+
+Normalize only unsupported layouts. A noncontiguous required mode may need a compact copy, but an
+outer-strided or misaligned tensor belongs on the general signature if the generated loads are safe.
+Note that `.contiguous()` returns an already-contiguous tensor unchanged and therefore does not fix
+a misaligned storage offset.
+
+For every new CuTe tensor ABI, test:
+
+- compact aligned input selects the fast path;
+- arbitrary aligned outer strides with the required contiguous mode;
+- a noncontiguous required mode and its documented fallback or rejection;
+- contiguous storage with a deliberately misaligned offset;
+- partial logical tiles (odd token counts and non-divisible head/channel groups);
+- every supported dtype, fake/opcheck, dynamic fullgraph reuse, and forced-int64 equivalence.
+
+Express views through native slicing and `local_tile`/partition algebra. Reconstruct a tensor from
+`.iterator` only for a deliberate storage reinterpretation such as a TMA mode permutation, and
+explain that contract at the call site.
+
 ### Mutation and aliasing
 
 Declare every mutated argument in the schema string:

@@ -17,6 +17,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
     chunk_kda_fwd_inter_solve_ragged_cute,
@@ -25,7 +26,6 @@ from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
-from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE
 
 
 def chunk_kda_fwd_intra(

@@ -25,6 +25,11 @@ from torch._inductor.utils import do_bench_using_profiling
 Tensor = torch.Tensor
 
 
+def ceildiv(number: int, divisor: int) -> int:
+    """Return ``ceil(number / divisor)`` using integer or symbolic arithmetic."""
+    return -(number // -divisor)
+
+
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench_using_profiling"""
     no_args = lambda: func(*args, **kwargs)

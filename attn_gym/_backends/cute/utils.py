@@ -12,11 +12,6 @@ _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 TMA_ALIGNMENT_BYTES = 16
 
 
-def ceildiv(number: int, divisor: int) -> int:
-    """Return ``ceil(number / divisor)`` using integer arithmetic."""
-    return -(number // -divisor)
-
-
 def _contains_torch_tensor(value: Any) -> bool:
     if isinstance(value, torch.Tensor):
         return True
@@ -56,22 +51,82 @@ def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
     return False
 
 
-def tensor_supports_tma(tensor: torch.Tensor) -> bool:
-    """Return whether a CUDA tensor has a TMA-compatible aligned strided layout.
+def tensor_supports_contiguous_dim(
+    tensor: torch.Tensor,
+    *,
+    dim: int = -1,
+    alignment_bytes: int = 1,
+) -> bool:
+    """Return whether one tensor mode is contiguous with aligned slice origins.
 
-    The innermost dimension must be contiguous. The base pointer and every outer stride,
-    measured in bytes, must satisfy ``TMA_ALIGNMENT_BYTES``.
+    ``alignment_bytes`` applies to the base pointer and every other mode's stride in
+    bytes, so every slice along ``dim`` starts at that alignment. Use element-size
+    alignment for the general scalar/gather path and a vector width such as 16 for a
+    vectorized specialization.
     """
-    if not tensor.is_cuda:
+    if tensor.ndim == 0 or not -tensor.ndim <= dim < tensor.ndim or not 1 <= alignment_bytes:
         return False
+    dim %= tensor.ndim
     element_size = tensor.element_size()
     return (
-        tensor.ndim > 0
-        and tensor.stride(-1) == 1
-        and tensor.data_ptr() % TMA_ALIGNMENT_BYTES == 0
+        tensor.stride(dim) == 1
+        and tensor.data_ptr() % alignment_bytes == 0
         and all(
-            stride * element_size % TMA_ALIGNMENT_BYTES == 0 for stride in tensor.stride()[:-1]
+            index == dim or stride * element_size % alignment_bytes == 0
+            for index, stride in enumerate(tensor.stride())
         )
+    )
+
+
+def make_fake_strided_tensor(
+    dtype: Any,
+    shape: tuple[Any, ...],
+    *,
+    contiguous_dim: int = -1,
+    stride_divisibility: int = 1,
+    assumed_align: int | None = None,
+    use_int64_strides: bool = True,
+) -> Any:
+    """Create a fake tensor with one contiguous mode and dynamic other strides.
+
+    ``stride_divisibility`` is measured in elements. When ``assumed_align`` is omitted,
+    it is derived from that divisibility and the element width, matching the weakest
+    alignment promised by the dynamic stride layout.
+    """
+    if not shape:
+        raise ValueError("make_fake_strided_tensor requires at least one dimension")
+    if not -len(shape) <= contiguous_dim < len(shape):
+        raise ValueError(f"contiguous_dim is out of range for rank {len(shape)}")
+    if not 1 <= stride_divisibility:
+        raise ValueError("stride_divisibility must be positive")
+    if assumed_align is not None and assumed_align < 1:
+        raise ValueError("assumed_align must be positive")
+    contiguous_dim %= len(shape)
+    from cutlass import cute
+
+    sym_int = cute.sym_int64 if use_int64_strides else cute.sym_int
+    strides = tuple(
+        1 if index == contiguous_dim else sym_int(divisibility=stride_divisibility)
+        for index in range(len(shape))
+    )
+    if assumed_align is None:
+        alignment_bits = stride_divisibility * dtype.width
+        if alignment_bits % 8:
+            raise ValueError("sub-byte fake tensors require an explicit assumed_align")
+        assumed_align = max(1, alignment_bits // 8)
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=strides,
+        assumed_align=assumed_align,
+    )
+
+
+def tensor_supports_tma(tensor: torch.Tensor) -> bool:
+    """Return whether a CUDA tensor has a TMA-compatible aligned row layout."""
+    return tensor.is_cuda and tensor_supports_contiguous_dim(
+        tensor,
+        alignment_bytes=TMA_ALIGNMENT_BYTES,
     )
 
 
@@ -119,8 +174,9 @@ def compile_tvm_ffi(
 
 __all__ = [
     "TMA_ALIGNMENT_BYTES",
-    "ceildiv",
     "compile_tvm_ffi",
     "get_device_properties",
+    "make_fake_strided_tensor",
+    "tensor_supports_contiguous_dim",
     "tensor_supports_tma",
 ]

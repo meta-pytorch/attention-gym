@@ -138,7 +138,7 @@ def _naive_chunk_kda_step(
     return output, state
 
 
-def naive_chunk_kda_from_cumulative(
+def _naive_chunk_kda_from_cumulative(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -260,7 +260,7 @@ def naive_chunk_kda(
     exponents cannot overflow.
     """
     cumulative_g = chunk_cumsum_ref(g.float(), chunk_size)
-    return naive_chunk_kda_from_cumulative(
+    return _naive_chunk_kda_from_cumulative(
         q,
         k,
         v,
@@ -342,115 +342,10 @@ def chunk_cumsum_ref(
     return out * scale if scale is not None else out
 
 
-def _gate_map(z: torch.Tensor, A: torch.Tensor, lower_bound: float | None) -> torch.Tensor:
-    """KDA gate ``-A*softplus(z)`` or lower-bounded ``lb*sigmoid(A*z)``; ``A = exp(A_log)``."""
-    if lower_bound is None:
-        return -A * F.softplus(z)
-    return lower_bound * torch.sigmoid(A * z)
-
-
-def gate_fwd_ref(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor | None,
-    lower_bound: float | None,
-    scale: float | None,
-    reverse: bool,
-    chunk_size: int,
-    cu_seqlens: torch.Tensor | None,
-) -> torch.Tensor:
-    """Reference KDA gate map followed by a chunk-local cumulative sum.
-
-    The shipped optimized gate uses a required bias, finite lower bound, forward scan, and
-    dense or scheduler-routed ragged inputs. A missing bias or lower bound and reverse scans
-    remain reference-only modes. The ``scale`` argument expresses the optimized path's fixed
-    log2(e) post-scan scale; other values are reference-only. Gate math runs in fp32 (or fp64
-    when ``g`` is fp64).
-
-    Args:
-        g: raw gate input; shape ``(B, T, H, S)``.
-        A_log: per-head log-magnitude, ``A = exp(A_log)``; shape ``(H,)``.
-        dt_bias: optional per-(head, channel) bias added to ``g``; shape ``(H, S)``.
-        lower_bound: if None, gate is ``-A*softplus(g)``; else ``lower_bound*sigmoid(A*g)``.
-        scale: optional multiplier applied to the cumsum output.
-        reverse: reverse the chunk-local cumsum.
-        chunk_size: cumsum chunk length.
-        cu_seqlens: optional int32 varlen document offsets.
-    """
-    dtype = torch.promote_types(g.dtype, torch.float32)
-    z = g.to(dtype)
-    if dt_bias is not None:
-        z = z + dt_bias.to(dtype)  # (H, S) broadcasts over (B, T, H, S)
-    gate = _gate_map(z, A_log.to(dtype).exp().view(1, 1, -1, 1), lower_bound)
-    return chunk_cumsum_ref(gate, chunk_size, reverse, scale, cu_seqlens)
-
-
-def fused_gate_bwd_ref(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    d_cumulative: torch.Tensor,
-    lower_bound: float,
-    scale: float,
-    chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Differentiate the bounded gate map and its chunk-local prefix sum.
-
-    This is the reference for the fused KDA backward helper. The adjoint of a
-    forward prefix sum is a reverse prefix sum, so ``d_cumulative`` is scanned
-    in reverse before applying the pointwise gate derivative.
-    """
-    d_gate = chunk_cumsum_ref(
-        d_cumulative,
-        chunk_size,
-        reverse=True,
-        scale=scale,
-    )
-    dg, dA_log, d_bias = gate_bwd_ref(g, A_log, dt_bias, d_gate, lower_bound)
-    assert d_bias is not None
-    return dg, dA_log, d_bias
-
-
-def gate_bwd_ref(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor | None,
-    dyg: torch.Tensor,
-    lower_bound: float | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Gradients of the pointwise gate map (no cumsum) w.r.t. ``g``, ``A_log``, ``dt_bias``.
-
-    This reference differentiates the forward map in fp32 (or fp64 when ``g`` is fp64).
-    A missing bias or lower bound is a reference-only mode; optimized dense and ragged KDA
-    backward implement the bounded, biased contract.
-
-    Args:
-        g: raw gate input; shape ``(B, T, H, S)``.
-        A_log: per-head log-magnitude, ``A = exp(A_log)``; shape ``(H,)``.
-        dt_bias: optional per-(head, channel) bias added to ``g``; shape ``(H, S)``.
-        dyg: upstream gradient w.r.t. the gate map output; shape ``(B, T, H, S)``.
-        lower_bound: selects the gate variant (see :func:`gate_fwd_ref`).
-
-    Returns:
-        Gradients ``(dg, dA_log, dt_bias)``; the last is None when ``dt_bias`` is None.
-    """
-    dtype = torch.promote_types(g.dtype, torch.float32)
-    gg = g.to(dtype).detach().requires_grad_()
-    aa = A_log.to(dtype).detach().requires_grad_()
-    bb = dt_bias.to(dtype).detach().requires_grad_() if dt_bias is not None else None
-    z = gg if bb is None else gg + bb
-    _gate_map(z, aa.exp().view(1, 1, -1, 1), lower_bound).backward(dyg.to(dtype))
-    return gg.grad, aa.grad, (bb.grad if bb is not None else None)
-
-
 __all__ = [
     "chunk_cumsum_ref",
-    "fused_gate_bwd_ref",
-    "gate_bwd_ref",
-    "gate_fwd_ref",
     "l2norm_bwd_ref",
     "l2norm_fwd_ref",
     "naive_chunk_kda",
-    "naive_chunk_kda_from_cumulative",
     "naive_recurrent_kda",
 ]

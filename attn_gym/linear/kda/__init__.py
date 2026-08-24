@@ -14,6 +14,8 @@ lazily on first fused call, and the naive oracles in
 import importlib
 
 from attn_gym.linear.kda.api import chunk_kda, recurrent_kda
+from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
+from attn_gym.linear.kda.gate import bound_gate
 from attn_gym.linear.kda.masking import (
     active_token_mask,
     mask_inactive_token_gradients,
@@ -22,7 +24,6 @@ from attn_gym.linear.kda.masking import (
 
 # Note: Lazy Imports (see attn_gym/linear/__init__.py)
 _BACKEND_EXPORTS = {
-    "bounded_gate_cumsum": "attn_gym.linear.kda.fwd.triton.gate_fwd",
     "causal_conv1d": "attn_gym.linear.kda.short_conv",
     "causal_conv1d_decode": "attn_gym.linear.kda.short_conv",
     "l2norm": "attn_gym.linear.kda.fwd.triton.l2norm_fwd",
@@ -47,7 +48,9 @@ def __getattr__(name: str):
 
 __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
     [
+        "MAX_GATE_LOWER_BOUND_MAGNITUDE",
         "active_token_mask",
+        "bound_gate",
         "chunk_kda",
         "mask_inactive_token_gradients",
         "mask_inactive_tokens",

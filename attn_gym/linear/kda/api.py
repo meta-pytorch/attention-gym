@@ -16,9 +16,10 @@ from functools import partial
 
 import torch
 
+from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.reference import reference_kda
-from attn_gym.linear.kda.naive import naive_chunk_kda_from_cumulative, naive_recurrent_kda
+from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import validate_kda_inputs
 from attn_gym.linear.types import Impl, resolve_impl
@@ -30,7 +31,7 @@ def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cumulative_gate: torch.Tensor,
+    gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None = None,
     *,
@@ -46,9 +47,13 @@ def chunk_kda(
         q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
-        cumulative_gate: Inclusive cumulative log2 decay within each 64-token
-            chunk, shaped like ``q`` and produced by
-            ``bounded_gate_cumsum(chunk_size=64)``.
+        gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
+            each token the previous state is multiplied channelwise by ``exp(gate)``.
+            Pass per-token values, not cumulative gates; chunking and log-base conversion
+            are internal. The fused chunk implementation requires values to remain in
+            approximately ``[-5.914, 0]`` for its FP32 intra-chunk rebase; this
+            implementation limit is not shared by reference or recurrent execution and
+            is documented rather than checked with a runtime tensor reduction.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, K, V]`` entry per
             logical sequence.
@@ -77,19 +82,19 @@ def chunk_kda(
         q,
         k,
         v,
-        cumulative_gate,
+        gate,
         beta,
         initial_state,
         cu_seqlens,
         op_name="chunk_kda",
-        gate_name="cumulative_gate",
+        gate_name="gate",
     )
     if selected_impl is Impl.FUSED:
         return _fused_chunk_forward(
             q,
             k,
             v,
-            cumulative_gate,
+            gate,
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
@@ -98,11 +103,11 @@ def chunk_kda(
             autotune=autotune,
         )
     return reference_kda(
-        partial(naive_chunk_kda_from_cumulative, chunk_size=_CHUNK_SIZE),
+        partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE),
         q,
         k,
         v,
-        cumulative_gate,
+        gate.float() * LOG2_E,
         beta,
         initial_state,
         cu_seqlens,
@@ -169,9 +174,10 @@ def recurrent_kda(
         q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
-        gate: Per-token log2 decay shaped like ``q``, as produced by
-            ``bounded_gate_cumsum(chunk_size=1)``; do not pass chunk-cumulative
-            gates.
+        gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
+            each token the previous state is multiplied channelwise by ``exp(gate)``.
+            Use the same non-cumulative representation for chunked and recurrent
+            execution; recurrent execution has no chunk-rebase lower limit.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, K, V]`` entry per
             logical sequence.
@@ -229,12 +235,13 @@ def recurrent_kda(
         _validate_paged_state(q, v, initial_state, cu_seqlens, state_indices, output_final_state)
         if selected_impl is not Impl.FUSED:
             raise ValueError("state_indices requires impl='fused'")
+    log2_gate = gate.float() * LOG2_E
     if selected_impl is Impl.FUSED:
         return _fused_recurrent_forward(
             q,
             k,
             v,
-            gate,
+            log2_gate,
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
@@ -243,7 +250,15 @@ def recurrent_kda(
             autotune=autotune,
         )
     return reference_kda(
-        naive_recurrent_kda, q, k, v, gate, beta, initial_state, cu_seqlens, output_final_state
+        naive_recurrent_kda,
+        q,
+        k,
+        v,
+        log2_gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        output_final_state,
     )
 
 

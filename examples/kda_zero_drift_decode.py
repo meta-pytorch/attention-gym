@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from attn_gym.linear import bounded_gate_cumsum, chunk_kda, recurrent_kda
+from attn_gym.linear.kda import bound_gate, chunk_kda, recurrent_kda
 
 CHUNK_SIZE = 64
 TOKENS = 256
@@ -75,14 +75,12 @@ def run_chunk(
     output_final_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the training kernel after rebuilding gates for this partial chunk."""
-    cumulative_gate = bounded_gate_cumsum(
-        inputs.raw_gate, inputs.a_log, inputs.dt_bias, chunk_size=CHUNK_SIZE
-    )
+    gate = bound_gate(inputs.raw_gate, inputs.a_log, inputs.dt_bias, impl=impl)
     return chunk_kda(
         inputs.q,
         inputs.k,
         inputs.v,
-        cumulative_gate,
+        gate,
         inputs.beta,
         initial_state,
         output_final_state=output_final_state,
@@ -131,12 +129,8 @@ def main() -> None:
     training_output, _ = run_chunk(inputs, impl)
     replay_output = replay_decode(inputs, impl)
 
-    per_token_gate = bounded_gate_cumsum(
-        inputs.raw_gate, inputs.a_log, inputs.dt_bias, chunk_size=1
-    )
-    recurrent_output, _ = recurrent_kda(
-        inputs.q, inputs.k, inputs.v, per_token_gate, inputs.beta, impl=impl
-    )
+    gate = bound_gate(inputs.raw_gate, inputs.a_log, inputs.dt_bias, impl=impl)
+    recurrent_output, _ = recurrent_kda(inputs.q, inputs.k, inputs.v, gate, inputs.beta, impl=impl)
 
     replay_matches = torch.equal(replay_output, training_output)
     recurrent_drifts = not torch.equal(recurrent_output, training_output)

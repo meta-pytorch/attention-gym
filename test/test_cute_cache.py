@@ -17,7 +17,8 @@ from attn_gym._backends.cute import cache as cute_cache
 from attn_gym._backends.cute import compile as cute_compile
 from attn_gym._backends.cute import target as cute_target
 from attn_gym._backends.cute.tune import benchmark_gpu, run_tunable, tune
-from attn_gym._backends.cute.utils import ceildiv, compile_tvm_ffi
+from attn_gym._backends.cute.utils import compile_tvm_ffi
+from attn_gym.utils import ceildiv
 
 _DRIVER_LOG_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_LOG"
 _DRIVER_READY_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_READY"

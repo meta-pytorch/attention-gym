@@ -32,6 +32,7 @@ from attn_gym.linear.kda.chunk_schedule import (
     validate_schedule_request,
 )
 from attn_gym.linear.kda.chunk_scheduler import GridScheduler
+from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
 )
@@ -39,7 +40,6 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_k4b_inverse_cutedsl import (
     ChunkKDAFwdK4bInverseCuteDSL,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
-from attn_gym.linear.kda.utils import DEFAULT_CHUNK_SIZE
 
 _SUPPORTED_HEAD_DIM = 128
 _SUPPORTED_CHUNK_SIZE = 64

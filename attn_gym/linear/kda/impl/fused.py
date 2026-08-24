@@ -5,11 +5,9 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym.linear.kda.chunk_schedule import (
-    RaggedChunkMetadata,
-    prepare_ragged_chunk_metadata,
-)
+from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.ops import (
+    _plain_gate_scan_op,
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
     chunk_fwd_op,
@@ -41,7 +39,7 @@ class _ChunkKDA(torch.autograd.Function):
         q,
         k,
         v,
-        cumulative_gate,
+        gate,
         beta,
         initial_state,
         cu_seqlens,
@@ -50,6 +48,12 @@ class _ChunkKDA(torch.autograd.Function):
         fastmath,
         autotune,
     ):
+        cumulative_gate = _plain_gate_scan_op(
+            gate,
+            cu_seqlens,
+            chunk_offsets,
+            False,
+        )
         if cu_seqlens is None:
             assert chunk_offsets is None
             if output_final_state:
@@ -137,46 +141,48 @@ class _ChunkKDA(torch.autograd.Function):
             ctx.autotune,
         )
         if initial_state is not None:
-            dq, dk, dv, dg, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
+            dq, dk, dv, d_cumulative, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
         else:
-            dq, dk, dv, dg, db = chunk_bwd_op(*args)
+            dq, dk, dv, d_cumulative, db = chunk_bwd_op(*args)
             d_initial_state = None
-        return dq, dk, dv, dg, db, d_initial_state, None, None, None, None, None
+        d_gate = _plain_gate_scan_op(
+            d_cumulative,
+            cu_seqlens,
+            chunk_offsets,
+            True,
+        )
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
 
 
 def chunk_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cumulative_gate: torch.Tensor,
+    gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
-    metadata: RaggedChunkMetadata | None = None,
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Normalize inputs and invoke the registered fused chunk operators."""
-    if metadata is not None:
-        assert cu_seqlens is None
-        metadata.validate_chunk_size(_CHUNK_SIZE)
-        cu_seqlens = metadata.cu_seqlens
+    """Normalize per-token natural-log gates and invoke the fused chunk operators."""
     _validate_fused_constraints(q, v)
     output_dtype = q.dtype
     output_shape = q.shape
     q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
-    cumulative_gate = cumulative_gate.float().contiguous()
+    gate = gate.float()
     beta = beta.float().contiguous()
     batch, tokens, heads, head_dim = output_shape
-    if cu_seqlens is not None and metadata is None:
-        metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, _CHUNK_SIZE)
+    metadata = (
+        prepare_ragged_chunk_metadata(cu_seqlens, tokens, _CHUNK_SIZE)
+        if cu_seqlens is not None
+        else None
+    )
     if metadata is None and (batch != 1 or tokens % _CHUNK_SIZE != 0):
         packed_shape = (1, batch * tokens, heads, head_dim)
-        q, k, v, cumulative_gate = (
-            tensor.reshape(packed_shape) for tensor in (q, k, v, cumulative_gate)
-        )
+        q, k, v, gate = (tensor.reshape(packed_shape) for tensor in (q, k, v, gate))
         beta = beta.reshape(packed_shape[:3])
         cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
@@ -189,7 +195,7 @@ def chunk_forward(
             q,
             k,
             v,
-            cumulative_gate,
+            gate,
             beta,
             initial_state,
             cu_seqlens,
@@ -203,7 +209,7 @@ def chunk_forward(
             q,
             k,
             v,
-            cumulative_gate,
+            gate,
             beta,
             initial_state,
             cu_seqlens,
