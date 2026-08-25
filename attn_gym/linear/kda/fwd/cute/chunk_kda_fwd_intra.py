@@ -22,7 +22,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
     chunk_kda_fwd_inter_solve_ragged_cute,
 )
-from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd_cute_bf16
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
@@ -107,7 +107,7 @@ def chunk_kda_fwd_intra(
         if profile_ranges
         else nullcontext()
     ):
-        w, u, _qg, kg = recompute_w_u_fwd(
+        w, u, _qg, kg = recompute_w_u_fwd_cute_bf16(
             autotune=autotune,
             k=k,
             v=v,

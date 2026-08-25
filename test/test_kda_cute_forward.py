@@ -532,7 +532,6 @@ def test_kda_offset_width_specializations_match(monkeypatch):
         "attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop",
         "attn_gym.linear.kda.fwd.triton.chunk_delta_h",
         "attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o",
-        "attn_gym.linear.kda.fwd.triton.recompute_w_u",
         "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav",
     ):
         module = importlib.import_module(module_name)

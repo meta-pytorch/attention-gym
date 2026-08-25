@@ -6,16 +6,12 @@
 #
 # CuTe DSL implementation of recompute_w_u_fwd (SM100 / Blackwell).
 #
-# TODO: at chunk_size=64 this tcgen05/UMMA kernel is memory-bound and its
-# operand staging (cp.async -> CVT -> swizzled SMEM -> UMMA) costs ~40% of its
-# runtime, so the register-operand Triton kernel in fwd/triton/recompute_w_u.py
-# now serves the ENTIRE public contract (all dot_precision modes and grouped
-# value heads); this kernel is unreachable from the public API and only tests
-# call `_recompute_w_u_fwd_cute` to keep it compiling. It is kept solely
-# because warp-MMA register pressure collapses at larger chunk sizes (register
-# accumulators scale with BT x K: measured ~70x cliff at BT=256; evidence in
-# PR #311) and TMEM accumulation becomes necessary there. If chunk_size never
-# grows past 64, delete this file.
+# The composed BF16 KDA core uses this kernel for its fixed BT=64 contract.
+# Production specializations minimize their shared-memory footprint: no-Q omits
+# Q storage and right-sizes BF16 A, while Q-enabled execution reuses the consumed
+# Q tile for later A staging/MMA operands. Both fit two CTAs per GB200 SM. The
+# checked standalone wrapper retains all precision/grouped-head modes; the Triton
+# implementation remains an independent comparison path.
 #
 # This is the narrow production CuTe path for varlen B=1 full chunks:
 # BT=64 and head_dim K=V=128. It recomputes:
@@ -66,6 +62,8 @@
 # requires eager-evaluated annotations.
 
 import enum
+import functools
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -77,8 +75,9 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
+from attn_gym._backends.cute.target import CompileTarget, get_compile_target
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
@@ -267,30 +266,24 @@ def _make_input_tiles(
 
 
 @cute.jit
-def _copy_input_tiles(
+def _copy_kvqg_tiles(
     tiled_copy_bf16: cute.TiledCopy,
     tiled_copy_fp32_kv: cute.TiledCopy,
-    tiled_copy_a: cute.TiledCopy,
     thr_copy_bf16: cute.TiledCopy,
     thr_copy_fp32_kv: cute.TiledCopy,
-    thr_copy_a: cute.TiledCopy,
     gK_tile: cute.Tensor,
     gV_tile: cute.Tensor,
     gQ_tile: cute.Tensor | None,
     gG_tile: cute.Tensor | None,
-    gA_tile: cute.Tensor,
     sK_stage: cute.Tensor,
     sV_stage: cute.Tensor,
-    sQ_stage: cute.Tensor,
+    sQ_stage: cute.Tensor | None,
     sG_stage: cute.Tensor,
-    sA_stage: cute.Tensor,
     valid: Int32,
     has_q: Constexpr,
     has_gk: Constexpr,
 ):
     cKV = cute.make_identity_tensor((BT, KEY_DIM))
-    cA = cute.make_identity_tensor((BT, BT))
-
     if valid >= BT:
         cute.copy(
             tiled_copy_bf16,
@@ -314,12 +307,6 @@ def _copy_input_tiles(
                 thr_copy_fp32_kv.partition_S(gG_tile),
                 thr_copy_fp32_kv.partition_D(sG_stage),
             )
-        cute.arch.cp_async_commit_group()
-        cute.copy(
-            tiled_copy_a,
-            thr_copy_a.partition_S(gA_tile),
-            thr_copy_a.partition_D(sA_stage),
-        )
     else:
         pred_bf16 = _predicate_valid(thr_copy_bf16.partition_S(cKV), valid, check_cols=False)
         cute.copy(
@@ -349,7 +336,25 @@ def _copy_input_tiles(
                 thr_copy_fp32_kv.partition_D(sG_stage),
                 pred=pred_g,
             )
-        cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_commit_group()
+
+
+@cute.jit
+def _copy_a_tile(
+    tiled_copy_a: cute.TiledCopy,
+    thr_copy_a: cute.TiledCopy,
+    gA_tile: cute.Tensor,
+    sA_stage: cute.Tensor,
+    valid: Int32,
+):
+    if valid >= BT:
+        cute.copy(
+            tiled_copy_a,
+            thr_copy_a.partition_S(gA_tile),
+            thr_copy_a.partition_D(sA_stage),
+        )
+    else:
+        cA = cute.make_identity_tensor((BT, BT))
         pred_a = _predicate_valid(thr_copy_a.partition_S(cA), valid, check_cols=True)
         cute.copy(
             tiled_copy_a,
@@ -435,6 +440,50 @@ class SharedStorage:
     sBeta_staging: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, BT], 128]
 
 
+@cute.struct
+class SharedStorageNoQBF16:
+    """Two-CTA-resident storage for the production no-Q, BF16-A specialization."""
+
+    ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, AB_STAGES * 2]
+    acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ACC_STAGE * 2]
+    tmem_holding_buf: cutlass.Int32
+    sK_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * KEY_DIM], 128]
+    sV_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * VAL_DIM], 128]
+    sG_staging: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, BT * KEY_DIM], 128]
+    sA_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * BT], 128]
+    sBeta_staging: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, BT], 128]
+
+
+@cute.struct
+class SharedStorageQAliasBF16:
+    """Two-CTA-resident storage that reuses staged Q for the later A operands."""
+
+    ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, AB_STAGES * 2]
+    acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ACC_STAGE * 2]
+    tmem_holding_buf: cutlass.Int32
+    sK_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * KEY_DIM], 128]
+    sV_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * VAL_DIM], 128]
+    sQ_staging: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, BT * KEY_DIM], 128]
+    sG_staging: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, BT * KEY_DIM], 128]
+    sBeta_staging: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, BT], 128]
+
+
+_A_TILE_ELEMENTS = BT * BT
+_BF16_A_TILE_BYTES = _A_TILE_ELEMENTS * IO_DTYPE.width // 8
+_BF16_B_TILES_BYTES = BT * (KEY_DIM + VAL_DIM) * IO_DTYPE.width // 8
+_PRODUCTION_DYNAMIC_SMEM_BYTES = 115_072
+_SM100_TWO_CTA_SMEM_BUDGET = 233_472 // 2
+assert BT * KEY_DIM == 2 * _A_TILE_ELEMENTS
+assert (
+    SharedStorageNoQBF16.size_in_bytes() + _BF16_A_TILE_BYTES + _BF16_B_TILES_BYTES
+    == _PRODUCTION_DYNAMIC_SMEM_BYTES
+)
+assert (
+    SharedStorageQAliasBF16.size_in_bytes() + _BF16_B_TILES_BYTES == _PRODUCTION_DYNAMIC_SMEM_BYTES
+)
+assert _PRODUCTION_DYNAMIC_SMEM_BYTES <= _SM100_TWO_CTA_SMEM_BUDGET
+
+
 # ============================================================================
 # Kernel
 # ============================================================================
@@ -485,6 +534,16 @@ def _kernel_varlen_b1_full_chunk(
     # (kind::tf32, K-inst 8). The accumulator is fp32 either way.
     mma_dtype: Constexpr = cutlass.BFloat16 if mma_is_bf16 else MMA_DTYPE
     mma_k_inst: Constexpr = MMA_K_INST_BF16 if mma_is_bf16 else MMA_K_INST
+    alias_q_a: Constexpr = has_q and not a_is_fp32 and mma_is_bf16
+    if cutlass.const_expr(alias_q_a):
+        assert cute.cosize(a_smem_layout.outer) == _A_TILE_ELEMENTS
+    shared_storage_type: Constexpr = (
+        SharedStorageQAliasBF16
+        if alias_q_a
+        else SharedStorageNoQBF16
+        if not has_q and not a_is_fp32
+        else SharedStorage
+    )
 
     # CVT scatter geometry: each thread reads/writes CVT_VEC contiguous elements
     # per row. CVT_VEC stays 4 for BOTH precisions on purpose. The (8 x 32)
@@ -526,7 +585,7 @@ def _kernel_varlen_b1_full_chunk(
 
         # ---- 2. SMEM allocation ----
         smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        storage = smem.allocate(shared_storage_type)
         route = cute.make_tensor(
             cute.recast_ptr(storage.ab_mbar_ptr.data_ptr(), dtype=Int32),
             cute.make_layout(2),
@@ -534,12 +593,20 @@ def _kernel_varlen_b1_full_chunk(
 
         # MMA-ready swizzled SMEM for A and B operands.
         # A is shared by both MMAs; B is split into KB (for W) and VB (for U).
-        sA_mma = smem.allocate_tensor(
-            element_type=mma_dtype,
-            layout=a_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=a_smem_layout.inner,
-        )
+        if cutlass.const_expr(alias_q_a):
+            sA_mma_ptr = cute.recast_ptr(
+                storage.sQ_staging.data_ptr() + _A_TILE_ELEMENTS,
+                a_smem_layout.inner,
+                dtype=mma_dtype,
+            )
+            sA_mma = cute.make_tensor(sA_mma_ptr, a_smem_layout.outer)
+        else:
+            sA_mma = smem.allocate_tensor(
+                element_type=mma_dtype,
+                layout=a_smem_layout.outer,
+                byte_alignment=128,
+                swizzle=a_smem_layout.inner,
+            )
         sKb_mma = smem.allocate_tensor(
             element_type=mma_dtype,
             layout=b_smem_layout.outer,
@@ -593,24 +660,32 @@ def _kernel_varlen_b1_full_chunk(
             storage.sV_staging.data_ptr(),
             cute.make_layout((BT, VAL_DIM), stride=(VAL_DIM, 1)),
         )
-        sQ_stage = cute.make_tensor(
-            storage.sQ_staging.data_ptr(),
-            cute.make_layout((BT, KEY_DIM), stride=(KEY_DIM, 1)),
-        )
+        if cutlass.const_expr(has_q):
+            sQ_stage = cute.make_tensor(
+                storage.sQ_staging.data_ptr(),
+                cute.make_layout((BT, KEY_DIM), stride=(KEY_DIM, 1)),
+            )
+        else:
+            sQ_stage = None
         sG_stage = cute.make_tensor(
             storage.sG_staging.data_ptr(),
             cute.make_layout((BT, KEY_DIM), stride=(KEY_DIM, 1)),
         )
-        # sA_staging is allocated as fp32 (max size). For bf16 A, reinterpret
-        # the pointer as bf16 — uses the same memory, half the elements.
+        # FP32 A owns the generic max-sized tile. BF16 A either owns a right-sized
+        # tile (no Q) or reuses the first half of consumed Q storage.
         if cutlass.const_expr(a_is_fp32):
             sA_stage = cute.make_tensor(
                 storage.sA_staging.data_ptr(),
                 cute.make_layout((BT, BT), stride=(BT, 1)),
             )
         else:
+            sA_ptr = (
+                storage.sQ_staging.data_ptr()
+                if cutlass.const_expr(alias_q_a)
+                else cute.recast_ptr(storage.sA_staging.data_ptr(), dtype=cutlass.BFloat16)
+            )
             sA_stage = cute.make_tensor(
-                cute.recast_ptr(storage.sA_staging.data_ptr(), dtype=cutlass.BFloat16),
+                sA_ptr,
                 cute.make_layout((BT, BT), stride=(BT, 1)),
             )
         sBeta_stage = cute.make_tensor(storage.sBeta_staging.data_ptr(), cute.make_layout(BT))
@@ -704,27 +779,25 @@ def _kernel_varlen_b1_full_chunk(
                 has_q,
                 has_gk,
             )
-            _copy_input_tiles(
+            _copy_kvqg_tiles(
                 tiled_copy_bf16,
                 tiled_copy_fp32_kv,
-                tiled_copy_a,
                 thr_copy_bf16,
                 thr_copy_fp32_kv,
-                thr_copy_a,
                 gK_tile,
                 gV_tile,
                 gQ_tile,
                 gG_tile,
-                gA_tile,
                 sK_stage,
                 sV_stage,
                 sQ_stage,
                 sG_stage,
-                sA_stage,
                 valid,
                 has_q,
                 has_gk,
             )
+            if cutlass.const_expr(not alias_q_a):
+                _copy_a_tile(tiled_copy_a, thr_copy_a, gA_tile, sA_stage, valid)
 
             # Stage beta[time_base:time_base+BT, value_head_idx] into SMEM once per chunk.
             # beta staging only depends on gmem mBeta (independent of the K/V/Q/G
@@ -740,8 +813,11 @@ def _kernel_varlen_b1_full_chunk(
                     0, time_base + safe_tidx, value_head_idx
                 ]
 
-            # Wait until only 1 group is in flight — i.e., KVQG done, A may still be loading.
-            cute.arch.cp_async_wait_group(1)
+            # Without the Q/A alias, KVQG is group 1 and A remains in flight as group 0.
+            if cutlass.const_expr(alias_q_a):
+                cute.arch.cp_async_wait_group(0)
+            else:
+                cute.arch.cp_async_wait_group(1)
             cute.arch.barrier()
 
             # ---- 3b. CVT: 256 threads, (CVT_NROW x CVT_NCOL) layout ----
@@ -877,7 +953,14 @@ def _kernel_varlen_b1_full_chunk(
                         )
                         cute.autovec_copy(kg_frag, gKG_slice)
 
-            # Wait for A cp.async (group 0) to complete — was allowed to overlap with KVQG CVT.
+            if cutlass.const_expr(alias_q_a):
+                # Order every generic Q read before cp.async reuses the same storage for A.
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier()
+                _copy_a_tile(tiled_copy_a, thr_copy_a, gA_tile, sA_stage, valid)
+
+            # Wait for A cp.async (group 0) to complete. The ordinary path overlaps it
+            # with KVQG conversion; the alias path issues it after Q consumption.
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
@@ -1326,6 +1409,7 @@ def _compile_recompute_w_u(
     precision: MmaPrecision,
     cu_seqlens_i32: bool,
     ragged: bool,
+    use_int64_offsets: bool,
 ):
     """Compile one persistent recompute specialization from fake tensors."""
     target = get_compile_target()
@@ -1345,11 +1429,12 @@ def _compile_recompute_w_u(
 
     tokens = cute.sym_int() if ragged else cute.sym_int(divisibility=chunk_size)
     tensor_shape = (1, tokens)
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     q = (
         make_fake_tensor(
             IO_DTYPE,
             (*tensor_shape, value_heads, key_dim),
-            stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
+            stride=tuple(sym_int(divisibility=8) for _ in range(3)) + (1,),
             assumed_align=DATA_ALIGN_BYTES,
         )
         if has_q
@@ -1358,13 +1443,13 @@ def _compile_recompute_w_u(
     k = make_fake_tensor(
         IO_DTYPE,
         (*tensor_shape, key_heads, key_dim),
-        stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
+        stride=tuple(sym_int(divisibility=8) for _ in range(3)) + (1,),
         assumed_align=DATA_ALIGN_BYTES,
     )
     v = make_fake_tensor(
         IO_DTYPE,
         (*tensor_shape, value_heads, value_dim),
-        stride=tuple(cute.sym_int(divisibility=8) for _ in range(3)) + (1,),
+        stride=tuple(sym_int(divisibility=8) for _ in range(3)) + (1,),
         assumed_align=DATA_ALIGN_BYTES,
     )
     beta = make_fake_compact_tensor(
@@ -1464,7 +1549,8 @@ def _compile_recompute_w_u(
         name=(
             f"kda_recompute_hk{key_heads}_hv{value_heads}_k{key_dim}_v{value_dim}_"
             f"a{int(a_is_fp32)}_b{int(beta_is_fp32)}_q{int(has_q)}_g{int(has_gk)}_"
-            f"{precision.value}_i{int(cu_seqlens_i32)}_rg{int(ragged)}"
+            f"{precision.value}_i{int(cu_seqlens_i32)}_rg{int(ragged)}_"
+            f"off64{int(use_int64_offsets)}"
         ),
     )
 
@@ -1550,6 +1636,105 @@ def recompute_w_u_fwd(
     )
 
 
+@functools.cache
+def _compile_bf16_recompute_w_u(
+    process_id: int,
+    target: CompileTarget,
+    key_heads: int,
+    value_heads: int,
+    has_q: bool,
+    ragged: bool,
+    use_int64_offsets: bool,
+):
+    """Memoize the production specialization by process and complete compile target."""
+    del process_id
+    assert target == get_compile_target()
+    return _compile_recompute_w_u(
+        BT,
+        key_heads,
+        value_heads,
+        KEY_DIM,
+        VAL_DIM,
+        False,
+        True,
+        has_q,
+        True,
+        MmaPrecision.BF16,
+        True,
+        ragged,
+        use_int64_offsets,
+    )
+
+
+def recompute_w_u_fwd_cute_bf16(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    gk: torch.Tensor,
+    metadata: RaggedChunkMetadata | None = None,
+    q: torch.Tensor | None = None,
+    *,
+    autotune: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Launch the validated production BF16 specialization or its SM120 fallback."""
+    batch, tokens, key_heads, key_dim = k.shape
+    value_heads, value_dim = v.shape[2:]
+    has_q = q is not None
+    if isinstance(k, FakeTensor):
+        return (
+            k.new_empty(batch, tokens, value_heads, key_dim),
+            v.new_empty(batch, tokens, value_heads, value_dim),
+            q.new_empty(q.shape) if q is not None else None,
+            k.new_empty(batch, tokens, value_heads, key_dim),
+        )
+    properties = get_device_properties(k.device)
+    if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
+        w, u, qg, kg = recompute_w_u_fwd_triton(
+            k,
+            v,
+            beta,
+            A,
+            metadata,
+            q=q,
+            gk=gk,
+            chunk_size=BT,
+            dot_precision="bf16",
+            autotune=autotune,
+        )
+        assert kg is not None
+        return w, u, qg, kg
+
+    w = k.new_empty(batch, tokens, value_heads, key_dim)
+    u = v.new_empty(batch, tokens, value_heads, value_dim)
+    qg = q.new_empty(q.shape) if q is not None else None
+    kg = k.new_empty(batch, tokens, value_heads, key_dim)
+    compiled = _compile_bf16_recompute_w_u(
+        os.getpid(),
+        get_compile_target(),
+        key_heads,
+        value_heads,
+        has_q,
+        metadata is not None,
+        requires_int64_abi(q, k, v),
+    )
+    compiled(
+        q,
+        k,
+        v,
+        beta,
+        A,
+        gk,
+        w,
+        u,
+        qg,
+        kg,
+        None if metadata is None else metadata.cu_seqlens,
+        None if metadata is None else metadata.chunk_offsets,
+    )
+    return w, u, qg, kg
+
+
 def _recompute_w_u_fwd_cute(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1567,9 +1752,8 @@ def _recompute_w_u_fwd_cute(
     torch.Tensor | None,
 ]:
     """
-    Retained CuTe/UMMA reference implementation; unreachable from the public
-    API (see the module TODO). Tests call it directly to keep it compiling and
-    to pin the Triton kernel's numerics against an independent engine.
+    Checked CuTe/UMMA entry point for direct tests and non-production precision
+    modes. The composed KDA path uses the lean validated-ABI launcher above.
 
     Scope: B=1, chunk_size=64, K=V=128. Dense inputs derive complete chunks
     directly from the token dimension. Ragged metadata reads the active count
@@ -1743,6 +1927,7 @@ def _recompute_w_u_fwd_cute(
         precision,
         cu_seqlens is None or cu_seqlens.dtype == torch.int32,
         ragged,
+        requires_int64_abi(q if has_q else None, k, v),
     )
     compiled(
         q.detach() if has_q and q is not None else None,
