@@ -55,6 +55,36 @@ def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.silu(_plain_conv_reference(x, weight))
 
 
+def test_short_conv_forced_int64_matches_default(monkeypatch):
+    """Widen forward and every training gradient without changing bits."""
+
+    def run():
+        torch.manual_seed(43)
+        x, weight = _inputs(tokens=64, channels=512, batch=2)
+        initial_state = torch.randn(
+            2,
+            weight.shape[1] - 1,
+            x.shape[2],
+            device="cuda",
+            dtype=x.dtype,
+            requires_grad=True,
+        )
+        output = causal_conv1d(
+            x,
+            weight,
+            activation="silu",
+            initial_state=initial_state,
+        )
+        gradients = torch.autograd.grad(output.square().sum(), (x, weight, initial_state))
+        return output, *gradients
+
+    baseline = run()
+    monkeypatch.setattr(cute_backend, "requires_int64_abi", lambda *tensors: True)
+    forced = run()
+    for expected, actual in zip(baseline, forced, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _packed_reference(
     x: torch.Tensor,
     weight: torch.Tensor,
