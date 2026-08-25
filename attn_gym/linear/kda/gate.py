@@ -43,8 +43,6 @@ def _validate_bound_gate_inputs(
         )
     if not all(tensor.device == raw_gate.device for tensor in (A_log, dt_bias)):
         raise ValueError("bound_gate inputs must be on the same device")
-    if torch.compiler.is_compiling():
-        return heads, head_dim, lower_bound
     if isinstance(lower_bound, bool) or not isinstance(lower_bound, Real):
         raise TypeError(f"lower_bound must be a real scalar, got {type(lower_bound).__name__}")
     lower_bound = float(lower_bound)
@@ -113,7 +111,8 @@ def bound_gate(
         lower_bound: Finite nonpositive gate floor.
         fastmath: Use approximate fused exponentials; rejected by the reference path.
         impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private CuTeDSL
-            kernels and requires CUDA, ``D=128``, and FP16, BF16, or FP32 logits.
+            kernels and requires CUDA capability 9.0 or newer, ``D=128``, and FP16, BF16,
+            or FP32 logits.
     """
     heads, head_dim, lower_bound = _validate_bound_gate_inputs(
         raw_gate,

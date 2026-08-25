@@ -250,9 +250,9 @@ not checked at runtime. The training example uses the Kimi-style FP32 transform
 part of the public KDA API.
 
 Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
-and enforces their constraints (the chunked core needs BF16 operands, `head_dim=128`,
-and Blackwell; it chunks internally at 64 tokens, and the fused recurrent scan is
-inference-only), while `"reference"`
+and enforces their constraints (the chunked core requires `head_dim=128` and Blackwell,
+normalizes Q/K/V operands to BF16 internally, and chunks at 64 tokens; the fused recurrent scan
+is inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
 dimension, and stays differentiable. There is no automatic fallback between the two, and
 the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly
