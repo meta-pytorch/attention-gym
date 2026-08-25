@@ -130,8 +130,8 @@ given a fixed configuration. The guarantees, strongest first:
   recurrent, and fused versus reference are different kernels with different
   reduction orders. They agree numerically, not bit-for-bit — for example, the
   dense and packed chunk lowerings match bitwise everywhere except the FP32
-  cumulative-gate gradient, whose software reduction chains compile with
-  different schedules.
+  gradient at the internal chunk-scan boundary, whose software reduction chains
+  compile with different schedules.
 
 The reference implementations compute in FP32 even inside an autocast region.
 

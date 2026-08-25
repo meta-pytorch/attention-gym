@@ -24,7 +24,6 @@ from attn_gym.linear.types import Impl
 # Missing backends raise an actionable ImportError.
 if TYPE_CHECKING:
     from attn_gym.linear.kda import (
-        bounded_gate_cumsum,
         causal_conv1d,
         causal_conv1d_decode,
         l2norm,
@@ -32,7 +31,6 @@ if TYPE_CHECKING:
     )
 
 KDA_OPS = [
-    "bounded_gate_cumsum",
     "chunk_kda",
     "recurrent_kda",
 ]

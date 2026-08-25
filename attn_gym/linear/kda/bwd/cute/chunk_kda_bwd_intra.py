@@ -25,6 +25,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import LN2
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
@@ -39,7 +40,6 @@ K_PHASES = KEY_DIM // KEY_DIM_PER_CTA  # four 32-wide head-dim phases
 KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
 # The gate algebra accumulates d/d(natural exponent); this kernel owns the last dg
 # write, so it converts the complete gradient to d/d(log2 gate).
-LN2 = 0.6931471805599453
 # q and k may arrive as unbound QKV views: only their innermost dimension is
 # contiguous, and the 16-byte cp.async stages need every outer stride and the
 # base pointer to be 16-byte (8 bf16 element) aligned.

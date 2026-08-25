@@ -83,35 +83,30 @@ main Kimi block structure, projected Q/K/V pass through a causal depthwise SiLU
 convolution, the forget and output gates use two-stage factorized projections,
 and the per-head output uses learned RMS normalization before sigmoid gating.
 `--backend=reference` uses the PyTorch reference throughout. On Blackwell,
-`--backend=fused` selects the composed CuTeDSL/Triton forward and first-order
-backward, including optimized Q/K normalization, bounded-gate activation and
-prefix sum, intra-chunk solves, inter-chunk state recurrence, output
-composition, and bounded-gate backward.
-The kernel boundaries are labeled explicitly in profiler traces. Dense gate backward
-consumes the complete `[B, T, H, D]` gate tensor in one CuTe launch and emits
-per-batch, per-chunk partials for the shared parameter reduction. Packed gate backward
-instead uses one graph-safe ragged Triton launch that fuses the reverse scan, bounded-gate
-derivative, and FP32 parameter-gradient partials. The example explicitly runs projections
-in BF16 while retaining FP32 parameters and gate reductions; no ambient autocast context
-is required. Distributed mixed-precision policies must preserve `A_log` and `dt_bias` as
-FP32 when parameters are materialized, rather than only casting activations inside
-`forward`. A module-wide BF16 FSDP policy violates the fused gate ABI. A correctness-first
-integration can keep the KDA unit under an FP32 policy while its projections explicitly
-compute in BF16; isolating only the strict-FP32 decay state is a future bandwidth
-optimization.
-The CuTe dense gate backward requires a head dimension divisible by 32 in `[32, 1024]`;
-gate forward is Triton for both dense and ragged inputs.
-The optimized core requires Blackwell, BF16 kernel inputs, `head_dim=128`, and 64-token
-chunks. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
+`--backend=fused` uses the same public boundary: the model produces per-token natural-log decay
+and `chunk_kda` owns the BT64 scan. Implementations may inline that scan, but cumulative gates and
+chunk boundaries are not caller-visible representations.
+
+The example explicitly runs projections in BF16 while retaining FP32 parameters and gate
+math; no ambient autocast context is required. Distributed mixed-precision policies must
+preserve `A_log` and `dt_bias` as FP32 when parameters are materialized, rather than only
+casting activations inside `forward`. A module-wide BF16 FSDP policy violates that
+contract. A correctness-first integration can keep the KDA unit under an FP32 policy while
+its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
+a future bandwidth optimization.
+The optimized core requires Blackwell and `head_dim=128`; its public boundary accepts
+FP16, BF16, or FP32 inputs and normalizes private Q/K/V kernel operands to BF16. It chunks
+internally at 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
 equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
 explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
 forward,
 backward, and recurrent states; logical sequences may have tails or be empty. For
 fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
-values outside `[0, cu_seqlens[-1])` are unspecified. Primitives deliberately do not mask
-this inactive suffix automatically; caller-owned masking keeps that cost out of each
-primitive hot path.
+forward values outside `[0, cu_seqlens[-1])` are unspecified. The internal reverse scan
+returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
+parameterized gate producers: callers still need the masking rules below because
+``0 * NaN`` can poison their reductions.
 
 A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
 replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal
@@ -186,8 +181,8 @@ token, so token masks must not be applied to them.
 
 ::: attn_gym.linear.kda.mask_inactive_token_gradients
 
-`KDAAttention.forward` passes explicit offsets to its short convolution and prepares one
-private ragged chunk schedule shared by the bounded-gate prefix sum and KDA core. Set
+`KDAAttention.forward` passes explicit offsets to its short convolution and `chunk_kda`;
+the selected implementation owns its sequence-local scan and scheduling. Set
 `mask_inactive_capacity=True` only when the packed tensor reserves physical rows beyond
 `cu_seqlens[-1]`; dense and exact-packed
 callers leave it disabled and pay no masking cost. The optimized boundaries are
@@ -195,8 +190,7 @@ first-order and do not support higher-order autograd. Run
 `python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256`
 to sample token-level lengths from a truncated Zipf distribution, pack them exactly
 into one physical batch, print their `cu_seqlens`, and pass those offsets through the
-complete training step. Add `--padded` when chunk-aligned samples are needed. The
-complete composed core forward and backward use private custom
+complete training step. The complete composed core forward and backward use private custom
 operators with fake-tensor registrations and first-order autograd wrappers, so fused
 `chunk_kda` supports strict `torch.compile(fullgraph=True)` and CUDA Graph capture for
 fixed physical token capacity and sequence count. Packed reference execution is
@@ -206,8 +200,9 @@ changing the physical token capacity or sequence count
 requires recompilation or recapture. Pass `--compile` to compile the complete example as
 one full graph. This keeps the custom KDA core behind its registered operator boundary
 while allowing
-Inductor to fuse the surrounding PyTorch normalization, gating, and pointwise
-work. It can be combined with `--profile`; compilation warmups run before the
+Inductor to fuse the surrounding PyTorch normalization and remaining pointwise work.
+The bounded gate itself uses private CuTeDSL forward and backward operators. It can be
+combined with `--profile`; compilation warmups run before the
 trace starts. Like FLA's default training path, its backward recomputes the W/U,
 gated Q/K, recurrent-state, and
 corrected-value intermediates instead of retaining them across the forward/backward
@@ -243,17 +238,25 @@ the model's packed-sequence metadata, cache layout, and distributed execution po
 short convolution, factorized gates, and learned gated RMS normalization match
 the production structure but remain ordinary PyTorch teaching implementations.
 
-The two public KDA cores are `chunk_kda` (training and prefill; consumes the
-chunk-local inclusive cumulative log2 gate from `bounded_gate_cumsum(chunk_size=64)`
-without a second cumulative sum) and `recurrent_kda` (decode and inference prefill;
-consumes the per-token log2 gate from `bounded_gate_cumsum(chunk_size=1)`). Both
-select their implementation with `impl`: `"fused"` runs the optimized kernels and
-enforces their constraints (the chunked core needs BF16 operands, `head_dim=128`,
-`chunk_size=64`, and Blackwell; the fused scan is inference-only), while
-`"reference"` runs the eager FP32 oracle behind the identical packed contract on
-any hardware and head dimension, and stays differentiable. There is no automatic
-fallback between the two, and the chunk-versus-recurrent switch is caller policy
-(on B200 the scan wins below roughly 32 tokens per sequence).
+The two public KDA cores share one gate contract: `gate` is the per-token
+natural-log decay before any prefix sum. `chunk_kda` owns the natural-log-to-log2
+conversion and its sequence-local BT64 cumulative sum; `recurrent_kda` performs only the
+conversion because recurrence consumes one token decay at a time. This keeps chunking out
+of model code and lets callers switch execution modes without changing gate
+representation. Custom producers should return finite, nonpositive values; the fused chunk
+backend additionally requires approximately `[-5.914, 0]`; this tensor-value range is
+not checked at runtime. The training example uses the Kimi-style FP32 transform
+`lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
+part of the public KDA API.
+
+Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
+and enforces their constraints (the chunked core requires `head_dim=128` and Blackwell,
+normalizes Q/K/V operands to BF16 internally, and chunks at 64 tokens; the fused recurrent scan
+is inference-only), while `"reference"`
+runs the eager FP32 oracle behind the identical packed contract on any hardware and head
+dimension, and stays differentiable. There is no automatic fallback between the two, and
+the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly
+32 tokens per sequence).
 
 The serving limitations listed under `recurrent_kda` below are deliberate and
 the contract is otherwise stable to build against; CUDA-graph capture amortizes

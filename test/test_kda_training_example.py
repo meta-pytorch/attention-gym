@@ -11,6 +11,7 @@ from torch._inductor import config as inductor_config
 pytest.importorskip("cutlass")
 pytest.importorskip("typer")
 
+from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from examples import kda_training
 from examples.kda_training import KDAAttention, packed_sequence_metadata
 
@@ -18,6 +19,44 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="the fused KDA example requires CUDA capability 10.0 or newer",
 )
+
+
+def test_kda_example_validates_public_gate_configuration():
+    with pytest.raises(ValueError, match="lower_bound"):
+        KDAAttention(
+            hidden_size=128,
+            num_heads=1,
+            head_dim=128,
+            lower_bound=-(MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3),
+            backend="fused",
+            device="cuda",
+        )
+    KDAAttention(
+        hidden_size=128,
+        num_heads=1,
+        head_dim=128,
+        lower_bound=-(MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3),
+        backend="reference",
+        device="cuda",
+    )
+    with pytest.raises(ValueError, match="finite and nonpositive"):
+        KDAAttention(
+            hidden_size=128,
+            num_heads=1,
+            head_dim=128,
+            lower_bound=1.0,
+            backend="reference",
+            device="cuda",
+        )
+    with pytest.raises(ValueError, match="fastmath applies only"):
+        KDAAttention(
+            hidden_size=128,
+            num_heads=1,
+            head_dim=128,
+            fastmath=True,
+            backend="reference",
+            device="cuda",
+        )
 
 
 @pytest.mark.parametrize(
@@ -103,22 +142,16 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
 
 
 def test_kda_example_builds_packed_sequence_metadata():
-    """Keep token-level and optionally aligned Zipf samples bounded and cumulative."""
+    """Keep token-level Zipf samples bounded and cumulative."""
     torch.manual_seed(0)
-    lengths, offsets = packed_sequence_metadata(4, 63, 64)
+    lengths, offsets = packed_sequence_metadata(4, 63)
     assert len(lengths) == 4
-    assert all(0 < length <= 63 and length % 64 != 0 for length in lengths)
+    assert all(0 < length <= 63 for length in lengths)
     assert offsets[0] == 0
     assert tuple(end - start for start, end in pairwise(offsets)) == lengths
 
-    padded_lengths, padded_offsets = packed_sequence_metadata(4, 256, 64, padded=True)
-    assert all(length % 64 == 0 and 0 < length <= 256 for length in padded_lengths)
-    assert tuple(end - start for start, end in pairwise(padded_offsets)) == padded_lengths
-
-    with pytest.raises(ValueError, match="divisible"):
-        packed_sequence_metadata(2, 96, 64, padded=True)
     with pytest.raises(ValueError, match="at least one"):
-        packed_sequence_metadata(3, 0, 64)
+        packed_sequence_metadata(3, 0)
 
 
 def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
@@ -149,8 +182,7 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
         "kda/short_convolution",
         "kda/qk_normalization",
         "kda/gate_projections",
-        "kda/chunk_metadata",
-        "kda/gate_prefix_sum/fused",
+        "kda/gate_activation",
         "kda/core/fused",
         "kda/output_normalization",
         "kda/output_gate",
@@ -159,19 +191,12 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
 
 
 def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
-    """Match independent execution while sharing one packed schedule across fused stages."""
-    scheduled_metadata = []
-    consumed_metadata = []
+    """Match one packed execution against independent sequence calls."""
     fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
-    prepare_metadata = kda_training.prepare_ragged_chunk_metadata
     short_conv = kda_training.causal_conv1d
     fused_l2norm = kda_training.l2norm
-    gate = kda_training._bounded_gate_cumsum
-    core = kda_training._chunk_kda
-
-    def record_prepare(*args):
-        scheduled_metadata.append(prepare_metadata(*args))
-        return scheduled_metadata[-1]
+    gate = kda_training.bound_gate
+    core = kda_training.chunk_kda
 
     def record_short_conv(*args, **kwargs):
         fused_calls["short_conv"] += 1
@@ -183,21 +208,16 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
 
     def record_gate(*args, **kwargs):
         fused_calls["gate"] += 1
-        if kwargs.get("metadata") is not None:
-            consumed_metadata.append(kwargs["metadata"])
         return gate(*args, **kwargs)
 
     def record_core(*args, **kwargs):
         fused_calls["core"] += 1
-        if kwargs.get("metadata") is not None:
-            consumed_metadata.append(kwargs["metadata"])
         return core(*args, **kwargs)
 
-    monkeypatch.setattr(kda_training, "prepare_ragged_chunk_metadata", record_prepare)
     monkeypatch.setattr(kda_training, "causal_conv1d", record_short_conv)
     monkeypatch.setattr(kda_training, "l2norm", record_l2norm)
-    monkeypatch.setattr(kda_training, "_bounded_gate_cumsum", record_gate)
-    monkeypatch.setattr(kda_training, "_chunk_kda", record_core)
+    monkeypatch.setattr(kda_training, "bound_gate", record_gate)
+    monkeypatch.setattr(kda_training, "chunk_kda", record_core)
     torch.manual_seed(19)
     model = KDAAttention(
         hidden_size=32,
@@ -226,11 +246,6 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
     actual_gradient = torch.autograd.grad(actual, packed_hidden, cotangent)[0]
     expected_gradient = torch.autograd.grad(expected, loop_hidden, cotangent)[0]
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
-
-    assert len(scheduled_metadata) == 1
-    assert scheduled_metadata[0].cu_seqlens is cu_seqlens
-    assert len(consumed_metadata) == 2
-    assert all(metadata is scheduled_metadata[0] for metadata in consumed_metadata)
 
 
 @pytest.mark.parametrize(

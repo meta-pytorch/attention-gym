@@ -23,11 +23,12 @@ Crossover point: w_tiles_bv16 = SM_count ≈ 132 on GH200.
 
 import torch
 
-from attn_gym._backends.cute import ceildiv, get_device_properties
+from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import (
     blackwell_delta_h_bwd_dhu_v1,
 )
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.utils import ceildiv
 
 
 def blackwell_delta_h_bwd_dhu_dispatch(

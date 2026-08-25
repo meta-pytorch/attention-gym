@@ -8,12 +8,14 @@ import torch
 pytest.importorskip("cutlass")
 
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,
     _chunk_kda_fwd_ragged_op,
     _chunk_kda_fwd_ragged_with_state_op,
 )
+from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
@@ -23,10 +25,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_ragged_custom_op_registrations():
-    inputs = make_kda_test_inputs(128, requires_grad=True)
+    q, k, v, gate, beta = make_kda_test_inputs(128, requires_grad=True)
     initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
     cu_seqlens = cumulative_sequence_offsets([65, 63])
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, inputs[0].shape[1], 64)
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
+    cumulative_gate = chunk_cumsum_ref(gate, 64, scale=LOG2_E, cu_seqlens=cu_seqlens)
+    inputs = (q, k, v, cumulative_gate, beta)
     forward_args = (
         *(value.detach() for value in inputs),
         initial_state.detach(),

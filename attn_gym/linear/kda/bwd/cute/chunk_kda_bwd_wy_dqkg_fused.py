@@ -1538,8 +1538,6 @@ def umma_arrive_noelect(mbar_ptr: cute.Pointer):
 
 PRINT_DEBUG = False
 
-LN2 = 0.6931471805599453
-RCP_LN2 = 1.4426950408889634
 
 COMPILE_OPTIONS = "--enable-tvm-ffi"
 USE_FAST_MATH: bool = os.getenv("MSLK_USE_FAST_MATH", "1") == "1"

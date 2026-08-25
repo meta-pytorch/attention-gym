@@ -10,7 +10,8 @@ import torch
 pytest.importorskip("cutlass")
 
 from attn_gym.linear import chunk_kda
-from attn_gym.linear.kda.naive import naive_chunk_kda_from_cumulative
+from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.naive import naive_chunk_kda
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,
@@ -77,8 +78,9 @@ def _run_naive_gradients(
         sequence_state = (
             None if reference_state is None else reference_state[sequence : sequence + 1]
         )
-        output, final_state = naive_chunk_kda_from_cumulative(
-            *(value[:, token_slice] for value in reference_inputs[:4]),
+        output, final_state = naive_chunk_kda(
+            *(value[:, token_slice] for value in reference_inputs[:3]),
+            reference_inputs[3][:, token_slice] * LOG2_E,
             reference_inputs[4][:, token_slice],
             initial_state=sequence_state,
             output_final_state=output_final_state,

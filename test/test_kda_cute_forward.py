@@ -5,12 +5,14 @@ from __future__ import annotations
 import functools
 import gc
 import importlib
+import math
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda_from_cumulative
+from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 
 pytest.importorskip("cutlass")
 
@@ -51,9 +53,9 @@ def _inputs(
     q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
     v = torch.randn(shape, device="cuda", dtype=dtype)
-    cumulative_gate = chunk_cumsum_ref(-torch.rand(shape, device="cuda"), 64)
+    gate = -torch.rand(shape, device="cuda") * math.log(2.0)
     beta = torch.rand(batch, tokens, heads, device="cuda")
-    tensors = [q, k, v, cumulative_gate, beta]
+    tensors = [q, k, v, gate, beta]
     if initial_state:
         tensors.append(torch.randn(batch, heads, head_dim, head_dim, device="cuda") * 0.01)
     return tuple(tensor.requires_grad_() for tensor in tensors)
@@ -120,15 +122,15 @@ def _packed_reference(
     spans: tuple[tuple[int, int], ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate packed sequences independently with the naive implementation."""
-    q, k, v, cumulative_gate, beta, initial_state = inputs
+    q, k, v, gate, beta, initial_state = inputs
     outputs = []
     states = []
     for sequence, (start, end) in enumerate(spans):
-        output, state = naive_chunk_kda_from_cumulative(
+        output, state = naive_chunk_kda(
             q[:, start:end],
             k[:, start:end],
             v[:, start:end],
-            cumulative_gate[:, start:end],
+            gate[:, start:end] * LOG2_E,
             beta[:, start:end],
             initial_state=initial_state[sequence : sequence + 1],
             output_final_state=True,
@@ -144,17 +146,17 @@ def test_optimized_chunk_kda_matches_reference():
     """Check forward values and the isolated final-state cotangent path."""
     torch.manual_seed(3)
     inputs = _inputs(initial_state=True)
-    q, k, v, cumulative_gate, beta, initial_state = inputs
+    q, k, v, gate, beta, initial_state = inputs
 
     output, state = chunk_kda(*inputs, output_final_state=True)
     assert state is not None
     assert output.dtype == torch.bfloat16
     assert state.dtype == torch.float32
-    expected, expected_state = naive_chunk_kda_from_cumulative(
+    expected, expected_state = naive_chunk_kda(
         q.float(),
         k.float(),
         v.float(),
-        cumulative_gate,
+        gate * LOG2_E,
         beta,
         initial_state=initial_state,
         output_final_state=True,
@@ -165,7 +167,7 @@ def test_optimized_chunk_kda_matches_reference():
     torch.testing.assert_close(state, expected_state, rtol=2e-2, atol=2e-3)
 
     d_state = torch.randn_like(state)
-    state_inputs = (k, v, cumulative_gate, beta, initial_state)
+    state_inputs = (k, v, gate, beta, initial_state)
     actual_gradients = torch.autograd.grad(state, state_inputs, d_state)
     expected_gradients = torch.autograd.grad(expected_state, state_inputs, d_state)
     for actual_gradient, expected_gradient in zip(
@@ -181,12 +183,12 @@ def test_optimized_chunk_kda_matches_reference():
 def test_optimized_chunk_kda_accepts_strided_packed_qkv_views():
     """Read Q/K/V directly from one packed projection in forward and backward."""
     torch.manual_seed(29)
-    q, k, v, cumulative_gate, beta = _inputs(tokens=128, heads=2)
+    q, k, v, gate, beta = _inputs(tokens=128, heads=2)
     q, k, v = _strided_qkv_views(q, k, v)
     expected_stride = (128 * 3 * 2 * 128, 3 * 2 * 128, 128, 1)
     assert all(tensor.stride() == expected_stride for tensor in (q, k, v))
     assert not any(tensor.is_contiguous() for tensor in (q, k, v))
-    actual_inputs = (q, k, v, cumulative_gate, beta)
+    actual_inputs = (q, k, v, gate, beta)
     expected_inputs = _clone_inputs(actual_inputs)
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
 
@@ -221,7 +223,7 @@ def test_optimized_chunk_kda_accepts_strided_packed_qkv_views():
 def test_optimized_chunk_kda_accumulates_into_packed_qkv_backing():
     """Map compact kernel gradients back through the packed QKV views."""
     torch.manual_seed(41)
-    q, k, v, cumulative_gate, beta = _inputs(tokens=128, heads=2)
+    q, k, v, gate, beta = _inputs(tokens=128, heads=2)
     actual_qkv = _packed_qkv_tensor(q, k, v)
     expected_qkv = actual_qkv.detach().clone().requires_grad_()
     actual_q, actual_k, actual_v = actual_qkv.unbind(2)
@@ -232,7 +234,7 @@ def test_optimized_chunk_kda_accumulates_into_packed_qkv_backing():
         actual_q,
         actual_k,
         actual_v,
-        cumulative_gate,
+        gate,
         beta,
         cu_seqlens=cu_seqlens,
     )
@@ -240,7 +242,7 @@ def test_optimized_chunk_kda_accumulates_into_packed_qkv_backing():
         expected_q,
         expected_k,
         expected_v,
-        cumulative_gate,
+        gate,
         beta,
         cu_seqlens=cu_seqlens,
     )
@@ -278,9 +280,9 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
     """Keep packed sequence boundaries first-class through forward and backward."""
     torch.manual_seed(13)
     inputs = _inputs(tokens=192, heads=2, initial_state=True)
-    q, k, v, cumulative_gate, beta, _initial_state = inputs
+    q, k, v, gate, beta, _initial_state = inputs
     initial_state = torch.randn(2, 2, 128, 128, device="cuda", requires_grad=True) * 0.01
-    inputs = (q, k, v, cumulative_gate, beta, initial_state)
+    inputs = (q, k, v, gate, beta, initial_state)
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
 
     output, state = chunk_kda(
@@ -291,7 +293,7 @@ def test_optimized_chunk_kda_packed_matches_independent_sequences():
     assert state is not None and state.shape == (2, 2, 128, 128)
 
     spans = ((0, 64), (64, 192))
-    reference_inputs = (q.float(), k.float(), v.float(), cumulative_gate, beta, initial_state)
+    reference_inputs = (q.float(), k.float(), v.float(), gate, beta, initial_state)
     expected_output, expected_state = _packed_reference(reference_inputs, spans)
     golden_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
     golden_output, golden_state = _packed_reference(golden_inputs, spans)
@@ -370,13 +372,13 @@ def test_optimized_chunk_kda_dense_batch_matches_equal_length_packing():
     torch.manual_seed(43)
     dense_inputs = _inputs(batch=2, tokens=128, heads=2, initial_state=True)
     packed_inputs = _clone_inputs(dense_inputs)
-    q, k, v, cumulative_gate, beta, initial_state = packed_inputs
+    q, k, v, gate, beta, initial_state = packed_inputs
     packed_shape = (1, 256, 2, 128)
     packed_inputs = (
         q.reshape(packed_shape),
         k.reshape(packed_shape),
         v.reshape(packed_shape),
-        cumulative_gate.reshape(packed_shape),
+        gate.reshape(packed_shape),
         beta.reshape(1, 256, 2),
         initial_state,
     )
@@ -435,9 +437,9 @@ def test_chunk_kda_single_sequence_metadata_matches_dense_path():
         (explicit_output, explicit_state), explicit_inputs, (d_output, d_state)
     )
     # Forward values and most gradients stay bitwise across the two lowerings.
-    # The exception is the FP32 cumulative-gate gradient: it is the only output
-    # assembled by software FP32 reduction chains (dq/dk/dv come from MMA
-    # accumulators with hardware-fixed order), and the dense versus ragged
+    # The exception is the FP32 gradient at the internal chunk-scan boundary:
+    # it is the only output assembled by software FP32 reduction chains (dq/dk/dv come
+    # from MMA accumulators with hardware-fixed order), and the dense versus ragged
     # constexpr specializations of the fused wy/dqkg kernel schedule those
     # chains differently, so it accumulates a few rounding steps near zero and
     # gets an absolute bound instead of bit equality.
@@ -453,17 +455,17 @@ def test_optimized_chunk_kda_autograd_without_initial_state():
     """Exercise the isolated output cotangent path with identical BF16-rounded values."""
     torch.manual_seed(4)
     inputs = _inputs(heads=2)
-    q, k, v, cumulative_gate, beta = inputs
+    q, k, v, gate, beta = inputs
     d_output = torch.randn_like(q)
 
     output, state = chunk_kda(*inputs)
     assert state is None
     actual_gradients = torch.autograd.grad(output, inputs, d_output)
-    reference_output, _ = naive_chunk_kda_from_cumulative(
+    reference_output, _ = naive_chunk_kda(
         q.float(),
         k.float(),
         v.float(),
-        cumulative_gate,
+        gate * LOG2_E,
         beta,
         chunk_size=64,
     )
@@ -616,7 +618,8 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
 def test_chunk_kda_op_registration():
     """Validate schema, fake tensors, and AOT dispatch for both raw forward operators."""
     torch.manual_seed(5)
-    q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
+    q, k, v, gate, beta, initial_state = _inputs(initial_state=True)
+    cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     q, k, v = _strided_qkv_views(q, k, v)
     # The raw operators are intentionally not differentiable; autograd lives in the
     # _ChunkKDA autograd.Function, covered by the gradient tests above.
@@ -636,7 +639,8 @@ def test_chunk_kda_op_registration():
 def test_chunk_kda_backward_op_registration():
     """Validate the intentionally first-order backward operator registrations."""
     torch.manual_seed(6)
-    q, k, v, cumulative_gate, beta, initial_state = _inputs(initial_state=True)
+    q, k, v, gate, beta, initial_state = _inputs(initial_state=True)
+    cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     with torch.no_grad():
         _output, state, Aqk, Akk = _chunk_kda_fwd_with_state_op(
             q,
@@ -827,8 +831,8 @@ def test_chunk_kda_reduce_overhead_backward():
 
 def test_chunk_kda_rejects_higher_order_autograd():
     """Keep the composed backward explicitly first-order."""
-    q, k, v, cumulative_gate, beta = _inputs()
-    output, _ = chunk_kda(q, k, v, cumulative_gate, beta)
+    q, k, v, gate, beta = _inputs()
+    output, _ = chunk_kda(q, k, v, gate, beta)
     gradient = torch.autograd.grad(output.float().sum(), q, create_graph=True)[0]
     with pytest.raises(RuntimeError, match="does not require grad"):
         torch.autograd.grad(gradient.float().sum(), q)
@@ -921,7 +925,7 @@ def test_chunk_kda_forward_prefix_ignores_future_tokens(cut):
 
     def forward(tensors, gate_increments):
         """Run the public core from per-token gate increments."""
-        output, _ = chunk_kda(*tensors, chunk_cumsum_ref(gate_increments, 64), beta)
+        output, _ = chunk_kda(*tensors, gate_increments, beta)
         return output
 
     baseline = forward((query, key, value), increments)
@@ -942,17 +946,17 @@ def test_chunk_kda_forward_prefix_ignores_future_tokens(cut):
 
 def test_chunk_kda_validates_public_contract():
     """Reject malformed inputs at the opaque boundary before a kernel launch."""
-    q, k, v, cumulative_gate, beta = (tensor.detach() for tensor in _inputs())
+    q, k, v, gate, beta = (tensor.detach() for tensor in _inputs())
 
     with pytest.raises(ValueError, match="k must have shape"):
-        chunk_kda(q, k[:, :-1], v, cumulative_gate, beta)
+        chunk_kda(q, k[:, :-1], v, gate, beta)
     with pytest.raises(ValueError, match="beta must have shape"):
-        chunk_kda(q, k, v, cumulative_gate, beta[:, :-1])
+        chunk_kda(q, k, v, gate, beta[:, :-1])
     with pytest.raises(ValueError, match="initial_state must have shape"):
-        chunk_kda(q, k, v, cumulative_gate, beta, q.new_empty(1, 1, 64, 128))
+        chunk_kda(q, k, v, gate, beta, q.new_empty(1, 1, 64, 128))
     with pytest.raises(ValueError, match="nonempty"):
-        chunk_kda(q[:, :0], k[:, :0], v[:, :0], cumulative_gate[:, :0], beta[:, :0])
+        chunk_kda(q[:, :0], k[:, :0], v[:, :0], gate[:, :0], beta[:, :0])
     with pytest.raises(ValueError, match="same device"):
-        chunk_kda(q, k, v, cumulative_gate, beta.cpu())
+        chunk_kda(q, k, v, gate, beta.cpu())
     with pytest.raises(TypeError, match="inputs must use one of"):
-        chunk_kda(q.double(), k, v, cumulative_gate, beta)
+        chunk_kda(q.double(), k, v, gate, beta)

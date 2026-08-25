@@ -52,16 +52,12 @@ rebuilds its values from the current ``cu_seqlens`` on every replay::
     chunk_count[i] = ceil_div(cu_seqlens[i + 1] - cu_seqlens[i], chunk_size)
     chunk_offsets = exclusive_prefix_sum(chunk_count)
 
-``KDAAttention`` prepares this prefix once, passes the same
-``RaggedChunkMetadata`` to the gate and core forward stages, and saves the same
-``cu_seqlens``/``chunk_offsets`` storage for backward. Each consumer still
-binary-searches ``chunk_offsets`` to map a global chunk to its sequence and local
-chunk, but it does not recompute every sequence's chunk count and prefix. This
-avoids duplicate metadata launches and guarantees one global-chunk coordinate
-system across stages. The motivating packed-step A/B moved from 4.650 to
-4.467 ms; that end-to-end result supports the ownership choice but does not
-isolate metadata preparation alone. The training-example tests explicitly
-enforce one preparation with shared consumers.
+The fused ``chunk_kda`` implementation prepares this prefix once per call, passes the same
+``RaggedChunkMetadata`` to its internal gate scan and core stages, and saves the same
+``cu_seqlens``/``chunk_offsets`` storage for backward. Each consumer still binary-searches
+``chunk_offsets`` to map a global chunk to its sequence and local chunk, but it does not
+recompute every sequence's chunk count and prefix. This avoids duplicate metadata launches and
+guarantees one global-chunk coordinate system across the implementation.
 
 Worked example
 --------------

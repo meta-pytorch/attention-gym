@@ -28,7 +28,6 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
 from attn_gym._backends.cute import (
-    ceildiv,
     compile_tvm_ffi,
     get_device_properties,
     jit_cache,
@@ -39,6 +38,7 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda import ops as kda_ops
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
+from attn_gym.utils import ceildiv
 
 _forward_op = kda_ops.short_conv_forward_op
 _backward_op = kda_ops.short_conv_backward_op

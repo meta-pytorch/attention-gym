@@ -71,6 +71,55 @@ def test_forced_int64_chunk_kda_matches_default_path(monkeypatch):
 
 
 @pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
+def test_forced_int64_bound_gate_matches_default_path(monkeypatch):
+    """Force the private gate backward's wide ABI on an ordinary input."""
+    import attn_gym.linear.kda.bwd.cute.gate_bwd as gate_module
+    import attn_gym.linear.kda.fwd.cute.gate_fwd as gate_forward_module
+    from attn_gym.linear.kda import bound_gate
+
+    def run():
+        torch.manual_seed(19)
+        inputs = (
+            torch.randn(1, 65, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+            torch.randn(2, device="cuda", requires_grad=True),
+            torch.randn(2, 128, device="cuda", requires_grad=True),
+        )
+        output = bound_gate(*inputs, impl="fused")
+        return (output, *torch.autograd.grad(output.square().sum(), inputs))
+
+    baseline = run()
+    monkeypatch.setattr(gate_module, "requires_int64_abi", lambda *tensors: True)
+    monkeypatch.setattr(gate_forward_module, "requires_int64_abi", lambda *tensors: True)
+    forced = run()
+    for expected, actual in zip(baseline, forced, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
+def test_bound_gate_oversized_singleton_stride_matches_compact():
+    """Exercise automatic wide-ABI routing on the gate forward and backward."""
+    from attn_gym.linear.kda import bound_gate
+
+    def run(oversized_batch_stride: bool):
+        torch.manual_seed(23)
+        raw_gate = torch.randn(1, 65, 2, 128, device="cuda", dtype=torch.bfloat16)
+        if oversized_batch_stride:
+            raw_gate = raw_gate.as_strided(raw_gate.shape, (2**31, *raw_gate.stride()[1:]))
+            assert requires_int64_abi(raw_gate)
+        raw_gate = raw_gate.requires_grad_()
+        A_log = torch.randn(2, device="cuda", requires_grad=True)
+        dt_bias = torch.randn(2, 128, device="cuda", requires_grad=True)
+        output = bound_gate(raw_gate, A_log, dt_bias, impl="fused")
+        gradients = torch.autograd.grad(output.square().sum(), (raw_gate, A_log, dt_bias))
+        return (output, *gradients)
+
+    compact = run(False)
+    oversized = run(True)
+    for expected, actual in zip(compact, oversized, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
 def test_chunk_kda_oversized_singleton_stride_matches_compact():
     """Exercise automatic int64 ABI selection without allocating unreachable storage."""
     from attn_gym.linear import chunk_kda
@@ -130,25 +179,3 @@ def test_chunk_kda_full_262144_tokens_executes_offsets_past_int32():
         wide, _ = chunk_kda(*packed, gate, beta, cu_seqlens=offsets)
         narrow, _ = chunk_kda(*compact, gate, beta, cu_seqlens=offsets)
     torch.testing.assert_close(wide, narrow, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
-def test_forced_int64_dense_gate_backward_matches_default(monkeypatch):
-    """Cover the dense fused gate backward's i64 specialization on small inputs."""
-    import attn_gym.linear.kda.bwd.cute.gate_bwd_fused as gate_module
-    from attn_gym.linear.kda.bwd.cute.gate_bwd_fused import fused_gate_bwd
-
-    def run():
-        torch.manual_seed(19)
-        raw_gate = torch.randn(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16) / 8
-        A_log = torch.zeros(2, device="cuda")
-        dt_bias = torch.zeros(2, 128, device="cuda")
-        d_cumulative = torch.randn(1, 128, 2, 128, device="cuda") / 8
-        result = fused_gate_bwd(raw_gate, A_log, dt_bias, d_cumulative, lower_bound=-5.0)
-        return result.dg, result.dA_partial, result.d_dt_bias
-
-    baseline = run()
-    monkeypatch.setattr(gate_module, "requires_int64_abi", lambda *tensors: True)
-    forced = run()
-    for expected, actual in zip(baseline, forced, strict=True):
-        assert torch.equal(actual, expected)

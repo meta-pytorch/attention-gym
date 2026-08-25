@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym.linear.kda.naive import (
+    _naive_chunk_kda_from_cumulative,
     chunk_cumsum_ref,
     naive_chunk_kda,
-    naive_chunk_kda_from_cumulative,
     naive_recurrent_kda,
 )
 
@@ -43,7 +43,7 @@ def test_naive_chunk_matches_recurrent(seq_len, chunk_size, use_initial_state):
     torch.testing.assert_close(chunk_output, recurrent_output, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(chunk_state, recurrent_state, atol=1e-5, rtol=1e-4)
 
-    cumulative_output, cumulative_state = naive_chunk_kda_from_cumulative(
+    cumulative_output, cumulative_state = _naive_chunk_kda_from_cumulative(
         *inputs[:3],
         chunk_cumsum_ref(inputs[3], chunk_size),
         inputs[4],
@@ -58,7 +58,7 @@ def test_naive_chunk_matches_recurrent(seq_len, chunk_size, use_initial_state):
 def test_naive_chunk_accumulates_low_precision_gate_in_fp32():
     q, k, v, g, beta, initial_state = make_inputs(seq_len=64)
     g = g.to(torch.bfloat16)
-    expected = naive_chunk_kda_from_cumulative(
+    expected = _naive_chunk_kda_from_cumulative(
         q,
         k,
         v,
@@ -118,11 +118,11 @@ def test_naive_chunk_from_cumulative_validates_shapes():
     q, k, v, g, beta, _state = make_inputs(seq_len=7)
     cumulative_g = chunk_cumsum_ref(g, 4)
     with pytest.raises(ValueError, match="k must have shape"):
-        naive_chunk_kda_from_cumulative(q, k[:, :-1], v, cumulative_g, beta, chunk_size=4)
+        _naive_chunk_kda_from_cumulative(q, k[:, :-1], v, cumulative_g, beta, chunk_size=4)
     with pytest.raises(ValueError, match="beta must have shape"):
-        naive_chunk_kda_from_cumulative(q, k, v, cumulative_g, beta.transpose(1, 2), chunk_size=4)
+        _naive_chunk_kda_from_cumulative(q, k, v, cumulative_g, beta.transpose(1, 2), chunk_size=4)
     with pytest.raises(ValueError, match="initial_state must have shape"):
-        naive_chunk_kda_from_cumulative(
+        _naive_chunk_kda_from_cumulative(
             q,
             k,
             v,

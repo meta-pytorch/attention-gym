@@ -27,7 +27,7 @@ def make_kda_test_inputs(
     seed: int = 41,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Create deterministic public KDA inputs with the production dtypes."""
+    """Create deterministic public KDA inputs with per-token natural-log gates."""
     torch.manual_seed(seed)
     shape = (batch, tokens, 1, 128)
     values = (

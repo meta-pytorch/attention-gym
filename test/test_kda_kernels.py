@@ -26,11 +26,6 @@ from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
 )
-from attn_gym.linear.kda.fwd.triton.gate_fwd import (
-    _bounded_gate_chunk_cumsum_dense_kernel,
-    _bounded_gate_cumsum_dense_op,
-    _requires_int64_offsets,
-)
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     _l2norm_bwd_op,
     _l2norm_fwd_op,
@@ -38,7 +33,7 @@ from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     l2norm_fwd_kernel,
 )
 from attn_gym.linear.kda.naive import l2norm_bwd_ref, l2norm_fwd_ref
-from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED, RCP_LN2
+from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED
 from attn_gym.testing.kda import (
     bwd_intra_reference as _bwd_intra_ref,
 )
@@ -473,73 +468,6 @@ def test_l2norm_bwd(dtype, T, D, strided):
         IS_VARLEN=False,
     )
     assert_golden(dx, golden, ref, dtype, f"l2norm_bwd_kernel T={T} D={D}")
-
-
-def test_bounded_gate_fwd_int64_offsets():
-    """Force the dense bounded gate's 64-bit offset specialization."""
-    torch.manual_seed(12)
-    raw_gate = torch.randn(1, 1, 1, 32, device=DEV, dtype=torch.bfloat16)
-    A_log = torch.randn(1, device=DEV)
-    dt_bias = torch.randn(1, 32, device=DEV)
-    output = torch.empty_like(raw_gate, dtype=torch.float32)
-    synthetic_batch_stride = 1 << 31
-
-    # B=2 makes the synthetic batch span exceed int32, while the one-program
-    # grid accesses only batch zero and therefore remains within the tiny allocation.
-    assert _requires_int64_offsets(
-        {
-            "B": 2,
-            "T": 1,
-            "H": 1,
-            "D": 32,
-            "g_batch_stride": synthetic_batch_stride,
-            "o_batch_stride": synthetic_batch_stride,
-            "G_STRIDES": raw_gate.stride()[1:],
-            "A_LOG_STRIDES": A_log.stride(),
-            "DT_BIAS_STRIDES": dt_bias.stride(),
-            "O_STRIDES": output.stride()[1:],
-        }
-    )
-    _bounded_gate_chunk_cumsum_dense_kernel[(1, 1, 1)](
-        raw_gate,
-        A_log,
-        dt_bias,
-        output,
-        -3.25,
-        RCP_LN2,
-        1,
-        synthetic_batch_stride,
-        synthetic_batch_stride,
-        G_STRIDES=raw_gate.stride()[1:],
-        A_LOG_STRIDES=A_log.stride(),
-        DT_BIAS_STRIDES=dt_bias.stride(),
-        O_STRIDES=output.stride()[1:],
-        B=2,
-        H=1,
-        D=32,
-        BT=1,
-        BD=32,
-        num_warps=2,
-        num_stages=3,
-    )
-    expected = -3.25 * torch.sigmoid(A_log.exp().view(1, 1, 1, 1) * (raw_gate + dt_bias))
-    torch.testing.assert_close(output, expected * RCP_LN2)
-
-
-def test_bounded_gate_fwd_dense_op_registration():
-    """Validate the dense gate's functional schema, fake tensor, and AOT dispatch."""
-    torch.manual_seed(13)
-    # Strided views cover the stride-preserving real/fake metadata contract.
-    raw_gate = torch.randn(2, 96, 2, 128, device=DEV, dtype=torch.bfloat16)[..., ::2]
-    A_log = (0.25 * torch.randn(4, device=DEV, dtype=torch.float32))[::2]
-    dt_bias = (0.25 * torch.randn(2, 128, device=DEV, dtype=torch.float32))[..., ::2]
-    assert not any(tensor.is_contiguous() for tensor in (raw_gate, A_log, dt_bias))
-    # Autograd is intentionally owned by _BoundedGateCumsum rather than the raw operator.
-    torch.library.opcheck(
-        _bounded_gate_cumsum_dense_op,
-        (raw_gate, A_log, dt_bias, 64, -5.0),
-        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
-    )
 
 
 def _bwd_dav_ref(v, A, do, scale, chunk_size=64):

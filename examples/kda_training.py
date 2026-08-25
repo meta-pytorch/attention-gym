@@ -50,16 +50,15 @@ from torch import nn
 from torch.cuda.graph_annotations import mark_kernels
 
 from attn_gym.linear.kda import (
+    MAX_GATE_LOWER_BOUND_MAGNITUDE,
     active_token_mask,
+    bound_gate,
+    causal_conv1d,
+    chunk_kda,
+    l2norm,
     mask_inactive_token_gradients,
     mask_inactive_tokens,
 )
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import _chunk_kda
-from attn_gym.linear.kda.fwd.triton.gate_fwd import _bounded_gate_cumsum
-from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm
-from attn_gym.linear.kda.naive import gate_fwd_ref, l2norm_fwd_ref, naive_chunk_kda_from_cumulative
-from attn_gym.linear.kda.short_conv import causal_conv1d
 
 Backend = Literal["reference", "fused"]
 
@@ -98,11 +97,6 @@ def _profile_trace(
     active_profiler.export_chrome_trace(str(path))
 
 
-def _kernel_annotation(enabled: bool, name: str):
-    """Annotate captured CUDA Graph nodes only when explicitly enabled."""
-    return mark_kernels(name) if enabled else nullcontext()
-
-
 def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Label one KDA stage during annotation-enabled CUDA Graph capture."""
 
@@ -130,21 +124,12 @@ class KDAAttentionOutput(NamedTuple):
 def packed_sequence_metadata(
     num_sequences: int,
     max_tokens: int,
-    chunk_size: int,
-    padded: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Sample sequence lengths from a truncated Zipf distribution."""
+    """Sample token-level sequence lengths from a truncated Zipf distribution."""
     if max_tokens < 1:
         raise ValueError("packed tokens must include at least one token")
-    if padded:
-        if max_tokens % chunk_size:
-            raise ValueError("packed tokens must be divisible by chunk_size when padded")
-        max_length = max_tokens // chunk_size
-    else:
-        max_length = max_tokens
-    weights = torch.arange(1, max_length + 1, dtype=torch.float64).reciprocal()
-    sampled_lengths = torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist()
-    lengths = tuple(length * chunk_size if padded else length for length in sampled_lengths)
+    weights = torch.arange(1, max_tokens + 1, dtype=torch.float64).reciprocal()
+    lengths = tuple(torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist())
     return lengths, (0, *accumulate(lengths))
 
 
@@ -167,7 +152,6 @@ class KDAAttention(nn.Module):
         num_heads: int,
         head_dim: int,
         *,
-        chunk_size: int = 64,
         short_conv_kernel_size: int = 4,
         lower_bound: float = -5.0,
         backend: Backend = "reference",
@@ -181,23 +165,27 @@ class KDAAttention(nn.Module):
         super().__init__()
         if hidden_size < 1 or num_heads < 1 or head_dim < 1:
             raise ValueError("hidden_size, num_heads, and head_dim must be positive")
-        if chunk_size < 1:
-            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if short_conv_kernel_size < 1:
             raise ValueError(
                 f"short_conv_kernel_size must be positive, got {short_conv_kernel_size}"
             )
-        if not math.isfinite(lower_bound) or lower_bound > 0:
-            raise ValueError(f"lower_bound must be finite and non-positive, got {lower_bound}")
         if backend not in ("reference", "fused"):
             raise ValueError(f"backend must be 'reference' or 'fused', got {backend!r}")
-        if backend == "fused" and (head_dim != 128 or chunk_size != 64):
-            raise ValueError("the fused backend requires head_dim=128 and chunk_size=64")
+        if not math.isfinite(lower_bound) or lower_bound > 0.0:
+            raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
+        if backend == "fused" and lower_bound < -MAX_GATE_LOWER_BOUND_MAGNITUDE:
+            raise ValueError(
+                f"the fused backend requires lower_bound >= "
+                f"{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, got {lower_bound}"
+            )
+        if backend == "fused" and head_dim != 128:
+            raise ValueError("the fused backend requires head_dim=128")
+        if backend == "reference" and fastmath:
+            raise ValueError("fastmath applies only to backend='fused'")
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.chunk_size = chunk_size
         self.lower_bound = lower_bound
         self.backend = backend
         self.fastmath = fastmath
@@ -293,54 +281,17 @@ class KDAAttention(nn.Module):
         # These barriers exclude undefined primitive dInputs from projection dW.
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
         beta = mask_inactive_token_gradients(beta, active_mask)
-        if cu_seqlens is None:
-            metadata = None
-        else:
-            with _kernel_annotation(
-                self.enable_graph_annotations,
-                "kda/chunk_metadata",
-            ):
-                metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, self.chunk_size)
-        if metadata is None:
-            cumulative_gate = self.gate_prefix_sum(raw_gate)
-            output, final_state = self.kda_core(
-                q,
-                k,
-                v,
-                cumulative_gate,
-                beta,
-                initial_state,
-                return_final_state=return_final_state,
-            )
-        else:
-            with _kernel_annotation(
-                self.enable_graph_annotations,
-                "kda/gate_prefix_sum/fused",
-            ):
-                cumulative_gate = _bounded_gate_cumsum(
-                    raw_gate,
-                    self.A_log,
-                    self.dt_bias,
-                    chunk_size=self.chunk_size,
-                    lower_bound=self.lower_bound,
-                    fastmath=self.fastmath,
-                    metadata=metadata,
-                )
-            with _kernel_annotation(
-                self.enable_graph_annotations,
-                "kda/core/fused",
-            ):
-                output, final_state = _chunk_kda(
-                    q,
-                    k,
-                    v,
-                    cumulative_gate,
-                    beta,
-                    initial_state,
-                    metadata=metadata,
-                    output_final_state=return_final_state,
-                    fastmath=self.fastmath,
-                )
+        gate = self.gate_activation(raw_gate)
+        output, final_state = self.kda_core(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens=cu_seqlens,
+            return_final_state=return_final_state,
+        )
         # KDA leaves its output suffix undefined; sanitize it before RMSNorm saves it.
         output = self.output_normalization(mask_inactive_tokens(output, active_mask))
         output_gate = self.output_gate(hidden_states_compute, output)
@@ -412,7 +363,10 @@ class KDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.backend == "reference":
-            return l2norm_fwd_ref(q.float()), l2norm_fwd_ref(k.float())
+            q, k = q.float(), k.float()
+            q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+            k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+            return q, k
 
         return l2norm(q, cu_seqlens=cu_seqlens), l2norm(k, cu_seqlens=cu_seqlens)
 
@@ -438,33 +392,16 @@ class KDAAttention(nn.Module):
         )
         return raw_gate.contiguous(), beta
 
-    @annotate_kernels("kda/gate_prefix_sum/{backend}")
-    def gate_prefix_sum(
-        self,
-        raw_gate: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if self.backend == "reference":
-            return gate_fwd_ref(
-                raw_gate,
-                self.A_log,
-                self.dt_bias,
-                self.lower_bound,
-                math.log2(math.e),
-                False,
-                self.chunk_size,
-                None,
-            )
-
-        return _bounded_gate_cumsum(
+    @annotate_kernels("kda/gate_activation")
+    def gate_activation(self, raw_gate: torch.Tensor) -> torch.Tensor:
+        """Map projection outputs to per-token natural-log decay."""
+        return bound_gate(
             raw_gate,
             self.A_log,
             self.dt_bias,
-            chunk_size=self.chunk_size,
             lower_bound=self.lower_bound,
             fastmath=self.fastmath,
-            cu_seqlens=cu_seqlens,
+            impl=self.backend,
         )
 
     @annotate_kernels("kda/core/{backend}")
@@ -473,35 +410,24 @@ class KDAAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cumulative_gate: torch.Tensor,
+        gate: torch.Tensor,
         beta: torch.Tensor,
         initial_state: torch.Tensor | None,
         *,
         cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.backend == "reference":
-            return naive_chunk_kda_from_cumulative(
-                q,
-                k,
-                v.float(),
-                cumulative_gate,
-                beta,
-                initial_state=initial_state,
-                output_final_state=return_final_state,
-                chunk_size=self.chunk_size,
-            )
-
-        return _chunk_kda(
+        return chunk_kda(
             q,
             k,
             v,
-            cumulative_gate,
+            gate,
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
             output_final_state=return_final_state,
             fastmath=self.fastmath,
+            impl=self.backend,
         )
 
     @annotate_kernels("kda/output_normalization")
@@ -556,7 +482,6 @@ def main(
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 2304,
     num_heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 32,
     head_dim: Annotated[int, typer.Option(min=1, help="Channels per KDA head.")] = 128,
-    chunk_size: Annotated[int, typer.Option(min=1, help="KDA recurrence chunk size.")] = 64,
     short_conv_kernel_size: Annotated[
         int,
         typer.Option(min=1, help="Causal Q/K/V convolution width."),
@@ -581,22 +506,15 @@ def main(
         bool,
         typer.Option(help="Pack batch-size Zipf-distributed sequences bounded by tokens."),
     ] = False,
-    padded: Annotated[
-        bool,
-        typer.Option(help="Round packed Zipf samples to complete recurrence chunks."),
-    ] = False,
 ) -> None:
     """Train the single-device KDA example."""
     torch.manual_seed(0)
     if packed and backend != BackendOption.FUSED:
         raise ValueError("--packed requires --backend=fused")
-    if padded and not packed:
-        raise ValueError("--padded requires --packed")
     model = KDAAttention(
         hidden_size,
         num_heads,
         head_dim,
-        chunk_size=chunk_size,
         short_conv_kernel_size=short_conv_kernel_size,
         backend=backend.value,
         device=device,
@@ -608,15 +526,10 @@ def main(
     input_shape = (batch_size, tokens, hidden_size)
     layout_name = ""
     if packed:
-        sequence_lengths, offsets = packed_sequence_metadata(
-            batch_size,
-            tokens,
-            chunk_size,
-            padded=padded,
-        )
+        sequence_lengths, offsets = packed_sequence_metadata(batch_size, tokens)
         cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
         input_shape = (1, offsets[-1], hidden_size)
-        layout_name = "_packed_padded" if padded else "_packed"
+        layout_name = "_packed"
         print(f"packed_sequence_lengths={sequence_lengths} cu_seqlens={offsets}")
     hidden_states = torch.randn(input_shape, device=device)
     target = torch.randn_like(hidden_states)

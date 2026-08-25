@@ -9,7 +9,6 @@ from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capac
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
-from attn_gym.linear.kda.impl.fused import chunk_forward as _chunk_kda
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op as _chunk_kda_bwd_op,
 )
@@ -348,8 +347,6 @@ def _chunk_kda_bwd_with_state_grad_cuda(*args) -> tuple[torch.Tensor, ...]:
     return _chunk_kda_bwd_shared(*args)
 
 
-forward = _chunk_kda
-
 __all__ = [
     "_chunk_kda_bwd_op",
     "_chunk_kda_bwd_with_state_grad_op",
@@ -357,5 +354,4 @@ __all__ = [
     "_chunk_kda_fwd_ragged_op",
     "_chunk_kda_fwd_ragged_with_state_op",
     "_chunk_kda_fwd_with_state_op",
-    "forward",
 ]
