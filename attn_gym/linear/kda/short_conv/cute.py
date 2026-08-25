@@ -35,6 +35,7 @@ from attn_gym._backends.cute import (
     tune,
 )
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda import ops as kda_ops
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
 from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
@@ -284,6 +285,7 @@ class ShortConvKernel:
         width: int,
         config: ShortConvConfig,
         dtype: ShortConvDType,
+        use_int64_offsets: bool = False,
     ):
         self.sequences = sequences
         self.tokens = tokens
@@ -293,6 +295,17 @@ class ShortConvKernel:
         self.channels_per_thread = config.channels_per_thread
         self.times_per_block = config.times_per_block
         self.dtype = dtype
+        self.use_int64_offsets = use_int64_offsets
+
+    @cute.jit
+    def upcast_offset(self, value):
+        """Widen an address operand before any potentially overflowing arithmetic."""
+        return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
+
+    @cute.jit
+    def flattened_row(self, batch, time):
+        """Return ``batch * tokens + time`` without overflowing before widening."""
+        return self.upcast_offset(batch) * self.tokens + self.upcast_offset(time)
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
@@ -305,6 +318,8 @@ class ShortConvKernel:
         name += f"_v{self.channels_per_thread}"
         if self.tma_stage_tokens:
             name += f"_tma{self.tma_stage_tokens}"
+        if self.use_int64_offsets:
+            name += "_i64"
         return name
 
 
@@ -331,8 +346,17 @@ class CausalConv1dSiluForward(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
+        use_int64_offsets: bool = False,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            use_int64_offsets,
+        )
         self.batches = batches
         self.activation = activation
 
@@ -377,7 +401,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 if input_time >= 0 and input_time < active_endpoint:
                     inputs[(None, input_offset)].store(
                         x_groups[
-                            ((0, None), (batch * self.tokens + input_time, channel_group))
+                            ((0, None), (self.flattened_row(batch, input_time), channel_group))
                         ].load()
                     )
 
@@ -438,9 +462,9 @@ class CausalConv1dSiluForward(ShortConvKernel):
                                         + inputs[(None, time_offset + tap)].load().to(Float32)
                                         * weights[(None, tap)].load()
                                     )
-                    output_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
-                        self.activation(value).to(self.dtype.cute_type)
-                    )
+                    output_groups[
+                        ((0, None), (self.flattened_row(batch, time), channel_group))
+                    ].store(self.activation(value).to(self.dtype.cute_type))
 
     @cute.kernel
     def kernel(
@@ -617,8 +641,17 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        use_int64_offsets: bool = False,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            use_int64_offsets,
+        )
         self.batches = batches
         self.d_activation = d_activation
 
@@ -662,7 +695,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                 if input_time >= 0 and input_time < self.tokens:
                     inputs[(None, input_offset)].store(
                         x_groups[
-                            ((0, None), (batch * self.tokens + input_time, channel_group))
+                            ((0, None), (self.flattened_row(batch, input_time), channel_group))
                         ].load()
                     )
 
@@ -729,7 +762,9 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                         )
                     derivative = self.d_activation(value)
                     incoming = (
-                        dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                        dy_groups[
+                            ((0, None), (self.flattened_row(batch, output_time), channel_group))
+                        ]
                         .load()
                         .to(Float32)
                     )
@@ -777,7 +812,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                         Float32(0.0),
                         reduction_profile=(None, 1),
                     )
-                    dx_groups[((0, None), (batch * self.tokens + time, channel_group))].store(
+                    dx_groups[((0, None), (self.flattened_row(batch, time), channel_group))].store(
                         value.to(self.dtype.cute_type)
                     )
 
@@ -826,8 +861,17 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        use_int64_offsets: bool = False,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            use_int64_offsets,
+        )
         self.batches = batches
         self.d_activation = d_activation
 
@@ -891,7 +935,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                                     x_groups[
                                         (
                                             (0, None),
-                                            (batch * self.tokens + input_time, channel_group),
+                                            (self.flattened_row(batch, input_time), channel_group),
                                         )
                                     ]
                                     .load()
@@ -915,7 +959,9 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                         )
                         derivative = self.d_activation(value)
                         incoming = (
-                            dy_groups[((0, None), (batch * self.tokens + time, channel_group))]
+                            dy_groups[
+                                ((0, None), (self.flattened_row(batch, time), channel_group))
+                            ]
                             .load()
                             .to(Float32)
                         )
@@ -978,12 +1024,22 @@ class ShortConvTmaKernel:
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        use_int64_offsets: bool = False,
     ):
         channel_tile = config.threads * config.channels_per_thread
         assert channels % channel_tile == 0, (
             f"TMA channels ({channels}) must be divisible by the channel tile ({channel_tile})"
         )
-        super().__init__(batches, tokens, channels, width, config, dtype, d_activation)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            d_activation,
+            use_int64_offsets,
+        )
 
     def staged_layout(self):
         channels_per_block = self.threads * self.channels_per_thread
@@ -1050,7 +1106,7 @@ class ShortConvTmaKernel:
             if history_time >= sequence_start:
                 history[(None, history_offset)].store(
                     x_groups[
-                        ((0, None), (batch * self.tokens + history_time, channel_group))
+                        ((0, None), (self.flattened_row(batch, history_time), channel_group))
                     ].load()
                 )
             elif cutlass.const_expr(initial_state is not None):
@@ -1217,8 +1273,18 @@ class CausalConv1dSiluInputGradientTma(
         dtype: ShortConvDType,
         d_activation,
         time_workers: int = 0,
+        use_int64_offsets: bool = False,
     ):
-        super().__init__(batches, tokens, channels, width, config, dtype, d_activation)
+        super().__init__(
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            d_activation,
+            use_int64_offsets,
+        )
         if time_workers:
             assert config.times_per_block >= self.stages * self.tma_stage_tokens, (
                 "persistent TMA input gradients require at least one full pipeline cycle"
@@ -1263,9 +1329,9 @@ class CausalConv1dSiluInputGradientTma(
         if cutlass.const_expr(packed):
             owns_input = owns_input and input_time >= sequence_start
         if owns_input:
-            grad_x_groups[((0, None), (batch * self.tokens + input_time, channel_group))].store(
-                dx_value.to(self.dtype.cute_type)
-            )
+            grad_x_groups[
+                ((0, None), (self.flattened_row(batch, input_time), channel_group))
+            ].store(dx_value.to(self.dtype.cute_type))
 
     @cute.jit
     def flush_mainloop_sequence(
@@ -1406,7 +1472,7 @@ class CausalConv1dSiluInputGradientTma(
                 if history_time >= sequence_start:
                     history[(None, history_offset)].store(
                         x_groups[
-                            ((0, None), (batch * self.tokens + history_time, channel_group))
+                            ((0, None), (self.flattened_row(batch, history_time), channel_group))
                         ].load()
                     )
         else:
@@ -1533,11 +1599,11 @@ class CausalConv1dSiluInputGradientTma(
             if has_input:
                 current.store(
                     x_groups[
-                        ((0, None), (batch * self.tokens + output_time, channel_group))
+                        ((0, None), (self.flattened_row(batch, output_time), channel_group))
                     ].load()
                 )
                 incoming.store(
-                    dy_groups[((0, None), (batch * self.tokens + output_time, channel_group))]
+                    dy_groups[((0, None), (self.flattened_row(batch, output_time), channel_group))]
                     .load()
                     .to(Float32)
                 )
@@ -1949,7 +2015,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                     if cutlass.const_expr(self.dtype.name == "fp32"):
                         for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                             history[channel_offset, history_offset] = x[
-                                batch * self.tokens + history_time,
+                                self.flattened_row(batch, history_time),
                                 channel + channel_offset,
                             ]
                     else:
@@ -1957,7 +2023,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                             x_groups[
                                 (
                                     (0, None),
-                                    (batch * self.tokens + history_time, channel_group),
+                                    (self.flattened_row(batch, history_time), channel_group),
                                 )
                             ].load()
                         )
@@ -2135,8 +2201,17 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         d_activation,
+        use_int64_offsets: bool = False,
     ):
-        super().__init__(num_sequences, tokens, channels, width, config, dtype)
+        super().__init__(
+            num_sequences,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            use_int64_offsets,
+        )
         self.num_sequences = num_sequences
         self.d_activation = d_activation
 
@@ -2157,7 +2232,7 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
         channel = channel_group * self.channels_per_thread
 
         if cutlass.const_expr(cu_seqlens is None):
-            sequence_start = sequence * self.tokens
+            sequence_start = self.upcast_offset(sequence) * self.tokens
             sequence_end = sequence_start + self.tokens
         else:
             sequence_start = Int32(cu_seqlens[sequence])
@@ -2189,7 +2264,10 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                                 x_groups[
                                     (
                                         (0, None),
-                                        (sequence_start + input_offset, channel_group),
+                                        (
+                                            self.upcast_offset(sequence_start + input_offset),
+                                            channel_group,
+                                        ),
                                     )
                                 ]
                                 .load()
@@ -2218,7 +2296,10 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                         dy_groups[
                             (
                                 (0, None),
-                                (sequence_start + output_offset, channel_group),
+                                (
+                                    self.upcast_offset(sequence_start + output_offset),
+                                    channel_group,
+                                ),
                             )
                         ]
                         .load()
@@ -2234,7 +2315,11 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
             dstate_groups[
                 (
                     (0, None),
-                    (sequence * (self.width - 1) + history_offset, channel_group),
+                    (
+                        self.upcast_offset(sequence) * (self.width - 1)
+                        + self.upcast_offset(history_offset),
+                        channel_group,
+                    ),
                 )
             ].store(gradient.load().to(self.dtype.cute_type))
 
@@ -2319,11 +2404,19 @@ def _compile_forward(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    use_int64_offsets: bool = False,
 ):
     """Compile one static forward specialization."""
     activation_fn = activation.forward
     operation = CausalConv1dSiluForward(
-        batches, tokens, channels, width, config, dtype, activation_fn
+        batches,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        activation_fn,
+        use_int64_offsets,
     )
     return compile_tvm_ffi(
         operation,
@@ -2405,6 +2498,7 @@ def _compile_input_gradient(
     has_initial_state: bool,
     activation: Activation,
     time_workers: int = 0,
+    use_int64_offsets: bool = False,
 ):
     """Compile one static or explicitly persistent TMA input-gradient specialization."""
     derivative = activation.derivative
@@ -2423,10 +2517,18 @@ def _compile_input_gradient(
             dtype,
             derivative,
             time_workers,
+            use_int64_offsets,
         )
         if use_tma
         else CausalConv1dSiluInputGradient(
-            batches, tokens, channels, width, config, dtype, derivative
+            batches,
+            tokens,
+            channels,
+            width,
+            config,
+            dtype,
+            derivative,
+            use_int64_offsets,
         )
     )
     return compile_tvm_ffi(
@@ -2457,6 +2559,7 @@ def _compile_weight_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    use_int64_offsets: bool = False,
 ):
     """Compile one static weight-gradient specialization."""
     derivative = activation.derivative
@@ -2479,7 +2582,16 @@ def _compile_weight_gradient(
         if use_tma
         else CausalConv1dSiluWeightGradientPartials
     )
-    operation = operation_type(batches, tokens, channels, width, config, dtype, derivative)
+    operation = operation_type(
+        batches,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        derivative,
+        use_int64_offsets,
+    )
     return compile_tvm_ffi(
         operation,
         _fake_matrix(dtype, batches * tokens, channels),
@@ -2508,13 +2620,21 @@ def _compile_initial_state_gradient(
     channels_per_thread: int,
     num_sequences: int | None,
     activation: Activation,
+    use_int64_offsets: bool = False,
 ):
     """Compile one initial-state gradient specialization."""
     derivative = activation.derivative
     state_sequences = batches if num_sequences is None else num_sequences
     config = ShortConvConfig(threads, channels_per_thread, times_per_block=1)
     operation = CausalConv1dSiluInitialStateGradient(
-        state_sequences, tokens, channels, width, config, dtype, derivative
+        state_sequences,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        derivative,
+        use_int64_offsets,
     )
     return compile_tvm_ffi(
         operation,
@@ -2646,6 +2766,7 @@ def _launch_forward(
         None if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         initial_state is not None,
         resolved_activation,
+        requires_int64_abi(x, output),
     )
     compiled(
         x.view(batches * tokens, channels),
@@ -2705,6 +2826,7 @@ def _launch_backward(
         initial_state is not None,
         resolved_activation,
         input_time_workers,
+        requires_int64_abi(x, grad_output, grad_x),
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2736,6 +2858,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        requires_int64_abi(x, grad_output),
     )(
         x.view(batches * tokens, channels),
         weight,
@@ -2755,6 +2878,7 @@ def _launch_backward(
             input_config.channels_per_thread,
             num_sequences,
             resolved_activation,
+            requires_int64_abi(x, grad_output),
         )(
             x.view(batches * tokens, channels),
             weight,
