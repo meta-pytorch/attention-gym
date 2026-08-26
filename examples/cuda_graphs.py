@@ -11,7 +11,6 @@ import typer
 from torch import nn
 from torch.cuda.graph_annotations import mark_kernels
 from torch.nn.attention.varlen import varlen_attn
-from transformer_nuggets.utils.benchmark import profiler
 
 Tensor = torch.Tensor
 GraphOutput = TypeVar("GraphOutput")
@@ -83,6 +82,8 @@ def get_zipf_tokens(
 
 
 def hello_world() -> Tensor:
+    from transformer_nuggets.utils.benchmark import profiler
+
     total_tokens = 4096
     dim = 512
     num_heads = 8
@@ -133,6 +134,8 @@ def capture_graph(
 
 # --8<-- [start:hello-world-graph]
 def hello_world_graph() -> Tensor:
+    from transformer_nuggets.utils.benchmark import profiler
+
     total_tokens = 4096
     dim = 512
     num_heads = 8
@@ -332,6 +335,8 @@ def training_loop_profiler(
     trace_format: TraceFormat = "track_event",
     fix_overlapping_events: bool = True,
 ):
+    from transformer_nuggets.utils.benchmark import profiler
+
     if trace_path is None:
         trace_path = TRACE_PATH / "docs/assets/traces/hello_world_training_loop"
     return profiler(
