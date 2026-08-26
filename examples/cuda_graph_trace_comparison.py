@@ -4,7 +4,6 @@ import multiprocessing
 from pathlib import Path
 
 import torch
-from transformer_nuggets.utils.merge_traces import merge_traces
 
 from examples.cuda_graphs import hello_world_training_loop
 
@@ -30,6 +29,8 @@ def _capture_trace(
 
 def main() -> None:
     """Capture stock and annotated arms, then write one native Perfetto trace."""
+    from transformer_nuggets.utils.merge_traces import merge_traces
+
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     before_trace = WORK_DIR / "before-raw.json"
     after_trace = WORK_DIR / "after-postprocessed.json.gz"

@@ -8,8 +8,8 @@
 
 from __future__ import annotations
 
-import math
 from numbers import Real
+from sys import float_info
 
 import torch
 
@@ -46,7 +46,7 @@ def _validate_bound_gate_inputs(
     if isinstance(lower_bound, bool) or not isinstance(lower_bound, Real):
         raise TypeError(f"lower_bound must be a real scalar, got {type(lower_bound).__name__}")
     lower_bound = float(lower_bound)
-    if not math.isfinite(lower_bound) or lower_bound > 0.0:
+    if not -float_info.max <= lower_bound <= 0.0:
         raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
     return heads, head_dim, lower_bound
 
