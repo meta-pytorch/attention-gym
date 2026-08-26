@@ -149,7 +149,7 @@ def selected_attention(
     sliding_window_size: int = 512,
     backend: str = "triton",
     mode: str = "auto",
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     """
     Performs selected attention.
         Each query attends to the previous sliding_window_size elements in the local_kv tensor
@@ -194,7 +194,8 @@ def selected_attention(
 
         mode: Currently only chunked is supported; auto defaults to chunked
     Returns:
-        Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
+        Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
+        head_dim) and lse has shape (batch_size, num_heads, sequence_length).
     """
     share_kv = sparse_kv.shape[1] == 1
     if not torch.compiler.is_compiling():

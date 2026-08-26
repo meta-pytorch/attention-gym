@@ -72,7 +72,7 @@ def selected_attention(
     doc_ids: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     """
     Performs selected attention as follows:
         if share_kv:
@@ -116,7 +116,8 @@ def selected_attention(
 
         share_kv: bool, true iff all query heads attend to the same KV head
     Returns:
-        Tensor in shape of (batch_size, num_heads, sequence_length, head_dim)
+        Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
+        head_dim) and lse has shape (batch_size, num_heads, sequence_length).
     """
     device = query.device
     dtype = query.dtype
@@ -176,6 +177,10 @@ def selected_attention(
     probs_with_sink = torch.softmax(logits_with_sink, dim=-1)
     probs = probs_with_sink[..., :-1].to(dtype)
 
+    # Compute log-sum-exp over the full logits (including sink).
+    lse = torch.logsumexp(logits_with_sink, dim=-1)  # (b, h, s)
+
     # The low-precision P and KV operands accumulate in FP32 before the output
     # is stored in the input dtype, as in a tensor-core dot.
-    return torch.matmul(probs.to(accumulation_dtype), attention_kv_acc).to(dtype)
+    output = torch.matmul(probs.to(accumulation_dtype), attention_kv_acc).to(dtype)
+    return output, lse

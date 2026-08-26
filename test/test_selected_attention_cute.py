@@ -121,7 +121,7 @@ def test_cute_precision_vs_fp64(
     sparse_kv_lp_cute = sparse_kv_lp.clone().requires_grad_(True)
 
     # --- Forward ---
-    out_64 = selected_attention(
+    out_64, _ = selected_attention(
         query_64,
         local_kv_64,
         sparse_kv_64,
@@ -131,7 +131,7 @@ def test_cute_precision_vs_fp64(
         sliding_window_size,
         backend="eager",
     )
-    out_lp_ref = selected_attention(
+    out_lp_ref, _ = selected_attention(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
@@ -141,7 +141,7 @@ def test_cute_precision_vs_fp64(
         sliding_window_size,
         backend="eager",
     )
-    out_lp_cute = selected_attention(
+    out_lp_cute, _ = selected_attention(
         query_lp_cute,
         local_kv_lp_cute,
         sparse_kv_lp_cute,
@@ -199,3 +199,47 @@ def test_cute_precision_vs_fp64(
             sparse_kv_64.grad,
             reduction_sizes=dsparse_kv_reduction_sizes,
         )
+
+
+# ---------------------------------------------------------------------------
+# LSE correctness
+# ---------------------------------------------------------------------------
+
+
+def test_cute_lse_matches_manual_computation():
+    """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
+    _skip_no_sm100()
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch, heads, seq_len, head_dim = 1, 128, 64, 512
+    sparse_seq_len = 32
+    num_topk = 16
+    window = 32
+
+    torch.manual_seed(99)
+    query = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    local_kv = torch.randn(batch, 1, seq_len, head_dim, device=device, dtype=dtype)
+    sparse_kv = torch.randn(batch, 1, sparse_seq_len, head_dim, device=device, dtype=dtype)
+    kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, num_topk), device=device)
+    sink = None
+
+    _, lse_cute = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend="cute"
+    )
+
+    # Use the eager backend on the same inputs (promoted to fp64) as ground truth.
+    _, lse_eager = selected_attention(
+        query.double(),
+        local_kv.double(),
+        sparse_kv.double(),
+        kv_indices,
+        sink,
+        None,
+        window,
+        backend="eager",
+    )
+
+    assert lse_cute.shape == (batch, heads, seq_len)
+    assert lse_eager.shape == (batch, heads, seq_len)
+    # CuTe operates in bf16/fp32 so allow tolerance comparable to the forward output.
+    torch.testing.assert_close(lse_cute.double(), lse_eager, atol=0.05, rtol=0.02)

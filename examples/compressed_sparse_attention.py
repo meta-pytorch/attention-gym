@@ -348,7 +348,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output = _selected_attention_with_causal_blocks(
+    attention_output, _ = _selected_attention_with_causal_blocks(
         Q,
         KV,
         compressed_kv,

@@ -120,11 +120,15 @@ def selected_attention(
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool = True,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL (SM100) forward+backward for selected attention.
 
     Eager-only — torch.compile is not supported for this backend.
     Attention sinks are not supported (assumes sink weight ≈ 0).
+
+    Returns:
+        Tuple of (output, lse) where output has shape (batch, heads, seq, head_dim)
+        and lse has shape (batch, heads, seq).
     """
     _validate_cute_constraints(
         query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
@@ -157,7 +161,7 @@ def selected_attention(
     # Call FA4's public interface.
     # Passing k=v (same object) with hdim=512 triggers MLA mode internally:
     # FA4 moves q into qv and nulls q/k, then routes to the sparse MLA kernels.
-    out, _lse = flash_attn_func(
+    out, lse = flash_attn_func(
         q=qv_bshd,
         k=v_bshd,
         v=v_bshd,
@@ -169,4 +173,5 @@ def selected_attention(
     )
 
     # Back to BHSD: (batch, nheads, seqlen, hdim)
-    return out.permute(0, 2, 1, 3)
+    # FA4 returns out as (batch, seqlen, nheads, hdim) and lse as (batch, nheads, seqlen).
+    return out.permute(0, 2, 1, 3), lse

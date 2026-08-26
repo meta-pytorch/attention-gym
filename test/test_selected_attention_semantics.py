@@ -113,7 +113,7 @@ def test_local_only_matches_manual_computation(backend):
     kv_indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
     )
 
@@ -135,7 +135,7 @@ def test_local_only_matches_manual_computation(backend):
     expected = probs @ local_kv
 
     sparse_kv2 = torch.randn_like(sparse_kv)
-    out2 = selected_attention(
+    out2, _ = selected_attention(
         query, local_kv, sparse_kv2, kv_indices, sink, None, window, backend=backend
     )
 
@@ -167,7 +167,7 @@ def test_selected_block_only_manual(backend):
 
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend=backend
     )
 
@@ -189,7 +189,7 @@ def test_selected_block_only_manual(backend):
     expected = torch.bmm(probs.unsqueeze(1), gathered).squeeze(1)  # (4, 8)
 
     local_kv2 = torch.randn_like(local_kv)
-    out2 = selected_attention(
+    out2, _ = selected_attention(
         query, local_kv2, sparse_kv, kv_indices, sink, None, 0, backend=backend
     )
 
@@ -225,7 +225,7 @@ def test_joint_normalization(backend):
 
     kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
     )
 
@@ -288,7 +288,7 @@ def test_sink_large_absorbs_probability(backend):
     # Very large positive sink
     sink = torch.full((h,), 50.0, device=device, dtype=dtype)
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
     )
 
@@ -318,7 +318,7 @@ def test_sink_very_negative_has_no_effect(backend):
     # Very negative sink (contributes nothing)
     sink = torch.full((h,), -100.0, device=device, dtype=dtype)
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
     )
 
@@ -348,7 +348,7 @@ def test_float32_attention_sink(backend):
     kv_indices = torch.tensor([[[0, 1], [1, 2], [2, 3], [0, 3]]], device=device, dtype=torch.int32)
     attention_sink = torch.randn(2, device=device, dtype=torch.float32)
 
-    high_precision_expected = selected_attention(
+    high_precision_expected, _ = selected_attention(
         query.double(),
         local_kv.double(),
         sparse_kv.double(),
@@ -358,10 +358,10 @@ def test_float32_attention_sink(backend):
         2,
         backend="eager",
     )
-    low_precision_expected = selected_attention(
+    low_precision_expected, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend="eager"
     )
-    actual = selected_attention(
+    actual, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend=backend
     )
 
@@ -421,7 +421,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
     )
     expected = (probabilities.float() @ attention_kv.float()).to(torch.bfloat16)
 
-    actual = selected_attention(
+    actual, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -431,7 +431,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
         window,
         backend="eager",
     )
-    actual_float32_sink = selected_attention(
+    actual_float32_sink, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -477,7 +477,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     # All slots repeat position 2
     kv_indices = torch.full((b, s, num_repeats), 2, dtype=torch.long, device=device)
 
-    out_eager = selected_attention(
+    out_eager, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
     )
     grad_output = torch.randn_like(out_eager)
@@ -492,7 +492,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     sparse_kv.grad = None
     sink.grad = None
 
-    out_triton = selected_attention(
+    out_triton, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
     )
     out_triton.backward(grad_output)
@@ -525,10 +525,10 @@ def test_mixed_repeated_and_unique_indices_backends_match():
         device=device,
     )
 
-    out_eager = selected_attention(
+    out_eager, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, 3, backend="eager"
     )
-    out_triton = selected_attention(
+    out_triton, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, 3, backend="triton"
     )
 
@@ -551,7 +551,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         tensor.detach().double().requires_grad_(True) for tensor in differentiable_inputs
     )
 
-    high_precision_expected = selected_attention(
+    high_precision_expected, _ = selected_attention(
         high_precision_inputs[0],
         high_precision_inputs[1],
         high_precision_inputs[2],
@@ -561,7 +561,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         19,
         backend="eager",
     )
-    expected = selected_attention(
+    expected, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -571,7 +571,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         19,
         backend="eager",
     )
-    actual = selected_attention(
+    actual, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -620,7 +620,7 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True)
     try:
-        expected = selected_attention(
+        expected, _ = selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -630,7 +630,7 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
             19,
             backend="eager",
         )
-        actual = selected_attention(
+        actual, _ = selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -687,7 +687,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
     attention_sink = torch.randn(heads, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
-    expected = selected_attention(
+    expected, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -697,7 +697,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         window,
         backend="eager",
     )
-    actual = selected_attention(
+    actual, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -758,7 +758,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         tensor.detach().double().requires_grad_(True) for tensor in differentiable_inputs
     )
 
-    high_precision_expected = selected_attention(
+    high_precision_expected, _ = selected_attention(
         high_precision_inputs[0],
         high_precision_inputs[1],
         high_precision_inputs[2],
@@ -768,7 +768,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         window,
         backend="eager",
     )
-    expected = selected_attention(
+    expected, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -778,7 +778,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         window,
         backend="eager",
     )
-    actual = selected_attention(
+    actual, _ = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -827,7 +827,7 @@ def test_shared_kv_blackwell_dsv4_forward():
     attention_sink = torch.randn(heads, device="cuda", dtype=torch.float32)
 
     with torch.inference_mode():
-        high_precision_expected = selected_attention(
+        high_precision_expected, _ = selected_attention(
             query.double(),
             local_kv.double(),
             sparse_kv.double(),
@@ -837,7 +837,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             window,
             backend="eager",
         )
-        low_precision_expected = selected_attention(
+        low_precision_expected, _ = selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -847,7 +847,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             window,
             backend="eager",
         )
-        actual = selected_attention(
+        actual, _ = selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -889,7 +889,7 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
     def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids):
-        return selected_attention(
+        out, _lse = selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -899,6 +899,7 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
             19,
             backend="triton",
         )
+        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
     compiled_inputs = tuple(
@@ -947,9 +948,10 @@ def test_torch_compile_fullgraph_forward():
     sink = torch.randn(h, device=device, dtype=dtype)
 
     def fn(query, local_kv, sparse_kv, kv_indices, sink):
-        return selected_attention(
+        out, _lse = selected_attention(
             query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
         )
+        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
@@ -976,9 +978,10 @@ def test_torch_compile_fullgraph_backward(backend):
     _, kv_indices = torch.topk(scores, k=topk, dim=-1)
 
     def fn(query, local_kv, sparse_kv, sink):
-        return selected_attention(
+        out, _lse = selected_attention(
             query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
         )
+        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
@@ -1034,7 +1037,7 @@ def test_repeated_indices_manual_forward_and_backward():
     #             query 2 selects [1,3,3] (pos 1 once, pos 3 twice)
     kv_indices = torch.tensor([[[0, 0, 1], [2, 2, 2], [1, 3, 3]]])
 
-    out = selected_attention(
+    out, _ = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend="eager"
     )
 
@@ -1074,3 +1077,58 @@ def test_repeated_indices_manual_forward_and_backward():
 
     torch.testing.assert_close(query.grad, query_m.grad, atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(sparse_kv.grad, sparse_kv_m.grad, atol=1e-12, rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 9. LSE correctness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lse_matches_manual_computation(backend):
+    """Returned LSE matches manual logsumexp over all logits including the sink."""
+    device = _device_for_backend(backend)
+    dtype = torch.float64 if backend == "eager" else torch.float32
+    b, h, s, d = 1, 1, 6, 8
+    window = 3
+    sparse_seq_len = 4
+    num_topk = 2
+
+    torch.manual_seed(77)
+    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
+    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
+    kv_indices = torch.randint(0, sparse_seq_len, (b, s, num_topk), device=device)
+    sink = torch.randn(h, device=device, dtype=dtype)
+
+    _, lse = selected_attention(
+        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
+    )
+
+    # Manual: for each query position, compute logsumexp over all attended logits + sink
+    scale = d**0.5
+    q = query[0, 0]  # (s, d)
+    lkv = local_kv[0, 0]  # (s, d)
+    skv = sparse_kv[0, 0]  # (sparse_seq_len, d)
+    sink_val = sink[0]
+
+    expected_lse = torch.zeros(s, device=device, dtype=torch.float64)
+    for seq in range(s):
+        # Gather sparse entries
+        gathered_sparse = skv[kv_indices[0, seq]]  # (num_topk, d)
+
+        # Gather local window entries
+        first = max(0, seq - window + 1)
+        local_entries = lkv[first : seq + 1]  # (window_len, d)
+
+        # All KV entries this query attends to
+        all_kv = torch.cat([gathered_sparse, local_entries], dim=0)
+
+        # Compute logits + sink
+        logits = (q[seq].double() @ all_kv.double().T) / scale
+        logits_with_sink = torch.cat([logits, sink_val.double().unsqueeze(0)])
+        expected_lse[seq] = torch.logsumexp(logits_with_sink, dim=0)
+
+    atol = 1e-4 if backend == "triton" else 1e-10
+    assert lse.shape == (b, h, s)
+    torch.testing.assert_close(lse[0, 0].double(), expected_lse, atol=atol, rtol=1e-4)
