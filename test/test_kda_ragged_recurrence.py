@@ -134,6 +134,8 @@ def _run_persistent_overflow_case(
     final_state = torch.empty_like(inputs[-1])
     h, v_new = _delta_h_launch(
         *inputs,
+        None,
+        None,
         metadata.cu_seqlens,
         metadata.chunk_offsets,
         metadata.capacity,
@@ -392,6 +394,8 @@ def test_ragged_recurrence_persistent_cuda_graph_replays_active_sequences(
         u,
         gk,
         initial_state,
+        None,
+        None,
         expected_metadata.cu_seqlens,
         expected_metadata.chunk_offsets,
         expected_metadata.capacity,

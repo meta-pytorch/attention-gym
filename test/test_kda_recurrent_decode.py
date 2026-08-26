@@ -476,6 +476,7 @@ def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
 
 
 def test_recurrent_decode_fullgraph_dynamic_batch():
+    torch.compiler.reset()
     with torch._dynamo.config.patch(error_on_recompile=True):
         compiled = torch.compile(recurrent_kda_decode, fullgraph=True, dynamic=True)
         for batch in (2, 3):
