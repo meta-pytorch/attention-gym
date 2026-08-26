@@ -12,7 +12,10 @@ inference prefill. Use ``impl`` to select fused kernels or the eager reference.
 
 from __future__ import annotations
 
+import sys
 from functools import partial
+from numbers import Real
+from typing import Literal
 
 import torch
 
@@ -20,11 +23,26 @@ from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
+from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
-from attn_gym.linear.kda.validation import validate_kda_inputs
+from attn_gym.linear.kda.validation import SUPPORTED_INPUT_DTYPES, validate_kda_inputs
 from attn_gym.linear.types import Impl, resolve_impl
 
 _CHUNK_SIZE = 64
+_DECODE_GATE_TRANSFORMS = {
+    "bounded": True,
+    "softplus": False,
+}
+
+
+def _resolve_decode_gate_transform(gate_transform: str) -> bool:
+    try:
+        return _DECODE_GATE_TRANSFORMS[gate_transform]
+    except KeyError:
+        supported = ", ".join(sorted(_DECODE_GATE_TRANSFORMS))
+        raise ValueError(
+            f"gate_transform must be one of {{{supported}}}, got {gate_transform!r}"
+        ) from None
 
 
 def chunk_kda(
@@ -262,4 +280,169 @@ def recurrent_kda(
     )
 
 
-__all__ = ["Impl", "chunk_kda", "recurrent_kda"]
+def recurrent_kda_decode(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    gate_transform: Literal["bounded", "softplus"] = "bounded",
+    lower_bound: float = -5.0,
+    scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one-token paged KDA decode with preprocessing fused into the recurrence.
+
+    Args:
+        packed_qkv: Post-convolution QKV shaped ``[B, H * (2 * K + V)]``. Each
+            token stores ``[Q for all heads | K for all heads | V for all heads]``;
+            within each section, head rows are contiguous.
+        raw_gate: Unactivated gate shaped ``[1, B, H, K]``.
+        raw_beta: Unactivated write gate shaped ``[1, B, H]``.
+        A_log: FP32 per-head log decay parameter shaped ``[H]``.
+        dt_bias: FP32 per-head/channel gate bias shaped ``[H, K]``.
+        state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots
+            may have padding between them but each ``[H, V, K]`` row must be dense.
+            ``K`` must be at most 256.
+            The prefill kernel uses ``[H, K, V]``, while this decode kernel uses
+            ``[H, V, K]`` because decode benefits significantly from a contiguous
+            ``K`` dimension. A prefill-to-decode transition therefore requires a
+            transpose/layout conversion.
+        state_indices: Contiguous int32 slot indices shaped ``[B]``. Non-positive
+            indices are padding/null entries: they produce zero output and leave the
+            cache untouched. Each positive index must be in ``[1, num_slots)`` and
+            unique among active rows because duplicate in-place updates race. These
+            value constraints are caller responsibilities and are not host-validated.
+        gate_transform: Pointwise gate transform. ``"bounded"`` computes
+            ``lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))``;
+            ``"softplus"`` computes
+            ``-exp(A_log) * softplus(raw_gate + dt_bias)``.
+        lower_bound: Finite nonpositive bound used only by the ``"bounded"`` transform.
+        scale: Query scale. Defaults to ``1 / sqrt(K)``.
+        out: Optional caller-owned contiguous output buffer shaped ``[1, B, H, V]``
+            in ``packed_qkv.dtype`` on the same device. When supplied, the kernel
+            writes into and returns this exact tensor. It must not alias any input.
+
+    Returns:
+        Decode output shaped ``[1, B, H, V]`` in ``packed_qkv.dtype``. This is
+        ``out`` itself when a buffer is supplied.
+
+    Q/K L2 normalization, gate activation, beta sigmoid, the recurrent update, and
+    the output projection from recurrent state are performed in one Triton kernel.
+    The operation is inference-only and advances ``state_cache`` in place.
+    """
+    if packed_qkv.ndim != 2 or packed_qkv.shape[0] < 1 or packed_qkv.stride(1) != 1:
+        raise ValueError("packed_qkv must have shape [B, C] and be contiguous within each token")
+    if state_cache.ndim != 4:
+        raise ValueError("state_cache must have shape [num_slots, H, V, K]")
+    num_slots, heads, value_dim, key_dim = state_cache.shape
+    batch = packed_qkv.shape[0]
+    if num_slots < 1 or heads < 1 or key_dim < 1 or value_dim < 1:
+        raise ValueError(
+            f"state_cache must have nonempty dimensions, got {tuple(state_cache.shape)}"
+        )
+    expected_channels = heads * (2 * key_dim + value_dim)
+    if packed_qkv.shape[1] != expected_channels:
+        raise ValueError(
+            f"packed_qkv must have shape ({batch}, {expected_channels}), "
+            f"got {tuple(packed_qkv.shape)}"
+        )
+    if raw_gate.shape != (1, batch, heads, key_dim) or raw_gate.stride()[2:] != (key_dim, 1):
+        raise ValueError(
+            f"raw_gate must have shape {(1, batch, heads, key_dim)} and dense [H, K] rows"
+        )
+    if raw_beta.shape != (1, batch, heads) or raw_beta.stride(2) != 1:
+        raise ValueError(f"raw_beta must have shape {(1, batch, heads)} with contiguous heads")
+    if A_log.shape != (heads,) or A_log.dtype != torch.float32 or not A_log.is_contiguous():
+        raise ValueError(f"A_log must be contiguous float32 with shape ({heads},)")
+    if (
+        dt_bias.shape != (heads, key_dim)
+        or dt_bias.dtype != torch.float32
+        or not dt_bias.is_contiguous()
+    ):
+        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads}, {key_dim})")
+    if state_cache.dtype != torch.float32:
+        raise TypeError("state_cache must use float32")
+    expected_state_strides = (value_dim * key_dim, key_dim, 1)
+    if state_cache.stride()[1:] != expected_state_strides:
+        raise TypeError("state_cache must be contiguous within each [H, V, K] slot")
+    if state_cache.stride(0) < heads * key_dim * value_dim:
+        raise ValueError("state_cache slots must not overlap")
+    if (
+        state_indices.shape != (batch,)
+        or state_indices.dtype != torch.int32
+        or not state_indices.is_contiguous()
+    ):
+        raise ValueError(f"state_indices must be contiguous int32 with shape ({batch},)")
+    if key_dim > 256:
+        raise ValueError(f"recurrent_kda_decode requires K in [1, 256], got {key_dim}")
+
+    device = packed_qkv.device
+    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias)
+    if any(tensor.device != device for tensor in (*data_tensors, state_cache, state_indices)):
+        raise ValueError("all recurrent_kda_decode inputs must be on the same device")
+    activation_tensors = (packed_qkv, raw_gate, raw_beta)
+    if any(tensor.dtype not in SUPPORTED_INPUT_DTYPES for tensor in activation_tensors):
+        supported = ", ".join(str(dtype) for dtype in SUPPORTED_INPUT_DTYPES)
+        raise TypeError(f"decode activation inputs must use one of {supported}")
+
+    use_lower_bound = _resolve_decode_gate_transform(gate_transform)
+    if use_lower_bound:
+        if not isinstance(lower_bound, Real) or isinstance(lower_bound, bool):
+            raise TypeError("lower_bound must be a real scalar")
+        lower_bound = float(lower_bound)
+        if (
+            lower_bound != lower_bound  # noqa: PLR0124 - compile-safe NaN check
+            or lower_bound < -sys.float_info.max
+            or lower_bound > 0
+        ):
+            raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
+    else:
+        lower_bound = 0.0
+    if scale is None:
+        scale = key_dim**-0.5
+    elif not isinstance(scale, Real) or isinstance(scale, bool):
+        raise TypeError("scale must be a real scalar or None")
+    else:
+        scale = float(scale)
+        if (
+            scale != scale  # noqa: PLR0124 - compile-safe NaN check
+            or scale <= 0
+            or scale > sys.float_info.max
+        ):
+            raise ValueError(f"scale must be finite and positive, got {scale}")
+
+    expected_output_shape = (1, batch, heads, value_dim)
+    if out is None:
+        out = packed_qkv.new_empty(expected_output_shape)
+    else:
+        if out.shape != expected_output_shape:
+            raise ValueError(
+                f"out must have shape {expected_output_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != packed_qkv.dtype:
+            raise TypeError(f"out must use packed_qkv.dtype ({packed_qkv.dtype}), got {out.dtype}")
+        if out.device != device:
+            raise ValueError("out must be on packed_qkv.device")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    return _fused_recurrent_decode_forward(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        out,
+        lower_bound,
+        use_lower_bound,
+        scale,
+    )
+
+
+__all__ = ["Impl", "chunk_kda", "recurrent_kda", "recurrent_kda_decode"]

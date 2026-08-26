@@ -16,6 +16,7 @@ from attn_gym.linear.kda import (
     mask_inactive_token_gradients,
     mask_inactive_tokens,
     recurrent_kda,
+    recurrent_kda_decode,
 )
 from attn_gym.linear.types import Impl
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 KDA_OPS = [
     "chunk_kda",
     "recurrent_kda",
+    "recurrent_kda_decode",
 ]
 
 GDN_OPS = [
