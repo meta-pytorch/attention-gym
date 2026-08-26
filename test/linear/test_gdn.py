@@ -62,6 +62,55 @@ def test_segmented_recurrent_execution_matches_full_sequence():
     torch.testing.assert_close(second_state, full_state)
 
 
+@pytest.mark.parametrize("function", REFERENCE_CASES)
+def test_packed_matches_independent_sequences(function):
+    q, k, v, gate, beta, _state = make_inputs(sequence=8)
+    q, k, v, gate, beta = (tensor[:1] for tensor in (q, k, v, gate, beta))
+    cu_seqlens = torch.tensor([0, 3, 3, 7], dtype=torch.int32)
+    initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1])
+
+    output, final_state = function(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    expected_output = torch.zeros_like(v)
+    expected_state = initial_state.clone()
+    for sequence, (begin, end) in enumerate(((0, 3), (3, 3), (3, 7))):
+        if begin == end:
+            continue
+        span = slice(begin, end)
+        span_output, span_state = function(
+            q[:, span],
+            k[:, span],
+            v[:, span],
+            gate[:, span],
+            beta[:, span],
+            initial_state[sequence : sequence + 1],
+            output_final_state=True,
+        )
+        expected_output[:, span] = span_output
+        expected_state[sequence] = span_state[0]
+
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(final_state, expected_state)
+
+
+@pytest.mark.parametrize("offsets", [[1, 3], [0, 4, 3], [0, 9]])
+def test_packed_rejects_invalid_offset_values(offsets):
+    inputs = make_inputs(sequence=8)
+    with pytest.raises(ValueError, match="start at zero, be nondecreasing"):
+        recurrent_gdn(
+            *(tensor[:1] for tensor in inputs[:-1]),
+            cu_seqlens=torch.tensor(offsets, dtype=torch.int32),
+        )
+
+
 def test_recurrent_execution_is_batch_invariant():
     inputs = make_inputs(sequence=5)
     batched_output, batched_state = recurrent_gdn(*inputs[:-1], output_final_state=True)
@@ -204,7 +253,9 @@ def test_impl_accepts_enum_and_string(function):
 
     with pytest.raises(ValueError, match="'fused', 'reference'"):
         function(*inputs[:-1], impl="eager")
-    with pytest.raises(NotImplementedError, match="impl='fused'"):
+    error = NotImplementedError if function is chunk_gdn else ValueError
+    message = "impl='fused'" if function is chunk_gdn else "requires CUDA tensors"
+    with pytest.raises(error, match=message):
         function(*inputs[:-1], impl=Impl.FUSED)
 
 
