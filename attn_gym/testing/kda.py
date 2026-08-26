@@ -52,10 +52,12 @@ def assert_matches_low_precision_reference(
     high_precision: torch.Tensor,
     low_precision: torch.Tensor,
     name: str,
+    *,
+    source_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    """Bound kernel error by an independent low-precision reference's FP64 error."""
+    """Bound kernel error by the reference error and source-operand precision."""
     high_precision = high_precision.double()
-    rounding_band = torch.finfo(torch.bfloat16).eps * high_precision.abs().max().item()
+    rounding_band = torch.finfo(source_dtype).eps * high_precision.abs().max().item()
     actual_error = (actual.double() - high_precision).abs().max().item()
     reference_error = (low_precision.double() - high_precision).abs().max().item()
     budget = 2 * (reference_error + rounding_band)

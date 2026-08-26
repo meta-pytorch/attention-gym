@@ -53,6 +53,14 @@ from attn_gym.utils import ceildiv
 
 _MIN_SEQUENCE_EXTENT_SEQUENCES = 32
 _MIN_SEQUENCE_EXTENT_HEADS = 8
+_IO_TYPES = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+}
+_IO_TYPE_NAMES = {
+    cutlass.Float16: "fp16",
+    cutlass.BFloat16: "bf16",
+}
 
 
 def select_delta_h_bv(
@@ -185,6 +193,7 @@ class BlackwellDeltaHBwd:
     def __init__(
         self,
         num_heads: int,
+        io_type: type[cutlass.Numeric] = cutlass.BFloat16,
         head_bv: int = 16,
         varlen: bool = False,
         use_int64_offsets: bool = False,
@@ -194,7 +203,7 @@ class BlackwellDeltaHBwd:
         self.head_k = 128
         self.head_v = 128
         self.acc_type = cutlass.Float32
-        self.io_type = cutlass.BFloat16
+        self.io_type = io_type
         self.num_heads = num_heads
         self.varlen = varlen
         self.use_int64_offsets = use_int64_offsets
@@ -250,7 +259,7 @@ class BlackwellDeltaHBwd:
         """Return a stable artifact and profiler name for this specialization."""
         return (
             f"kda_bwd_dhu_dv_fused_vl{int(self.varlen)}_h{self.num_heads}"
-            f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}"
+            f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{_IO_TYPE_NAMES[self.io_type]}"
             f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
         )
 
@@ -2167,26 +2176,27 @@ def make_fake_tensor(dtype, shape):
 
 
 @jit_cache
-def _compile_delta_h_bwd(H, bv, use_int64_offsets):
+def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets):
     """Compile one dense BlackwellDeltaHBwd variant."""
     K = V = 128
     chunk_size = 64
     kern = BlackwellDeltaHBwd(
         head_bv=bv,
         num_heads=H,
+        io_type=io_type,
         use_int64_offsets=use_int64_offsets,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     sa, sb, snt, sns, sn = (sym_int() for _ in range(5))
 
-    qf, kf, wf = (make_fake_tensor(cutlass.BFloat16, (sa, sb, H, K)) for _ in range(3))
-    dof = make_fake_tensor(cutlass.BFloat16, (sa, sb, H, V))
-    aqkf = make_fake_tensor(cutlass.BFloat16, (sa, sb, H, chunk_size))
+    qf, kf, wf = (make_fake_tensor(io_type, (sa, sb, H, K)) for _ in range(3))
+    dof = make_fake_tensor(io_type, (sa, sb, H, V))
+    aqkf = make_fake_tensor(io_type, (sa, sb, H, chunk_size))
     gkf = make_fake_tensor(cutlass.Float32, (sa, sb, H, K))
     dhtf = make_fake_tensor(cutlass.Float32, (sns, H, K, V))
     dh0f = make_fake_tensor(cutlass.Float32, (sns, H, K, V))
-    dhof = make_fake_tensor(cutlass.BFloat16, (sa, snt, H, K, V))
-    dv2f = make_fake_tensor(cutlass.BFloat16, (sa, sb, H, V))
+    dhof = make_fake_tensor(io_type, (sa, snt, H, K, V))
+    dv2f = make_fake_tensor(io_type, (sa, sb, H, V))
     cuf = make_fake_tensor(cutlass.Int32, (sn,))
     cof = make_fake_tensor(cutlass.Int32, (sn,))
 
@@ -2216,6 +2226,7 @@ def _compile_delta_h_bwd(H, bv, use_int64_offsets):
 def _compile_delta_h_bwd_packed(
     heads: int,
     bv: int,
+    io_type: type[cutlass.Numeric],
     use_int64_offsets: bool,
     bound_sequence_extent: bool,
 ):
@@ -2225,6 +2236,7 @@ def _compile_delta_h_bwd_packed(
     kernel = BlackwellDeltaHBwd(
         num_heads=heads,
         head_bv=bv,
+        io_type=io_type,
         varlen=True,
         use_int64_offsets=use_int64_offsets,
         bound_sequence_extent=bound_sequence_extent,
@@ -2236,20 +2248,20 @@ def _compile_delta_h_bwd_packed(
         return make_fake_tensor(dtype, (tokens, heads, width))
 
     state = make_fake_tensor(cutlass.Float32, (sequences, heads, key_dim, value_dim))
-    chunk_state = make_fake_tensor(cutlass.BFloat16, (chunks, heads, key_dim, value_dim))
+    chunk_state = make_fake_tensor(io_type, (chunks, heads, key_dim, value_dim))
     metadata = make_fake_tensor(cutlass.Int32, (metadata_entries,))
     return compile_tvm_ffi(
         kernel,
-        token_tensor(cutlass.BFloat16, key_dim),
-        token_tensor(cutlass.BFloat16, key_dim),
-        token_tensor(cutlass.BFloat16, key_dim),
-        token_tensor(cutlass.BFloat16, value_dim),
-        token_tensor(cutlass.BFloat16, chunk_size),
+        token_tensor(io_type, key_dim),
+        token_tensor(io_type, key_dim),
+        token_tensor(io_type, key_dim),
+        token_tensor(io_type, value_dim),
+        token_tensor(io_type, chunk_size),
         token_tensor(cutlass.Float32, key_dim),
         state,
         state,
         chunk_state,
-        token_tensor(cutlass.BFloat16, value_dim),
+        token_tensor(io_type, value_dim),
         metadata,
         metadata,
         (Int32(1), Int32(1), Int32(heads), Int32(key_dim), Int32(value_dim)),
@@ -2304,8 +2316,9 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         raise ValueError("packed delta-H+dV inputs must share q.device")
     if any(not tensor.is_contiguous() for tensor in tensor_inputs):
         raise ValueError("packed delta-H+dV inputs must be contiguous")
-    if any(tensor.dtype != torch.bfloat16 for tensor in (q, k, w, do, aqk)):
-        raise TypeError("q, k, w, do, and Aqk must be bfloat16")
+    if q.dtype not in _IO_TYPES or any(tensor.dtype != q.dtype for tensor in (k, w, do, aqk)):
+        raise TypeError("q, k, w, do, and Aqk must share dtype float16 or bfloat16")
+    io_type = _IO_TYPES[q.dtype]
     if gk is not None and gk.dtype != torch.float32:
         raise TypeError("gk must be float32")
     sequences = metadata.cu_seqlens.shape[0] - 1
@@ -2360,6 +2373,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
     compiled = _compile_delta_h_bwd_packed(
         heads,
         bv,
+        io_type,
         use_int64_offsets,
         should_bound_sequence_extent(
             tokens,
@@ -2439,6 +2453,9 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         else torch.empty(state_shape, dtype=torch.float32, device=dev)
     )
 
+    if q.dtype not in _IO_TYPES or any(tensor.dtype != q.dtype for tensor in (k, w, do, aqk)):
+        raise TypeError("q, k, w, do, and Aqk must share dtype float16 or bfloat16")
+    io_type = _IO_TYPES[q.dtype]
     use_int64_offsets = requires_int64_abi(
         q,
         k,
@@ -2451,7 +2468,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         dh_out,
         dv2,
     )
-    fn = _compile_delta_h_bwd(H, bv, use_int64_offsets)
+    fn = _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets)
     dummy_metadata = torch.empty(2, dtype=torch.int32, device=dev)
     fn(
         q,

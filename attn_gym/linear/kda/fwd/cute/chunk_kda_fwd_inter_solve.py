@@ -50,6 +50,10 @@ _SUPPORTED_NUM_SUBCHUNKS = 4
 # three-wave crossover because the persistent chunk loop can otherwise lose.
 _INTER_SOLVE_SHORT_AUTO_WAVES = 1
 _INTER_SOLVE_LONG_AUTO_WAVES = 3
+_IO_TYPES = {
+    torch.float16: (cutlass.Float16, "fp16"),
+    torch.bfloat16: (cutlass.BFloat16, "bf16"),
+}
 
 
 def _check_compile_target() -> None:
@@ -117,6 +121,8 @@ def _compile_k3b(
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
+    io_type: type[cutlass.Numeric],
+    io_name: str,
     chunk_schedule: ChunkSchedule,
     schedule_kind: ScheduleKind,
     chunk_workers: int = 0,
@@ -139,13 +145,13 @@ def _compile_k3b(
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     q = make_fake_tensor(
-        cutlass.BFloat16,
+        io_type,
         (tokens, heads * head_dim),
         stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
     )
     k = make_fake_tensor(
-        cutlass.BFloat16,
+        io_type,
         (tokens, heads * head_dim),
         stride=(sym_int(divisibility=8), 1),
         assumed_align=16,
@@ -163,7 +169,7 @@ def _compile_k3b(
         assumed_align=16,
     )
     Aqk = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        io_type,
         (tokens, heads * chunk_size),
         stride_order=(1, 0),
         assumed_align=16,
@@ -190,7 +196,7 @@ def _compile_k3b(
         cu_seqlens,
         chunk_offsets,
         name=(
-            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
+            f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_{io_name}"
             f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
             f"_cw{chunk_workers}_i64{int(use_int64_offsets)}"
         ),
@@ -203,6 +209,8 @@ def _compile_k4b(
     head_dim: int,
     chunk_size: int,
     subchunk_size: int,
+    io_type: type[cutlass.Numeric],
+    io_name: str,
     chunk_schedule: ChunkSchedule,
     schedule_kind: ScheduleKind,
     chunk_workers: int = 0,
@@ -235,7 +243,7 @@ def _compile_k4b(
         assumed_align=16,
     )
     Akk = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        io_type,
         (tokens, heads * chunk_size),
         stride_order=(1, 0),
         assumed_align=16,
@@ -252,7 +260,7 @@ def _compile_k4b(
         cu_seqlens,
         chunk_offsets,
         name=(
-            f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}"
+            f"kda_fwd_k4b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_{io_name}"
             f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
             f"_cw{chunk_workers}_i64{int(use_int64_offsets)}"
         ),
@@ -295,6 +303,9 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         AkkOD.zero_()
         return Aqk, AkkOD
 
+    if q.dtype != k.dtype or q.dtype != Aqk.dtype or q.dtype not in _IO_TYPES:
+        raise TypeError("q, k, and Aqk must share dtype float16 or bfloat16")
+    io_type, io_name = _IO_TYPES[q.dtype]
     q_flat = q[0].reshape(tokens, heads * head_dim)
     k_flat = k[0].reshape(tokens, heads * head_dim)
     g_flat = gk.reshape(tokens, heads * head_dim).contiguous()
@@ -306,6 +317,8 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         head_dim,
         chunk_size,
         subchunk_size,
+        io_type,
+        io_name,
         ChunkSchedule.RAGGED,
         resolved.kind,
         chunk_workers,
@@ -348,6 +361,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     metadata: RaggedChunkMetadata,
     resolved: ResolvedSchedule,
     subchunk_size: int = _SUPPORTED_SUBCHUNK_SIZE,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Compute K4 with the same execution plan that produced ``AkkOD``."""
     if Akkd.ndim != 4:
@@ -372,9 +386,12 @@ def _chunk_kda_fwd_k4b_ragged_impl(
 
     # Only rows owned by active ragged chunks are defined; downstream ragged consumers route from
     # metadata and must not read capacity slack.
+    if output_dtype not in _IO_TYPES:
+        raise TypeError("Akk output dtype must be float16 or bfloat16")
+    io_type, io_name = _IO_TYPES[output_dtype]
     Akk = torch.empty(
         (batch, tokens, heads, chunk_size),
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
         device=Akkd.device,
     )
     if isinstance(Akkd, FakeTensor) or metadata.capacity == 0:
@@ -388,6 +405,8 @@ def _chunk_kda_fwd_k4b_ragged_impl(
         _SUPPORTED_HEAD_DIM,
         chunk_size,
         subchunk_size,
+        io_type,
+        io_name,
         ChunkSchedule.RAGGED,
         resolved.kind,
         chunk_workers,
@@ -410,16 +429,20 @@ def chunk_kda_fwd_k4b_ragged_cute(
     Akkd: torch.Tensor,
     metadata: RaggedChunkMetadata,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Run the eager ragged K4 inverse stage."""
     resolved = _resolve_ragged_execution(Akkd, metadata, schedule)
-    return _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata, resolved)
+    return _chunk_kda_fwd_k4b_ragged_impl(
+        AkkOD, Akkd, metadata, resolved, output_dtype=output_dtype
+    )
 
 
 def chunk_kda_fwd_k4b_dense_cute(
     AkkOD: torch.Tensor,
     Akkd: torch.Tensor,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Assemble dense BT=64 inverse blocks from precomputed K3-compatible factors."""
     if Akkd.ndim != 4:
@@ -437,9 +460,12 @@ def chunk_kda_fwd_k4b_dense_cute(
     if AkkOD.shape != expected_od:
         raise ValueError(f"AkkOD must have shape {expected_od}, got {tuple(AkkOD.shape)}")
 
+    if output_dtype not in _IO_TYPES:
+        raise TypeError("Akk output dtype must be float16 or bfloat16")
+    io_type, io_name = _IO_TYPES[output_dtype]
     Akk = torch.empty(
         (batch, tokens, heads, chunk_size),
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
         device=Akkd.device,
     )
     if isinstance(Akkd, FakeTensor) or chunks == 0:
@@ -451,6 +477,8 @@ def chunk_kda_fwd_k4b_dense_cute(
         _SUPPORTED_HEAD_DIM,
         chunk_size,
         subchunk_size,
+        io_type,
+        io_name,
         ChunkSchedule.DENSE,
         ScheduleKind.STATIC,
         use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
@@ -472,7 +500,9 @@ def chunk_kda_fwd_inter_solve_ragged_cute(
     """Run K3 and K4 with one shared automatic scheduling decision."""
     resolved = _resolve_ragged_execution(k, metadata, ScheduleRequest.AUTO)
     Aqk, AkkOD = _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk, scale, metadata, resolved)
-    return Aqk, _chunk_kda_fwd_k4b_ragged_impl(AkkOD, Akkd, metadata, resolved)
+    return Aqk, _chunk_kda_fwd_k4b_ragged_impl(
+        AkkOD, Akkd, metadata, resolved, output_dtype=q.dtype
+    )
 
 
 def chunk_kda_fwd_inter_solve_cute(
@@ -520,6 +550,11 @@ def chunk_kda_fwd_inter_solve_cute(
         )
         Akk_flat = Akk.reshape(B * T, H * BT)
 
+    if q.dtype != k.dtype or q.dtype not in _IO_TYPES:
+        raise TypeError("q and k must share dtype float16 or bfloat16")
+    if Aqk.dtype != q.dtype or Akk.dtype != q.dtype:
+        raise TypeError("Aqk and Akk must match the Q/K dtype")
+    io_type, io_name = _IO_TYPES[q.dtype]
     if isinstance(k, FakeTensor):
         return Aqk, Akk
 
@@ -546,6 +581,8 @@ def chunk_kda_fwd_inter_solve_cute(
             K,
             BT,
             BC,
+            io_type,
+            io_name,
             ChunkSchedule.DENSE,
             ScheduleKind.STATIC,
             use_int64_offsets=requires_int64_abi(
@@ -573,6 +610,8 @@ def chunk_kda_fwd_inter_solve_cute(
             K,
             BT,
             BC,
+            io_type,
+            io_name,
             ChunkSchedule.DENSE,
             ScheduleKind.STATIC,
             use_int64_offsets=requires_int64_abi(akk_od, akkd_flat, Akk_flat),

@@ -47,7 +47,15 @@ KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
 # contiguous, and the 16-byte cp.async stages need every outer stride and the
 # base pointer to be 16-byte (8 bf16 element) aligned.
 _MIN_ALIGN_BYTES = 16
-_MIN_ALIGN_ELEMENTS_BF16 = _MIN_ALIGN_BYTES // 2
+_MIN_ALIGN_ELEMENTS_16BIT = _MIN_ALIGN_BYTES // 2
+_IO_TYPES = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+}
+_IO_TYPE_NAMES = {
+    cutlass.Float16: "fp16",
+    cutlass.BFloat16: "bf16",
+}
 
 
 @triton.jit(do_not_specialize=["elements"])
@@ -149,16 +157,12 @@ def _cp_async_cg_g2s_16b(
     loc=None,
     ip=None,
 ):
-    """Issue one 16-byte cp.async from global to shared memory."""
+    """Issue one 16-byte cp.async without the register cost of the native wrapper."""
     gmem_addr = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     smem_addr = smem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
-        [
-            smem_addr,
-            gmem_addr,
-            src_bytes.ir_value(loc=loc, ip=ip),
-        ],
+        [smem_addr, gmem_addr, src_bytes.ir_value(loc=loc, ip=ip)],
         "cp.async.cg.shared.global [$0], [$1], 0x10, $2;",
         "r,l,r",
         has_side_effects=True,
@@ -288,31 +292,10 @@ def _bitcast_i32_to_f32(x: Int32, *, loc=None, ip=None):
     return cutlass.Float32(llvm.bitcast(T.f32(), x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
-@dsl_user_op
-def _bf16x2_to_f32_pair(x: Int32, *, loc=None, ip=None):
-    result = llvm.inline_asm(
-        ir.Type.parse("!llvm.struct<(f32, f32)>"),
-        [x.ir_value(loc=loc, ip=ip)],
-        "{\n\t"
-        ".reg .u32 lo, hi, lo_f32, hi_f32;\n\t"
-        "and.b32 lo, $2, 0x0000ffff;\n\t"
-        "shr.u32 hi, $2, 16;\n\t"
-        "shl.b32 lo_f32, lo, 16;\n\t"
-        "shl.b32 hi_f32, hi, 16;\n\t"
-        "mov.b32 $0, lo_f32;\n\t"
-        "mov.b32 $1, hi_f32;\n\t"
-        "}\n",
-        "=f,=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return (
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
-    )
+@cute.jit
+def _half2_to_f32_pair(x, io_type):
+    values = cutlass.Vector.from_elements((x,), Int32).bitcast(io_type).to(Float32)
+    return Float32(values[0]), Float32(values[1])
 
 
 @dsl_user_op
@@ -422,67 +405,10 @@ def _ld_global_f32x4_lo2_pred(
     )
 
 
-@dsl_user_op
-def _add_f32x2(
-    a0: Float32,
-    a1: Float32,
-    b0: Float32,
-    b1: Float32,
-    *,
-    loc=None,
-    ip=None,
-):
-    result = llvm.inline_asm(
-        ir.Type.parse("!llvm.struct<(f32, f32)>"),
-        [
-            Float32(a0).ir_value(loc=loc, ip=ip),
-            Float32(a1).ir_value(loc=loc, ip=ip),
-            Float32(b0).ir_value(loc=loc, ip=ip),
-            Float32(b1).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n\t"
-        ".reg .b64 lhs, rhs, out;\n\t"
-        "mov.b64 lhs, {$2, $3};\n\t"
-        "mov.b64 rhs, {$4, $5};\n\t"
-        "add.f32x2 out, lhs, rhs;\n\t"
-        "mov.b64 {$0, $1}, out;\n\t"
-        "}\n",
-        "=f,=f,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return (
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
-    )
-
-
-@dsl_user_op
-def _cvt_bf16x2_f32(
-    a: Float32,
-    b: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Int32:
-    packed = llvm.inline_asm(
-        T.i32(),
-        [
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-        ],
-        "cvt.rn.bf16x2.f32 $0, $2, $1;",
-        "=r,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(packed)
+@cute.jit
+def _cvt_half2_f32(a, b, io_type):
+    packed = cutlass.Vector.from_elements((a, b), Float32).to(io_type).bitcast(Int32)
+    return Int32(packed[0])
 
 
 @dsl_user_op
@@ -594,23 +520,8 @@ def _st_global_u32x4_pred(
     )
 
 
-@dsl_user_op
-def _bar_warp_sync(*, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [],
-        "bar.warp.sync -1;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 @cute.jit
-def _st_global_bf16_ldmatrix_epilogue_16x32(
+def _st_global_16b_ldmatrix_epilogue_16x32(
     sEpi_tile,
     gmem_ptr,
     top0: Int32,
@@ -639,11 +550,11 @@ def _st_global_bf16_ldmatrix_epilogue_16x32(
     row_valid0 = (row_base + out_row0) < valid
     row_valid1 = (row_base + out_row0 + 8) < valid
 
-    _bar_warp_sync()
+    cute.arch.sync_warp()
     _st_shared_u32x4(sEpi_tile.iterator + store_bytes // 2, top0, top1, top2, top3)
-    _bar_warp_sync()
+    cute.arch.sync_warp()
     v0, v1, v2, v3 = _ldmatrix_x4_b16(sEpi_tile.iterator + load_bytes // 2)
-    _bar_warp_sync()
+    cute.arch.sync_warp()
     _st_shared_u32x4(
         sEpi_tile.iterator + store_bytes // 2,
         bottom0,
@@ -651,7 +562,7 @@ def _st_global_bf16_ldmatrix_epilogue_16x32(
         bottom2,
         bottom3,
     )
-    _bar_warp_sync()
+    cute.arch.sync_warp()
     v4, v5, v6, v7 = _ldmatrix_x4_b16(sEpi_tile.iterator + load_bytes // 2)
     _st_global_u32x4_pred(
         gmem_ptr + out_row0 * row_stride + out_col,
@@ -669,7 +580,7 @@ def _st_global_bf16_ldmatrix_epilogue_16x32(
         v7,
         Boolean(row_valid1),
     )
-    _bar_warp_sync()
+    cute.arch.sync_warp()
 
 
 @cute.jit
@@ -715,7 +626,7 @@ def _st_global_f32_triton_shared_epilogue_16x32(
     valid,
     row_stride,
 ):
-    _bar_warp_sync()
+    cute.arch.sync_warp()
     lane = tidx & 31
     low3 = lane & 7
     lane_bit3 = lane & 8
@@ -768,7 +679,7 @@ def _st_global_f32_triton_shared_epilogue_16x32(
         v15,
         Boolean(row_valid3),
     )
-    _bar_warp_sync()
+    cute.arch.sync_warp()
 
 
 @dsl_user_op
@@ -801,10 +712,10 @@ def _hmma_load_b_groups_smem_ldmatrix(sB, row_base, k_outer, tidx):
     group8 = tidx // 8
     smem_ptr = sB.iterator + (row_base + k_outer * 8 + lane8) * KEY_DIM_PER_CTA + group8 * 8
     r0, r1, r2, r3 = _ldmatrix_x4_trans_b16(smem_ptr)
-    b00, b01 = _bf16x2_to_f32_pair(r0)
-    b10, b11 = _bf16x2_to_f32_pair(r1)
-    b20, b21 = _bf16x2_to_f32_pair(r2)
-    b30, b31 = _bf16x2_to_f32_pair(r3)
+    b00, b01 = _half2_to_f32_pair(r0, sB.element_type)
+    b10, b11 = _half2_to_f32_pair(r1, sB.element_type)
+    b20, b21 = _half2_to_f32_pair(r2, sB.element_type)
+    b30, b31 = _half2_to_f32_pair(r3, sB.element_type)
     return b00, b01, b10, b11, b20, b21, b30, b31
 
 
@@ -1004,13 +915,13 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     # SMEM is allocated once and reused across the chunk-loop iterations.
     smem = cutlass.utils.SmemAllocator()
     sQ_tile = smem.allocate_tensor(
-        element_type=cutlass.BFloat16,
+        element_type=mQ.element_type,
         layout=cute.make_layout((BT * KEY_DIM_PER_CTA,), stride=(1,)),
         byte_alignment=128,
         swizzle=None,
     )
     sK_tile = smem.allocate_tensor(
-        element_type=cutlass.BFloat16,
+        element_type=mK.element_type,
         layout=cute.make_layout((BT * KEY_DIM_PER_CTA,), stride=(1,)),
         byte_alignment=128,
         swizzle=None,
@@ -1028,7 +939,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
         swizzle=None,
     )
     sEpi_tile = smem.allocate_tensor(
-        element_type=cutlass.BFloat16,
+        element_type=mDq2.element_type,
         layout=cute.make_layout((2048,), stride=(1,)),
         byte_alignment=128,
         swizzle=None,
@@ -1286,7 +1197,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     b0 = b0 if key0 < valid else z
                     b1 = b1 if key1 < valid else z
                     _hmma_stage_b_group_stmatrix(sEpi_tile, b0, b1, tidx)
-                    _bar_warp_sync()
+                    cute.arch.sync_warp()
                     b0, b1 = _hmma_load_b_group_stmatrix(sEpi_tile, tidx)
                     if group == 0:
                         q00, q01, q02, q03 = _mma_tf32_m16n8k8(
@@ -1405,7 +1316,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 b0 = b0 if key0 < valid else z
                 b1 = b1 if key1 < valid else z
                 _hmma_stage_b_group_stmatrix(sEpi_tile, b0, b1, tidx)
-                _bar_warp_sync()
+                cute.arch.sync_warp()
                 b0, b1 = _hmma_load_b_group_stmatrix(sEpi_tile, tidx)
                 if group == 0:
                     qd00, qd01, qd02, qd03 = _mma_tf32_m16n8k8(
@@ -1768,11 +1679,11 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 )
                 dq_add0 = q_acc0 * qscale_prev0 + q_diag0 * qscale_diag0
                 dq_add1 = q_acc1 * qscale_prev1 + q_diag1 * qscale_diag1
-                dq_out0, dq_out1 = _add_f32x2(dq_in0, dq_in1, dq_add0, dq_add1)
+                dq_out0, dq_out1 = cute.arch.add_packed_f32x2((dq_in0, dq_in1), (dq_add0, dq_add1))
                 if lane_row == 0:
-                    dq_word0 = _cvt_bf16x2_f32(dq_out0, dq_out1)
+                    dq_word0 = _cvt_half2_f32(dq_out0, dq_out1, mDq2.element_type)
                 else:
-                    dq_word1 = _cvt_bf16x2_f32(dq_out0, dq_out1)
+                    dq_word1 = _cvt_half2_f32(dq_out0, dq_out1, mDq2.element_type)
                 dk_qk0 = k_acc0 * qscale_prev0 + k_diag0 * qscale_diag0
                 dk_qk1 = k_acc1 * qscale_prev1 + k_diag1 * qscale_diag1
                 dkt0 = d_acc0 * dscale0 + t_acc0 * tscale0
@@ -1781,11 +1692,11 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 dk_beta1 = dk_qk1 * beta_row
                 dk_add0 = dk_beta0 + dkt0
                 dk_add1 = dk_beta1 + dkt1
-                dk_out0, dk_out1 = _add_f32x2(dk_in0, dk_in1, dk_add0, dk_add1)
+                dk_out0, dk_out1 = cute.arch.add_packed_f32x2((dk_in0, dk_in1), (dk_add0, dk_add1))
                 if lane_row == 0:
-                    dk_word0 = _cvt_bf16x2_f32(dk_out0, dk_out1)
+                    dk_word0 = _cvt_half2_f32(dk_out0, dk_out1, mDk2.element_type)
                 else:
-                    dk_word1 = _cvt_bf16x2_f32(dk_out0, dk_out1)
+                    dk_word1 = _cvt_half2_f32(dk_out0, dk_out1, mDk2.element_type)
                 dg_out0 = (dg_in0 + dq_add0 * qval0 + (dk_beta0 - dkt0) * kval0) * Float32(LN2)
                 dg_out1 = (dg_in1 + dq_add1 * qval1 + (dk_beta1 - dkt1) * kval1) * Float32(LN2)
                 if lane_row == 0:
@@ -1885,7 +1796,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             valid=valid,
             row_stride=dg2_row_stride,
         )
-        _st_global_bf16_ldmatrix_epilogue_16x32(
+        _st_global_16b_ldmatrix_epilogue_16x32(
             sEpi_tile,
             mDq2.iterator
             + (row_start + row_base) * dq2_row_stride
@@ -1904,7 +1815,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             valid=valid,
             row_stride=dq2_row_stride,
         )
-        _st_global_bf16_ldmatrix_epilogue_16x32(
+        _st_global_16b_ldmatrix_epilogue_16x32(
             sEpi_tile,
             mDk2.iterator
             + (row_start + row_base) * dk2_row_stride
@@ -2025,6 +1936,7 @@ def _compile_chunk_kda_bwd_intra(
     capacity: int,
     grid_chunks: int,
     ragged: bool,
+    io_type: type[cutlass.Numeric],
     use_int64_offsets: bool = False,
 ):
     """Compile one persistent intra-chunk backward specialization."""
@@ -2062,14 +1974,14 @@ def _compile_chunk_kda_bwd_intra(
             (columns, tokens, heads),
             stride=(
                 1,
-                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
-                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_BF16),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_16BIT),
+                sym_int(divisibility=_MIN_ALIGN_ELEMENTS_16BIT),
             ),
             assumed_align=_MIN_ALIGN_BYTES,
         )
 
-    q = strided_column_token_head(cutlass.BFloat16, KEY_DIM)
-    k = strided_column_token_head(cutlass.BFloat16, KEY_DIM)
+    q = strided_column_token_head(io_type, KEY_DIM)
+    k = strided_column_token_head(io_type, KEY_DIM)
     g = column_token_head(cutlass.Float32, KEY_DIM)
     beta = normal(cutlass.Float32, (1, tokens, heads))
     dAqk = column_token_head(cutlass.Float32, BT)
@@ -2078,8 +1990,8 @@ def _compile_chunk_kda_bwd_intra(
     dk = column_token_head(cutlass.Float32, KEY_DIM)
     db_partial = normal(cutlass.Float32, (K_PHASES, tokens, heads))
     dg = column_token_head(cutlass.Float32, KEY_DIM)
-    dq2 = column_token_head(cutlass.BFloat16, KEY_DIM)
-    dk2 = column_token_head(cutlass.BFloat16, KEY_DIM)
+    dq2 = column_token_head(io_type, KEY_DIM)
+    dk2 = column_token_head(io_type, KEY_DIM)
     dg2 = column_token_head(cutlass.Float32, KEY_DIM)
     cu_seqlens = normal(cutlass.Int32, (sequences,)) if ragged else None
     chunk_offsets = normal(cutlass.Int32, (sequences,)) if ragged else None
@@ -2101,7 +2013,7 @@ def _compile_chunk_kda_bwd_intra(
         cu_seqlens,
         chunk_offsets,
         name=(
-            f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_rg{int(ragged)}"
+            f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_{_IO_TYPE_NAMES[io_type]}_rg{int(ragged)}"
             f"_i64{int(use_int64_offsets)}"
         ),
     )
@@ -2171,12 +2083,14 @@ class ChunkKdaBwdIntraTunable:
     def compile_call(
         config: ChunkKdaBwdIntraConfig,
         args: Args,
-    ) -> tuple[int, int, int, bool, bool]:
+    ) -> tuple[int, int, int, bool, type[cutlass.Numeric], bool]:
+        io_type = _IO_TYPES[args.q.dtype]
         return (
             args.q.shape[2],
             args.capacity,
             config.grid_chunks,
             args.chunk_offsets is not None,
+            io_type,
             requires_int64_abi(
                 _column_token_head(args.q),
                 _column_token_head(args.k),
@@ -2260,6 +2174,8 @@ def chunk_kda_bwd_intra(
     batch, tokens, heads, head_dim = q.shape
     if batch != 1 or head_dim != KEY_DIM:
         raise ValueError("the intra-chunk backward requires B=1 and K=128")
+    if q.dtype not in _IO_TYPES or k.dtype != q.dtype:
+        raise TypeError("q and k must share dtype float16 or bfloat16")
     if metadata is not None:
         metadata.validate_chunk_size(BT)
     elif tokens % BT:

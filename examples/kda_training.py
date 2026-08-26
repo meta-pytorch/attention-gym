@@ -17,6 +17,10 @@ On a Blackwell GPU, exercise the fused backend with::
 
     python examples/kda_training.py --backend=fused
 
+Run the fused training loop in FP16 with::
+
+    python examples/kda_training.py --backend=fused --compute-dtype=float16
+
 Pack Zipf-distributed sequence lengths into one physical batch with::
 
     python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256
@@ -68,6 +72,13 @@ class BackendOption(str, Enum):
 
     REFERENCE = "reference"
     FUSED = "fused"
+
+
+class ComputeDTypeOption(str, Enum):
+    """Low-precision compute dtypes exposed by the command line."""
+
+    FLOAT16 = "float16"
+    BFLOAT16 = "bfloat16"
 
 
 def _record_function(enabled: bool, name: str):
@@ -197,8 +208,8 @@ class KDAAttention(nn.Module):
             if compute_dtype is None
             else compute_dtype
         )
-        if backend == "fused" and self.compute_dtype != torch.bfloat16:
-            raise ValueError("the fused backend requires compute_dtype=torch.bfloat16")
+        if backend == "fused" and self.compute_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("the fused backend requires compute_dtype float16 or bfloat16")
 
         projection_size = num_heads * head_dim
         factory_kwargs = {"device": device}
@@ -472,6 +483,10 @@ def main(
         BackendOption,
         typer.Option(help="Use the reference or the best integrated fused kernels."),
     ] = BackendOption.REFERENCE,
+    compute_dtype: Annotated[
+        ComputeDTypeOption | None,
+        typer.Option(help="Use float16 or bfloat16 projection and fused-kernel inputs."),
+    ] = None,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
     batch_size: Annotated[
         int,
@@ -519,11 +534,14 @@ def main(
         head_dim,
         short_conv_kernel_size=short_conv_kernel_size,
         backend=backend.value,
+        compute_dtype=(None if compute_dtype is None else getattr(torch, compute_dtype.value)),
         device=device,
     )
+    use_grad_scaler = model.compute_dtype == torch.float16 and torch.device(device).type == "cuda"
     if compile_model:
         model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
     cu_seqlens = None
     input_shape = (batch_size, tokens, hidden_size)
     layout_name = ""
@@ -536,8 +554,9 @@ def main(
     hidden_states = torch.randn(input_shape, device=device)
     target = torch.randn_like(hidden_states)
     execution_name = "_compiled" if compile_model else ""
+    dtype_name = "" if compute_dtype is None else f"_{compute_dtype.value}"
     profile_name = (
-        f"kda_training_backend-{backend.value}{layout_name}{execution_name}"
+        f"kda_training_backend-{backend.value}{dtype_name}{layout_name}{execution_name}"
         f"_b{batch_size}_t{tokens}_c{hidden_size}_h{num_heads}_d{head_dim}"
     )
 
@@ -548,9 +567,10 @@ def main(
         with _record_function(profile, f"{profile_name}/loss"):
             loss = F.mse_loss(output.float(), target)
         with _record_function(profile, f"{profile_name}/backward"):
-            loss.backward()
+            grad_scaler.scale(loss).backward()
         with _record_function(profile, f"{profile_name}/optimizer"):
-            optimizer.step()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
         return loss
 
     if profile or compile_model:

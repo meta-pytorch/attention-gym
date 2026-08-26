@@ -30,11 +30,11 @@ def _metadata(lengths: list[int]):
     return prepare_ragged_chunk_metadata(offsets, sum(lengths), 64)
 
 
-def _inputs(tokens: int) -> tuple[torch.Tensor, ...]:
+def _inputs(tokens: int, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, ...]:
     """Create deterministic standalone inputs for the intra backward stage."""
     torch.manual_seed(29)
     shape = (1, tokens, 1, 128)
-    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    q = torch.randn(shape, device="cuda", dtype=dtype) / 8
     k = torch.randn_like(q) / 8
     g = -torch.rand(shape, device="cuda")
     beta = torch.rand(1, tokens, 1, device="cuda")
@@ -75,9 +75,10 @@ def _sequence_local_reference(
     return tuple(torch.cat(parts, dim=1) for parts in output_parts)
 
 
-def test_ragged_bwd_intra_matches_independent_numerical_reference():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ragged_bwd_intra_matches_independent_numerical_reference(dtype: torch.dtype):
     lengths = [65, 0, 63]
-    inputs = list(_inputs(sum(lengths)))
+    inputs = list(_inputs(sum(lengths), dtype))
     cu_seqlens = cumulative_sequence_offsets(lengths)
     chunk_routes = torch.tensor(
         [
@@ -121,7 +122,7 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference():
             inputs[8].to(db.dtype) + db,
         )
         if reference:
-            return (outputs[0].to(torch.bfloat16), outputs[1].to(torch.bfloat16), *outputs[2:])
+            return (outputs[0].to(dtype), outputs[1].to(dtype), *outputs[2:])
         return outputs
 
     golden = combine(golden_contribution, reference=False)
@@ -130,7 +131,13 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference():
         ("dq", "dk", "dg", "db"), actual, golden, reference, strict=True
     ):
         assert torch.isfinite(output).all()
-        assert_matches_low_precision_reference(output, golden_output, reference_output, name)
+        assert_matches_low_precision_reference(
+            output,
+            golden_output,
+            reference_output,
+            name,
+            source_dtype=dtype,
+        )
 
 
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():

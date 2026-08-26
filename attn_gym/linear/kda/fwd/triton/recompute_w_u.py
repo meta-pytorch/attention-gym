@@ -467,15 +467,19 @@ def recompute_w_u_fwd_triton(
             f"q must have shape {(batch, tokens, value_heads, key_dim)}, got {tuple(q.shape)}"
         )
     for name, tensor, dtypes in (
-        ("k", k, (torch.bfloat16,)),
-        ("v", v, (torch.bfloat16,)),
-        ("q", q, (torch.bfloat16,)),
-        ("beta", beta, (torch.float32, torch.bfloat16)),
+        ("k", k, (torch.float16, torch.bfloat16)),
+        ("v", v, (torch.float16, torch.bfloat16)),
+        ("q", q, (torch.float16, torch.bfloat16)),
+        ("beta", beta, (torch.float32, torch.float16, torch.bfloat16)),
         ("gk", gk, (torch.float32,)),
-        ("A", A, (torch.float32, torch.bfloat16)),
+        ("A", A, (torch.float32, torch.float16, torch.bfloat16)),
     ):
         if tensor is not None and tensor.dtype not in dtypes:
             raise ValueError(f"{name} must be one of {dtypes}, got {tensor.dtype}")
+    if k.dtype != v.dtype or (q is not None and q.dtype != k.dtype):
+        raise ValueError("q, k, and v must share one dtype")
+    if A.dtype != torch.float32 and A.dtype != k.dtype:
+        raise ValueError("half-precision A must match the Q/K/V dtype")
     if dot_precision == "tf32x3" and A.dtype != torch.float32:
         raise ValueError("dot_precision='tf32x3' requires fp32 A")
     # q/k/v may carry a strided token dimension (fused-QKV views); heads must be

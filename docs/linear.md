@@ -95,8 +95,9 @@ contract. A correctness-first integration can keep the KDA unit under an FP32 po
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
 The optimized core requires Blackwell and `head_dim=128`; its public boundary accepts
-FP16, BF16, or FP32 inputs and normalizes private Q/K/V kernel operands to BF16. It chunks
-internally at 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
+FP16, BF16, or FP32 inputs. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
+FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
+64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
 equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
 explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
@@ -107,6 +108,16 @@ forward values outside `[0, cu_seqlens[-1])` are unspecified. The internal rever
 returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
 parameterized gate producers: callers still need the masking rules below because
 ``0 * NaN`` can poison their reductions.
+
+!!! warning "FP16 intermediate range"
+
+    Use L2-normalized Q/K with FP16, as the training example does. Unnormalized Q/K can easily
+    produce attention or solve factors outside the FP16 range. Unusually large V or initial-state
+    carries can likewise overflow the FP16 chunk-state and value intermediates. The GEMMs
+    accumulate in FP32, but their results are converted back to FP16 when used as inputs to the
+    next GEMM; an overflow at that conversion cannot be recovered by the next FP32 accumulator.
+    BF16 uses the same storage size with a much larger exponent range, so it is substantially less
+    likely to hit these issues, although sufficiently large values can overflow any finite dtype.
 
 A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
 replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal
@@ -251,8 +262,8 @@ part of the public KDA API.
 
 Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
 and enforces their constraints (the chunked core requires `head_dim=128` and Blackwell,
-normalizes Q/K/V operands to BF16 internally, and chunks at 64 tokens; the fused recurrent scan
-is inference-only), while `"reference"`
+preserves homogeneous FP16/BF16 Q/K/V, normalizes FP32 or mixed inputs to BF16, and chunks at
+64 tokens; the fused recurrent scan is inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
 dimension, and stays differentiable. There is no automatic fallback between the two, and
 the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly

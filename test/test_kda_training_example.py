@@ -190,8 +190,9 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
     ]
 
 
-def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
-    """Match one packed execution against independent sequence calls."""
+@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float16])
+def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype):
+    """Match packed BF16/FP16 training against independent sequence calls."""
     fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
     short_conv = kda_training.causal_conv1d
     fused_l2norm = kda_training.l2norm
@@ -224,6 +225,7 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch):
         num_heads=1,
         head_dim=128,
         backend="fused",
+        compute_dtype=compute_dtype,
         device="cuda",
     )
     offsets = (0, 65, 65, 128)

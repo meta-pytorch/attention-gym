@@ -64,8 +64,10 @@ def chunk_kda(
     """Apply chunk-parallel KDA for training and prefill.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.
-        k: Keys shaped like ``q``.
+        q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally. Use
+            L2-normalized Q/K with fused FP16: unnormalized values can overflow the FP16
+            intermediates passed between FP32-accumulating GEMMs.
+        k: Keys shaped like ``q`` and subject to the same fused FP16 range limitation.
         v: Values shaped ``[B, T, H, V]``.
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
