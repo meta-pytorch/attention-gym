@@ -10,6 +10,7 @@ from torch._inductor import config as inductor_config
 
 pytest.importorskip("cutlass")
 pytest.importorskip("typer")
+pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
 
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from examples import kda_training

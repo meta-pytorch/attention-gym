@@ -4,8 +4,8 @@ Attention Gym provides functional linear-attention operators with eager referenc
 
 ## Gated Delta Rule
 
-`chunk_gdn` and `recurrent_gdn` use the SDPA layout
-`[batch, heads, sequence, dimension]` and return a structured result. For each token, the scalar
+`chunk_gdn` and `recurrent_gdn` use the token-major layout
+`[batch, sequence, heads, dimension]` and return an output/state tuple. For each token, the scalar
 natural-log gate decays the previous state before the delta update, and the query reads the updated
 state:
 
@@ -23,23 +23,20 @@ chooses the execution form explicitly; `impl="reference"` selects the eager PyTo
 ```python
 from attn_gym.linear import chunk_gdn
 
-result = chunk_gdn(
+output, final_state = chunk_gdn(
     query,
     key,
     value,
     gate,
     beta,
     impl="reference",
-    return_final_state=True,
+    output_final_state=True,
 )
-
-output = result.output
-final_state = result.final_state
 ```
 
 ### Supported capabilities
 
-- Fixed-length inputs in `[batch, heads, sequence, dimension]` layout.
+- Fixed-length inputs in `[batch, sequence, heads, dimension]` layout.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
 - Autograd for inputs and initial state.
@@ -58,16 +55,15 @@ Packed variable-length inputs and fused implementations are not implemented yet.
   `recurrent_gdn(...)`.
 - `naive_chunk_gated_delta_rule(...)` and `gated_delta_rule(..., mode="chunked")` become
   `chunk_gdn(...)`.
-- Inputs use `[batch, heads, sequence, dimension]`, matching SDPA and FlexAttention.
-- `output_final_state` is named `return_final_state`.
-- Both operations return `GatedDeltaRuleOutput`; access tensors through `.output` and
-  `.final_state`.
+- Inputs use `[batch, sequence, heads, dimension]`, matching the KDA operations; keyword callers
+  use `q`, `k`, and `v`.
+- The public chunk size is fixed at 64, matching KDA's fused decomposition.
+- `initial_state` may be positional, and `output_final_state` controls the optional state output.
+- Both operations return `(output, final_state)`, matching the KDA operations.
 
 ::: attn_gym.linear.chunk_gdn
 
 ::: attn_gym.linear.recurrent_gdn
-
-::: attn_gym.linear.GatedDeltaRuleOutput
 
 ## Kimi Delta Attention
 

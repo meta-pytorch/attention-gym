@@ -12,6 +12,10 @@ import math
 import pytest
 import torch
 
+pytest.importorskip(
+    "flash_attn.cute.interface", reason="the CuTe backend requires FlashAttention-4"
+)
+
 from attn_gym.sparse.selected_attention import selected_attention
 
 

@@ -5,137 +5,136 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+_CHUNK_SIZE = 64
+
 
 def reference_gdn(
     dense_op,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     log_decay: torch.Tensor,
     beta: torch.Tensor,
     *,
     scale: float | None,
     initial_state: torch.Tensor | None,
-    return_final_state: bool,
+    output_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run a dense GDN reference operation in the documented compute dtype."""
-    output_dtype = query.dtype
-    compute_dtype = torch.promote_types(query.dtype, torch.float32)
-    query, key, value, log_decay, beta = (
-        tensor.to(compute_dtype) for tensor in (query, key, value, log_decay, beta)
-    )
+    output_dtype = q.dtype
+    compute_dtype = torch.promote_types(q.dtype, torch.float32)
+    q, k, v, log_decay, beta = (tensor.to(compute_dtype) for tensor in (q, k, v, log_decay, beta))
     # Explicit casts do not stop autocast from selecting low-precision contractions.
-    with torch.autocast(device_type=query.device.type, enabled=False):
+    with torch.autocast(device_type=q.device.type, enabled=False):
         output, state = dense_op(
-            query,
-            key,
-            value,
+            q,
+            k,
+            v,
             log_decay,
             beta,
             scale=scale,
             initial_state=initial_state,
-            return_final_state=return_final_state,
+            output_final_state=output_final_state,
         )
     return output.to(output_dtype), state
 
 
 def recurrent_forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     log_decay: torch.Tensor,
     beta: torch.Tensor,
     *,
     scale: float | None,
     initial_state: torch.Tensor | None,
-    return_final_state: bool,
+    output_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Evaluate the gated delta rule recurrence one token at a time."""
-    batch, heads, sequence, key_dimension = query.shape
-    query = query * (key_dimension**-0.5 if scale is None else scale)
+    batch, sequence, heads, key_dim = q.shape
+    q = q * (key_dim**-0.5 if scale is None else scale)
     state = (
-        query.new_zeros(batch, heads, key_dimension, value.shape[-1])
-        if initial_state is None
-        else initial_state
+        q.new_zeros(batch, heads, key_dim, v.shape[-1]) if initial_state is None else initial_state
     )
     outputs = []
 
     for token in range(sequence):
-        state = state * log_decay[:, :, token].exp()[..., None, None]
-        residual = value[:, :, token] - torch.einsum("bhk,bhkv->bhv", key[:, :, token], state)
-        residual = residual * beta[:, :, token, None]
-        state = state + torch.einsum("bhk,bhv->bhkv", key[:, :, token], residual)
-        outputs.append(torch.einsum("bhk,bhkv->bhv", query[:, :, token], state))
+        state = state * log_decay[:, token].exp()[..., None, None]
+        residual = v[:, token] - torch.einsum("bhk,bhkv->bhv", k[:, token], state)
+        residual = residual * beta[:, token, :, None]
+        state = state + torch.einsum("bhk,bhv->bhkv", k[:, token], residual)
+        outputs.append(torch.einsum("bhk,bhkv->bhv", q[:, token], state))
 
-    return torch.stack(outputs, dim=2), state if return_final_state else None
+    return torch.stack(outputs, dim=1), state if output_final_state else None
 
 
 def chunk_forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     log_decay: torch.Tensor,
     beta: torch.Tensor,
     *,
     scale: float | None,
     initial_state: torch.Tensor | None,
-    return_final_state: bool,
-    chunk_size: int,
+    output_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Evaluate the gated delta rule with a naive chunk-parallel decomposition."""
-    batch, heads, sequence, key_dimension = query.shape
-    value_dimension = value.shape[-1]
-    scale = key_dimension**-0.5 if scale is None else scale
-    padding = (-sequence) % chunk_size
+    """Evaluate the gated delta rule with the fixed chunk-parallel decomposition."""
+    batch, sequence, heads, key_dim = q.shape
+    value_dim = v.shape[-1]
+    scale = key_dim**-0.5 if scale is None else scale
+    padding = (-sequence) % _CHUNK_SIZE
     if padding:
-        query, key, value = (F.pad(tensor, (0, 0, 0, padding)) for tensor in (query, key, value))
-        beta, log_decay = (F.pad(tensor, (0, padding)) for tensor in (beta, log_decay))
+        q, k, v = (F.pad(tensor, (0, 0, 0, 0, 0, padding)) for tensor in (q, k, v))
+        beta, log_decay = (F.pad(tensor, (0, 0, 0, padding)) for tensor in (beta, log_decay))
 
-    padded_length = query.shape[-2]
-    chunk_count = padded_length // chunk_size
-    query = query * scale
-    value = value * beta[..., None]
-    beta_key = key * beta[..., None]
+    padded_length = q.shape[1]
+    chunk_count = padded_length // _CHUNK_SIZE
+    q = q * scale
+    v = v * beta[..., None]
+    beta_key = k * beta[..., None]
 
-    query, key, value, beta_key = (
-        tensor.reshape(batch, heads, chunk_count, chunk_size, tensor.shape[-1])
-        for tensor in (query, key, value, beta_key)
+    q, k, v, beta_key = (
+        tensor.reshape(batch, chunk_count, _CHUNK_SIZE, heads, tensor.shape[-1]).permute(
+            0, 3, 1, 2, 4
+        )
+        for tensor in (q, k, v, beta_key)
     )
-    cumulative_decay = log_decay.reshape(batch, heads, chunk_count, chunk_size).cumsum(-1)
+    cumulative_decay = (
+        log_decay.reshape(batch, chunk_count, _CHUNK_SIZE, heads).permute(0, 3, 1, 2).cumsum(-1)
+    )
 
     decay_matrix = (
         (cumulative_decay.unsqueeze(-1) - cumulative_decay.unsqueeze(-2)).tril().exp().tril()
     )
     diagonal_and_upper = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device)
+        torch.ones(_CHUNK_SIZE, _CHUNK_SIZE, dtype=torch.bool, device=q.device)
     )
-    transition = -((beta_key @ key.transpose(-1, -2)) * decay_matrix).masked_fill(
+    transition = -((beta_key @ k.transpose(-1, -2)) * decay_matrix).masked_fill(
         diagonal_and_upper, 0
     )
 
-    for row in range(1, chunk_size):
+    for row in range(1, _CHUNK_SIZE):
         transition[..., row, :row] = transition[..., row, :row].clone() + (
             transition[..., row, :row, None].clone() * transition[..., :row, :row].clone()
         ).sum(-2)
 
-    transition = transition + torch.eye(chunk_size, dtype=query.dtype, device=query.device)
-    value = transition @ value
+    transition = transition + torch.eye(_CHUNK_SIZE, dtype=q.dtype, device=q.device)
+    v = transition @ v
     decayed_key = transition @ (beta_key * cumulative_decay.exp()[..., None])
 
     state = (
-        query.new_zeros(batch, heads, key_dimension, value_dimension)
-        if initial_state is None
-        else initial_state
+        q.new_zeros(batch, heads, key_dim, value_dim) if initial_state is None else initial_state
     )
-    output = torch.zeros_like(value)
+    output = torch.zeros_like(v)
     strictly_upper = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+        torch.ones(_CHUNK_SIZE, _CHUNK_SIZE, dtype=torch.bool, device=q.device), diagonal=1
     )
 
     for chunk in range(chunk_count):
-        chunk_query = query[:, :, chunk]
-        chunk_key = key[:, :, chunk]
-        chunk_value = value[:, :, chunk]
+        chunk_query = q[:, :, chunk]
+        chunk_key = k[:, :, chunk]
+        chunk_value = v[:, :, chunk]
         attention = (
             (chunk_query @ chunk_key.transpose(-1, -2)) * decay_matrix[:, :, chunk]
         ).masked_fill(strictly_upper, 0)
@@ -152,8 +151,8 @@ def chunk_forward(
             @ corrected_value
         )
 
-    output = output.reshape(batch, heads, padded_length, value_dimension)[:, :, :sequence]
-    return output, state if return_final_state else None
+    output = output.permute(0, 2, 3, 1, 4).reshape(batch, padded_length, heads, value_dim)
+    return output[:, :sequence], state if output_final_state else None
 
 
 __all__ = ["chunk_forward", "recurrent_forward", "reference_gdn"]

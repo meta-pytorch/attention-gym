@@ -6,53 +6,49 @@ import torch
 
 
 def validate_gdn_inputs(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
 ) -> None:
     """Validate backend-independent gated delta rule tensor invariants."""
-    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+    if q.ndim != 4:
+        raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
+    batch, tokens, heads, key_dim = q.shape
+    if batch == 0 or tokens == 0 or heads == 0 or key_dim == 0:
+        raise ValueError(f"q must have nonempty dimensions, got {tuple(q.shape)}")
+    if k.shape != q.shape:
+        raise ValueError(f"k must have shape {tuple(q.shape)}, got {tuple(k.shape)}")
+    if v.ndim != 4 or v.shape[:3] != (batch, tokens, heads) or v.shape[-1] == 0:
         raise ValueError(
-            "query, key, and value must have shape [batch, heads, sequence, dimension]"
+            f"v must have shape [{batch}, {tokens}, {heads}, V], got {tuple(v.shape)}"
         )
-    if gate.ndim != 3 or beta.ndim != 3:
-        raise ValueError("gate and beta must have shape [batch, heads, sequence]")
-    if query.shape != key.shape:
-        raise ValueError(
-            f"query and key must have the same shape, got {query.shape} and {key.shape}"
-        )
+    if gate.shape != (batch, tokens, heads):
+        raise ValueError(f"gate must have shape {(batch, tokens, heads)}, got {tuple(gate.shape)}")
+    if beta.shape != (batch, tokens, heads):
+        raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
 
-    batch, heads, sequence, key_dimension = query.shape
-    if sequence == 0:
-        raise ValueError("sequence length must be greater than zero")
-    if value.shape[:3] != (batch, heads, sequence):
-        raise ValueError("value must match query in its batch, head, and sequence dimensions")
-    if gate.shape != (batch, heads, sequence) or beta.shape != (batch, heads, sequence):
-        raise ValueError("gate and beta must match query's batch, head, and sequence dimensions")
     if initial_state is not None:
-        expected_state_shape = (batch, heads, key_dimension, value.shape[-1])
+        expected_state_shape = (batch, heads, key_dim, v.shape[-1])
         if initial_state.shape != expected_state_shape:
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, got {initial_state.shape}"
             )
 
-    tensors = (query, key, value, gate, beta)
-    if initial_state is not None:
-        tensors += (initial_state,)
+    tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if not all(tensor.is_floating_point() for tensor in tensors):
         raise ValueError("all inputs must have floating-point dtypes")
-    if any(tensor.device != query.device for tensor in tensors[1:]):
+    if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")
-    if key.dtype != query.dtype or value.dtype != query.dtype:
-        raise ValueError("query, key, and value must have the same dtype")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
 
-    compute_dtype = torch.promote_types(query.dtype, torch.float32)
+    compute_dtype = torch.promote_types(q.dtype, torch.float32)
     if initial_state is not None and initial_state.dtype != compute_dtype:
         raise ValueError(
-            f"initial_state must have dtype {compute_dtype} for {query.dtype} query, "
+            f"initial_state must have dtype {compute_dtype} for {q.dtype} q, "
             f"got {initial_state.dtype}"
         )
 
