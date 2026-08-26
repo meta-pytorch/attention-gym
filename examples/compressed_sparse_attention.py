@@ -375,12 +375,8 @@ def indexer_loss(
     attention_sink: torch.Tensor | None,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Compute the KL-divergence indexer loss using the attention LSE as a teacher.
-
-    The teacher signal is derived from the main attention's probability mass on the
-    selected compressed keys. Because LSE already includes the sink contribution,
-    we can recover per-key probabilities without recomputing the full softmax.
-
+    """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention 
+    
     Args:
         main_query: (B, H, S, D) — main attention queries (detached).
         selected_compressed_kv: (B, S, K, D) — the K compressed keys selected by
@@ -389,15 +385,14 @@ def indexer_loss(
             This includes the sliding window, sparse, AND sink contributions.
         selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
             the K selected keys.
-        attention_sink: (H,) or None — learned per-head sink weight.  If None the
-            LSE is assumed to already be the full denominator (no separate sink).
+        attention_sink: (H,) or None
         softmax_scale: float — the 1/sqrt(d) scale used in the attention computation.
 
     Returns:
         Scalar KL-divergence loss (mean over batch and sequence).
     """
-    # 1. Recompute main-attention logits for selected compressed keys.
-    #    main_query: (B, H, S, D), selected_compressed_kv: (B, S, K, D)
+    # Recompute main-attention logits for selected compressed keys.
+    # Selected attention doesn't store an attention matrix, so we have to do this
     compressed_attention_logits = (
         torch.einsum(
             "bhsd,bskd->bhsk",
@@ -406,16 +401,9 @@ def indexer_loss(
         )
         * softmax_scale
     )
-    # Shape: (B, H, S, K)
 
-    # 2. Recover per-key probabilities under the full attention denominator.
-    #    attention_lse already includes sliding-window + sparse + sink logits.
     full_attention_lse = attention_lse  # (B, H, S)
     if attention_sink is not None:
-        # If the LSE excludes the sink, incorporate it via logaddexp.
-        # In our implementation the triton/eager kernels already include the sink
-        # in the online softmax, so this branch is a no-op for standard usage.
-        # Kept for generality if a caller passes LSE without sink.
         full_attention_lse = torch.logaddexp(
             full_attention_lse,
             attention_sink[None, :, None],  # (1, H, 1)
@@ -424,24 +412,15 @@ def indexer_loss(
     per_head_compressed_probs = torch.exp(
         compressed_attention_logits - full_attention_lse[..., None]
     )
-    # Shape: (B, H, S, K) — does NOT sum to 1 over K.
-
-    # 3. Aggregate the teacher signal across attention heads.
     compressed_teacher_mass = per_head_compressed_probs.sum(dim=1)
-    # Shape: (B, S, K)
-
-    # 4. Normalize so the teacher is a valid distribution over the K keys.
+    # Normalize so we have a valid kl divergence
     eps = torch.finfo(torch.float32).tiny
     compressed_teacher_probs = (
         compressed_teacher_mass / compressed_teacher_mass.sum(dim=-1, keepdim=True).clamp_min(eps)
     ).detach()
-    # Shape: (B, S, K), sums to 1 over K.
 
-    # 5. The indexer produces its own distribution over the same K keys.
     indexer_probs = F.softmax(selected_indexer_logits.float(), dim=-1)
-    # Shape: (B, S, K)
-
-    # 6. KL divergence: teacher || indexer.
+    # Return KL
     return (
         (
             compressed_teacher_probs
