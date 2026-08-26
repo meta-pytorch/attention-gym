@@ -172,7 +172,12 @@ def chunk_forward(
     _validate_fused_constraints(q, v)
     output_dtype = q.dtype
     output_shape = q.shape
-    q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
+    kernel_dtype = (
+        q.dtype
+        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
+        else torch.bfloat16
+    )
+    q, k, v = (tensor.to(kernel_dtype) for tensor in (q, k, v))
     gate = gate.float()
     beta = beta.float().contiguous()
     batch, tokens, heads, head_dim = output_shape

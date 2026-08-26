@@ -27,14 +27,15 @@ def _inputs(
     sequences: int,
     heads: int = 1,
     lengths: list[int] | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, ...]:
     torch.manual_seed(37)
     shape = (1, tokens, heads, 128)
-    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    q = torch.randn(shape, device="cuda", dtype=dtype) / 8
     k = torch.randn_like(q) / 8
     w = torch.randn_like(q) / 8
     do = torch.randn_like(q) / 8
-    aqk = torch.randn(1, tokens, heads, 64, device="cuda", dtype=torch.bfloat16) / 8
+    aqk = torch.randn(1, tokens, heads, 64, device="cuda", dtype=dtype) / 8
     begin = 0
     for sequence_length in lengths or [tokens]:
         for offset in range(0, sequence_length, 64):
@@ -155,9 +156,10 @@ def test_ragged_delta_h_rejects_mismatched_chunk_size():
         )
 
 
-def test_ragged_delta_h_matches_independent_sequences():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ragged_delta_h_matches_independent_sequences(dtype: torch.dtype):
     lengths = [65, 0, 63]
-    inputs = _inputs(sum(lengths), len(lengths), lengths=lengths)
+    inputs = _inputs(sum(lengths), len(lengths), lengths=lengths, dtype=dtype)
     dh, dh0, dv = _run_ragged(inputs, lengths)
 
     expected_dh = []

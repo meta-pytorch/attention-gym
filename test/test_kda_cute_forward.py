@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 
 pytest.importorskip("cutlass")
@@ -159,6 +159,41 @@ def _packed_reference(
     return torch.cat(outputs, dim=1), torch.cat(states)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_private_chunk_kda_forward_matches_reference(dtype: torch.dtype):
+    """Exercise native 16-bit forward factors without the public dtype normalization."""
+    torch.manual_seed(2)
+    q, k, v, gate, beta = _inputs(tokens=64, dtype=dtype)
+    cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
+    actual, aqk, akk = _chunk_kda_fwd_op(q, k, v, cumulative_gate, beta, None, False)
+    golden, _ = naive_chunk_kda(
+        q.double(),
+        k.double(),
+        v.double(),
+        (gate * LOG2_E).double(),
+        beta.double(),
+        chunk_size=64,
+    )
+    reference, _ = naive_chunk_kda(q, k, v, gate * LOG2_E, beta, chunk_size=64)
+
+    assert actual.dtype == aqk.dtype == akk.dtype == dtype
+    _assert_golden(actual, golden, reference, dtype, f"private forward {dtype}")
+
+
+def test_private_fp16_forward_factors_are_finite_at_gate_limit():
+    """Keep the diagonal gate factorization within FP16 range at the public bound."""
+    torch.manual_seed(37)
+    q, k, v, _gate, beta = _inputs(tokens=64, dtype=torch.float16)
+    gate = torch.full_like(q, -MAX_GATE_LOWER_BOUND_MAGNITUDE, dtype=torch.float32)
+    cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
+
+    output, aqk, akk = _chunk_kda_fwd_op(q, k, v, cumulative_gate, beta, None, False)
+
+    for tensor in (output, aqk, akk):
+        assert tensor.dtype == torch.float16
+        assert torch.isfinite(tensor).all()
+
+
 def test_optimized_chunk_kda_matches_reference():
     """Check forward values and the isolated final-state cotangent path."""
     torch.manual_seed(3)
@@ -195,6 +230,46 @@ def test_optimized_chunk_kda_matches_reference():
         error = (actual_gradient.float() - expected_gradient).abs().max()
         tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
         assert error <= tolerance
+
+
+@pytest.mark.parametrize(("tokens", "packed"), [(128, False), (65, True)])
+def test_optimized_chunk_kda_fp16_training_matches_reference(tokens, packed):
+    """Exercise native FP16 dense and packed training with state gradients."""
+    torch.manual_seed(101)
+    inputs = _inputs(tokens=tokens, initial_state=True, dtype=torch.float16)
+    actual_inputs = _clone_inputs(inputs)
+    expected_inputs = _clone_inputs(inputs)
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32) if packed else None
+
+    actual, actual_state = chunk_kda(
+        *actual_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        autotune=False,
+    )
+    expected, expected_state = chunk_kda(
+        *expected_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        impl="reference",
+    )
+    assert actual_state is not None and expected_state is not None
+    actual_loss = actual.float().square().mean() + actual_state.square().mean()
+    expected_loss = expected.float().square().mean() + expected_state.square().mean()
+    actual_gradients = torch.autograd.grad(actual_loss, actual_inputs)
+    expected_gradients = torch.autograd.grad(expected_loss, expected_inputs)
+
+    assert actual.dtype == torch.float16
+    assert actual_state.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1e-3)
+    torch.testing.assert_close(actual_state, expected_state, rtol=3e-2, atol=1e-3)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        assert torch.isfinite(actual_gradient).all()
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=1e-3)
 
 
 def test_optimized_chunk_kda_accepts_strided_packed_qkv_views():
@@ -780,10 +855,11 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
     assert captured["metadata"] is metadata
 
 
-def test_chunk_kda_op_registration():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_chunk_kda_op_registration(dtype):
     """Validate schema, fake tensors, and AOT dispatch for both raw forward operators."""
     torch.manual_seed(5)
-    q, k, v, gate, beta, initial_state = _inputs(initial_state=True)
+    q, k, v, gate, beta, initial_state = _inputs(initial_state=True, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     q, k, v = _strided_qkv_views(q, k, v)
     # The raw operators are intentionally not differentiable; autograd lives in the
@@ -831,10 +907,11 @@ def test_chunk_kda_paged_op_registration():
     )
 
 
-def test_chunk_kda_backward_op_registration():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_chunk_kda_backward_op_registration(dtype):
     """Validate the intentionally first-order backward operator registrations."""
     torch.manual_seed(6)
-    q, k, v, gate, beta, initial_state = _inputs(initial_state=True)
+    q, k, v, gate, beta, initial_state = _inputs(initial_state=True, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     with torch.no_grad():
         _output, state, Aqk, Akk = _chunk_kda_fwd_with_state_op(
@@ -899,8 +976,9 @@ def test_chunk_kda_backward_op_registration():
         (torch.bfloat16, False, True),
         (torch.bfloat16, True, False),
         (torch.bfloat16, True, True),
+        (torch.float16, True, True),
     ],
-    ids=["fp32-output", "no-initial", "no-final", "initial-and-final"],
+    ids=["fp32-output", "no-initial", "no-final", "initial-and-final", "fp16"],
 )
 def test_chunk_kda_fullgraph_forward_and_backward(dtype, initial_state, output_final_state):
     """Capture the public operation and its registered backward as one strict graph."""
@@ -1094,10 +1172,11 @@ def test_chunk_kda_cuda_graph_replay():
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
-def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_chunk_kda_packed_cuda_graph_replays_boundaries_and_backward(dtype):
     """Replay packed metadata and gradients without capture-time host transfers."""
     torch.manual_seed(23)
-    inputs = _inputs(tokens=192, heads=2)
+    inputs = _inputs(tokens=192, heads=2, dtype=dtype)
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     warm_output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens)
     warm_gradients = torch.autograd.grad(warm_output.float().sum(), inputs)

@@ -251,18 +251,24 @@ def test_bound_gate_operator_registration():
     )
 
 
-def test_fused_chunk_gate_range_boundary_is_finite():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_chunk_gate_range_boundary_is_finite(dtype):
     """Exercise the strongest documented per-token decay accepted by the fused rebase."""
     torch.manual_seed(17)
     shape = (1, 64, 1, 128)
-    q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
-    k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
-    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    gate = torch.full(shape, -MAX_GATE_LOWER_BOUND_MAGNITUDE, device="cuda")
-    beta = torch.rand(shape[:3], device="cuda")
+    inputs = (
+        F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype),
+        F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype),
+        torch.randn(shape, device="cuda", dtype=dtype),
+        torch.full(shape, -MAX_GATE_LOWER_BOUND_MAGNITUDE, device="cuda"),
+        torch.rand(shape[:3], device="cuda"),
+    )
+    inputs = tuple(tensor.requires_grad_() for tensor in inputs)
 
-    output, _ = chunk_kda(q, k, v, gate, beta, autotune=False)
+    output, _ = chunk_kda(*inputs, autotune=False)
+    gradients = torch.autograd.grad(output.float().square().mean(), inputs)
     assert torch.isfinite(output).all()
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_plain_gate_scan_accepts_strided_dense_input():

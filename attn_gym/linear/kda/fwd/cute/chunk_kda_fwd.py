@@ -72,8 +72,11 @@ def _validate_private_abi(
     contiguous_tensors = (cumulative_gate, beta)
     if initial_state is not None:
         contiguous_tensors += (initial_state,)
-    if (q.dtype, k.dtype, v.dtype) != (torch.bfloat16,) * 3:
-        raise TypeError("the private chunk_kda ABI requires bfloat16 q, k, and v")
+    if q.dtype not in (torch.float16, torch.bfloat16) or (k.dtype, v.dtype) != (
+        q.dtype,
+        q.dtype,
+    ):
+        raise TypeError("the private chunk_kda ABI requires matching float16 or bfloat16 q, k, v")
     if cumulative_gate.dtype != torch.float32 or beta.dtype != torch.float32:
         raise TypeError("the private chunk_kda ABI requires float32 cumulative_gate and beta")
     if initial_state is not None and initial_state.dtype != torch.float32:
