@@ -373,10 +373,9 @@ def indexer_loss(
     attention_lse: torch.Tensor,
     selected_indexer_logits: torch.Tensor,
     attention_sink: torch.Tensor | None,
-    softmax_scale: float,
 ) -> torch.Tensor:
-    """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention 
-    
+    """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention
+
     Args:
         main_query: (B, H, S, D) — main attention queries (detached).
         selected_compressed_kv: (B, S, K, D) — the K compressed keys selected by
@@ -386,11 +385,13 @@ def indexer_loss(
         selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
             the K selected keys.
         attention_sink: (H,) or None
-        softmax_scale: float — the 1/sqrt(d) scale used in the attention computation.
 
     Returns:
         Scalar KL-divergence loss (mean over batch and sequence).
     """
+    head_dim = main_query.shape[-1]
+    softmax_scale = head_dim**-0.5
+
     # Recompute main-attention logits for selected compressed keys.
     # Selected attention doesn't store an attention matrix, so we have to do this
     compressed_attention_logits = (
