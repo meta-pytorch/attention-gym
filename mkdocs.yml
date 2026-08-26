@@ -56,17 +56,19 @@ plugins:
 
 nav:
   - Home: index.md
-  - Getting Started: getting-started.md
-  - Concepts: concepts.md
-  - Tutorials:
-      - CUDA Graphs: tutorials/cuda-graphs.md
-  - Determinism: determinism.md
-  - Masks: masks.md
-  - Score Mods: mods.md
-  - Linear Attention: linear.md
+  - Start Here:
+      - Getting Started: getting-started.md
+      - Core Concepts: concepts.md
+  - Guides:
+      - Ragged CUDA Graphs: tutorials/cuda-graphs.md
+      - Determinism: determinism.md
+  - Reference:
+      - Masks: masks.md
+      - Score Mods: mods.md
+      - Linear Attention: linear.md
+      - Utilities: utilities.md
   - Examples: examples.md
-  - Utilities: utilities.md
-  - Developers:
+  - Development:
       - CI Health: developers/ci-health.md
 
 markdown_extensions:
