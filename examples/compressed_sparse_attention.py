@@ -372,7 +372,6 @@ def indexer_loss(
     selected_compressed_kv: torch.Tensor,
     attention_lse: torch.Tensor,
     selected_indexer_logits: torch.Tensor,
-    attention_sink: torch.Tensor | None,
 ) -> torch.Tensor:
     """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention
 
@@ -384,7 +383,6 @@ def indexer_loss(
             This includes the sliding window, sparse, AND sink contributions.
         selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
             the K selected keys.
-        attention_sink: (H,) or None
 
     Returns:
         Scalar KL-divergence loss (mean over batch and sequence).
@@ -403,12 +401,7 @@ def indexer_loss(
         * softmax_scale
     )
 
-    full_attention_lse = attention_lse  # (B, H, S)
-    if attention_sink is not None:
-        full_attention_lse = torch.logaddexp(
-            full_attention_lse,
-            attention_sink[None, :, None],  # (1, H, 1)
-        )
+    full_attention_lse = attention_lse.detach().float()
 
     per_head_compressed_probs = torch.exp(
         compressed_attention_logits - full_attention_lse[..., None]
