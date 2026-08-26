@@ -8,12 +8,11 @@ It provides ready-to-use **mask functions** and **score mods** that you can comp
 
 ## What's Inside
 
-- **[Concepts](concepts.md)** — how `mask_mod`, `score_mod`, and `BlockMask` work together
-- **[Masks](masks.md)** — `mask_mod` functions for causal, sliding window, document-level, neighborhood attention, and more
-- **[Score Mods](mods.md)** — `score_mod` functions like ALiBi, soft-capping, and latent attention
-- **[Linear Attention](linear.md)** — gated-delta-rule reference implementations
-- **[Examples](examples.md)** — benchmarks, MLA, paged attention, determinism testing, and advanced patterns
-- **[Utilities](utilities.md)** — visualization, benchmarking, and profiling helpers
+- **[Getting Started](getting-started.md)** — install Attention Gym and build your first mask
+- **[Core Concepts](concepts.md)** — understand how `mask_mod`, `score_mod`, and `BlockMask` work together
+- **Guides** — learn about [CUDA Graphs for ragged training](tutorials/cuda-graphs.md) and [deterministic FlexAttention](determinism.md)
+- **Reference** — browse [masks](masks.md), [score mods](mods.md), [linear attention](linear.md), and [utilities](utilities.md)
+- **[Examples](examples.md)** — explore benchmarks, MLA, paged attention, distributed attention, and advanced patterns
 
 ## Quick Example
 
