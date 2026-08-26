@@ -15,7 +15,7 @@ triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
 from attn_gym._backends.triton.utils import can_use_tma
-from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_dav import chunk_kda_bwd_kernel_dAv
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -35,6 +35,9 @@ from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
 from attn_gym.linear.kda.naive import l2norm_bwd_ref, l2norm_fwd_ref
 from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED
 from attn_gym.testing.kda import (
+    bwd_daqk_reference,
+)
+from attn_gym.testing.kda import (
     bwd_intra_reference as _bwd_intra_ref,
 )
 from attn_gym.testing.kda import (
@@ -44,8 +47,10 @@ from attn_gym.testing.kda import (
 IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 try:
-    from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd_v1_dispatch as dispatch_mod
-    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd_v1 import blackwell_delta_h_bwd_dhu_v1
+    from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_bwd
+    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+        blackwell_delta_h_bwd_dhu_dv_fused,
+    )
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
         chunk_kda_bwd_intra as chunk_kda_bwd_intra_cute,
     )
@@ -470,73 +475,17 @@ def test_l2norm_bwd(dtype, T, D, strided):
     assert_golden(dx, golden, ref, dtype, f"l2norm_bwd_kernel T={T} D={D}")
 
 
-def _bwd_dav_ref(v, A, do, scale, chunk_size=64):
-    """Reference for ``chunk_kda_bwd_kernel_dAv``.
-
-    The forward adds ``o += tril(A) @ v_new`` per chunk (``A`` lower-triangular incl. diag),
-    so the adjoints are ``dv = tril(A)^T @ do`` and ``dA = tril(do @ v^T) * scale``.
-    """
-    B, T, H, V = v.shape
-    num_chunks = (T + chunk_size - 1) // chunk_size
-    acc = torch.float64 if v.dtype == torch.float64 else torch.float32
-    vc, Ac, doc = v.to(acc), A.to(acc), do.to(acc)
-    dv = torch.zeros(B, T, H, V, dtype=acc, device=v.device)
-    dA = torch.zeros(B, T, H, chunk_size, dtype=acc, device=v.device)
-    full_tril = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=v.device))
-    for it in range(num_chunks):
-        s = it * chunk_size
-        e = min(s + chunk_size, T)
-        L = e - s
-        tril = full_tril[:L, :L][None, :, None, :]  # (1, l, 1, m), l >= m
-        dob = doc[:, s:e]  # (b, l, h, v)
-        dv[:, s:e] = torch.einsum("blhm,blhv->bmhv", Ac[:, s:e, :, :L] * tril, dob)
-        dA[:, s:e, :, :L] = torch.einsum("blhv,bmhv->blhm", dob, vc[:, s:e]) * scale * tril
-    return dv, dA
-
-
-@pytest.mark.parametrize(
-    "dtype,T,H",
-    [
-        (torch.float16, 64, 1),
-        (torch.bfloat16, 128, 2),
-        (torch.bfloat16, 130, 2),
-    ],
-    ids=["single-fp16", "multi-bf16", "tail-bf16"],
-)
-def test_chunk_kda_bwd_dav(dtype, T, H):
+@pytest.mark.parametrize("tokens,heads", [(64, 1), (128, 2)])
+def test_chunk_kda_bwd_daqk(tokens, heads):
     torch.manual_seed(10)
-    B, V = 1, 64
+    shape = (1, tokens, heads, 128)
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    d_output = torch.randn_like(v)
     scale = 0.5
-    # Build the low-precision inputs first, then upcast the *same* values for the fp64 measuring
-    # stick so the reference error reflects only compute precision, not input quantization.
-    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    do = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    A = torch.randn(B, T, H, 64, device="cuda", dtype=dtype)
 
-    gdv, gdA = _bwd_dav_ref(v.double(), A.double(), do.double(), scale)
-    rdv, rdA = _bwd_dav_ref(v, A, do, scale)
-
-    dv = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
-    dA = torch.zeros(B, T, H, 64, device="cuda", dtype=dtype)
-    chunk_kda_bwd_kernel_dAv[(triton.cdiv(T, 64), B * H)](
-        v=v,
-        A=A,
-        do=do,
-        dv=dv,
-        dA=dA,
-        cu_seqlens=None,
-        chunk_offsets=None,
-        scale=scale,
-        T=T,
-        H=H,
-        V=V,
-        BT=64,
-        BV=V,
-        num_sequences=0,
-    )
-    tag = f"T={T} H={H}"
-    assert_golden(dv, gdv, rdv, dtype, f"bwd_dav dv {tag}")
-    assert_golden(dA, gdA, rdA, dtype, f"bwd_dav dA {tag}")
+    actual = chunk_kda_bwd_daqk(v, d_output, scale)
+    expected = bwd_daqk_reference(v, d_output, [tokens], scale)
+    torch.testing.assert_close(actual, expected, rtol=4e-3, atol=4e-3)
 
 
 def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64, use_exp2=True):
@@ -932,7 +881,7 @@ def test_recompute_w_u_fwd_cute():
 
 
 def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
-    """Reference for ``blackwell_delta_h_bwd_dhu_v1`` — the backward of the delta-rule
+    """Reference for the backward of the delta-rule
     h-recurrence (see ``_fwd_h_ref``), iterated over chunks in reverse::
 
         dh_out[c] = dh                                      (snapshot before update)
@@ -991,16 +940,24 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     )
     w = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
     do = torch.randn(B, T, H, V, device="cuda", dtype=torch.float32)
-    dv = torch.randn(B, T, H, V, device="cuda", dtype=torch.float32)
+    aqk = torch.randn(B, T, H, 64, device="cuda", dtype=torch.float32) * 0.1
+    aqk = aqk * _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
     # gk is the cumulative per-channel log2-decay (<= 0), so 2^{gk_last} <= 1.
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
     dht = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_dht else None
 
-    qb, kb, wb, dob, dvb = (t.to(torch.bfloat16) for t in (q, k, w, do, dv))
-    dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_v1(
-        qb, kb, wb, dob, dvb, gk=gk, h0=h0, dht=dht, scale=scale, chunk_size=64, bv=bv
+    qb, kb, wb, dob, aqkb = (t.to(torch.bfloat16) for t in (q, k, w, do, aqk))
+    dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_dv_fused(
+        qb, kb, wb, dob, aqkb, gk=gk, h0=h0, dht=dht, scale=scale, chunk_size=64, bv=bv
     )
+    dvb = torch.empty(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+    for start in range(0, T, 64):
+        dvb[:, start : start + 64] = torch.einsum(
+            "blhm,blhv->bmhv",
+            aqkb[:, start : start + 64],
+            dob[:, start : start + 64],
+        )
 
     h0d = h0.double() if use_h0 else None
     dhtd = dht.double() if use_dht else None
@@ -1038,17 +995,17 @@ def test_delta_h_bwd_dhu_dispatch_selects_bv(monkeypatch, sm_count, expected_bv)
 
     captured = {}
 
-    def fake_v1(*args, bv, **kwargs):
+    def fake_fused(*args, bv, **kwargs):
         captured["bv"] = bv
         return zeros, None, zeros
 
     class _Props:
         multi_processor_count = sm_count
 
-    monkeypatch.setattr(dispatch_mod, "get_device_properties", lambda device: _Props())
-    monkeypatch.setattr(dispatch_mod, "blackwell_delta_h_bwd_dhu_v1", fake_v1)
+    monkeypatch.setattr(delta_h_bwd, "get_device_properties", lambda device: _Props())
+    monkeypatch.setattr(delta_h_bwd, "blackwell_delta_h_bwd_dhu_dv_fused", fake_fused)
 
-    dispatch_mod.blackwell_delta_h_bwd_dhu_dispatch(q, q, q, zeros, zeros)
+    delta_h_bwd.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(q, q, q, zeros, zeros)
     assert captured["bv"] == expected_bv
 
 

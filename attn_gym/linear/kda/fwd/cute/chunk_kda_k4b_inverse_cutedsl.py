@@ -97,6 +97,16 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         cute.arch.sync_warp()
 
     @cute.jit
+    def _store_zero_block(self, mAkk, row_start, col_start, lane_idx, eos):
+        """Store one explicit zero 16x16 upper block."""
+        for k in cutlass.range_constexpr(self.BC * self.BC // self.WARP_SIZE):
+            linear_idx = lane_idx + k * self.WARP_SIZE
+            row = linear_idx // self.BC
+            col = linear_idx % self.BC
+            if row_start + row < eos:
+                mAkk[row_start + row, col_start + col] = self._dtype(0.0)
+
+    @cute.jit
     def __call__(
         self,
         mAkkOD: cute.Tensor,
@@ -660,14 +670,17 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             for i in cutlass.range_constexpr(cute.size(acc_res1)):
                 acc_res1[i] = -acc_res1[i]
 
-            # Store Ai32
+            # Store Ai32 and three upper-zero blocks while warp 0 remains busy.
             for i in cutlass.range_constexpr(cute.size(acc_res1)):
                 row = tCcC[i][0]
                 col = tCcC[i][1]
                 if i_tc3 + row < eos:
                     mAkk[i_tc3 + row, h_akk_col + 2 * self.BC + col] = self._dtype(acc_res1[i])
+            self._store_zero_block(mAkk, i_tc0, h_akk_col + self.BC, lane_idx, eos)
+            self._store_zero_block(mAkk, i_tc1, h_akk_col + 2 * self.BC, lane_idx, eos)
+            self._store_zero_block(mAkk, i_tc2, h_akk_col + 3 * self.BC, lane_idx, eos)
 
-        # ── WARP 3: Store all 4 diagonal blocks ──
+        # ── WARP 3: Store all 4 diagonal blocks and remaining upper zeros ──
         if is_active and warp_idx == 3:
             for k in cutlass.range_constexpr(self.BC * self.BC // 32):
                 linear_idx = lane_idx + k * 32
@@ -690,3 +703,6 @@ class ChunkKDAFwdK4bInverseCuteDSL:
                     mAkk[i_tc2 + row, h_akk_col + 2 * self.BC + col_idx] = self._dtype(value2)
                 if i_tc3 + row < eos:
                     mAkk[i_tc3 + row, h_akk_col + 3 * self.BC + col_idx] = self._dtype(value3)
+            self._store_zero_block(mAkk, i_tc0, h_akk_col + 2 * self.BC, lane_idx, eos)
+            self._store_zero_block(mAkk, i_tc0, h_akk_col + 3 * self.BC, lane_idx, eos)
+            self._store_zero_block(mAkk, i_tc1, h_akk_col + 3 * self.BC, lane_idx, eos)

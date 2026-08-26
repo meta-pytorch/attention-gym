@@ -24,18 +24,20 @@ def make_kda_test_inputs(
     tokens: int,
     *,
     batch: int = 1,
+    heads: int = 1,
     seed: int = 41,
+    gate_scale: float = 1.0,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Create deterministic public KDA inputs with per-token natural-log gates."""
     torch.manual_seed(seed)
-    shape = (batch, tokens, 1, 128)
+    shape = (batch, tokens, heads, 128)
     values = (
         torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
         torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
         torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        -torch.rand(shape, device="cuda"),
-        torch.rand(batch, tokens, 1, device="cuda"),
+        -torch.rand(shape, device="cuda") * gate_scale,
+        torch.rand(batch, tokens, heads, device="cuda"),
     )
     return tuple(value.requires_grad_(requires_grad) for value in values)
 
@@ -62,6 +64,32 @@ def assert_matches_low_precision_reference(
         f"{name}: kernel error {actual_error:.3e} exceeds {budget:.3e} "
         f"(reference error {reference_error:.3e})"
     )
+
+
+def bwd_daqk_reference(
+    value: torch.Tensor,
+    d_output: torch.Tensor,
+    lengths: Sequence[int],
+    scale: float,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Compute packed sequence-local dAqk in FP32."""
+    result = torch.zeros(*value.shape[:-1], chunk_size, device=value.device)
+    begin = 0
+    for length in lengths:
+        for offset in range(0, length, chunk_size):
+            end = min(offset + chunk_size, length)
+            size = end - offset
+            token = slice(begin + offset, begin + end)
+            block = torch.einsum(
+                "blhv,bmhv->blhm",
+                d_output[:, token].float(),
+                value[:, token].float(),
+            )
+            causal = torch.ones(size, size, dtype=torch.bool, device=value.device).tril()
+            result[:, token, :, :size] = block * scale * causal[None, :, None, :]
+        begin += length
+    return result
 
 
 def bwd_intra_reference(
@@ -242,6 +270,7 @@ def bwd_wy_dqkg_reference(
 
 __all__ = [
     "assert_matches_low_precision_reference",
+    "bwd_daqk_reference",
     "bwd_intra_reference",
     "bwd_wy_dqkg_reference",
     "clone_kda_inputs",

@@ -4,10 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# CuTe DSL KDA forward intra-chunk path.
-#
-# This wrapper keeps the full forward-intra pipeline and delegates the
-# inter-solve stage to the isolated K3b+K4b CuTe helper.
+# CuTe DSL KDA forward intra-chunk path: the persistent engine produces Aqk and
+# K3-compatible factors, then K4b assembles the dense or ragged Akk inverse.
 
 from __future__ import annotations
 
@@ -19,13 +17,46 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
-    chunk_kda_fwd_inter_solve_cute,
-    chunk_kda_fwd_inter_solve_ragged_cute,
+    chunk_kda_fwd_k4b_dense_cute,
+    chunk_kda_fwd_k4b_ragged_cute,
 )
+from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
-from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
-    chunk_kda_fwd_intra_diagonal,
-)
+
+
+def chunk_kda_fwd_factors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    metadata: RaggedChunkMetadata | None,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    profile_ranges: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce the BT64 Aqk/Akk factors used by forward and backward recompute."""
+    assert chunk_size == 64, "chunk_kda_fwd_factors requires chunk_size=64"
+    batch, tokens, heads, key_dim = k.shape
+    assert batch == 1, f"chunk_kda_fwd_factors requires B=1, got B={batch}"
+    assert key_dim == 128, f"chunk_kda_fwd_factors requires K=128, got K={key_dim}"
+
+    if isinstance(k, FakeTensor):
+        shape = (batch, tokens, heads, chunk_size)
+        return k.new_empty(shape), k.new_empty(shape)
+
+    with (
+        torch.profiler.record_function("kda/cute/intra_engine")
+        if profile_ranges
+        else nullcontext()
+    ):
+        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata)
+        Akk = (
+            chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size)
+            if metadata is None
+            else chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, metadata)
+        )
+    return Aqk, Akk
 
 
 def chunk_kda_fwd_intra(
@@ -46,62 +77,19 @@ def chunk_kda_fwd_intra(
     torch.Tensor,
     torch.Tensor,
 ]:
-    assert chunk_size == 64, "chunk_kda_fwd_intra CuTe path requires chunk_size=64"
-
-    B, T, H, K = k.shape
-    _, _, _, V = v.shape
-    BT = chunk_size
-    BC = 16
-    assert B == 1, f"chunk_kda_fwd_intra CuTe path requires B=1, got B={B}"
-    assert K == 128, f"chunk_kda_fwd_intra CuTe path requires K=128, got K={K}"
-    assert V == 128, f"chunk_kda_fwd_intra CuTe path requires V=128, got V={V}"
-
-    if isinstance(k, FakeTensor):
-        Aqk = torch.empty((B, T, H, BT), device=k.device, dtype=k.dtype)
-        Akkd = torch.empty((B, T, H, BC), device=k.device, dtype=torch.float32)
-    else:
-        with (
-            torch.profiler.record_function("kda/triton/intra_subchunk")
-            if profile_ranges
-            else nullcontext()
-        ):
-            Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
-                q=q,
-                k=k,
-                g=gk,
-                beta=beta,
-                scale=scale,
-                metadata=metadata,
-                chunk_size=BT,
-            )
-
-    with (
-        torch.profiler.record_function("kda/cute/inter_solve") if profile_ranges else nullcontext()
-    ):
-        if metadata is not None:
-            Aqk, Akk = chunk_kda_fwd_inter_solve_ragged_cute(
-                q=q,
-                k=k,
-                gk=gk,
-                beta=beta,
-                Akkd=Akkd,
-                Aqk=Aqk,
-                scale=scale,
-                metadata=metadata,
-            )
-        else:
-            Aqk, Akk = chunk_kda_fwd_inter_solve_cute(
-                q=q,
-                k=k,
-                gk=gk,
-                beta=beta,
-                Akkd=Akkd,
-                scale=scale,
-                chunk_size=BT,
-                Aqk=Aqk,
-                profile_ranges=profile_ranges,
-            )
-
+    """Produce the current BT64 forward intermediates and backward factors."""
+    if v.shape[-1] != 128:
+        raise ValueError(f"chunk_kda_fwd_intra requires V=128, got V={v.shape[-1]}")
+    Aqk, Akk = chunk_kda_fwd_factors(
+        q,
+        k,
+        gk,
+        beta,
+        scale,
+        metadata,
+        chunk_size=chunk_size,
+        profile_ranges=profile_ranges,
+    )
     with (
         torch.profiler.record_function("kda/cute/recompute_w_u")
         if profile_ranges
@@ -120,4 +108,4 @@ def chunk_kda_fwd_intra(
     return w, u, kg, Aqk, Akk
 
 
-__all__ = ["chunk_kda_fwd_intra"]
+__all__ = ["chunk_kda_fwd_factors", "chunk_kda_fwd_intra"]

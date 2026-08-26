@@ -15,6 +15,8 @@ from typing import NamedTuple
 import cuda.bindings.driver as cuda
 import cutlass
 import torch
+import triton
+import triton.language as tl
 from cutlass import Boolean, Float32, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -24,6 +26,7 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import LN2
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
@@ -45,6 +48,32 @@ KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
 # base pointer to be 16-byte (8 bf16 element) aligned.
 _MIN_ALIGN_BYTES = 16
 _MIN_ALIGN_ELEMENTS_BF16 = _MIN_ALIGN_BYTES // 2
+
+
+@triton.jit(do_not_specialize=["elements"])
+def _finalize_db_kernel(
+    db,
+    partial,
+    output,
+    elements,
+    PHASES: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Add four K-phase beta-gradient partials directly into final db."""
+    program = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    if USE_INT64_OFFSETS:
+        program = program.to(tl.int64)
+        lane = lane.to(tl.int64)
+        elements = elements.to(tl.int64)
+    offsets = program * BLOCK + lane
+    mask = offsets < elements
+    value = tl.load(db + offsets, mask=mask, other=0.0).to(tl.float32)
+    for phase in tl.static_range(PHASES):
+        value += tl.load(partial + phase * elements + offsets, mask=mask, other=0.0)
+    tl.store(output + offsets, value, mask=mask)
+
 
 # Kernel phase map:
 # 1. Host wrapper validates tensors and prepares caller-owned varlen metadata.
@@ -2189,12 +2218,21 @@ class ChunkKdaBwdIntraTunable:
             args.cu_seqlens,
             args.chunk_offsets,
         )
-        return (
-            args.dq2,
-            args.dk2,
-            args.dg2,
-            args.db + args.db_partial.sum(0).unsqueeze(0),
+        db2 = torch.empty_like(args.db)
+        elements = args.db.numel()
+        block = 256
+        _finalize_db_kernel[(triton.cdiv(elements, block),)](
+            args.db,
+            args.db_partial,
+            db2,
+            elements=elements,
+            PHASES=K_PHASES,
+            BLOCK=block,
+            USE_INT64_OFFSETS=requires_int64_offsets(args.db, args.db_partial, db2),
+            num_warps=4,
+            num_stages=1,
         )
+        return args.dq2, args.dk2, args.dg2, db2
 
 
 def chunk_kda_bwd_intra(
@@ -2226,7 +2264,7 @@ def chunk_kda_bwd_intra(
         metadata.validate_chunk_size(BT)
     elif tokens % BT:
         raise ValueError("the intra-chunk backward requires complete 64-token chunks")
-    if metadata is not None and tokens == 0:
+    if tokens == 0:
         return (
             torch.empty_like(q, memory_format=torch.contiguous_format),
             torch.empty_like(k, memory_format=torch.contiguous_format),

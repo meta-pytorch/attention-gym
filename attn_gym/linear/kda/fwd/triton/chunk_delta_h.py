@@ -27,8 +27,6 @@ from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
     ScheduleKind,
     ScheduleRequest,
-    load_ragged_chunk_count,
-    load_ragged_chunk_work,
     load_ragged_sequence_extent,
 )
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
@@ -43,7 +41,7 @@ def _run_chunk_delta_h_sequence(
     u_desc,
     vnew_desc,
     h_desc,
-    decay_desc,
+    gk_desc,
     h0,
     ht,
     cu_seqlens,
@@ -113,8 +111,8 @@ def _run_chunk_delta_h_sequence(
             [0, tok, i_h, i_v * BV],
             tl.reshape(b_vnew.to(k.dtype.element_ty), [1, BT, 1, BV]),
         )
-        b_decay = tl.reshape(decay_desc.load([chunk, i_h, 0]), [K])
-        b_h = b_h * b_decay[:, None]
+        b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
+        b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
@@ -146,8 +144,8 @@ def _run_chunk_delta_h_sequence(
             b_vnew.to(k.dtype.element_ty),
             mask=m_t[:, None],
         )
-        b_decay = tl.reshape(decay_desc.load([chunk, i_h, 0]), [K])
-        b_h = b_h * b_decay[:, None]
+        b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
+        b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.load(
             k + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
             mask=m_t[:, None],
@@ -169,7 +167,7 @@ def chunk_delta_h_kernel_k128_wsp(
     u_desc,
     vnew_desc,
     h_desc,
-    decay_desc,
+    gk_desc,
     h0,
     ht,
     cu_seqlens,
@@ -198,7 +196,7 @@ def chunk_delta_h_kernel_k128_wsp(
         u_desc,
         vnew_desc,
         h_desc,
-        decay_desc,
+        gk_desc,
         h0,
         ht,
         cu_seqlens,
@@ -231,7 +229,7 @@ def chunk_delta_h_kernel_k128_persistent(
     u_desc,
     vnew_desc,
     h_desc,
-    decay_desc,
+    gk_desc,
     h0,
     ht,
     cu_seqlens,
@@ -267,7 +265,7 @@ def chunk_delta_h_kernel_k128_persistent(
             u_desc,
             vnew_desc,
             h_desc,
-            decay_desc,
+            gk_desc,
             h0,
             ht,
             cu_seqlens,
@@ -291,67 +289,6 @@ def chunk_delta_h_kernel_k128_persistent(
             True,
             USE_INT64_OFFSETS,
         )
-
-
-@triton.jit(do_not_specialize=["num_sequences"])
-def _chunk_decay_last_kernel(
-    gk,
-    decay,
-    cu_seqlens,
-    chunk_offsets,
-    num_sequences,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    """Materialize exp2 of each chunk's last-row cumulative gate in one launch."""
-    global_chunk, i_h = tl.program_id(0), tl.program_id(1)
-    if IS_VARLEN:
-        if global_chunk >= load_ragged_chunk_count(chunk_offsets, num_sequences):
-            return
-        _, _, token_start, valid_tokens = load_ragged_chunk_work(
-            cu_seqlens,
-            chunk_offsets,
-            global_chunk,
-            num_sequences,
-            BT,
-        )
-        last_idx = token_start + valid_tokens - 1
-    else:
-        last_idx = global_chunk * BT + BT - 1
-    o_k = tl.arange(0, K)
-    b_g = tl.load(gk + last_idx.to(tl.int64) * H * K + i_h * K + o_k)
-    tl.store(decay + global_chunk.to(tl.int64) * H * K + i_h * K + o_k, exp2(b_g))
-
-
-def _chunk_decay_last(
-    gk: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    chunk_offsets: torch.Tensor | None,
-    chunks: int,
-    chunk_size: int,
-) -> torch.Tensor:
-    """Per-chunk exp2 last-row decay factors for the recurrence kernel.
-
-    Kept as a Triton kernel so exp2 stays bitwise-identical to the previous
-    in-loop decay; torch.exp2 makes no such guarantee.
-    """
-    _, _, heads, key_dim = gk.shape
-    decay = torch.empty(chunks, heads, key_dim, dtype=torch.float32, device=gk.device)
-    _chunk_decay_last_kernel[(chunks, heads)](
-        gk,
-        decay,
-        cu_seqlens,
-        chunk_offsets,
-        num_sequences=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
-        H=heads,
-        K=key_dim,
-        BT=chunk_size,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=1,
-    )
-    return decay
 
 
 # The op pair's schemas, fakes, and dispatch registrations live in
@@ -406,7 +343,8 @@ def _delta_h_launch(
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
     v_new = torch.empty_like(u)
-    decay = _chunk_decay_last(gk, cu_seqlens, chunk_offsets, capacity, _CHUNK_SIZE)
+    if not can_use_tma(gk):
+        gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     # FP32 tiles double the descriptor staging past the shared-memory limit
     # at the 16-bit tile shape, and warp specialization pins its own stage
@@ -420,7 +358,7 @@ def _delta_h_launch(
         TensorDescriptor.from_tensor(u, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(v_new, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(h, [1, 1, 1, key_dim, block_value_dim]),
-        TensorDescriptor.from_tensor(decay, [1, 1, key_dim]),
+        TensorDescriptor.from_tensor(gk, [1, 1, 1, key_dim]),
     )
     kernel_args = (
         *descriptors,
@@ -444,7 +382,9 @@ def _delta_h_launch(
         "NUM_STAGES": 3 if use_16bit_config else 2,
         "USE_INITIAL_STATE": initial_state is not None,
         "STORE_FINAL_STATE": final_state is not None,
-        "USE_INT64_OFFSETS": requires_int64_offsets(k, w, u, v_new, h, initial_state, final_state),
+        "USE_INT64_OFFSETS": requires_int64_offsets(
+            k, w, u, gk, v_new, h, initial_state, final_state
+        ),
         "num_warps": 4,
     }
     value_tiles = value_dim // block_value_dim

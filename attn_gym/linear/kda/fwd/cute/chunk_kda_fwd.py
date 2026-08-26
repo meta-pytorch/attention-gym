@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from attn_gym._backends.cute import get_device_properties, tensor_supports_tma
+from attn_gym._backends.cute import (
+    get_device_properties,
+    tensor_supports_contiguous_dim,
+    tensor_supports_tma,
+)
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -43,6 +47,13 @@ def _has_supported_qkv_layout(tensor: torch.Tensor) -> bool:
 def _normalize_qkv_layout(tensor: torch.Tensor) -> torch.Tensor:
     """Copy only layouts unsupported by one or more composed KDA stages."""
     if _has_supported_qkv_layout(tensor):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+def _normalize_packed_cotangent(tensor: torch.Tensor) -> torch.Tensor:
+    """Provide the compact 128-byte-aligned ABI required by packed delta-H."""
+    if tensor.is_contiguous() and tensor_supports_contiguous_dim(tensor, alignment_bytes=128):
         return tensor
     return tensor.clone(memory_format=torch.contiguous_format)
 
@@ -211,7 +222,7 @@ def _chunk_kda_fwd_ragged_shared(
     autotune: bool,
     output_final_state: bool,
 ):
-    """Run ragged forward with caller-prepared routing and fixed-schema tape."""
+    """Run ragged forward with caller-prepared routing and fixed-schema factors."""
     q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     metadata = RaggedChunkMetadata(
@@ -284,25 +295,19 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
     )
 
 
-def _chunk_kda_bwd_shared(
+def _prepare_chunk_kda_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
-    Aqk: torch.Tensor,
-    Akk: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
-    fastmath: bool,
-    autotune: bool,
 ):
-    """Keep the complete first-order composed backward opaque to AOTAutograd."""
-    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
-
+    """Normalize one backward invocation and reconstruct its optional metadata."""
     if (cu_seqlens is None) != (chunk_offsets is None):
         raise ValueError(
             "cu_seqlens and chunk_offsets must either both be present or both be absent"
@@ -316,11 +321,69 @@ def _chunk_kda_bwd_shared(
             chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
             _CHUNK_SIZE,
         )
-
     q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     if d_output is None:
         d_output = v.new_zeros(v.shape)
+    elif metadata is not None:
+        d_output = _normalize_packed_cotangent(d_output)
+    else:
+        d_output = _normalize_qkv_layout(d_output)
+    if d_final_state is not None:
+        d_final_state = d_final_state.float()
+        d_final_state = (
+            _normalize_packed_cotangent(d_final_state)
+            if metadata is not None
+            else _normalize_qkv_layout(d_final_state)
+        )
+    return q, k, v, metadata, d_output, d_final_state
+
+
+def _chunk_kda_bwd_shared(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    Aqk: torch.Tensor | None,
+    Akk: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    fastmath: bool,
+    autotune: bool,
+):
+    """Run the opaque composed backward with saved or recomputed factors."""
+    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
+
+    q, k, v, metadata, d_output, d_final_state = _prepare_chunk_kda_backward(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        cu_seqlens,
+        chunk_offsets,
+        d_output,
+        d_final_state,
+        initial_state,
+    )
+    if Aqk is None:
+        assert Akk is None
+        from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
+
+        Aqk, Akk = chunk_kda_fwd_factors(
+            q,
+            k,
+            cumulative_gate,
+            beta,
+            _HEAD_DIM**-0.5,
+            metadata,
+        )
+    else:
+        assert Akk is not None
     return chunk_kda_bwd(
         q,
         k,
@@ -329,8 +392,8 @@ def _chunk_kda_bwd_shared(
         beta,
         Aqk,
         Akk,
-        d_output.contiguous(),
-        None if d_final_state is None else d_final_state.float().contiguous(),
+        d_output,
+        d_final_state,
         initial_state,
         metadata,
         fastmath=fastmath,
@@ -338,17 +401,67 @@ def _chunk_kda_bwd_shared(
     )
 
 
+def _chunk_kda_bwd_recompute_factors_shared(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    fastmath: bool,
+    autotune: bool,
+):
+    """Keep the recomputed-factor backward opaque to AOTAutograd."""
+    return _chunk_kda_bwd_shared(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        None,
+        None,
+        cu_seqlens,
+        chunk_offsets,
+        d_output,
+        d_final_state,
+        initial_state,
+        fastmath,
+        autotune,
+    )
+
+
 def _chunk_kda_bwd_cuda(*args) -> tuple[torch.Tensor, ...]:
+    """Drop the unused state gradient to match the no-state operator schema."""
     dq, dk, dv, dg, db, _d_initial_state = _chunk_kda_bwd_shared(*args)
     return dq, dk, dv, dg, db
 
 
 def _chunk_kda_bwd_with_state_grad_cuda(*args) -> tuple[torch.Tensor, ...]:
+    """Preserve the state gradient required by the stateful operator schema."""
     return _chunk_kda_bwd_shared(*args)
+
+
+def _chunk_kda_bwd_recompute_factors_cuda(*args) -> tuple[torch.Tensor, ...]:
+    """Drop the recomputed state gradient for the no-state operator schema."""
+    dq, dk, dv, dg, db, _d_initial_state = _chunk_kda_bwd_recompute_factors_shared(*args)
+    return dq, dk, dv, dg, db
+
+
+def _chunk_kda_bwd_recompute_factors_with_state_grad_cuda(
+    *args,
+) -> tuple[torch.Tensor, ...]:
+    """Preserve the recomputed state gradient for the stateful operator schema."""
+    return _chunk_kda_bwd_recompute_factors_shared(*args)
 
 
 __all__ = [
     "_chunk_kda_bwd_op",
+    "_chunk_kda_bwd_recompute_factors_cuda",
+    "_chunk_kda_bwd_recompute_factors_with_state_grad_cuda",
     "_chunk_kda_bwd_with_state_grad_op",
     "_chunk_kda_fwd_op",
     "_chunk_kda_fwd_ragged_op",

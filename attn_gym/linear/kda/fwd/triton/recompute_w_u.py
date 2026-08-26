@@ -57,7 +57,12 @@ from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
 
 
-_AUTOTUNE_CONFIGS = [triton.Config({}, num_warps=w, num_stages=s) for w in [4, 8] for s in [2, 3]]
+_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=8, num_stages=2),
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=4, num_stages=3),
+    triton.Config({}, num_warps=8, num_stages=3),
+]
 _AUTOTUNE_KEY = [
     "H",
     "HV",

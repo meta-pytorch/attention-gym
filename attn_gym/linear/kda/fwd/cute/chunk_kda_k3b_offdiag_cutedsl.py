@@ -500,7 +500,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 mAkkOD[od_row, akkod_col + row * self.BC + col] = acc_Akk[i] * beta_val
         elif warp_idx == 2:
             # Define the noncausal block while this CTA already owns the
-            # corresponding lower block. Aqk is exposed as custom-op tape, so
+            # corresponding lower block. Aqk is exposed as custom-op factor, so
             # its complete storage must be deterministic for fake/AOT checks.
             out_dtype = mAqk.element_type
             for i in cutlass.range_constexpr(cute.size(acc_Aqk)):
