@@ -45,6 +45,9 @@ watch:
 plugins:
   - search
   - macros
+  - redirects:
+      redirect_maps:
+        tutorials/cuda-graphs.md: guides/ragged-cuda-graphs.md
   - mkdocstrings:
       handlers:
         python:
@@ -60,7 +63,7 @@ nav:
       - Getting Started: getting-started.md
       - Core Concepts: concepts.md
   - Guides:
-      - Ragged CUDA Graphs: tutorials/cuda-graphs.md
+      - Ragged CUDA Graphs: guides/ragged-cuda-graphs.md
       - Determinism: determinism.md
   - Reference:
       - Masks: masks.md
