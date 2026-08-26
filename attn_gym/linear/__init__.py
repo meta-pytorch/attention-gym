@@ -15,6 +15,7 @@ from attn_gym.linear.kda import (
     chunk_kda,
     mask_inactive_token_gradients,
     mask_inactive_tokens,
+    paged_chunk_kda,
     recurrent_kda,
     recurrent_kda_decode,
 )
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
 KDA_OPS = [
     "chunk_kda",
+    "paged_chunk_kda",
     "recurrent_kda",
     "recurrent_kda_decode",
 ]

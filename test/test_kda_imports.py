@@ -44,10 +44,13 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
             chunk_kda,
             mask_inactive_token_gradients,
             mask_inactive_tokens,
+            paged_chunk_kda,
             recurrent_kda,
             recurrent_kda_decode,
         )
         from attn_gym.linear.kda import bound_gate
+
+        assert callable(paged_chunk_kda)
 
         raw_gate = torch.randn(1, 3, 1, 2, requires_grad=True)
         a_log = torch.randn(1, requires_grad=True)

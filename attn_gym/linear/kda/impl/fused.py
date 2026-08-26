@@ -12,6 +12,7 @@ from attn_gym.linear.kda.ops import (
     chunk_bwd_with_state_grad_op,
     chunk_fwd_op,
     chunk_fwd_ragged_op,
+    chunk_fwd_ragged_paged_op,
     chunk_fwd_ragged_with_state_op,
     chunk_fwd_with_state_op,
 )
@@ -222,4 +223,61 @@ def chunk_forward(
     return output.reshape(output_shape).to(output_dtype), state
 
 
-__all__ = ["chunk_forward"]
+def paged_chunk_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    autotune: bool = True,
+) -> torch.Tensor:
+    """Normalize inputs and invoke the registered paged chunk operator."""
+    _validate_fused_constraints(q, v)
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k, v, gate, beta, state_cache)
+    ):
+        raise RuntimeError(
+            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+
+    output_dtype = q.dtype
+    output_shape = q.shape
+    q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
+    gate = gate.float()
+    beta = beta.float().contiguous()
+    batch, tokens, heads, head_dim = output_shape
+    if cu_seqlens is None:
+        packed_shape = (1, batch * tokens, heads, head_dim)
+        q, k, v, gate = (tensor.reshape(packed_shape) for tensor in (q, k, v, gate))
+        beta = beta.reshape(packed_shape[:3])
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
+    cumulative_gate = _plain_gate_scan_op(
+        gate,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        False,
+    )
+    output = chunk_fwd_ragged_paged_op(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        autotune,
+    )
+    return output.reshape(output_shape).to(output_dtype)
+
+
+__all__ = ["chunk_forward", "paged_chunk_forward"]
