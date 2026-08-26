@@ -4,6 +4,12 @@
   --md-primary-fg-color: #0e0e0e;
   --accent-green: #6f8f7b;
   --accent-green-dim: #5f7f67;
+  --capacity-tokens: #68b5e6;
+  --capacity-sequences: #e3a15f;
+  --capacity-t: var(--capacity-tokens);
+  --capacity-l: #78c596;
+  --capacity-n: var(--capacity-sequences);
+  --capacity-m: #c18ad9;
   --rule-color: #202020;
 }
 
@@ -50,6 +56,12 @@
   --md-code-fg-color: #1a2e22;
   --md-footer-bg-color: #e8e4dc;
   --md-footer-fg-color: #3a4a3e;
+  --capacity-tokens: #176d9c;
+  --capacity-sequences: #97551c;
+  --capacity-t: var(--capacity-tokens);
+  --capacity-l: #33794f;
+  --capacity-n: var(--capacity-sequences);
+  --capacity-m: #784895;
 }
 
 [data-md-color-scheme="default"] .md-header {
@@ -209,6 +221,936 @@
 
 [data-md-color-scheme="default"] .md-typeset img[alt="Attention Gym"] {
   border-color: #d0ccc4;
+}
+
+/* ── Padded-to-packed tensor diagram ── */
+
+.md-typeset .ragged-viz {
+  margin: 1.1rem 0 1.4rem;
+  padding: 1rem;
+  border: 1px solid #292929;
+  border-radius: 2px;
+  background: var(--md-code-bg-color);
+}
+
+[data-md-color-scheme="default"] .md-typeset .ragged-viz {
+  border-color: #d0ccc4;
+}
+
+.md-typeset .ragged-viz__stage {
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.75rem;
+}
+
+.md-typeset .ragged-viz__meta {
+  display: grid;
+  gap: 0.2rem;
+  color: var(--md-default-fg-color--light);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.64rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.md-typeset .ragged-viz__meta code,
+.md-typeset .ragged-viz__tensor {
+  padding: 0;
+  background: transparent;
+  color: var(--md-default-fg-color);
+  font-size: 0.68rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.md-typeset .ragged-viz__padded {
+  display: grid;
+  width: min(100%, 18rem);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.18rem;
+}
+
+.md-typeset .ragged-viz__cell,
+.md-typeset .ragged-viz__segment {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  height: 2rem;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--segment-color) 62%, transparent);
+  background: color-mix(in srgb, var(--segment-color) 11%, transparent);
+  color: color-mix(in srgb, var(--segment-color) 82%, var(--md-typeset-color));
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.md-typeset .ragged-viz__cell {
+  border-radius: 2px;
+}
+
+.md-typeset .ragged-viz__a {
+  --segment-color: var(--capacity-tokens);
+}
+
+.md-typeset .ragged-viz__b {
+  --segment-color: var(--capacity-sequences);
+}
+
+.md-typeset .ragged-viz__c {
+  --segment-color: var(--accent-green);
+}
+
+.md-typeset .ragged-viz__pad {
+  border-style: dashed;
+  border-color: var(--md-default-fg-color--lighter);
+  background: transparent;
+  color: var(--md-default-fg-color--lighter);
+  font-size: 0.62rem;
+  font-weight: 400;
+}
+
+.md-typeset .ragged-viz__action {
+  margin: 0.55rem 0 0.65rem 13.75rem;
+  color: var(--md-default-fg-color--lighter);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.md-typeset .ragged-viz__action strong {
+  color: var(--accent-green);
+  font-weight: 500;
+}
+
+.md-typeset .ragged-viz__packed-wrap {
+  width: min(100%, 40.5rem);
+}
+
+.md-typeset .ragged-viz__packed {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  padding-bottom: 1.7rem;
+}
+
+.md-typeset .ragged-viz__segment {
+  position: relative;
+  grid-row: 1;
+  border-radius: 0;
+}
+
+.md-typeset .ragged-viz__segment + .ragged-viz__segment {
+  border-left: 0;
+}
+
+.md-typeset .ragged-viz__segment:first-child {
+  border-radius: 2px 0 0 2px;
+}
+
+.md-typeset .ragged-viz__segment--last {
+  border-radius: 0 2px 2px 0;
+}
+
+.md-typeset .ragged-viz__packed::after {
+  position: absolute;
+  z-index: 0;
+  top: 2.55rem;
+  right: 0;
+  left: 0;
+  border-top: 1px solid var(--md-default-fg-color--lighter);
+  content: "";
+}
+
+.md-typeset .ragged-viz__segment::after {
+  position: absolute;
+  z-index: 1;
+  top: 2rem;
+  right: -1px;
+  width: 1px;
+  height: 0.55rem;
+  background: var(--segment-color);
+  content: "";
+}
+
+.md-typeset .ragged-viz__segment::before {
+  position: absolute;
+  z-index: 1;
+  top: 2.65rem;
+  right: 0;
+  color: var(--segment-color);
+  content: attr(data-end);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.7rem;
+  font-weight: 400;
+  transform: translateX(50%);
+}
+
+.md-typeset .ragged-viz__segment--last::before {
+  transform: none;
+}
+
+.md-typeset .ragged-viz__start {
+  position: absolute;
+  z-index: 1;
+  top: 2rem;
+  left: 0;
+  padding-top: 0.65rem;
+  color: var(--md-default-fg-color--light);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.7rem;
+}
+
+.md-typeset .ragged-viz__start::before {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 0.55rem;
+  background: currentcolor;
+  content: "";
+}
+
+.md-typeset .ragged-viz__tensor {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+@media screen and (max-width: 40rem) {
+  .md-typeset .ragged-viz__stage {
+    grid-template-columns: 1fr;
+    gap: 0.45rem;
+  }
+
+  .md-typeset .ragged-viz__action {
+    margin-left: 0;
+  }
+}
+
+/* ── cu_seqlens → chunk_offsets diagram ── */
+
+.md-typeset .chunk-offset-viz {
+  --wrong-color: #d47b72;
+  margin: 1rem 0 1.25rem;
+  padding: 0.85rem;
+  border: 1px solid #292929;
+  border-radius: 2px;
+  background: var(--md-code-bg-color);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+[data-md-color-scheme="default"] .md-typeset .chunk-offset-viz {
+  --wrong-color: #9c443c;
+  border-color: #d0ccc4;
+}
+
+.md-typeset .chunk-offset-viz__steps {
+  display: grid;
+  grid-template-columns:
+    minmax(7rem, 1fr) auto minmax(6rem, 0.8fr) auto minmax(5rem, 0.7fr) auto
+    minmax(7rem, 1fr);
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.md-typeset .chunk-offset-viz__step {
+  --step-color: var(--accent-green);
+  display: grid;
+  min-width: 0;
+  gap: 0.28rem;
+  align-content: center;
+  padding: 0.62rem 0.68rem;
+  border: 1px solid color-mix(in srgb, var(--step-color) 48%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--step-color) 9%, transparent);
+  box-shadow: inset 0 2px 0 color-mix(in srgb, var(--step-color) 72%, transparent);
+}
+
+.md-typeset .chunk-offset-viz__step--input {
+  --step-color: var(--capacity-tokens);
+}
+
+.md-typeset .chunk-offset-viz__step--lengths {
+  --step-color: var(--capacity-sequences);
+}
+
+.md-typeset .chunk-offset-viz__step--chunks {
+  --step-color: var(--capacity-l);
+}
+
+.md-typeset .chunk-offset-viz__step--output {
+  --step-color: var(--capacity-m);
+}
+
+.md-typeset .chunk-offset-viz__step span {
+  color: var(--md-default-fg-color--light);
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.md-typeset .chunk-offset-viz code {
+  padding: 0;
+  background: transparent;
+  color: var(--md-default-fg-color);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.md-typeset .chunk-offset-viz__connector {
+  display: grid;
+  min-width: 3.3rem;
+  place-items: center;
+  color: var(--md-default-fg-color--lighter);
+  text-align: center;
+}
+
+.md-typeset .chunk-offset-viz__connector span {
+  font-size: 0.48rem;
+  letter-spacing: 0.035em;
+  line-height: 1.15;
+  text-transform: uppercase;
+}
+
+.md-typeset .chunk-offset-viz__connector b {
+  color: var(--accent-green);
+  font-size: 0.9rem;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.md-typeset .chunk-offset-viz__wrong {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.65rem;
+  padding: 0.5rem 0.65rem;
+  border-left: 2px solid var(--wrong-color);
+  background: color-mix(in srgb, var(--wrong-color) 7%, transparent);
+}
+
+.md-typeset .chunk-offset-viz__wrong b {
+  color: var(--wrong-color);
+  font-weight: 400;
+}
+
+.md-typeset .chunk-offset-viz__wrong strong {
+  justify-self: end;
+  padding: 0.12rem 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--wrong-color) 54%, transparent);
+  border-radius: 999px;
+  color: var(--wrong-color);
+  font-size: 0.52rem;
+  font-weight: 600;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+@media screen and (max-width: 52rem) {
+  .md-typeset .chunk-offset-viz__steps {
+    grid-template-columns: 1fr;
+  }
+
+  .md-typeset .chunk-offset-viz__connector {
+    min-width: 0;
+    min-height: 1.8rem;
+  }
+
+  .md-typeset .chunk-offset-viz__connector b {
+    transform: rotate(90deg);
+  }
+
+  .md-typeset .chunk-offset-viz__wrong {
+    grid-template-columns: 1fr auto;
+  }
+
+  .md-typeset .chunk-offset-viz__wrong code:first-of-type {
+    grid-column: 1 / -1;
+  }
+
+  .md-typeset .chunk-offset-viz__wrong strong {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+}
+
+/* ── Tutorial widgets ── */
+
+.tutorial-widget {
+  width: 100%;
+  min-height: 32rem;
+  border: 1px solid #1a1a1a;
+  border-radius: 2px;
+  background: var(--md-code-bg-color);
+}
+
+[data-md-color-scheme="default"] .tutorial-widget {
+  border-color: #d0ccc4;
+}
+
+.md-typeset .plotly-chart {
+  width: 100%;
+  margin: 1.2rem 0;
+}
+
+.md-typeset .plotly-chart__frame {
+  display: block;
+  min-height: 0;
+}
+
+.md-typeset .plotly-chart figcaption {
+  margin-top: 0.35rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.7rem;
+  text-align: center;
+}
+
+.md-typeset .memory-pools-frame {
+  display: block;
+  min-height: 20rem;
+  margin: 1.2rem 0 0;
+  scroll-margin-top: 4rem;
+}
+
+.md-typeset .memory-pools-caption {
+  margin: 0.35rem 0 1.2rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.7rem;
+  text-align: center;
+}
+
+.md-typeset .memory-viz-frame {
+  display: block;
+  min-height: 40rem;
+  margin: 1.2rem 0;
+}
+
+@media screen and (max-width: 44em) {
+  .md-typeset .memory-pools-frame {
+    min-height: 33rem;
+  }
+}
+
+.md-typeset .trace-embed {
+  margin: 1.2rem 0;
+}
+
+.md-typeset .trace-preview {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #292929;
+  border-radius: 3px;
+  background: var(--md-code-bg-color);
+  color: var(--md-default-fg-color);
+  cursor: pointer;
+  font: inherit;
+  text-align: initial;
+}
+
+[data-md-color-scheme="default"] .md-typeset .trace-preview {
+  border-color: #d0ccc4;
+}
+
+.md-typeset .trace-preview img {
+  display: block;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  transition: filter 160ms ease, transform 160ms ease;
+}
+
+.md-typeset .trace-preview__label {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid color-mix(in srgb, var(--md-accent-fg-color) 48%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--md-default-bg-color) 88%, transparent);
+  color: var(--md-default-fg-color);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.015em;
+  backdrop-filter: blur(6px);
+}
+
+.md-typeset .trace-preview:hover,
+.md-typeset .trace-preview:focus-visible {
+  border-color: var(--md-accent-fg-color);
+}
+
+.md-typeset .trace-preview:hover img {
+  filter: brightness(1.05);
+  transform: scale(1.002);
+}
+
+.md-typeset .trace-preview:focus-visible {
+  outline: 2px solid var(--md-accent-fg-color);
+  outline-offset: 2px;
+}
+
+.md-typeset .trace-preview[hidden] {
+  display: none;
+}
+
+.md-typeset .trace-embed__viewer {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid #292929;
+  border-radius: 3px;
+  background: var(--md-code-bg-color);
+}
+
+[data-md-color-scheme="default"] .md-typeset .trace-embed__viewer {
+  border-color: #d0ccc4;
+}
+
+.trace-embed__viewer:fullscreen,
+.md-typeset .trace-embed__viewer--fullscreen {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  aspect-ratio: auto;
+  border: 0;
+  border-radius: 0;
+  background: #111;
+}
+
+body.trace-embed-fullscreen-open {
+  overflow: hidden;
+}
+
+.md-typeset .trace-embed__viewer .tutorial-widget {
+  display: block;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+}
+
+.md-typeset .trace-embed__controls {
+  position: absolute;
+  z-index: 2;
+  top: 0.5rem;
+  left: 0.5rem;
+  display: flex;
+  gap: 0.35rem;
+}
+
+.md-typeset .trace-embed__close,
+.md-typeset .trace-embed__fullscreen {
+  padding: 0.25rem 0.4rem;
+  border: 1px solid color-mix(in srgb, var(--md-accent-fg-color) 55%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--md-default-bg-color) 90%, transparent);
+  color: var(--md-default-fg-color);
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.015em;
+  backdrop-filter: blur(6px);
+}
+
+.md-typeset .trace-embed__close:hover,
+.md-typeset .trace-embed__close:focus-visible,
+.md-typeset .trace-embed__fullscreen:hover,
+.md-typeset .trace-embed__fullscreen:focus-visible {
+  border-color: var(--md-accent-fg-color);
+}
+
+/* ── Collapsible code ── */
+
+.md-typeset details.code-disclosure {
+  margin: 0.9rem 0 1.1rem;
+  border: 1px solid color-mix(in srgb, var(--md-default-fg-color) 20%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--md-code-bg-color) 45%, transparent);
+  box-shadow: none;
+}
+
+.md-typeset details.code-disclosure summary {
+  padding: 0.55rem 2rem 0.55rem 0.75rem;
+  background: transparent;
+  color: var(--md-default-fg-color--light);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+}
+
+.md-typeset details.code-disclosure summary::before {
+  display: none;
+}
+
+.md-typeset details.code-disclosure summary::after {
+  color: var(--md-default-fg-color--lighter);
+}
+
+.md-typeset details.code-disclosure[open] summary {
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--md-default-fg-color) 16%, transparent);
+}
+
+.md-typeset details.code-disclosure .highlight {
+  margin: 0;
+}
+
+/* ── Code annotations ── */
+
+.md-typeset .highlight span[id^="__span"]:has(.md-annotation) {
+  display: block;
+  width: max-content;
+  margin-left: -1.1764705882em;
+  padding: 0 0.4em 0 1.1764705882em;
+  background: color-mix(in srgb, var(--md-accent-fg-color) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--md-accent-fg-color);
+  transition: background-color 160ms ease;
+}
+
+.md-typeset .highlight span[id^="__span"]:has(.md-annotation):hover,
+.md-typeset .highlight span[id^="__span"]:has(.md-annotation):focus-within {
+  background: color-mix(in srgb, var(--md-accent-fg-color) 18%, transparent);
+}
+
+[data-md-color-scheme="default"]
+  .md-typeset
+  .highlight
+  span[id^="__span"]:has(.md-annotation) {
+  background: color-mix(in srgb, var(--md-accent-fg-color) 12%, transparent);
+}
+
+[data-md-color-scheme="default"]
+  .md-typeset
+  .highlight
+  span[id^="__span"]:has(.md-annotation):hover,
+[data-md-color-scheme="default"]
+  .md-typeset
+  .highlight
+  span[id^="__span"]:has(.md-annotation):focus-within {
+  background: color-mix(in srgb, var(--md-accent-fg-color) 22%, transparent);
+}
+
+.md-typeset .md-annotation__index::after {
+  background-color: var(--md-accent-fg-color);
+}
+
+/* ── Tutorial sidenotes ── */
+
+.md-typeset .with-sidenote {
+  --sidenote-accent: var(--capacity-color, var(--md-accent-fg-color));
+  margin: 1.5rem 0;
+}
+
+.md-typeset .with-sidenote > :first-child > :first-child,
+.md-typeset .sidenote > :first-child {
+  margin-top: 0;
+}
+
+.md-typeset .with-sidenote > :first-child > :last-child,
+.md-typeset .sidenote > :last-child {
+  margin-bottom: 0;
+}
+
+.md-typeset .sidenote-ref {
+  border-radius: 2px;
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-color: var(--sidenote-accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+  cursor: help;
+  transition: background-color 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    box-shadow 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.md-typeset .sidenote-ref--equation {
+  display: block;
+  padding: 0.12rem 0.4rem;
+  text-decoration: none;
+  box-shadow: inset 2px 0 0 transparent;
+}
+
+.md-typeset .sidenote-ref--equation .arithmatex {
+  margin: 0;
+}
+
+.md-typeset .sidenote-ref--equation:is(:hover, :focus),
+.md-typeset .with-sidenote:has(.sidenote:hover, .sidenote:focus-within)
+  .sidenote-ref--equation {
+  box-shadow: inset 2px 0 0 var(--sidenote-accent);
+}
+
+.md-typeset .sidenote {
+  color: var(--md-default-fg-color--light);
+  font-size: 0.76rem;
+  line-height: 1.55;
+}
+
+.md-typeset .sidenote p,
+.md-typeset .sidenote li {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.md-typeset .sidenote em {
+  color: var(--md-accent-fg-color);
+}
+
+.md-typeset .with-sidenote:has(
+    .sidenote-ref:hover,
+    .sidenote-ref:focus,
+    .sidenote:hover,
+    .sidenote:focus-within
+  )
+  .sidenote-ref {
+  background: color-mix(in srgb, var(--sidenote-accent) 16%, transparent);
+}
+
+.md-typeset .sidenote--hover-media a,
+.md-typeset .sidenote--hover-media img {
+  display: block;
+  width: 100%;
+  margin: 0;
+}
+
+.md-typeset .sidenote--hover-media img {
+  border: 1px solid color-mix(in srgb, var(--sidenote-accent) 55%, transparent);
+  border-radius: 2px;
+}
+
+@media screen and (min-width: 60em) {
+  .md-main__inner:has(.with-sidenote) .md-sidebar--secondary {
+    visibility: hidden;
+  }
+
+  .md-typeset .with-sidenote {
+    position: relative;
+  }
+
+  .md-typeset .sidenote {
+    position: absolute;
+    top: 0;
+    inset-inline-start: calc(100% + 2.2rem);
+    width: 10.4rem;
+  }
+
+  .md-typeset .sidenote:not(.sidenote--hover-media) {
+    padding-inline-start: 0.55rem;
+    box-shadow: inset 2px 0 0 transparent;
+    transition: color 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      box-shadow 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .md-typeset .with-sidenote:has(.sidenote-ref:hover)
+    .sidenote:not(.sidenote--hover-media),
+  .md-typeset .with-sidenote:has(.sidenote-ref:focus)
+    .sidenote:not(.sidenote--hover-media),
+  .md-typeset .with-sidenote:has(.sidenote:hover)
+    .sidenote:not(.sidenote--hover-media),
+  .md-typeset .with-sidenote:has(.sidenote:focus-within)
+    .sidenote:not(.sidenote--hover-media) {
+    color: var(--md-typeset-color);
+    box-shadow: inset 2px 0 0 var(--sidenote-accent);
+  }
+
+  .md-typeset .sidenote--hover-media {
+    width: 13rem;
+    padding: 0.4rem;
+    background: var(--md-default-bg-color);
+    filter: drop-shadow(
+      0 0 0.38rem color-mix(in srgb, var(--sidenote-accent) 42%, transparent)
+    );
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-0.25rem);
+    transition: opacity 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 180ms ease;
+  }
+
+  .md-typeset .with-sidenote:has(.sidenote-ref:hover) .sidenote--hover-media,
+  .md-typeset .with-sidenote:has(.sidenote-ref:focus) .sidenote--hover-media,
+  .md-typeset .with-sidenote:has(.sidenote--hover-media:hover) .sidenote--hover-media,
+  .md-typeset .with-sidenote:has(.sidenote--hover-media:focus-within)
+    .sidenote--hover-media {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  .md-typeset #optimizer-address-handoff-note {
+    top: -7rem;
+    inset-inline-start: calc(100% + 0.75rem);
+    width: 11.5rem;
+  }
+}
+
+@media screen and (min-width: 76.25em) {
+  .md-main__inner:has(.capacity-glossary) .md-sidebar--primary {
+    display: none;
+  }
+}
+
+@media screen and (max-width: 59.984375em) {
+  .md-typeset .with-sidenote {
+    position: relative;
+  }
+
+  .md-typeset .sidenote {
+    position: absolute;
+    z-index: 3;
+    top: calc(100% + 0.35rem);
+    right: 0;
+    left: 0;
+    width: auto;
+    margin: 0;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid color-mix(in srgb, var(--sidenote-accent) 45%, transparent);
+    border-radius: 2px;
+    background: var(--md-default-bg-color);
+    box-shadow: inset 2px 0 0 var(--sidenote-accent),
+      0 0.45rem 1.2rem rgb(0 0 0 / 18%);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-0.2rem);
+    transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+  }
+
+  .md-typeset .with-sidenote:has(.sidenote-ref:hover) .sidenote,
+  .md-typeset .with-sidenote:has(.sidenote-ref:focus) .sidenote,
+  .md-typeset .with-sidenote:has(.sidenote:hover) .sidenote,
+  .md-typeset .with-sidenote:has(.sidenote:focus-within) .sidenote {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}
+
+/* ── CUDA Graph capacity terminology ── */
+
+.md-typeset .capacity-symbol {
+  --capacity-symbol-color: var(--md-accent-fg-color);
+  display: inline-block;
+  padding: 0.02em 0.24em;
+  border: 1px solid color-mix(in srgb, var(--capacity-symbol-color) 48%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--capacity-symbol-color) 12%, transparent);
+  color: var(--capacity-symbol-color);
+  font-size: 0.9em;
+  font-weight: 650;
+  line-height: 1.25;
+  vertical-align: 0.04em;
+}
+
+.md-typeset .capacity-symbol--t {
+  --capacity-symbol-color: var(--capacity-t);
+}
+
+.md-typeset .capacity-symbol--l {
+  --capacity-symbol-color: var(--capacity-l);
+}
+
+.md-typeset .capacity-symbol--n {
+  --capacity-symbol-color: var(--capacity-n);
+}
+
+.md-typeset .capacity-symbol--m {
+  --capacity-symbol-color: var(--capacity-m);
+}
+
+.md-typeset .capacity-glossary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 2rem;
+  margin: 1.5rem 0;
+}
+
+.md-typeset .capacity-definition {
+  padding-top: 0.6rem;
+  border-top: 2px solid var(--capacity-color);
+  font-size: 0.88rem;
+}
+
+.md-typeset .capacity-definition--tokens {
+  --capacity-color: var(--capacity-tokens);
+}
+
+.md-typeset .capacity-definition--sequences {
+  --capacity-color: var(--capacity-sequences);
+}
+
+.md-typeset .capacity-definition > :first-child {
+  margin-top: 0;
+}
+
+.md-typeset .capacity-definition > :last-child {
+  margin-bottom: 0;
+}
+
+.md-typeset .capacity-term--lead {
+  color: var(--capacity-color);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78em;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.md-typeset .capacity-term:not(.capacity-term--lead) {
+  color: color-mix(in srgb, var(--capacity-color) 78%, var(--md-typeset-color));
+  font-weight: 600;
+  text-decoration: underline dotted var(--capacity-color) 1px;
+  text-underline-offset: 0.18em;
+}
+
+.md-typeset .capacity-term code:not(.capacity-symbol) {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 1em;
+}
+
+.md-typeset .capacity-definition .capacity-sidenote {
+  margin: 1rem 0 0;
+}
+
+.md-typeset .capacity-definition .capacity-sidenote .sidenote-ref {
+  text-decoration-color: var(--capacity-color);
+}
+
+@media screen and (min-width: 60em) {
+  .md-typeset .capacity-definition--tokens .capacity-sidenote .sidenote {
+    top: -3.5rem;
+    inset-inline-start: calc(200% + 3.2rem);
+  }
+
+  .md-typeset .capacity-definition--sequences .capacity-sidenote .sidenote {
+    top: 2.75rem;
+    inset-inline-start: calc(100% + 2.2rem);
+  }
+}
+
+@media screen and (max-width: 48rem) {
+  .md-typeset .capacity-glossary {
+    grid-template-columns: 1fr;
+    gap: 1.4rem 0;
+  }
 }
 
 /* ── CI health dashboard ── */

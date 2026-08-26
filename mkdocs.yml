@@ -22,6 +22,7 @@ theme:
     text: IBM Plex Sans
     code: IBM Plex Mono
   features:
+    - content.code.annotate
     - content.code.copy
     - navigation.top
     - toc.follow
@@ -32,8 +33,18 @@ theme:
 extra_css:
   - stylesheets/extra.css
 
+extra_javascript:
+  - assets/javascripts/perfetto-trace-embed.js
+  - assets/javascripts/plotly-theme.js
+  - assets/javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+watch:
+  - examples
+
 plugins:
   - search
+  - macros
   - mkdocstrings:
       handlers:
         python:
@@ -47,6 +58,8 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Concepts: concepts.md
+  - Tutorials:
+      - CUDA Graphs: tutorials/cuda-graphs.md
   - Determinism: determinism.md
   - Masks: masks.md
   - Score Mods: mods.md
@@ -59,11 +72,17 @@ nav:
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
   - admonition
   - pymdownx.details
+  - pymdownx.snippets
   - attr_list
+  - md_in_html
   - toc:
       permalink: "#"
