@@ -41,7 +41,8 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- An inference-only fused recurrent implementation on CUDA.
+- An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
+  shaped `[num_slots, H, V, K]` selected by `state_indices`.
 - Autograd for reference inputs and initial state.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.

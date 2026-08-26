@@ -108,7 +108,7 @@ torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS
 torch.library.define(
     "attn_gym::kda_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache,"
-    " Tensor state_indices, Tensor? cu_seqlens, bool autotune) -> Tensor",
+    " Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_recurrent_decode",
@@ -673,10 +673,10 @@ def _recurrent_fwd_paged_fake(
     beta: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
-    autotune: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, state_cache, state_indices, cu_seqlens, autotune
+    del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -822,6 +822,7 @@ def recurrent_forward(
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and invoke the lazily loaded fused recurrent implementation."""
@@ -845,7 +846,7 @@ def recurrent_forward(
         # `.contiguous()` on the pool would copy and silently drop the in-place advance.
         assert initial_state is not None
         return recurrent_fwd_paged_op(
-            q, k, v, gate, beta, initial_state, state_indices, cu_seqlens, autotune
+            q, k, v, gate, beta, initial_state, state_indices, has_initial_state, cu_seqlens
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
