@@ -1,4 +1,4 @@
-"""Correctness and integration tests for the CuTeDSL KDA short convolution."""
+"""Correctness and integration tests for the CuTeDSL short convolution."""
 
 import sys
 from itertools import pairwise
@@ -10,23 +10,48 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
-import attn_gym.linear.kda.short_conv.cute as cute_backend
-from attn_gym.linear.kda.short_conv import activations
-from attn_gym.linear.kda.short_conv.cute import (
+import attn_gym.linear.short_conv.cute as cute_backend
+from attn_gym.linear.short_conv import activations
+from attn_gym.linear.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
-    _backward_op,
     _candidate_configs,
-    _configured_backward_op,
-    _configured_backward_with_state_grad_op,
-    _configured_decode_op,
-    _configured_forward_op,
-    _decode_op,
-    _forward_op,
     causal_conv1d,
     causal_conv1d_decode,
     tune_causal_conv1d,
 )
+from attn_gym.linear.short_conv.ops import (
+    short_conv_backward_op as _backward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_backward_op as _configured_backward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_backward_with_state_grad_op as _configured_backward_with_state_grad_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_decode_op as _configured_decode_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_forward_op as _configured_forward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_decode_op as _decode_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_forward_op as _forward_op,
+)
+
+
+def test_kda_backward_compatibility_exports():
+    """The moved names stay importable from attn_gym.linear.kda and stay identical."""
+    from attn_gym.linear import kda, short_conv
+
+    for name in ("causal_conv1d", "causal_conv1d_decode", "register_activation"):
+        assert getattr(kda, name) is getattr(short_conv, name)
+        # Wildcard imports resolved these names before the move and must keep doing so.
+        assert name in kda.__all__
+
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
