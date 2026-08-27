@@ -45,6 +45,7 @@ class _ChunkKDA(torch.autograd.Function):
         initial_state,
         cu_seqlens,
         chunk_offsets,
+        scale,
         output_final_state,
         fastmath,
         autotune,
@@ -59,11 +60,11 @@ class _ChunkKDA(torch.autograd.Function):
             assert chunk_offsets is None
             if output_final_state:
                 output, state, aqk, akk = chunk_fwd_with_state_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
                 )
             else:
                 output, aqk, akk = chunk_fwd_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
                 )
         elif output_final_state:
             assert chunk_offsets is not None
@@ -76,6 +77,7 @@ class _ChunkKDA(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 chunk_offsets,
+                scale,
                 autotune,
             )
         else:
@@ -89,6 +91,7 @@ class _ChunkKDA(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 chunk_offsets,
+                scale,
                 autotune,
             )
         ctx.save_for_backward(
@@ -103,6 +106,7 @@ class _ChunkKDA(torch.autograd.Function):
             cu_seqlens,
             chunk_offsets,
         )
+        ctx.scale = scale
         ctx.fastmath = fastmath
         ctx.autotune = autotune
         ctx.set_materialize_grads(False)
@@ -138,6 +142,7 @@ class _ChunkKDA(torch.autograd.Function):
             d_output,
             d_final_state,
             initial_state,
+            ctx.scale,
             ctx.fastmath,
             ctx.autotune,
         )
@@ -152,7 +157,7 @@ class _ChunkKDA(torch.autograd.Function):
             chunk_offsets,
             True,
         )
-        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None
 
 
 def chunk_forward(
@@ -164,6 +169,7 @@ def chunk_forward(
     initial_state: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    scale: float,
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
@@ -206,6 +212,7 @@ def chunk_forward(
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            scale,
             True,
             fastmath,
             autotune,
@@ -220,6 +227,7 @@ def chunk_forward(
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            scale,
             False,
             fastmath,
             autotune,

@@ -1226,6 +1226,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
         dh,
         dv,
         None,
+        scale=scale,
         chunk_size=64,
     )
 
