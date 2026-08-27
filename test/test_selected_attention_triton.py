@@ -114,8 +114,8 @@ def test_triton_forward_matches_reference(share_kv, num_topk, head_dim):
     )
 
     with torch.inference_mode():
-        expected, _ = selected_attention(**inputs, backend="eager")
-        actual, _ = selected_attention(**inputs, backend="triton")
+        expected = selected_attention(**inputs, backend="eager")
+        actual = selected_attention(**inputs, backend="triton")
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -140,8 +140,8 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
     inputs = _make_inputs(share_kv=share_kv, num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids)
 
     with torch.inference_mode():
-        expected, _ = selected_attention(**inputs, backend="eager")
-        actual, _ = selected_attention(**inputs, backend="triton")
+        expected = selected_attention(**inputs, backend="eager")
+        actual = selected_attention(**inputs, backend="triton")
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -168,8 +168,8 @@ def test_triton_backward(share_kv, num_topk, sliding_window_size):
         seed=42,
     )
 
-    out_ref, _ = selected_attention(**inputs_ref, backend="eager")
-    out_tri, _ = selected_attention(**inputs_tri, backend="triton")
+    out_ref = selected_attention(**inputs_ref, backend="eager")
+    out_tri = selected_attention(**inputs_tri, backend="triton")
 
     grad_gen = torch.Generator(device=out_ref.device).manual_seed(7777)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
@@ -208,8 +208,8 @@ def test_triton_backward_with_doc_ids(num_topk):
         num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
     )
 
-    out_ref, _ = selected_attention(**inputs_ref, backend="eager")
-    out_tri, _ = selected_attention(**inputs_tri, backend="triton")
+    out_ref = selected_attention(**inputs_ref, backend="eager")
+    out_tri = selected_attention(**inputs_tri, backend="triton")
 
     grad_gen = torch.Generator(device=out_ref.device).manual_seed(4444)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
@@ -242,10 +242,10 @@ def test_empty_sliding_window(sliding_window_size):
     # All slots repeat position 2
     kv_indices = torch.full((b, s, 1), 2, dtype=torch.long, device=device)
 
-    out_eager, _ = selected_attention(
+    out_eager = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
     )
-    out_triton, _ = selected_attention(
+    out_triton = selected_attention(
         query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
     )
 
@@ -259,8 +259,8 @@ def test_triton_forward_half_precision(dtype):
     inputs = _make_inputs(dtype=dtype, num_topk=2)
 
     with torch.inference_mode():
-        expected, _ = selected_attention(**inputs, backend="eager")
-        actual, _ = selected_attention(**inputs, backend="triton")
+        expected = selected_attention(**inputs, backend="eager")
+        actual = selected_attention(**inputs, backend="triton")
 
     # Wider tolerance for half precision
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
@@ -280,8 +280,8 @@ def test_triton_larger_sequence():
     )
 
     with torch.inference_mode():
-        expected, _ = selected_attention(**inputs, backend="eager")
-        actual, _ = selected_attention(**inputs, backend="triton")
+        expected = selected_attention(**inputs, backend="eager")
+        actual = selected_attention(**inputs, backend="triton")
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -344,7 +344,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
     sink_lp_tri = sink_lp.clone().requires_grad_(True)
 
     # --- Forward (fp64 reference as ground truth) ---
-    out_64, _ = selected_attention(
+    out_64 = selected_attention(
         query_64,
         local_kv_64,
         sparse_kv_64,
@@ -354,7 +354,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sliding_window_size,
         backend="eager",
     )
-    out_lp_ref, _ = selected_attention(
+    out_lp_ref = selected_attention(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
@@ -364,7 +364,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sliding_window_size,
         backend="eager",
     )
-    out_lp_tri, _ = selected_attention(
+    out_lp_tri = selected_attention(
         query_lp_tri,
         local_kv_lp_tri,
         sparse_kv_lp_tri,

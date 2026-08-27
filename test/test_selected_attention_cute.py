@@ -12,7 +12,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 
 
 def _skip_no_sm100():
@@ -121,7 +121,7 @@ def test_cute_precision_vs_fp64(
     sparse_kv_lp_cute = sparse_kv_lp.clone().requires_grad_(True)
 
     # --- Forward ---
-    out_64, _ = selected_attention(
+    out_64 = selected_attention(
         query_64,
         local_kv_64,
         sparse_kv_64,
@@ -131,7 +131,7 @@ def test_cute_precision_vs_fp64(
         sliding_window_size,
         backend="eager",
     )
-    out_lp_ref, _ = selected_attention(
+    out_lp_ref = selected_attention(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
@@ -141,7 +141,7 @@ def test_cute_precision_vs_fp64(
         sliding_window_size,
         backend="eager",
     )
-    out_lp_cute, _ = selected_attention(
+    out_lp_cute = selected_attention(
         query_lp_cute,
         local_kv_lp_cute,
         sparse_kv_lp_cute,
@@ -223,12 +223,21 @@ def test_cute_lse_matches_manual_computation():
     kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, num_topk), device=device)
     sink = None
 
-    _, lse_cute = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend="cute"
+    _, aux_cute = selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        sink,
+        None,
+        window,
+        backend="cute",
+        return_aux=AuxRequest(lse=True),
     )
+    lse_cute = aux_cute.lse
 
     # Use the eager backend on the same inputs (promoted to fp64) as ground truth.
-    _, lse_eager = selected_attention(
+    _, aux_eager = selected_attention(
         query.double(),
         local_kv.double(),
         sparse_kv.double(),
@@ -237,7 +246,9 @@ def test_cute_lse_matches_manual_computation():
         None,
         window,
         backend="eager",
+        return_aux=AuxRequest(lse=True),
     )
+    lse_eager = aux_eager.lse
 
     assert lse_cute.shape == (batch, heads, seq_len)
     assert lse_eager.shape == (batch, heads, seq_len)

@@ -8,7 +8,7 @@ def _run_selected_attention(
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
 ):
     """Helper that calls selected_attention and returns the output."""
-    output, _ = selected_attention(
+    output = selected_attention(
         query,
         local_kv,
         sparse_kv,

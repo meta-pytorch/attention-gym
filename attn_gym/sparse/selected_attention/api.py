@@ -1,5 +1,33 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import overload
+
 import torch
 from torch import Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class AuxRequest:
+    """Specifies which auxiliary outputs to return from selected_attention.
+
+    Attributes:
+        lse: If True, include the log-sum-exp tensor in the returned auxiliary data.
+    """
+
+    lse: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedAttentionAux:
+    """Auxiliary outputs returned by selected_attention when requested.
+
+    Attributes:
+        lse: Log-sum-exp values with shape (batch_size, num_heads, sequence_length),
+            or None if not requested.
+    """
+
+    lse: Tensor | None = None
 
 
 def _validate_inputs(
@@ -139,6 +167,38 @@ def _validate_inputs(
             )
 
 
+@overload
+def selected_attention(
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor,
+    attention_sink: Tensor | None = ...,
+    doc_ids: Tensor | None = ...,
+    sliding_window_size: int = ...,
+    backend: str = ...,
+    mode: str = ...,
+    *,
+    return_aux: None = ...,
+) -> Tensor: ...
+
+
+@overload
+def selected_attention(
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor,
+    attention_sink: Tensor | None = ...,
+    doc_ids: Tensor | None = ...,
+    sliding_window_size: int = ...,
+    backend: str = ...,
+    mode: str = ...,
+    *,
+    return_aux: AuxRequest,
+) -> tuple[Tensor, SelectedAttentionAux]: ...
+
+
 def selected_attention(
     query: Tensor,
     local_kv: Tensor,
@@ -149,7 +209,9 @@ def selected_attention(
     sliding_window_size: int = 512,
     backend: str = "triton",
     mode: str = "auto",
-) -> tuple[Tensor, Tensor]:
+    *,
+    return_aux: AuxRequest | None = None,
+) -> Tensor | tuple[Tensor, SelectedAttentionAux]:
     """
     Performs selected attention.
         Each query attends to the previous sliding_window_size elements in the local_kv tensor
@@ -193,9 +255,17 @@ def selected_attention(
             algorithms are enabled with torch.use_deterministic_algorithms.
 
         mode: Currently only chunked is supported; auto defaults to chunked
+
+        return_aux: If None (default), return only the output tensor. If an AuxRequest
+            instance, return a tuple of (output, SelectedAttentionAux) containing the
+            requested auxiliary outputs (e.g. LSE when return_aux.lse is True).
+
     Returns:
-        Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
-        head_dim) and lse has shape (batch_size, num_heads, sequence_length).
+        If return_aux is None: output tensor with shape
+            (batch_size, num_heads, sequence_length, head_dim).
+        If return_aux is an AuxRequest: tuple of (output, SelectedAttentionAux) where
+            output has shape (batch_size, num_heads, sequence_length, head_dim) and
+            aux.lse has shape (batch_size, num_heads, sequence_length) when requested.
     """
     share_kv = sparse_kv.shape[1] == 1
     if not torch.compiler.is_compiling():
@@ -218,7 +288,7 @@ def selected_attention(
                 attention_sink = torch.full(
                     (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
                 )
-            return reference.selected_attention(
+            output, lse = reference.selected_attention(
                 query,
                 local_kv,
                 sparse_kv,
@@ -235,7 +305,7 @@ def selected_attention(
                 attention_sink = torch.full(
                     (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
                 )
-            return triton_backend.selected_attention(
+            output, lse = triton_backend.selected_attention(
                 query,
                 local_kv,
                 sparse_kv,
@@ -248,7 +318,7 @@ def selected_attention(
         case "cute":
             from .impl import cute as cute_backend
 
-            return cute_backend.selected_attention(
+            output, lse = cute_backend.selected_attention(
                 query,
                 local_kv,
                 sparse_kv,
@@ -260,3 +330,8 @@ def selected_attention(
             )
         case _:
             raise NotImplementedError(f"Backend {backend!r} is not supported yet.")
+
+    if return_aux is None:
+        return output
+
+    return output, SelectedAttentionAux(lse=lse if return_aux.lse else None)

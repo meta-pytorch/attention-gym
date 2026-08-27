@@ -183,6 +183,8 @@ def _selected_attention_with_causal_blocks(
     indexer_mask,
     attention_sink,
     sliding_window_size,
+    *,
+    return_aux=None,
 ):
     """Call selected_attention while preserving the completed-block constraint.
 
@@ -205,6 +207,7 @@ def _selected_attention_with_causal_blocks(
         None,
         sliding_window_size,
         backend=backend,
+        return_aux=return_aux,
     )
 
 
@@ -348,7 +351,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output, _ = _selected_attention_with_causal_blocks(
+    attention_output = _selected_attention_with_causal_blocks(
         Q,
         KV,
         compressed_kv,
