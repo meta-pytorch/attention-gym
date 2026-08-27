@@ -34,6 +34,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_fwd_ragged_paged_op,
     _chunk_kda_fwd_with_state_op,
 )
+from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -97,22 +98,6 @@ def _head_major_view(tensor: torch.Tensor) -> torch.Tensor:
     storage = tensor.detach().permute(0, 2, 1, 3).contiguous()
     storage.requires_grad_(tensor.requires_grad)
     return storage.permute(0, 2, 1, 3)
-
-
-def _strided_state_pool(
-    num_slots: int,
-    heads: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    state_elements = heads * 128 * 128
-    storage = torch.randn(
-        num_slots,
-        state_elements + 29,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    pool = storage[:, :state_elements].view(num_slots, heads, 128, 128)
-    assert not pool.is_contiguous()
-    return storage, pool
 
 
 def _assert_golden(
@@ -424,7 +409,7 @@ def test_paged_chunk_kda_updates_strided_pool():
     q, k, v, cumulative_gate, beta = inputs
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
-    storage, pool = _strided_state_pool(6, q.shape[2])
+    storage, pool = strided_state_pool(6, q.shape[2], 128, 128, prefix=0)
     expected_storage = storage.clone()
     state_elements = pool[0].numel()
     expected_pool = expected_storage[:, :state_elements].view_as(pool)
@@ -489,7 +474,7 @@ def test_paged_chunk_kda_ignores_padding_slots():
     q, k, v, cumulative_gate, beta = inputs
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     slots = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
-    storage, pool = _strided_state_pool(5, q.shape[2])
+    storage, pool = strided_state_pool(5, q.shape[2], 128, 128, prefix=0)
     before = storage.clone()
 
     output = paged_chunk_kda(
@@ -529,7 +514,7 @@ def test_paged_chunk_kda_zero_initializes_new_slots():
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
-    storage, pool = _strided_state_pool(5, q.shape[2])
+    storage, pool = strided_state_pool(5, q.shape[2], 128, 128, prefix=0)
     before = storage.clone()
 
     output = paged_chunk_kda(
@@ -883,7 +868,7 @@ def test_chunk_kda_paged_op_registration():
     q, k, v, cumulative_gate, beta = (tensor.detach() for tensor in _inputs(tokens=128, heads=2))
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
-    _storage, pool = _strided_state_pool(5, q.shape[2])
+    _storage, pool = strided_state_pool(5, q.shape[2], 128, 128, prefix=0)
     slots = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
 
@@ -1071,8 +1056,8 @@ def test_paged_chunk_kda_fullgraph_compile():
     inputs = tuple(tensor.detach() for tensor in _inputs(tokens=192, heads=2))
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
-    eager_storage, eager_pool = _strided_state_pool(6, inputs[0].shape[2])
-    compiled_storage, compiled_pool = _strided_state_pool(6, inputs[0].shape[2])
+    eager_storage, eager_pool = strided_state_pool(6, inputs[0].shape[2], 128, 128, prefix=0)
+    compiled_storage, compiled_pool = strided_state_pool(6, inputs[0].shape[2], 128, 128, prefix=0)
     compiled_storage.copy_(eager_storage)
 
     def operation(state_pool):
@@ -1210,7 +1195,7 @@ def test_paged_chunk_kda_cuda_graph_replay():
     q, k, v, cumulative_gate, beta = inputs
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
-    storage, pool = _strided_state_pool(7, q.shape[2])
+    storage, pool = strided_state_pool(7, q.shape[2], 128, 128, prefix=0)
     paged_chunk_kda(
         q,
         k,
@@ -1322,7 +1307,7 @@ def test_chunk_kda_validates_public_contract():
 
 def test_paged_chunk_kda_validates_public_contract():
     q, k, v, gate, beta = (tensor.detach() for tensor in _inputs())
-    _storage, pool = _strided_state_pool(3, q.shape[2])
+    _storage, pool = strided_state_pool(3, q.shape[2], 128, 128, prefix=0)
     slots = torch.tensor([2], device="cuda", dtype=torch.int32)
 
     with pytest.raises(ValueError, match="paged state pool must have shape"):
