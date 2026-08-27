@@ -4,6 +4,19 @@
 
 from dataclasses import dataclass, replace
 
+import cutlass
+from cutlass import cute
+
+
+@cute.jit
+def smem_data_ptr(storage):
+    """Return the raw shared-memory pointer for an Array or Tensor."""
+    if cutlass.const_expr(hasattr(storage, "iterator")):
+        pointer = storage.iterator.raw_ptr()
+    else:
+        pointer = storage.data_ptr()
+    return pointer
+
 
 @dataclass(frozen=True)
 class MmaDesc:
@@ -128,20 +141,36 @@ class SmemTile:
     tma_subtile_stride_elems: int = 0
     stages: int = 1
 
+    def _offset_base(self, offset):
+        if hasattr(self.base, "iterator"):
+            return cute.domain_offset((offset,), self.base)
+        if hasattr(self.base, "subview"):
+            return self.base.subview(offset)
+        if hasattr(self.base, "data_ptr"):
+            return self.base.data_ptr() + offset
+        return self.base + offset
+
     def __getitem__(self, stage):
-        off = stage * self.elems_per_stage
-        base = self.base.subview(off) if hasattr(self.base, "subview") else self.base + off
-        return replace(self, base=base, stages=1)
+        return replace(
+            self,
+            base=self._offset_base(stage * self.elems_per_stage),
+            stages=1,
+        )
 
     def shifted(self, off_elems):
-        base = self.base.subview(off_elems) if hasattr(self.base, "subview") else self.base + off_elems
-        return replace(self, base=base)
+        return replace(self, base=self._offset_base(off_elems))
 
     def desc(self):
         from cutlass.experimental import primitives as prims
 
+        if hasattr(self.base, "data_ptr"):
+            base = self.base.data_ptr()
+        elif hasattr(self.base, "iterator"):
+            base = self.base.iterator.raw_ptr()
+        else:
+            base = self.base
         return prims.Tcgen05SmemDesc.build(
-            self.base,
+            base,
             leading_byte_offset=self.leading_byte_offset,
             stride_byte_offset=self.stride_byte_offset,
             layout=self.layout,
