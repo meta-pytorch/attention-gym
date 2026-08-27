@@ -18,11 +18,18 @@ pytestmark = pytest.mark.skipif(
 
 
 def make_inputs(
-    *, batch: int = 2, tokens: int = 9, heads: int = 2, key_dim: int = 32, value_dim: int = 24
+    *,
+    batch: int = 2,
+    tokens: int = 9,
+    heads: int = 2,
+    key_dim: int = 32,
+    value_dim: int = 24,
+    key_heads: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Create stable token-major scalar-gate inputs."""
+    """Create stable token-major scalar-gate inputs; ``key_heads`` enables grouped heads."""
     torch.manual_seed(0)
-    q = torch.randn(batch, tokens, heads, key_dim, device="cuda")
+    q_heads = heads if key_heads is None else key_heads
+    q = torch.randn(batch, tokens, q_heads, key_dim, device="cuda")
     k = F.normalize(torch.randn_like(q), dim=-1)
     v = torch.randn(batch, tokens, heads, value_dim, device="cuda")
     gate = F.logsigmoid(torch.randn(batch, tokens, heads, device="cuda"))
@@ -58,10 +65,13 @@ def test_fused_recurrent_matches_reference(use_initial_state: bool, output_final
         assert actual[1] is expected[1] is None
 
 
-def test_fused_recurrent_matches_packed_reference():
-    q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=8)
+@pytest.mark.parametrize("key_heads", [None, 2])
+def test_fused_recurrent_matches_packed_reference(key_heads: int | None):
+    q, k, v, gate, beta, _state = make_inputs(
+        batch=1, tokens=8, heads=6 if key_heads else 2, key_heads=key_heads
+    )
     cu_seqlens = cumulative_sequence_offsets([3, 0, 4])
-    state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(3, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
     with torch.no_grad():
         expected = recurrent_gdn(
             q,
@@ -190,6 +200,50 @@ def test_fused_recurrent_packed_paged_state():
     torch.testing.assert_close(state_cache, expected_cache, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("tokens", [1, 9])
+def test_fused_recurrent_grouped_heads_matches_reference(tokens: int):
+    """Fewer q/k heads than v heads must match the expanding reference oracle."""
+    q, k, v, gate, beta, state = make_inputs(tokens=tokens, heads=6, key_heads=2)
+    with torch.no_grad():
+        expected = recurrent_gdn(
+            q, k, v, gate, beta, state, output_final_state=True, impl=Impl.REFERENCE
+        )
+        actual = recurrent_gdn(
+            q, k, v, gate, beta, state, output_final_state=True, impl=Impl.FUSED
+        )
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-5)
+
+
+def test_fused_recurrent_grouped_heads_paged_matches_dense():
+    """Paged grouped-head decode equals the dense fused path on gathered slots."""
+    q, k, v, gate, beta, _state = make_inputs(batch=3, tokens=1, heads=6, key_heads=2)
+    _storage, pool = strided_state_pool(5, v.shape[2], q.shape[-1], v.shape[-1])
+    slots = torch.tensor([1, 3, 4], device="cuda", dtype=torch.int32)
+    initial_state = pool[slots.long()].transpose(-1, -2).contiguous()
+
+    with torch.no_grad():
+        expected_output, expected_state = recurrent_gdn(
+            q, k, v, gate, beta, initial_state, output_final_state=True, impl=Impl.REFERENCE
+        )
+        output, _ = recurrent_gdn(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            pool,
+            state_indices=slots,
+            has_initial_state=torch.ones(3, device="cuda", dtype=torch.bool),
+            impl=Impl.FUSED,
+        )
+
+    torch.testing.assert_close(output, expected_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        pool[slots.long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
+    )
+
+
 def test_fused_recurrent_packed_paged_empty_sequences():
     """Empty packed sequences zero freshly assigned slots and preserve resumed ones."""
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=4)
@@ -239,6 +293,15 @@ def test_fused_recurrent_paged_registration():
             None,
             q.shape[-1] ** -0.5,
         ),
+    )
+
+
+def test_fused_recurrent_grouped_heads_registration():
+    """Grouped-head fakes must size the final state from value heads, not query heads."""
+    q, k, v, gate, beta, state = make_inputs(batch=1, tokens=3, heads=6, key_heads=2)
+    torch.library.opcheck(
+        recurrent_fwd_op,
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, False),
     )
 
 

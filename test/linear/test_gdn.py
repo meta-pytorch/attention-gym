@@ -236,6 +236,43 @@ def test_low_precision_default_state_is_fp32(function):
     assert final_state.dtype == torch.float32
 
 
+@pytest.mark.parametrize("function", REFERENCE_CASES)
+def test_grouped_heads_match_expanded_heads(function):
+    """Fewer q/k heads than v heads must equal an explicit repeat_interleave."""
+    q, k, v, gate, beta, state = make_inputs(sequence=7)
+    groups = 2
+    v, gate, beta = (tensor.repeat_interleave(groups, dim=2) for tensor in (v, gate, beta))
+    state = state.repeat_interleave(groups, dim=1)
+
+    grouped_output, grouped_state = function(q, k, v, gate, beta, state, output_final_state=True)
+    expanded_output, expanded_state = function(
+        q.repeat_interleave(groups, dim=2),
+        k.repeat_interleave(groups, dim=2),
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+    )
+
+    # The grouped path expands to the identical tensors internally, so equality is exact.
+    torch.testing.assert_close(grouped_output, expanded_output, rtol=0, atol=0)
+    torch.testing.assert_close(grouped_state, expanded_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("function", REFERENCE_CASES)
+def test_grouped_heads_require_divisible_counts(function):
+    q, k, v, gate, beta, _state = make_inputs(sequence=3)
+    # Five value heads cannot be grouped over three query heads.
+    v, gate, beta = (
+        tensor.repeat_interleave(2, dim=2)[:, :, :5].contiguous() for tensor in (v, gate, beta)
+    )
+    with pytest.raises(ValueError, match="positive multiple of q heads"):
+        function(q, k, v, gate, beta)
+    with pytest.raises(ValueError, match="positive multiple of q heads"):
+        function(q, k, v[:, :, :0], gate[:, :, :0], beta[:, :, :0])
+
+
 @pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])
 def test_fp64_preserves_compute_and_state_dtype(function):
     inputs = [tensor.double() for tensor in make_inputs(sequence=3)]

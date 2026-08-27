@@ -16,15 +16,19 @@ def validate_gdn_inputs(
 ) -> None:
     """Validate backend-independent gated delta rule tensor invariants."""
     if q.ndim != 4:
-        raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
-    batch, tokens, heads, key_dim = q.shape
-    if batch == 0 or tokens == 0 or heads == 0 or key_dim == 0:
+        raise ValueError(f"q must have shape [B, T, HK, K], got {tuple(q.shape)}")
+    batch, tokens, key_heads, key_dim = q.shape
+    if batch == 0 or tokens == 0 or key_heads == 0 or key_dim == 0:
         raise ValueError(f"q must have nonempty dimensions, got {tuple(q.shape)}")
     if k.shape != q.shape:
         raise ValueError(f"k must have shape {tuple(q.shape)}, got {tuple(k.shape)}")
-    if v.ndim != 4 or v.shape[:3] != (batch, tokens, heads) or v.shape[-1] == 0:
+    if v.ndim != 4 or v.shape[:2] != (batch, tokens) or v.shape[-1] == 0:
+        raise ValueError(f"v must have shape [{batch}, {tokens}, H, V], got {tuple(v.shape)}")
+    heads = v.shape[2]
+    if heads == 0 or heads % key_heads != 0:
         raise ValueError(
-            f"v must have shape [{batch}, {tokens}, {heads}, V], got {tuple(v.shape)}"
+            f"v heads must be a positive multiple of q heads for grouped-head attention, "
+            f"got {heads} value heads for {key_heads} query heads"
         )
     if gate.shape != (batch, tokens, heads):
         raise ValueError(f"gate must have shape {(batch, tokens, heads)}, got {tuple(gate.shape)}")

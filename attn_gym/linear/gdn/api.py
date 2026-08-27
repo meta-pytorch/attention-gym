@@ -32,7 +32,9 @@ def chunk_gdn(
     that recurrence. FP16 and BF16 inputs use FP32 recurrence math and state.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``.
+        q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value head count ``H``
+            for grouped-head attention: each block of ``H // HK`` consecutive value heads
+            shares one query/key head.
         k: Keys shaped like ``q`` and using the same dtype.
         v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
@@ -92,7 +94,9 @@ def recurrent_gdn(
     inputs use FP32 recurrence math and state.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``.
+        q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value head count ``H``
+            for grouped-head attention: each block of ``H // HK`` consecutive value heads
+            shares one query/key head.
         k: Keys shaped like ``q`` and using the same dtype.
         v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
