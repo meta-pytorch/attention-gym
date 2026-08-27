@@ -232,13 +232,17 @@ def recurrent_kda(
     """Apply recurrent KDA for decoding and inference prefill.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.
+        q: Queries shaped ``[B, T, HK, K]``, scaled by ``1/sqrt(K)`` internally. ``HK``
+            may divide the value head count ``H`` for multi-value attention (MVA): each
+            block of ``H // HK`` consecutive value heads shares one query/key head, while
+            the gate, beta, and state stay per value head.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
-        gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
-            each token the previous state is multiplied channelwise by ``exp(gate)``.
-            Use the same non-cumulative representation for chunked and recurrent
-            execution; recurrent execution has no chunk-rebase lower limit.
+        gate: Finite, nonpositive per-token natural-log decay shaped ``[B, T, H, K]``,
+            one decay vector per value head. At each token the previous state is
+            multiplied channelwise by ``exp(gate)``. Use the same non-cumulative
+            representation for chunked and recurrent execution; recurrent execution has
+            no chunk-rebase lower limit.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, K, V]`` entry per
             logical sequence.
@@ -293,6 +297,7 @@ def recurrent_kda(
         cu_seqlens,
         op_name="recurrent_kda",
         gate_name="gate",
+        allow_grouped_heads=True,
     )
     if state_indices is not None:
         if initial_state is None:

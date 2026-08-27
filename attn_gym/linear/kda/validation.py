@@ -28,20 +28,38 @@ def validate_kda_inputs(
     *,
     op_name: str,
     gate_name: str,
+    allow_grouped_heads: bool = False,
 ) -> None:
-    """Validate the shared KDA operation contract before normalizing inputs."""
+    """Validate the shared KDA operation contract before normalizing inputs.
+
+    ``allow_grouped_heads`` admits value-head counts that are positive multiples of the
+    q/k head count (the recurrent forms map heads in-kernel); the chunk pipeline requires
+    equal head counts. This is the multi-value attention (MVA) pattern of "Transformers
+    are SSMs" (arXiv:2405.21060, section 7.2): only q/k are shared across a group, while
+    the gate and beta drive each value head's state update and keep one entry per value
+    head.
+    """
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
-    batch, tokens, heads, key_dim = q.shape
-    if batch == 0 or tokens == 0 or heads == 0 or key_dim == 0:
+    batch, tokens, key_heads, key_dim = q.shape
+    if batch == 0 or tokens == 0 or key_heads == 0 or key_dim == 0:
         raise ValueError(f"q must have nonempty dimensions, got {tuple(q.shape)}")
     if k.shape != q.shape:
         raise ValueError(f"k must have shape {tuple(q.shape)}, got {tuple(k.shape)}")
-    if gate.shape != q.shape:
-        raise ValueError(f"{gate_name} must have shape {tuple(q.shape)}, got {tuple(gate.shape)}")
-    if v.ndim != 4 or v.shape[:3] != (batch, tokens, heads) or v.shape[-1] < 1:
+    if v.ndim != 4 or v.shape[:2] != (batch, tokens) or v.shape[-1] < 1:
+        raise ValueError(f"v must have shape [{batch}, {tokens}, H, V], got {tuple(v.shape)}")
+    heads = v.shape[2]
+    if heads != key_heads and not (allow_grouped_heads and heads != 0 and heads % key_heads == 0):
+        message = (
+            f"v heads must be a positive multiple of q heads for {op_name}, "
+            if allow_grouped_heads
+            else f"v heads must match q heads for {op_name}, "
+        )
+        raise ValueError(message + f"got {heads} value heads for {key_heads} query heads")
+    if gate.shape != (batch, tokens, heads, key_dim):
         raise ValueError(
-            f"v must have shape [{batch}, {tokens}, {heads}, V], got {tuple(v.shape)}"
+            f"{gate_name} must have shape {(batch, tokens, heads, key_dim)}, "
+            f"got {tuple(gate.shape)}"
         )
     if beta.shape != (batch, tokens, heads):
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")

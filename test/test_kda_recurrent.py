@@ -159,6 +159,95 @@ def test_recurrent_packed_capacity_and_empty_slots():
         )
 
 
+def test_recurrent_grouped_heads_match_expanded_heads():
+    """Sharing q/k across a value-head group must equal an explicit repeat_interleave.
+
+    Only q/k are grouped; the gate carries an independent decay per value head, so it is
+    identical in both calls rather than expanded.
+    """
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=17, heads=2, seed=11)
+    groups = 3
+    v = v.repeat_interleave(groups, dim=2).contiguous()
+    beta = beta.repeat_interleave(groups, dim=2).contiguous()
+    # Independent per-value-head decays: grouping must not collapse state capacity.
+    gate = -torch.rand(2, 17, v.shape[2], q.shape[3], device="cuda") * 3.0
+    state = torch.randn(2, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+
+    # Fixed heuristics keep both calls on one kernel specialization so equality is exact;
+    # HK is an autotune key, so autotuned calls may pick different tiles.
+    grouped_output, grouped_state = recurrent_kda(
+        q, k, v, gate, beta, state, output_final_state=True, autotune=False
+    )
+    expanded_output, expanded_state = recurrent_kda(
+        q.repeat_interleave(groups, dim=2),
+        k.repeat_interleave(groups, dim=2),
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+        autotune=False,
+    )
+
+    torch.testing.assert_close(grouped_output, expanded_output, rtol=0, atol=0)
+    torch.testing.assert_close(grouped_state, expanded_state, rtol=0, atol=0)
+
+
+def test_recurrent_grouped_heads_match_reference():
+    """The grouped fused path agrees with the expanding reference oracle."""
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=9, heads=2, seed=12)
+    v = v.repeat_interleave(2, dim=2).contiguous()
+    beta = beta.repeat_interleave(2, dim=2).contiguous()
+    gate = -torch.rand(2, 9, v.shape[2], q.shape[3], device="cuda") * 3.0
+    state = torch.randn(2, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+
+    fused = recurrent_kda(q, k, v, gate, beta, state, output_final_state=True)
+    reference = recurrent_kda(
+        q, k, v, gate, beta, state, output_final_state=True, impl="reference"
+    )
+
+    torch.testing.assert_close(fused[0], reference[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(fused[1], reference[1], rtol=1e-5, atol=1e-5)
+
+
+def test_grouped_heads_require_divisible_counts():
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=3, heads=2)
+    bad_v = v.repeat_interleave(2, dim=2)[:, :, :3].contiguous()
+    bad_beta = beta.repeat_interleave(2, dim=2)[:, :, :3].contiguous()
+    with pytest.raises(ValueError, match="positive multiple of q heads"):
+        recurrent_kda(q, k, bad_v, gate, bad_beta)
+
+
+def test_grouped_heads_require_per_value_head_gate():
+    """A gate shaped like grouped q/k is rejected: decays belong to value heads."""
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=3, heads=2)
+    grouped_v = v.repeat_interleave(2, dim=2).contiguous()
+    grouped_beta = beta.repeat_interleave(2, dim=2).contiguous()
+    with pytest.raises(ValueError, match="gate must have shape"):
+        recurrent_kda(q, k, grouped_v, gate, grouped_beta)
+
+
+def test_chunk_rejects_grouped_heads():
+    """The chunk pipeline requires equal head counts; only recurrent forms group."""
+    from attn_gym.linear import chunk_kda
+
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=64, heads=2)
+    grouped_v = v.repeat_interleave(2, dim=2).contiguous()
+    grouped_beta = beta.repeat_interleave(2, dim=2).contiguous()
+    with pytest.raises(ValueError, match="v heads must match q heads"):
+        chunk_kda(q, k, grouped_v, gate, grouped_beta)
+
+
+def test_recurrent_grouped_heads_registration():
+    """Grouped-head fakes must size the final state from value heads, not query heads."""
+    q, k, v, gate, beta, _ = _inputs(batch=1, tokens=3, heads=2)
+    v = v.repeat_interleave(3, dim=2).contiguous()
+    beta = beta.repeat_interleave(3, dim=2).contiguous()
+    gate = gate.repeat_interleave(3, dim=2).contiguous()
+    state = torch.randn(1, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None, True))
+
+
 @pytest.mark.skipif(not BLACKWELL, reason="chunk_kda requires CUDA capability 10.0")
 def test_recurrent_agrees_with_chunked_core():
     """Cross-check the decode scan against the training core on shared inputs."""
