@@ -122,6 +122,7 @@ def _launch_kda_recurrent_fwd(
     *,
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the vector-gate specialization used by recurrent KDA."""
@@ -137,6 +138,7 @@ def _launch_kda_recurrent_fwd(
         gate_kind=GateKind.VECTOR,
         store_final_state=store_final_state,
         state_indices=state_indices,
+        has_initial_state=has_initial_state,
         autotune=autotune,
     )
 
@@ -197,8 +199,8 @@ def _kda_recurrent_fwd_paged_cuda(
     beta: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
-    autotune: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -210,7 +212,8 @@ def _kda_recurrent_fwd_paged_cuda(
         cu_seqlens,
         store_final_state=True,
         state_indices=state_indices,
-        autotune=autotune,
+        has_initial_state=has_initial_state,
+        autotune=False,
     )[0]
 
 

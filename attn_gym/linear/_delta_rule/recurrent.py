@@ -63,6 +63,7 @@ def _recurrent_delta_rule_fwd_kernel(
     ht,
     cu_seqlens,
     state_indices,
+    has_initial_state,
     scale,
     T,
     N,
@@ -76,6 +77,7 @@ def _recurrent_delta_rule_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
+    USE_HAS_INITIAL_STATE: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers."""
@@ -93,17 +95,15 @@ def _recurrent_delta_rule_fwd_kernel(
         bos = i_n * T
         eos = bos + T
 
-    if USE_STATE_INDICES and bos == eos:
-        return
-
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
     m_k = o_k < K
     m_v = o_v < V
     m_kv = m_k[:, None] & m_v[None, :]
 
-    # Paged mode addresses the state pool by slot instead of by sequence position. Active
-    # sequences must select distinct, positive, in-bounds slots; nonpositive slots are padding.
+    # Paged mode addresses the state pool by slot instead of by sequence position. Empty
+    # sequences still take the load/store path below so that a freshly assigned slot is
+    # initialized before a later decode reads it.
     if USE_STATE_INDICES:
         i_state = tl.load(state_indices + i_n).to(tl.int64)
         if i_state <= 0:
@@ -121,7 +121,10 @@ def _recurrent_delta_rule_fwd_kernel(
             (state_batch_stride, K * V, V, 1),
         )
     if USE_INITIAL_STATE:
-        b_state = tl.load(h0 + p_state, mask=m_kv, other=0.0).to(tl.float32)
+        m_state = m_kv
+        if USE_HAS_INITIAL_STATE:
+            m_state &= tl.load(has_initial_state + i_n)
+        b_state = tl.load(h0 + p_state, mask=m_state, other=0.0).to(tl.float32)
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
@@ -186,14 +189,47 @@ def launch_recurrent_delta_rule_fwd(
     gate_kind: GateKind,
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     autotune: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Launch a scalar- or vector-gated recurrent delta-rule specialization."""
+    """Launch a scalar- or vector-gated recurrent delta-rule specialization.
+
+    Args:
+        q: Queries shaped ``[B, T, H, K]``; packed callers pass ``B == 1``.
+        k: Keys shaped like ``q``.
+        v: Values shaped ``[B, T, H, V]``.
+        gate: Natural-log decay, shaped ``[B, T, H]`` for ``GateKind.SCALAR`` or like ``q``
+            for ``GateKind.VECTOR``.
+        beta: Per-token write gate shaped ``[B, T, H]``.
+        initial_state: Optional FP32 starting state shaped ``[N, H, K, V]``, or the mutable
+            ``[slots, H, V, K]`` pool that ``state_indices`` addresses in paged mode.
+        cu_seqlens: Optional packed boundaries shaped ``[N + 1]``; offsets are trusted and
+            must be validated by the caller before launch.
+        scale: Multiplier applied to ``q`` before each state read.
+        gate_kind: Gate layout consumed by the scan.
+        store_final_state: Allocate and return the post-scan state; implied and mandatory in
+            paged mode, where the pool itself is advanced in place.
+        state_indices: Optional per-sequence slot indices enabling paged mode. Active
+            sequences must select distinct, positive, in-bounds slots; nonpositive entries
+            are padding that produce zero output and leave the pool untouched.
+        has_initial_state: Optional per-sequence booleans qualifying paged slots. Pool
+            allocators hand out slots without zeroing them, so a False entry marks garbage
+            contents: the scan starts from zero and overwrites the slot, including for empty
+            sequences, so the slot is initialized before a later decode reads it. Without
+            this mask every selected slot is treated as real history.
+        autotune: Benchmark tile configurations when true; paged launches always use fixed
+            heuristics because rerunning candidates would advance the pool repeatedly.
+
+    Returns:
+        The output in ``q.dtype`` plus the final state (``None`` unless requested). In paged
+        mode the returned state aliases ``initial_state``.
+    """
     assert k.shape == q.shape
     assert v.shape[:3] == q.shape[:3]
     assert gate.shape == (q.shape[:-1] if gate_kind is GateKind.SCALAR else q.shape)
     assert beta.shape == q.shape[:-1]
     assert all(tensor.is_contiguous() for tensor in (q, k, v, gate, beta))
+    assert has_initial_state is None or state_indices is not None
 
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
@@ -254,6 +290,7 @@ def launch_recurrent_delta_rule_fwd(
         final_state,
         cu_seqlens,
         state_indices,
+        has_initial_state,
         scale=scale,
         T=tokens,
         N=num_sequences,
@@ -266,6 +303,7 @@ def launch_recurrent_delta_rule_fwd(
         STORE_FINAL_STATE=final_state is not None,
         IS_VARLEN=cu_seqlens is not None,
         USE_STATE_INDICES=state_indices is not None,
+        USE_HAS_INITIAL_STATE=has_initial_state is not None,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
         **launch_options,
     )

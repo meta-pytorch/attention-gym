@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 
+from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
@@ -187,7 +188,7 @@ def paged_chunk_kda(
         op_name="paged_chunk_kda",
         gate_name="gate",
     )
-    _validate_paged_state(
+    validate_paged_state(
         q,
         v,
         state_cache,
@@ -209,54 +210,6 @@ def paged_chunk_kda(
     )
 
 
-def _validate_paged_state(
-    q: torch.Tensor,
-    v: torch.Tensor,
-    state_cache: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    state_indices: torch.Tensor,
-    has_initial_state: torch.Tensor | None = None,
-) -> None:
-    """Validate the paged state pool and its slot indices."""
-    expected_shape = (q.shape[2], v.shape[-1], q.shape[3])
-    if state_cache.ndim != 4 or state_cache.shape[1:] != expected_shape:
-        raise ValueError(
-            "the paged state pool must have shape "
-            f"[num_slots, {q.shape[2]}, {v.shape[-1]}, {q.shape[3]}], "
-            f"got {tuple(state_cache.shape)}"
-        )
-    if state_cache.device != q.device:
-        raise ValueError("the paged state pool must be on q.device")
-    if state_cache.dtype != torch.float32:
-        raise TypeError("the paged state pool must use float32")
-    expected_inner_strides = (v.shape[-1] * q.shape[3], q.shape[3], 1)
-    if state_cache.stride()[1:] != expected_inner_strides:
-        raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
-    if state_cache.stride(0) < q.shape[2] * q.shape[3] * v.shape[-1]:
-        raise ValueError("paged state pool slots must not overlap")
-    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    if (
-        tuple(state_indices.shape) != (num_sequences,)
-        or state_indices.dtype != torch.int32
-        or not state_indices.is_contiguous()
-        or state_indices.device != q.device
-    ):
-        raise ValueError(
-            f"state_indices must be a contiguous int32 tensor of shape ({num_sequences},) "
-            f"on q.device, got {tuple(state_indices.shape)} of {state_indices.dtype}"
-        )
-    if has_initial_state is not None and (
-        tuple(has_initial_state.shape) != (num_sequences,)
-        or has_initial_state.dtype != torch.bool
-        or not has_initial_state.is_contiguous()
-        or has_initial_state.device != q.device
-    ):
-        raise ValueError(
-            "has_initial_state must be a contiguous bool tensor with one entry "
-            "per sequence on q.device"
-        )
-
-
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -268,6 +221,7 @@ def recurrent_kda(
     cu_seqlens: torch.Tensor | None = None,
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -305,6 +259,8 @@ def recurrent_kda(
                 seq 1 is padding (index is -1) so this is ignored
                 seq 2 reads and updates initial_state[5]
                 seq 3 is padding bc 0
+        has_initial_state: Optional contiguous boolean mask, one per logical sequence.
+            False entries ignore stale contents in the selected slot and start from zero.
         autotune: Benchmark candidate value-tile sizes for non-paged execution
             when true; winners are cached and reused. Paged execution and false
             use a deterministic sequence-length heuristic.
@@ -339,9 +295,11 @@ def recurrent_kda(
             raise ValueError("state_indices requires initial_state as the paged state pool")
         if output_final_state:
             raise ValueError("state_indices advances the pool in place; drop output_final_state")
-        _validate_paged_state(q, v, initial_state, cu_seqlens, state_indices)
+        validate_paged_state(q, v, initial_state, cu_seqlens, state_indices, has_initial_state)
         if selected_impl is not Impl.FUSED:
             raise ValueError("state_indices requires impl='fused'")
+    elif has_initial_state is not None:
+        raise ValueError("has_initial_state requires state_indices")
     if selected_impl is Impl.FUSED:
         return _fused_recurrent_forward(
             q,
@@ -353,6 +311,7 @@ def recurrent_kda(
             cu_seqlens=cu_seqlens,
             output_final_state=output_final_state,
             state_indices=state_indices,
+            has_initial_state=has_initial_state,
             autotune=autotune,
         )
     return reference_kda(
@@ -395,10 +354,8 @@ def recurrent_kda_decode(
         state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots
             may have padding between them but each ``[H, V, K]`` row must be dense.
             ``K`` must be at most 256.
-            The prefill kernel uses ``[H, K, V]``, while this decode kernel uses
-            ``[H, V, K]`` because decode benefits significantly from a contiguous
-            ``K`` dimension. A prefill-to-decode transition therefore requires a
-            transpose/layout conversion.
+            Paged chunk and recurrent prefill use the same ``[H, V, K]`` slot layout, so the
+            cache can transition directly from prefill to decode without a layout conversion.
         state_indices: Contiguous int32 slot indices shaped ``[B]``. Non-positive
             indices are padding/null entries: they produce zero output and leave the
             cache untouched. Each positive index must be in ``[1, num_slots)`` and

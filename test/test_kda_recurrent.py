@@ -245,6 +245,32 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
     )
 
 
+def test_recurrent_paged_fresh_slot_ignores_existing_state():
+    q, k, v, gate, beta, _ = _inputs(batch=2, tokens=3, seed=9)
+    _, pool = _strided_state_pool(5, q.shape[2], q.shape[3], v.shape[-1])
+    slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([False, False], device="cuda")
+
+    output, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        pool,
+        state_indices=slots,
+        has_initial_state=has_initial_state,
+    )
+    expected, expected_state = naive_recurrent_kda(
+        q, k, v, gate * LOG2_E, beta, output_final_state=True
+    )
+
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        pool[slots.long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
+    )
+
+
 def test_recurrent_paged_decode_accumulates_in_place():
     """Successive single-token steps advance each slot without a round trip."""
     _, pool = _strided_state_pool(5, 2, 64, 64)
@@ -317,6 +343,10 @@ def test_recurrent_paged_validates_contract():
         recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots[:1])
     with pytest.raises(ValueError, match="drop output_final_state"):
         recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots, output_final_state=True)
+    with pytest.raises(ValueError, match="requires state_indices"):
+        recurrent_kda(
+            q, k, v, gate, beta, has_initial_state=torch.ones_like(slots, dtype=torch.bool)
+        )
 
 
 def test_recurrent_validates_public_contract():
@@ -396,7 +426,7 @@ def test_recurrent_custom_op_registration(packed: bool):
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, cu_seqlens, True),
+        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens),
     )
 
 
@@ -415,7 +445,7 @@ def test_recurrent_custom_op_registration_mixed_dtype():
     )
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, True),
+        (q, k, v, gate, beta, state_pool, slots, None, None),
     )
 
 
@@ -516,12 +546,12 @@ def test_recurrent_paged_cuda_graph_replay():
     q, k, v, gate, beta, _ = _inputs(batch=3, tokens=1, dtype=torch.bfloat16, seed=31)
     storage, pool = _strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
-    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, True)
+    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, True)
+        captured_output = _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None)
 
     with torch.no_grad():
         storage.add_(0.25)
@@ -550,6 +580,34 @@ def test_recurrent_launches_beyond_grid_y_limit():
     output, _ = recurrent_kda(q, k, v, gate, beta)
     expected, _ = naive_recurrent_kda(q, k, v, gate * LOG2_E, beta)
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_recurrent_paged_empty_sequences_initialize_fresh_slots():
+    """Empty packed sequences zero freshly assigned slots and preserve resumed ones."""
+    q, k, v, gate, beta, _ = _inputs(batch=1, tokens=4, seed=9)
+    cu_seqlens = torch.tensor([0, 0, 4, 4], device="cuda", dtype=torch.int32)
+    _, pool = _strided_state_pool(6, q.shape[2], q.shape[3], v.shape[-1])
+    original_pool = pool.clone()
+    slots = torch.tensor([2, 3, 5], device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([False, False, True], device="cuda")
+
+    recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+        has_initial_state=has_initial_state,
+    )
+
+    # The empty fresh sequence must initialize its slot to the zero state.
+    torch.testing.assert_close(pool[2], torch.zeros_like(pool[2]), rtol=0, atol=0)
+    # The empty resumed sequence and unselected slots keep their contents.
+    preserved = [0, 1, 4, 5]
+    torch.testing.assert_close(pool[preserved], original_pool[preserved], rtol=0, atol=0)
 
 
 def test_naive_recurrent_packed_matches_public_contract():

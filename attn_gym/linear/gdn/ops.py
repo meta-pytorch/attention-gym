@@ -12,6 +12,11 @@ _RECURRENT_ARGS = (
 )
 torch.library.define("attn_gym::gdn_recurrent_fwd", _RECURRENT_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::gdn_recurrent_fwd_no_state", _RECURRENT_ARGS + " -> Tensor")
+torch.library.define(
+    "attn_gym::gdn_recurrent_fwd_paged",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
+    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale) -> Tensor",
+)
 
 
 def _recurrent_backend():
@@ -31,11 +36,20 @@ def _recurrent_fwd_no_state_cuda(*args):
     return _recurrent_backend()._gdn_recurrent_fwd_no_state_cuda(*args)
 
 
+def _recurrent_fwd_paged_cuda(*args):
+    return _recurrent_backend()._gdn_recurrent_fwd_paged_cuda(*args)
+
+
 torch.library.impl("attn_gym::gdn_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
 torch.library.impl(
     "attn_gym::gdn_recurrent_fwd_no_state",
     "CUDA",
     _recurrent_fwd_no_state_cuda,
+)
+torch.library.impl(
+    "attn_gym::gdn_recurrent_fwd_paged",
+    "CUDA",
+    _recurrent_fwd_paged_cuda,
 )
 
 
@@ -75,8 +89,26 @@ def _recurrent_fwd_no_state_fake(
     return torch.empty_like(v, dtype=q.dtype)
 
 
+@torch.library.register_fake("attn_gym::gdn_recurrent_fwd_paged")
+def _recurrent_fwd_paged_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
+    return torch.empty_like(v, dtype=q.dtype)
+
+
 recurrent_fwd_op = torch.ops.attn_gym.gdn_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.gdn_recurrent_fwd_no_state.default
+recurrent_fwd_paged_op = torch.ops.attn_gym.gdn_recurrent_fwd_paged.default
 
 
 def recurrent_forward(
@@ -90,6 +122,8 @@ def recurrent_forward(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     output_final_state: bool,
+    state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize inputs and invoke the fused recurrent GDN operator."""
@@ -108,6 +142,20 @@ def recurrent_forward(
 
     q, k, v = (tensor.contiguous() for tensor in (q, k, v))
     gate, beta = (tensor.float().contiguous() for tensor in (gate, beta))
+    if state_indices is not None:
+        assert initial_state is not None
+        return recurrent_fwd_paged_op(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            state_indices,
+            has_initial_state,
+            cu_seqlens,
+            scale,
+        ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
     args = (q, k, v, gate, beta, initial_state, cu_seqlens, scale, autotune)
@@ -116,4 +164,9 @@ def recurrent_forward(
     return recurrent_fwd_no_state_op(*args), None
 
 
-__all__ = ["recurrent_forward", "recurrent_fwd_no_state_op", "recurrent_fwd_op"]
+__all__ = [
+    "recurrent_forward",
+    "recurrent_fwd_no_state_op",
+    "recurrent_fwd_op",
+    "recurrent_fwd_paged_op",
+]

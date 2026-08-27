@@ -266,6 +266,31 @@ def test_invalid_initial_state_shape_fails_clearly(function):
         function(*inputs[:-1], initial_state=inputs[-1][..., :-1])
 
 
+def test_recurrent_paged_validates_mode_contract():
+    q, k, v, gate, beta, _state = make_inputs(sequence=2)
+    state_cache = torch.randn(4, q.shape[2], v.shape[-1], q.shape[-1])
+    state_indices = torch.tensor([1, 2], dtype=torch.int32)
+    has_initial_state = torch.ones(2, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="requires initial_state"):
+        recurrent_gdn(q, k, v, gate, beta, state_indices=state_indices)
+    with pytest.raises(ValueError, match="drop output_final_state"):
+        recurrent_gdn(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices=state_indices,
+            output_final_state=True,
+        )
+    with pytest.raises(ValueError, match="requires impl='fused'"):
+        recurrent_gdn(q, k, v, gate, beta, state_cache, state_indices=state_indices)
+    with pytest.raises(ValueError, match="requires state_indices"):
+        recurrent_gdn(q, k, v, gate, beta, has_initial_state=has_initial_state)
+
+
 def test_mismatched_qkv_dtypes_fail_clearly():
     inputs = list(make_inputs(sequence=2))
     inputs[2] = inputs[2].double()
