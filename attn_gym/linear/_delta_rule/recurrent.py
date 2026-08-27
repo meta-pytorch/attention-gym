@@ -69,6 +69,7 @@ def _recurrent_delta_rule_fwd_kernel(
     N,
     state_batch_stride: tl.constexpr,
     H: tl.constexpr,
+    HK: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -80,12 +81,19 @@ def _recurrent_delta_rule_fwd_kernel(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
 ):
-    """Scan one sequence/head/value tile while retaining the FP32 state in registers."""
+    """Scan one sequence/head/value tile while retaining the FP32 state in registers.
+
+    Programs are indexed by value head. With grouped heads (``HK < H``) each block of
+    ``H // HK`` consecutive value heads reads one shared q/k (and vector-gate) head; KDA
+    passes ``HK == H``, which reduces every ``row_k`` to the ungrouped ``row``.
+    """
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
     i_v = pid % NV
     i_nh = pid // NV
     i_n, i_h = i_nh // H, i_nh % H
+    # Grouped heads: consecutive value heads share one query/key (and vector-gate) head.
+    i_hk = i_h // (H // HK)
 
     if IS_VARLEN:
         # Assumption: seqlens have been validated prior to call
@@ -130,14 +138,18 @@ def _recurrent_delta_rule_fwd_kernel(
 
     for t in range(bos, eos):
         row = t * H + i_h
-        b_q = tl.load(q + row * K + o_k, mask=m_k, other=0.0).to(tl.float32) * scale
-        b_k = tl.load(k + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+        row_k = t * HK + i_hk
+        b_q = tl.load(q + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
+        b_q *= scale
+        b_k = tl.load(k + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
         if SCALAR_GATE:
             b_g = tl.load(gate + row).to(tl.float32)
         else:
-            b_g = tl.load(gate + row * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_g = tl.load(gate + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(
+                tl.float32
+            )
         b_beta = tl.load(beta + row).to(tl.float32)
-        b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
+        b_v = tl.load(v + ptr_offset((row, o_v), (V, 1)), mask=m_v, other=0.0).to(tl.float32)
 
         # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
         if SCALAR_GATE:
@@ -148,7 +160,9 @@ def _recurrent_delta_rule_fwd_kernel(
         b_delta = (b_v - tl.sum(b_k[:, None] * b_state, 0)) * b_beta
         b_state += b_k[:, None] * b_delta[None, :]
         b_o = tl.sum(b_q[:, None] * b_state, 0)
-        tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
+        tl.store(
+            output + ptr_offset((row, o_v), (V, 1)), b_o.to(output.dtype.element_ty), mask=m_v
+        )
 
     if STORE_FINAL_STATE:
         tl.store(ht + p_state, b_state, mask=m_kv)
@@ -164,6 +178,7 @@ recurrent_delta_rule_fwd_kernel = triton.autotune(
         "T",
         "N",
         "H",
+        "HK",
         "K",
         "V",
         "USE_INITIAL_STATE",
@@ -195,11 +210,14 @@ def launch_recurrent_delta_rule_fwd(
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``; packed callers pass ``B == 1``.
+        q: Queries shaped ``[B, T, HK, K]``; packed callers pass ``B == 1``. ``HK`` may be a
+            divisor of the value head count ``H`` (grouped heads): each block of ``H // HK``
+            consecutive value heads shares one query/key head, so callers never materialize a
+            ``repeat_interleave``.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
         gate: Natural-log decay, shaped ``[B, T, H]`` for ``GateKind.SCALAR`` or like ``q``
-            for ``GateKind.VECTOR``.
+            for ``GateKind.VECTOR`` (vector gates follow the query/key head count).
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Optional FP32 starting state shaped ``[N, H, K, V]``, or the mutable
             ``[slots, H, V, K]`` pool that ``state_indices`` addresses in paged mode.
@@ -225,14 +243,15 @@ def launch_recurrent_delta_rule_fwd(
         mode the returned state aliases ``initial_state``.
     """
     assert k.shape == q.shape
-    assert v.shape[:3] == q.shape[:3]
-    assert gate.shape == (q.shape[:-1] if gate_kind is GateKind.SCALAR else q.shape)
-    assert beta.shape == q.shape[:-1]
+    assert v.shape[:2] == q.shape[:2]
+    assert gate.shape == (v.shape[:-1] if gate_kind is GateKind.SCALAR else q.shape)
+    assert beta.shape == v.shape[:-1]
     assert all(tensor.is_contiguous() for tensor in (q, k, v, gate, beta))
     assert has_initial_state is None or state_indices is not None
 
-    batch, tokens, heads, key_dim = q.shape
-    value_dim = v.shape[-1]
+    batch, tokens, key_heads, key_dim = q.shape
+    heads, value_dim = v.shape[2], v.shape[-1]
+    assert heads % key_heads == 0
     if initial_state is not None:
         if state_indices is None:
             assert initial_state.is_contiguous()
@@ -296,6 +315,7 @@ def launch_recurrent_delta_rule_fwd(
         N=num_sequences,
         state_batch_stride=state_batch_stride,
         H=heads,
+        HK=key_heads,
         K=key_dim,
         V=value_dim,
         BK=triton.next_power_of_2(key_dim),

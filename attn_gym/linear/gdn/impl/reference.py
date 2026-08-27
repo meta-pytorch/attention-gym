@@ -83,6 +83,10 @@ def reference_gdn(
     output_dtype = q.dtype
     compute_dtype = torch.promote_types(q.dtype, torch.float32)
     q, k, v, log_decay, beta = (tensor.to(compute_dtype) for tensor in (q, k, v, log_decay, beta))
+    if q.shape[2] != v.shape[2]:
+        # Grouped heads: expand each shared query/key head across its value-head group.
+        groups = v.shape[2] // q.shape[2]
+        q, k = (tensor.repeat_interleave(groups, dim=2) for tensor in (q, k))
     # Explicit casts do not stop autocast from selecting low-precision contractions.
     with torch.autocast(device_type=q.device.type, enabled=False):
         if cu_seqlens is None:
