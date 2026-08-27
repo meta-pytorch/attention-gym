@@ -24,6 +24,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_DEFAULT_SCALE = 128**-0.5
+
+
 def test_ragged_custom_op_registrations():
     q, k, v, gate, beta = make_kda_test_inputs(128, requires_grad=True)
     initial_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
@@ -36,6 +39,7 @@ def test_ragged_custom_op_registrations():
         initial_state.detach(),
         cu_seqlens,
         metadata.chunk_offsets,
+        _DEFAULT_SCALE,
         True,
     )
     torch.library.opcheck(
@@ -67,6 +71,7 @@ def test_ragged_custom_op_registrations():
             torch.randn_like(output),
             torch.randn_like(state),
             initial_state.detach(),
+            _DEFAULT_SCALE,
             False,
             True,
         ),
@@ -80,6 +85,7 @@ def test_ragged_custom_op_registrations():
         None,
         cu_seqlens,
         metadata.chunk_offsets,
+        _DEFAULT_SCALE,
         True,
     )
     with torch.no_grad():
@@ -95,6 +101,7 @@ def test_ragged_custom_op_registrations():
             torch.randn_like(output),
             None,
             None,
+            _DEFAULT_SCALE,
             False,
             True,
         ),

@@ -3351,6 +3351,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     head_dim: int,
     chunk_size: int,
     io_dtype: torch.dtype,
+    scale: float,
     fastmath: bool,
     grid_waves: int,
     ragged: bool,
@@ -3363,7 +3364,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         head_dim_k=head_dim,
         head_dim_v=head_dim,
         io_dtype=cutlass_io_dtype,
-        scale=head_dim**-0.5,
+        scale=scale,
         grid_waves=grid_waves,
         use_fast_math=fastmath,
         use_int64_offsets=use_int64_offsets,
@@ -3459,6 +3460,7 @@ class ChunkKdaBwdWyDqkgTunable:
         cu_seqlens: torch.Tensor | None
         chunk_offsets: torch.Tensor | None
         chunk_size: int
+        scale: float
         fastmath: bool
 
     @staticmethod
@@ -3490,12 +3492,13 @@ class ChunkKdaBwdWyDqkgTunable:
     def compile_call(
         config: ChunkKdaBwdWyDqkgConfig,
         args: Args,
-    ) -> tuple[int, int, int, torch.dtype, bool, int, bool, bool]:
+    ) -> tuple[int, int, int, torch.dtype, float, bool, int, bool, bool]:
         return (
             args.q.shape[2],
             args.q.shape[3],
             args.chunk_size,
             args.q.dtype,
+            args.scale,
             args.fastmath,
             config.grid_waves,
             args.chunk_offsets is not None,
@@ -3585,6 +3588,7 @@ def chunk_kda_bwd_wy_dqkg(
     dv: torch.Tensor,
     metadata: RaggedChunkMetadata | None = None,
     *,
+    scale: float,
     chunk_size: int = 64,
     fastmath: bool = False,
     config: ChunkKdaBwdWyDqkgConfig | None = None,
@@ -3663,6 +3667,7 @@ def chunk_kda_bwd_wy_dqkg(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         chunk_size=chunk_size,
+        scale=scale,
         fastmath=fastmath,
     )
     # An explicit config pins the schedule regardless of the plumbed flag.

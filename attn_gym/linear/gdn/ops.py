@@ -6,6 +6,8 @@ import importlib
 
 import torch
 
+from attn_gym.linear.kda.api import chunk_kda
+
 _RECURRENT_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
     "Tensor? cu_seqlens, float scale, bool autotune)"
@@ -197,6 +199,54 @@ def recurrent_forward(
     return recurrent_fwd_no_state_op(*args), None
 
 
+def fused_chunk_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    scale: float,
+    output_final_state: bool,
+    autotune: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run chunk GDN on the fused KDA pipeline by expanding the scalar gate per channel.
+
+    GDN's recurrence is KDA's with one decay shared by every key channel, so the fused KDA
+    chunk kernels compute it exactly. The expansions stay inside autograd, whose backward
+    reduces the gate gradient over K and the q/k gradients over each value-head group.
+    The gate expansion is a zero-stride view; the KDA pipeline normalizes any layouts its
+    kernels cannot take directly.
+    """
+    # TODO: easy (slower) adapter until the Mega chunk backend lands; delegating here
+    # means chunk_gdn inherits that backend for free.
+    if not q.is_cuda:
+        raise ValueError("chunk_gdn(impl='fused') requires CUDA tensors")
+    key_dim = q.shape[-1]
+    groups = v.shape[2] // q.shape[2]
+    if groups > 1:
+        q, k = (tensor.repeat_interleave(groups, dim=2) for tensor in (q, k))
+    # GDN admits any floating gate/beta dtype; KDA validation caps them at FP32.
+    gate, beta = (
+        tensor.float() if tensor.dtype == torch.float64 else tensor for tensor in (gate, beta)
+    )
+    vector_gate = gate.unsqueeze(-1).expand(*gate.shape, key_dim)
+    return chunk_kda(
+        q,
+        k,
+        v,
+        vector_gate,
+        beta,
+        initial_state,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        output_final_state=output_final_state,
+        autotune=autotune,
+    )
+
+
 def recurrent_decode_forward(
     packed_qkv: torch.Tensor,
     raw_gate: torch.Tensor,
@@ -234,6 +284,7 @@ def recurrent_decode_forward(
 
 
 __all__ = [
+    "fused_chunk_forward",
     "recurrent_decode_forward",
     "recurrent_decode_op",
     "recurrent_forward",

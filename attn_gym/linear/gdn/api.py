@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import sys
-from numbers import Real
 
 import torch
 
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
+    resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
 )
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
-from attn_gym.linear.gdn.ops import recurrent_decode_forward
+from attn_gym.linear.gdn.ops import fused_chunk_forward, recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
 from attn_gym.linear.types import Impl, resolve_impl
@@ -30,6 +30,7 @@ def chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
+    autotune: bool = True,
     impl: Impl | str = Impl.REFERENCE,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply chunk-parallel gated delta rule attention for training and prefill.
@@ -54,16 +55,35 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        impl: ``"reference"`` uses eager PyTorch. ``"fused"`` is reserved for the optimized
-            backend and currently raises ``NotImplementedError``.
+        autotune: Benchmark candidate fused-kernel configurations when true (winners are
+            cached and reused); use fixed heuristics when false for repeatable selection
+            across machines and cache states. Ignored by the reference implementation.
+        impl: ``"reference"`` uses eager PyTorch. ``"fused"`` runs the CuTe KDA chunk
+            pipeline with the scalar gate expanded per key channel; it requires an
+            SM100-class GPU (compute capability 10.0 or 10.3) and ``K = V = 128``,
+            supports training through autograd, and
+            inherits the fused chunk pipeline's gate-range limit of approximately
+            ``[-5.914, 0]`` per token.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
+    scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        raise NotImplementedError("chunk_gdn impl='fused' is not implemented yet")
+        return fused_chunk_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens=cu_seqlens,
+            scale=scale,
+            output_final_state=output_final_state,
+            autotune=autotune,
+        )
 
     return reference_gdn(
         chunk_forward,
@@ -72,7 +92,7 @@ def chunk_gdn(
         v,
         gate,
         beta,
-        scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        scale=scale,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         output_final_state=output_final_state,
@@ -265,18 +285,13 @@ def recurrent_gdn_decode(
     if dt_bias.shape != (heads,) or dt_bias.dtype != torch.float32 or not dt_bias.is_contiguous():
         raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads},)")
 
-    if scale is None:
-        scale = key_dim**-0.5
-    elif not isinstance(scale, Real) or isinstance(scale, bool):
-        raise TypeError("scale must be a real scalar or None")
-    else:
-        scale = float(scale)
-        if (
-            scale != scale  # noqa: PLR0124 - compile-safe NaN check
-            or scale <= 0
-            or scale > sys.float_info.max
-        ):
-            raise ValueError(f"scale must be finite and positive, got {scale}")
+    scale = resolve_scale(scale, key_dim)
+    if (
+        scale != scale  # noqa: PLR0124 - compile-safe NaN check
+        or scale <= 0
+        or scale > sys.float_info.max
+    ):
+        raise ValueError(f"scale must be finite and positive, got {scale}")
 
     out = resolve_decode_out(packed_qkv, out, (1, batch, heads, value_dim))
     return recurrent_decode_forward(

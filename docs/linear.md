@@ -19,7 +19,9 @@ output = scale * query @ state
 `chunk_gdn` uses a chunk-parallel decomposition for training and prefill. `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
 chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
-`recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
+`chunk_gdn(..., impl="fused")` selects the training-capable CuTe KDA chunk pipeline with the
+scalar gate expanded per key channel, while `recurrent_gdn(..., impl="fused")` selects the
+inference-only Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -43,7 +45,7 @@ output, final_state = chunk_gdn(
 - CPU and CUDA execution through eager PyTorch operations.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
-- Autograd for reference inputs and initial state.
+- Autograd for reference execution and fused chunk execution, including the initial state.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.
 - Gate and beta may use independent floating dtypes and are converted to the recurrence compute
@@ -53,7 +55,9 @@ output, final_state = chunk_gdn(
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
 capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. The fused
-chunk implementation is not implemented yet; unsupported implementation choices fail rather than
+chunk implementation requires an SM100-class GPU (CUDA capability 10.0 or 10.3) and
+`K = V = 128`, and inherits `chunk_kda`’s
+fused FP16 Q/K normalization guidance; unsupported implementation choices fail rather than
 falling back to the reference.
 
 ### Migration from the prototype API
