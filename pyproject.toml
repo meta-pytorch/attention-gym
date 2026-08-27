@@ -36,7 +36,6 @@ tests = [
     "typer",
     "jsonargparse",
     "docstring-parser",
-    "numpy",
     "flash-attn-4[cu13]~=4.0.0b23; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -47,12 +46,10 @@ dev = [
     "typer",
     "jsonargparse",
     "docstring-parser",
-    "numpy",
 ]
 
 viz = [
     "matplotlib",
-    "numpy",
     "jsonargparse",
     "docstring-parser",
     "tabulate",
@@ -65,7 +62,6 @@ docs = [
     "mkdocs-macros-plugin",
     "mkdocs-redirects",
     "mkdocstrings[python]",
-    "numpy",
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------

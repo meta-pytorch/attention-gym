@@ -54,6 +54,21 @@ def test_linear_base_import_keeps_cutedsl_lazy():
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_base_import_does_not_require_numpy():
+    """The base package declares only torch and must not import NumPy directly."""
+    script = (
+        "import builtins\n"
+        "original_import = builtins.__import__\n"
+        "def without_numpy(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if level == 0 and (name == 'numpy' or name.startswith('numpy.')):\n"
+        "        raise ModuleNotFoundError('blocked NumPy import')\n"
+        "    return original_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = without_numpy\n"
+        "import attn_gym\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_short_conv_decode_uses_decode_name():
     assert "causal_conv1d_decode" in attn_gym.linear.__all__
     assert "causal_conv1d_update" not in attn_gym.linear.__all__

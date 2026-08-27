@@ -2,7 +2,6 @@ import math
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
@@ -203,8 +202,8 @@ def visualize_attention_scores(
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
-        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.set_xticks(torch.arange(-0.5, num_kv_tokens, 1), minor=True)
+        ax.set_yticks(torch.arange(-0.5, num_query_tokens, 1), minor=True)
         ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()
@@ -305,8 +304,8 @@ def plot_attention_scores(
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
-        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.set_xticks(torch.arange(-0.5, num_kv_tokens, 1), minor=True)
+        ax.set_yticks(torch.arange(-0.5, num_query_tokens, 1), minor=True)
         ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()
