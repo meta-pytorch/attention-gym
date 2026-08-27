@@ -37,9 +37,11 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
 from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTeDSL KDA forward pipeline requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the CuTeDSL KDA forward pipeline requires SM100/SM103",
 )
+
+_DEFAULT_SCALE = 128**-0.5
 
 
 def _inputs(
@@ -150,7 +152,9 @@ def test_private_chunk_kda_forward_matches_reference(dtype: torch.dtype):
     torch.manual_seed(2)
     q, k, v, gate, beta = _inputs(tokens=64, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
-    actual, aqk, akk = _chunk_kda_fwd_op(q, k, v, cumulative_gate, beta, None, False)
+    actual, aqk, akk = _chunk_kda_fwd_op(
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False
+    )
     golden, _ = naive_chunk_kda(
         q.double(),
         k.double(),
@@ -172,7 +176,9 @@ def test_private_fp16_forward_factors_are_finite_at_gate_limit():
     gate = torch.full_like(q, -MAX_GATE_LOWER_BOUND_MAGNITUDE, dtype=torch.float32)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
 
-    output, aqk, akk = _chunk_kda_fwd_op(q, k, v, cumulative_gate, beta, None, False)
+    output, aqk, akk = _chunk_kda_fwd_op(
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False
+    )
 
     for tensor in (output, aqk, akk):
         assert tensor.dtype == torch.float16
@@ -564,12 +570,12 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
     module = importlib.import_module("attn_gym.linear.kda.impl.fused")
     routes = []
 
-    def dense_forward(q, _k, v, _gate, _beta, _state, _tune):
+    def dense_forward(q, _k, v, _gate, _beta, _state, _scale, _tune):
         routes.append("dense")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
 
-    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _tune):
+    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _scale, _tune):
         routes.append("ragged")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
@@ -856,6 +862,7 @@ def test_chunk_kda_op_registration(dtype):
         cumulative_gate.detach(),
         beta.detach(),
         initial_state.detach(),
+        _DEFAULT_SCALE,
         True,
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
@@ -906,6 +913,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             cumulative_gate,
             beta,
             initial_state,
+            _DEFAULT_SCALE,
             True,
         )
     torch.library.opcheck(
@@ -923,6 +931,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             None,
             torch.randn_like(state),
             None,
+            _DEFAULT_SCALE,
             False,
             True,
         ),
@@ -945,6 +954,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             None,
             torch.randn_like(state),
             initial_state.detach(),
+            _DEFAULT_SCALE,
             False,
             True,
         ),

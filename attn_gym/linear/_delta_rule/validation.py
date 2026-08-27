@@ -2,9 +2,28 @@
 
 from __future__ import annotations
 
+import sys
+from numbers import Real
+
 import torch
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def resolve_scale(scale: float | None, key_dim: int) -> float:
+    """Resolve a query-scale override to a validated float, defaulting to ``1/sqrt(K)``."""
+    if scale is None:
+        return key_dim**-0.5
+    if not isinstance(scale, Real) or isinstance(scale, bool):
+        raise TypeError("scale must be a real scalar or None")
+    scale = float(scale)
+    if (
+        scale != scale  # noqa: PLR0124 - compile-safe NaN check
+        or scale <= 0
+        or scale > sys.float_info.max
+    ):
+        raise ValueError(f"scale must be finite and positive, got {scale}")
+    return scale
 
 
 def validate_has_initial_state(
@@ -148,6 +167,7 @@ def validate_paged_state(
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "resolve_decode_out",
+    "resolve_scale",
     "validate_decode_inputs",
     "validate_has_initial_state",
     "validate_paged_state",

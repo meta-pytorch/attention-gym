@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import sys
-from numbers import Real
-
 import torch
 
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
+    resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
 )
@@ -265,18 +263,7 @@ def recurrent_gdn_decode(
     if dt_bias.shape != (heads,) or dt_bias.dtype != torch.float32 or not dt_bias.is_contiguous():
         raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads},)")
 
-    if scale is None:
-        scale = key_dim**-0.5
-    elif not isinstance(scale, Real) or isinstance(scale, bool):
-        raise TypeError("scale must be a real scalar or None")
-    else:
-        scale = float(scale)
-        if (
-            scale != scale  # noqa: PLR0124 - compile-safe NaN check
-            or scale <= 0
-            or scale > sys.float_info.max
-        ):
-            raise ValueError(f"scale must be finite and positive, got {scale}")
+    scale = resolve_scale(scale, key_dim)
 
     out = resolve_decode_out(packed_qkv, out, (1, batch, heads, value_dim))
     return recurrent_decode_forward(

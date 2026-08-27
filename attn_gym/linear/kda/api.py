@@ -22,6 +22,7 @@ import torch
 
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
+    resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
 )
@@ -61,6 +62,7 @@ def chunk_kda(
     initial_state: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    scale: float | None = None,
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
@@ -69,7 +71,7 @@ def chunk_kda(
     """Apply chunk-parallel KDA for training and prefill.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally. Use
+        q: Queries shaped ``[B, T, H, K]``, scaled by ``scale`` internally. Use
             L2-normalized Q/K with fused FP16: unnormalized values can overflow the FP16
             intermediates passed between FP32-accumulating GEMMs.
         k: Keys shaped like ``q`` and subject to the same fused FP16 range limitation.
@@ -88,6 +90,8 @@ def chunk_kda(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
+        scale: Query scale, applied inside the kernels in FP32. Defaults to
+            ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
         fastmath: Allow less precise fused math for speed; rejected with
             ``"reference"``.
@@ -116,6 +120,7 @@ def chunk_kda(
         op_name="chunk_kda",
         gate_name="gate",
     )
+    scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
         return _fused_chunk_forward(
             q,
@@ -125,12 +130,13 @@ def chunk_kda(
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
+            scale=scale,
             output_final_state=output_final_state,
             fastmath=fastmath,
             autotune=autotune,
         )
     return reference_kda(
-        partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE),
+        partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE, scale=scale),
         q,
         k,
         v,
@@ -435,18 +441,7 @@ def recurrent_kda_decode(
             raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
     else:
         lower_bound = 0.0
-    if scale is None:
-        scale = key_dim**-0.5
-    elif not isinstance(scale, Real) or isinstance(scale, bool):
-        raise TypeError("scale must be a real scalar or None")
-    else:
-        scale = float(scale)
-        if (
-            scale != scale  # noqa: PLR0124 - compile-safe NaN check
-            or scale <= 0
-            or scale > sys.float_info.max
-        ):
-            raise ValueError(f"scale must be finite and positive, got {scale}")
+    scale = resolve_scale(scale, key_dim)
 
     out = resolve_decode_out(packed_qkv, out, (1, batch, heads, value_dim))
 

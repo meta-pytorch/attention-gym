@@ -142,12 +142,11 @@ def _chunk_kda_fwd(
     has_initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     *,
+    scale: float,
     output_final_state: bool,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
-    scale = _HEAD_DIM**-0.5
-
     with profiler_range("kda/fused/chunk_kda_fwd_intra"):
         w, u, kg, Aqk, Akk = chunk_kda_fwd_intra(
             q,
@@ -197,6 +196,7 @@ def _chunk_kda_fwd_shared(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    scale: float,
     autotune: bool,
     output_final_state: bool,
 ):
@@ -213,6 +213,7 @@ def _chunk_kda_fwd_shared(
         None,
         None,
         None,
+        scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
     )
@@ -225,6 +226,7 @@ def _chunk_kda_fwd_cuda(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    scale: float,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, _final_state, Aqk, Akk = _chunk_kda_fwd_shared(
@@ -234,6 +236,7 @@ def _chunk_kda_fwd_cuda(
         cumulative_gate,
         beta,
         initial_state,
+        scale,
         autotune,
         False,
     )
@@ -247,6 +250,7 @@ def _chunk_kda_fwd_with_state_cuda(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    scale: float,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _chunk_kda_fwd_shared(
@@ -256,6 +260,7 @@ def _chunk_kda_fwd_with_state_cuda(
         cumulative_gate,
         beta,
         initial_state,
+        scale,
         autotune,
         True,
     )
@@ -270,6 +275,7 @@ def _chunk_kda_fwd_ragged_shared(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    scale: float,
     autotune: bool,
     output_final_state: bool,
 ):
@@ -292,6 +298,7 @@ def _chunk_kda_fwd_ragged_shared(
         None,
         None,
         metadata,
+        scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
     )
@@ -306,6 +313,7 @@ def _chunk_kda_fwd_ragged_cuda(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    scale: float,
     autotune: bool,
 ):
     output, _state, Aqk, Akk = _chunk_kda_fwd_ragged_shared(
@@ -317,6 +325,7 @@ def _chunk_kda_fwd_ragged_cuda(
         initial_state,
         cu_seqlens,
         chunk_offsets,
+        scale,
         autotune,
         False,
     )
@@ -332,6 +341,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    scale: float,
     autotune: bool,
 ):
     return _chunk_kda_fwd_ragged_shared(
@@ -343,6 +353,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
         initial_state,
         cu_seqlens,
         chunk_offsets,
+        scale,
         autotune,
         True,
     )
@@ -389,6 +400,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         state_indices,
         has_initial_state,
         metadata,
+        scale=_HEAD_DIM**-0.5,
         output_final_state=False,
         autotune=autotune,
     )
@@ -452,6 +464,7 @@ def _chunk_kda_bwd_shared(
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
+    scale: float,
     fastmath: bool,
     autotune: bool,
 ):
@@ -479,7 +492,7 @@ def _chunk_kda_bwd_shared(
             k,
             cumulative_gate,
             beta,
-            _HEAD_DIM**-0.5,
+            scale,
             metadata,
         )
     else:
@@ -496,6 +509,7 @@ def _chunk_kda_bwd_shared(
         d_final_state,
         initial_state,
         metadata,
+        scale=scale,
         fastmath=fastmath,
         autotune=autotune,
     )
@@ -512,6 +526,7 @@ def _chunk_kda_bwd_recompute_factors_shared(
     d_output: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
+    scale: float,
     fastmath: bool,
     autotune: bool,
 ):
@@ -529,6 +544,7 @@ def _chunk_kda_bwd_recompute_factors_shared(
         d_output,
         d_final_state,
         initial_state,
+        scale,
         fastmath,
         autotune,
     )

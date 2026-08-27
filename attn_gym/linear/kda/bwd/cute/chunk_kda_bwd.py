@@ -31,6 +31,7 @@ def chunk_kda_bwd(
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     *,
+    scale: float,
     chunk_size: int = 64,
     fastmath: bool = False,
     autotune: bool = True,
@@ -51,7 +52,6 @@ def chunk_kda_bwd(
         raise ValueError(f"the composed KDA backward requires chunk_size=64, got {chunk_size}")
     if tokens % chunk_size and metadata is None:
         raise ValueError("the composed KDA backward requires complete chunks")
-    scale = head_dim**-0.5
 
     # Forward deliberately saves only the minimal backward factors. Always
     # reconstruct the large W/U, gated Q/K, state, and corrected-value
@@ -120,6 +120,7 @@ def chunk_kda_bwd(
             dh,
             dv,
             metadata,
+            scale=scale,
             chunk_size=chunk_size,
             fastmath=fastmath,
             autotune=autotune,

@@ -273,6 +273,37 @@ def test_recurrent_agrees_with_chunked_core():
     torch.testing.assert_close(recurrent_state, chunked_state, rtol=5e-2, atol=5e-2)
 
 
+def test_chunk_scale_override_matches_query_prescale():
+    """``scale`` post-multiplies the output, which equals scaling FP32 queries directly."""
+    from attn_gym.linear import chunk_kda
+
+    q, k, v, gate, beta, state = _inputs(tokens=32, initial_state=True, seed=5)
+    scale, key_dim = 0.25, q.shape[-1]
+    scaled = chunk_kda(
+        q, k, v, gate, beta, state, scale=scale, output_final_state=True, impl="reference"
+    )
+    expected = chunk_kda(
+        q * (scale * key_dim**0.5),
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+        impl="reference",
+    )
+    torch.testing.assert_close(scaled[0], expected[0])
+    torch.testing.assert_close(scaled[1], expected[1], rtol=0, atol=0)
+
+
+def test_chunk_scale_rejects_bool():
+    from attn_gym.linear import chunk_kda
+
+    q, k, v, gate, beta, _ = _inputs(tokens=3)
+    with pytest.raises(TypeError, match="scale must be a real scalar"):
+        chunk_kda(q, k, v, gate, beta, scale=True, impl="reference")
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_recurrent_paged_matches_gather_scatter(packed: bool):
     """Slot indexing equals a native gather, dense scan, and scatter round trip."""

@@ -66,7 +66,7 @@ def _inputs(
 
 
 def _run(inputs: StageInputs, metadata):
-    return chunk_kda_bwd_wy_dqkg(*inputs, metadata)
+    return chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5)
 
 
 def _sequence_local_reference(inputs: StageInputs, lengths: list[int]):
@@ -232,7 +232,7 @@ def test_ragged_wy_cuda_graph_replay():
     def operation(*args):
         *stage_tensors, offsets = args
         metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
-        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata)
+        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata, scale=128**-0.5)
 
     operation(*inputs, cu_seqlens)
     torch.cuda.synchronize()
