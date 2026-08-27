@@ -232,7 +232,9 @@ def recurrent_kda(
     """Apply recurrent KDA for decoding and inference prefill.
 
     Args:
-        q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.
+        q: Queries shaped ``[B, T, HK, K]``, scaled by ``1/sqrt(K)`` internally. ``HK``
+            may divide the value head count ``H`` for grouped-head attention: each block
+            of ``H // HK`` consecutive value heads shares one query/key (and gate) head.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
@@ -293,6 +295,7 @@ def recurrent_kda(
         cu_seqlens,
         op_name="recurrent_kda",
         gate_name="gate",
+        allow_grouped_heads=True,
     )
     if state_indices is not None:
         if initial_state is None:

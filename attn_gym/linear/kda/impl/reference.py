@@ -92,6 +92,10 @@ def reference_kda(
     q, k, v = (tensor.float() for tensor in (q, k, v))
     gate = gate.float()
     beta = beta.float()
+    if q.shape[2] != v.shape[2]:
+        # Grouped heads: expand each shared query/key/gate head across its value-head group.
+        groups = v.shape[2] // q.shape[2]
+        q, k, gate = (tensor.repeat_interleave(groups, dim=2) for tensor in (q, k, gate))
     if initial_state is not None:
         initial_state = initial_state.float()
     # ``.float()`` casts alone do not stop an active autocast region from

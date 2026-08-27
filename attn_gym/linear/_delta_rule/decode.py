@@ -24,8 +24,8 @@ Gate transforms (`USE_LOWER_BOUND` selects the first):
     bounded:  lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))
     softplus: -exp(A_log) * softplus(raw_gate + dt_bias)
 
-Scalar-gated callers may pass fewer q/k heads than value heads (grouped heads): each block of
-``H // HK`` consecutive value heads shares one q/k head inside the packed buffer.
+Callers may pass fewer q/k heads than value heads (grouped heads): each block of ``H // HK``
+consecutive value heads shares one q/k (and vector-gate) head inside the packed buffer.
 """
 
 from __future__ import annotations
@@ -120,9 +120,10 @@ def _recurrent_delta_rule_decode_kernel(
         b_gate_input = tl.load(raw_gate + i_n * gate_token_stride + i_h).to(tl.float32)
         b_gate_input += tl.load(dt_bias + i_h).to(tl.float32)
     else:
-        p_gate = raw_gate + i_n * gate_token_stride + ptr_offset((i_h, o_k), (K, 1))
+        # Vector gates follow the q/k heads: the per-channel decay acts on the shared key basis.
+        p_gate = raw_gate + i_n * gate_token_stride + ptr_offset((i_hk, o_k), (K, 1))
         b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
-        b_gate_input += tl.load(dt_bias + ptr_offset((i_h, o_k), (K, 1)), mask=m_k, other=0.0).to(
+        b_gate_input += tl.load(dt_bias + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(
             tl.float32
         )
     b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
@@ -175,7 +176,7 @@ def launch_recurrent_delta_rule_decode(
 
     Args:
         packed_qkv: ``[B, HK*K | HK*K | H*V]`` per-token buffer; within each section head
-            rows are contiguous. ``HK == key_heads`` may divide ``H`` for scalar gates.
+            rows are contiguous. ``HK == key_heads`` may divide ``H``.
         raw_gate: Unactivated token-major gate, ``[B, H]`` for ``GateKind.SCALAR`` or
             ``[B, H, K]`` for ``GateKind.VECTOR``.
         raw_beta: Unactivated token-major write gate shaped ``[B, H]``, activated in-kernel

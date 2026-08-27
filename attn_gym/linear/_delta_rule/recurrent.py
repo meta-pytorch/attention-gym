@@ -83,9 +83,9 @@ def _recurrent_delta_rule_fwd_kernel(
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers.
 
-    Programs are indexed by value head. Scalar-gated callers may share one q/k head across
-    each block of ``H // HK`` consecutive value heads; vector-gated KDA passes ``HK == H``,
-    which reduces every ``row_k`` to the ungrouped ``row``.
+    Programs are indexed by value head. With grouped heads (``HK < H``) each block of
+    ``H // HK`` consecutive value heads reads one shared q/k head; vector gates follow the
+    q/k heads because the per-channel decay acts on the key basis those heads define.
     """
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -209,9 +209,9 @@ def launch_recurrent_delta_rule_fwd(
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
 
     Args:
-        q: Queries shaped ``[B, T, HK, K]``; packed callers pass ``B == 1``. Scalar-gated
-            callers may pass ``HK`` as a divisor of the value head count ``H`` (grouped
-            heads): each block of ``H // HK`` consecutive value heads shares one query/key
+        q: Queries shaped ``[B, T, HK, K]``; packed callers pass ``B == 1``. ``HK`` may be
+            a divisor of the value head count ``H`` (grouped heads): each block of
+            ``H // HK`` consecutive value heads shares one query/key (and vector-gate)
             head, so callers never materialize a ``repeat_interleave``.
         k: Keys shaped like ``q``.
         v: Values shaped ``[B, T, H, V]``.
@@ -251,8 +251,6 @@ def launch_recurrent_delta_rule_fwd(
     batch, tokens, key_heads, key_dim = q.shape
     heads, value_dim = v.shape[2], v.shape[-1]
     assert heads % key_heads == 0
-    # No caller groups vector gates; keep that unsupported mode out of the shared contract.
-    assert gate_kind is GateKind.SCALAR or key_heads == heads
     if initial_state is not None:
         if state_indices is None:
             assert initial_state.is_contiguous()
