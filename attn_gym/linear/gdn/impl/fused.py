@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym.linear._delta_rule.decode import GateTransform, launch_recurrent_delta_rule_decode
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
 
 
@@ -119,6 +120,41 @@ def _gdn_recurrent_fwd_paged_cuda(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
     )[0]
+
+
+def _gdn_recurrent_decode_cuda(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    output: torch.Tensor,
+    scale: float,
+) -> None:
+    """Advance one token per sequence with GDN preprocessing fused into the step."""
+    heads, value_dim, key_dim = state_cache.shape[1:]
+    key_heads = (packed_qkv.shape[1] - heads * value_dim) // (2 * key_dim)
+    launch_recurrent_delta_rule_decode(
+        packed_qkv,
+        # The shared boundary takes token-major gates; drop the vLLM-style unit token dim.
+        raw_gate[0],
+        raw_beta[0],
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        output,
+        gate_kind=GateKind.SCALAR,
+        gate_transform=GateTransform.SOFTPLUS,
+        key_heads=key_heads,
+        lower_bound=0.0,
+        scale=scale,
+        has_initial_state=has_initial_state,
+        op_name="recurrent_gdn_decode",
+    )
 
 
 __all__ = []

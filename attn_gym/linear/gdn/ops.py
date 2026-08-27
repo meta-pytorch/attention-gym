@@ -17,6 +17,12 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale) -> Tensor",
 )
+torch.library.define(
+    "attn_gym::gdn_recurrent_decode",
+    "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
+    " Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, Tensor(b!) out,"
+    " float scale) -> ()",
+)
 
 
 def _recurrent_backend():
@@ -40,6 +46,10 @@ def _recurrent_fwd_paged_cuda(*args):
     return _recurrent_backend()._gdn_recurrent_fwd_paged_cuda(*args)
 
 
+def _recurrent_decode_cuda(*args):
+    return _recurrent_backend()._gdn_recurrent_decode_cuda(*args)
+
+
 torch.library.impl("attn_gym::gdn_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
 torch.library.impl(
     "attn_gym::gdn_recurrent_fwd_no_state",
@@ -50,6 +60,11 @@ torch.library.impl(
     "attn_gym::gdn_recurrent_fwd_paged",
     "CUDA",
     _recurrent_fwd_paged_cuda,
+)
+torch.library.impl(
+    "attn_gym::gdn_recurrent_decode",
+    "CUDA",
+    _recurrent_decode_cuda,
 )
 
 
@@ -107,9 +122,26 @@ def _recurrent_fwd_paged_fake(
     return torch.empty_like(v, dtype=q.dtype)
 
 
+@torch.library.register_fake("attn_gym::gdn_recurrent_decode")
+def _recurrent_decode_fake(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    out: torch.Tensor,
+    scale: float,
+) -> None:
+    """The decode op returns nothing and mutates preallocated buffers; no metadata to fake."""
+
+
 recurrent_fwd_op = torch.ops.attn_gym.gdn_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.gdn_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.gdn_recurrent_fwd_paged.default
+recurrent_decode_op = torch.ops.attn_gym.gdn_recurrent_decode.default
 
 
 def recurrent_forward(
@@ -165,7 +197,45 @@ def recurrent_forward(
     return recurrent_fwd_no_state_op(*args), None
 
 
+def recurrent_decode_forward(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    out: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Invoke the lazily loaded fused decode implementation."""
+    if not packed_qkv.is_cuda:
+        raise ValueError("recurrent_gdn_decode requires CUDA tensors")
+    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
+        raise RuntimeError(
+            "recurrent_gdn_decode is inference-only and has no backward; "
+            "call under torch.no_grad() / torch.inference_mode()"
+        )
+    recurrent_decode_op(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        out,
+        scale,
+    )
+    return out
+
+
 __all__ = [
+    "recurrent_decode_forward",
+    "recurrent_decode_op",
     "recurrent_forward",
     "recurrent_fwd_no_state_op",
     "recurrent_fwd_op",
