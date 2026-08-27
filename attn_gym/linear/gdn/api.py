@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from functools import partial
-from typing import NamedTuple
-
 import torch
 
 from attn_gym.linear.gdn.impl.reference import (
@@ -16,124 +13,109 @@ from attn_gym.linear.gdn.validation import validate_gdn_inputs
 from attn_gym.linear.types import Impl, resolve_impl
 
 
-class GatedDeltaRuleOutput(NamedTuple):
-    """Output and optional recurrent state from a gated delta rule operation."""
-
-    output: torch.Tensor
-    final_state: torch.Tensor | None = None
-
-
 def chunk_gdn(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
     *,
     scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    return_final_state: bool = False,
-    chunk_size: int = 64,
+    output_final_state: bool = False,
     impl: Impl | str = Impl.REFERENCE,
-) -> GatedDeltaRuleOutput:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply chunk-parallel gated delta rule attention for training and prefill.
 
-    Inputs use the SDPA layout ``[batch, heads, sequence, dimension]``. The scalar natural-log gate
-    decays the previous state before each beta-scaled delta update, and the query reads the updated
-    state. Chunking changes only the decomposition and floating-point order of that recurrence.
-    FP16 and BF16 inputs use FP32 recurrence math and state.
+    Inputs use the token-major layout ``[batch, sequence, heads, dimension]``. The scalar
+    natural-log gate decays the previous state before each beta-scaled delta update, and the query
+    reads the updated state. Chunking changes only the decomposition and floating-point order of
+    that recurrence. FP16 and BF16 inputs use FP32 recurrence math and state.
 
     Args:
-        query: Query tensor with shape ``[B, H, T, K]``.
-        key: Key tensor with shape ``[B, H, T, K]`` and the same dtype as ``query``.
-        value: Value tensor with shape ``[B, H, T, V]`` and the same dtype as ``query``.
-        gate: Floating per-token scalar natural-log decay with shape ``[B, H, T]``.
-        beta: Floating per-token write gate with shape ``[B, H, T]``.
+        q: Queries shaped ``[B, T, H, K]``.
+        k: Keys shaped like ``q`` and using the same dtype.
+        v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
+        gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
+        beta: Floating per-token write gate shaped ``[B, T, H]``.
+        initial_state: Initial recurrent state shaped ``[B, H, K, V]`` in the recurrence compute
+            dtype (FP32 for FP16/BF16 QKV).
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        initial_state: Initial recurrent state with shape ``[B, H, K, V]`` and the recurrence
-            compute dtype (FP32 for FP16/BF16 QKV).
-        return_final_state: Include the final recurrent state in the result.
-        chunk_size: Number of tokens per chunk.
+        output_final_state: Return the final recurrent state with the output.
         impl: ``"reference"`` uses eager PyTorch. ``"fused"`` is reserved for the optimized
             backend and currently raises ``NotImplementedError``.
 
     Returns:
-        The attention output in ``query.dtype`` and, when requested, the final recurrent state in
-        the recurrence compute dtype.
+        The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    validate_gdn_inputs(query, key, value, gate, beta, initial_state)
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be greater than zero, got {chunk_size}")
+    validate_gdn_inputs(q, k, v, gate, beta, initial_state)
     if selected_impl is Impl.FUSED:
         raise NotImplementedError("chunk_gdn impl='fused' is not implemented yet")
 
-    output, final_state = reference_gdn(
-        partial(chunk_forward, chunk_size=chunk_size),
-        query,
-        key,
-        value,
+    return reference_gdn(
+        chunk_forward,
+        q,
+        k,
+        v,
         gate,
         beta,
         scale=scale,
         initial_state=initial_state,
-        return_final_state=return_final_state,
+        output_final_state=output_final_state,
     )
-    return GatedDeltaRuleOutput(output=output, final_state=final_state)
 
 
 def recurrent_gdn(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
     *,
     scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    return_final_state: bool = False,
+    output_final_state: bool = False,
     impl: Impl | str = Impl.REFERENCE,
-) -> GatedDeltaRuleOutput:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 
     The recurrence consumes tokens in order, carrying an explicit ``[B, H, K, V]`` state. Inputs
-    and outputs use the SDPA layout ``[batch, heads, sequence, dimension]``. FP16 and BF16 inputs use
-    FP32 recurrence math and state.
+    and outputs use the token-major layout ``[batch, sequence, heads, dimension]``. FP16 and BF16
+    inputs use FP32 recurrence math and state.
 
     Args:
-        query: Query tensor with shape ``[B, H, T, K]``.
-        key: Key tensor with shape ``[B, H, T, K]`` and the same dtype as ``query``.
-        value: Value tensor with shape ``[B, H, T, V]`` and the same dtype as ``query``.
-        gate: Floating per-token scalar natural-log decay with shape ``[B, H, T]``.
-        beta: Floating per-token write gate with shape ``[B, H, T]``.
+        q: Queries shaped ``[B, T, H, K]``.
+        k: Keys shaped like ``q`` and using the same dtype.
+        v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
+        gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
+        beta: Floating per-token write gate shaped ``[B, T, H]``.
+        initial_state: Initial recurrent state shaped ``[B, H, K, V]`` in the recurrence compute
+            dtype (FP32 for FP16/BF16 QKV).
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        initial_state: Initial recurrent state with shape ``[B, H, K, V]`` and the recurrence
-            compute dtype (FP32 for FP16/BF16 QKV).
-        return_final_state: Include the final recurrent state in the result.
+        output_final_state: Return the final recurrent state with the output.
         impl: ``"reference"`` uses eager PyTorch. ``"fused"`` is reserved for the optimized
             backend and currently raises ``NotImplementedError``.
 
     Returns:
-        The attention output in ``query.dtype`` and, when requested, the final recurrent state in
-        the recurrence compute dtype.
+        The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    validate_gdn_inputs(query, key, value, gate, beta, initial_state)
+    validate_gdn_inputs(q, k, v, gate, beta, initial_state)
     if selected_impl is Impl.FUSED:
         raise NotImplementedError("recurrent_gdn impl='fused' is not implemented yet")
 
-    output, final_state = reference_gdn(
+    return reference_gdn(
         recurrent_forward,
-        query,
-        key,
-        value,
+        q,
+        k,
+        v,
         gate,
         beta,
         scale=scale,
         initial_state=initial_state,
-        return_final_state=return_final_state,
+        output_final_state=output_final_state,
     )
-    return GatedDeltaRuleOutput(output=output, final_state=final_state)
 
 
-__all__ = ["GatedDeltaRuleOutput", "chunk_gdn", "recurrent_gdn"]
+__all__ = ["chunk_gdn", "recurrent_gdn"]
