@@ -34,19 +34,11 @@ from attn_gym._backends.cute import (
     tune,
 )
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym._backends.cute.ragged import load_ragged_token_count
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda import ops as kda_ops
-from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
-from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
+from attn_gym.linear.short_conv import ops as short_conv_ops
+from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.utils import ceildiv
-
-_forward_op = kda_ops.short_conv_forward_op
-_backward_op = kda_ops.short_conv_backward_op
-_decode_op = kda_ops.short_conv_decode_op
-_configured_forward_op = kda_ops.short_conv_configured_forward_op
-_configured_backward_op = kda_ops.short_conv_configured_backward_op
-_configured_backward_with_state_grad_op = kda_ops.short_conv_configured_backward_with_state_grad_op
-_configured_decode_op = kda_ops.short_conv_configured_decode_op
 
 
 @dataclass(frozen=True)
@@ -3568,7 +3560,7 @@ class _ShortConv(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         activation: str | None,
     ) -> torch.Tensor:
-        output = kda_ops.short_conv_forward_op(
+        output = short_conv_ops.short_conv_forward_op(
             x, weight, cu_seqlens, initial_state, activation=activation
         )
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
@@ -3581,7 +3573,7 @@ class _ShortConv(torch.autograd.Function):
         x, weight, cu_seqlens, initial_state = ctx.saved_tensors
         activation = ctx.activation
         if initial_state is None:
-            grad_x, grad_weight = kda_ops.short_conv_backward_op(
+            grad_x, grad_weight = short_conv_ops.short_conv_backward_op(
                 x, weight, grad_output, cu_seqlens, activation=activation
             )
             grad_initial_state = None
@@ -3603,7 +3595,7 @@ class _ShortConv(torch.autograd.Function):
             )
             if ctx.needs_input_grad[3]:
                 grad_x, grad_weight, grad_initial_state = (
-                    kda_ops.short_conv_configured_backward_with_state_grad_op(
+                    short_conv_ops.short_conv_configured_backward_with_state_grad_op(
                         x,
                         weight,
                         grad_output,
@@ -3614,7 +3606,7 @@ class _ShortConv(torch.autograd.Function):
                     )
                 )
             else:
-                grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
+                grad_x, grad_weight = short_conv_ops.short_conv_configured_backward_op(
                     x,
                     weight,
                     grad_output,
@@ -3647,7 +3639,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         weight_times: int,
         persistent_tma_input_gradient: bool,
     ) -> torch.Tensor:
-        output = kda_ops.short_conv_configured_forward_op(
+        output = short_conv_ops.short_conv_configured_forward_op(
             x,
             weight,
             cu_seqlens,
@@ -3685,7 +3677,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         configs = ctx.backward_config
         if initial_state is not None and ctx.needs_input_grad[3]:
             grad_x, grad_weight, grad_initial_state = (
-                kda_ops.short_conv_configured_backward_with_state_grad_op(
+                short_conv_ops.short_conv_configured_backward_with_state_grad_op(
                     x,
                     weight,
                     grad_output,
@@ -3696,7 +3688,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
                 )
             )
         else:
-            grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
+            grad_x, grad_weight = short_conv_ops.short_conv_configured_backward_op(
                 x,
                 weight,
                 grad_output,
@@ -3969,8 +3961,10 @@ def causal_conv1d_decode(
     config = _compatible_config(default, x.shape[1]) if forward_config is None else forward_config
     _validate_config(config, x.shape[1], "forward_config")
     if forward_config is None and config == default:
-        return kda_ops.short_conv_decode_op(x, weight, state, state_indices, activation=activation)
-    return kda_ops.short_conv_configured_decode_op(
+        return short_conv_ops.short_conv_decode_op(
+            x, weight, state, state_indices, activation=activation
+        )
+    return short_conv_ops.short_conv_configured_decode_op(
         x,
         weight,
         state,

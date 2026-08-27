@@ -10,6 +10,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym._backends.cute.ragged import load_ragged_token_count
 
 
 @cute.jit
@@ -17,12 +18,6 @@ def load_ragged_chunk_count(chunk_offsets: cute.Tensor):
     """Load the terminal prefix-sum entry containing the active chunk count."""
     num_sequences = Int32(cute.size(chunk_offsets)) - 1
     return Int32(chunk_offsets[num_sequences])
-
-
-@cute.jit
-def load_ragged_token_count(cu_seqlens: cute.Tensor):
-    """Load the terminal packed offset containing the runtime active token count."""
-    return Int32(cu_seqlens[cute.size(cu_seqlens) - 1])
 
 
 @cute.jit
@@ -223,5 +218,4 @@ __all__ = [
     "load_ragged_chunk_count",
     "load_ragged_chunk_work",
     "load_ragged_sequence_extent",
-    "load_ragged_token_count",
 ]

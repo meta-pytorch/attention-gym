@@ -19,16 +19,17 @@ from attn_gym.linear.kda import (
     recurrent_kda,
     recurrent_kda_decode,
 )
+from attn_gym.linear.short_conv import ops as _short_conv_ops
 from attn_gym.linear.types import Impl
 
 # Note: Lazy Imports
 # Backend-backed names load on first use, keeping reference imports torch-only.
 # Missing backends raise an actionable ImportError.
 if TYPE_CHECKING:
-    from attn_gym.linear.kda import (
+    from attn_gym.linear.kda import l2norm
+    from attn_gym.linear.short_conv import (
         causal_conv1d,
         causal_conv1d_decode,
-        l2norm,
         register_activation,
     )
 
@@ -44,7 +45,7 @@ GDN_OPS = [
     "recurrent_gdn",
 ]
 
-# Model-agnostic building blocks; they currently ship from the KDA module.
+# Model-agnostic building blocks.
 GENERIC_OPS = [
     "Impl",
     "active_token_mask",
@@ -58,10 +59,14 @@ GENERIC_OPS = [
 
 __all__ = GDN_OPS + GENERIC_OPS + KDA_OPS  # noqa: PLE0605 -- built from the op groups above
 
+_SHORT_CONV_EXPORTS = {"causal_conv1d", "causal_conv1d_decode", "register_activation"}
+
 
 def __getattr__(name: str):
-    # Names in __all__ that are not bound eagerly above resolve through
-    # attn_gym.linear.kda; see the lazy-imports note.
+    # Names in __all__ that are not bound eagerly above resolve through their
+    # owning module; see the lazy-imports note.
+    if name in _SHORT_CONV_EXPORTS:
+        return getattr(importlib.import_module("attn_gym.linear.short_conv"), name)
     if name in __all__:
         return getattr(importlib.import_module("attn_gym.linear.kda"), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

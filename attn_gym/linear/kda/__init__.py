@@ -29,26 +29,22 @@ from attn_gym.linear.kda.masking import (
 )
 
 # Note: Lazy Imports (see attn_gym/linear/__init__.py)
-_BACKEND_EXPORTS = {
-    "causal_conv1d": "attn_gym.linear.kda.short_conv",
-    "causal_conv1d_decode": "attn_gym.linear.kda.short_conv",
-    "l2norm": "attn_gym.linear.kda.fwd.triton.l2norm_fwd",
-    "register_activation": "attn_gym.linear.kda.short_conv",
-}
+_BACKEND_EXPORTS = {"l2norm": "attn_gym.linear.kda.fwd.triton.l2norm_fwd"}
+# Backward compat: these moved to attn_gym.linear.short_conv, which owns their
+# lazy resolution and error message; import them from attn_gym.linear instead.
+_SHORT_CONV_BC = {"causal_conv1d", "causal_conv1d_decode", "register_activation"}
 
 
 def __getattr__(name: str):
+    if name in _SHORT_CONV_BC:
+        return getattr(importlib.import_module("attn_gym.linear.short_conv"), name)
     module_name = _BACKEND_EXPORTS.get(name)
     if module_name is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     try:
         module = importlib.import_module(module_name)
     except ImportError as error:
-        if name in {"causal_conv1d", "causal_conv1d_decode", "register_activation"}:
-            message = f"{name} requires the optional CuTeDSL backend: pip install attn-gym[linear]"
-        else:
-            message = f"{name} requires CUDA with Triton support"
-        raise ImportError(message) from error
+        raise ImportError(f"{name} requires CUDA with Triton support") from error
     return getattr(module, name)
 
 
@@ -64,5 +60,6 @@ __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
         "recurrent_kda",
         "recurrent_kda_decode",
         *_BACKEND_EXPORTS,
+        *_SHORT_CONV_BC,
     ]
 )
