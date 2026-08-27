@@ -12,6 +12,7 @@ def validate_gdn_inputs(
     gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> None:
     """Validate backend-independent gated delta rule tensor invariants."""
     if q.ndim != 4:
@@ -30,8 +31,21 @@ def validate_gdn_inputs(
     if beta.shape != (batch, tokens, heads):
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
 
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed cu_seqlens require q to have batch size one")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
+        if (
+            cu_seqlens.dtype != torch.int32
+            or not cu_seqlens.is_contiguous()
+            or cu_seqlens.device != q.device
+        ):
+            raise ValueError("cu_seqlens must be contiguous int32 on q.device")
+
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     if initial_state is not None:
-        expected_state_shape = (batch, heads, key_dim, v.shape[-1])
+        expected_state_shape = (state_batch, heads, key_dim, v.shape[-1])
         if initial_state.shape != expected_state_shape:
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, got {initial_state.shape}"

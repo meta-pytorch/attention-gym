@@ -18,7 +18,8 @@ output = scale * query @ state
 
 `chunk_gdn` uses a chunk-parallel decomposition for training and prefill. `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
-chooses the execution form explicitly; `impl="reference"` selects the eager PyTorch implementation.
+chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
+`recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -36,18 +37,23 @@ output, final_state = chunk_gdn(
 
 ### Supported capabilities
 
-- Fixed-length inputs in `[batch, sequence, heads, dimension]` layout.
+- Fixed-length inputs in `[batch, sequence, heads, dimension]` layout and packed batch-one inputs
+  with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- Autograd for inputs and initial state.
+- An inference-only fused recurrent implementation on CUDA.
+- Autograd for reference inputs and initial state.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.
 - Gate and beta may use independent floating dtypes and are converted to the recurrence compute
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
-Packed variable-length inputs and fused implementations are not implemented yet. Explicit
-`impl="fused"` calls fail rather than falling back to the reference.
+The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
+`K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
+capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. The fused
+chunk implementation is not implemented yet; unsupported implementation choices fail rather than
+falling back to the reference.
 
 ### Migration from the prototype API
 
