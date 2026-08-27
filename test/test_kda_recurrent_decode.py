@@ -160,6 +160,65 @@ def test_recurrent_decode_matches_reference(
     torch.testing.assert_close(state_cache, expected_cache, rtol=tolerance, atol=tolerance)
 
 
+def test_decode_launcher_grouped_vector_gate_matches_expanded():
+    """Grouped vector-gate decode shares only q/k; the gate stays per value head.
+
+    The public KDA decode pins equal head counts, so this pins the shared launcher's
+    multi-value attention addressing directly against explicit q/k expansion.
+    """
+    from attn_gym.linear._delta_rule.decode import (
+        GateTransform,
+        launch_recurrent_delta_rule_decode,
+    )
+    from attn_gym.linear._delta_rule.recurrent import GateKind
+
+    torch.manual_seed(0)
+    batch, key_heads, heads, dim = 3, 2, 6, 32
+    groups = heads // key_heads
+    q = torch.randn(batch, key_heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    # Independent per-value-head decays: grouping must not collapse state capacity.
+    raw_gate = torch.randn(1, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    raw_beta = torch.randn(1, batch, heads, device="cuda", dtype=torch.bfloat16)
+    A_log = 0.1 * torch.randn(heads, device="cuda")
+    dt_bias = 0.1 * torch.randn(heads, dim, device="cuda")
+    state_indices = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
+
+    def run(query: torch.Tensor, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        packed = torch.cat((query.flatten(1), key.flatten(1), v.flatten(1)), dim=1)
+        pool = torch.randn(4, heads, dim, dim, device="cuda", dtype=torch.float32)
+        torch.manual_seed(7)
+        pool.normal_()
+        output = packed.new_empty(batch, heads, dim)
+        launch_recurrent_delta_rule_decode(
+            packed,
+            raw_gate[0],
+            raw_beta[0],
+            A_log,
+            dt_bias,
+            pool,
+            state_indices,
+            output,
+            gate_kind=GateKind.VECTOR,
+            gate_transform=GateTransform.SOFTPLUS,
+            key_heads=query.shape[1],
+            lower_bound=0.0,
+            scale=dim**-0.5,
+            has_initial_state=None,
+            op_name="test",
+        )
+        return output, pool
+
+    grouped_output, grouped_pool = run(q, k)
+    expanded_output, expanded_pool = run(
+        q.repeat_interleave(groups, dim=1), k.repeat_interleave(groups, dim=1)
+    )
+
+    torch.testing.assert_close(grouped_output, expanded_output, rtol=0, atol=0)
+    torch.testing.assert_close(grouped_pool, expanded_pool, rtol=0, atol=0)
+
+
 def test_recurrent_decode_fresh_slots_start_from_zero():
     """has_initial_state=False treats slot contents as garbage and overwrites them."""
     inputs = _decode_inputs()
