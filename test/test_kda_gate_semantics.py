@@ -107,6 +107,7 @@ def test_bound_gate_fused_backward_matches_pytorch(
 
 def test_bound_gate_fused_backward_fullgraph_dynamic_tokens():
     """Reuse one fullgraph callable across batch and partial-token shapes."""
+    torch.compiler.reset()
     torch.manual_seed(29)
     with torch._dynamo.config.patch(error_on_recompile=True):
         compiled = torch.compile(
