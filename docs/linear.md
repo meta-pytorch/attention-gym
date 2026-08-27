@@ -68,9 +68,16 @@ falling back to the reference.
 - `initial_state` may be positional, and `output_final_state` controls the optional state output.
 - Both operations return `(output, final_state)`, matching the KDA operations.
 
+`recurrent_gdn_decode` is the serving-specific one-token path: it consumes `[B, H*, D]`
+tensors without a token dimension, advances the paged FP32 state pool in place through
+`state_indices`, supports grouped q/k heads, and fuses the per-token query/key L2
+normalization into the scan so no separate elementwise kernels run per decode step.
+
 ::: attn_gym.linear.chunk_gdn
 
 ::: attn_gym.linear.recurrent_gdn
+
+::: attn_gym.linear.recurrent_gdn_decode
 
 ## Kimi Delta Attention
 

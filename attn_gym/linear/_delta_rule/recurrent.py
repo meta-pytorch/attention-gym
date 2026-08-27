@@ -80,12 +80,17 @@ def _recurrent_delta_rule_fwd_kernel(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
+    QK_L2NORM: tl.constexpr,
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers.
 
     Programs are indexed by value head. With grouped heads (``HK < H``) each block of
     ``H // HK`` consecutive value heads reads one shared q/k (and vector-gate) head; KDA
     passes ``HK == H``, which reduces every ``row_k`` to the ungrouped ``row``.
+
+    ``QK_L2NORM`` rescales each loaded q/k slice to unit L2 norm in registers, computed as
+    ``x / sqrt(sum(x^2) + 1e-6)``; the epsilon keeps near-zero heads finite, and masked
+    tail lanes load zero so they drop out of the sum.
     """
     pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
@@ -140,8 +145,11 @@ def _recurrent_delta_rule_fwd_kernel(
         row = t * H + i_h
         row_k = t * HK + i_hk
         b_q = tl.load(q + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
-        b_q *= scale
         b_k = tl.load(k + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
+        if QK_L2NORM:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q *= scale
         if SCALAR_GATE:
             b_g = tl.load(gate + row).to(tl.float32)
         else:
@@ -185,6 +193,7 @@ recurrent_delta_rule_fwd_kernel = triton.autotune(
         "STORE_FINAL_STATE",
         "IS_VARLEN",
         "SCALAR_GATE",
+        "QK_L2NORM",
     ],
     prune_configs_by={"early_config_prune": _prune_recurrent_configs},
     **autotune_cache_kwargs,
@@ -205,6 +214,7 @@ def launch_recurrent_delta_rule_fwd(
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    qk_l2norm: bool = False,
     autotune: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
@@ -235,6 +245,8 @@ def launch_recurrent_delta_rule_fwd(
             contents: the scan starts from zero and overwrites the slot, including for empty
             sequences, so the slot is initialized before a later decode reads it. Without
             this mask every selected slot is treated as real history.
+        qk_l2norm: L2-normalize each ``[K]`` query and key slice in registers before the
+            scan step; see the kernel docstring for the exact formula.
         autotune: Benchmark tile configurations when true; paged launches always use fixed
             heuristics because rerunning candidates would advance the pool repeatedly.
 
@@ -325,6 +337,7 @@ def launch_recurrent_delta_rule_fwd(
         USE_STATE_INDICES=state_indices is not None,
         USE_HAS_INITIAL_STATE=has_initial_state is not None,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
+        QK_L2NORM=qk_l2norm,
         **launch_options,
     )
     return output, final_state

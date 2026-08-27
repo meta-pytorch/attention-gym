@@ -15,7 +15,8 @@ torch.library.define("attn_gym::gdn_recurrent_fwd_no_state", _RECURRENT_ARGS + "
 torch.library.define(
     "attn_gym::gdn_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
-    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale) -> Tensor",
+    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
+    "bool qk_l2norm) -> Tensor",
 )
 
 
@@ -102,8 +103,9 @@ def _recurrent_fwd_paged_fake(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    qk_l2norm: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
+    del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale, qk_l2norm
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -126,18 +128,20 @@ def recurrent_forward(
     state_indices: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     autotune: bool,
+    qk_l2norm: bool = False,
+    op_name: str = "recurrent_gdn(impl='fused')",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize inputs and invoke the fused recurrent GDN operator."""
     if q.shape[-1] > 256:
-        raise ValueError(f"recurrent_gdn requires K in [1, 256], got {q.shape[-1]}")
+        raise ValueError(f"{op_name} requires K in [1, 256], got {q.shape[-1]}")
     if not q.is_cuda:
-        raise ValueError("recurrent_gdn(impl='fused') requires CUDA tensors")
+        raise ValueError(f"{op_name} requires CUDA tensors")
     if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("recurrent_gdn(impl='fused') requires float16, bfloat16, or float32 QKV")
+        raise TypeError(f"{op_name} requires float16, bfloat16, or float32 QKV")
     tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         raise RuntimeError(
-            "recurrent_gdn(impl='fused') is inference-only and has no backward; "
+            f"{op_name} is inference-only and has no backward; "
             "call under torch.no_grad() or torch.inference_mode()"
         )
 
@@ -156,7 +160,9 @@ def recurrent_forward(
             has_initial_state,
             cu_seqlens,
             scale,
+            qk_l2norm,
         ), None
+    assert not qk_l2norm, "qk_l2norm is only plumbed through the paged operator"
     if initial_state is not None:
         initial_state = initial_state.contiguous()
     args = (q, k, v, gate, beta, initial_state, cu_seqlens, scale, autotune)

@@ -288,6 +288,7 @@ def test_fused_recurrent_paged_registration():
             has_initial_state,
             None,
             q.shape[-1] ** -0.5,
+            False,
         ),
     )
 

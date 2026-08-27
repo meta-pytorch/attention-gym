@@ -176,4 +176,75 @@ def recurrent_gdn(
     )
 
 
-__all__ = ["chunk_gdn", "recurrent_gdn"]
+def recurrent_gdn_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    has_initial_state: torch.Tensor | None = None,
+    scale: float | None = None,
+    qk_l2norm: bool = True,
+) -> torch.Tensor:
+    """Run one-token paged GDN decode with QK normalization fused into the recurrence.
+
+    The decode counterpart to :func:`recurrent_gdn`: one token per sequence, the paged
+    state pool advanced in place, and the per-token query/key L2 normalization computed
+    in registers so serving callers launch no separate elementwise kernels.
+
+    Args:
+        q: Queries shaped ``[B, HK, K]``, one token per sequence. ``HK`` may divide the
+            value head count for grouped-head attention.
+        k: Keys shaped like ``q`` and using the same dtype.
+        v: Values shaped ``[B, H, V]``.
+        gate: Finite, nonpositive per-token natural-log decay shaped ``[B, H]``.
+        beta: Per-token write gate shaped ``[B, H]``.
+        state_cache: Mutable FP32 state pool shaped ``[num_slots, H, V, K]``, advanced in
+            place. Slots may have padding between them but each ``[H, V, K]`` row must be
+            dense.
+        state_indices: Contiguous int32 slot indices shaped ``[B]``. Positive indices must
+            be unique and in bounds; non-positive indices are padding that produce zero
+            output and leave the pool untouched.
+        has_initial_state: Optional contiguous boolean mask, one per sequence. False
+            entries mark freshly assigned slots whose contents are garbage: they start
+            from zero and overwrite the slot.
+        scale: Query scale. Defaults to ``1 / sqrt(K)``.
+        qk_l2norm: L2-normalize each query and key head in-kernel, computed as
+            ``x / sqrt(sum(x^2) + 1e-6)``. Disable when the caller has already normalized.
+
+    Returns:
+        Decode output shaped ``[B, H, V]`` in ``q.dtype``. ``state_cache`` is advanced in
+        place.
+    """
+    if q.ndim != 3:
+        raise ValueError(f"q must have shape [B, HK, K], got {tuple(q.shape)}")
+    if v.ndim != 3:
+        raise ValueError(f"v must have shape [B, H, V], got {tuple(v.shape)}")
+    token_q, token_k, token_v = (tensor.unsqueeze(1) for tensor in (q, k, v))
+    token_gate, token_beta = (tensor.unsqueeze(1) for tensor in (gate, beta))
+    validate_gdn_inputs(token_q, token_k, token_v, token_gate, token_beta, None)
+    validate_paged_state(token_q, token_v, state_cache, None, state_indices, has_initial_state)
+
+    output, _ = fused_recurrent_forward(
+        token_q,
+        token_k,
+        token_v,
+        token_gate,
+        token_beta,
+        state_cache,
+        cu_seqlens=None,
+        scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        output_final_state=False,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
+        autotune=False,
+        qk_l2norm=qk_l2norm,
+        op_name="recurrent_gdn_decode",
+    )
+    return output.squeeze(1)
+
+
+__all__ = ["chunk_gdn", "recurrent_gdn", "recurrent_gdn_decode"]
