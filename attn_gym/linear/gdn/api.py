@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+from numbers import Real
+
 import torch
 
-from attn_gym.linear._delta_rule.validation import validate_paged_state
+from attn_gym.linear._delta_rule.validation import (
+    resolve_decode_out,
+    validate_decode_inputs,
+    validate_paged_state,
+)
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
+from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
 from attn_gym.linear.types import Impl, resolve_impl
@@ -176,4 +184,113 @@ def recurrent_gdn(
     )
 
 
-__all__ = ["chunk_gdn", "recurrent_gdn"]
+def recurrent_gdn_decode(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    has_initial_state: torch.Tensor | None = None,
+    scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one-token paged GDN decode with preprocessing fused into the recurrence.
+
+    One Triton kernel slices the post-convolution QKV buffer, computes the gate as
+    ``-exp(A_log) * softplus(raw_gate + dt_bias)`` and the write gate as
+    ``sigmoid(raw_beta)``, L2-normalizes q and k, and advances the selected cache
+    slots in place, so serving callers launch no separate elementwise kernels.
+
+    Args:
+        packed_qkv: Post-convolution QKV shaped ``[B, HK*K + HK*K + H*V]``. Each token
+            stores ``[Q for HK heads | K for HK heads | V for H heads]``; within each
+            section head rows are contiguous. ``HK`` may divide ``H`` for grouped-head
+            attention: each block of ``H // HK`` consecutive value heads shares one
+            query/key head.
+        raw_gate: Unactivated per-head gate projection shaped ``[1, B, H]``, matching the
+            vLLM-style single-token decode convention used by ``recurrent_kda_decode``.
+        raw_beta: Unactivated write gate shaped ``[1, B, H]``.
+        A_log: FP32 per-head log decay parameter shaped ``[H]``.
+        dt_bias: FP32 per-head gate bias shaped ``[H]``.
+        state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots may
+            have padding between them but each ``[H, V, K]`` row must be dense. ``K``
+            must be at most 256.
+        state_indices: Contiguous int32 slot indices shaped ``[B]``. Non-positive
+            indices are padding/null entries: they produce zero output and leave the
+            cache untouched. Each positive index must be in ``[1, num_slots)`` and
+            unique among active rows because duplicate in-place updates race. These
+            value constraints are caller responsibilities and are not host-validated.
+        has_initial_state: Optional contiguous boolean mask, one per sequence. False
+            entries mark freshly assigned slots whose contents are garbage: the step
+            starts from the zero state and overwrites the slot.
+        scale: Query scale. Defaults to ``1 / sqrt(K)``.
+        out: Optional caller-owned contiguous output buffer shaped ``[1, B, H, V]`` in
+            ``packed_qkv.dtype`` on the same device. When supplied, the kernel writes
+            into and returns this exact tensor. It must not alias any input.
+
+    Returns:
+        Decode output shaped ``[1, B, H, V]`` in ``packed_qkv.dtype``. This is ``out``
+        itself when a buffer is supplied. The operation is inference-only and advances
+        ``state_cache`` in place.
+    """
+    batch, heads, value_dim, key_dim = validate_decode_inputs(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        op_name="recurrent_gdn_decode",
+    )
+    qk_channels = packed_qkv.shape[1] - heads * value_dim
+    key_heads = qk_channels // (2 * key_dim)
+    if (
+        qk_channels <= 0
+        or key_heads < 1
+        or qk_channels != 2 * key_heads * key_dim
+        or heads % key_heads != 0
+    ):
+        raise ValueError(
+            f"packed_qkv must have shape [B, 2*HK*{key_dim} + {heads}*{value_dim}] with HK a "
+            f"positive divisor of {heads} value heads, got {tuple(packed_qkv.shape)}"
+        )
+    for name, tensor in (("raw_gate", raw_gate), ("raw_beta", raw_beta)):
+        if tensor.shape != (1, batch, heads) or tensor.stride(2) != 1:
+            raise ValueError(f"{name} must have shape {(1, batch, heads)} with contiguous heads")
+    if dt_bias.shape != (heads,) or dt_bias.dtype != torch.float32 or not dt_bias.is_contiguous():
+        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads},)")
+
+    if scale is None:
+        scale = key_dim**-0.5
+    elif not isinstance(scale, Real) or isinstance(scale, bool):
+        raise TypeError("scale must be a real scalar or None")
+    else:
+        scale = float(scale)
+        if (
+            scale != scale  # noqa: PLR0124 - compile-safe NaN check
+            or scale <= 0
+            or scale > sys.float_info.max
+        ):
+            raise ValueError(f"scale must be finite and positive, got {scale}")
+
+    out = resolve_decode_out(packed_qkv, out, (1, batch, heads, value_dim))
+    return recurrent_decode_forward(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        out,
+        scale,
+    )
+
+
+__all__ = ["chunk_gdn", "recurrent_gdn", "recurrent_gdn_decode"]
