@@ -17,26 +17,11 @@ pytest.importorskip("triton")
 from attn_gym.linear import recurrent_kda_decode
 from attn_gym.linear.kda.naive import naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_op
+from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_kda_decode requires CUDA"
 )
-
-
-def _strided_state_pool(
-    num_slots: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    prefix, suffix = 11, 17
-    state_elements = heads * key_dim * value_dim
-    storage = torch.randn(
-        num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
-    )
-    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
-    assert not state.is_contiguous()
-    return storage, state
 
 
 def _decode_inputs(
@@ -57,7 +42,7 @@ def _decode_inputs(
     raw_beta = torch.randn(1, batch, heads, device="cuda", dtype=dtype)
     A_log = 0.1 * torch.randn(heads, device="cuda", dtype=torch.float32)
     dt_bias = 0.1 * torch.randn(heads, key_dim, device="cuda", dtype=torch.float32)
-    storage, state_cache = _strided_state_pool(7, heads, key_dim, value_dim)
+    storage, state_cache = strided_state_pool(7, heads, key_dim, value_dim)
     state_indices = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)[:batch]
     return (
         packed_qkv,
@@ -433,7 +418,7 @@ def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
     inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, eager_cache, state_indices = inputs
     lower_bound = 0.0 if gate_transform == "bounded" else float("nan")
-    _, compiled_cache = _strided_state_pool(
+    _, compiled_cache = strided_state_pool(
         eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[3], eager_cache.shape[2]
     )
     compiled_cache.copy_(eager_cache)

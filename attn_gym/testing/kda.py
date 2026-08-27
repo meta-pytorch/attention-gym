@@ -20,6 +20,35 @@ def cumulative_sequence_offsets(
     return torch.tensor(offsets, device=device, dtype=torch.int32)
 
 
+def strided_state_pool(
+    num_slots: int,
+    heads: int,
+    key_dim: int,
+    value_dim: int,
+    *,
+    prefix: int = 11,
+    suffix: int = 17,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the slot-strided FP32 recurrent state view produced by vLLM's packed byte pages.
+
+    Returns the flat backing storage plus a non-contiguous ``[num_slots, heads, V, K]`` view
+    whose slots are separated by padding, matching how serving engines carve recurrent state
+    out of larger per-slot pages. Keep the storage alive while the view is in use.
+
+    The default ``prefix`` deliberately misaligns the pool base to stress the Triton paths,
+    which tolerate arbitrary element offsets. CuTe backends declare ``assumed_align=16`` on
+    the pool pointer, so their tests must pass ``prefix=0`` to keep the base 16-byte aligned.
+    """
+    state_elements = heads * key_dim * value_dim
+    storage = torch.randn(
+        num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
+    )
+    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
+    assert not state.is_contiguous()
+    assert state.stride()[1:] == (value_dim * key_dim, key_dim, 1)
+    return storage, state
+
+
 def make_kda_test_inputs(
     tokens: int,
     *,

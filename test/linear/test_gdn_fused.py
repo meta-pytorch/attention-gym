@@ -10,7 +10,7 @@ from attn_gym.linear.gdn.ops import (
     recurrent_fwd_op,
     recurrent_fwd_paged_op,
 )
-from attn_gym.testing import cumulative_sequence_offsets
+from attn_gym.testing import cumulative_sequence_offsets, strided_state_pool
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the fused recurrent scan requires CUDA"
@@ -96,10 +96,7 @@ def test_fused_recurrent_paged_state():
     q, k, v, gate, beta, _state = make_inputs(batch=3, tokens=5)
     slots = torch.tensor([2, 0, 4], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, False], device="cuda")
-    storage = torch.randn(6, q.shape[2] * v.shape[-1] * q.shape[-1] + 17, device="cuda")
-    state_cache = storage[:, : q.shape[2] * v.shape[-1] * q.shape[-1]].view(
-        6, q.shape[2], v.shape[-1], q.shape[-1]
-    )
+    _storage, state_cache = strided_state_pool(6, q.shape[2], q.shape[-1], v.shape[-1])
     original_cache = state_cache.clone()
 
     expected_output = torch.zeros_like(v)
