@@ -160,6 +160,38 @@ def test_recurrent_decode_matches_reference(
     torch.testing.assert_close(state_cache, expected_cache, rtol=tolerance, atol=tolerance)
 
 
+def test_recurrent_decode_fresh_slots_start_from_zero():
+    """has_initial_state=False treats slot contents as garbage and overwrites them."""
+    inputs = _decode_inputs()
+    packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
+    has_initial_state = torch.tensor([True, False, True], device="cuda")
+    zeroed = state_cache.clone()
+    zeroed[state_indices[1].long()] = 0.0
+
+    output = recurrent_kda_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        has_initial_state=has_initial_state,
+    )
+    expected, expected_cache = _reference_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        zeroed,
+        state_indices,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(state_cache, expected_cache, rtol=1e-5, atol=1e-5)
+
+
 def test_recurrent_decode_softplus_matches_negative_tail_reference():
     inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8, dtype=torch.float32)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
@@ -365,6 +397,24 @@ def test_recurrent_decode_rejects_aliasing_out(compiled: bool):
             out=out,
         )
 
+    if compiled:
+        # Inductor rejects dtype-view input mutations before our alias check can run.
+        return
+    fresh_out = packed_qkv.new_empty(1, 2, 2, 8)
+    has_initial_state = fresh_out.view(torch.bool).flatten()[:2]
+    with pytest.raises(ValueError, match="out must not alias"):
+        function(
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            has_initial_state=has_initial_state,
+            out=fresh_out,
+        )
+
 
 def test_recurrent_decode_rejects_state_aliasing_read_only_input():
     batch, heads, key_dim, value_dim, slots = 1, 1, 16, 8, 7
@@ -405,6 +455,7 @@ def test_recurrent_decode_custom_op_registration():
             dt_bias,
             state_cache,
             state_indices,
+            None,
             out,
             -5.0,
             True,
@@ -425,6 +476,8 @@ def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
     output_shape = (1, 1, eager_cache.shape[1], eager_cache.shape[2])
     eager_out = packed_qkv.new_full(output_shape, torch.nan) if use_out else None
     compiled_out = torch.full_like(eager_out, torch.nan) if eager_out is not None else None
+    # Exercises the optional-tensor plumbing and USE_HAS_INITIAL_STATE under compilation.
+    has_initial_state = torch.ones(1, device="cuda", dtype=torch.bool)
 
     expected = recurrent_kda_decode(
         packed_qkv,
@@ -434,6 +487,7 @@ def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
         dt_bias,
         eager_cache,
         state_indices,
+        has_initial_state=has_initial_state,
         gate_transform=gate_transform,
         lower_bound=lower_bound,
         out=eager_out,
@@ -447,6 +501,7 @@ def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
         dt_bias,
         compiled_cache,
         state_indices,
+        has_initial_state=has_initial_state,
         gate_transform=gate_transform,
         lower_bound=lower_bound,
         out=compiled_out,

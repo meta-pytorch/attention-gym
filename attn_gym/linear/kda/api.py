@@ -336,6 +336,7 @@ def recurrent_kda_decode(
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
     *,
+    has_initial_state: torch.Tensor | None = None,
     gate_transform: Literal["bounded", "softplus"] = "bounded",
     lower_bound: float = -5.0,
     scale: float | None = None,
@@ -361,6 +362,9 @@ def recurrent_kda_decode(
             cache untouched. Each positive index must be in ``[1, num_slots)`` and
             unique among active rows because duplicate in-place updates race. These
             value constraints are caller responsibilities and are not host-validated.
+        has_initial_state: Optional contiguous boolean mask, one per sequence. False
+            entries mark freshly assigned slots whose contents are garbage: the step
+            starts from the zero state and overwrites the slot.
         gate_transform: Pointwise gate transform. ``"bounded"`` computes
             ``lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))``;
             ``"softplus"`` computes
@@ -422,6 +426,15 @@ def recurrent_kda_decode(
         or not state_indices.is_contiguous()
     ):
         raise ValueError(f"state_indices must be contiguous int32 with shape ({batch},)")
+    if has_initial_state is not None and (
+        has_initial_state.shape != (batch,)
+        or has_initial_state.dtype != torch.bool
+        or not has_initial_state.is_contiguous()
+        or has_initial_state.device != packed_qkv.device
+    ):
+        raise ValueError(
+            f"has_initial_state must be contiguous bool with shape ({batch},) on packed_qkv.device"
+        )
     if key_dim > 256:
         raise ValueError(f"recurrent_kda_decode requires K in [1, 256], got {key_dim}")
 
@@ -483,6 +496,7 @@ def recurrent_kda_decode(
         dt_bias,
         state_cache,
         state_indices,
+        has_initial_state,
         out,
         lower_bound,
         use_lower_bound,
