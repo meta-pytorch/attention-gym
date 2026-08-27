@@ -22,6 +22,7 @@ from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_paged_op,
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
+from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_kda requires CUDA"
@@ -141,7 +142,7 @@ def test_recurrent_paged_skips_autotune(monkeypatch):
 def test_recurrent_packed_capacity_and_empty_slots():
     """Pass empty-slot state through and ignore rows past the terminal offset."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=3)
-    cu_seqlens = torch.tensor([0, 0, 11, 27, 27], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([0, 11, 16, 0])
     initial_state = torch.randn(4, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
 
     output, final_state = recurrent_kda(
@@ -205,9 +206,7 @@ def test_recurrent_agrees_with_chunked_core():
 def test_recurrent_paged_matches_gather_scatter(packed: bool):
     """Slot indexing equals a native gather, dense scan, and scatter round trip."""
     q, k, v, gate, beta, _ = _inputs(batch=1 if packed else 3, tokens=32, seed=8)
-    cu_seqlens = (
-        torch.tensor([0, 11, 27, 32], device="cuda", dtype=torch.int32) if packed else None
-    )
+    cu_seqlens = cumulative_sequence_offsets([11, 16, 5]) if packed else None
     storage, pool = _strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
     storage_before = storage.clone()
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
@@ -367,7 +366,7 @@ def test_recurrent_validates_public_contract():
             v,
             gate,
             beta,
-            cu_seqlens=torch.tensor([0, 4], device="cuda", dtype=torch.int32),
+            cu_seqlens=cumulative_sequence_offsets([4]),
         )
     with pytest.raises(ValueError, match="num_sequences"):
         recurrent_kda(
@@ -411,7 +410,7 @@ def test_recurrent_custom_op_registration(packed: bool):
     """Exercise the schema and fake implementation for both modes."""
     batch = 1 if packed else 2
     q, k, v, gate, beta, _ = _inputs(batch=batch, tokens=17)
-    cu_seqlens = torch.tensor([0, 2, 7, 17], device="cuda", dtype=torch.int32) if packed else None
+    cu_seqlens = cumulative_sequence_offsets([2, 5, 10]) if packed else None
     num_sequences = 3 if packed else batch
     state = torch.randn(num_sequences, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
     torch.library.opcheck(
@@ -507,7 +506,7 @@ def test_recurrent_paged_mixed_dtype_fullgraph_compile():
 def test_recurrent_cuda_graph_replay():
     """Replay fixed shapes with mutated boundaries, values, and history."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=5)
-    cu_seqlens = torch.tensor([0, 11, 27, 32], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
     initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
     _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, True)
     torch.cuda.synchronize()
@@ -521,9 +520,7 @@ def test_recurrent_cuda_graph_replay():
     active_tokens = 23
     with torch.no_grad():
         initial_state.add_(0.25)
-        cu_seqlens.copy_(
-            torch.tensor([0, 8, active_tokens, active_tokens], device="cuda", dtype=torch.int32)
-        )
+        cu_seqlens.copy_(cumulative_sequence_offsets([8, active_tokens - 8, 0]))
         q[:, active_tokens:].fill_(float("nan"))
         v[:, active_tokens:].fill_(float("nan"))
     graph.replay()
@@ -585,7 +582,7 @@ def test_recurrent_launches_beyond_grid_y_limit():
 def test_recurrent_paged_empty_sequences_initialize_fresh_slots():
     """Empty packed sequences zero freshly assigned slots and preserve resumed ones."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=4, seed=9)
-    cu_seqlens = torch.tensor([0, 0, 4, 4], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([0, 4, 0])
     _, pool = _strided_state_pool(6, q.shape[2], q.shape[3], v.shape[-1])
     original_pool = pool.clone()
     slots = torch.tensor([2, 3, 5], device="cuda", dtype=torch.int32)
@@ -613,7 +610,7 @@ def test_recurrent_paged_empty_sequences_initialize_fresh_slots():
 def test_naive_recurrent_packed_matches_public_contract():
     """The pure reference honors packed semantics: empty slots and capacity tails."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=7)
-    cu_seqlens = torch.tensor([0, 0, 11, 27, 27], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([0, 11, 16, 0])
     initial_state = torch.randn(4, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
 
     output, final_state = naive_recurrent_kda(

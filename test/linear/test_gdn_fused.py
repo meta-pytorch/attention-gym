@@ -10,6 +10,7 @@ from attn_gym.linear.gdn.ops import (
     recurrent_fwd_op,
     recurrent_fwd_paged_op,
 )
+from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the fused recurrent scan requires CUDA"
@@ -59,7 +60,7 @@ def test_fused_recurrent_matches_reference(use_initial_state: bool, output_final
 
 def test_fused_recurrent_matches_packed_reference():
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=8)
-    cu_seqlens = torch.tensor([0, 3, 3, 7], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([3, 0, 4])
     state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
     with torch.no_grad():
         expected = recurrent_gdn(
@@ -142,7 +143,7 @@ def test_fused_recurrent_paged_state():
 
 def test_fused_recurrent_packed_paged_state():
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=8)
-    cu_seqlens = torch.tensor([0, 3, 3, 7], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([3, 0, 4])
     slots = torch.tensor([2, 0, 4], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, False], device="cuda")
     state_cache = torch.randn(6, q.shape[2], v.shape[-1], q.shape[-1], device="cuda")
@@ -195,7 +196,7 @@ def test_fused_recurrent_packed_paged_state():
 def test_fused_recurrent_packed_paged_empty_sequences():
     """Empty packed sequences zero freshly assigned slots and preserve resumed ones."""
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=4)
-    cu_seqlens = torch.tensor([0, 0, 4, 4], device="cuda", dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([0, 4, 0])
     slots = torch.tensor([2, 3, 5], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([False, False, True], device="cuda")
     state_cache = torch.randn(6, q.shape[2], v.shape[-1], q.shape[-1], device="cuda")
