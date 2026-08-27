@@ -342,13 +342,12 @@ def recurrent_kda(
         _validate_paged_state(q, v, initial_state, cu_seqlens, state_indices)
         if selected_impl is not Impl.FUSED:
             raise ValueError("state_indices requires impl='fused'")
-    log2_gate = gate.float() * LOG2_E
     if selected_impl is Impl.FUSED:
         return _fused_recurrent_forward(
             q,
             k,
             v,
-            log2_gate,
+            gate,
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
@@ -361,7 +360,7 @@ def recurrent_kda(
         q,
         k,
         v,
-        log2_gate,
+        gate.float() * LOG2_E,
         beta,
         initial_state,
         cu_seqlens,

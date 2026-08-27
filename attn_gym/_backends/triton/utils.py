@@ -1,10 +1,34 @@
 """Small utilities shared by hand-written Triton kernels."""
 
+import inspect
+import math
 from collections.abc import Sequence
 
 import torch
 import triton
 import triton.language as tl
+
+# Kernels fold natural-log inputs into the faster exp2 with ``exp(x) == exp2(x * LOG2_E)``.
+# Wrapped as a constexpr so ``@triton.jit`` functions can reference it as a module global.
+LOG2_E = tl.constexpr(math.log2(math.e))
+
+SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
+autotune_cache_kwargs = {"cache_results": True} if SUPPORTS_AUTOTUNE_CACHE else {}
+
+
+def configure_triton_allocator() -> None:
+    """Install a scratch allocator when Triton kernels may require one.
+
+    On Blackwell (SM100 datacenter / SM120 consumer) the Triton compiler may emit
+    global_scratch even without TMA descriptors; a default allocator prevents
+    NullAllocator crashes. See triton-lang/triton#10002.
+    """
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (10, 12):
+        triton.set_allocator(
+            lambda size, alignment, stream: torch.empty(
+                size, device=torch.device("cuda", torch.cuda.current_device()), dtype=torch.int8
+            )
+        )
 
 
 @triton.jit

@@ -838,7 +838,9 @@ def recurrent_forward(
             "training or call under torch.no_grad() / torch.inference_mode()"
         )
 
-    q, k, v, gate, beta = (tensor.contiguous() for tensor in (q, k, v, gate, beta))
+    q, k, v, beta = (tensor.contiguous() for tensor in (q, k, v, beta))
+    # FP32 gate loads measured faster than bf16 in the latency-bound scan loop.
+    gate = gate.float().contiguous()
     if state_indices is not None:
         # `.contiguous()` on the pool would copy and silently drop the in-place advance.
         assert initial_state is not None
