@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym.linear import Impl, chunk_gdn, recurrent_gdn
+from attn_gym.testing import cumulative_sequence_offsets
 
 REFERENCE_CASES = [recurrent_gdn, chunk_gdn]
 
@@ -66,7 +67,7 @@ def test_segmented_recurrent_execution_matches_full_sequence():
 def test_packed_matches_independent_sequences(function):
     q, k, v, gate, beta, _state = make_inputs(sequence=8)
     q, k, v, gate, beta = (tensor[:1] for tensor in (q, k, v, gate, beta))
-    cu_seqlens = torch.tensor([0, 3, 3, 7], dtype=torch.int32)
+    cu_seqlens = cumulative_sequence_offsets([3, 0, 4], device="cpu")
     initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1])
 
     output, final_state = function(
