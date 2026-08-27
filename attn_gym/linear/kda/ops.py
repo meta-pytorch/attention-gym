@@ -113,8 +113,8 @@ torch.library.define(
 torch.library.define(
     "attn_gym::kda_recurrent_decode",
     "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
-    " Tensor(a!) state_cache, Tensor state_indices, Tensor(b!) out, float lower_bound,"
-    " bool use_lower_bound, float scale) -> ()",
+    " Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, Tensor(b!) out,"
+    " float lower_bound, bool use_lower_bound, float scale) -> ()",
 )
 torch.library.define(
     "attn_gym::kda_prepare_chunk_offsets",
@@ -642,6 +642,7 @@ def _recurrent_decode_fake(
     dt_bias: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
     out: torch.Tensor,
     lower_bound: float,
     use_lower_bound: bool,
@@ -655,6 +656,7 @@ def _recurrent_decode_fake(
         dt_bias,
         state_cache,
         state_indices,
+        has_initial_state,
         out,
         lower_bound,
         use_lower_bound,
@@ -809,6 +811,7 @@ def recurrent_decode_forward(
     dt_bias: torch.Tensor,
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
     out: torch.Tensor,
     lower_bound: float,
     use_lower_bound: bool,
@@ -831,6 +834,7 @@ def recurrent_decode_forward(
         dt_bias,
         state_cache,
         state_indices,
+        has_initial_state,
         out,
         lower_bound,
         use_lower_bound,
