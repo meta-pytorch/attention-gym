@@ -29,7 +29,7 @@ def _packed_reference(
     final_state = None
     if output_final_state:
         final_state = (
-            q.new_zeros(num_sequences, heads, key_dim, value_dim)
+            q.new_zeros(num_sequences, heads, value_dim, key_dim)
             if initial_state is None
             else initial_state.clone()
         )
@@ -131,16 +131,16 @@ def recurrent_forward(
     batch, sequence, heads, key_dim = q.shape
     q = q * scale
     state = (
-        q.new_zeros(batch, heads, key_dim, v.shape[-1]) if initial_state is None else initial_state
+        q.new_zeros(batch, heads, v.shape[-1], key_dim) if initial_state is None else initial_state
     )
     outputs = []
 
     for token in range(sequence):
         state = state * log_decay[:, token].exp()[..., None, None]
-        residual = v[:, token] - torch.einsum("bhk,bhkv->bhv", k[:, token], state)
+        residual = v[:, token] - torch.einsum("bhvk,bhk->bhv", state, k[:, token])
         residual = residual * beta[:, token, :, None]
-        state = state + torch.einsum("bhk,bhv->bhkv", k[:, token], residual)
-        outputs.append(torch.einsum("bhk,bhkv->bhv", q[:, token], state))
+        state = state + torch.einsum("bhv,bhk->bhvk", residual, k[:, token])
+        outputs.append(torch.einsum("bhvk,bhk->bhv", state, q[:, token]))
 
     return torch.stack(outputs, dim=1), state if output_final_state else None
 
@@ -200,7 +200,9 @@ def chunk_forward(
     decayed_key = transition @ (beta_key * cumulative_decay.exp()[..., None])
 
     state = (
-        q.new_zeros(batch, heads, key_dim, value_dim) if initial_state is None else initial_state
+        q.new_zeros(batch, heads, key_dim, value_dim)
+        if initial_state is None
+        else initial_state.transpose(-1, -2)
     )
     output = torch.zeros_like(v)
     strictly_upper = torch.triu(
@@ -228,7 +230,8 @@ def chunk_forward(
         )
 
     output = output.permute(0, 2, 3, 1, 4).reshape(batch, padded_length, heads, value_dim)
-    return output[:, :sequence], state if output_final_state else None
+    final_state = state.transpose(-1, -2).contiguous() if output_final_state else None
+    return output[:, :sequence], final_state
 
 
 __all__ = ["chunk_forward", "recurrent_forward", "reference_gdn"]

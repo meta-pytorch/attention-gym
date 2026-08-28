@@ -49,7 +49,7 @@ def validate_gdn_inputs(
 
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     if initial_state is not None:
-        expected_state_shape = (state_batch, heads, key_dim, v.shape[-1])
+        expected_state_shape = (state_batch, heads, v.shape[-1], key_dim)
         if initial_state.shape != expected_state_shape:
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, got {initial_state.shape}"

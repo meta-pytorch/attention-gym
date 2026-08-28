@@ -121,11 +121,8 @@ def _run_chunk_delta_h_sequence(
         i_state = i_n.to(tl.int64)
     else:
         i_state = i_n
-    p_state = i_state * state_batch_stride + i_h * K * V
-    if USE_STATE_INDICES:
-        p_state += ptr_offset((o_v[None, :], o_k[:, None]), (K, 1))
-    else:
-        p_state += ptr_offset((o_k[:, None], o_v[None, :]), (V, 1))
+    p_state = i_state * state_batch_stride + i_h * V * K
+    p_state += ptr_offset((o_v[None, :], o_k[:, None]), (K, 1))
 
     b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -527,7 +524,7 @@ def _delta_h_with_state_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = torch.empty(
-        state_batch, k.shape[2], k.shape[3], u.shape[-1], dtype=torch.float32, device=k.device
+        state_batch, k.shape[2], u.shape[-1], k.shape[3], dtype=torch.float32, device=k.device
     )
     h, v_new = _delta_h_launch(
         k,
@@ -630,7 +627,7 @@ def chunk_gated_delta_rule_fwd_h(
     if torch.cuda.get_device_capability(k.device)[0] < 10:
         raise ValueError("the inter-chunk state recurrence requires CUDA capability 10.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    expected_state_shape = (state_batch, heads, key_dim, value_dim)
+    expected_state_shape = (state_batch, heads, value_dim, key_dim)
     if state_indices is not None:
         if initial_state is None:
             raise ValueError("state_indices requires initial_state as the paged state pool")
@@ -672,7 +669,8 @@ def chunk_gated_delta_rule_fwd_h(
                 f"initial_state must have shape {expected_state_shape}, "
                 f"got {tuple(initial_state.shape)}"
             )
-        initial_state = initial_state.contiguous()
+        if initial_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+            raise TypeError("initial_state must be contiguous within each [H, V, K] row")
 
     if tokens == 0:
         # Zero-size tensors cannot back descriptors; the recurrence is empty

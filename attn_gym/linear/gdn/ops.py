@@ -82,9 +82,9 @@ def _recurrent_fwd_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, gate, beta, initial_state, scale, autotune
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    # The state carries one [K, V] slab per value head; grouped callers have v.shape[2] > HK.
+    # The state carries one [V, K] slab per value head; grouped callers have v.shape[2] > HK.
     final_state = q.new_empty(
-        num_sequences, v.shape[2], q.shape[3], v.shape[-1], dtype=torch.float32
+        num_sequences, v.shape[2], v.shape[-1], q.shape[3], dtype=torch.float32
     )
     return torch.empty_like(v, dtype=q.dtype), final_state
 

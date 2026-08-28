@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym.linear import Impl, chunk_gdn, recurrent_gdn
+from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.testing import cumulative_sequence_offsets
 
 REFERENCE_CASES = [recurrent_gdn, chunk_gdn]
@@ -17,7 +18,7 @@ def make_inputs(sequence: int) -> tuple[torch.Tensor, ...]:
     value = torch.randn(batch, sequence, heads, value_dimension)
     gate = F.logsigmoid(torch.randn(batch, sequence, heads))
     beta = torch.sigmoid(torch.randn(batch, sequence, heads))
-    initial_state = torch.randn(batch, heads, key_dimension, value_dimension)
+    initial_state = torch.randn(batch, heads, value_dimension, key_dimension)
     return query, key, value, gate, beta, initial_state
 
 
@@ -44,6 +45,14 @@ def test_chunk_matches_recurrent(sequence, use_initial_state):
 
     torch.testing.assert_close(chunked_output, recurrent_output, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(chunked_state, recurrent_state, atol=1e-6, rtol=1e-5)
+    assert chunked_state.is_contiguous()
+    validate_paged_state(
+        inputs[0],
+        inputs[2],
+        chunked_state,
+        None,
+        torch.arange(inputs[0].shape[0], dtype=torch.int32),
+    )
 
 
 def test_segmented_recurrent_execution_matches_full_sequence():
@@ -68,7 +77,7 @@ def test_packed_matches_independent_sequences(function):
     q, k, v, gate, beta, _state = make_inputs(sequence=8)
     q, k, v, gate, beta = (tensor[:1] for tensor in (q, k, v, gate, beta))
     cu_seqlens = cumulative_sequence_offsets([3, 0, 4], device="cpu")
-    initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1])
+    initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3])
 
     output, final_state = function(
         q,

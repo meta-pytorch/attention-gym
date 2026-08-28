@@ -78,7 +78,7 @@ def reference_decode(
     for row, slot in enumerate(slots.tolist()):
         if slot <= 0:
             continue
-        state = pool[slot].transpose(-1, -2).unsqueeze(0).clone()
+        state = pool[slot].unsqueeze(0).clone()
         row_output, final_state = recurrent_gdn(
             q[row : row + 1, None],
             k[row : row + 1, None],
@@ -91,7 +91,7 @@ def reference_decode(
             impl="reference",
         )
         output[row] = row_output[0, 0]
-        pool[slot] = final_state[0].transpose(-1, -2)
+        pool[slot] = final_state[0]
     return output, pool
 
 

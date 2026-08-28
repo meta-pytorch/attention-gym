@@ -50,7 +50,7 @@ def _inputs(
     # Realistic bounded natural-log decays keep the recurrence stable over the scan.
     gate = -torch.rand(batch, tokens, heads, key_dim, device="cuda") * 3.0
     beta = torch.rand(batch, tokens, heads, device="cuda")
-    state = torch.randn(batch, heads, key_dim, value_dim, device="cuda") if initial_state else None
+    state = torch.randn(batch, heads, value_dim, key_dim, device="cuda") if initial_state else None
     return q, k, v, gate, beta, state
 
 
@@ -84,12 +84,24 @@ def test_recurrent_matches_naive_dense(dtype: torch.dtype, use_initial_state: bo
 @pytest.mark.parametrize(("key_dim", "value_dim"), [(80, 48), (128, 128)])
 def test_recurrent_matches_naive_non_power_of_two(key_dim: int, value_dim: int):
     """Mask partial key and value blocks correctly."""
-    q, k, v, gate, beta, _ = _inputs(key_dim=key_dim, value_dim=value_dim, seed=1)
-
-    output, final_state = recurrent_kda(q, k, v, gate, beta, output_final_state=True)
-    expected, expected_state = naive_recurrent_kda(
-        q, k, v, gate * LOG2_E, beta, output_final_state=True
+    q, k, v, gate, beta, state = _inputs(
+        key_dim=key_dim,
+        value_dim=value_dim,
+        initial_state=True,
+        seed=1,
     )
+
+    output, final_state = recurrent_kda(q, k, v, gate, beta, state, output_final_state=True)
+    expected, expected_state = naive_recurrent_kda(
+        q,
+        k,
+        v,
+        gate * LOG2_E,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+    )
+    assert final_state.shape == (q.shape[0], v.shape[2], value_dim, key_dim)
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(final_state, expected_state, rtol=1e-5, atol=1e-5)
 
@@ -125,7 +137,7 @@ def test_recurrent_packed_capacity_and_empty_slots():
     """Pass empty-slot state through and ignore rows past the terminal offset."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=3)
     cu_seqlens = cumulative_sequence_offsets([0, 11, 16, 0])
-    initial_state = torch.randn(4, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    initial_state = torch.randn(4, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
 
     output, final_state = recurrent_kda(
         q,
@@ -171,7 +183,7 @@ def test_recurrent_grouped_heads_match_expanded_heads():
     beta = beta.repeat_interleave(groups, dim=2).contiguous()
     # Independent per-value-head decays: grouping must not collapse state capacity.
     gate = -torch.rand(2, 17, v.shape[2], q.shape[3], device="cuda") * 3.0
-    state = torch.randn(2, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(2, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
 
     # Fixed heuristics keep both calls on one kernel specialization so equality is exact;
     # HK is an autotune key, so autotuned calls may pick different tiles.
@@ -199,7 +211,7 @@ def test_recurrent_grouped_heads_match_reference():
     v = v.repeat_interleave(2, dim=2).contiguous()
     beta = beta.repeat_interleave(2, dim=2).contiguous()
     gate = -torch.rand(2, 9, v.shape[2], q.shape[3], device="cuda") * 3.0
-    state = torch.randn(2, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(2, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
 
     fused = recurrent_kda(q, k, v, gate, beta, state, output_final_state=True)
     reference = recurrent_kda(
@@ -244,7 +256,7 @@ def test_recurrent_grouped_heads_registration():
     v = v.repeat_interleave(3, dim=2).contiguous()
     beta = beta.repeat_interleave(3, dim=2).contiguous()
     gate = gate.repeat_interleave(3, dim=2).contiguous()
-    state = torch.randn(1, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(1, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None, True))
 
 
@@ -326,11 +338,11 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
         v,
         gate * LOG2_E,
         beta,
-        initial_state=before[slots.long()].transpose(-1, -2).contiguous(),
+        initial_state=before[slots.long()],
         output_final_state=True,
         cu_seqlens=cu_seqlens,
     )
-    expected_pool[slots.long()] = expected_state.transpose(-1, -2)
+    expected_pool[slots.long()] = expected_state
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
     # Rows the indices never name stay bitwise untouched.
@@ -367,16 +379,14 @@ def test_recurrent_paged_fresh_slot_ignores_existing_state():
     )
 
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(
-        pool[slots.long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
-    )
+    torch.testing.assert_close(pool[slots.long()], expected_state, rtol=1e-5, atol=1e-5)
 
 
 def test_recurrent_paged_decode_accumulates_in_place():
     """Successive single-token steps advance each slot without a round trip."""
     _, pool = strided_state_pool(5, 2, 64, 64)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    state = pool[slots.long()].transpose(-1, -2).contiguous()
+    state = pool[slots.long()].clone()
 
     for step in range(3):
         q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=20 + step)
@@ -385,9 +395,7 @@ def test_recurrent_paged_decode_accumulates_in_place():
             q, k, v, gate * LOG2_E, beta, initial_state=state, output_final_state=True
         )
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(
-            pool[slots.long()], state.transpose(-1, -2), rtol=1e-5, atol=1e-5
-        )
+        torch.testing.assert_close(pool[slots.long()], state, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("padding_slot", [0, -1])
@@ -407,14 +415,12 @@ def test_recurrent_paged_padding_slot_is_ignored(padding_slot: int):
         v[active],
         gate[active] * LOG2_E,
         beta[active],
-        initial_state=before[slots[active].long()].transpose(-1, -2).contiguous(),
+        initial_state=before[slots[active].long()],
         output_final_state=True,
     )
     torch.testing.assert_close(output[active], expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]), rtol=0, atol=0)
-    torch.testing.assert_close(
-        pool[slots[active].long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
-    )
+    torch.testing.assert_close(pool[slots[active].long()], expected_state, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool[0], before[0], rtol=0, atol=0)
 
 
@@ -514,7 +520,7 @@ def test_recurrent_custom_op_registration(packed: bool):
     q, k, v, gate, beta, _ = _inputs(batch=batch, tokens=17)
     cu_seqlens = cumulative_sequence_offsets([2, 5, 10]) if packed else None
     num_sequences = 3 if packed else batch
-    state = torch.randn(num_sequences, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(num_sequences, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         _recurrent_fwd_op,
         (q, k, v, gate, beta, state, cu_seqlens, True),
@@ -535,7 +541,7 @@ def test_recurrent_custom_op_registration_mixed_dtype():
     """Fake outputs follow Q dtype even when V uses the model activation dtype."""
     q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, dtype=torch.bfloat16)
     q, k = q.float(), k.float()
-    state = torch.randn(2, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(2, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     _, state_pool = strided_state_pool(3, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
 
@@ -609,7 +615,7 @@ def test_recurrent_cuda_graph_replay():
     """Replay fixed shapes with mutated boundaries, values, and history."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=5)
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
-    initial_state = torch.randn(3, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, True)
     torch.cuda.synchronize()
 
@@ -713,7 +719,7 @@ def test_naive_recurrent_packed_matches_public_contract():
     """The pure reference honors packed semantics: empty slots and capacity tails."""
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=7)
     cu_seqlens = cumulative_sequence_offsets([0, 11, 16, 0])
-    initial_state = torch.randn(4, q.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    initial_state = torch.randn(4, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
 
     output, final_state = naive_recurrent_kda(
         q,

@@ -21,7 +21,7 @@ def make_inputs(seq_len: int) -> tuple[torch.Tensor, ...]:
     v = torch.randn(batch, seq_len, heads, value_dim)
     g = F.logsigmoid(torch.randn(batch, seq_len, heads, key_dim))  # per-channel (diagonal) gate
     beta = torch.sigmoid(torch.randn(batch, seq_len, heads))
-    initial_state = torch.randn(batch, heads, key_dim, value_dim)
+    initial_state = torch.randn(batch, heads, value_dim, key_dim)
     return q, k, v, g, beta, initial_state
 
 
