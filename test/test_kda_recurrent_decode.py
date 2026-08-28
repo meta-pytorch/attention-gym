@@ -101,11 +101,11 @@ def _reference_decode(
             gate[:, active].transpose(0, 1),
             beta[:, active].transpose(0, 1),
             scale=scale,
-            initial_state=state_cache[active_indices].transpose(-1, -2).contiguous(),
+            initial_state=state_cache[active_indices],
             output_final_state=True,
         )
         output[:, active] = active_output.transpose(0, 1).to(output.dtype)
-        expected_cache[active_indices] = active_state.transpose(-1, -2)
+        expected_cache[active_indices] = active_state
     return output, expected_cache
 
 

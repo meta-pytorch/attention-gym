@@ -74,7 +74,7 @@ def delta_h_reference(
     begin = 0
     for sequence, length in enumerate(lengths):
         state = (
-            d_final_state[sequence].float().clone()
+            d_final_state[sequence].transpose(-1, -2).float().clone()
             if d_final_state is not None
             else torch.zeros(heads, key_dim, value_dim, device=q.device)
         )
@@ -95,7 +95,7 @@ def delta_h_reference(
             )
         chunk_states.extend(state for _, state in sorted(sequence_states))
         if d_initial_state is not None:
-            d_initial_state.append(state)
+            d_initial_state.append(state.transpose(-1, -2))
         begin += length
     chunk_state = (
         torch.stack(chunk_states)[None]

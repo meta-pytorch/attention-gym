@@ -11,12 +11,14 @@ state:
 
 ```text
 decayed_state = exp(gate) * state
-residual = beta * (value - key @ decayed_state)
-state = decayed_state + outer(key, residual)
-output = scale * query @ state
+residual = beta * (value - decayed_state @ key)
+state = decayed_state + outer(residual, key)
+output = scale * state @ query
 ```
 
-`chunk_gdn` uses a chunk-parallel decomposition for training and prefill. `recurrent_gdn` consumes
+Public and persistent state uses V-major storage shaped `[N, H, V, K]`; paged pools replace `N`
+with the slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
+`recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
 chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
 `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
@@ -87,7 +89,8 @@ The KDA references use token-major tensors: query, key, and per-channel gate are
 `[batch, sequence, heads, key_dimension]`; value is
 `[batch, sequence, heads, value_dimension]`; beta is
 `[batch, sequence, heads]`. Both recurrent and chunked forms support ordinary
-PyTorch autograd and an optional recurrent state.
+PyTorch autograd and an optional V-major recurrent state shaped `[N, H, V, K]`. Paged prefill and
+decode use the same layout with the leading dimension interpreted as cache slots.
 
 `examples/kda_training.py` builds these operations into a small trainable
 `[B, T, hidden_size] -> [B, T, hidden_size]` attention module. To mirror the

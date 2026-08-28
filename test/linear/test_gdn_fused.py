@@ -34,7 +34,7 @@ def make_inputs(
     v = torch.randn(batch, tokens, heads, value_dim, device="cuda")
     gate = F.logsigmoid(torch.randn(batch, tokens, heads, device="cuda"))
     beta = torch.sigmoid(torch.randn(batch, tokens, heads, device="cuda"))
-    state = torch.randn(batch, heads, key_dim, value_dim, device="cuda")
+    state = torch.randn(batch, heads, value_dim, key_dim, device="cuda")
     return q, k, v, gate, beta, state
 
 
@@ -71,7 +71,7 @@ def test_fused_recurrent_matches_packed_reference(key_heads: int | None):
         batch=1, tokens=8, heads=6 if key_heads else 2, key_heads=key_heads
     )
     cu_seqlens = cumulative_sequence_offsets([3, 0, 4])
-    state = torch.randn(3, v.shape[2], q.shape[3], v.shape[-1], device="cuda")
+    state = torch.randn(3, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
     with torch.no_grad():
         expected = recurrent_gdn(
             q,
@@ -114,9 +114,7 @@ def test_fused_recurrent_paged_state():
     with torch.no_grad():
         for sequence, slot in ((0, 2), (2, 4)):
             initial_state = (
-                original_cache[slot].transpose(-1, -2).unsqueeze(0)
-                if has_initial_state[sequence]
-                else None
+                original_cache[slot].unsqueeze(0) if has_initial_state[sequence] else None
             )
             output, final_state = recurrent_gdn(
                 q[sequence : sequence + 1],
@@ -129,7 +127,7 @@ def test_fused_recurrent_paged_state():
                 impl=Impl.REFERENCE,
             )
             expected_output[sequence] = output[0]
-            expected_cache[slot] = final_state[0].transpose(-1, -2)
+            expected_cache[slot] = final_state[0]
 
         output, final_state = recurrent_gdn(
             q,
@@ -167,9 +165,7 @@ def test_fused_recurrent_packed_paged_state():
             if begin == end or slot <= 0:
                 continue
             span = slice(begin, end)
-            initial_state = (
-                original_cache[slot].transpose(-1, -2).unsqueeze(0) if use_state else None
-            )
+            initial_state = original_cache[slot].unsqueeze(0) if use_state else None
             span_output, span_state = recurrent_gdn(
                 q[:, span],
                 k[:, span],
@@ -181,7 +177,7 @@ def test_fused_recurrent_packed_paged_state():
                 impl=Impl.REFERENCE,
             )
             expected_output[:, span] = span_output
-            expected_cache[slot] = span_state[0].transpose(-1, -2)
+            expected_cache[slot] = span_state[0]
 
         output, _ = recurrent_gdn(
             q,
@@ -220,7 +216,7 @@ def test_fused_recurrent_grouped_heads_paged_matches_dense():
     q, k, v, gate, beta, _state = make_inputs(batch=3, tokens=1, heads=6, key_heads=2)
     _storage, pool = strided_state_pool(5, v.shape[2], q.shape[-1], v.shape[-1])
     slots = torch.tensor([1, 3, 4], device="cuda", dtype=torch.int32)
-    initial_state = pool[slots.long()].transpose(-1, -2).contiguous()
+    initial_state = pool[slots.long()].clone()
 
     with torch.no_grad():
         expected_output, expected_state = recurrent_gdn(
@@ -239,9 +235,7 @@ def test_fused_recurrent_grouped_heads_paged_matches_dense():
         )
 
     torch.testing.assert_close(output, expected_output, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(
-        pool[slots.long()], expected_state.transpose(-1, -2), rtol=1e-5, atol=1e-5
-    )
+    torch.testing.assert_close(pool[slots.long()], expected_state, rtol=1e-5, atol=1e-5)
 
 
 def test_fused_recurrent_packed_paged_empty_sequences():
@@ -301,7 +295,17 @@ def test_fused_recurrent_grouped_heads_registration():
     q, k, v, gate, beta, state = make_inputs(batch=1, tokens=3, heads=6, key_heads=2)
     torch.library.opcheck(
         recurrent_fwd_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, False),
+        (
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            None,
+            q.shape[-1] ** -0.5,
+            False,
+        ),
     )
 
 
@@ -311,7 +315,17 @@ def test_fused_recurrent_registration(output_final_state: bool):
     op = recurrent_fwd_op if output_final_state else recurrent_fwd_no_state_op
     torch.library.opcheck(
         op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, False),
+        (
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            None,
+            q.shape[-1] ** -0.5,
+            False,
+        ),
     )
 
 

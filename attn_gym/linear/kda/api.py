@@ -89,7 +89,7 @@ def chunk_kda(
             implementation limit is not shared by reference or recurrent execution and
             is documented rather than checked with a runtime tensor reduction.
         beta: Per-token write gate shaped ``[B, T, H]``.
-        initial_state: Starting recurrent state, with one ``[H, K, V]`` entry per
+        initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
         cu_seqlens: Packed offsets shaped ``[N + 1]`` for batch-one inputs, as
             contiguous ``int32`` on ``q.device``; they start at zero, never
@@ -262,7 +262,7 @@ def recurrent_kda(
             representation for chunked and recurrent execution; recurrent execution has
             no chunk-rebase lower limit.
         beta: Per-token write gate shaped ``[B, T, H]``.
-        initial_state: Starting recurrent state, with one ``[H, K, V]`` entry per
+        initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
         cu_seqlens: Packed offsets shaped ``[N + 1]`` for batch-one inputs, as
             contiguous ``int32`` on ``q.device``; they start at zero, never

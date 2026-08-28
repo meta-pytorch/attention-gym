@@ -44,7 +44,7 @@ def _make_inputs(
     value = torch.randn(batch, tokens, heads, value_dim, device="cuda")
     gate = F.logsigmoid(torch.randn(batch, tokens, heads, device="cuda"))
     beta = torch.sigmoid(torch.randn(batch, tokens, heads, device="cuda"))
-    state = torch.randn(batch, heads, key_dim, value_dim, device="cuda") if initial_state else None
+    state = torch.randn(batch, heads, value_dim, key_dim, device="cuda") if initial_state else None
     return query.to(dtype), key.to(dtype), value.to(dtype), gate, beta, state
 
 
@@ -60,7 +60,7 @@ def _launch_scalar_gdn(
     store_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the scalar-gate specialization with public GDN inputs."""
-    return launch_recurrent_delta_rule_fwd(
+    output, final_state = launch_recurrent_delta_rule_fwd(
         query,
         key,
         value,
@@ -72,6 +72,7 @@ def _launch_scalar_gdn(
         gate_kind=GateKind.SCALAR,
         store_final_state=store_final_state,
     )
+    return output, final_state
 
 
 @pytest.mark.parametrize(

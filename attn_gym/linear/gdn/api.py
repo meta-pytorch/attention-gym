@@ -45,7 +45,7 @@ def chunk_gdn(
         v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
-        initial_state: Initial recurrent state shaped ``[N, H, K, V]`` in the recurrence compute
+        initial_state: Initial recurrent state shaped ``[N, H, V, K]`` in the recurrence compute
             dtype, where ``N`` is the number of logical sequences.
         cu_seqlens: Optional packed offsets shaped ``[N + 1]`` for batch-one inputs. They start at
             zero, never decrease, and may end before ``T``; output beyond the terminal offset is
@@ -95,7 +95,7 @@ def recurrent_gdn(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 
-    The recurrence consumes tokens in order, carrying an explicit ``[N, H, K, V]`` state. Inputs
+    The recurrence consumes tokens in order, carrying an explicit ``[N, H, V, K]`` state. Inputs
     and outputs use the token-major layout ``[batch, sequence, heads, dimension]``. FP16 and BF16
     inputs use FP32 recurrence math and state.
 
@@ -107,7 +107,7 @@ def recurrent_gdn(
         v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
-        initial_state: Initial recurrent state shaped ``[N, H, K, V]`` in the recurrence compute
+        initial_state: Initial recurrent state shaped ``[N, H, V, K]`` in the recurrence compute
             dtype, where ``N`` is the number of logical sequences.
         cu_seqlens: Optional packed offsets shaped ``[N + 1]`` for batch-one inputs. They start at
             zero, never decrease, and may end before ``T``; output beyond the terminal offset is

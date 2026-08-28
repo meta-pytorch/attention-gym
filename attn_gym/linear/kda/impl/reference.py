@@ -41,7 +41,7 @@ def _packed_reference(
     final_state = None
     if output_final_state:
         final_state = (
-            q.new_zeros(num_sequences, heads, key_dim, value_dim)
+            q.new_zeros(num_sequences, heads, value_dim, key_dim)
             if initial_state is None
             else initial_state.clone()
         )

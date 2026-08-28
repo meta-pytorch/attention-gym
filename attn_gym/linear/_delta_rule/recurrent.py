@@ -119,15 +119,13 @@ def _recurrent_delta_rule_fwd_kernel(
                 row = t * H + i_h
                 tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
             return
-        p_state = ptr_offset(
-            (i_state, i_h, o_v[None, :], o_k[:, None]),
-            (state_batch_stride, V * K, K, 1),
-        )
+        state_row = i_state
     else:
-        p_state = ptr_offset(
-            (i_n, i_h, o_k[:, None], o_v[None, :]),
-            (state_batch_stride, K * V, V, 1),
-        )
+        state_row = i_n
+    p_state = ptr_offset(
+        (state_row, i_h, o_v[None, :], o_k[:, None]),
+        (state_batch_stride, V * K, K, 1),
+    )
     if USE_INITIAL_STATE:
         m_state = m_kv
         if USE_HAS_INITIAL_STATE:
@@ -219,7 +217,7 @@ def launch_recurrent_delta_rule_fwd(
         gate: Natural-log decay per value head, shaped ``[B, T, H]`` for
             ``GateKind.SCALAR`` or ``[B, T, H, K]`` for ``GateKind.VECTOR``.
         beta: Per-token write gate shaped ``[B, T, H]``.
-        initial_state: Optional FP32 starting state shaped ``[N, H, K, V]``, or the mutable
+        initial_state: Optional FP32 starting state shaped ``[N, H, V, K]``, or the mutable
             ``[slots, H, V, K]`` pool that ``state_indices`` addresses in paged mode.
         cu_seqlens: Optional packed boundaries shaped ``[N + 1]``; offsets are trusted and
             must be validated by the caller before launch.
@@ -255,10 +253,7 @@ def launch_recurrent_delta_rule_fwd(
     heads, value_dim = v.shape[2], v.shape[-1]
     assert heads % key_heads == 0
     if initial_state is not None:
-        if state_indices is None:
-            assert initial_state.is_contiguous()
-        else:
-            assert initial_state.stride()[1:] == (value_dim * key_dim, key_dim, 1)
+        assert initial_state.stride()[1:] == (value_dim * key_dim, key_dim, 1)
     num_sequences = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     output = torch.empty_like(v, dtype=q.dtype)
     if state_indices is not None:
@@ -267,7 +262,7 @@ def launch_recurrent_delta_rule_fwd(
         assert store_final_state and initial_state is not None
         final_state = initial_state
     elif store_final_state:
-        final_state = q.new_empty(num_sequences, heads, key_dim, value_dim, dtype=torch.float32)
+        final_state = q.new_empty(num_sequences, heads, value_dim, key_dim, dtype=torch.float32)
     else:
         final_state = None
     state_batch_stride = (

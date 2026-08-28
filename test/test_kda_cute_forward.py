@@ -426,12 +426,12 @@ def test_paged_chunk_kda_updates_strided_pool():
         v,
         cumulative_gate,
         beta,
-        expected_pool[slots.long()].transpose(-1, -2).contiguous(),
+        expected_pool[slots.long()],
         cu_seqlens=cu_seqlens,
         output_final_state=True,
     )
     assert expected_state is not None
-    expected_pool[slots.long()] = expected_state.transpose(-1, -2)
+    expected_pool[slots.long()] = expected_state
 
     output = paged_chunk_kda(
         q,
@@ -454,7 +454,7 @@ def test_paged_chunk_kda_matches_pytorch():
     state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     state_cache = torch.randn(4, 1, 128, 128, device="cuda")
     expected_cache = state_cache.clone()
-    initial_state = expected_cache[state_indices.long()].transpose(-1, -2).contiguous()
+    initial_state = expected_cache[state_indices.long()].clone()
 
     expected_output, expected_state = naive_chunk_kda(
         q.float(),
@@ -467,7 +467,7 @@ def test_paged_chunk_kda_matches_pytorch():
     )
     output = paged_chunk_kda(q, k, v, cumulative_gate, beta, state_cache, state_indices)
     assert expected_state is not None
-    expected_cache[state_indices.long()] = expected_state.transpose(-1, -2)
+    expected_cache[state_indices.long()] = expected_state
 
     torch.testing.assert_close(output.float(), expected_output, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(state_cache, expected_cache, rtol=2e-2, atol=2e-3)
@@ -500,16 +500,13 @@ def test_paged_chunk_kda_ignores_padding_slots():
         v[:, :64],
         cumulative_gate[:, :64],
         beta[:, :64],
-        before[3:4, : pool[0].numel()]
-        .view(1, q.shape[2], 128, 128)
-        .transpose(-1, -2)
-        .contiguous(),
+        before[3:4, : pool[0].numel()].view(1, q.shape[2], 128, 128),
         output_final_state=True,
     )
     assert expected_state is not None
     torch.testing.assert_close(output[:, :64], expected, rtol=0, atol=0)
     torch.testing.assert_close(output[:, 64:], torch.zeros_like(output[:, 64:]), rtol=0, atol=0)
-    torch.testing.assert_close(pool[3], expected_state[0].transpose(-1, -2), rtol=0, atol=0)
+    torch.testing.assert_close(pool[3], expected_state[0], rtol=0, atol=0)
     torch.testing.assert_close(storage[0], before[0], rtol=0, atol=0)
 
 
@@ -536,7 +533,7 @@ def test_paged_chunk_kda_zero_initializes_new_slots():
     )
     state_elements = pool[0].numel()
     original_slot = before[4, :state_elements].view_as(pool[4])
-    expected_initial = torch.stack((original_slot, torch.zeros_like(pool[2]))).transpose(-1, -2)
+    expected_initial = torch.stack((original_slot, torch.zeros_like(pool[2])))
     expected_output, expected_state = chunk_kda(
         q,
         k,
@@ -550,7 +547,7 @@ def test_paged_chunk_kda_zero_initializes_new_slots():
 
     assert expected_state is not None
     torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
-    torch.testing.assert_close(pool[2], expected_state[1].transpose(-1, -2), rtol=0, atol=0)
+    torch.testing.assert_close(pool[2], expected_state[1], rtol=0, atol=0)
     torch.testing.assert_close(storage[0], before[0], rtol=0, atol=0)
 
 

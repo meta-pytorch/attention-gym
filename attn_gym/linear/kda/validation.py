@@ -75,7 +75,7 @@ def validate_kda_inputs(
         ):
             raise ValueError("cu_seqlens must be contiguous int32 on q.device")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    expected_state = (state_batch, heads, key_dim, v.shape[-1])
+    expected_state = (state_batch, heads, v.shape[-1], key_dim)
     if initial_state is not None and initial_state.shape != expected_state:
         raise ValueError(
             f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"

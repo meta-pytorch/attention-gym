@@ -14,10 +14,9 @@ autograd; a future GDN adapter can reuse the same implementation boundary.
 - Internal recurrent state and checkpoints use `[sequence, head, V, K]`.
 
 The `[V, K]` state layout is schedule-native rather than an inherited naming choice. State GEMMs use
-value dimension as the MMA M mode and contiguous key vectors as the K mode; forward, recompute, and
-bprop share that orientation. A maintained adapter must preserve the public `[K, V]` contract with
-explicit conversion unless the MMA descriptors, direct state loads/stores, and checkpoint TMA layout
-are redesigned together.
+the value dimension as the MMA M mode and contiguous key vectors as the K mode; forward, recompute,
+and bprop share that orientation. It now matches the public and paged delta-rule state contract, so
+stateful calls require no layout conversion at the Mega boundary.
 
 ## Checkpoint contract
 

@@ -614,7 +614,11 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     h = torch.zeros(B, num_chunks, H, K, V, dtype=acc, device=k.device)
     v_new = torch.zeros(B, T, H, V, dtype=acc, device=k.device)
     # State recurrence is sequential across chunks; batch (B, H) into the matmuls.
-    state = torch.zeros(B, H, K, V, dtype=acc, device=k.device) if h0 is None else h0.to(acc)
+    state = (
+        torch.zeros(B, H, K, V, dtype=acc, device=k.device)
+        if h0 is None
+        else h0.transpose(-1, -2).to(acc)
+    )
     for it in range(num_chunks):
         s = it * chunk_size
         e = min(s + chunk_size, T)
@@ -627,7 +631,7 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
         v_new[:, s:e] = vn
         state = state * gkc[:, e - 1].exp2()[..., None]
         state = state + torch.einsum("blhk,blhv->bhkv", kc[:, s:e], vn.to(acc))
-    return h.reshape(B * num_chunks, H, K, V), v_new, state
+    return h.reshape(B * num_chunks, H, K, V), v_new, state.transpose(-1, -2)
 
 
 @pytest.mark.parametrize(
@@ -651,7 +655,7 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     # Since prod keeps initial and final state in fp32, do that here to match.
-    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
+    h0 = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_h0 else None
 
     gh, gvn, ght = _fwd_h_ref(
         k.double(), w.double(), v.double(), gk.double(), h0.double() if use_h0 else None
@@ -902,7 +906,7 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
     dv2 = torch.zeros(B, T, H, V, dtype=acc, device=q.device)
     # Reverse recurrence is sequential across chunks; batch (B, H) into the matmuls.
     D = (
-        dht.to(acc).clone()
+        dht.transpose(-1, -2).to(acc).clone()
         if dht is not None
         else torch.zeros(B, H, K, V, dtype=acc, device=q.device)
     )
@@ -917,7 +921,7 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
             + scale * torch.einsum("blhk,blhv->bhkv", qf[:, s:e], dof[:, s:e])
             - torch.einsum("blhk,blhv->bhkv", wf[:, s:e], dv2c)
         )
-    dh0 = D if h0 is not None else None
+    dh0 = D.transpose(-1, -2) if h0 is not None else None
     return dh_out, dh0, dv2
 
 
@@ -944,8 +948,8 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     aqk = aqk * _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
     # gk is the cumulative per-channel log2-decay (<= 0), so 2^{gk_last} <= 1.
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
-    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
-    dht = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_dht else None
+    h0 = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_h0 else None
+    dht = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_dht else None
 
     qb, kb, wb, dob, aqkb = (t.to(torch.bfloat16) for t in (q, k, w, do, aqk))
     dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_dv_fused(

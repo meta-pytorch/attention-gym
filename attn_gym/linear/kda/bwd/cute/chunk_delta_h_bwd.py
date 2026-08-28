@@ -343,14 +343,14 @@ class BlackwellDeltaHBwd:
             dht_in.iterator,
             cute.make_layout(
                 (K, V, (H, B)),
-                stride=(V, 1, (K * V, self.upcast(H * K * V))),
+                stride=(1, K, (K * V, self.upcast(H * K * V))),
             ),
         )
         g_dh0_t = cute.make_tensor(
             dh0_in.iterator,
             cute.make_layout(
                 (V, K, (H, B)),
-                stride=(1, V, (K * V, self.upcast(H * K * V))),
+                stride=(K, 1, (K * V, self.upcast(H * K * V))),
             ),
         )
         return GmemViews(
@@ -421,11 +421,11 @@ class BlackwellDeltaHBwd:
             ),
             cute.make_tensor(
                 dht_in.iterator,
-                cute.group_modes(cute.select(dht_in.layout, mode=[2, 3, 1, 0]), 2, 4),
+                cute.group_modes(cute.select(dht_in.layout, mode=[3, 2, 1, 0]), 2, 4),
             ),
             cute.make_tensor(
                 dh0_in.iterator,
-                cute.group_modes(cute.select(dh0_in.layout, mode=[3, 2, 1, 0]), 2, 4),
+                cute.group_modes(cute.select(dh0_in.layout, mode=[2, 3, 1, 0]), 2, 4),
             ),
         )
 
@@ -2193,8 +2193,8 @@ def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets):
     dof = make_fake_tensor(io_type, (sa, sb, H, V))
     aqkf = make_fake_tensor(io_type, (sa, sb, H, chunk_size))
     gkf = make_fake_tensor(cutlass.Float32, (sa, sb, H, K))
-    dhtf = make_fake_tensor(cutlass.Float32, (sns, H, K, V))
-    dh0f = make_fake_tensor(cutlass.Float32, (sns, H, K, V))
+    dhtf = make_fake_tensor(cutlass.Float32, (sns, H, V, K))
+    dh0f = make_fake_tensor(cutlass.Float32, (sns, H, V, K))
     dhof = make_fake_tensor(io_type, (sa, snt, H, K, V))
     dv2f = make_fake_tensor(io_type, (sa, sb, H, V))
     cuf = make_fake_tensor(cutlass.Int32, (sn,))
@@ -2247,7 +2247,7 @@ def _compile_delta_h_bwd_packed(
     def token_tensor(dtype, width):
         return make_fake_tensor(dtype, (tokens, heads, width))
 
-    state = make_fake_tensor(cutlass.Float32, (sequences, heads, key_dim, value_dim))
+    state = make_fake_tensor(cutlass.Float32, (sequences, heads, value_dim, key_dim))
     chunk_state = make_fake_tensor(io_type, (chunks, heads, key_dim, value_dim))
     metadata = make_fake_tensor(cutlass.Int32, (metadata_entries,))
     return compile_tvm_ffi(
@@ -2322,7 +2322,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
     if gk is not None and gk.dtype != torch.float32:
         raise TypeError("gk must be float32")
     sequences = metadata.cu_seqlens.shape[0] - 1
-    expected_state = (sequences, heads, key_dim, value_dim)
+    expected_state = (sequences, heads, value_dim, key_dim)
     for name, state in (("h0", h0), ("dht", dht)):
         if state is not None and state.shape != expected_state:
             raise ValueError(f"{name} must have shape {expected_state}")
@@ -2428,7 +2428,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     expected_aqk = (B, T, H, BT)
     if aqk.shape != expected_aqk:
         raise ValueError(f"the dense delta-H kernel requires Aqk with shape {expected_aqk}")
-    expected_state = (B, H, K, V)
+    expected_state = (B, H, V, K)
     for name, state in (("h0", h0), ("dht", dht)):
         if state is not None and state.shape != expected_state:
             raise ValueError(f"{name} must have shape {expected_state}")
@@ -2444,7 +2444,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     if active_fake_mode() is not None:
         return dh_out, dh0_out, dv2
 
-    state_shape = (B, H, K, V)
+    state_shape = (B, H, V, K)
     gk_k = gk if gk is not None else torch.empty((B, T, H, K), dtype=torch.float32, device=dev)
     dht_k = dht if dht is not None else torch.empty(state_shape, dtype=torch.float32, device=dev)
     dh0_k = (
