@@ -75,9 +75,17 @@ def l2norm_fwd_kernel(
     )
 
 
-def _l2norm_launch_config(rows: int, use_hopper_decode_config: bool) -> tuple[int, int]:
+def _l2norm_launch_config(rows: int, tuned_major: int | None) -> tuple[int, int]:
     """Select the rows per program and warp count for L2 normalization."""
-    if not use_hopper_decode_config or rows > 2048:
+    if tuned_major == 10:
+        if rows <= 8:
+            return 1, 1
+        if rows <= 32:
+            return 1, 4
+        if rows <= 512:
+            return 4, 4
+        return 8, 4
+    if tuned_major != 9 or rows > 2048:
         return 16, 4
     if rows <= 9:
         return 1, 1
@@ -103,14 +111,17 @@ def _l2norm_fwd_cuda(
     output = torch.empty(rows, head_dim, dtype=x.dtype, device=x.device)
     rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
     block_dim = triton.next_power_of_2(head_dim)
-    use_hopper_decode_config = (
-        get_device_properties(x.device).major == 9
-        and x.dtype is torch.bfloat16
-        and head_dim == 128
-        and cu_seqlens is not None
-        and cu_seqlens.shape[0] == tokens + 1
+    major = get_device_properties(x.device).major
+    has_decode_metadata_shape = cu_seqlens is not None and cu_seqlens.shape[0] == tokens + 1
+    measured_decode_shape = (
+        x.dtype is torch.bfloat16 and head_dim == 128 and has_decode_metadata_shape
     )
-    block_tokens, num_warps = _l2norm_launch_config(rows, use_hopper_decode_config)
+    tuned_major = None
+    if measured_decode_shape and (
+        major == 9 or (major == 10 and heads in (2, 4, 8, 16) and tokens <= 256)
+    ):
+        tuned_major = major
+    block_tokens, num_warps = _l2norm_launch_config(rows, tuned_major)
     l2norm_fwd_kernel[(triton.cdiv(rows, block_tokens),)](
         x,
         output,

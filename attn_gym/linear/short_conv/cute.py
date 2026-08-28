@@ -2898,18 +2898,23 @@ def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfi
 def _default_decode_config(x: torch.Tensor, width: int, activation: str | None) -> ShortConvConfig:
     """Select the measured one-token schedule for the active architecture."""
     default = ShortConvTunedConfig.default(x.dtype).forward
-    if (
-        get_device_properties(x.device).major == 9
-        and x.dtype is torch.bfloat16
-        and width == 4
-        and activation == "silu"
-    ):
-        # Narrower channel ownership gives Qwen's small H100 decode grids more CTAs.
-        default = ShortConvConfig(
-            default.threads,
-            1 if x.shape[0] <= 8 else 2,
-            default.times_per_block,
-        )
+    if x.dtype is torch.bfloat16 and width == 4 and activation == "silu":
+        major = get_device_properties(x.device).major
+        if major == 9:
+            # Narrower channel ownership gives Qwen's small H100 decode grids more CTAs.
+            default = ShortConvConfig(
+                default.threads,
+                1 if x.shape[0] <= 8 else 2,
+                default.times_per_block,
+            )
+        elif major == 10 and x.shape[0] <= 256 and x.shape[1] in (768, 1536, 3072, 6144):
+            local_heads = x.shape[1] // (3 * 128)
+            sequence_heads = x.shape[0] * local_heads
+            default = ShortConvConfig(
+                default.threads,
+                1 if sequence_heads <= 128 else 2,
+                default.times_per_block,
+            )
     return _compatible_config(default, x.shape[1])
 
 

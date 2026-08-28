@@ -52,16 +52,23 @@ class GateTransform(Enum):
 def _decode_launch_config(
     value_dim: int,
     sequence_heads: int,
-    hopper_gate_kind: GateKind | None,
+    tuned_major: int | None,
+    gate_kind: GateKind,
 ) -> tuple[int, int]:
     """Select the value tile and warp count for one-token decode."""
     if value_dim <= 32:
         return min(triton.next_power_of_2(value_dim), 8), 4
-    if hopper_gate_kind is GateKind.SCALAR:
+    if tuned_major == 10:
+        if sequence_heads <= 32:
+            return min(triton.next_power_of_2(value_dim), 8), 4
+        if sequence_heads <= 128:
+            return min(triton.next_power_of_2(value_dim), 8), 2
+        return min(triton.next_power_of_2(value_dim), 8), 1
+    if tuned_major == 9 and gate_kind is GateKind.SCALAR:
         # The H100 scalar-gate crossover is between 96 and 104 sequence-heads.
         block_v = 8 if sequence_heads < 104 else 16
         num_warps = 2 if sequence_heads <= 8 else 1
-    elif hopper_gate_kind is GateKind.VECTOR:
+    elif tuned_major == 9 and gate_kind is GateKind.VECTOR:
         # Vector gates move the H100 crossover between 224 and 232 sequence-heads.
         block_v = 8 if sequence_heads < 232 else 16
         num_warps = 1
@@ -233,17 +240,24 @@ def launch_recurrent_delta_rule_decode(
     batch = packed_qkv.shape[0]
     heads, value_dim, key_dim = state_cache.shape[1:]
     assert key_heads > 0 and heads % key_heads == 0
-    hopper_gate_kind = (
-        gate_kind
-        if get_device_properties(packed_qkv.device).major == 9
-        and packed_qkv.dtype is torch.bfloat16
-        and key_dim == value_dim == 128
-        else None
-    )
+    major = get_device_properties(packed_qkv.device).major
+    measured_gdn_shape = packed_qkv.dtype is torch.bfloat16 and key_dim == value_dim == 128
+    tuned_major = None
+    if measured_gdn_shape and (
+        major == 9
+        or (
+            major == 10
+            and gate_kind is GateKind.SCALAR
+            and heads in (2, 4, 8, 16)
+            and batch <= 256
+        )
+    ):
+        tuned_major = major
     block_v, num_warps = _decode_launch_config(
         value_dim,
         batch * heads,
-        hopper_gate_kind,
+        tuned_major,
+        gate_kind,
     )
     grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
     _recurrent_delta_rule_decode_kernel[grid](

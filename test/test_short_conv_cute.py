@@ -201,23 +201,31 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
 
 
 @pytest.mark.parametrize(
-    ("sequences", "width", "activation", "channels_per_thread"),
+    ("major", "sequences", "channels", "width", "activation", "channels_per_thread"),
     [
-        (8, 4, "silu", 1),
-        (9, 4, "silu", 2),
-        (8, 5, "silu", 4),
-        (8, 4, None, 4),
+        (9, 8, 6144, 4, "silu", 1),
+        (9, 9, 6144, 4, "silu", 2),
+        (9, 8, 6144, 5, "silu", 4),
+        (9, 8, 6144, 4, None, 4),
+        (10, 64, 768, 4, "silu", 1),
+        (10, 65, 768, 4, "silu", 2),
+        (10, 256, 6144, 4, "silu", 2),
+        (10, 257, 6144, 4, "silu", 4),
+        (10, 64, 384, 4, "silu", 4),
+        (10, 64, 768, 5, "silu", 4),
     ],
 )
-def test_short_conv_hopper_decode_defaults(
+def test_short_conv_tuned_decode_defaults(
+    major: int,
     sequences: int,
+    channels: int,
     width: int,
     activation: str | None,
     channels_per_thread: int,
 ):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Hopper-specific decode schedule")
-    x = torch.empty(sequences, 6144, device="cuda", dtype=torch.bfloat16)
+    if torch.cuda.get_device_capability()[0] != major:
+        pytest.skip(f"SM{major} decode schedule")
+    x = torch.empty(sequences, channels, device="cuda", dtype=torch.bfloat16)
     config = cute_backend._default_decode_config(x, width, activation)
     assert config == ShortConvConfig(128, channels_per_thread, 16)
 
@@ -1822,16 +1830,32 @@ def test_short_conv_decode_configured_dynamic_shapes(paged_short_conv_inputs):
         torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
 
 
-def test_short_conv_hopper_default_schedule_matches_reference(paged_short_conv_inputs):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Hopper-specific decode schedule")
-    x, weight, state, slots = paged_short_conv_inputs(sequences=64, channels=3072, slots=65)
+@pytest.mark.parametrize(
+    ("major", "sequences", "channels"),
+    [(9, 64, 3072), (10, 65, 768)],
+)
+def test_short_conv_tuned_default_schedule_matches_reference(
+    paged_short_conv_inputs,
+    major: int,
+    sequences: int,
+    channels: int,
+):
+    if torch.cuda.get_device_capability()[0] != major:
+        pytest.skip(f"SM{major} decode schedule")
+    x, weight, state, slots = paged_short_conv_inputs(
+        sequences=sequences,
+        channels=channels,
+        slots=sequences + 1,
+    )
     initial_state = state.clone()
     history = torch.cat([initial_state[slots.long()], x.unsqueeze(1)], dim=1)
+    expected_state = initial_state.clone()
+    expected_state[slots.long()] = history[:, 1:]
 
     actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
 
     torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
 def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs):
@@ -1931,10 +1955,22 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
         )
 
 
-def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs):
+@pytest.mark.parametrize(
+    "input_kwargs",
+    [
+        pytest.param({}, id="generic"),
+        pytest.param(
+            {"sequences": 8, "channels": 1536, "slots": 9},
+            id="blackwell",
+        ),
+    ],
+)
+def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs, input_kwargs):
     """Capture the one-token step and replay it from a reset history."""
     torch.manual_seed(8)
-    x, weight, state, slots = paged_short_conv_inputs()
+    if input_kwargs and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Blackwell-specific decode schedule")
+    x, weight, state, slots = paged_short_conv_inputs(**input_kwargs)
     initial_state = state.clone()
     causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
     torch.cuda.synchronize()
