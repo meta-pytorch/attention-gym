@@ -54,8 +54,8 @@ def test_kda_backward_compatibility_exports():
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTeDSL short convolution requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="the CuTeDSL short convolution requires CUDA capability 9.0 or newer",
 )
 
 
@@ -198,6 +198,28 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize(
+    ("sequences", "width", "activation", "channels_per_thread"),
+    [
+        (8, 4, "silu", 1),
+        (9, 4, "silu", 2),
+        (8, 5, "silu", 4),
+        (8, 4, None, 4),
+    ],
+)
+def test_short_conv_hopper_decode_defaults(
+    sequences: int,
+    width: int,
+    activation: str | None,
+    channels_per_thread: int,
+):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper-specific decode schedule")
+    x = torch.empty(sequences, 6144, device="cuda", dtype=torch.bfloat16)
+    config = cute_backend._default_decode_config(x, width, activation)
+    assert config == ShortConvConfig(128, channels_per_thread, 16)
 
 
 def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
@@ -1798,6 +1820,18 @@ def test_short_conv_decode_configured_dynamic_shapes(paged_short_conv_inputs):
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_short_conv_hopper_default_schedule_matches_reference(paged_short_conv_inputs):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper-specific decode schedule")
+    x, weight, state, slots = paged_short_conv_inputs(sequences=64, channels=3072, slots=65)
+    initial_state = state.clone()
+    history = torch.cat([initial_state[slots.long()], x.unsqueeze(1)], dim=1)
+
+    actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
 
 
 def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs):

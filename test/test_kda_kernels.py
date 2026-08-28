@@ -29,6 +29,7 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     _l2norm_bwd_op,
     _l2norm_fwd_op,
+    _l2norm_launch_config,
     l2norm,
     l2norm_fwd_kernel,
 )
@@ -187,6 +188,24 @@ _L2NORM_CASES = [(torch.float32, T, D, strided) for T, D, strided in L2NORM_SHAP
 
 
 # l2norm forward
+@pytest.mark.parametrize(
+    ("rows", "use_hopper_decode_config", "expected"),
+    [
+        (1, True, (1, 1)),
+        (2, True, (1, 1)),
+        (9, True, (1, 1)),
+        (10, True, (4, 2)),
+        (2048, True, (4, 2)),
+        (2049, True, (16, 4)),
+        (128, False, (16, 4)),
+    ],
+)
+def test_l2norm_launch_config(
+    rows: int, use_hopper_decode_config: bool, expected: tuple[int, int]
+):
+    assert _l2norm_launch_config(rows, use_hopper_decode_config) == expected
+
+
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_fwd(dtype, T, D, strided):
     torch.manual_seed(0)
@@ -208,8 +227,7 @@ def test_l2norm_fwd(dtype, T, D, strided):
     y = _empty_strided_like(x) if strided else torch.empty_like(x)
     rstd_template = torch.empty(T, device=DEV, dtype=torch.float32)
     rstd = _empty_strided_like(rstd_template) if strided else rstd_template
-    grid = lambda meta: (triton.cdiv(T, meta["BT"]),)
-    l2norm_fwd_kernel[grid](
+    l2norm_fwd_kernel[(triton.cdiv(T, 16),)](
         x,
         y,
         rstd,
@@ -223,9 +241,11 @@ def test_l2norm_fwd(dtype, T, D, strided):
         H=1,
         D=D,
         BD=BD,
-        NB=triton.cdiv(T, 16),
         NUM_SEQUENCES=0,
         IS_VARLEN=False,
+        BT=16,
+        num_warps=4,
+        num_stages=3,
     )
     assert_golden(y, golden, ref, dtype, f"l2norm_fwd_kernel T={T} D={D}")
     assert_golden(rstd, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel rstd T={T} D={D}")

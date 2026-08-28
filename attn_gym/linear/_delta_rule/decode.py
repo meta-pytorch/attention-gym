@@ -37,6 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.recurrent import GateKind
 
@@ -46,6 +47,17 @@ class GateTransform(Enum):
 
     BOUNDED = "bounded"  # lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))
     SOFTPLUS = "softplus"  # -exp(A_log) * softplus(raw_gate + dt_bias)
+
+
+def _decode_launch_config(
+    value_dim: int, sequence_heads: int, use_hopper_gdn_config: bool
+) -> tuple[int, int]:
+    """Select the value tile and warp count for one-token decode."""
+    if value_dim <= 32:
+        return min(triton.next_power_of_2(value_dim), 8), 4
+    # H100 measurements become inconclusive above 96 sequence-heads.
+    block_v = 8 if use_hopper_gdn_config and sequence_heads < 104 else 16
+    return min(triton.next_power_of_2(value_dim), block_v), 2 if sequence_heads <= 8 else 1
 
 
 # Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
@@ -210,12 +222,17 @@ def launch_recurrent_delta_rule_decode(
     batch = packed_qkv.shape[0]
     heads, value_dim, key_dim = state_cache.shape[1:]
     assert key_heads > 0 and heads % key_heads == 0
-    if value_dim <= 32:
-        block_v, num_warps = min(triton.next_power_of_2(value_dim), 8), 4
-    elif batch * heads <= 8:
-        block_v, num_warps = min(triton.next_power_of_2(value_dim), 16), 2
-    else:
-        block_v, num_warps = min(triton.next_power_of_2(value_dim), 16), 1
+    use_hopper_gdn_config = (
+        get_device_properties(packed_qkv.device).major == 9
+        and packed_qkv.dtype is torch.bfloat16
+        and key_dim == value_dim == 128
+        and gate_kind is GateKind.SCALAR
+    )
+    block_v, num_warps = _decode_launch_config(
+        value_dim,
+        batch * heads,
+        use_hopper_gdn_config,
+    )
     grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
     _recurrent_delta_rule_decode_kernel[grid](
         packed_qkv,

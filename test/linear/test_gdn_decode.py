@@ -7,12 +7,32 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode
+from attn_gym.linear._delta_rule.decode import _decode_launch_config
 from attn_gym.linear.gdn.ops import recurrent_decode_op
 from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_gdn_decode requires CUDA"
 )
+
+
+@pytest.mark.parametrize(
+    ("value_dim", "sequence_heads", "use_hopper_gdn_config", "expected"),
+    [
+        (32, 128, True, (8, 4)),
+        (128, 8, True, (8, 2)),
+        (128, 96, True, (8, 1)),
+        (128, 104, True, (16, 1)),
+        (128, 96, False, (16, 1)),
+    ],
+)
+def test_decode_launch_config(
+    value_dim: int,
+    sequence_heads: int,
+    use_hopper_gdn_config: bool,
+    expected: tuple[int, int],
+):
+    assert _decode_launch_config(value_dim, sequence_heads, use_hopper_gdn_config) == expected
 
 
 def make_decode_inputs(
@@ -116,6 +136,33 @@ def test_decode_matches_reference(key_heads: int | None, dtype: torch.dtype, sca
     tolerance = 1e-5 if dtype is torch.float32 else 3e-2
     assert output.dtype == dtype and output.shape[0] == 1
     torch.testing.assert_close(output[0].float(), expected_output, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
+
+
+def test_hopper_decode_schedule_matches_reference():
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper-specific decode schedule")
+    inputs = make_decode_inputs(
+        batch=1,
+        heads=8,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.bfloat16,
+    )
+    inputs["state_indices"] = torch.tensor([1], device="cuda", dtype=torch.int32)
+    expected_output, expected_pool = reference_decode(inputs)
+
+    output = recurrent_gdn_decode(
+        inputs["packed_qkv"],
+        inputs["raw_gate"],
+        inputs["raw_beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["state_cache"],
+        inputs["state_indices"],
+    )
+
+    torch.testing.assert_close(output[0].float(), expected_output, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
 
 
