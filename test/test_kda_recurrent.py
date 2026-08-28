@@ -257,7 +257,10 @@ def test_recurrent_grouped_heads_registration():
     beta = beta.repeat_interleave(3, dim=2).contiguous()
     gate = gate.repeat_interleave(3, dim=2).contiguous()
     state = torch.randn(1, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
-    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None, True))
+    torch.library.opcheck(
+        _recurrent_fwd_op,
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+    )
 
 
 @pytest.mark.skipif(not BLACKWELL, reason="chunk_kda requires CUDA capability 10.0")
@@ -316,6 +319,55 @@ def test_chunk_scale_rejects_bool():
         chunk_kda(q, k, v, gate, beta, scale=True, impl="reference")
 
 
+def test_recurrent_scale_override_matches_reference_and_query_prescale():
+    """Use the same host-provided query scale in reference and fused recurrent paths."""
+    q, k, v, gate, beta, state = _inputs(tokens=32, initial_state=True, seed=6)
+    scale, key_dim = 0.25, q.shape[-1]
+    expected = recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        scale=scale,
+        output_final_state=True,
+        impl="reference",
+    )
+    prescaled = recurrent_kda(
+        q * (scale * key_dim**0.5),
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+        impl="reference",
+    )
+    with torch.no_grad():
+        actual = recurrent_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            scale=scale,
+            output_final_state=True,
+        )
+
+    torch.testing.assert_close(expected[0], prescaled[0])
+    torch.testing.assert_close(expected[1], prescaled[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-5)
+
+
+def test_recurrent_scale_rejects_bool():
+    q, k, v, gate, beta, _ = _inputs(tokens=3)
+    with pytest.raises(TypeError, match="scale must be a real scalar"):
+        recurrent_kda(q, k, v, gate, beta, scale=True, impl="reference")
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_recurrent_paged_matches_gather_scatter(packed: bool):
     """Slot indexing equals a native gather, dense scan, and scatter round trip."""
@@ -326,8 +378,17 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     before = pool.clone()
 
+    scale = 0.25
     output, final_state = recurrent_kda(
-        q, k, v, gate, beta, pool, cu_seqlens=cu_seqlens, state_indices=slots
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        state_indices=slots,
     )
 
     assert final_state is None
@@ -338,6 +399,7 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
         v,
         gate * LOG2_E,
         beta,
+        scale=scale,
         initial_state=before[slots.long()],
         output_final_state=True,
         cu_seqlens=cu_seqlens,
@@ -523,17 +585,17 @@ def test_recurrent_custom_op_registration(packed: bool):
     state = torch.randn(num_sequences, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         _recurrent_fwd_op,
-        (q, k, v, gate, beta, state, cu_seqlens, True),
+        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
     )
     torch.library.opcheck(
         _recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, cu_seqlens, True),
+        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
     )
     _, state_pool = strided_state_pool(num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens),
+        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens, q.shape[-1] ** -0.5),
     )
 
 
@@ -545,14 +607,17 @@ def test_recurrent_custom_op_registration_mixed_dtype():
     _, state_pool = strided_state_pool(3, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
 
-    torch.library.opcheck(_recurrent_fwd_op, (q, k, v, gate, beta, state, None, True))
+    torch.library.opcheck(
+        _recurrent_fwd_op,
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+    )
     torch.library.opcheck(
         _recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, None, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
     )
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, None),
+        (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5),
     )
 
 
@@ -561,6 +626,7 @@ def test_recurrent_custom_op_registration_mixed_dtype():
 def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
     """Compile both optional-state branches of the public operation."""
     q, k, v, gate, beta, state = _inputs(initial_state=True)
+    scale = 0.25
 
     expected, expected_state = recurrent_kda(
         q,
@@ -569,6 +635,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         gate,
         beta,
         state,
+        scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
     )
@@ -580,6 +647,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         gate,
         beta,
         state,
+        scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
     )
@@ -598,10 +666,13 @@ def test_recurrent_paged_mixed_dtype_fullgraph_compile():
     compiled_storage, compiled_pool = strided_state_pool(4, q.shape[2], q.shape[3], v.shape[-1])
     compiled_pool.copy_(eager_pool)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    scale = 0.25
 
-    expected, _ = recurrent_kda(q, k, v, gate, beta, eager_pool, state_indices=slots)
+    expected, _ = recurrent_kda(q, k, v, gate, beta, eager_pool, scale=scale, state_indices=slots)
     compiled = torch.compile(recurrent_kda, fullgraph=True)
-    output, final_state = compiled(q, k, v, gate, beta, compiled_pool, state_indices=slots)
+    output, final_state = compiled(
+        q, k, v, gate, beta, compiled_pool, scale=scale, state_indices=slots
+    )
 
     assert output.dtype == q.dtype and final_state is None
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
@@ -616,13 +687,14 @@ def test_recurrent_cuda_graph_replay():
     q, k, v, gate, beta, _ = _inputs(batch=1, tokens=32, seed=5)
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
     initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
-    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, True)
+    scale = 0.25
+    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output, captured_state = _recurrent_fwd_op(
-            q, k, v, gate, beta, initial_state, cu_seqlens, True
+            q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
         )
 
     active_tokens = 23
@@ -635,7 +707,7 @@ def test_recurrent_cuda_graph_replay():
     torch.cuda.synchronize()
 
     expected_output, expected_state = _recurrent_fwd_op(
-        q, k, v, gate, beta, initial_state, cu_seqlens, True
+        q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens],
@@ -651,12 +723,15 @@ def test_recurrent_paged_cuda_graph_replay():
     q, k, v, gate, beta, _ = _inputs(batch=3, tokens=1, dtype=torch.bfloat16, seed=31)
     storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
-    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None)
+    scale = 0.25
+    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None)
+        captured_output = _recurrent_fwd_paged_op(
+            q, k, v, gate, beta, pool, slots, None, None, scale
+        )
 
     with torch.no_grad():
         storage.add_(0.25)
@@ -666,7 +741,9 @@ def test_recurrent_paged_cuda_graph_replay():
     expected_storage = storage.clone()
     state_elements = pool[0].numel()
     expected_pool = expected_storage[:, 11 : 11 + state_elements].view_as(pool)
-    expected, _ = recurrent_kda(q, k, v, gate, beta, expected_pool, state_indices=slots)
+    expected, _ = recurrent_kda(
+        q, k, v, gate, beta, expected_pool, scale=scale, state_indices=slots
+    )
 
     graph.replay()
     torch.cuda.synchronize()

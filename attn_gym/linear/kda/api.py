@@ -241,6 +241,7 @@ def recurrent_kda(
     initial_state: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    scale: float | None = None,
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
@@ -250,7 +251,7 @@ def recurrent_kda(
     """Apply recurrent KDA for decoding and inference prefill.
 
     Args:
-        q: Queries shaped ``[B, T, HK, K]``, scaled by ``1/sqrt(K)`` internally. ``HK``
+        q: Queries shaped ``[B, T, HK, K]``, scaled by ``scale`` internally. ``HK``
             may divide the value head count ``H`` for multi-value attention (MVA): each
             block of ``H // HK`` consecutive value heads shares one query/key head, while
             the gate, beta, and state stay per value head.
@@ -268,6 +269,7 @@ def recurrent_kda(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
             and may end before ``T``.
+        scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output. Rejected
             together with ``state_indices``, which advances the pool in place instead.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence,
@@ -327,6 +329,7 @@ def recurrent_kda(
             raise ValueError("state_indices requires impl='fused'")
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
+    scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
         return _fused_recurrent_forward(
             q,
@@ -336,13 +339,14 @@ def recurrent_kda(
             beta,
             initial_state,
             cu_seqlens=cu_seqlens,
+            scale=scale,
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             autotune=autotune,
         )
     return reference_kda(
-        naive_recurrent_kda,
+        partial(naive_recurrent_kda, scale=scale),
         q,
         k,
         v,
