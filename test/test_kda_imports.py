@@ -55,7 +55,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
         raw_gate = torch.randn(1, 3, 1, 2, requires_grad=True)
         a_log = torch.randn(1, requires_grad=True)
         dt_bias = torch.randn(1, 2, requires_grad=True)
-        gate = bound_gate(raw_gate, a_log, dt_bias, lower_bound=-3.25)
+        gate = bound_gate(raw_gate, a_log, dt_bias, lower_bound=-3.25, impl='reference')
         expected_gate = -3.25 * torch.sigmoid(
             a_log.exp().view(1, 1, 1, 1) * (raw_gate.float() + dt_bias)
         )

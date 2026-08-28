@@ -97,7 +97,7 @@ def bound_gate(
     *,
     lower_bound: float = -5.0,
     fastmath: bool = False,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
 ) -> torch.Tensor:
     """Map projection outputs to bounded per-token natural-log decays.
 
