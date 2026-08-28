@@ -1,6 +1,6 @@
 # Attention Gym
 
-![Attention Gym](assets/hero.png)
+![Attention Gym](assets/hero-friends.jpg)
 
 Attention Gym is a collection of tools and examples for working with PyTorch's [FlexAttention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html) API.
 
