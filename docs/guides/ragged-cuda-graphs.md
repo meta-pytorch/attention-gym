@@ -478,13 +478,15 @@ There are really two separate ways our captured graph can guess too high:
 
 For every complete implementation I also capture an `ideal` graph for the actual `(L, M, max_seqlen)` shape with dashed lines. Comparing the worst-case graph against the `ideal` graph shows how much forward-plus-first-order-backward replay time we lose to extra scheduling capacity. The FA4 persistent-forward series uses exact points for its slowdown denominator but does not draw a separate dashed trace.
 
+Holding {{ capacity_symbol("L") }} fixed while changing {{ capacity_symbol("M") }} also changes the tokens per document and therefore the chunk and tile counts. So its not a perfect isolation of M's effect. The third `constant sequence length` tab tries to isolate this -> every active sequence has 128 tokens while also moving the `actual vs capacity` ratios `M/N=L/T` in lock step. It uses max_seqlen_q=8192 for FA2/FA4 (absolute worst case).
+
 {{ plotly_chart(
     "ragged_attention_overcapture",
     title="Captured versus exact CUDA Graphs under fragmentation and token overcapture",
     height=880,
 ) }}
 
-Measured on B200 as CUDA Graph replay only: pooled p50 of 30 samples with p05-p95 error bars. Capture, allocation, input updates, correctness checks and host dispatch are excluded. The FA2/FA4 `L < T` cases are implementation probes outside the public exact-packed varlen contract; KDA has an explicit fixed-capacity contract.
+Note: the third graph was done on a GB200 vs the B200 - at different power limits.
 
 ### Does this hold E2E
 
