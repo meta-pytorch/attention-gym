@@ -68,11 +68,6 @@ def run_natten(
     return results
 
 
-@pytest.mark.xfail(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
-    reason="tiled NATTEN query gradients mismatch on Hopper (#408)",
-    strict=True,
-)
 def test_natten_masks(
     B=16,
     H=16,
