@@ -37,6 +37,7 @@ def _launch_kda_recurrent_fwd(
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     *,
+    scale: float,
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
@@ -51,7 +52,7 @@ def _launch_kda_recurrent_fwd(
         beta,
         initial_state,
         cu_seqlens,
-        scale=q.shape[-1] ** -0.5,
+        scale=scale,
         gate_kind=GateKind.VECTOR,
         store_final_state=store_final_state,
         state_indices=state_indices,
@@ -68,6 +69,7 @@ def _kda_recurrent_fwd_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    scale: float,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = _launch_kda_recurrent_fwd(
@@ -78,6 +80,7 @@ def _kda_recurrent_fwd_cuda(
         beta,
         initial_state,
         cu_seqlens,
+        scale=scale,
         store_final_state=True,
         autotune=autotune,
     )
@@ -93,6 +96,7 @@ def _kda_recurrent_fwd_no_state_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    scale: float,
     autotune: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
@@ -103,6 +107,7 @@ def _kda_recurrent_fwd_no_state_cuda(
         beta,
         initial_state,
         cu_seqlens,
+        scale=scale,
         store_final_state=False,
         autotune=autotune,
     )[0]
@@ -118,6 +123,7 @@ def _kda_recurrent_fwd_paged_cuda(
     state_indices: torch.Tensor,
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    scale: float,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -127,6 +133,7 @@ def _kda_recurrent_fwd_paged_cuda(
         beta,
         state_cache,
         cu_seqlens,
+        scale=scale,
         store_final_state=True,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
