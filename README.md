@@ -1,6 +1,8 @@
 # Attention Gym
 
-Attention Gym is a collection of helpful tools and examples for working with [flex-attention](https://pytorch.org/docs/main/nn.attention.flex_attention.html#module-torch.nn.attention.flex_attention)
+Attention Gym is a collection of kernels, guides, and examples for
+[FlexAttention](https://pytorch.org/docs/main/nn.attention.flex_attention.html#module-torch.nn.attention.flex_attention)
+and other novel attention variants.
 
 [**📚 Docs**](https://meta-pytorch.github.io/attention-gym/) |
 [**🎯 Features**](#-features) |
@@ -9,16 +11,19 @@ Attention Gym is a collection of helpful tools and examples for working with [fl
 [**🛠️ Dev**](#️-dev) |
 [**🤝 Contributing**](#-contributing) |
 [**⚖️ License**](#️-license)
+
 ## 📖 Overview
 
-This repository aims to provide a playground for experimenting with various attention mechanisms using the FlexAttention API. It includes implementations of different attention variants, performance comparisons, and utility functions to help researchers and developers explore and optimize attention mechanisms in their models.
+Attention Gym began as a library of examples showing the many ways to express attention variants with the
+FlexAttention API. It is growing into a broader playground for attention, with the addition of sparse attention kernels, linear attention APIs for training and inference as well as showcasing how to use FlexAttention and friends in real workloads.
 
-![favorite](https://github.com/user-attachments/assets/3747fd24-1282-4d65-9072-882e55dad0ad)
+![Two new Flexys—Sparse Attention and Linear Attention—enter Attention Gym while the original Flexys train](docs/assets/hero-friends.jpg)
 
 ## 🎯 Features
 
-- Implementations of various attention mechanisms using FlexAttention
-- Reference implementations for linear-attention recurrences
+- FlexAttention masks and score modifications
+- Sparse attention patterns
+- APIs and kernels for efficient GDN and KDA
 - Utility functions for creating and combining attention masks
 - Examples of how to use FlexAttention in real-world scenarios
 
@@ -30,50 +35,41 @@ This repository aims to provide a playground for experimenting with various atte
 
 ### Installation
 
+Install the official wheel from [PyPI](https://pypi.org/project/attn-gym/#files):
+
 ```bash
-git clone https://github.com/meta-pytorch/attention-gym.git
-cd attention-gym
-pip install .
+pip install attn-gym
 ```
+
+The base package intentionally keeps its runtime dependency surface small: it depends only on
+PyTorch (unpinned). Optional features live behind extras, so install only what you need:
+
+```bash
+pip install "attn-gym[linear]"  # Linear-attention APIs and kernels
+pip install "attn-gym[viz]"     # Visualization and example dependencies
+```
+
+> [!WARNING]
+> Attention Gym is under active development. We reserve the right to make
+> backward-incompatible changes between releases. If you depend on a particular API or kernel
+> behavior, hard-pin the version you test, for example:
+> `pip install "attn-gym[linear]==X.Y.Z"`.
 
 ## 💻 Usage
 
-There are two main ways to use Attention Gym:
+Attention Gym supports three complementary workflows:
 
-1. **Run Example Scripts**: Many files in the project can be executed directly to demonstrate their functionality:
-   ```bash
-   python attn_gym/masks/document_mask.py
-   ```
-   These scripts often generate visualizations to help you understand the attention mechanisms.
-
-2. **Import in Your Projects**: You can use Attention Gym components in your own work by importing them:
-   ```python
-   from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-   from attn_gym.masks import generate_sliding_window
-
-   # Use the imported function in your code
-   sliding_window_mask_mod = generate_sliding_window(window_size=1024)
-   block_mask = create_block_mask(sliding_window_mask_mod, 1, 1, S, S, device=device)
-   out = flex_attention(query, key, value, block_mask=block_mask)
-   ```
-
-For comprehensive examples of using FlexAttention in real-world scenarios, explore the `examples/` directory. These end-to-end implementations showcase how to integrate various attention mechanisms into your models.
-
-### Note
-
-Attention Gym is under active development, and we do not currently offer any backward compatibility guarantees. APIs and functionalities may change between versions. We recommend pinning to a specific version in your projects and carefully reviewing changes when upgrading.
-
-## 📁 Structure
-
-Attention Gym is organized for easy exploration of attention mechanisms:
-
-### 🔍 Key Locations
-
-- `attn_gym.masks`: Examples creating `BlockMasks`
-- `attn_gym.mods`: Examples creating `score_mods`
-- `attn_gym.linear`: Reference linear-attention implementations
-- `examples/`: Detailed implementations using FlexAttention
-- `examples/paged_attention`: Paged KV-cache examples using FlexAttention
+1. **Compose FlexAttention building blocks.** Import
+   [`mask_mod`](attn_gym/masks) and [`score_mod`](attn_gym/mods) functions and pass them directly
+   to PyTorch's FlexAttention APIs.
+2. **Use sparse and linear-attention APIs and kernels.** Build with
+   [`selected_attention`](attn_gym/sparse/selected_attention), GDN and KDA chunk, recurrent, and
+   decode paths, and short-convolution primitives. See the
+   [compressed sparse attention](examples/compressed_sparse_attention.py) and
+   [KDA training](examples/kda_training.py) for working examples.
+3. **Run real workloads and benchmarks.** The [`examples/`](examples) directory covers paged,
+   ring, and variable sparse attention, CUDA Graphs, determinism, compilation, and profiling. Most
+   of this should serve as inspiration for fun things you might build from our building blocks :)
 
 ## 🛠️ Dev
 
