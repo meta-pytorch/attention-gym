@@ -148,7 +148,7 @@ def chunk_kda(
             autotune=autotune,
         )
     return reference_kda(
-        partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE, scale=scale),
+        partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE),
         q,
         k,
         v,
@@ -156,6 +156,7 @@ def chunk_kda(
         beta,
         initial_state,
         cu_seqlens,
+        scale,
         output_final_state,
     )
 
@@ -346,7 +347,7 @@ def recurrent_kda(
             autotune=autotune,
         )
     return reference_kda(
-        partial(naive_recurrent_kda, scale=scale),
+        naive_recurrent_kda,
         q,
         k,
         v,
@@ -354,6 +355,7 @@ def recurrent_kda(
         beta,
         initial_state,
         cu_seqlens,
+        scale,
         output_final_state,
     )
 

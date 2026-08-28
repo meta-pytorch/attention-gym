@@ -1,4 +1,4 @@
-"""Validation shared by paged delta-rule operations."""
+"""Structural validation shared by public delta-rule operations."""
 
 from __future__ import annotations
 
@@ -8,6 +8,70 @@ from numbers import Real
 import torch
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def validate_delta_rule_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    *,
+    op_name: str,
+    gate_name: str,
+    vector_gate: bool,
+    allow_grouped_heads: bool,
+) -> None:
+    """Validate structural invariants shared by scalar- and vector-gated delta rules."""
+    if q.ndim != 4:
+        raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
+    batch, tokens, key_heads, key_dim = q.shape
+    if batch == 0 or tokens == 0 or key_heads == 0 or key_dim == 0:
+        raise ValueError(f"q must have nonempty dimensions, got {tuple(q.shape)}")
+    if k.shape != q.shape:
+        raise ValueError(f"k must have shape {tuple(q.shape)}, got {tuple(k.shape)}")
+    if v.ndim != 4 or v.shape[:2] != (batch, tokens) or v.shape[-1] < 1:
+        raise ValueError(f"v must have shape [{batch}, {tokens}, H, V], got {tuple(v.shape)}")
+
+    heads = v.shape[2]
+    grouped_heads = heads != key_heads
+    if grouped_heads and not (allow_grouped_heads and heads != 0 and heads % key_heads == 0):
+        relation = "be a positive multiple of" if allow_grouped_heads else "match"
+        raise ValueError(
+            f"v heads must {relation} q heads for {op_name}, "
+            f"got {heads} value heads for {key_heads} query heads"
+        )
+
+    gate_shape = (batch, tokens, heads, key_dim) if vector_gate else (batch, tokens, heads)
+    if gate.shape != gate_shape:
+        raise ValueError(f"{gate_name} must have shape {gate_shape}, got {tuple(gate.shape)}")
+    if beta.shape != (batch, tokens, heads):
+        raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
+
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed cu_seqlens require q to have batch size one")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
+        if (
+            cu_seqlens.dtype != torch.int32
+            or not cu_seqlens.is_contiguous()
+            or cu_seqlens.device != q.device
+        ):
+            raise ValueError("cu_seqlens must be contiguous int32 on q.device")
+
+    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    expected_state = (state_batch, heads, v.shape[-1], key_dim)
+    if initial_state is not None and initial_state.shape != expected_state:
+        raise ValueError(
+            f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"
+        )
+
+    tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
+    if any(tensor.device != q.device for tensor in tensors[1:]):
+        raise ValueError("all inputs must be on the same device")
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -169,6 +233,7 @@ __all__ = [
     "resolve_decode_out",
     "resolve_scale",
     "validate_decode_inputs",
+    "validate_delta_rule_inputs",
     "validate_has_initial_state",
     "validate_paged_state",
 ]
