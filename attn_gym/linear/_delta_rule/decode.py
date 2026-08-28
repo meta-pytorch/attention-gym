@@ -50,14 +50,25 @@ class GateTransform(Enum):
 
 
 def _decode_launch_config(
-    value_dim: int, sequence_heads: int, use_hopper_gdn_config: bool
+    value_dim: int,
+    sequence_heads: int,
+    hopper_gate_kind: GateKind | None,
 ) -> tuple[int, int]:
     """Select the value tile and warp count for one-token decode."""
     if value_dim <= 32:
         return min(triton.next_power_of_2(value_dim), 8), 4
-    # H100 measurements become inconclusive above 96 sequence-heads.
-    block_v = 8 if use_hopper_gdn_config and sequence_heads < 104 else 16
-    return min(triton.next_power_of_2(value_dim), block_v), 2 if sequence_heads <= 8 else 1
+    if hopper_gate_kind is GateKind.SCALAR:
+        # The H100 scalar-gate crossover is between 96 and 104 sequence-heads.
+        block_v = 8 if sequence_heads < 104 else 16
+        num_warps = 2 if sequence_heads <= 8 else 1
+    elif hopper_gate_kind is GateKind.VECTOR:
+        # Vector gates move the H100 crossover between 224 and 232 sequence-heads.
+        block_v = 8 if sequence_heads < 232 else 16
+        num_warps = 1
+    else:
+        block_v = 16
+        num_warps = 2 if sequence_heads <= 8 else 1
+    return min(triton.next_power_of_2(value_dim), block_v), num_warps
 
 
 # Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
@@ -222,16 +233,17 @@ def launch_recurrent_delta_rule_decode(
     batch = packed_qkv.shape[0]
     heads, value_dim, key_dim = state_cache.shape[1:]
     assert key_heads > 0 and heads % key_heads == 0
-    use_hopper_gdn_config = (
-        get_device_properties(packed_qkv.device).major == 9
+    hopper_gate_kind = (
+        gate_kind
+        if get_device_properties(packed_qkv.device).major == 9
         and packed_qkv.dtype is torch.bfloat16
         and key_dim == value_dim == 128
-        and gate_kind is GateKind.SCALAR
+        else None
     )
     block_v, num_warps = _decode_launch_config(
         value_dim,
         batch * heads,
-        use_hopper_gdn_config,
+        hopper_gate_kind,
     )
     grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
     _recurrent_delta_rule_decode_kernel[grid](
