@@ -252,6 +252,10 @@ def test_bound_gate_operator_registration():
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="the fused chunk KDA core requires CUDA capability 10.0 or newer",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_chunk_gate_range_boundary_is_finite(dtype):
     """Exercise the strongest documented per-token decay accepted by the fused rebase."""
