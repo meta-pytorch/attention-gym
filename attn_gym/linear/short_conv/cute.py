@@ -2895,6 +2895,24 @@ def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfi
     return ShortConvConfig(config.threads, channels_per_thread, config.times_per_block)
 
 
+def _default_decode_config(x: torch.Tensor, width: int, activation: str | None) -> ShortConvConfig:
+    """Select the measured one-token schedule for the active architecture."""
+    default = ShortConvTunedConfig.default(x.dtype).forward
+    if (
+        get_device_properties(x.device).major == 9
+        and x.dtype is torch.bfloat16
+        and width == 4
+        and activation == "silu"
+    ):
+        # Narrower channel ownership gives Qwen's small H100 decode grids more CTAs.
+        default = ShortConvConfig(
+            default.threads,
+            1 if x.shape[0] <= 8 else 2,
+            default.times_per_block,
+        )
+    return _compatible_config(default, x.shape[1])
+
+
 def _candidate_configs(
     kind: str,
     channels: int,
@@ -3232,7 +3250,7 @@ def _cute_short_conv_decode_cuda(
 ) -> torch.Tensor:
     """Launch the tuned forward defaults through the decode schema."""
     _validate_decode_inputs(x, weight, state, state_indices)
-    config = _compatible_config(ShortConvTunedConfig.default(x.dtype).forward, x.shape[1])
+    config = _default_decode_config(x, weight.shape[1], activation)
     return _launch_decode(
         x,
         weight,
@@ -3974,21 +3992,19 @@ def causal_conv1d_decode(
             "causal_conv1d_decode is inference-only and has no backward; use "
             "causal_conv1d for training or call under torch.no_grad()"
         )
-    default = ShortConvTunedConfig.default(x.dtype).forward
-    config = _compatible_config(default, x.shape[1]) if forward_config is None else forward_config
-    _validate_config(config, x.shape[1], "forward_config")
-    if forward_config is None and config == default:
+    if forward_config is None:
         return short_conv_ops.short_conv_decode_op(
             x, weight, state, state_indices, activation=activation
         )
+    _validate_config(forward_config, x.shape[1], "forward_config")
     return short_conv_ops.short_conv_configured_decode_op(
         x,
         weight,
         state,
         state_indices,
-        config.threads,
-        config.channels_per_thread,
-        config.times_per_block,
+        forward_config.threads,
+        forward_config.channels_per_thread,
+        forward_config.times_per_block,
         activation=activation,
     )
 

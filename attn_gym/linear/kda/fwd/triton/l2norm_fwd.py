@@ -6,18 +6,13 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": 16}, num_warps=4, num_stages=3),
-    ],
-    key=["D", "NB"],
-)
 @triton.jit
 def l2norm_fwd_kernel(
     x,
@@ -33,7 +28,6 @@ def l2norm_fwd_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB,
     NUM_SEQUENCES: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
@@ -81,6 +75,15 @@ def l2norm_fwd_kernel(
     )
 
 
+def _l2norm_launch_config(rows: int, use_hopper_decode_config: bool) -> tuple[int, int]:
+    """Select the rows per program and warp count for L2 normalization."""
+    if not use_hopper_decode_config or rows > 2048:
+        return 16, 4
+    if rows <= 9:
+        return 1, 1
+    return 4, 2
+
+
 torch.library.define(
     "attn_gym::kda_l2norm_fwd",
     "(Tensor x, float eps, Tensor? cu_seqlens=None) -> (Tensor, Tensor)",
@@ -100,8 +103,15 @@ def _l2norm_fwd_cuda(
     output = torch.empty(rows, head_dim, dtype=x.dtype, device=x.device)
     rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
     block_dim = triton.next_power_of_2(head_dim)
-    grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
-    l2norm_fwd_kernel[grid](
+    use_hopper_decode_config = (
+        get_device_properties(x.device).major == 9
+        and x.dtype is torch.bfloat16
+        and head_dim == 128
+        and cu_seqlens is not None
+        and cu_seqlens.shape[0] == tokens + 1
+    )
+    block_tokens, num_warps = _l2norm_launch_config(rows, use_hopper_decode_config)
+    l2norm_fwd_kernel[(triton.cdiv(rows, block_tokens),)](
         x,
         output,
         rstd,
@@ -115,9 +125,11 @@ def _l2norm_fwd_cuda(
         H=heads,
         D=head_dim,
         BD=block_dim,
-        NB=triton.cdiv(rows, 16),
         NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         IS_VARLEN=cu_seqlens is not None,
+        BT=block_tokens,
+        num_warps=num_warps,
+        num_stages=3,
     )
     return output.view_as(x), rstd
 
