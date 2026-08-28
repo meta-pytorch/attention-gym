@@ -1816,6 +1816,39 @@ def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs
     torch.testing.assert_close(state, expected_final, rtol=0, atol=0)
 
 
+def test_short_conv_decode_advances_strided_state_slots(paged_short_conv_inputs):
+    """Address slots in a page-padded state pool without touching the padding."""
+    torch.manual_seed(2)
+    x, weight, compact_state, slots = paged_short_conv_inputs()
+    num_slots, state_rows, channels = compact_state.shape
+    num_state_elements = state_rows * channels
+    alignment_elements = 16 // compact_state.element_size()
+    padding = alignment_elements - num_state_elements % alignment_elements
+    storage = torch.randn(
+        num_slots,
+        num_state_elements + padding,
+        device=compact_state.device,
+        dtype=compact_state.dtype,
+    )
+    state = storage[:, :num_state_elements].view(num_slots, state_rows, channels)
+    state.copy_(compact_state)
+    initial_storage = storage.clone()
+    history = torch.cat([state[slots.long()].clone(), x.unsqueeze(1)], dim=1)
+
+    actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    expected_state = initial_storage[:, :num_state_elements].view_as(state)
+    expected_state[slots.long()] = history[:, 1:]
+    torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        storage[:, num_state_elements:],
+        initial_storage[:, num_state_elements:],
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_short_conv_decode_ignores_padding_slots(paged_short_conv_inputs):
     x, weight, state, slots = paged_short_conv_inputs()
     slots.copy_(torch.tensor([3, 0, -1], device="cuda", dtype=torch.int32))
