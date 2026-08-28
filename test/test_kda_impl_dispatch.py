@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear import Impl, chunk_kda, recurrent_kda
+from attn_gym.linear import Impl, KernelOptions, chunk_kda, recurrent_kda
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
 
@@ -182,6 +182,32 @@ def test_chunk_reference_supports_any_head_dim():
     assert output.shape == v.shape and state.shape == (2, 2, 48, 48)
     with pytest.raises(ValueError, match="128"):
         chunk_kda(q, k, v, gate, beta, impl="fused")
+
+
+def test_chunk_kernel_options_plumbing():
+    """Expose a typed extension point without silently accepting unknown options."""
+    q, k, v, gate, beta = _inputs(tokens=8)
+    options: KernelOptions = {}
+    expected, _ = chunk_kda(q, k, v, gate, beta, impl="reference")
+    actual, _ = chunk_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        impl="reference",
+        kernel_options=options,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="no chunk_kda kernel options"):
+        chunk_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            kernel_options={"BACKEND": "MEGA"},  # type: ignore[typeddict-unknown-key]
+        )
 
 
 def test_chunk_reference_rejects_fastmath():
