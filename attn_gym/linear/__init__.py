@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from attn_gym.linear.gdn import chunk_gdn, recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear.kda import (
+    KernelOptions,
     active_token_mask,
     chunk_kda,
     mask_inactive_token_gradients,
@@ -49,6 +50,7 @@ GDN_OPS = [
 # Model-agnostic building blocks.
 GENERIC_OPS = [
     "Impl",
+    "KernelOptions",
     "active_token_mask",
     "causal_conv1d",
     "causal_conv1d_decode",

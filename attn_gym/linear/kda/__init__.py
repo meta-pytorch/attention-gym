@@ -15,6 +15,7 @@ and the naive oracles in
 import importlib
 
 from attn_gym.linear.kda.api import (
+    KernelOptions,
     chunk_kda,
     paged_chunk_kda,
     recurrent_kda,
@@ -50,6 +51,7 @@ def __getattr__(name: str):
 
 __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
     [
+        "KernelOptions",
         "MAX_GATE_LOWER_BOUND_MAGNITUDE",
         "active_token_mask",
         "bound_gate",

@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from functools import partial
 from numbers import Real
-from typing import Literal
+from typing import Literal, TypedDict
 
 import torch
 
@@ -43,6 +43,10 @@ _DECODE_GATE_TRANSFORMS = {
 }
 
 
+class KernelOptions(TypedDict, total=False):
+    """Backend-specific controls for :func:`chunk_kda`."""
+
+
 def _resolve_decode_gate_transform(gate_transform: str) -> bool:
     try:
         return _DECODE_GATE_TRANSFORMS[gate_transform]
@@ -67,6 +71,7 @@ def chunk_kda(
     fastmath: bool = False,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply chunk-parallel KDA for training and prefill.
 
@@ -101,12 +106,19 @@ def chunk_kda(
         impl: ``"fused"`` uses the Blackwell kernels with first-order autograd;
             ``"reference"`` uses differentiable eager PyTorch in FP32, with no
             automatic fallback.
+        kernel_options: Backend-specific options. This is a sneaky BC trick.
+            It is annoying to have a bunch of kwargs that its hard to know when they apply
+            but, this trick allows us to add new options without breaking the API. I will
+            do my best to add new options by providing a nice typed dict and hopefully
+            your agent will now how to use this and be able to find the right option to wiggle.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
         per logical sequence or ``None``.
     """
     selected_impl = resolve_impl(impl)
+    if kernel_options:
+        raise ValueError("no chunk_kda kernel options are currently supported")
     if selected_impl is Impl.REFERENCE and fastmath:
         raise ValueError("fastmath applies only to impl='fused'")
     validate_kda_inputs(
@@ -461,4 +473,11 @@ def recurrent_kda_decode(
     )
 
 
-__all__ = ["Impl", "chunk_kda", "paged_chunk_kda", "recurrent_kda", "recurrent_kda_decode"]
+__all__ = [
+    "Impl",
+    "KernelOptions",
+    "chunk_kda",
+    "paged_chunk_kda",
+    "recurrent_kda",
+    "recurrent_kda_decode",
+]
