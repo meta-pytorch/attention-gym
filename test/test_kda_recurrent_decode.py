@@ -160,6 +160,36 @@ def test_recurrent_decode_matches_reference(
     torch.testing.assert_close(state_cache, expected_cache, rtol=tolerance, atol=tolerance)
 
 
+def test_hopper_vector_gate_schedule_matches_reference():
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Hopper-specific decode schedule")
+    inputs = _decode_inputs(batch=1, heads=16, key_dim=128, value_dim=128)
+    packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
+    before = state_cache.clone()
+
+    output = recurrent_kda_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+    )
+    expected, expected_cache = _reference_decode(
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        before,
+        state_indices,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(state_cache, expected_cache, rtol=3e-2, atol=3e-2)
+
+
 def test_decode_launcher_grouped_vector_gate_matches_expanded():
     """Grouped vector-gate decode shares only q/k; the gate stays per value head.
 

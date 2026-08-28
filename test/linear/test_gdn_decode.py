@@ -8,6 +8,7 @@ pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear._delta_rule.decode import _decode_launch_config
+from attn_gym.linear._delta_rule.recurrent import GateKind
 from attn_gym.linear.gdn.ops import recurrent_decode_op
 from attn_gym.testing import strided_state_pool
 
@@ -17,22 +18,24 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    ("value_dim", "sequence_heads", "use_hopper_gdn_config", "expected"),
+    ("value_dim", "sequence_heads", "hopper_gate_kind", "expected"),
     [
-        (32, 128, True, (8, 4)),
-        (128, 8, True, (8, 2)),
-        (128, 96, True, (8, 1)),
-        (128, 104, True, (16, 1)),
-        (128, 96, False, (16, 1)),
+        (32, 128, GateKind.SCALAR, (8, 4)),
+        (128, 8, GateKind.SCALAR, (8, 2)),
+        (128, 96, GateKind.SCALAR, (8, 1)),
+        (128, 104, GateKind.SCALAR, (16, 1)),
+        (128, 224, GateKind.VECTOR, (8, 1)),
+        (128, 232, GateKind.VECTOR, (16, 1)),
+        (128, 96, None, (16, 1)),
     ],
 )
 def test_decode_launch_config(
     value_dim: int,
     sequence_heads: int,
-    use_hopper_gdn_config: bool,
+    hopper_gate_kind: GateKind | None,
     expected: tuple[int, int],
 ):
-    assert _decode_launch_config(value_dim, sequence_heads, use_hopper_gdn_config) == expected
+    assert _decode_launch_config(value_dim, sequence_heads, hopper_gate_kind) == expected
 
 
 def make_decode_inputs(
