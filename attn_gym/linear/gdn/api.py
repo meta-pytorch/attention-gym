@@ -63,6 +63,7 @@ def chunk_gdn(
     if selected_impl is Impl.FUSED:
         raise NotImplementedError("chunk_gdn impl='fused' is not implemented yet")
 
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
     return reference_gdn(
         chunk_forward,
         q,
@@ -70,7 +71,7 @@ def chunk_gdn(
         v,
         gate,
         beta,
-        scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        scale=scale,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         output_final_state=output_final_state,
