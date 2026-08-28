@@ -329,10 +329,10 @@ def test_fused_recurrent_registration(output_final_state: bool):
     )
 
 
-def test_fused_recurrent_default_autotune():
+def test_recurrent_defaults_to_fused():
     inputs = make_inputs(batch=1, tokens=3)
     with torch.no_grad():
-        output, _ = recurrent_gdn(*inputs, impl=Impl.FUSED)
+        output, _ = recurrent_gdn(*inputs)
     assert torch.isfinite(output).all()
 
 

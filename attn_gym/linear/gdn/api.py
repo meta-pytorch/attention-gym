@@ -92,7 +92,7 @@ def recurrent_gdn(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 

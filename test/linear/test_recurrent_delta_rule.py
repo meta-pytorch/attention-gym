@@ -105,6 +105,7 @@ def test_scalar_gate_matches_recurrent_gdn(
             state,
             scale=scale,
             output_final_state=return_final_state,
+            impl="reference",
         )
         output, final_state = _launch_scalar_gdn(
             query,
@@ -132,6 +133,7 @@ def test_scalar_gate_matches_recurrent_gdn(
             scale=scale,
             initial_state=None if state is None else state.double(),
             output_final_state=return_final_state,
+            impl="reference",
         )
         assert_matches_low_precision_reference(output, high_precision[0], expected[0], "output")
         if return_final_state:
