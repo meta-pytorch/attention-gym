@@ -560,7 +560,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
 
             x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
-            state_groups = cute.zipped_divide(state, (1, self.channels_per_thread))
+            state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
 
             if active:
                 weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
@@ -570,13 +570,12 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                             weight[channel + channel_offset, tap]
                         )
 
-                history_base = slot * (self.width - 1)
                 taps = cute.make_rmem_tensor(
                     (self.channels_per_thread, self.width), self.dtype.cute_type
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
                     taps[(None, row)].store(
-                        state_groups[((0, None), (history_base + row, channel_group))].load()
+                        state_groups[((0, 0, None), (slot, row, channel_group))].load()
                     )
                 taps[(None, self.width - 1)].store(
                     x_groups[((0, None), (sequence, channel_group))].load()
@@ -588,7 +587,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                     )
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
-                    state_groups[((0, None), (history_base + row, channel_group))].store(
+                    state_groups[((0, 0, None), (slot, row, channel_group))].store(
                         taps[(None, row + 1)].load()
                     )
             else:
@@ -2711,8 +2710,12 @@ def _validate_decode_inputs(
     expected_state = (slots, weight.shape[1] - 1, channels)
     if slots < 1 or state.ndim != 3 or state.shape != expected_state:
         raise ValueError(f"state must have shape {expected_state}, got {tuple(state.shape)}")
-    if state.dtype != x.dtype or state.device != x.device or not state.is_contiguous():
-        raise ValueError("state must match x dtype and be contiguous on x.device")
+    if state.dtype != x.dtype or state.device != x.device:
+        raise ValueError("state must match x dtype and be on x.device")
+    if state.stride()[1:] != (channels, 1):
+        raise ValueError("state must be contiguous within each [W - 1, C] slot")
+    if state.stride(0) < (weight.shape[1] - 1) * channels:
+        raise ValueError("state slots must not overlap")
 
     if state_indices is not None and (
         tuple(state_indices.shape) != (sequences,)
@@ -3118,6 +3121,20 @@ def _fake_state_indices(paged: bool):
     )
 
 
+def _fake_decode_state(dtype: ShortConvDType, width: int, channels: int):
+    """Create a state pool with a dynamic slot stride and compact slot contents."""
+    return cute.runtime.make_fake_tensor(
+        dtype.cute_type,
+        (cute.sym_int32(), width - 1, channels),
+        stride=(
+            cute.sym_int64(),
+            channels,
+            1,
+        ),
+        assumed_align=16,
+    )
+
+
 @jit_cache
 def _compile_decode(
     channels: int,
@@ -3134,7 +3151,7 @@ def _compile_decode(
         _fake_dynamic_rows(dtype, channels),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels),
-        _fake_dynamic_rows(dtype, channels),
+        _fake_decode_state(dtype, width, channels),
         _fake_state_indices(paged),
     )
 
@@ -3166,7 +3183,7 @@ def _launch_decode(
         state_indices is not None,
         resolved_activation,
     )
-    compiled(x, weight, output, state.flatten(0, 1), state_indices)
+    compiled(x, weight, output, state, state_indices)
     return output
 
 
@@ -3934,9 +3951,9 @@ def causal_conv1d_decode(
         state: Causal history ``[num_slots, W - 1, C]`` holding each slot's trailing
             ``W - 1`` inputs, oldest first -- the layout :func:`causal_conv1d` takes as
             ``initial_state`` and returns as its final state. Advanced **in place**: the
-            rows shift left and ``x`` becomes the newest. Its storage must be contiguous
-            and 16-byte aligned, since the launcher cannot realign it without losing the
-            update.
+            rows shift left and ``x`` becomes the newest. Each slot must be contiguous,
+            but padding between slots is supported. The storage must be 16-byte aligned,
+            since the launcher cannot realign it without losing the update.
         activation: Any name registered with :func:`register_activation`, or ``None``.
         state_indices: Optional contiguous int32 slot indices, one per sequence, selecting
             rows of a paged ``state`` pool. Without them, sequence ``i`` uses slot ``i``.
