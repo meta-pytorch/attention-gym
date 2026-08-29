@@ -89,6 +89,29 @@ Implements a generic single-node ring-attention example launched with `torchrun`
 torchrun --standalone --nproc_per_node=4 examples/ring_attention.py --seq-len 131072
 ```
 
+## KDA Context Parallelism
+
+[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
+— Build packed KDA context parallelism from native CuTeDSL affine-summary kernels and PyTorch
+distributed collectives.
+
+The default backend computes forward and reverse `[bias; transition]` state summaries with Blackwell
+TMA/UMMA kernels; the reverse scan uses persistent work scheduling. It all-gathers only summaries
+for sequence fragments crossing rank boundaries, then runs the ordinary local KDA forward or
+backward once with the composed boundary state. A contiguous rank boundary is one cut in the packed
+token stream, so it can split at most one logical sequence. Each rank therefore exchanges at most
+one fixed-size forward summary and one reverse summary, independent of how many complete local
+sequences it owns. The `--summary-backend public` option retains the zero/identity-probe formulation
+as a correctness oracle. The example validates local outputs, global endpoint states, and gradients
+against an unsharded execution; it can also capture forward, NCCL communication, and backward in
+one CUDA Graph and validate a changed-input replay.
+
+```bash
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
+
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
+```
+
 ## Kernel Tuning
 
 ### Autotune Replay
