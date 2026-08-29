@@ -43,7 +43,7 @@ halves of the I/O dtype and accumulated in two UMMA passes. The A operands
 
 Limitations:
   - B=1, dense complete chunks only (``T % 64 == 0``), fixed K=V=128, BT=64.
-  - Contiguous inputs with an int32-addressable ABI; SM100 (tcgen05) only.
+  - Contiguous inputs; SM100 (tcgen05) only.
 """
 
 # NOTE: no `from __future__ import annotations` — cute.struct requires
@@ -75,6 +75,11 @@ DATA_ALIGN_BYTES = 16
 
 _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
+
+
+def _aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize the uncommon contiguous view that misses the TMA alignment."""
+    return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
 
 
 @cute.jit
@@ -148,13 +153,20 @@ class _AffineSummaryFwdOp:
     WARP_SZ = cute.arch.WARP_SIZE
     CTA_THREADS = WarpRole.END * WARP_SZ
 
-    def __init__(self, dtype_name: str, heads: int, state_bn: int):
+    def __init__(
+        self,
+        dtype_name: str,
+        heads: int,
+        state_bn: int,
+        use_int64_offsets: bool,
+    ):
         assert state_bn in (32, 64), f"state_bn must be 32 or 64, got {state_bn}"
         assert SUMMARY_DIM % state_bn == 0
         self.dtype_name = dtype_name
         self.io_type = _CUTE_IO_TYPES[dtype_name]
         self.heads = heads
         self.BN = state_bn
+        self.use_int64_offsets = use_int64_offsets
 
         # MMA tile shapes (M, N, K).
         # MMA1: w @ X -> wx — w is (BT, K) K-major, X is (K, BN) snapshot in SMEM.
@@ -177,7 +189,10 @@ class _AffineSummaryFwdOp:
 
     def get_name(self) -> str:
         """Return a stable profiler and artifact name for this specialization."""
-        return f"delta_affine_summary_fwd_h{self.heads}_bn{self.BN}_{self.dtype_name}"
+        return (
+            f"delta_affine_summary_fwd_h{self.heads}_bn{self.BN}_{self.dtype_name}"
+            f"_i64{int(self.use_int64_offsets)}"
+        )
 
     # ------------------------------------------------------------------
     # Host-side setup (__call__): GMEM views → MMA → TMA → SMEM → launch
@@ -950,7 +965,12 @@ class _AffineSummaryFwdOp:
 
 
 @jit_cache
-def _compile_affine_summary(dtype_name: str, heads: int, state_bn: int):
+def _compile_affine_summary(
+    dtype_name: str,
+    heads: int,
+    state_bn: int,
+    use_int64_offsets: bool,
+):
     """Compile one dtype/head-count specialization from fake tensors."""
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
@@ -958,7 +978,8 @@ def _compile_affine_summary(dtype_name: str, heads: int, state_bn: int):
             f"affine_summary_fwd requires an SM100 (CUDA capability >= 10.0) target; "
             f"got target={target}"
         )
-    tokens = cute.sym_int(divisibility=BT)
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens = sym_int(divisibility=BT)
 
     def factor(dtype, last_dim: int):
         return make_fake_compact_tensor(
@@ -976,7 +997,7 @@ def _compile_affine_summary(dtype_name: str, heads: int, state_bn: int):
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
-        _AffineSummaryFwdOp(dtype_name, heads, state_bn),
+        _AffineSummaryFwdOp(dtype_name, heads, state_bn, use_int64_offsets),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, VAL_DIM),
@@ -1004,8 +1025,8 @@ def build_state_summary(
         FP32 tensor of shape ``[H, 256, 128]``, V-first packed as state bias then
         state transition for ``H_out = H_in @ transition + bias``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous int32-addressable
-    inputs, SM100. A partial final chunk is neutral-padded by the wrapper.
+    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous inputs on SM100.
+    A partial final chunk is neutral-padded by the wrapper.
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
@@ -1040,9 +1061,7 @@ def build_state_summary(
     for name, tensor in (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate)):
         assert tensor.device == kg.device, f"{name} must be on {kg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-        assert tensor.data_ptr() % DATA_ALIGN_BYTES == 0, (
-            f"{name} data pointer must be {DATA_ALIGN_BYTES}-byte aligned"
-        )
+    kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
     pad = (-tokens) % BT
     if pad:
         padding = (0, 0, 0, 0, 0, pad)
@@ -1054,15 +1073,15 @@ def build_state_summary(
             ),
             dim=1,
         )
-    assert not requires_int64_abi(kg, w, u, cumulative_gate, out), (
-        "build_state_summary currently requires int32-addressable tensors"
-    )
+    use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, out)
 
     # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
     # BN=64 only when the extra column tiles would spill past one CTA wave and
     # serialize whole recurrence chains.
     sm_count = get_device_properties(kg.device).multi_processor_count
     state_bn = 32 if heads * (SUMMARY_DIM // 32) <= sm_count else 64
-    compiled = _compile_affine_summary(_IO_TYPE_NAMES[kg.dtype], heads, state_bn)
+    compiled = _compile_affine_summary(
+        _IO_TYPE_NAMES[kg.dtype], heads, state_bn, use_int64_offsets
+    )
     compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), out)
     return out
