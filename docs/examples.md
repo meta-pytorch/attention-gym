@@ -103,12 +103,16 @@ token stream, so it can split at most one logical sequence. Each rank therefore 
 one fixed-size forward summary and one reverse summary, independent of how many complete local
 sequences it owns. The example validates local outputs, global endpoint states, and gradients
 against an unsharded execution; it can also capture forward, NCCL communication, and backward in
-one CUDA Graph and validate a changed-input replay.
+one CUDA Graph and validate a changed-input replay. Add `--profile` to export a Chrome trace for
+each rank; when transformer-nuggets is installed, the example also writes one merged multi-rank
+trace.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
 
 torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
+
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --profile
 ```
 
 ## Kernel Tuning

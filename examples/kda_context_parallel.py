@@ -5,8 +5,9 @@ Each rank owns an equal contiguous token shard. Launch with:
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 
 Add ``--cuda-graph`` to capture forward and backward together and validate a replay with
-changed inputs. The example requires one Blackwell GPU per rank because the fused KDA backend
-currently targets SM100 or newer.
+changed inputs. Add ``--profile`` to export per-rank Chrome traces and, when
+transformer-nuggets is installed, a merged trace. The example requires one Blackwell GPU per rank
+because the fused KDA backend currently targets SM100 or newer.
 """
 
 from __future__ import annotations
@@ -15,9 +16,13 @@ import argparse
 import bisect
 import gc
 import os
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from importlib import import_module
+from importlib.util import find_spec
 from itertools import accumulate, pairwise
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -65,6 +70,30 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True):
         annotation = mark_kernels(name, backward=backward)
     with torch.profiler.record_function(name), annotation:
         yield
+
+
+@contextmanager
+def profile_trace(
+    enabled: bool,
+    path: Path,
+    rank: int,
+) -> Iterator[torch.profiler.profile | None]:
+    """Export one rank's trace, preferring transformer-nuggets when installed."""
+    if not enabled:
+        yield None
+        return
+
+    if find_spec("transformer_nuggets") is not None:
+        profiler = import_module("transformer_nuggets.utils.benchmark").profiler
+        with profiler(path, record_shapes=True) as active_profiler:
+            yield active_profiler
+        return
+
+    rank_path = path.with_name(f"{path.stem}_rank_{rank}.json")
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities, record_shapes=True) as active_profiler:
+        yield active_profiler
+    active_profiler.export_chrome_trace(str(rank_path))
 
 
 # NOTE [One crossing sequence per contiguous rank boundary]
@@ -429,6 +458,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Capture forward and backward and validate a changed-input replay.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Export per-rank Chrome traces and a merged transformer-nuggets trace.",
+    )
     return parser.parse_args()
 
 
@@ -523,6 +557,40 @@ def main() -> None:
             gradients = torch.autograd.grad(loss, inputs)
         return output, final_state, gradients
 
+    profile_mode = "cuda_graph" if args.cuda_graph else "eager"
+    profile_path = Path(
+        f"kda_context_parallel_{profile_mode}_w{world_size}_t{tokens}_h{args.heads}"
+    ).resolve()
+
+    def record_profile(step: Callable[[], object], label: str) -> None:
+        """Capture one synchronized distributed step and merge rank traces when possible."""
+        dist.barrier()
+        with profile_trace(args.profile, profile_path, rank) as active_profiler:
+            with torch.profiler.record_function(f"cp/rank_{rank}/{label}"):
+                step()
+            torch.cuda.synchronize(device)
+            if active_profiler is not None:
+                active_profiler.step()
+        dist.barrier()
+
+        rank_path = profile_path.with_name(f"{profile_path.stem}_rank_{rank}.json")
+        if find_spec("transformer_nuggets") is None:
+            print(f"rank {rank}: profile={rank_path}", flush=True)
+        elif rank == 0:
+            merge_traces = import_module("transformer_nuggets.utils.merge_traces").merge_traces
+            merged_path = profile_path.with_name(f"{profile_path.stem}_merged.json.gz")
+            merge_traces(
+                [
+                    str(profile_path.with_name(f"{profile_path.stem}_rank_{index}.json"))
+                    for index in range(world_size)
+                ],
+                str(merged_path),
+                labels=[f"Rank {index} · GPU {index}" for index in range(world_size)],
+                align_timestamps=False,
+            )
+            print(f"profile={merged_path}", flush=True)
+        dist.barrier()
+
     output, final_state, gradients = run(local_inputs)
     global_reference_inputs = tuple(
         tensor.detach().clone().requires_grad_() for tensor in global_inputs
@@ -590,10 +658,15 @@ def main() -> None:
             torch.testing.assert_close(graph_state, eager_state, atol=0.15, rtol=0.15)
             for replayed, expected in zip(graph_gradients, eager_gradients, strict=True):
                 torch.testing.assert_close(replayed, expected, atol=0.15, rtol=0.15)
+            if args.profile:
+                record_profile(graph.replay, "cuda_graph_replay")
         finally:
             torch.cuda.synchronize(device)
             graph.reset()
             gc.collect()
+    elif args.profile:
+        profile_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in local_inputs)
+        record_profile(lambda: run(profile_inputs), "iteration")
 
     mode = " with CUDA Graph replay" if args.cuda_graph else ""
     print(f"rank {rank}: packed KDA CP passed{mode}", flush=True)
