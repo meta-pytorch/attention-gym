@@ -49,6 +49,20 @@ _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
 
 
+@cute.jit
+def _sequence_feature_head_batch_view(tensor):
+    """Re-rank ``[B,T,H,D]`` as ``[T,D,(H,B)]`` for a TMA operand."""
+    layout = cute.group_modes(cute.select(tensor.layout, mode=[1, 3, 2, 0]), 2, 4)
+    return cute.make_tensor(tensor.iterator, layout)
+
+
+@cute.jit
+def _feature_sequence_head_batch_view(tensor):
+    """Re-rank ``[B,T,H,D]`` as ``[D,T,(H,B)]`` for a TMA operand."""
+    layout = cute.group_modes(cute.select(tensor.layout, mode=[3, 1, 2, 0]), 2, 4)
+    return cute.make_tensor(tensor.iterator, layout)
+
+
 class WarpRole(IntEnum):
     """Warp-role boundaries in the persistent summary kernel."""
 
@@ -111,17 +125,20 @@ class BlackwellDeltaAffineSummaryRev:
         self,
         num_heads: int,
         io_type: type[cutlass.Numeric],
-        head_bn: int,
+        state_tile_width: int,
     ):
-        assert head_bn in (16, 32), f"BN must be 16 or 32, got {head_bn}"
+        # This limits columns handled by one CTA, not the number of attention heads.
+        assert state_tile_width in (16, 32), (
+            f"state tile width must be 16 or 32, got {state_tile_width}"
+        )
         self.num_heads = num_heads
         self.io_type = io_type
         self.acc_type = cutlass.Float32
         self.BT = BT
         self.BK = KEY_DIM
-        self.BN = head_bn
+        self.BN = state_tile_width
 
-        self.state_regs = 128 if head_bn == 16 else 160
+        self.state_regs = 128 if state_tile_width == 16 else 160
         self.aux_regs = 40
 
         self.dv_tile = (self.BT, self.BN, self.BK)
@@ -129,7 +146,7 @@ class BlackwellDeltaAffineSummaryRev:
         self.aqdo_tile = (self.BT, self.BN, self.BT)
         self.wdv_tile = (self.BK, self.BN, self.BT)
 
-        self.k_depth = 6 if head_bn == 16 else 4
+        self.k_depth = 6 if state_tile_width == 16 else 4
         self.q_depth = 2
         self.do_depth = 2
         self.w_depth = 2
@@ -166,28 +183,23 @@ class BlackwellDeltaAffineSummaryRev:
         stream: cuda.CUstream,
     ):
         """Construct TMA/UMMA descriptors and launch the persistent kernel."""
-        g_k = cute.make_tensor(
-            kg.iterator,
-            cute.group_modes(cute.select(kg.layout, mode=[1, 3, 2, 0]), 2, 4),
-        )
-        g_qt = cute.make_tensor(
-            qg.iterator,
-            cute.group_modes(cute.select(qg.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
-        g_wt = cute.make_tensor(w.iterator, g_qt.layout)
-        g_gate = cute.make_tensor(
-            cumulative_gate.iterator,
-            cute.group_modes(cute.select(cumulative_gate.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
-        g_do = cute.make_tensor(
-            dout.iterator,
-            cute.group_modes(cute.select(dout.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
-        g_aqk = cute.make_tensor(
-            aqk.iterator,
-            cute.group_modes(cute.select(aqk.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
+        g_k = _sequence_feature_head_batch_view(kg)
+        g_qt = _feature_sequence_head_batch_view(qg)
+        g_wt = _feature_sequence_head_batch_view(w)
+        g_gate = _feature_sequence_head_batch_view(cumulative_gate)
+        g_do = _feature_sequence_head_batch_view(dout)
+        g_aqk = _feature_sequence_head_batch_view(aqk)
 
+        # For one augmented-state tile X [K, BN], each reverse chunk evaluates:
+        #   dv    = kg @ X + Aqk^T @ dO       [BT, BN]
+        #   X     = decay * X + scale * qg^T @ dO - w^T @ dv
+        # dO is source-only: output gradients occupy the bias columns, while the
+        # transition columns are zero because they have no local output source.
+        # The four UMMAs below materialize those four matrix products. Separate
+        # operations are needed because their reduction dimensions and physical
+        # operand layouts differ, even when they share an output accumulator.
+
+        # MMA1: kg [BT,K] reads X [K,BN] to begin the local write gradient dv.
         mma_dv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
             tcgen05.OperandMajorMode.K,
@@ -197,6 +209,7 @@ class BlackwellDeltaAffineSummaryRev:
             self.dv_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
+        # MMA2: qg^T [K,BT] reads dO [BT,BN] for the direct query contribution.
         mma_qdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
             tcgen05.OperandMajorMode.MN,
@@ -206,6 +219,7 @@ class BlackwellDeltaAffineSummaryRev:
             self.qdo_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
+        # MMA3: Aqk^T [BT,BT] reads dO and accumulates the local term into dv.
         mma_aqdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
             tcgen05.OperandMajorMode.MN,
@@ -215,6 +229,7 @@ class BlackwellDeltaAffineSummaryRev:
             self.aqdo_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
+        # MMA4: w^T [K,BT] reads the completed dv for the subtractive WY term.
         mma_wdv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
             tcgen05.OperandMajorMode.MN,
@@ -1233,14 +1248,15 @@ class BlackwellDeltaAffineSummaryRev:
         return (min(sm_count, self.num_heads * (SUMMARY_DIM // self.BN)), 1, 1)
 
 
-def select_summary_bn(heads: int, device: torch.device) -> int:
-    """Choose BN using the delta-H width heuristic over the augmented state."""
-    column_tiles_at_bn16 = (SUMMARY_DIM // 16) * heads
-    return 32 if column_tiles_at_bn16 > get_device_properties(device).multi_processor_count else 16
+def select_summary_tile_width(heads: int, device: torch.device) -> int:
+    """Choose the per-CTA state-column width from the available SM count."""
+    work_tiles_at_width_16 = (SUMMARY_DIM // 16) * heads
+    sm_count = get_device_properties(device).multi_processor_count
+    return 32 if work_tiles_at_width_16 > sm_count else 16
 
 
 @jit_cache
-def _compile_affine_summary_rev(dtype_name: str, heads: int, head_bn: int):
+def _compile_affine_summary_rev(dtype_name: str, heads: int, state_tile_width: int):
     """Compile one reverse-summary dtype/head/tile specialization."""
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
@@ -1265,7 +1281,7 @@ def _compile_affine_summary_rev(dtype_name: str, heads: int, head_bn: int):
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
-        BlackwellDeltaAffineSummaryRev(heads, io_dtype, head_bn),
+        BlackwellDeltaAffineSummaryRev(heads, io_dtype, state_tile_width),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
@@ -1367,8 +1383,8 @@ def affine_summary_rev(
         "affine_summary_rev currently requires int32-addressable tensors"
     )
 
-    head_bn = select_summary_bn(heads, qg.device)
-    compiled = _compile_affine_summary_rev(_IO_TYPE_NAMES[qg.dtype], heads, head_bn)
+    state_tile_width = select_summary_tile_width(heads, qg.device)
+    compiled = _compile_affine_summary_rev(_IO_TYPE_NAMES[qg.dtype], heads, state_tile_width)
     compiled(
         qg.detach(),
         kg.detach(),

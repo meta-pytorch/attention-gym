@@ -6,9 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("cutlass")
+
 from attn_gym.linear._delta_rule.cute import affine_summary_fwd, affine_summary_rev
 
-pytest.importorskip("cutlass")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="the CuTeDSL affine summary requires CUDA capability 10.0 or newer",

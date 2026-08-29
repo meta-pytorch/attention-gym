@@ -77,6 +77,20 @@ _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
 
 
+@cute.jit
+def _sequence_feature_head_batch_view(tensor):
+    """Re-rank ``[B,T,H,D]`` as ``[T,D,(H,B)]`` for a TMA operand."""
+    layout = cute.group_modes(cute.select(tensor.layout, mode=[1, 3, 2, 0]), 2, 4)
+    return cute.make_tensor(tensor.iterator, layout)
+
+
+@cute.jit
+def _feature_sequence_head_batch_view(tensor):
+    """Re-rank ``[B,T,H,D]`` as ``[D,T,(H,B)]`` for a TMA operand."""
+    layout = cute.group_modes(cute.select(tensor.layout, mode=[3, 1, 2, 0]), 2, 4)
+    return cute.make_tensor(tensor.iterator, layout)
+
+
 class WarpRole(IntEnum):
     """Warp-role boundaries in the affine-summary kernel."""
 
@@ -181,22 +195,10 @@ class _AffineSummaryFwdOp:
     ):
         """Launch one CTA per (augmented-state column tile, head)."""
         # Re-rank the dense [1, T, H, D] inputs into the logical TMA views.
-        g_w = cute.make_tensor(
-            mW.iterator,
-            cute.group_modes(cute.select(mW.layout, mode=[1, 3, 2, 0]), 2, 4),
-        )
-        g_kgt = cute.make_tensor(
-            mKg.iterator,
-            cute.group_modes(cute.select(mKg.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
-        g_u_vt = cute.make_tensor(
-            mU.iterator,
-            cute.group_modes(cute.select(mU.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
-        g_gk_k = cute.make_tensor(
-            mG.iterator,
-            cute.group_modes(cute.select(mG.layout, mode=[3, 1, 2, 0]), 2, 4),
-        )
+        g_w = _sequence_feature_head_batch_view(mW)
+        g_kgt = _feature_sequence_head_batch_view(mKg)
+        g_u_vt = _feature_sequence_head_batch_view(mU)
+        g_gk_k = _feature_sequence_head_batch_view(mG)
 
         # --- MMA configurations (SS-mode: both operands from SMEM) ---
         # MMA1: w (A, K-major) × X snapshot (B, K-major) → wx.
@@ -603,12 +605,11 @@ class _AffineSummaryFwdOp:
         # X starts as this tile's slice of [0 | I]: value-tile columns are zero
         # and identity-tile column (col_base + nc) carries a one at key row kc.
         st = cute.make_rmem_tensor(coords_kv.shape, Float32)
+        st.fill(Float32(0.0))
         for ei in cutlass.range(cute.size(st), unroll_full=True):
             kc, nc = coords_kv[ei]
-            value = Float32(0.0)
             if col_base + nc == VAL_DIM + kc:
-                value = Float32(1.0)
-            st[ei] = value
+                st[ei] = Float32(1.0)
 
         for _ct in cutlass.range(0, num_chunks, unroll=0):
             # ---- Phase 1: R2S X hi/lo → sXb (B operand for MMA1) ----

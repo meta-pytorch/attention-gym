@@ -42,6 +42,8 @@ from attn_gym.linear.kda.ops import _plain_gate_scan_op
 # Keep the distributed autograd wrapper here while the CP contract is experimental, matching the
 # repository's ring-attention example. The reusable recurrence kernels live under _delta_rule/cute;
 # the private KDA prepare/finish seams prevent duplicate factor computation around collectives.
+# TODO: Decide which summary and prepare/finish seams belong in the public API before promoting
+# this orchestration out of the example.
 _CHUNK_SIZE = 64
 
 
@@ -131,32 +133,6 @@ def partition_packed_sequences(
     return tuple(shards)
 
 
-def _chunk_kda_with_state(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Call public fused KDA and narrow its requested final state to a tensor."""
-    output, final_state = chunk_kda(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        output_final_state=True,
-        autotune=False,
-        impl="fused",
-    )
-    assert final_state is not None
-    return output, final_state
-
-
 def local_affine_summaries(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -175,15 +151,39 @@ def local_affine_summaries(
     zero = q.new_zeros(sequences, heads, value_dim, key_dim, dtype=torch.float32)
     identity = torch.eye(key_dim, dtype=torch.float32, device=q.device).expand_as(zero)
     with kernel_stage("cp/fwd/summary_zero", annotate):
-        _, bias = _chunk_kda_with_state(q, k, v, gate, beta, zero, cu_seqlens)
+        _, bias = chunk_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state=zero,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            autotune=False,
+            impl="fused",
+        )
     with kernel_stage("cp/fwd/summary_identity", annotate):
-        _, identity_final = _chunk_kda_with_state(q, k, v, gate, beta, identity, cu_seqlens)
+        _, identity_final = chunk_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state=identity,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            autotune=False,
+            impl="fused",
+        )
+    if bias is None or identity_final is None:
+        raise RuntimeError("chunk_kda did not return its requested final state")
     transition = identity_final - bias
     return torch.cat((bias, transition), dim=-2)
 
 
-def apply_summary(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
-    """Apply one packed V-first affine summary to a recurrent state."""
+def propagate_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
+    """Propagate a recurrent state through one packed V-first affine summary."""
     value_dim = state.shape[-2]
     bias = summary[..., :value_dim, :]
     transition = summary[..., value_dim:, :]
@@ -249,15 +249,21 @@ def context_parallel_kda(
         states = states + gathered[rank].reshape(-1)[0] * 0
 
     with kernel_stage("cp/fwd/local_output", annotate):
-        return _chunk_kda_with_state(
+        output, final_state = chunk_kda(
             q,
             k,
             v,
             gate,
             beta,
-            states,
-            local_cu_seqlens,
+            initial_state=states,
+            cu_seqlens=local_cu_seqlens,
+            output_final_state=True,
+            autotune=False,
+            impl="fused",
         )
+        if final_state is None:
+            raise RuntimeError("chunk_kda did not return its requested final state")
+        return output, final_state
 
 
 def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -298,7 +304,7 @@ def _compose_forward_initial_states(
     first_sequence = shard.sequence_ids[0]
     for predecessor, predecessor_shard in zip(gathered[:rank], shards[:rank], strict=True):
         if predecessor_shard.sequence_ids[-1] == first_sequence:
-            first_state = apply_summary(first_state, predecessor)
+            first_state = propagate_state(first_state, predecessor)
     return torch.cat((first_state.unsqueeze(0), states[1:]), dim=0)
 
 
@@ -323,7 +329,7 @@ def _compose_reverse_final_states(
         successor = shards[successor_rank]
         if successor.sequence_ids[0] != last_sequence:
             continue
-        last_gradient = apply_summary(last_gradient, gathered[successor_rank])
+        last_gradient = propagate_state(last_gradient, gathered[successor_rank])
     incoming = incoming.clone()
     incoming[-1] += last_gradient
     return incoming
@@ -482,7 +488,7 @@ class _CuteContextParallelKDA(torch.autograd.Function):
                 )
             if d_final_state is not None:
                 value_dim = v.shape[-1]
-                bias = apply_summary(d_final_state[0], summary)
+                bias = propagate_state(d_final_state[0], summary)
                 summary = torch.cat((bias, summary[..., value_dim:, :]), dim=-2)
         else:
             summary = _unused_summary(q)
