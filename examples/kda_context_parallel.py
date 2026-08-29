@@ -5,9 +5,9 @@ Each rank owns an equal contiguous token shard. Launch with:
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 
 Add ``--cuda-graph`` to capture forward and backward together and validate a replay with
-changed inputs. Add ``--profile`` to export per-rank Chrome traces and, when
-transformer-nuggets is installed, a merged trace. The example requires one Blackwell GPU per rank
-because the fused KDA backend currently targets SM100 or newer.
+changed inputs. Add ``--profile`` to export a merged native Perfetto trace using
+transformer-nuggets. The example requires one Blackwell GPU per rank because the fused KDA backend
+currently targets SM100 or newer.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from importlib import import_module
-from importlib.util import find_spec
 from itertools import accumulate, pairwise
 from pathlib import Path
 
@@ -73,27 +72,21 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True):
 
 
 @contextmanager
-def profile_trace(
-    enabled: bool,
-    path: Path,
-    rank: int,
-) -> Iterator[torch.profiler.profile | None]:
-    """Export one rank's trace, preferring transformer-nuggets when installed."""
-    if not enabled:
-        yield None
-        return
-
-    if find_spec("transformer_nuggets") is not None:
+def profile_trace(path: Path) -> Iterator[torch.profiler.profile]:
+    """Record one native Perfetto trace per rank."""
+    try:
         profiler = import_module("transformer_nuggets.utils.benchmark").profiler
-        with profiler(path, record_shapes=True) as active_profiler:
-            yield active_profiler
-        return
+    except ImportError as error:
+        raise RuntimeError(
+            "--profile requires a transformer-nuggets build with native Perfetto support"
+        ) from error
 
-    rank_path = path.with_name(f"{path.stem}_rank_{rank}.json")
-    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-    with torch.profiler.profile(activities=activities, record_shapes=True) as active_profiler:
+    with profiler(
+        path.with_suffix(".pftrace"),
+        record_shapes=True,
+        trace_format="track_event",
+    ) as active_profiler:
         yield active_profiler
-    active_profiler.export_chrome_trace(str(rank_path))
 
 
 # NOTE [One crossing sequence per contiguous rank boundary]
@@ -461,7 +454,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Export per-rank Chrome traces and a merged transformer-nuggets trace.",
+        help="Export one merged native Perfetto trace with transformer-nuggets.",
     )
     return parser.parse_args()
 
@@ -563,27 +556,27 @@ def main() -> None:
     ).resolve()
 
     def record_profile(step: Callable[[], object], label: str) -> None:
-        """Capture one synchronized distributed step and merge rank traces when possible."""
+        """Capture one synchronized distributed step and merge its rank traces."""
         dist.barrier()
-        with profile_trace(args.profile, profile_path, rank) as active_profiler:
+        with profile_trace(profile_path) as active_profiler:
+            # Start the measured step together after rank-local profiler setup.
+            dist.barrier()
+            torch.cuda.synchronize(device)
             with torch.profiler.record_function(f"cp/rank_{rank}/{label}"):
                 step()
             torch.cuda.synchronize(device)
-            if active_profiler is not None:
-                active_profiler.step()
+            active_profiler.step()
         dist.barrier()
 
-        rank_path = profile_path.with_name(f"{profile_path.stem}_rank_{rank}.json")
-        if find_spec("transformer_nuggets") is None:
-            print(f"rank {rank}: profile={rank_path}", flush=True)
-        elif rank == 0:
+        if rank == 0:
             merge_traces = import_module("transformer_nuggets.utils.merge_traces").merge_traces
-            merged_path = profile_path.with_name(f"{profile_path.stem}_merged.json.gz")
+            rank_paths = [
+                profile_path.with_name(f"{profile_path.stem}_rank_{index}.pftrace")
+                for index in range(world_size)
+            ]
+            merged_path = profile_path.with_name(f"{profile_path.stem}_merged.pftrace")
             merge_traces(
-                [
-                    str(profile_path.with_name(f"{profile_path.stem}_rank_{index}.json"))
-                    for index in range(world_size)
-                ],
+                [str(path) for path in rank_paths],
                 str(merged_path),
                 labels=[f"Rank {index} · GPU {index}" for index in range(world_size)],
                 align_timestamps=False,
