@@ -51,7 +51,6 @@ import torch
 import torch.nn.functional as F
 import typer
 from torch import nn
-from torch.cuda.graph_annotations import mark_kernels
 
 from attn_gym.linear.kda import (
     MAX_GATE_LOWER_BOUND_MAGNITUDE,
@@ -106,6 +105,13 @@ def _profile_trace(
     with torch.profiler.profile(activities=activities) as active_profiler:
         yield active_profiler
     active_profiler.export_chrome_trace(str(path))
+
+
+def mark_kernels(*args: Any, **kwargs: Any):
+    """Load optional CUDA Graph annotations only when they are requested."""
+    from torch.cuda.graph_annotations import mark_kernels as annotate
+
+    return annotate(*args, **kwargs)
 
 
 def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
