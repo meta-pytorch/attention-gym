@@ -185,6 +185,33 @@ def _assert_conv_matches(run, x, weight, activation="silu", rtol=2e-2, atol=2e-2
     return actual, expected
 
 
+def test_short_conv_supports_more_than_65535_time_tiles():
+    """Place the unbounded time grid on CUDA's large x dimension."""
+    torch.manual_seed(0)
+    tokens = 65_536
+    x, weight = _inputs(tokens=tokens, channels=4, width=4)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    config = ShortConvConfig(32, 1, 1)
+
+    actual = causal_conv1d(
+        x,
+        weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+        forward_config=config,
+        input_grad_config=config,
+        weight_grad_config=config,
+    )
+    expected = _reference(x, weight)
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
 @pytest.mark.parametrize("width", [1, 4, 5])
 def test_short_conv_forward_and_backward_match_pytorch(width: int):
     """Check generic widths and partial first and last time tiles."""
