@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
-from attn_gym.linear._delta_rule.cute import affine_summary_fwd, affine_summary_rev
+from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def affine_summary_reference(
+def state_summary_reference(
     kg: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
@@ -54,7 +54,7 @@ def affine_summary_reference(
     return state.transpose(-2, -1).contiguous()
 
 
-def affine_summary_rev_reference(
+def state_grad_summary_reference(
     qg: torch.Tensor,
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -113,8 +113,8 @@ def test_affine_summary_matches_fp32_reference(dtype, tokens, heads):
     u = torch.randn_like(kg) / 16
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
 
-    actual = affine_summary_fwd(kg, w, u, cumulative_gate)
-    expected = affine_summary_reference(kg, w, u, cumulative_gate)
+    actual = build_state_summary(kg, w, u, cumulative_gate)
+    expected = state_summary_reference(kg, w, u, cumulative_gate)
 
     assert actual.shape == (heads, 256, 128)
     assert actual.dtype == torch.float32
@@ -123,7 +123,7 @@ def test_affine_summary_matches_fp32_reference(dtype, tokens, heads):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens,heads", [(64, 1), (65, 2), (256, 3)])
-def test_affine_summary_rev_matches_fp32_reference(dtype, tokens, heads):
+def test_build_state_grad_summary_matches_fp32_reference(dtype, tokens, heads):
     torch.manual_seed(27)
     shape = (1, tokens, heads, 128)
     qg = torch.randn(shape, dtype=dtype, device="cuda") / 32
@@ -134,8 +134,8 @@ def test_affine_summary_rev_matches_fp32_reference(dtype, tokens, heads):
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
     scale = 128**-0.5
 
-    actual = affine_summary_rev(qg, kg, w, dout, aqk, cumulative_gate, scale)
-    expected = affine_summary_rev_reference(qg, kg, w, dout, aqk, cumulative_gate, scale)
+    actual = build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, scale)
+    expected = state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, scale)
 
     assert actual.shape == (heads, 256, 128)
     assert actual.dtype == torch.float32
@@ -154,20 +154,20 @@ def test_affine_summary_selector_variants_and_persistent_work():
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
 
     torch.testing.assert_close(
-        affine_summary_fwd(kg, w, u, cumulative_gate),
-        affine_summary_reference(kg, w, u, cumulative_gate),
+        build_state_summary(kg, w, u, cumulative_gate),
+        state_summary_reference(kg, w, u, cumulative_gate),
         atol=2e-4,
         rtol=2e-4,
     )
     torch.testing.assert_close(
-        affine_summary_rev(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
-        affine_summary_rev_reference(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
+        build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
+        state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
         atol=2e-4,
         rtol=2e-4,
     )
 
 
-def test_affine_summary_fwd_cuda_graph_replay():
+def test_build_state_summary_cuda_graph_replay():
     torch.manual_seed(29)
     shape = (1, 128, 2, 128)
     kg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 16
@@ -175,20 +175,20 @@ def test_affine_summary_fwd_cuda_graph_replay():
     u = torch.randn_like(kg) / 16
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
 
-    affine_summary_fwd(kg, w, u, cumulative_gate)
+    build_state_summary(kg, w, u, cumulative_gate)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = affine_summary_fwd(kg, w, u, cumulative_gate)
+        actual = build_state_summary(kg, w, u, cumulative_gate)
 
     u.mul_(0.5)
-    expected = affine_summary_reference(kg, w, u, cumulative_gate)
+    expected = state_summary_reference(kg, w, u, cumulative_gate)
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
-def test_affine_summary_rev_cuda_graph_replay():
+def test_build_state_grad_summary_cuda_graph_replay():
     torch.manual_seed(31)
     shape = (1, 128, 2, 128)
     qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
@@ -199,14 +199,14 @@ def test_affine_summary_rev_cuda_graph_replay():
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
     scale = 128**-0.5
 
-    affine_summary_rev(qg, kg, w, dout, aqk, cumulative_gate, scale)
+    build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, scale)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = affine_summary_rev(qg, kg, w, dout, aqk, cumulative_gate, scale)
+        actual = build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, scale)
 
     dout.mul_(0.5)
-    expected = affine_summary_rev_reference(qg, kg, w, dout, aqk, cumulative_gate, scale)
+    expected = state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, scale)
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)

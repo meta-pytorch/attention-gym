@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from attn_gym.linear import chunk_kda
-from attn_gym.linear._delta_rule.cute import affine_summary_fwd, affine_summary_rev
+from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
     _prepare_chunk_kda_bwd,
@@ -133,7 +133,7 @@ def partition_packed_sequences(
     return tuple(shards)
 
 
-def local_affine_summaries(
+def build_state_summaries(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -182,8 +182,8 @@ def local_affine_summaries(
     return torch.cat((bias, transition), dim=-2)
 
 
-def propagate_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
-    """Propagate a recurrent state through one packed V-first affine summary."""
+def merge_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
+    """Merge a packed V-first affine summary into a recurrent state."""
     value_dim = state.shape[-2]
     bias = summary[..., :value_dim, :]
     transition = summary[..., value_dim:, :]
@@ -223,7 +223,7 @@ def context_parallel_kda(
         boundary_start = shard.cu_seqlens[-2]
         boundary_inputs = tuple(tensor[:, boundary_start:] for tensor in (q, k, v, gate, beta))
         boundary_cu_seqlens = local_cu_seqlens[-2:] - local_cu_seqlens[-2]
-        local_summary = local_affine_summaries(
+        local_summary = build_state_summaries(
             *boundary_inputs,
             boundary_cu_seqlens,
             annotate,
@@ -304,7 +304,7 @@ def _compose_forward_initial_states(
     first_sequence = shard.sequence_ids[0]
     for predecessor, predecessor_shard in zip(gathered[:rank], shards[:rank], strict=True):
         if predecessor_shard.sequence_ids[-1] == first_sequence:
-            first_state = propagate_state(first_state, predecessor)
+            first_state = merge_state(first_state, predecessor)
     return torch.cat((first_state.unsqueeze(0), states[1:]), dim=0)
 
 
@@ -329,7 +329,7 @@ def _compose_reverse_final_states(
         successor = shards[successor_rank]
         if successor.sequence_ids[0] != last_sequence:
             continue
-        last_gradient = propagate_state(last_gradient, gathered[successor_rank])
+        last_gradient = merge_state(last_gradient, gathered[successor_rank])
     incoming = incoming.clone()
     incoming[-1] += last_gradient
     return incoming
@@ -378,7 +378,7 @@ class _CuteContextParallelKDA(torch.autograd.Function):
         if continues:
             start = shard.cu_seqlens[-2]
             with kernel_stage("cp/fwd/summary", annotate):
-                summary = affine_summary_fwd(
+                summary = build_state_summary(
                     factors.kg[:, start:],
                     factors.w[:, start:],
                     factors.u[:, start:],
@@ -477,7 +477,7 @@ class _CuteContextParallelKDA(torch.autograd.Function):
         if continues_from_previous:
             stop = shard.cu_seqlens[1]
             with kernel_stage("cp/bwd/summary", ctx.annotate, backward=False):
-                summary = affine_summary_rev(
+                summary = build_state_grad_summary(
                     prepared.qg[:, :stop],
                     prepared.kg[:, :stop],
                     prepared.w[:, :stop],
@@ -488,7 +488,7 @@ class _CuteContextParallelKDA(torch.autograd.Function):
                 )
             if d_final_state is not None:
                 value_dim = v.shape[-1]
-                bias = propagate_state(d_final_state[0], summary)
+                bias = merge_state(d_final_state[0], summary)
                 summary = torch.cat((bias, summary[..., value_dim:, :]), dim=-2)
         else:
             summary = _unused_summary(q)

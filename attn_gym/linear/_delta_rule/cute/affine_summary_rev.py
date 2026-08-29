@@ -1293,7 +1293,7 @@ def _compile_affine_summary_rev(dtype_name: str, heads: int, state_tile_width: i
     )
 
 
-def affine_summary_rev(
+def build_state_grad_summary(
     qg: torch.Tensor,
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -1322,9 +1322,9 @@ def affine_summary_rev(
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
-    assert batch == 1, f"affine_summary_rev requires B=1, got B={batch}"
-    assert tokens > 0, "affine_summary_rev requires at least one token"
-    assert key_dim == KEY_DIM, f"affine_summary_rev requires K={KEY_DIM}, got {key_dim}"
+    assert batch == 1, f"build_state_grad_summary requires B=1, got B={batch}"
+    assert tokens > 0, "build_state_grad_summary requires at least one token"
+    assert key_dim == KEY_DIM, f"build_state_grad_summary requires K={KEY_DIM}, got {key_dim}"
     for name, tensor in (("kg", kg), ("w", w), ("dout", dout)):
         assert tensor.shape == qg.shape, (
             f"{name} must match qg shape {tuple(qg.shape)}, got {tuple(tensor.shape)}"
@@ -1353,7 +1353,7 @@ def affine_summary_rev(
     if isinstance(qg, FakeTensor):
         return out
 
-    assert qg.is_cuda, "affine_summary_rev requires CUDA tensors"
+    assert qg.is_cuda, "build_state_grad_summary requires CUDA tensors"
     inputs = (
         ("qg", qg),
         ("kg", kg),
@@ -1380,7 +1380,7 @@ def affine_summary_rev(
             dim=1,
         )
     assert not requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out), (
-        "affine_summary_rev currently requires int32-addressable tensors"
+        "build_state_grad_summary currently requires int32-addressable tensors"
     )
 
     state_tile_width = select_summary_tile_width(heads, qg.device)

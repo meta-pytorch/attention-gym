@@ -985,7 +985,7 @@ def _compile_affine_summary(dtype_name: str, heads: int, state_bn: int):
     )
 
 
-def affine_summary_fwd(
+def build_state_summary(
     kg: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
@@ -1009,9 +1009,9 @@ def affine_summary_fwd(
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
-    assert batch == 1, f"affine_summary_fwd requires B=1, got B={batch}"
-    assert tokens > 0, "affine_summary_fwd requires at least one token"
-    assert key_dim == KEY_DIM, f"affine_summary_fwd requires K={KEY_DIM}, got {key_dim}"
+    assert batch == 1, f"build_state_summary requires B=1, got B={batch}"
+    assert tokens > 0, "build_state_summary requires at least one token"
+    assert key_dim == KEY_DIM, f"build_state_summary requires K={KEY_DIM}, got {key_dim}"
     assert w.shape == kg.shape, f"w must match kg shape {tuple(kg.shape)}, got {tuple(w.shape)}"
     assert u.shape == (1, tokens, heads, VAL_DIM), (
         f"u must have shape {(1, tokens, heads, VAL_DIM)}, got {tuple(u.shape)}"
@@ -1036,7 +1036,7 @@ def affine_summary_fwd(
     if isinstance(kg, FakeTensor):
         return out
 
-    assert kg.is_cuda, "affine_summary_fwd requires CUDA tensors"
+    assert kg.is_cuda, "build_state_summary requires CUDA tensors"
     for name, tensor in (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate)):
         assert tensor.device == kg.device, f"{name} must be on {kg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
@@ -1055,7 +1055,7 @@ def affine_summary_fwd(
             dim=1,
         )
     assert not requires_int64_abi(kg, w, u, cumulative_gate, out), (
-        "affine_summary_fwd currently requires int32-addressable tensors"
+        "build_state_summary currently requires int32-addressable tensors"
     )
 
     # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
