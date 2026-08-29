@@ -1006,6 +1006,7 @@ def _compile_affine_summary(
     )
 
 
+@torch.compiler.disable
 def build_state_summary(
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -1055,7 +1056,10 @@ def build_state_summary(
         device=kg.device,
     )
     if isinstance(kg, FakeTensor):
-        return out
+        raise TypeError(
+            "build_state_summary does not support torch.export; run the context-parallel "
+            "summary eagerly or under CUDA Graph capture"
+        )
 
     assert kg.is_cuda, "build_state_summary requires CUDA tensors"
     for name, tensor in (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate)):
