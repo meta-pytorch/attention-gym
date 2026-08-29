@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from attn_gym._backends.cute import (
@@ -131,6 +133,88 @@ def _validate_paged_private_abi(
         raise ValueError("has_initial_state must be contiguous bool with one entry per sequence")
 
 
+class ChunkKDAFactors(NamedTuple):
+    """Local KDA factors shared by state summary and output composition."""
+
+    w: torch.Tensor
+    u: torch.Tensor
+    kg: torch.Tensor
+    aqk: torch.Tensor
+    akk: torch.Tensor
+
+
+def _prepare_chunk_kda_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    metadata: RaggedChunkMetadata | None,
+    *,
+    scale: float,
+    autotune: bool,
+) -> ChunkKDAFactors:
+    """Compute the local factors needed by both CP summaries and ordinary output."""
+    with profiler_range("kda/fused/chunk_kda_fwd_intra"):
+        return ChunkKDAFactors(
+            *chunk_kda_fwd_intra(
+                q,
+                k,
+                v,
+                cumulative_gate,
+                beta,
+                scale,
+                metadata,
+                chunk_size=_CHUNK_SIZE,
+                profile_ranges=torch.autograd.profiler._is_profiler_enabled,
+                autotune=autotune,
+            )
+        )
+
+
+def _finish_chunk_kda_fwd(
+    q: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    factors: ChunkKDAFactors,
+    initial_state: torch.Tensor | None,
+    state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    metadata: RaggedChunkMetadata | None,
+    *,
+    scale: float,
+    output_final_state: bool,
+    autotune: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply an initial state and compose token outputs from prepared local factors."""
+    with profiler_range("kda/triton/inter_chunk_state"):
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            factors.kg,
+            factors.w,
+            factors.u,
+            cumulative_gate,
+            initial_state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+            chunk_size=_CHUNK_SIZE,
+            output_final_state=output_final_state,
+            metadata=metadata,
+            autotune=autotune,
+        )
+    with profiler_range("kda/triton/output_composition"):
+        output = chunk_gla_fwd_o_gk(
+            q,
+            v_new,
+            cumulative_gate,
+            factors.aqk,
+            h,
+            scale,
+            chunk_size=_CHUNK_SIZE,
+            metadata=metadata,
+            autotune=autotune,
+        )
+    return output, final_state
+
+
 def _chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -147,46 +231,29 @@ def _chunk_kda_fwd(
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
-    with profiler_range("kda/fused/chunk_kda_fwd_intra"):
-        w, u, kg, Aqk, Akk = chunk_kda_fwd_intra(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            scale,
-            metadata,
-            chunk_size=_CHUNK_SIZE,
-            profile_ranges=torch.autograd.profiler._is_profiler_enabled,
-            autotune=autotune,
-        )
-    with profiler_range("kda/triton/inter_chunk_state"):
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-            kg,
-            w,
-            u,
-            cumulative_gate,
-            initial_state,
-            state_indices=state_indices,
-            has_initial_state=has_initial_state,
-            chunk_size=_CHUNK_SIZE,
-            output_final_state=output_final_state,
-            metadata=metadata,
-            autotune=autotune,
-        )
-    with profiler_range("kda/triton/output_composition"):
-        output = chunk_gla_fwd_o_gk(
-            q,
-            v_new,
-            cumulative_gate,
-            Aqk,
-            h,
-            scale,
-            chunk_size=_CHUNK_SIZE,
-            metadata=metadata,
-            autotune=autotune,
-        )
-    return output, final_state, Aqk, Akk
+    factors = _prepare_chunk_kda_fwd(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        metadata,
+        scale=scale,
+        autotune=autotune,
+    )
+    output, final_state = _finish_chunk_kda_fwd(
+        q,
+        cumulative_gate,
+        factors,
+        initial_state,
+        state_indices,
+        has_initial_state,
+        metadata,
+        scale=scale,
+        output_final_state=output_final_state,
+        autotune=autotune,
+    )
+    return output, final_state, factors.aqk, factors.akk
 
 
 def _chunk_kda_fwd_shared(
