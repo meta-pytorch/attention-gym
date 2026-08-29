@@ -101,8 +101,7 @@ for sequence fragments crossing rank boundaries, then runs the ordinary local KD
 backward once with the composed boundary state. A contiguous rank boundary is one cut in the packed
 token stream, so it can split at most one logical sequence. Each rank therefore exchanges at most
 one fixed-size forward summary and one reverse summary, independent of how many complete local
-sequences it owns. The `--summary-backend public` option retains the zero/identity-probe formulation
-as a correctness oracle. The example validates local outputs, global endpoint states, and gradients
+sequences it owns. The example validates local outputs, global endpoint states, and gradients
 against an unsharded execution; it can also capture forward, NCCL communication, and backward in
 one CUDA Graph and validate a changed-input replay.
 

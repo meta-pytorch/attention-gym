@@ -76,28 +76,6 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True):
 # and ordering remain uniform.
 
 
-class _AllGather(torch.autograd.Function):
-    """Autograd-enabled all-gather built from public distributed collectives."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-        ctx.group = group
-        gathered = tensor.new_empty(dist.get_world_size(group), *tensor.shape)
-        dist.all_gather_single(gathered, tensor.contiguous(), group=group)
-        return gathered
-
-    @staticmethod
-    def backward(ctx, grad_gathered: torch.Tensor) -> tuple[torch.Tensor, None]:
-        grad_tensor = torch.empty_like(grad_gathered[0])
-        dist.reduce_scatter_single(
-            grad_tensor,
-            grad_gathered.contiguous(),
-            op=dist.ReduceOp.SUM,
-            group=ctx.group,
-        )
-        return grad_tensor, None
-
-
 def partition_packed_sequences(
     global_cu_seqlens: tuple[int, ...],
     world_size: int,
@@ -133,137 +111,12 @@ def partition_packed_sequences(
     return tuple(shards)
 
 
-def build_state_summaries(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    annotate: bool = False,
-) -> torch.Tensor:
-    """Recover each local fragment's ``H_out = H_in @ A + B`` summary."""
-    sequences = cu_seqlens.shape[0] - 1
-    heads, key_dim, value_dim = q.shape[2], q.shape[-1], v.shape[-1]
-    if value_dim != key_dim:
-        raise ValueError("the public identity-probe construction requires value_dim == key_dim")
-
-    zero = q.new_zeros(sequences, heads, value_dim, key_dim, dtype=torch.float32)
-    identity = torch.eye(key_dim, dtype=torch.float32, device=q.device).expand_as(zero)
-    with kernel_stage("cp/fwd/summary_zero", annotate):
-        _, bias = chunk_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            initial_state=zero,
-            cu_seqlens=cu_seqlens,
-            output_final_state=True,
-            autotune=False,
-            impl="fused",
-        )
-    with kernel_stage("cp/fwd/summary_identity", annotate):
-        _, identity_final = chunk_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            initial_state=identity,
-            cu_seqlens=cu_seqlens,
-            output_final_state=True,
-            autotune=False,
-            impl="fused",
-        )
-    if bias is None or identity_final is None:
-        raise RuntimeError("chunk_kda did not return its requested final state")
-    transition = identity_final - bias
-    return torch.cat((bias, transition), dim=-2)
-
-
 def merge_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
     """Merge a packed V-first affine summary into a recurrent state."""
     value_dim = state.shape[-2]
     bias = summary[..., :value_dim, :]
     transition = summary[..., value_dim:, :]
     return state @ transition + bias
-
-
-def context_parallel_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    group: dist.ProcessGroup,
-    shards: tuple[PackedShard, ...],
-    local_cu_seqlens: torch.Tensor,
-    annotate: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply zero-state packed KDA to one contiguous context-parallel shard."""
-    rank = dist.get_rank(group)
-    shard = shards[rank]
-    shard_tokens = shard.cu_seqlens[-1]
-    if q.shape[0] != 1 or q.shape[1] != shard_tokens:
-        raise ValueError(f"rank inputs must have shape [1,{shard_tokens},H,D]")
-    if (
-        local_cu_seqlens.shape != (len(shard.cu_seqlens),)
-        or local_cu_seqlens.dtype != torch.int32
-        or local_cu_seqlens.device != q.device
-    ):
-        raise ValueError("local_cu_seqlens has invalid shape, dtype, or device")
-
-    # See NOTE [One crossing sequence per contiguous rank boundary].
-    continues_on_next_rank = (
-        rank + 1 < len(shards) and shard.sequence_ids[-1] == shards[rank + 1].sequence_ids[0]
-    )
-    if continues_on_next_rank:
-        boundary_start = shard.cu_seqlens[-2]
-        boundary_inputs = tuple(tensor[:, boundary_start:] for tensor in (q, k, v, gate, beta))
-        boundary_cu_seqlens = local_cu_seqlens[-2:] - local_cu_seqlens[-2]
-        local_summary = build_state_summaries(
-            *boundary_inputs,
-            boundary_cu_seqlens,
-            annotate,
-        )[0]
-    else:
-        # Keep collective autograd ordering identical when no state crosses this boundary.
-        anchor = q.reshape(-1)[0].float() * 0
-        local_summary = (
-            q.new_zeros(
-                q.shape[2],
-                v.shape[-1] + q.shape[-1],
-                q.shape[-1],
-                dtype=torch.float32,
-            )
-            + anchor
-        )
-    with kernel_stage("cp/fwd/all_gather", annotate):
-        gathered = _AllGather.apply(local_summary, group)
-
-    with kernel_stage("cp/fwd/exclusive_prefix", annotate):
-        states = _compose_forward_initial_states(gathered, q, v, rank, shards)
-        # Ranks with an empty prefix must still execute all-gather's backward collective.
-        states = states + gathered[rank].reshape(-1)[0] * 0
-
-    with kernel_stage("cp/fwd/local_output", annotate):
-        output, final_state = chunk_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            initial_state=states,
-            cu_seqlens=local_cu_seqlens,
-            output_final_state=True,
-            autotune=False,
-            impl="fused",
-        )
-        if final_state is None:
-            raise RuntimeError("chunk_kda did not return its requested final state")
-        return output, final_state
 
 
 def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -530,7 +383,7 @@ class _CuteContextParallelKDA(torch.autograd.Function):
         return dq, dk, dv, d_gate, db, None, None, None, None, None, None, None
 
 
-def context_parallel_kda_cute(
+def context_parallel_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -571,12 +424,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated nonempty packed sequence lengths.",
     )
     parser.add_argument("--heads", type=int, default=2)
-    parser.add_argument(
-        "--summary-backend",
-        choices=("cute", "public"),
-        default="cute",
-        help="Use native CuTeDSL affine summaries or the public zero/identity probes.",
-    )
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
@@ -661,12 +508,8 @@ def main() -> None:
         global_cu_seqlens,
     )
 
-    cp_operation = (
-        context_parallel_kda_cute if args.summary_backend == "cute" else context_parallel_kda
-    )
-
     def run(inputs: tuple[torch.Tensor, ...], *, annotate: bool = False):
-        output, final_state = cp_operation(
+        output, final_state = context_parallel_kda(
             *inputs,
             group=dist.group.WORLD,
             shards=shards,
