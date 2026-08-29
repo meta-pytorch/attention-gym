@@ -257,6 +257,35 @@ def test_affine_summary_selector_variants_and_persistent_work():
     )
 
 
+def test_affine_summaries_reject_torch_export_instead_of_emitting_empty_outputs():
+    """Fail capture explicitly until the launchers become registered graph operators."""
+
+    class ForwardSummary(torch.nn.Module):
+        def forward(self, kg, w, u, cumulative_gate):
+            return build_state_summary(kg, w, u, cumulative_gate)
+
+    class ReverseSummary(torch.nn.Module):
+        def forward(self, qg, kg, w, dout, aqk, cumulative_gate):
+            return build_state_grad_summary(
+                qg,
+                kg,
+                w,
+                dout,
+                aqk,
+                cumulative_gate,
+                128**-0.5,
+            )
+
+    shape = (1, 64, 1, 128)
+    x = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    gate = torch.zeros(shape, dtype=torch.float32, device="cuda")
+    aqk = torch.zeros(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(TypeError, match="build_state_summary does not support torch.export"):
+        torch.export.export(ForwardSummary(), (x, x, x, gate), strict=False)
+    with pytest.raises(TypeError, match="build_state_grad_summary does not support torch.export"):
+        torch.export.export(ReverseSummary(), (x, x, x, x, aqk, gate), strict=False)
+
+
 def test_build_state_summary_cuda_graph_replay():
     torch.manual_seed(29)
     shape = (1, 128, 2, 128)

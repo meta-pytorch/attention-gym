@@ -1314,6 +1314,7 @@ def _compile_affine_summary_rev(
     )
 
 
+@torch.compiler.disable
 def build_state_grad_summary(
     qg: torch.Tensor,
     kg: torch.Tensor,
@@ -1372,7 +1373,10 @@ def build_state_grad_summary(
         device=qg.device,
     )
     if isinstance(qg, FakeTensor):
-        return out
+        raise TypeError(
+            "build_state_grad_summary does not support torch.export; run the context-parallel "
+            "summary eagerly or under CUDA Graph capture"
+        )
 
     assert qg.is_cuda, "build_state_grad_summary requires CUDA tensors"
     inputs = (
