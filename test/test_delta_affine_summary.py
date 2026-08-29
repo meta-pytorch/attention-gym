@@ -16,6 +16,28 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def int64_stride_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy a B=1 tensor into a contiguous view whose unreachable batch stride needs int64."""
+    result = torch.empty_strided(
+        tensor.shape,
+        (2**31, *tensor.stride()[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    result.copy_(tensor)
+    assert result.is_contiguous()
+    return result
+
+
+def misaligned_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy into contiguous storage beginning one element past an aligned allocation."""
+    storage = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
+    result = storage[1:].view(tensor.shape)
+    result.copy_(tensor)
+    assert result.is_contiguous() and result.data_ptr() % 16 != 0
+    return result
+
+
 def state_summary_reference(
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -101,6 +123,74 @@ def state_grad_summary_reference(
             - chunk_w.transpose(-2, -1) @ corrected
         )
     return state.transpose(-2, -1).contiguous()
+
+
+def test_affine_summaries_support_int64_tensor_strides():
+    """Compile wide-address kernels for realistic long-sequence batch strides."""
+    torch.manual_seed(19)
+    shape = (1, 64, 1, 128)
+    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
+    kg = torch.randn_like(qg) / 32
+    w = torch.randn_like(qg) / 32
+    u = torch.randn_like(qg) / 32
+    dout = torch.randn_like(qg) / 32
+    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
+    cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
+
+    expected_forward = build_state_summary(kg, w, u, cumulative_gate)
+    expected_reverse = build_state_grad_summary(
+        qg,
+        kg,
+        w,
+        dout,
+        aqk,
+        cumulative_gate,
+        128**-0.5,
+    )
+    actual_forward = build_state_summary(
+        *(int64_stride_copy(tensor) for tensor in (kg, w, u, cumulative_gate))
+    )
+    actual_reverse = build_state_grad_summary(
+        *(int64_stride_copy(tensor) for tensor in (qg, kg, w, dout, aqk, cumulative_gate)),
+        128**-0.5,
+    )
+
+    torch.testing.assert_close(actual_forward, expected_forward, rtol=0, atol=0)
+    torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
+
+
+def test_affine_summaries_accept_misaligned_contiguous_storage():
+    """Normalize ordinary storage-offset views before constructing TMA descriptors."""
+    torch.manual_seed(21)
+    shape = (1, 64, 1, 128)
+    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
+    kg = torch.randn_like(qg) / 32
+    w = torch.randn_like(qg) / 32
+    u = torch.randn_like(qg) / 32
+    dout = torch.randn_like(qg) / 32
+    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
+    cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
+
+    expected_forward = build_state_summary(kg, w, u, cumulative_gate)
+    expected_reverse = build_state_grad_summary(
+        qg,
+        kg,
+        w,
+        dout,
+        aqk,
+        cumulative_gate,
+        128**-0.5,
+    )
+    actual_forward = build_state_summary(
+        *(misaligned_copy(tensor) for tensor in (kg, w, u, cumulative_gate))
+    )
+    actual_reverse = build_state_grad_summary(
+        *(misaligned_copy(tensor) for tensor in (qg, kg, w, dout, aqk, cumulative_gate)),
+        128**-0.5,
+    )
+
+    torch.testing.assert_close(actual_forward, expected_forward, rtol=0, atol=0)
+    torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

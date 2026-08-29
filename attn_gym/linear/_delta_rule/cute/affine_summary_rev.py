@@ -49,6 +49,11 @@ _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
 
 
+def _aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize the uncommon contiguous view that misses the TMA alignment."""
+    return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
+
+
 @cute.jit
 def _sequence_feature_head_batch_view(tensor):
     """Re-rank ``[B,T,H,D]`` as ``[T,D,(H,B)]`` for a TMA operand."""
@@ -126,6 +131,7 @@ class BlackwellDeltaAffineSummaryRev:
         num_heads: int,
         io_type: type[cutlass.Numeric],
         state_tile_width: int,
+        use_int64_offsets: bool,
     ):
         # This limits columns handled by one CTA, not the number of attention heads.
         assert state_tile_width in (16, 32), (
@@ -137,6 +143,7 @@ class BlackwellDeltaAffineSummaryRev:
         self.BT = BT
         self.BK = KEY_DIM
         self.BN = state_tile_width
+        self.use_int64_offsets = use_int64_offsets
 
         self.state_regs = 128 if state_tile_width == 16 else 160
         self.aux_regs = 40
@@ -167,7 +174,10 @@ class BlackwellDeltaAffineSummaryRev:
     def get_name(self) -> str:
         """Return a stable artifact and profiler name for this specialization."""
         dtype_name = "bf16" if self.io_type is cutlass.BFloat16 else "fp16"
-        return f"delta_affine_summary_rev_h{self.num_heads}_bn{self.BN}_{dtype_name}"
+        return (
+            f"delta_affine_summary_rev_h{self.num_heads}_bn{self.BN}_{dtype_name}"
+            f"_i64{int(self.use_int64_offsets)}"
+        )
 
     @cute.jit
     def __call__(
@@ -1256,14 +1266,20 @@ def select_summary_tile_width(heads: int, device: torch.device) -> int:
 
 
 @jit_cache
-def _compile_affine_summary_rev(dtype_name: str, heads: int, state_tile_width: int):
+def _compile_affine_summary_rev(
+    dtype_name: str,
+    heads: int,
+    state_tile_width: int,
+    use_int64_offsets: bool,
+):
     """Compile one reverse-summary dtype/head/tile specialization."""
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
         raise ValueError(
             f"affine_summary_rev requires a CUDA capability >= 10.0 target; got {target}"
         )
-    tokens = cute.sym_int(divisibility=BT)
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens = sym_int(divisibility=BT)
 
     def factor(dtype, last_dim: int):
         return make_fake_compact_tensor(
@@ -1281,7 +1297,12 @@ def _compile_affine_summary_rev(dtype_name: str, heads: int, state_tile_width: i
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
-        BlackwellDeltaAffineSummaryRev(heads, io_dtype, state_tile_width),
+        BlackwellDeltaAffineSummaryRev(
+            heads,
+            io_dtype,
+            state_tile_width,
+            use_int64_offsets,
+        ),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
@@ -1317,8 +1338,8 @@ def build_state_grad_summary(
         FP32 tensor of shape ``[H, 256, 128]``, V-first packed as local bias then
         reverse transition for ``dH_in = dH_out @ transition + bias``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous int32-addressable
-    inputs on Blackwell. A partial final chunk is neutral-padded by the wrapper.
+    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous inputs on Blackwell.
+    A partial final chunk is neutral-padded by the wrapper.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
@@ -1365,9 +1386,7 @@ def build_state_grad_summary(
     for name, tensor in inputs:
         assert tensor.device == qg.device, f"{name} must be on {qg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-        assert tensor.data_ptr() % DATA_ALIGN_BYTES == 0, (
-            f"{name} data pointer must be {DATA_ALIGN_BYTES}-byte aligned"
-        )
+    qg, kg, w, dout, Aqk, cumulative_gate = (_aligned(tensor) for _name, tensor in inputs)
     pad = (-tokens) % BT
     if pad:
         padding = (0, 0, 0, 0, 0, pad)
@@ -1379,12 +1398,12 @@ def build_state_grad_summary(
             ),
             dim=1,
         )
-    assert not requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out), (
-        "build_state_grad_summary currently requires int32-addressable tensors"
-    )
+    use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out)
 
     state_tile_width = select_summary_tile_width(heads, qg.device)
-    compiled = _compile_affine_summary_rev(_IO_TYPE_NAMES[qg.dtype], heads, state_tile_width)
+    compiled = _compile_affine_summary_rev(
+        _IO_TYPE_NAMES[qg.dtype], heads, state_tile_width, use_int64_offsets
+    )
     compiled(
         qg.detach(),
         kg.detach(),
