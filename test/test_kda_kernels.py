@@ -189,21 +189,29 @@ _L2NORM_CASES = [(torch.float32, T, D, strided) for T, D, strided in L2NORM_SHAP
 
 # l2norm forward
 @pytest.mark.parametrize(
-    ("rows", "use_hopper_decode_config", "expected"),
+    ("rows", "tuned_major", "expected"),
     [
-        (1, True, (1, 1)),
-        (2, True, (1, 1)),
-        (9, True, (1, 1)),
-        (10, True, (4, 2)),
-        (2048, True, (4, 2)),
-        (2049, True, (16, 4)),
-        (128, False, (16, 4)),
+        (1, 9, (1, 1)),
+        (2, 9, (1, 1)),
+        (9, 9, (1, 1)),
+        (10, 9, (4, 2)),
+        (2048, 9, (4, 2)),
+        (2049, 9, (16, 4)),
+        (8, 10, (1, 1)),
+        (10, 10, (1, 4)),
+        (32, 10, (1, 4)),
+        (34, 10, (4, 4)),
+        (512, 10, (4, 4)),
+        (514, 10, (8, 4)),
+        (128, None, (16, 4)),
     ],
 )
 def test_l2norm_launch_config(
-    rows: int, use_hopper_decode_config: bool, expected: tuple[int, int]
+    rows: int,
+    tuned_major: int | None,
+    expected: tuple[int, int],
 ):
-    assert _l2norm_launch_config(rows, use_hopper_decode_config) == expected
+    assert _l2norm_launch_config(rows, tuned_major) == expected
 
 
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
@@ -293,6 +301,33 @@ def test_l2norm_op_registration():
             cu_seqlens,
         ),
     )
+
+
+def test_l2norm_blackwell_kda_decode_matches_reference_and_replays():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Blackwell-specific decode schedule")
+    torch.manual_seed(2)
+    tokens, heads = 32, 4
+    qkv = torch.randn(1, tokens, 3, heads, 128, device=DEV, dtype=torch.bfloat16)
+    x = qkv[:, :, 0]
+    cu_seqlens = torch.arange(tokens + 1, device=DEV, dtype=torch.int32)
+
+    output = l2norm(x, cu_seqlens=cu_seqlens)
+    compiled_output = torch.compile(l2norm, fullgraph=True)(x, cu_seqlens=cu_seqlens)
+    expected = l2norm_fwd_ref(x.float())
+    torch.testing.assert_close(output.float(), expected, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(compiled_output, output, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = l2norm(x, cu_seqlens=cu_seqlens)
+
+    x.add_(0.25)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()
+    expected = l2norm(x, cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
 
 
 def test_l2norm_ragged_matches_exact_active_prefix():

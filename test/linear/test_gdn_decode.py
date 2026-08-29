@@ -18,24 +18,29 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    ("value_dim", "sequence_heads", "hopper_gate_kind", "expected"),
+    ("value_dim", "sequence_heads", "tuned_major", "gate_kind", "expected"),
     [
-        (32, 128, GateKind.SCALAR, (8, 4)),
-        (128, 8, GateKind.SCALAR, (8, 2)),
-        (128, 96, GateKind.SCALAR, (8, 1)),
-        (128, 104, GateKind.SCALAR, (16, 1)),
-        (128, 224, GateKind.VECTOR, (8, 1)),
-        (128, 232, GateKind.VECTOR, (16, 1)),
-        (128, 96, None, (16, 1)),
+        (32, 128, None, GateKind.SCALAR, (8, 4)),
+        (128, 8, 9, GateKind.SCALAR, (8, 2)),
+        (128, 96, 9, GateKind.SCALAR, (8, 1)),
+        (128, 104, 9, GateKind.SCALAR, (16, 1)),
+        (128, 224, 9, GateKind.VECTOR, (8, 1)),
+        (128, 232, 9, GateKind.VECTOR, (16, 1)),
+        (128, 32, 10, GateKind.SCALAR, (8, 4)),
+        (128, 34, 10, GateKind.SCALAR, (8, 2)),
+        (128, 128, 10, GateKind.SCALAR, (8, 2)),
+        (128, 130, 10, GateKind.SCALAR, (8, 1)),
+        (128, 96, None, GateKind.SCALAR, (16, 1)),
     ],
 )
 def test_decode_launch_config(
     value_dim: int,
     sequence_heads: int,
-    hopper_gate_kind: GateKind | None,
+    tuned_major: int | None,
+    gate_kind: GateKind,
     expected: tuple[int, int],
 ):
-    assert _decode_launch_config(value_dim, sequence_heads, hopper_gate_kind) == expected
+    assert _decode_launch_config(value_dim, sequence_heads, tuned_major, gate_kind) == expected
 
 
 def make_decode_inputs(
@@ -142,12 +147,13 @@ def test_decode_matches_reference(key_heads: int | None, dtype: torch.dtype, sca
     torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
 
 
-def test_hopper_decode_schedule_matches_reference():
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Hopper-specific decode schedule")
+@pytest.mark.parametrize(("major", "heads"), [(9, 8), (10, 16)])
+def test_tuned_decode_schedule_matches_reference(major: int, heads: int):
+    if torch.cuda.get_device_capability()[0] != major:
+        pytest.skip(f"SM{major} decode schedule")
     inputs = make_decode_inputs(
         batch=1,
-        heads=8,
+        heads=heads,
         key_dim=128,
         value_dim=128,
         dtype=torch.bfloat16,
@@ -275,9 +281,27 @@ def test_decode_custom_op_registration():
     )
 
 
-def test_decode_fullgraph_and_cuda_graph():
+@pytest.mark.parametrize(
+    "decode_kwargs",
+    [
+        pytest.param({}, id="generic"),
+        pytest.param(
+            {
+                "batch": 1,
+                "heads": 16,
+                "key_dim": 128,
+                "value_dim": 128,
+                "dtype": torch.bfloat16,
+            },
+            id="blackwell",
+        ),
+    ],
+)
+def test_decode_fullgraph_and_cuda_graph(decode_kwargs: dict[str, object]):
     """The decode op compiles fullgraph and replays under CUDA graph capture."""
-    inputs = make_decode_inputs()
+    if decode_kwargs and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Blackwell-specific decode schedule")
+    inputs = make_decode_inputs(**decode_kwargs)
     initial_pool = inputs["state_cache"].clone()
     args = (
         inputs["packed_qkv"],
