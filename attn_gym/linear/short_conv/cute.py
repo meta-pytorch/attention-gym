@@ -315,6 +315,11 @@ class ShortConvKernel:
         return name
 
 
+# NOTE [Long-sequence launch grids]
+# CUDA limits grid.y and grid.z to 65,535 blocks, while grid.x supports over two billion.
+# Time is the only practically unbounded launch axis, so every time-tiled kernel maps time
+# to grid.x, channels to grid.y, and batch to grid.z.
+
 # NOTE [Packed forward active endpoint]
 # CUDA Graph capture fixes the physical token capacity T, while cu_seqlens[-1]
 # supplies the runtime active token count L. Keep the natural capacity launch grid
@@ -364,7 +369,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
     ):
         """Compute the physical time tile owned by this CTA."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -468,7 +473,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         initial_state: cute.Tensor | None,
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
-        _, time_block, _ = cute.arch.block_idx()
+        time_block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(cu_seqlens is not None):
             active_endpoint = load_ragged_token_count(cu_seqlens)
             if active_endpoint == self.tokens:
@@ -498,8 +503,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -658,7 +663,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
     ):
         """Compute one packed channel group and ten input-gradient tokens."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -829,8 +834,8 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -878,7 +883,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
     ):
         """Compute one FP32 weight-gradient partial per tap and owned channel."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -991,8 +996,8 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -1421,7 +1426,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Run one staged logical time tile with an optional sequence fast path."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, _, batch = cute.arch.block_idx()
+        _, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
         time_start = time_block * self.times_per_block
@@ -1631,7 +1636,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Compute boundary-aware input gradients while retaining one convolution window."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         time_start = time_block * self.times_per_block
         stage_tokens = self.tma_stage_tokens
@@ -1780,7 +1785,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Stride a fixed TMA worker grid over runtime-active input-gradient tiles."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, worker, batch = cute.arch.block_idx()
+        worker, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         (
             tile_pipeline,
@@ -1877,8 +1882,8 @@ class CausalConv1dSiluInputGradientTma(
                 tma_tensor_dy,
             ).launch(
                 grid=(
-                    self.channels // (self.threads * self.channels_per_thread),
                     self.time_workers,
+                    self.channels // (self.threads * self.channels_per_thread),
                     self.batches,
                 ),
                 block=(self.threads, 1, 1),
@@ -1899,8 +1904,8 @@ class CausalConv1dSiluInputGradientTma(
                 tma_tensor_dy,
             ).launch(
                 grid=(
-                    self.channels // (self.threads * self.channels_per_thread),
                     cute.ceil_div(self.tokens, self.times_per_block),
+                    self.channels // (self.threads * self.channels_per_thread),
                     self.batches,
                 ),
                 block=(self.threads, 1, 1),
@@ -1930,7 +1935,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
     ):
         """Compute boundary-aware weight-gradient partials from asynchronously staged tiles."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
         channel = channel_group * self.channels_per_thread
@@ -2162,8 +2167,8 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             tma_tensor_dy,
         ).launch(
             grid=(
-                self.channels // (self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                self.channels // (self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
