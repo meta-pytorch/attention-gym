@@ -510,6 +510,35 @@ def test_paged_chunk_kda_ignores_padding_slots():
     torch.testing.assert_close(storage[0], before[0], rtol=0, atol=0)
 
 
+def test_paged_chunk_kda_initializes_empty_new_slots():
+    """An empty fresh sequence still clears the newly assigned cache slot."""
+    torch.manual_seed(46)
+    inputs = tuple(tensor.detach() for tensor in _inputs(tokens=128, heads=2))
+    q, k, v, cumulative_gate, beta = inputs
+    cu_seqlens = torch.tensor([0, 0, 128, 128], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([4, 2, 3], device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor([False, False, True], device="cuda")
+    storage, pool = strided_state_pool(5, q.shape[2], 128, 128, prefix=0)
+    before = storage.clone()
+
+    paged_chunk_kda(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        pool,
+        slots,
+        cu_seqlens=cu_seqlens,
+        has_initial_state=has_initial_state,
+    )
+
+    state_elements = pool[0].numel()
+    before_pool = before[:, :state_elements].view_as(pool)
+    torch.testing.assert_close(pool[4], torch.zeros_like(pool[4]), rtol=0, atol=0)
+    torch.testing.assert_close(pool[3], before_pool[3], rtol=0, atol=0)
+
+
 def test_paged_chunk_kda_zero_initializes_new_slots():
     torch.manual_seed(47)
     inputs = tuple(tensor.detach() for tensor in _inputs(tokens=128, heads=2))

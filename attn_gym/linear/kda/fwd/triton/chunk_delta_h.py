@@ -94,8 +94,6 @@ def _run_chunk_delta_h_sequence(
     o_v = i_v * BV + tl.arange(0, BV)
 
     if USE_STATE_INDICES:
-        if T == 0:
-            return
         i_state = tl.load(state_indices + i_n).to(tl.int64)
         if i_state <= 0:
             for i_t in tl.range(0, NT):
