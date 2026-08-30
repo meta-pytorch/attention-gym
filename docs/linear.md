@@ -21,7 +21,6 @@ with the slot count. `chunk_gdn` uses a chunk-parallel decomposition for trainin
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
 chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
-`chunk_gdn(..., impl="fused")` selects the training-capable Blackwell chunk pipeline, while
 `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
@@ -33,7 +32,7 @@ output, final_state = chunk_gdn(
     value,
     gate,
     beta,
-    impl="fused",
+    impl="reference",
     output_final_state=True,
 )
 ```
@@ -44,28 +43,20 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- A training-capable fused chunk implementation on SM100/SM103 with dense, packed, tail, empty-
-  sequence, grouped Q/K-head, initial/final-state, strict `torch.compile`, and CUDA Graph support.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
-- Autograd for the reference and fused chunk implementations, including initial-state gradients.
+- Autograd for reference inputs and initial state.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.
 - Gate and beta may use independent floating dtypes and are converted to the recurrence compute
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
-The fused chunk implementation requires SM100/SM103, matching FP16 or BF16 Q/K/V, and
-`K = V = 128`. Its scalar natural-log gate is not lower-bounded: the kernels contract raw QK/KK
-first and apply only masked, nonpositive causal decay differences, avoiding KDA's reciprocal gate
-factorization. The public chunk size is BT64; internal 16x16 blocks are only the hierarchical
-triangular-solve representation and do not constrain gate values or semantic chunking. Ordinary
-layouts use int32 addressing; layouts requiring int64 tensor offsets are rejected until every new
-kernel has a wide-address specialization.
-
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
-capacity. Output rows beyond the terminal offset are inactive capacity and unspecified.
+capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. The fused
+chunk implementation is not implemented yet; unsupported implementation choices fail rather than
+falling back to the reference.
 
 ### Migration from the prototype API
 
