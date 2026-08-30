@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from attn_gym.linear import Impl, chunk_gdn
 from attn_gym.linear import recurrent_gdn as _recurrent_gdn
 from attn_gym.linear._delta_rule.validation import validate_paged_state
+from attn_gym.linear.gdn.validation import resolve_kernel_options
 from attn_gym.testing import cumulative_sequence_offsets
 
 
@@ -307,11 +308,23 @@ def test_impl_accepts_enum_and_string(function):
 
     with pytest.raises(ValueError, match="'fused', 'reference'"):
         function(*inputs[:-1], impl="eager")
-    message = (
-        "Mega GDN backend requires CUDA" if function is chunk_gdn else "requires CUDA tensors"
-    )
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
         function(*inputs[:-1], impl=Impl.FUSED)
+
+
+def test_chunk_kernel_options_are_strict():
+    """Keep the repo-local path as default and validate the Mega opt-in selector."""
+    assert resolve_kernel_options(None) == "fused"
+    assert resolve_kernel_options({}) == "fused"
+    inputs = make_inputs(sequence=2)
+    with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
+        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})
+    with pytest.raises(ValueError, match="must be 'fused' or 'mega'"):
+        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "other"})
+    with pytest.raises(ValueError, match="not supported with impl='reference'"):
+        chunk_gdn(*inputs[:-1], impl="reference", kernel_options={"backend": "mega"})
+    with pytest.raises(ValueError, match="Mega GDN backend requires CUDA"):
+        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "mega"})
 
 
 @pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])

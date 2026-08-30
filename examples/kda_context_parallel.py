@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import typer
 from torch.distributed._functional_collectives import all_gather_single
 
+from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
@@ -40,7 +41,6 @@ from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _finish_chunk_kda_fwd,
-    _normalize_packed_cotangent,
     _prepare_chunk_kda_fwd,
 )
 from attn_gym.linear.kda.ops import _plain_gate_scan_op
@@ -305,9 +305,9 @@ class ContextParallelKDAFunction(torch.autograd.Function):
         if d_output is None:
             d_output = torch.zeros_like(v)
         else:
-            d_output = _normalize_packed_cotangent(d_output)
+            d_output = normalize_compact_tensor(d_output)
         if d_final_state is not None:
-            d_final_state = _normalize_packed_cotangent(d_final_state.float())
+            d_final_state = normalize_compact_tensor(d_final_state.float())
         prepared = _prepare_chunk_kda_bwd(
             q,
             k,

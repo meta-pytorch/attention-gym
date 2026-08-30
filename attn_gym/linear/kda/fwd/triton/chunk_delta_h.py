@@ -28,6 +28,7 @@ from attn_gym.linear.kda.chunk_scheduler import (
     ScheduleKind,
     ScheduleRequest,
     load_ragged_sequence_extent,
+    load_ragged_sequence_work,
 )
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
@@ -82,9 +83,8 @@ def _run_chunk_delta_h_sequence(
     """
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        bos, eos, boh = load_ragged_sequence_work(cu_seqlens, chunk_offsets, i_n)
+        bos, eos, boh = bos.to(tl.int32), eos.to(tl.int32), boh.to(tl.int32)
         T = eos - bos
     else:
         bos = i_n * T

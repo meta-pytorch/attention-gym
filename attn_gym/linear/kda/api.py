@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from functools import partial
 from numbers import Real
-from typing import Literal, TypedDict
+from typing import Literal
 
 import torch
 
@@ -35,23 +35,13 @@ from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
-from attn_gym.linear.types import Impl, resolve_impl
+from attn_gym.linear.types import Impl, KernelOptions, resolve_impl
 
 _CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
     "bounded": True,
     "softplus": False,
 }
-
-
-class KernelOptions(TypedDict, total=False):
-    """Backend and experimental scheduling controls for :func:`chunk_kda`."""
-
-    backend: Literal["fused", "mega"]
-    """Select the default fused backend or the optional Mega CuTeDSL backend."""
-
-    split_backward: bool
-    """Approximate only Mega backward with schedule-selected forgetting-horizon splits."""
 
 
 def _resolve_decode_gate_transform(gate_transform: str) -> bool:

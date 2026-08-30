@@ -301,6 +301,15 @@ def load_ragged_chunk_count(chunk_offsets, num_sequences):
 
 
 @triton.jit
+def load_ragged_sequence_work(cu_seqlens, chunk_offsets, sequence):
+    """Load one sequence's token bounds and first global chunk."""
+    begin = tl.load(cu_seqlens + sequence)
+    end = tl.load(cu_seqlens + sequence + 1)
+    chunk_begin = tl.load(chunk_offsets + sequence)
+    return begin, end, chunk_begin
+
+
+@triton.jit
 def load_ragged_task_count(chunk_offsets, num_sequences, subtasks_per_chunk):
     """Return the runtime number of active flattened chunk tasks.
 
@@ -449,6 +458,7 @@ __all__ = [
     "load_ragged_chunk_count",
     "load_ragged_chunk_work",
     "load_ragged_sequence_extent",
+    "load_ragged_sequence_work",
     "load_ragged_task_count",
     "prepare_ragged_chunk_metadata",
 ]

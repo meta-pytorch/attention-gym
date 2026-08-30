@@ -21,8 +21,8 @@ slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and pre
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. `chunk_gdn`
 defaults to eager PyTorch (`impl="reference"`); `chunk_gdn(..., impl="fused")` selects the
-training-capable Mega CuTeDSL backend, while
-`recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
+repo-local scalar chunk pipeline. Pass `kernel_options={"backend": "mega"}` to select the optional
+Mega CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -44,8 +44,10 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- A training-capable fused chunk implementation on SM100/SM103 with dense and packed inputs,
-  grouped Q/K heads, tails, empty sequences, initial/final state, and state gradients.
+- A repo-local fused chunk pipeline on CUDA capability 9.0+ with dense and packed inputs, grouped
+  Q/K heads,
+  tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph support.
+- An opt-in Mega fused chunk implementation with the same public training/state contract.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
 - Autograd for the reference and fused chunk implementations, including initial-state gradients.
@@ -55,9 +57,19 @@ output, final_state = chunk_gdn(
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
-The fused chunk implementation requires the optional `mega` dependencies, SM100/SM103,
-FP16/BF16 Q/K/V, FP32 state, and `K = V = 128`. It consumes the scalar natural-log gate without a
-lower bound and uses exact execution without an approximate forgetting-horizon split.
+The repo-local fused chunk backend requires CUDA capability 9.0+, matching FP16 or BF16 Q/K/V,
+and
+`K = V = 128`, but has no Mega runtime dependency. Its scalar natural-log gate is not lower-bounded:
+kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
+chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
+Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
+wide-address path. Backward uses the tuned CuTe kernels on SM100/SM103 and portable Triton
+kernels on Hopper and other supported architectures.
+
+The Mega chunk backend requires the optional `mega` dependencies and SM100/SM103,
+FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
+gate without a lower bound and uses exact execution without an approximate forgetting-horizon
+split.
 
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
