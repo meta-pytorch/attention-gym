@@ -523,8 +523,9 @@ class ChunkKdaBwdWyDqkgFused:
         self.aux_warp_ids = (10, 11)  # WG2: Aux/Load/Store Aux
         self.threads_per_cta = self.threads_per_warp * 12  # 384 threads (3 WGs)
 
-        self.num_regs_cuda = 208
-        self.num_regs_others = 88
+        # Keep the CTA register pool fixed while favoring the long CUDA-core epilogue.
+        self.num_regs_cuda = 224
+        self.num_regs_others = 56
         if grid_waves < 1:
             raise ValueError(f"grid_waves must be positive, got {grid_waves}")
         self.grid_waves = grid_waves
