@@ -131,7 +131,7 @@ from .tile_dsl.barrier import (
 )
 from .tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from .tile_dsl.mma import mma_step, mma_ts_step
-from .tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_lin_S
+from .tile_dsl.swizzle import swizzle_box_offset_32b, swizzle_box_offset_128b
 from .tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from .tile_dsl.pointwise import (
     opaque_f32_zero,
@@ -494,7 +494,11 @@ def super_mma_warp(
         stsm_row_coord = stsm_row_coord + cutlass.Int32(8)
     if lane // 8 >= 2:
         stsm_col_coord = cutlass.Int32(8)
-    stsm_idx = swizzle_lin_S(stsm_row_coord * cfg.b_t + (stsm_col_coord ^ (cfg.b_t // 2)), bbits=1, mbase=3, sshift=3)
+    stsm_idx = swizzle_box_offset_32b(
+        stsm_row_coord,
+        stsm_col_coord ^ (cfg.b_t // 2),
+        box_rows=cfg.b_t,
+    )
     cum_chunk_base = cutlass.Int32(0)
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -935,7 +939,11 @@ def epilogue_warp(
         stsm_row_coord = stsm_row_coord + cutlass.Int32(8)
     if lane // 8 >= 2:
         stsm_col_coord = cutlass.Int32(8)
-    stsm_idx = swizzle_lin_S(stsm_row_coord * cfg.b_t + (stsm_col_coord ^ (cfg.b_t // 2)), bbits=1, mbase=3, sshift=3)
+    stsm_idx = swizzle_box_offset_32b(
+        stsm_row_coord,
+        stsm_col_coord ^ (cfg.b_t // 2),
+        box_rows=cfg.b_t,
+    )
     cum_chunk_base = cutlass.Int32(0)
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -1225,8 +1233,11 @@ def compute0_warp_group(
             block = prefix_dim // cutlass.Int32(16)
             coord = prefix_dim - block * cutlass.Int32(16)
             storage_col = coord ^ cutlass.Int32((cfg.b_t // 2))
-            linear_idx = block * cutlass.Int32(256) + coord * cutlass.Int32(16) + storage_col
-            diag_idx = swizzle_lin_S(linear_idx, bbits=1, mbase=3, sshift=3)
+            diag_idx = block * cutlass.Int32(256) + swizzle_box_offset_32b(
+                coord,
+                storage_col,
+                box_rows=16,
+            )
             sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
 
             nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)

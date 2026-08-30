@@ -49,6 +49,25 @@ def swizzle_xor_32b(row, col_elem, *, elem_bytes: cutlass.Constexpr[int] = 2):
 
 
 @cute.jit
+def swizzle_box_offset_32b(
+    row,
+    col,
+    *,
+    box_rows: cutlass.Constexpr[int],
+    elem_bytes: cutlass.Constexpr[int] = 2,
+):
+    """Map a logical coordinate into segment-major 32-byte-swizzled storage."""
+    box_cols = cutlass.const_expr(32 // elem_bytes)
+    box = col // box_cols
+    col_in_box = col - box * box_cols
+    return (
+        box * box_rows * box_cols
+        + row * box_cols
+        + swizzle_xor_32b(row, col_in_box, elem_bytes=elem_bytes)
+    )
+
+
+@cute.jit
 def swizzle_xor(
     row: cutlass.Int32,
     col: cutlass.Int32,
@@ -81,15 +100,3 @@ def swizzle_lin_128b(
     shift = cutlass.const_expr(row_stride_log2 - chunk_log2)
     mask = cutlass.const_expr(0x7 << chunk_log2)
     return lin ^ ((lin >> shift) & mask)
-
-
-@cute.jit
-def swizzle_lin_S(
-    lin,
-    *,
-    bbits: cutlass.Constexpr[int],
-    mbase: cutlass.Constexpr[int],
-    sshift: cutlass.Constexpr[int],
-):
-    yyy = (lin >> cutlass.const_expr(mbase + sshift)) & cutlass.const_expr((1 << bbits) - 1)
-    return lin ^ (yyy << cutlass.const_expr(mbase))
