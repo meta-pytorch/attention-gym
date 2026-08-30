@@ -131,7 +131,7 @@ from .tile_dsl.barrier import (
 )
 from .tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from .tile_dsl.mma import mma_step, mma_ts_step
-from .tile_dsl.swizzle import swizzle_lin_S, swizzle_xor_128b
+from .tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_lin_S, swizzle_xor_128b
 from .tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from .tile_dsl.pointwise import (
     opaque_f32_zero,
@@ -521,24 +521,17 @@ def super_mma_warp(
             for k_block in cutlass.range_constexpr((cfg.d_k // 16)):
                 # Load B operand
                 k_inv_col = k_block * 16 + rhs_col_offset
-                k_inv_segment = k_inv_col // 64
-                rhs_frag = nvvm.ldmatrix(
-                    sK_inv_ptr
-                    + k_inv_segment * (cfg.b_t * 64)
-                    + rhs_row_coord * 64
-                    + swizzle_xor_128b(rhs_row_coord, k_inv_col - k_inv_segment * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                rhs_offset = swizzle_box_offset_128b(
+                    rhs_row_coord, k_inv_col, box_rows=cfg.b_t
                 )
+                rhs_frag = nvvm.ldmatrix(sK_inv_ptr + rhs_offset, 4, nvvm.MMALayout.ROW)
                 # Load A operand
                 storage_key = (k_block * 16 + lhs_col_offset) ^ decay_key_mask
-                storage_slice = storage_key // 64
+                lhs_offset = swizzle_box_offset_128b(
+                    lhs_row_coord, storage_key, box_rows=cfg.b_t
+                )
                 kk_lhs_frag = nvvm.ldmatrix(
-                    sK_decay_ptr
-                    + storage_slice * (cfg.b_t * 64)
-                    + swizzle_xor_128b(lhs_row_coord, lhs_row_coord * 64 + storage_key - storage_slice * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                    sK_decay_ptr + lhs_offset, 4, nvvm.MMALayout.ROW
                 )
 
                 mma_step(
@@ -974,24 +967,17 @@ def epilogue_warp(
             for k_block in cutlass.range_constexpr((cfg.d_k // 16)):
                 # Load B operand
                 k_inv_col = k_block * 16 + rhs_col_offset
-                k_inv_segment = k_inv_col // 64
-                rhs_frag = nvvm.ldmatrix(
-                    sK_inv_ptr
-                    + k_inv_segment * (cfg.b_t * 64)
-                    + rhs_row_coord * 64
-                    + swizzle_xor_128b(rhs_row_coord, k_inv_col - k_inv_segment * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                rhs_offset = swizzle_box_offset_128b(
+                    rhs_row_coord, k_inv_col, box_rows=cfg.b_t
                 )
+                rhs_frag = nvvm.ldmatrix(sK_inv_ptr + rhs_offset, 4, nvvm.MMALayout.ROW)
                 # Load A operand
                 storage_key = (k_block * 16 + lhs_col_offset) ^ decay_key_mask
-                storage_slice = storage_key // 64
+                lhs_offset = swizzle_box_offset_128b(
+                    lhs_row_coord, storage_key, box_rows=cfg.b_t
+                )
                 a_lhs_frag = nvvm.ldmatrix(
-                    sQ_decay_ptr
-                    + storage_slice * (cfg.b_t * 64)
-                    + swizzle_xor_128b(lhs_row_coord, lhs_row_coord * 64 + storage_key - storage_slice * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                    sQ_decay_ptr + lhs_offset, 4, nvvm.MMALayout.ROW
                 )
 
                 mma_step(
