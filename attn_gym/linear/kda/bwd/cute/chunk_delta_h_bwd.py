@@ -43,7 +43,11 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
 from torch._guards import active_fake_mode
 
-from attn_gym._backends.cute import get_device_properties
+from attn_gym._backends.cute import (
+    get_device_properties,
+    make_fake_strided_tensor,
+    tensor_supports_contiguous_dim,
+)
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
@@ -198,6 +202,7 @@ class BlackwellDeltaHBwd:
         varlen: bool = False,
         use_int64_offsets: bool = False,
         bound_sequence_extent: bool = False,
+        dynamic_state_layout: bool = False,
     ):
         assert head_bv in (16, 32), f"BV must be 16 or 32, got {head_bv}"
         self.head_k = 128
@@ -208,6 +213,7 @@ class BlackwellDeltaHBwd:
         self.varlen = varlen
         self.use_int64_offsets = use_int64_offsets
         self.bound_sequence_extent = bound_sequence_extent
+        self.dynamic_state_layout = dynamic_state_layout
         assert not bound_sequence_extent or varlen, "sequence extent applies only to varlen inputs"
 
         # Tile dimensions
@@ -261,6 +267,7 @@ class BlackwellDeltaHBwd:
             f"kda_bwd_dhu_dv_fused_vl{int(self.varlen)}_h{self.num_heads}"
             f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{_IO_TYPE_NAMES[self.io_type]}"
             f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
+            f"_ds{int(self.dynamic_state_layout)}"
         )
 
     # ------------------------------------------------------------------
@@ -282,7 +289,7 @@ class BlackwellDeltaHBwd:
         dv2_out_in,
         problem_shape,
     ):
-        """Re-rank packed compact storage into the logical TMA/state views."""
+        """Re-rank packed storage into the logical TMA/state views."""
         B, T, H, K, V = problem_shape
         dB = Int32(1)
         NT = Int32(cute.size(dh_out_in.shape[0]))
@@ -339,20 +346,30 @@ class BlackwellDeltaHBwd:
                 ),
             ),
         )
-        g_dht = cute.make_tensor(
-            dht_in.iterator,
-            cute.make_layout(
-                (K, V, (H, B)),
-                stride=(1, K, (K * V, self.upcast(H * K * V))),
-            ),
-        )
-        g_dh0_t = cute.make_tensor(
-            dh0_in.iterator,
-            cute.make_layout(
-                (V, K, (H, B)),
-                stride=(K, 1, (K * V, self.upcast(H * K * V))),
-            ),
-        )
+        if cutlass.const_expr(self.dynamic_state_layout):
+            g_dht = cute.make_tensor(
+                dht_in.iterator,
+                cute.group_modes(cute.select(dht_in.layout, mode=[3, 2, 1, 0]), 2, 4),
+            )
+            g_dh0_t = cute.make_tensor(
+                dh0_in.iterator,
+                cute.group_modes(cute.select(dh0_in.layout, mode=[2, 3, 1, 0]), 2, 4),
+            )
+        else:
+            g_dht = cute.make_tensor(
+                dht_in.iterator,
+                cute.make_layout(
+                    (K, V, (H, B)),
+                    stride=(1, K, (K * V, self.upcast(H * K * V))),
+                ),
+            )
+            g_dh0_t = cute.make_tensor(
+                dh0_in.iterator,
+                cute.make_layout(
+                    (V, K, (H, B)),
+                    stride=(K, 1, (K * V, self.upcast(H * K * V))),
+                ),
+            )
         return GmemViews(
             g_k,
             g_qt,
@@ -2175,8 +2192,36 @@ def make_fake_tensor(dtype, shape):
     )
 
 
+def make_state_signature_tensor(dtype, shape, use_int64_offsets, dynamic_strides):
+    """Create the compact fast-path or dynamic-stride state signature."""
+    if not dynamic_strides:
+        return make_fake_tensor(dtype, shape)
+    return make_fake_strided_tensor(
+        dtype,
+        shape,
+        assumed_align=dtype.width // 8,
+        use_int64_strides=use_int64_offsets,
+    )
+
+
+def supports_state_layout(state: torch.Tensor) -> bool:
+    """Return whether raw state loads can address this nonnegative-strided layout."""
+    return all(stride >= 0 for stride in state.stride()) and tensor_supports_contiguous_dim(
+        state,
+        alignment_bytes=state.element_size(),
+    )
+
+
+def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
+    """Keep the 128-byte-aligned compact signature only for its original fast path."""
+    return any(
+        not state.is_contiguous() or not tensor_supports_contiguous_dim(state, alignment_bytes=128)
+        for state in states
+    )
+
+
 @jit_cache
-def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets):
+def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout):
     """Compile one dense BlackwellDeltaHBwd variant."""
     K = V = 128
     chunk_size = 64
@@ -2185,6 +2230,7 @@ def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets):
         num_heads=H,
         io_type=io_type,
         use_int64_offsets=use_int64_offsets,
+        dynamic_state_layout=dynamic_state_layout,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     sa, sb, snt, sns, sn = (sym_int() for _ in range(5))
@@ -2193,8 +2239,18 @@ def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets):
     dof = make_fake_tensor(io_type, (sa, sb, H, V))
     aqkf = make_fake_tensor(io_type, (sa, sb, H, chunk_size))
     gkf = make_fake_tensor(cutlass.Float32, (sa, sb, H, K))
-    dhtf = make_fake_tensor(cutlass.Float32, (sns, H, V, K))
-    dh0f = make_fake_tensor(cutlass.Float32, (sns, H, V, K))
+    dhtf = make_state_signature_tensor(
+        cutlass.Float32,
+        (sns, H, V, K),
+        use_int64_offsets,
+        dynamic_state_layout,
+    )
+    dh0f = make_state_signature_tensor(
+        cutlass.Float32,
+        (sns, H, V, K),
+        use_int64_offsets,
+        dynamic_state_layout,
+    )
     dhof = make_fake_tensor(io_type, (sa, snt, H, K, V))
     dv2f = make_fake_tensor(io_type, (sa, sb, H, V))
     cuf = make_fake_tensor(cutlass.Int32, (sn,))
@@ -2229,6 +2285,7 @@ def _compile_delta_h_bwd_packed(
     io_type: type[cutlass.Numeric],
     use_int64_offsets: bool,
     bound_sequence_extent: bool,
+    dynamic_state_layout: bool,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
     key_dim = value_dim = 128
@@ -2240,6 +2297,7 @@ def _compile_delta_h_bwd_packed(
         varlen=True,
         use_int64_offsets=use_int64_offsets,
         bound_sequence_extent=bound_sequence_extent,
+        dynamic_state_layout=dynamic_state_layout,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, chunks, sequences, metadata_entries = (sym_int() for _ in range(4))
@@ -2247,7 +2305,19 @@ def _compile_delta_h_bwd_packed(
     def token_tensor(dtype, width):
         return make_fake_tensor(dtype, (tokens, heads, width))
 
-    state = make_fake_tensor(cutlass.Float32, (sequences, heads, value_dim, key_dim))
+    state_shape = (sequences, heads, value_dim, key_dim)
+    dht_state = make_state_signature_tensor(
+        cutlass.Float32,
+        state_shape,
+        use_int64_offsets,
+        dynamic_state_layout,
+    )
+    dh0_state = make_state_signature_tensor(
+        cutlass.Float32,
+        state_shape,
+        use_int64_offsets,
+        dynamic_state_layout,
+    )
     chunk_state = make_fake_tensor(io_type, (chunks, heads, key_dim, value_dim))
     metadata = make_fake_tensor(cutlass.Int32, (metadata_entries,))
     return compile_tvm_ffi(
@@ -2258,8 +2328,8 @@ def _compile_delta_h_bwd_packed(
         token_tensor(io_type, value_dim),
         token_tensor(io_type, chunk_size),
         token_tensor(cutlass.Float32, key_dim),
-        state,
-        state,
+        dht_state,
+        dh0_state,
         chunk_state,
         token_tensor(io_type, value_dim),
         metadata,
@@ -2327,9 +2397,11 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         if state is not None and state.shape != expected_state:
             raise ValueError(f"{name} must have shape {expected_state}")
         if state is not None and (
-            state.dtype != torch.float32 or state.device != q.device or not state.is_contiguous()
+            state.dtype != torch.float32
+            or state.device != q.device
+            or not supports_state_layout(state)
         ):
-            raise TypeError(f"{name} must be contiguous float32 on q.device")
+            raise TypeError(f"{name} must be float32 with a contiguous key mode on q.device")
     if bv not in (16, 32):
         raise ValueError(f"bv must be 16 or 32, got {bv}")
 
@@ -2382,6 +2454,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
             chunk_size,
             h0 is not None,
         ),
+        requires_dynamic_state_layout(final_state_kernel, initial_state_gradient_kernel),
     )
     compiled(
         *kernel_tensors,
@@ -2433,9 +2506,11 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         if state is not None and state.shape != expected_state:
             raise ValueError(f"{name} must have shape {expected_state}")
         if state is not None and (
-            state.dtype != torch.float32 or state.device != q.device or not state.is_contiguous()
+            state.dtype != torch.float32
+            or state.device != q.device
+            or not supports_state_layout(state)
         ):
-            raise TypeError(f"{name} must be contiguous float32 on q.device")
+            raise TypeError(f"{name} must be float32 with a contiguous key mode on q.device")
 
     dh_out = q.new_empty(B, T // BT, H, K, V)
     dh0_out = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
@@ -2468,7 +2543,13 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         dh_out,
         dv2,
     )
-    fn = _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets)
+    fn = _compile_delta_h_bwd(
+        H,
+        bv,
+        io_type,
+        use_int64_offsets,
+        requires_dynamic_state_layout(dht_k, dh0_k),
+    )
     dummy_metadata = torch.empty(2, dtype=torch.int32, device=dev)
     fn(
         q,

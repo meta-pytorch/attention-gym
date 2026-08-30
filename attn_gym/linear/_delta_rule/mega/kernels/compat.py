@@ -42,14 +42,14 @@ def checkpoint_capacity_bound(tokens: int, num_sequences: int, interval: int) ->
 
 
 def validate_tma_tensor(name: str, tensor: torch.Tensor, *, alignment: int = 16) -> None:
-    """Reject layouts that cannot be represented by the current int32 TMA ABI."""
+    """Reject layouts that cannot satisfy the aligned TMA tensor contract."""
     if tensor.data_ptr() % alignment:
         raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
     if tensor.stride(-1) != 1:
         raise ValueError(f"{name} innermost stride must be one")
     element_bytes = tensor.element_size()
     for stride in tensor.stride()[:-1]:
-        if stride < 0 or stride > 2**31 - 1:
-            raise ValueError(f"{name} outer strides must fit nonnegative int32")
+        if stride < 0:
+            raise ValueError(f"{name} outer strides must be nonnegative")
         if stride * element_bytes % 16:
             raise ValueError(f"{name} outer byte strides must be multiples of 16")

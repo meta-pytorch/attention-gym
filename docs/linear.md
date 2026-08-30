@@ -16,8 +16,8 @@ state = decayed_state + outer(residual, key)
 output = scale * state @ query
 ```
 
-Public and persistent state uses V-major storage shaped `[N, H, V, K]`; paged pools replace `N`
-with the slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
+Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace `N` with the
+slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
 chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
@@ -89,8 +89,8 @@ The KDA references use token-major tensors: query, key, and per-channel gate are
 `[batch, sequence, heads, key_dimension]`; value is
 `[batch, sequence, heads, value_dimension]`; beta is
 `[batch, sequence, heads]`. Both recurrent and chunked forms support ordinary
-PyTorch autograd and an optional V-major recurrent state shaped `[N, H, V, K]`. Paged prefill and
-decode use the same layout with the leading dimension interpreted as cache slots.
+PyTorch autograd and an optional recurrent state shaped `[N, H, V, K]`. Paged prefill and decode
+use the same axis order with the leading dimension interpreted as cache slots.
 
 `examples/kda_training.py` builds these operations into a small trainable
 `[B, T, hidden_size] -> [B, T, hidden_size]` attention module. To mirror the
@@ -280,9 +280,9 @@ and enforces their constraints (the chunked core requires `head_dim=128` and Bla
 preserves homogeneous FP16/BF16 Q/K/V, normalizes FP32 or mixed inputs to BF16, and chunks at
 64 tokens; the fused recurrent scan is inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
-dimension, and stays differentiable. There is no automatic fallback between the two, and
-the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly
-32 tokens per sequence).
+dimension, and stays differentiable. There is no automatic fallback between implementations, and
+the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly 32 tokens
+per sequence).
 
 `recurrent_kda_decode` is the serving-specific one-token path. It consumes
 channel-major post-convolution QKV (`[Q for all heads | K for all heads | V for all
@@ -290,6 +290,23 @@ heads]`), raw gate and beta projections, and a paged state cache. Q/K normalizat
 gate activation, beta sigmoid, recurrence, output, and state-cache update run in one
 Triton kernel. Callers may provide a stable output buffer for allocation-free CUDA
 Graph replay.
+
+`chunk_kda(..., kernel_options={"backend": "mega"})` selects an opt-in SM100/SM103
+FP16/BF16 training backend for
+applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
+public CuTeDSL 4.7 primitives and has no cuDNN Frontend runtime dependency. Like the other
+implementations, it returns `(output, final_state)`; request the latter with
+`output_final_state=True`. Dense no-state calls require T divisible by 64 and omit `cu_seqlens`,
+while packed/stateful calls pass explicit contiguous int32 boundaries and FP32 `[N, H, V, K]`
+states. Q/K/V/gate/state accept TMA-compatible innermost modes with aligned dynamic outer strides;
+beta requires an element-aligned contiguous inner mode. Forward is always exact and unsplit.
+FP16 and BF16 use exact backward execution by default; eligible packed no-state long contexts may
+use the Mega backward with one unsplit work item per sequence and head. Callers that guarantee
+normalized keys, post-sigmoid beta, and nonpositive decay increments may explicitly opt into
+approximate backward-only forgetting-horizon splitting with
+`kernel_options={"backend": "mega", "split_backward": True}`. The implementation chooses the
+split count from the input geometry; no public split-size knob is exposed. Split backward currently
+requires a no-state call. Install the `mega` extra to use this backend.
 
 ::: attn_gym.linear.chunk_kda
 

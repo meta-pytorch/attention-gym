@@ -210,14 +210,15 @@ def test_chunk_kernel_options_plumbing():
         kernel_options=options,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="no chunk_kda kernel options"):
+    with pytest.raises(ValueError, match="not supported with impl='reference'"):
         chunk_kda(
             q,
             k,
             v,
             gate,
             beta,
-            kernel_options={"BACKEND": "MEGA"},  # type: ignore[typeddict-unknown-key]
+            impl="reference",
+            kernel_options={"backend": "mega"},
         )
 
 

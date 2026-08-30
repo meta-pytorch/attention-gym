@@ -83,13 +83,21 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor
+
+from attn_gym._backends.cute import make_fake_strided_tensor
 
 from ..compat import current_device, data_ptr, get_device_properties, tensor_device_index
 
 from .elementwise import softplus
-
-WORK_ITEM_FIELDS = 8
+from .host import get_dtype
+from .tvm_ffi import (
+    WORK_ITEM_FIELDS,
+    make_counter_signature,
+    make_cu_seqlens_signature,
+    make_work_items_signature,
+    validate_cu_seqlens,
+)
 WARMUP_CAP_CHUNKS = 32  # hard warmup cap: a cut must saturate within one warp of chunks per side
 MAX_BLOCKS = 2048  # piece-count ceiling; host clamps ideal_chunks so the per-tile block count fits
 WARP_SIZE = 32
@@ -916,6 +924,7 @@ def build_split_table(
     — no host synchronization."""
     if log2_threshold is None:
         log2_threshold = DEFAULT_LOG2_THRESHOLD
+    validate_cu_seqlens(cu_seqlens, assumed_align=4)
     if len(gate.shape) not in (2, 3):
         raise ValueError(f"gate must be (total_tokens, HO) or (total_tokens, HO, DK), got {tuple(gate.shape)}")
     gate_channels = gate.shape[2] if len(gate.shape) == 3 else 0
@@ -1006,6 +1015,8 @@ def build_split_table(
     overhead_chunks = max(1, OVERHEAD_TOKENS // b_t)
     cu_stream = cuda.CUstream(int(stream))
 
+    has_sched = sched_ctr is not None
+
     key = (
         device_index,
         device_properties.major,
@@ -1016,27 +1027,59 @@ def build_split_table(
         bool(log_gate),
         bool(safe_gate),
         gate_channels,
-        sched_ctr is not None,
-        str(cu_seqlens.dtype),
+        has_sched,
+        str(gate.dtype) if split else None,
+        str(a_log.dtype) if safe_gate else None,
+        str(dt_bias.dtype) if safe_gate else None,
     )
     if key not in compiled_cache:
-
-        dt_bias_c = None
-        if safe_gate:
-            dt_bias_c = from_dlpack(dt_bias, assumed_align=4)
-            dt_bias_c.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
-        chunk_scratch_c = None
-        item_scratch_c = None
-        if split:
-            chunk_scratch_c = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-            item_scratch_c = from_dlpack(item_scratch, assumed_align=4)
-            item_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_c = from_dlpack(work_items, assumed_align=4)
-        work_items_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_c = from_dlpack(work_count, assumed_align=4)
-        work_count_c.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        compiled_cache[key] = cute.compile(
+        tokens = cute.sym_int()
+        sequence_entries = cute.sym_int()
+        item_rows = cute.sym_int()
+        gate_c = (
+            make_fake_strided_tensor(
+                get_dtype(gate.dtype),
+                (tokens, n_heads_out, gate_channels) if gate_channels else (tokens, n_heads_out),
+                assumed_align=4,
+            )
+            if split
+            else None
+        )
+        a_log_c = (
+            make_fake_compact_tensor(
+                get_dtype(a_log.dtype),
+                (n_heads_out,),
+                stride_order=(0,),
+                assumed_align=4,
+            )
+            if safe_gate
+            else None
+        )
+        dt_bias_c = (
+            make_fake_compact_tensor(
+                get_dtype(dt_bias.dtype),
+                (n_heads_out, gate_channels) if gate_channels else (n_heads_out,),
+                stride_order=(1, 0) if gate_channels else (0,),
+                assumed_align=4,
+            )
+            if safe_gate
+            else None
+        )
+        chunk_scratch_c = (
+            make_fake_compact_tensor(
+                cutlass.Float32,
+                (cute.sym_int(), n_heads_out),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
+            if split
+            else None
+        )
+        work_items_c = make_work_items_signature(item_rows)
+        item_scratch_c = work_items_c if split else None
+        work_count_c = make_counter_signature()
+        sched_c = make_counter_signature(cute.sym_int()) if has_sched else None
+        compiled_cache[key] = cute.compile[cute.EnableTVMFFI](
             launch,
             bool(split),
             b_t,
@@ -1044,7 +1087,7 @@ def build_split_table(
             bool(safe_gate),
             gate_channels,
             overhead_chunks,
-            sched_ctr is not None,
+            has_sched,
             cutlass.Int32(n_heads_out),
             cutlass.Int32(n_tiles),
             cutlass.Int32(num_sms),
@@ -1052,19 +1095,18 @@ def build_split_table(
             cutlass.Int32(batch_size),
             cutlass.Float32(log2_threshold),
             cutlass.Float32(gate_scale_log2),
-            from_dlpack(gate, assumed_align=4).mark_layout_dynamic(leading_dim=len(gate.shape) - 1) if split else None,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if safe_gate else None,
+            gate_c,
+            a_log_c,
             dt_bias_c,
-            from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
+            make_cu_seqlens_signature(sequence_entries, assumed_align=4),
             chunk_scratch_c,
             item_scratch_c,
             work_items_c,
             work_count_c,
-            from_dlpack(sched_ctr, assumed_align=4).mark_layout_dynamic() if sched_ctr is not None else None,
+            sched_c,
             cutlass.Int32(n_scan_ctas),
             cutlass.Int32(n_walk_ctas),
-            cu_stream,
-            options="--enable-tvm-ffi",
+            cute.runtime.make_fake_stream(),
         )
     compiled_cache[key](
         n_heads_out,
@@ -1100,5 +1142,5 @@ def build_split_table(
         float(gate_scale_log2),
         n_scan_ctas,
         n_walk_ctas,
-        sched_ctr is not None,
+        has_sched,
     )

@@ -29,11 +29,12 @@ from attn_gym.linear._delta_rule.validation import (
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
+from attn_gym.linear.kda.impl.mega import chunk_forward as _mega_chunk_forward
 from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
-from attn_gym.linear.kda.validation import validate_kda_inputs
+from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
 from attn_gym.linear.types import Impl, resolve_impl
 
 _CHUNK_SIZE = 64
@@ -44,7 +45,13 @@ _DECODE_GATE_TRANSFORMS = {
 
 
 class KernelOptions(TypedDict, total=False):
-    """Backend-specific controls for :func:`chunk_kda`."""
+    """Backend and experimental scheduling controls for :func:`chunk_kda`."""
+
+    backend: Literal["fused", "mega"]
+    """Select the default fused backend or the optional Mega CuTeDSL backend."""
+
+    split_backward: bool
+    """Approximate only Mega backward with schedule-selected forgetting-horizon splits."""
 
 
 def _resolve_decode_gate_transform(gate_transform: str) -> bool:
@@ -98,14 +105,12 @@ def chunk_kda(
         scale: Query scale, applied inside the kernels in FP32. Defaults to
             ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        fastmath: Allow less precise fused math for speed; rejected with
-            ``"reference"``.
-        autotune: Benchmark candidate kernel configurations when true (winners
-            are cached and reused); use fixed heuristics when false for
-            repeatable selection across machines and cache states.
-        impl: ``"fused"`` uses the Blackwell kernels with first-order autograd;
-            ``"reference"`` uses differentiable eager PyTorch in FP32, with no
-            automatic fallback.
+        fastmath: Allow less precise fused math for speed; rejected by the Mega
+            backend and ``"reference"``.
+        autotune: Benchmark candidate fused-kernel configurations when true. Mega
+            accepts this argument for API compatibility but uses its fixed schedule.
+        impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
+            differentiable eager PyTorch in FP32. There is no automatic fallback.
         kernel_options: Backend-specific options. This is a sneaky BC trick.
             It is annoying to have a bunch of kwargs that its hard to know when they apply
             but, this trick allows us to add new options without breaking the API. I will
@@ -117,10 +122,12 @@ def chunk_kda(
         per logical sequence or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    if kernel_options:
-        raise ValueError("no chunk_kda kernel options are currently supported")
-    if selected_impl is Impl.REFERENCE and fastmath:
-        raise ValueError("fastmath applies only to impl='fused'")
+    backend, split_backward = resolve_kernel_options(kernel_options)
+    if selected_impl is Impl.REFERENCE:
+        if fastmath:
+            raise ValueError("fastmath applies only to impl='fused'")
+        if kernel_options:
+            raise ValueError("kernel_options are not supported with impl='reference'")
     validate_kda_inputs(
         q,
         k,
@@ -134,6 +141,21 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
+        if backend == "mega":
+            return _mega_chunk_forward(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial_state,
+                cu_seqlens=cu_seqlens,
+                scale=scale,
+                output_final_state=output_final_state,
+                fastmath=fastmath,
+                autotune=autotune,
+                split_backward=split_backward,
+            )
         return _fused_chunk_forward(
             q,
             k,
