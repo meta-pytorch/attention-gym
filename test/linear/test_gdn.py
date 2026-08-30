@@ -307,9 +307,7 @@ def test_impl_accepts_enum_and_string(function):
 
     with pytest.raises(ValueError, match="'fused', 'reference'"):
         function(*inputs[:-1], impl="eager")
-    error = NotImplementedError if function is chunk_gdn else ValueError
-    message = "impl='fused'" if function is chunk_gdn else "requires CUDA tensors"
-    with pytest.raises(error, match=message):
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
         function(*inputs[:-1], impl=Impl.FUSED)
 
 
