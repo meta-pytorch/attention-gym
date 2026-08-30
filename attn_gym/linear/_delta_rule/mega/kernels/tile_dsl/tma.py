@@ -6,6 +6,7 @@ from cutlass.experimental import primitives as nvvm
 import cutlass
 import cutlass.cute as cute
 
+from .handles import smem_data_ptr
 from .swizzle import swizzle_xor_128b
 
 
@@ -70,7 +71,7 @@ def tma_load_tile(
     outer_coords = tuple(gmem_slice.coords[1:])
     for i in cutlass.range_constexpr(num_iters):
         d = coord_d + cutlass.Int32(i * granu_elems)
-        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        smem_chunk = smem_data_ptr(smem_tile.shifted(i * sub_stride).base)
         if nvvm.elect_sync():
             coords = [d] + list(outer_coords)
             if cutlass.const_expr(cta_group == 1):
@@ -115,7 +116,7 @@ def tma_store_tile(smem_tile, gmem_slice, *, acquire: cutlass.Constexpr[bool] = 
         tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
     for i in cutlass.range_constexpr(num_iters):
         d = coord_d + cutlass.Int32(i * granu_elems)
-        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        smem_chunk = smem_data_ptr(smem_tile.shifted(i * sub_stride).base)
         nvvm.cp_async_bulk_tensor_global_shared_cta(
             tma_desc_ptr,
             smem_chunk,
