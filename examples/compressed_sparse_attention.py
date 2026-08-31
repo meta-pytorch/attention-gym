@@ -198,7 +198,7 @@ def _selected_attention_with_causal_blocks(
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
     backend = "triton" if query.device.type == "cuda" else "eager"
-    return selected_attention(
+    attn_result = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -209,6 +209,10 @@ def _selected_attention_with_causal_blocks(
         backend=backend,
         return_aux=return_aux,
     )
+
+    if return_aux is not None:
+        return *attn_result, selected_is_valid
+    return attn_result, selected_is_valid
 
 
 def CSA(
@@ -351,7 +355,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output = _selected_attention_with_causal_blocks(
+    attention_output, _selected_is_valid = _selected_attention_with_causal_blocks(
         Q,
         KV,
         compressed_kv,
@@ -423,6 +427,12 @@ def indexer_loss(
     ).detach()
 
     masked_logits = selected_indexer_logits.float().masked_fill(~selected_is_valid, float("-inf"))
+    row_has_valid = selected_is_valid.any(dim=-1)
+    masked_logits = torch.where(
+        row_has_valid[..., None],
+        masked_logits,
+        torch.zeros_like(masked_logits),
+    )
     indexer_probs = F.softmax(masked_logits, dim=-1)
 
     # Return KL
@@ -431,7 +441,6 @@ def indexer_loss(
         * (compressed_teacher_probs.clamp_min(eps).log() - indexer_probs.clamp_min(eps).log())
     ).sum(dim=-1)
 
-    row_has_valid = selected_is_valid.any(dim=-1)
     if row_has_valid.any():
         return kl[row_has_valid].mean()
     return torch.zeros((), dtype=kl.dtype, device=kl.device)

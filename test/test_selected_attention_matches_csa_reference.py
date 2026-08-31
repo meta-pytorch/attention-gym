@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym.sparse.selected_attention import AuxRequest
+
 ATOL = 1e-8
 RTOL = 1e-5
 
@@ -389,3 +391,152 @@ def test_selected_attention_matches_csa_reference_cuda_fp64():
     assert actual.device.type == expected.device.type == "cuda"
     assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end indexer_loss tests.
+# ---------------------------------------------------------------------------
+
+
+def _run_csa_pipeline_and_indexer_loss(*, device, dtype):
+    """Run compress → index → selected_attention → indexer_loss end-to-end.
+
+    Uses share_kv=True with the standard _make_inputs config (num_heads=2,
+    per-head compression biases).  compression_rate=2 with sequence_length=5
+    means position 0 has no completed blocks, exercising the early-position
+    validity mask.
+    """
+    inputs = _make_inputs(share_kv=True, num_topk_blocks=1, dtype=dtype, device=device)
+    (
+        Q,
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        _share_kv,
+    ) = inputs
+
+    b, num_heads, sequence_length, head_dim = Q.shape
+    _, num_index_heads, _, index_head_dim = Q_I.shape
+
+    # Expand shared KV heads (mirrors CSA internals)
+    KV = KV.expand(-1, num_heads, -1, -1)
+    C_a = C_a.expand(-1, num_heads, -1, -1)
+    C_b = C_b.expand(-1, num_heads, -1, -1)
+    Z_a = Z_a.expand(-1, num_heads, -1, -1)
+    Z_b = Z_b.expand(-1, num_heads, -1, -1)
+    K_Ia = K_Ia.expand(-1, num_index_heads, -1, -1)
+    K_Ib = K_Ib.expand(-1, num_index_heads, -1, -1)
+    Z_Ia = Z_Ia.expand(-1, num_index_heads, -1, -1)
+    Z_Ib = Z_Ib.expand(-1, num_index_heads, -1, -1)
+
+    compressed_kv = csa_example.compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate)
+    compressed_indices = csa_example.compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
+    num_total_blocks = compressed_kv.shape[-2]
+
+    Q_roped = torch.cat([Q[..., :-rope_dims], csa_example.apply_rope(Q[..., -rope_dims:])], dim=-1)
+    Q_I_roped = torch.cat(
+        [Q_I[..., :-rope_dims], csa_example.apply_rope(Q_I[..., -rope_dims:])], dim=-1
+    )
+    KV = F.rms_norm(KV, (head_dim,), weight=KV_norm_weight)
+    KV = torch.cat([KV[..., :-rope_dims], csa_example.apply_rope(KV[..., -rope_dims:])], dim=-1)
+
+    compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
+    compressed_indices = F.rms_norm(
+        compressed_indices, (index_head_dim,), weight=compressed_indices_norm_weight
+    )
+    compressed_indices = torch.cat(
+        [
+            compressed_indices[..., :-rope_dims],
+            csa_example.apply_rope(
+                compressed_indices[..., -rope_dims:], positions=compressed_positions
+            ),
+        ],
+        dim=-1,
+    )
+    compressed_kv = F.rms_norm(compressed_kv, (head_dim,), weight=compressed_kv_norm_weight)
+    compressed_kv = torch.cat(
+        [
+            compressed_kv[..., :-rope_dims],
+            csa_example.apply_rope(
+                compressed_kv[..., -rope_dims:], positions=compressed_positions
+            ),
+        ],
+        dim=-1,
+    )
+
+    # Indexer scoring
+    indexer_mask = csa_example.make_block_mask(
+        sequence_length, num_total_blocks, compression_rate, device, dtype
+    )
+    indexer_scale = math.sqrt(index_head_dim * num_index_heads)
+    scores = F.relu(Q_I_roped @ compressed_indices.transpose(-2, -1)) / indexer_scale
+    index_head_weights = W_I.transpose(1, 2).unsqueeze(-1)
+    scores = torch.sum(index_head_weights * scores, dim=1) + indexer_mask
+
+    topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1).indices
+
+    # selected_attention with causal blocks → (output, aux, selected_is_valid)
+    _attn_output, aux, selected_is_valid = csa_example._selected_attention_with_causal_blocks(
+        Q_roped,
+        KV,
+        compressed_kv,
+        topk_blocks,
+        indexer_mask,
+        attention_sink,
+        sliding_window_size,
+        return_aux=AuxRequest(lse=True),
+    )
+    lse = aux.lse
+    assert lse is not None
+
+    # Gather selected compressed keys: (B, H, num_blocks, D) → (B, H, S, K, D)
+    idx = topk_blocks[:, None, :, :].expand(b, num_heads, sequence_length, num_topk_blocks)
+    idx_flat = idx.reshape(b, num_heads, -1)
+    gathered = compressed_kv.gather(
+        dim=2, index=idx_flat.unsqueeze(-1).expand(*idx_flat.shape, head_dim)
+    )
+    selected_compressed_kv = gathered.reshape(
+        b, num_heads, sequence_length, num_topk_blocks, head_dim
+    )
+
+    selected_indexer_logits = scores.gather(dim=-1, index=topk_blocks)
+
+    loss = csa_example.indexer_loss(
+        Q_roped, selected_compressed_kv, lse, selected_indexer_logits, selected_is_valid
+    )
+
+    assert loss.shape == ()
+    assert torch.isfinite(loss), f"end-to-end loss is not finite: {loss}"
+    assert loss >= 0, f"KL divergence should be non-negative, got {loss.item()}"
+
+    # Position 0 has no completed blocks (compression_rate=2, seq_len=5)
+    assert not selected_is_valid[:, 0, :].any(), "Position 0 should have no valid blocks"
+
+
+def test_end_to_end_indexer_loss_cpu():
+    _run_csa_pipeline_and_indexer_loss(device=torch.device("cpu"), dtype=torch.float64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_end_to_end_indexer_loss_cuda():
+    _run_csa_pipeline_and_indexer_loss(device=torch.device("cuda"), dtype=torch.float64)
