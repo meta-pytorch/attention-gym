@@ -19,8 +19,9 @@ output = scale * state @ query
 Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace `N` with the
 slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
-tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
-chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
+tokens in order for decoding, inference prefill, and state-carrying correctness checks. `chunk_gdn`
+defaults to eager PyTorch (`impl="reference"`); `chunk_gdn(..., impl="fused")` selects the
+training-capable Mega CuTeDSL backend, while
 `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
@@ -32,7 +33,7 @@ output, final_state = chunk_gdn(
     value,
     gate,
     beta,
-    impl="reference",
+    impl="fused",
     output_final_state=True,
 )
 ```
@@ -43,20 +44,25 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
+- A training-capable fused chunk implementation on SM100/SM103 with dense and packed inputs,
+  grouped Q/K heads, tails, empty sequences, initial/final state, and state gradients.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
-- Autograd for reference inputs and initial state.
+- Autograd for the reference and fused chunk implementations, including initial-state gradients.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.
 - Gate and beta may use independent floating dtypes and are converted to the recurrence compute
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
+The fused chunk implementation requires the optional `mega` dependencies, SM100/SM103,
+FP16/BF16 Q/K/V, FP32 state, and `K = V = 128`. It consumes the scalar natural-log gate without a
+lower bound and uses exact execution without an approximate forgetting-horizon split.
+
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
-capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. The fused
-chunk implementation is not implemented yet; unsupported implementation choices fail rather than
-falling back to the reference.
+capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. Unsupported
+implementation choices fail rather than falling back to the reference.
 
 ### Migration from the prototype API
 

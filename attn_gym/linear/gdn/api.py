@@ -10,6 +10,7 @@ from attn_gym.linear._delta_rule.validation import (
     validate_decode_inputs,
     validate_paged_state,
 )
+from attn_gym.linear.gdn.impl.mega import chunk_forward as mega_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
@@ -52,18 +53,28 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        impl: ``"reference"`` uses eager PyTorch. ``"fused"`` is reserved for the optimized
-            backend and currently raises ``NotImplementedError``.
+        impl: ``"reference"`` uses eager PyTorch. ``"fused"`` uses the optional CuTeDSL 4.7
+            Mega backend on SM100/SM103 with FP16/BF16 QKV and ``K = V = 128``.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
+    scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        raise NotImplementedError("chunk_gdn impl='fused' is not implemented yet")
+        return mega_chunk_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens=cu_seqlens,
+            scale=scale,
+            output_final_state=output_final_state,
+        )
 
-    scale = q.shape[-1] ** -0.5 if scale is None else scale
     return reference_gdn(
         chunk_forward,
         q,
