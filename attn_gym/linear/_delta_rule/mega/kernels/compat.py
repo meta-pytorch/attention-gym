@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch host utilities for the experimental CuTeDSL 4.7 KDA backend."""
+"""Torch host utilities for the experimental CuTeDSL 4.7 Mega backends."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import cache
 
 import torch
+
+
+@contextmanager
+def initialized_cuda_device(tensor: torch.Tensor) -> Iterator[None]:
+    """Initialize TVM-FFI's CUDA runtime context and restore the caller's device."""
+    previous_device = torch.cuda.current_device()
+    torch.cuda.set_device(tensor.device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 def data_ptr(buffer: torch.Tensor) -> int:

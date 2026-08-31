@@ -31,7 +31,7 @@ def emit_seq_load_descs(
     cu_seqlens,
     base_ptr,
     n_batch: cutlass.Int32,
-    row_stride: cutlass.Int32,
+    row_stride: cutlass.Int64,
     seq_ord: cutlass.Constexpr[int],
 ) -> None:
     """Build sequence-relative input maps except at the physical token endpoint.
@@ -82,7 +82,7 @@ def emit_seq_descs(
     cu_seqlens,
     base_ptr,
     n_batch: cutlass.Int32,
-    row_stride: cutlass.Int32,
+    row_stride: cutlass.Int64,
     seq_ord: cutlass.Constexpr[int],
 ) -> None:
     """Per-BATCH TMA-descriptor array for a VARLEN (THD) tensor whose base
@@ -126,7 +126,7 @@ def emit_checkpoint_seq_descs(
     cu_seqlens,
     base_ptr,
     n_batch: cutlass.Int32,
-    row_stride: cutlass.Int32,
+    row_stride: cutlass.Int64,
     every_n: cutlass.Int32,
     seq_ord: cutlass.Constexpr[int],
 ) -> None:

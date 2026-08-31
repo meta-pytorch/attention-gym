@@ -1,16 +1,16 @@
 # Mega delta-rule CuTeDSL kernels
 
-This package contains the shared SM100/SM103 Mega kernels for delta-rule variants. The prefill,
-checkpoint-recompute, and bprop core is adapted from NVIDIA's Frost KDA implementation;
-`kda_plain_gate_bwd.py` is an Attention Gym-authored dense gate-gradient helper. The current KDA
-adapter owns public API selection, validation, and autograd, while a future GDN adapter can reuse
-the same implementation boundary.
+This package contains the shared SM100/SM103 Mega kernels for delta-rule variants. The KDA and
+scalar-GDN prefill, checkpoint-recompute, and bprop cores are adapted from NVIDIA's Frost
+implementations; `kda_plain_gate_bwd.py` is an Attention Gym-authored dense gate-gradient helper.
+Variant-owned adapters provide Torch validation and orchestration over the shared runtime.
 
 ## Raw specialization
 
 - CuTeDSL 4.7 or newer on NVIDIA SM100 or SM103.
 - Native FP16 or BF16 Q/K/V with K=V=128.
-- FP32 per-token natural-log gate increments and post-sigmoid beta.
+- FP32 per-token natural-log gate increments: `[T,H,K]` for KDA and `[T,H]` for GDN.
+- FP32 post-sigmoid beta.
 - Packed THD execution with contiguous int32 `cu_seqlens`, including tails and empty sequences.
 - Internal recurrent state and checkpoints use `[sequence, head, V, K]`.
 
