@@ -441,9 +441,8 @@ def indexer_loss(
         * (compressed_teacher_probs.clamp_min(eps).log() - indexer_probs.clamp_min(eps).log())
     ).sum(dim=-1)
 
-    if row_has_valid.any():
-        return kl[row_has_valid].mean()
-    return torch.zeros((), dtype=kl.dtype, device=kl.device)
+    valid_kl = torch.where(row_has_valid, kl, torch.zeros_like(kl))
+    return valid_kl.sum() / row_has_valid.sum().clamp_min(1)
 
 
 def main() -> None:
