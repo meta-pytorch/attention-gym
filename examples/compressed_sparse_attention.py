@@ -375,17 +375,20 @@ def indexer_loss(
     selected_compressed_kv: torch.Tensor,
     attention_lse: torch.Tensor,
     selected_indexer_logits: torch.Tensor,
+    selected_is_valid: torch.Tensor,
 ) -> torch.Tensor:
     """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention
 
     Args:
         main_query: (B, H, S, D) — main attention queries (detached).
-        selected_compressed_kv: (B, S, K, D) — the K compressed keys selected by
-            the indexer for each query position (detached).
+        selected_compressed_kv: (B, H, S, K, D) — the K compressed keys selected
+            by the indexer for each query position (detached).
         attention_lse: (B, H, S) — log-sum-exp returned by selected_attention.
             This includes the sliding window, sparse, AND sink contributions.
         selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
             the K selected keys.
+        selected_is_valid: (B, S, K) — boolean mask that is True for causally
+            valid block selections and False for sentinel (-1) entries.
 
     Returns:
         Scalar KL-divergence loss (mean over batch and sequence).
@@ -397,7 +400,7 @@ def indexer_loss(
     # Selected attention doesn't store an attention matrix, so we have to do this
     compressed_attention_logits = (
         torch.einsum(
-            "bhsd,bskd->bhsk",
+            "bhsd,bhskd->bhsk",
             main_query.detach(),
             selected_compressed_kv.detach(),
         )
@@ -410,22 +413,28 @@ def indexer_loss(
         compressed_attention_logits - full_attention_lse[..., None]
     )
     compressed_teacher_mass = per_head_compressed_probs.sum(dim=1)
+
     # Normalize so we have a valid kl divergence
     eps = torch.finfo(torch.float32).tiny
+    valid_f = selected_is_valid.float()
+    compressed_teacher_mass = compressed_teacher_mass * valid_f
     compressed_teacher_probs = (
         compressed_teacher_mass / compressed_teacher_mass.sum(dim=-1, keepdim=True).clamp_min(eps)
     ).detach()
 
-    indexer_probs = F.softmax(selected_indexer_logits.float(), dim=-1)
+    masked_logits = selected_indexer_logits.float().masked_fill(~selected_is_valid, float("-inf"))
+    indexer_probs = F.softmax(masked_logits, dim=-1)
+
     # Return KL
-    return (
-        (
-            compressed_teacher_probs
-            * (compressed_teacher_probs.clamp_min(eps).log() - indexer_probs.clamp_min(eps).log())
-        )
-        .sum(dim=-1)
-        .mean()
-    )
+    kl = (
+        compressed_teacher_probs
+        * (compressed_teacher_probs.clamp_min(eps).log() - indexer_probs.clamp_min(eps).log())
+    ).sum(dim=-1)
+
+    row_has_valid = selected_is_valid.any(dim=-1)
+    if row_has_valid.any():
+        return kl[row_has_valid].mean()
+    return torch.zeros((), dtype=kl.dtype, device=kl.device)
 
 
 def main() -> None:
