@@ -889,7 +889,7 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
     def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids):
-        out = selected_attention(
+        return selected_attention(
             query,
             local_kv,
             sparse_kv,
@@ -899,7 +899,6 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
             19,
             backend="triton",
         )
-        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
     compiled_inputs = tuple(
@@ -948,10 +947,9 @@ def test_torch_compile_fullgraph_forward():
     sink = torch.randn(h, device=device, dtype=dtype)
 
     def fn(query, local_kv, sparse_kv, kv_indices, sink):
-        out = selected_attention(
+        return selected_attention(
             query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
         )
-        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
@@ -978,10 +976,9 @@ def test_torch_compile_fullgraph_backward(backend):
     _, kv_indices = torch.topk(scores, k=topk, dim=-1)
 
     def fn(query, local_kv, sparse_kv, sink):
-        out = selected_attention(
+        return selected_attention(
             query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
         )
-        return out
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
