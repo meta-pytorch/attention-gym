@@ -398,7 +398,17 @@ def test_selected_attention_matches_csa_reference_cuda_fp64():
 # ---------------------------------------------------------------------------
 
 
-def _run_csa_pipeline_and_indexer_loss(*, device, dtype):
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+def test_end_to_end_indexer_loss(device):
     """Run compress → index → selected_attention → indexer_loss end-to-end.
 
     Uses share_kv=True with the standard _make_inputs config (num_heads=2,
@@ -406,6 +416,7 @@ def _run_csa_pipeline_and_indexer_loss(*, device, dtype):
     means position 0 has no completed blocks, exercising the early-position
     validity mask.
     """
+    dtype = torch.float64
     inputs = _make_inputs(share_kv=True, num_topk_blocks=1, dtype=dtype, device=device)
     (
         Q,
@@ -531,12 +542,3 @@ def _run_csa_pipeline_and_indexer_loss(*, device, dtype):
 
     # Position 0 has no completed blocks (compression_rate=2, seq_len=5)
     assert not selected_is_valid[:, 0, :].any(), "Position 0 should have no valid blocks"
-
-
-def test_end_to_end_indexer_loss_cpu():
-    _run_csa_pipeline_and_indexer_loss(device=torch.device("cpu"), dtype=torch.float64)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_end_to_end_indexer_loss_cuda():
-    _run_csa_pipeline_and_indexer_loss(device=torch.device("cuda"), dtype=torch.float64)
