@@ -30,6 +30,7 @@ from attn_gym.linear.kda.chunk_scheduler import (
     load_ragged_sequence_extent,
 )
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
+from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
 from attn_gym.linear.kda.utils import exp2
 
@@ -44,6 +45,8 @@ def _run_chunk_delta_h_sequence(
     gk_desc,
     h0,
     ht,
+    state_indices,
+    has_initial_state,
     cu_seqlens,
     chunk_offsets,
     k,
@@ -53,6 +56,9 @@ def _run_chunk_delta_h_sequence(
     T,
     i_nh,
     i_v,
+    H0_STRIDES,
+    HT_STRIDES,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -63,6 +69,8 @@ def _run_chunk_delta_h_sequence(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
+    USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Process one sequence, head, and value tile through the state recurrence.
@@ -73,10 +81,6 @@ def _run_chunk_delta_h_sequence(
     when the reachable layout requires int64 offsets.
     """
     i_n, i_h = i_nh // H, i_nh % H
-    if USE_INT64_OFFSETS:
-        i_state = i_nh.to(tl.int64)
-    else:
-        i_state = i_nh
     if IS_VARLEN:
         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -91,10 +95,52 @@ def _run_chunk_delta_h_sequence(
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
+    if USE_STATE_INDICES:
+        i_state = tl.load(state_indices + i_n).to(tl.int64)
+        if i_state <= 0:
+            for i_t in tl.range(0, NT):
+                chunk = boh + i_t
+                h_desc.store(
+                    [0, chunk, i_h, 0, i_v * BV],
+                    tl.reshape(
+                        tl.zeros([K, BV], dtype=k.dtype.element_ty),
+                        [1, 1, 1, K, BV],
+                    ),
+                )
+                o_t = bos + i_t * BT + tl.arange(0, BT)
+                m_t = o_t < bos + T
+                if USE_INT64_OFFSETS:
+                    o_t = o_t.to(tl.int64)
+                tl.store(
+                    v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
+                    0.0,
+                    mask=m_t[:, None],
+                )
+            return
+    elif USE_INT64_OFFSETS:
+        i_state = i_n.to(tl.int64)
+    else:
+        i_state = i_n
+    if DYNAMIC_STATE_LAYOUT:
+        state_indices_4d = (i_state, i_h, o_v[None, :], o_k[:, None])
+        p_h0 = ptr_offset(state_indices_4d, H0_STRIDES)
+        p_ht = ptr_offset(state_indices_4d, HT_STRIDES)
+    else:
+        p_h0 = i_state * H * V * K + i_h * V * K
+        p_h0 += ptr_offset((o_v[None, :], o_k[:, None]), (K, 1))
+        p_ht = p_h0
+
     b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        b_h += tl.load(h0 + i_state * K * V + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1))).to(
-            tl.float32
+        m_state = o_v[None, :] < V
+        if USE_HAS_INITIAL_STATE:
+            m_state &= tl.load(has_initial_state + i_n)
+        b_h += tl.load(
+            h0 + p_h0,
+            mask=m_state,
+            other=0.0,
+        ).to(
+            tl.float32,
         )
 
     for i_t in tl.range(0, NT_full, warp_specialize=WARP_SPECIALIZE, num_stages=NUM_STAGES):
@@ -155,7 +201,7 @@ def _run_chunk_delta_h_sequence(
 
     if STORE_FINAL_STATE:
         tl.store(
-            ht + i_state * K * V + ptr_offset((o_k[:, None], o_v[None, :]), (V, 1)),
+            ht + p_ht,
             b_h,
         )
 
@@ -170,6 +216,8 @@ def chunk_delta_h_kernel_k128_wsp(
     gk_desc,
     h0,
     ht,
+    state_indices,
+    has_initial_state,
     cu_seqlens,
     chunk_offsets,
     k,
@@ -177,6 +225,15 @@ def chunk_delta_h_kernel_k128_wsp(
     u,
     v_new,
     T,
+    h0_stride_0,
+    h0_stride_1,
+    h0_stride_2,
+    h0_stride_3,
+    ht_stride_0,
+    ht_stride_1,
+    ht_stride_2,
+    ht_stride_3,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -187,6 +244,8 @@ def chunk_delta_h_kernel_k128_wsp(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
+    USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Warp-specialized K=128 inter-chunk recurrence."""
@@ -199,6 +258,8 @@ def chunk_delta_h_kernel_k128_wsp(
         gk_desc,
         h0,
         ht,
+        state_indices,
+        has_initial_state,
         cu_seqlens,
         chunk_offsets,
         k,
@@ -208,6 +269,9 @@ def chunk_delta_h_kernel_k128_wsp(
         T,
         tl.program_id(0),
         tl.program_id(1),
+        (h0_stride_0, h0_stride_1, h0_stride_2, h0_stride_3),
+        (ht_stride_0, ht_stride_1, ht_stride_2, ht_stride_3),
+        DYNAMIC_STATE_LAYOUT,
         H,
         K,
         V,
@@ -218,6 +282,8 @@ def chunk_delta_h_kernel_k128_wsp(
         USE_INITIAL_STATE,
         STORE_FINAL_STATE,
         IS_VARLEN,
+        USE_STATE_INDICES,
+        USE_HAS_INITIAL_STATE,
         USE_INT64_OFFSETS,
     )
 
@@ -232,6 +298,8 @@ def chunk_delta_h_kernel_k128_persistent(
     gk_desc,
     h0,
     ht,
+    state_indices,
+    has_initial_state,
     cu_seqlens,
     chunk_offsets,
     k,
@@ -239,6 +307,15 @@ def chunk_delta_h_kernel_k128_persistent(
     u,
     v_new,
     T,
+    h0_stride_0,
+    h0_stride_1,
+    h0_stride_2,
+    h0_stride_3,
+    ht_stride_0,
+    ht_stride_1,
+    ht_stride_2,
+    ht_stride_3,
+    DYNAMIC_STATE_LAYOUT: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -248,6 +325,8 @@ def chunk_delta_h_kernel_k128_persistent(
     NUM_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
+    USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     NUM_SEQUENCES: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
@@ -268,6 +347,8 @@ def chunk_delta_h_kernel_k128_persistent(
             gk_desc,
             h0,
             ht,
+            state_indices,
+            has_initial_state,
             cu_seqlens,
             chunk_offsets,
             k,
@@ -277,6 +358,9 @@ def chunk_delta_h_kernel_k128_persistent(
             T,
             i_nh,
             i_v,
+            (h0_stride_0, h0_stride_1, h0_stride_2, h0_stride_3),
+            (ht_stride_0, ht_stride_1, ht_stride_2, ht_stride_3),
+            DYNAMIC_STATE_LAYOUT,
             H,
             K,
             V,
@@ -287,6 +371,8 @@ def chunk_delta_h_kernel_k128_persistent(
             USE_INITIAL_STATE,
             STORE_FINAL_STATE,
             True,
+            USE_STATE_INDICES,
+            USE_HAS_INITIAL_STATE,
             USE_INT64_OFFSETS,
         )
 
@@ -332,6 +418,8 @@ def _delta_h_launch(
     u: torch.Tensor,
     gk: torch.Tensor,
     initial_state: torch.Tensor | None,
+    state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
@@ -346,6 +434,9 @@ def _delta_h_launch(
     if not can_use_tma(gk):
         gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
+    h0_strides = initial_state.stride() if initial_state is not None else compact_state_strides
+    ht_strides = final_state.stride() if final_state is not None else compact_state_strides
     # FP32 tiles double the descriptor staging past the shared-memory limit
     # at the 16-bit tile shape, and warp specialization pins its own stage
     # count; for 4-byte inputs halve the value tile and use an ordinarily
@@ -364,6 +455,8 @@ def _delta_h_launch(
         *descriptors,
         initial_state,
         final_state,
+        state_indices,
+        has_initial_state,
         cu_seqlens,
         chunk_offsets,
         k,
@@ -371,8 +464,12 @@ def _delta_h_launch(
         u,
         v_new,
         tokens,
+        *h0_strides,
+        *ht_strides,
     )
     kernel_options = {
+        "DYNAMIC_STATE_LAYOUT": (initial_state is not None and not initial_state.is_contiguous())
+        or (final_state is not None and not final_state.is_contiguous()),
         "H": heads,
         "K": key_dim,
         "V": value_dim,
@@ -382,6 +479,8 @@ def _delta_h_launch(
         "NUM_STAGES": 3 if use_16bit_config else 2,
         "USE_INITIAL_STATE": initial_state is not None,
         "STORE_FINAL_STATE": final_state is not None,
+        "USE_STATE_INDICES": state_indices is not None,
+        "USE_HAS_INITIAL_STATE": has_initial_state is not None,
         "USE_INT64_OFFSETS": requires_int64_offsets(
             k, w, u, gk, v_new, h, initial_state, final_state
         ),
@@ -437,7 +536,9 @@ def _delta_h_cuda(
     chunk_offsets: torch.Tensor | None,
     capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _delta_h_launch(k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, capacity, None)
+    return _delta_h_launch(
+        k, w, u, gk, initial_state, None, None, cu_seqlens, chunk_offsets, capacity, None
+    )
 
 
 def _delta_h_with_state_cuda(
@@ -452,12 +553,49 @@ def _delta_h_with_state_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = torch.empty(
-        state_batch, k.shape[2], k.shape[3], u.shape[-1], dtype=torch.float32, device=k.device
+        state_batch, k.shape[2], u.shape[-1], k.shape[3], dtype=torch.float32, device=k.device
     )
     h, v_new = _delta_h_launch(
-        k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, capacity, final_state
+        k,
+        w,
+        u,
+        gk,
+        initial_state,
+        None,
+        None,
+        cu_seqlens,
+        chunk_offsets,
+        capacity,
+        final_state,
     )
     return h, v_new, final_state
+
+
+def _delta_h_paged_cuda(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _delta_h_launch(
+        k,
+        w,
+        u,
+        gk,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        chunk_offsets,
+        capacity,
+        state_cache,
+    )
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -467,6 +605,8 @@ def chunk_gated_delta_rule_fwd_h(
     gk: torch.Tensor,
     initial_state: torch.Tensor | None,
     *,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     chunk_size: int = 64,
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
@@ -516,14 +656,50 @@ def chunk_gated_delta_rule_fwd_h(
     if torch.cuda.get_device_capability(k.device)[0] < 10:
         raise ValueError("the inter-chunk state recurrence requires CUDA capability 10.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    expected_state_shape = (state_batch, heads, key_dim, value_dim)
-    if initial_state is not None:
+    expected_state_shape = (state_batch, heads, value_dim, key_dim)
+    if state_indices is not None:
+        if initial_state is None:
+            raise ValueError("state_indices requires initial_state as the paged state pool")
+        if output_final_state:
+            raise ValueError("paged state is advanced in place; drop output_final_state")
+        paged_state_shape = (heads, value_dim, key_dim)
+        if initial_state.ndim != 4 or initial_state.shape[1:] != paged_state_shape:
+            raise ValueError(
+                "the paged state pool must have shape "
+                f"[num_slots, {heads}, {value_dim}, {key_dim}], got {tuple(initial_state.shape)}"
+            )
+        if initial_state.dtype != torch.float32:
+            raise TypeError("the paged state pool must use float32")
+        if initial_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+            raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
+        if initial_state.stride(0) < heads * key_dim * value_dim:
+            raise ValueError("paged state pool slots must not overlap")
+        if (
+            state_indices.shape != (state_batch,)
+            or state_indices.dtype != torch.int32
+            or not state_indices.is_contiguous()
+            or state_indices.device != k.device
+        ):
+            raise ValueError(f"state_indices must be contiguous int32 with shape ({state_batch},)")
+        if has_initial_state is not None and (
+            has_initial_state.shape != (state_batch,)
+            or has_initial_state.dtype != torch.bool
+            or not has_initial_state.is_contiguous()
+            or has_initial_state.device != k.device
+        ):
+            raise ValueError(
+                f"has_initial_state must be contiguous bool with shape ({state_batch},)"
+            )
+    elif has_initial_state is not None:
+        raise ValueError("has_initial_state requires state_indices")
+    elif initial_state is not None:
         if initial_state.shape != expected_state_shape:
             raise ValueError(
                 f"initial_state must have shape {expected_state_shape}, "
                 f"got {tuple(initial_state.shape)}"
             )
-        initial_state = initial_state.contiguous()
+        if initial_state.stride(-1) != 1 or any(stride < 0 for stride in initial_state.stride()):
+            raise TypeError("initial_state requires a contiguous key mode")
 
     if tokens == 0:
         # Zero-size tensors cannot back descriptors; the recurrence is empty
@@ -544,6 +720,21 @@ def chunk_gated_delta_rule_fwd_h(
             "last-dimension-contiguous k, w, and u"
         )
 
+    if state_indices is not None:
+        assert initial_state is not None
+        h, v_new = _delta_h_paged_op(
+            k,
+            w,
+            u,
+            gk,
+            initial_state,
+            state_indices,
+            has_initial_state,
+            cu_seqlens,
+            chunk_offsets,
+            chunks,
+        )
+        return h, v_new, None
     if output_final_state:
         h, v_new, final_state = _delta_h_with_state_op(
             k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks

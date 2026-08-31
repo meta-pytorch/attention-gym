@@ -10,7 +10,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear import Impl, chunk_kda, recurrent_kda
+from attn_gym.linear import Impl, KernelOptions, chunk_kda, recurrent_kda
+from attn_gym.linear._delta_rule.validation import validate_paged_state
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
 
@@ -22,6 +23,7 @@ def _inputs(
     tokens: int = 37,
     heads: int = 2,
     head_dim: int = 64,
+    value_dim: int | None = None,
     dtype: torch.dtype = torch.float32,
     seed: int = 0,
     device: str = "cuda",
@@ -33,7 +35,8 @@ def _inputs(
         return F.normalize(raw, dim=-1).to(dtype)
 
     q, k = normalized(), normalized()
-    v = torch.randn(batch, tokens, heads, head_dim, device=device, dtype=dtype)
+    value_dim = head_dim if value_dim is None else value_dim
+    v = torch.randn(batch, tokens, heads, value_dim, device=device, dtype=dtype)
     gate = -torch.rand(batch, tokens, heads, head_dim, device=device) * 3.0
     beta = torch.rand(batch, tokens, heads, device=device)
     return q, k, v, gate, beta
@@ -177,11 +180,46 @@ def test_chunk_reference_packed_matches_fused():
 
 def test_chunk_reference_supports_any_head_dim():
     """Lift the fused K=V=128 constraint without changing the contract."""
-    q, k, v, gate, beta = _inputs(tokens=70, head_dim=48, seed=4)
+    q, k, v, gate, beta = _inputs(tokens=70, head_dim=48, value_dim=32, seed=4)
     output, state = chunk_kda(q, k, v, gate, beta, output_final_state=True, impl="reference")
-    assert output.shape == v.shape and state.shape == (2, 2, 48, 48)
+    assert output.shape == v.shape and state.shape == (2, 2, 32, 48)
+    assert state.is_contiguous()
+    validate_paged_state(
+        q,
+        v,
+        state,
+        None,
+        torch.arange(q.shape[0], dtype=torch.int32, device=q.device),
+    )
     with pytest.raises(ValueError, match="128"):
         chunk_kda(q, k, v, gate, beta, impl="fused")
+
+
+def test_chunk_kernel_options_plumbing():
+    """Expose a typed extension point without silently accepting unknown options."""
+    q, k, v, gate, beta = _inputs(tokens=8)
+    options: KernelOptions = {}
+    expected, _ = chunk_kda(q, k, v, gate, beta, impl="reference")
+    actual, _ = chunk_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        impl="reference",
+        kernel_options=options,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="not supported with impl='reference'"):
+        chunk_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            impl="reference",
+            kernel_options={"backend": "mega"},
+        )
 
 
 def test_chunk_reference_rejects_fastmath():

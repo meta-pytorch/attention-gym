@@ -77,6 +77,10 @@ def test_natten_masks(
     T_W=8,
     print_mask=True,
 ):
+    if torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip(
+            "SM90 ptxas miscompile: https://github.com/meta-pytorch/attention-gym/issues/408"
+        )
     if torch.cuda.get_device_capability()[0] == 10:
         pytest.skip("SM100 ptxas miscompile: https://github.com/pytorch/pytorch/issues/190973")
 

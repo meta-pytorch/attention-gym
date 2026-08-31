@@ -29,13 +29,28 @@ def _skip_no_cuda():
         pytest.skip("CUDA required for triton backend")
 
 
+# NOTE [Sink Gradient Delta Rounding]
+# The Triton backward follows the standard FlashAttention design: it recomputes
+# ``delta = sum(grad_output * output)`` from the saved low-precision output tensor and
+# rebuilds probabilities from low-precision score dots against the stored FP32 LSE. The
+# eager oracle instead backpropagates through its FP32 intermediates, so its own error
+# against FP64 excludes those quantization events. The sink gradient is a closed form of
+# delta (``dsink = -exp(sink - lse) * delta``) reduced to one scalar per head, so it has
+# no averaging to absorb them; its budget must charge the extra low-precision roundings
+# the kernel legitimately performs. This is a rounding-model difference, not a kernel bug.
 def assert_matches_low_precision_eager(
     actual,
     low_precision_expected,
     high_precision_expected,
     reduction_sizes,
+    quantized_intermediates=0,
 ):
-    """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
+    """Bound kernel error by low-precision eager error against an FP64 measuring stick.
+
+    ``quantized_intermediates`` counts low-precision rounding events inside the kernel's
+    numerical tree beyond the final output cast that the eager oracle computes in FP32;
+    see NOTE [Sink Gradient Delta Rounding].
+    """
     assert torch.isfinite(actual).all()
     actual_difference = (actual.double() - high_precision_expected).abs()
     eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
@@ -43,11 +58,11 @@ def assert_matches_low_precision_eager(
         sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
     )
     output_rounding_eps = torch.finfo(actual.dtype).eps
-    rounding_eps = accumulation_eps + output_rounding_eps
+    rounding_eps = accumulation_eps + (1 + quantized_intermediates) * output_rounding_eps
     mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
-    max_atol = (accumulation_eps + len(reduction_sizes) * output_rounding_eps) * (
-        high_precision_expected.abs().max().item()
-    )
+    max_atol = (
+        accumulation_eps + (len(reduction_sizes) + quantized_intermediates) * output_rounding_eps
+    ) * high_precision_expected.abs().max().item()
     assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
     assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
 
@@ -469,9 +484,12 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         sparse_kv_64.grad,
         reduction_sizes=dsparse_kv_reduction_sizes,
     )
+    # See NOTE [Sink Gradient Delta Rounding]: charge the bf16-rounded output feeding the
+    # delta recomputation and the low-precision score dots behind the rebuilt probabilities.
     assert_matches_low_precision_eager(
         sink_lp_tri.grad,
         sink_lp_ref.grad,
         sink_64.grad,
         reduction_sizes=dsink_reduction_sizes,
+        quantized_intermediates=2,
     )

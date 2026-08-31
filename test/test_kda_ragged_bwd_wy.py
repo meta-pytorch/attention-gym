@@ -39,30 +39,34 @@ class StageInputs(NamedTuple):
     dv: torch.Tensor
 
 
-def _inputs(tokens: int, capacity: int) -> StageInputs:
+def _inputs(
+    tokens: int,
+    capacity: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> StageInputs:
     torch.manual_seed(37)
     shape = (1, tokens, 1, 128)
 
-    def bf16(shape: tuple[int, ...]) -> torch.Tensor:
-        return torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    def rand16(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, device="cuda", dtype=dtype) / 8
 
     return StageInputs(
-        q=bf16(shape),
-        k=bf16(shape),
-        v=bf16(shape),
-        v_new=bf16(shape),
+        q=rand16(shape),
+        k=rand16(shape),
+        v=rand16(shape),
+        v_new=rand16(shape),
         g=-torch.rand(shape, device="cuda"),
         beta=torch.rand(1, tokens, 1, device="cuda"),
-        A=bf16((1, tokens, 1, 64)),
-        h=bf16((1, capacity, 1, 128, 128)),
-        do=bf16(shape),
-        dh=bf16((1, capacity, 1, 128, 128)),
-        dv=bf16(shape),
+        A=rand16((1, tokens, 1, 64)),
+        h=rand16((1, capacity, 1, 128, 128)),
+        do=rand16(shape),
+        dh=rand16((1, capacity, 1, 128, 128)),
+        dv=rand16(shape),
     )
 
 
 def _run(inputs: StageInputs, metadata):
-    return chunk_kda_bwd_wy_dqkg(*inputs, metadata)
+    return chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5)
 
 
 def _sequence_local_reference(inputs: StageInputs, lengths: list[int]):
@@ -97,7 +101,8 @@ def _sequence_local_reference(inputs: StageInputs, lengths: list[int]):
     return tuple(torch.cat(parts, dim=1) for parts in output_parts)
 
 
-def test_ragged_wy_matches_independent_numerical_reference():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ragged_wy_matches_independent_numerical_reference(dtype):
     lengths = [65, 0, 63]
     cu_seqlens = cumulative_sequence_offsets(lengths)
     chunk_routes = torch.tensor(
@@ -110,7 +115,7 @@ def test_ragged_wy_matches_independent_numerical_reference():
         dtype=torch.int64,
     )
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, sum(lengths), 64)
-    inputs = _inputs(sum(lengths), metadata.capacity)
+    inputs = _inputs(sum(lengths), metadata.capacity, dtype)
     actual = _run(inputs, metadata)
     reference_args = inputs[3:]
     scale = 128**-0.5
@@ -138,7 +143,13 @@ def test_ragged_wy_matches_independent_numerical_reference():
     for name, output, golden_output, reference_output in zip(
         names, actual, golden, reference, strict=True
     ):
-        assert_matches_low_precision_reference(output, golden_output, reference_output, name)
+        assert_matches_low_precision_reference(
+            output,
+            golden_output,
+            reference_output,
+            name,
+            source_dtype=dtype,
+        )
 
 
 def test_ragged_wy_rejects_mismatched_chunk_size():
@@ -221,7 +232,7 @@ def test_ragged_wy_cuda_graph_replay():
     def operation(*args):
         *stage_tensors, offsets = args
         metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
-        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata)
+        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata, scale=128**-0.5)
 
     operation(*inputs, cu_seqlens)
     torch.cuda.synchronize()

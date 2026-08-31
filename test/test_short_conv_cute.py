@@ -1,4 +1,4 @@
-"""Correctness and integration tests for the CuTeDSL KDA short convolution."""
+"""Correctness and integration tests for the CuTeDSL short convolution."""
 
 import sys
 from itertools import pairwise
@@ -10,27 +10,52 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
-import attn_gym.linear.kda.short_conv.cute as cute_backend
-from attn_gym.linear.kda.short_conv import activations
-from attn_gym.linear.kda.short_conv.cute import (
+import attn_gym.linear.short_conv.cute as cute_backend
+from attn_gym.linear.short_conv import activations
+from attn_gym.linear.short_conv.cute import (
     ShortConvConfig,
     ShortConvTunedConfig,
-    _backward_op,
     _candidate_configs,
-    _configured_backward_op,
-    _configured_backward_with_state_grad_op,
-    _configured_decode_op,
-    _configured_forward_op,
-    _decode_op,
-    _forward_op,
     causal_conv1d,
     causal_conv1d_decode,
     tune_causal_conv1d,
 )
+from attn_gym.linear.short_conv.ops import (
+    short_conv_backward_op as _backward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_backward_op as _configured_backward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_backward_with_state_grad_op as _configured_backward_with_state_grad_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_decode_op as _configured_decode_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_configured_forward_op as _configured_forward_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_decode_op as _decode_op,
+)
+from attn_gym.linear.short_conv.ops import (
+    short_conv_forward_op as _forward_op,
+)
+
+
+def test_kda_backward_compatibility_exports():
+    """The moved names stay importable from attn_gym.linear.kda and stay identical."""
+    from attn_gym.linear import kda, short_conv
+
+    for name in ("causal_conv1d", "causal_conv1d_decode", "register_activation"):
+        assert getattr(kda, name) is getattr(short_conv, name)
+        # Wildcard imports resolved these names before the move and must keep doing so.
+        assert name in kda.__all__
+
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTeDSL short convolution requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="the CuTeDSL short convolution requires CUDA capability 9.0 or newer",
 )
 
 
@@ -160,6 +185,33 @@ def _assert_conv_matches(run, x, weight, activation="silu", rtol=2e-2, atol=2e-2
     return actual, expected
 
 
+def test_short_conv_supports_more_than_65535_time_tiles():
+    """Place the unbounded time grid on CUDA's large x dimension."""
+    torch.manual_seed(0)
+    tokens = 65_536
+    x, weight = _inputs(tokens=tokens, channels=4, width=4)
+    grad_output = torch.randn_like(x)
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    config = ShortConvConfig(32, 1, 1)
+
+    actual = causal_conv1d(
+        x,
+        weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+        forward_config=config,
+        input_grad_config=config,
+        weight_grad_config=config,
+    )
+    expected = _reference(x, weight)
+    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
+    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
 @pytest.mark.parametrize("width", [1, 4, 5])
 def test_short_conv_forward_and_backward_match_pytorch(width: int):
     """Check generic widths and partial first and last time tiles."""
@@ -173,6 +225,36 @@ def test_short_conv_forward_and_backward_match_pytorch(width: int):
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
     torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize(
+    ("major", "sequences", "channels", "width", "activation", "channels_per_thread"),
+    [
+        (9, 8, 6144, 4, "silu", 1),
+        (9, 9, 6144, 4, "silu", 2),
+        (9, 8, 6144, 5, "silu", 4),
+        (9, 8, 6144, 4, None, 4),
+        (10, 64, 768, 4, "silu", 1),
+        (10, 65, 768, 4, "silu", 2),
+        (10, 256, 6144, 4, "silu", 2),
+        (10, 257, 6144, 4, "silu", 4),
+        (10, 64, 384, 4, "silu", 4),
+        (10, 64, 768, 5, "silu", 4),
+    ],
+)
+def test_short_conv_tuned_decode_defaults(
+    major: int,
+    sequences: int,
+    channels: int,
+    width: int,
+    activation: str | None,
+    channels_per_thread: int,
+):
+    if torch.cuda.get_device_capability()[0] != major:
+        pytest.skip(f"SM{major} decode schedule")
+    x = torch.empty(sequences, channels, device="cuda", dtype=torch.bfloat16)
+    config = cute_backend._default_decode_config(x, width, activation)
+    assert config == ShortConvConfig(128, channels_per_thread, 16)
 
 
 def test_short_conv_dtype_defaults_follow_measured_storage_traffic():
@@ -1775,6 +1857,34 @@ def test_short_conv_decode_configured_dynamic_shapes(paged_short_conv_inputs):
         torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("major", "sequences", "channels"),
+    [(9, 64, 3072), (10, 65, 768)],
+)
+def test_short_conv_tuned_default_schedule_matches_reference(
+    paged_short_conv_inputs,
+    major: int,
+    sequences: int,
+    channels: int,
+):
+    if torch.cuda.get_device_capability()[0] != major:
+        pytest.skip(f"SM{major} decode schedule")
+    x, weight, state, slots = paged_short_conv_inputs(
+        sequences=sequences,
+        channels=channels,
+        slots=sequences + 1,
+    )
+    initial_state = state.clone()
+    history = torch.cat([initial_state[slots.long()], x.unsqueeze(1)], dim=1)
+    expected_state = initial_state.clone()
+    expected_state[slots.long()] = history[:, 1:]
+
+    actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
 def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs):
     """Address a paged pool by slot and leave the other rows untouched."""
     torch.manual_seed(1)
@@ -1789,6 +1899,39 @@ def test_short_conv_decode_advances_only_the_named_slots(paged_short_conv_inputs
     torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
     # Absence of a write, not a numeric claim: unnamed rows must be bitwise intact.
     torch.testing.assert_close(state, expected_final, rtol=0, atol=0)
+
+
+def test_short_conv_decode_advances_strided_state_slots(paged_short_conv_inputs):
+    """Address slots in a page-padded state pool without touching the padding."""
+    torch.manual_seed(2)
+    x, weight, compact_state, slots = paged_short_conv_inputs()
+    num_slots, state_rows, channels = compact_state.shape
+    num_state_elements = state_rows * channels
+    alignment_elements = 16 // compact_state.element_size()
+    padding = alignment_elements - num_state_elements % alignment_elements
+    storage = torch.randn(
+        num_slots,
+        num_state_elements + padding,
+        device=compact_state.device,
+        dtype=compact_state.dtype,
+    )
+    state = storage[:, :num_state_elements].view(num_slots, state_rows, channels)
+    state.copy_(compact_state)
+    initial_storage = storage.clone()
+    history = torch.cat([state[slots.long()].clone(), x.unsqueeze(1)], dim=1)
+
+    actual = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
+
+    expected_state = initial_storage[:, :num_state_elements].view_as(state)
+    expected_state[slots.long()] = history[:, 1:]
+    torch.testing.assert_close(actual, _reference(history, weight)[:, -1], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        storage[:, num_state_elements:],
+        initial_storage[:, num_state_elements:],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_short_conv_decode_ignores_padding_slots(paged_short_conv_inputs):
@@ -1839,10 +1982,22 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
         )
 
 
-def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs):
+@pytest.mark.parametrize(
+    "input_kwargs",
+    [
+        pytest.param({}, id="generic"),
+        pytest.param(
+            {"sequences": 8, "channels": 1536, "slots": 9},
+            id="blackwell",
+        ),
+    ],
+)
+def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs, input_kwargs):
     """Capture the one-token step and replay it from a reset history."""
     torch.manual_seed(8)
-    x, weight, state, slots = paged_short_conv_inputs()
+    if input_kwargs and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Blackwell-specific decode schedule")
+    x, weight, state, slots = paged_short_conv_inputs(**input_kwargs)
     initial_state = state.clone()
     causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
     torch.cuda.synchronize()

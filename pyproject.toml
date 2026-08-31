@@ -30,13 +30,18 @@ linear = [
     "apache-tvm-ffi>=0.1.12",
 ]
 
+mega = [
+    "nvidia-cutlass-dsl[cu13]>=4.7.0,<4.8.0; sys_platform == 'linux'",
+    "cuda-python>=13.0; sys_platform == 'linux'",
+    "apache-tvm-ffi>=0.1.12",
+]
+
 tests = [
     "pytest",
     "pytest-xdist",
     "typer",
     "jsonargparse",
     "docstring-parser",
-    "numpy",
     "flash-attn-4[cu13]~=4.0.0b23; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -47,12 +52,10 @@ dev = [
     "typer",
     "jsonargparse",
     "docstring-parser",
-    "numpy",
 ]
 
 viz = [
     "matplotlib",
-    "numpy",
     "jsonargparse",
     "docstring-parser",
     "tabulate",
@@ -63,11 +66,19 @@ viz = [
 docs = [
     "mkdocs-material",
     "mkdocs-macros-plugin",
+    "mkdocs-redirects",
     "mkdocstrings[python]",
-    "numpy",
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------
+[tool.uv]
+conflicts = [
+    [
+        { extra = "mega" },
+        { extra = "tests" },
+    ],
+]
+
 [tool.hatch.version]
 source = "vcs"
 
@@ -109,6 +120,21 @@ exclude = [
     "site-packages",
     "venv",
     "*.ipynb",
+    # Vendored NVIDIA Apache-2.0/MIT source; lint the maintained Mega adapters instead.
+    "attn_gym/linear/_delta_rule/mega/kernels/common",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_bprop_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_bprop_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_prefill_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_prefill_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_recompute_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/gdn_recompute_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_bprop_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_bprop_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_prefill_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_prefill_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_config.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_f16.py",
+    "attn_gym/linear/_delta_rule/mega/kernels/tile_dsl",
 ]
 
 [tool.ruff.lint]

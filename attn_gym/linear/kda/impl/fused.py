@@ -12,6 +12,7 @@ from attn_gym.linear.kda.ops import (
     chunk_bwd_with_state_grad_op,
     chunk_fwd_op,
     chunk_fwd_ragged_op,
+    chunk_fwd_ragged_paged_op,
     chunk_fwd_ragged_with_state_op,
     chunk_fwd_with_state_op,
 )
@@ -44,6 +45,7 @@ class _ChunkKDA(torch.autograd.Function):
         initial_state,
         cu_seqlens,
         chunk_offsets,
+        scale,
         output_final_state,
         fastmath,
         autotune,
@@ -58,11 +60,11 @@ class _ChunkKDA(torch.autograd.Function):
             assert chunk_offsets is None
             if output_final_state:
                 output, state, aqk, akk = chunk_fwd_with_state_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
                 )
             else:
                 output, aqk, akk = chunk_fwd_op(
-                    q, k, v, cumulative_gate, beta, initial_state, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
                 )
         elif output_final_state:
             assert chunk_offsets is not None
@@ -75,6 +77,7 @@ class _ChunkKDA(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 chunk_offsets,
+                scale,
                 autotune,
             )
         else:
@@ -88,6 +91,7 @@ class _ChunkKDA(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 chunk_offsets,
+                scale,
                 autotune,
             )
         ctx.save_for_backward(
@@ -102,6 +106,7 @@ class _ChunkKDA(torch.autograd.Function):
             cu_seqlens,
             chunk_offsets,
         )
+        ctx.scale = scale
         ctx.fastmath = fastmath
         ctx.autotune = autotune
         ctx.set_materialize_grads(False)
@@ -137,6 +142,7 @@ class _ChunkKDA(torch.autograd.Function):
             d_output,
             d_final_state,
             initial_state,
+            ctx.scale,
             ctx.fastmath,
             ctx.autotune,
         )
@@ -151,7 +157,7 @@ class _ChunkKDA(torch.autograd.Function):
             chunk_offsets,
             True,
         )
-        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None
 
 
 def chunk_forward(
@@ -163,6 +169,7 @@ def chunk_forward(
     initial_state: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    scale: float,
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
@@ -171,7 +178,12 @@ def chunk_forward(
     _validate_fused_constraints(q, v)
     output_dtype = q.dtype
     output_shape = q.shape
-    q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
+    kernel_dtype = (
+        q.dtype
+        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
+        else torch.bfloat16
+    )
+    q, k, v = (tensor.to(kernel_dtype) for tensor in (q, k, v))
     gate = gate.float()
     beta = beta.float().contiguous()
     batch, tokens, heads, head_dim = output_shape
@@ -200,6 +212,7 @@ def chunk_forward(
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            scale,
             True,
             fastmath,
             autotune,
@@ -214,6 +227,7 @@ def chunk_forward(
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            scale,
             False,
             fastmath,
             autotune,
@@ -222,4 +236,61 @@ def chunk_forward(
     return output.reshape(output_shape).to(output_dtype), state
 
 
-__all__ = ["chunk_forward"]
+def paged_chunk_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    autotune: bool = True,
+) -> torch.Tensor:
+    """Normalize inputs and invoke the registered paged chunk operator."""
+    _validate_fused_constraints(q, v)
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k, v, gate, beta, state_cache)
+    ):
+        raise RuntimeError(
+            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+
+    output_dtype = q.dtype
+    output_shape = q.shape
+    q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
+    gate = gate.float()
+    beta = beta.float().contiguous()
+    batch, tokens, heads, head_dim = output_shape
+    if cu_seqlens is None:
+        packed_shape = (1, batch * tokens, heads, head_dim)
+        q, k, v, gate = (tensor.reshape(packed_shape) for tensor in (q, k, v, gate))
+        beta = beta.reshape(packed_shape[:3])
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
+    cumulative_gate = _plain_gate_scan_op(
+        gate,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        False,
+    )
+    output = chunk_fwd_ragged_paged_op(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        autotune,
+    )
+    return output.reshape(output_shape).to(output_dtype)
+
+
+__all__ = ["chunk_forward", "paged_chunk_forward"]

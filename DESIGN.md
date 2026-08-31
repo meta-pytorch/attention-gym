@@ -140,19 +140,8 @@ streaming should accept an initial state and optionally return a final state. Th
 - activation checkpointing policies;
 - serving-framework adapters.
 
-The initial proposal is a generic structured result:
-
-```python
-StateT = TypeVar("StateT")
-
-
-@dataclass
-class LinearAttentionOutput(Generic[StateT]):
-    output: torch.Tensor
-    final_state: StateT | None = None
-```
-
-The concrete state type may be a tensor or a variant-specific dataclass.
+Chunked and recurrent operations return ``(output, final_state)``. The state is ``None`` unless
+``output_final_state=True``; paged operations instead update their explicit cache in place.
 
 ### Reference implementations define correctness
 
@@ -291,6 +280,8 @@ Use the narrowest ownership level that fits the behavior:
 
 - mathematical behavior shared by two implementations of one variant belongs in
   `<variant>/impl/common.py`;
+- private mathematical kernels shared by multiple variants belong in a semantic namespace such as
+  `attn_gym/linear/_delta_rule/`, not in a backend-infrastructure package;
 - Triton infrastructure shared by different variants belongs in `attn_gym/_backends/triton/`;
 - CuTeDSL infrastructure shared by different variants belongs in `attn_gym/_backends/cute/`;
 - public types shared by multiple linear or sparse operations belong in a namespace-level module
@@ -457,20 +448,20 @@ use a custom sparse kernel.
 
 ### Inputs and layout
 
-Fixed-length public APIs use the SDPA/FlexAttention layout:
+Fixed-length public linear-attention APIs use the token-major layout:
 
 ```text
-[batch, heads, sequence, dimension]
+[batch, sequence, heads, dimension]
 ```
 
-Packed variable-length inputs use:
+Packed variable-length inputs use batch-one storage with tokens concatenated along the sequence
+axis:
 
 ```text
-[total_tokens, heads, dimension]
+[1, total_tokens, heads, dimension]
 ```
 
-where `total_tokens` is the sum of all sequence lengths. Backends may transpose internally, but
-public callers should not need backend-specific layouts. Outputs follow the corresponding input
+where `total_tokens` is the sum of all sequence lengths. Outputs follow the corresponding input
 layout.
 
 ### Execution form
@@ -499,7 +490,7 @@ local dispatch rather than a general capability solver.
 ### Variable-length inputs
 
 Variable-length support is part of the intended base contract rather than an optional follow-up.
-Packed inputs use `[total_tokens, heads, dimension]` tensors with cumulative sequence lengths:
+Packed inputs use `[1, total_tokens, heads, dimension]` tensors with cumulative sequence lengths:
 
 ```python
 cu_seqlens: torch.Tensor | None = None
@@ -511,16 +502,9 @@ unless required.
 
 ### Outputs and recurrent state
 
-The public API should always return a structured result rather than switch between a tensor and tuple
-based on `return_final_state`. A stable result shape is easier to compose and extend:
-
-```python
-result.output
-result.final_state
-```
-
-The cost is a small departure from existing operator conventions. This should be validated with the
-first TorchTitan integration before being finalized.
+Chunked and recurrent operations return ``(output, final_state)``. The state is ``None`` unless
+``output_final_state=True``. This matches the KDA operations and keeps state-carrying execution
+explicit without introducing a variant-specific result wrapper.
 
 ### Layers versus functional operators
 

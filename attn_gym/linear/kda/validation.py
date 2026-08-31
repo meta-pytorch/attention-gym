@@ -12,9 +12,36 @@ here once; implementation-specific constraints stay with the implementation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Literal
+
 import torch
 
+from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
+
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward"})
+
+
+def resolve_kernel_options(
+    kernel_options: Mapping[str, object] | None,
+) -> tuple[Literal["fused", "mega"], bool]:
+    """Validate chunk backend options and resolve their defaults."""
+    if kernel_options is None:
+        return "fused", False
+    unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported chunk_kda kernel options: {names}")
+    backend = kernel_options.get("backend", "fused")
+    if backend not in ("fused", "mega"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    split_backward = kernel_options.get("split_backward", False)
+    if not isinstance(split_backward, bool):
+        raise TypeError("kernel_options['split_backward'] must be a bool")
+    if split_backward and backend != "mega":
+        raise ValueError("split_backward requires kernel_options['backend']='mega'")
+    return backend, split_backward
 
 
 def validate_kda_inputs(
@@ -28,48 +55,34 @@ def validate_kda_inputs(
     *,
     op_name: str,
     gate_name: str,
+    allow_grouped_heads: bool = False,
 ) -> None:
-    """Validate the shared KDA operation contract before normalizing inputs."""
-    if q.ndim != 4:
-        raise ValueError(f"q must have shape [B, T, H, K], got {tuple(q.shape)}")
-    batch, tokens, heads, key_dim = q.shape
-    if batch == 0 or tokens == 0 or heads == 0 or key_dim == 0:
-        raise ValueError(f"q must have nonempty dimensions, got {tuple(q.shape)}")
-    if k.shape != q.shape:
-        raise ValueError(f"k must have shape {tuple(q.shape)}, got {tuple(k.shape)}")
-    if gate.shape != q.shape:
-        raise ValueError(f"{gate_name} must have shape {tuple(q.shape)}, got {tuple(gate.shape)}")
-    if v.ndim != 4 or v.shape[:3] != (batch, tokens, heads) or v.shape[-1] < 1:
-        raise ValueError(
-            f"v must have shape [{batch}, {tokens}, {heads}, V], got {tuple(v.shape)}"
-        )
-    if beta.shape != (batch, tokens, heads):
-        raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
-    if cu_seqlens is not None:
-        if batch != 1:
-            raise ValueError("packed cu_seqlens require q to have batch size one")
-        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
-            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
-        if (
-            cu_seqlens.dtype != torch.int32
-            or not cu_seqlens.is_contiguous()
-            or cu_seqlens.device != q.device
-        ):
-            raise ValueError("cu_seqlens must be contiguous int32 on q.device")
-    state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    expected_state = (state_batch, heads, key_dim, v.shape[-1])
-    if initial_state is not None and initial_state.shape != expected_state:
-        raise ValueError(
-            f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"
-        )
-    data_tensors = (q, k, v, gate, beta)
-    if initial_state is not None:
-        data_tensors += (initial_state,)
-    if not all(tensor.device == q.device for tensor in data_tensors):
-        raise ValueError(f"all {op_name} inputs must be on the same device")
+    """Validate the shared KDA operation contract before normalizing inputs.
+
+    ``allow_grouped_heads`` admits value-head counts that are positive multiples of the
+    q/k head count (the recurrent forms map heads in-kernel); the chunk pipeline requires
+    equal head counts. This is the multi-value attention (MVA) pattern of "Transformers
+    are SSMs" (arXiv:2405.21060, section 7.2): only q/k are shared across a group, while
+    the gate and beta drive each value head's state update and keep one entry per value
+    head.
+    """
+    validate_delta_rule_inputs(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        op_name=op_name,
+        gate_name=gate_name,
+        vector_gate=True,
+        allow_grouped_heads=allow_grouped_heads,
+    )
+    data_tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if any(tensor.dtype not in SUPPORTED_INPUT_DTYPES for tensor in data_tensors):
         supported = ", ".join(str(dtype) for dtype in SUPPORTED_INPUT_DTYPES)
         raise TypeError(f"{op_name} inputs must use one of {supported}")
 
 
-__all__ = ["SUPPORTED_INPUT_DTYPES", "validate_kda_inputs"]
+__all__ = ["SUPPORTED_INPUT_DTYPES", "resolve_kernel_options", "validate_kda_inputs"]

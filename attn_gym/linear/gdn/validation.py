@@ -4,55 +4,42 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
+
 
 def validate_gdn_inputs(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> None:
     """Validate backend-independent gated delta rule tensor invariants."""
-    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise ValueError(
-            "query, key, and value must have shape [batch, heads, sequence, dimension]"
-        )
-    if gate.ndim != 3 or beta.ndim != 3:
-        raise ValueError("gate and beta must have shape [batch, heads, sequence]")
-    if query.shape != key.shape:
-        raise ValueError(
-            f"query and key must have the same shape, got {query.shape} and {key.shape}"
-        )
-
-    batch, heads, sequence, key_dimension = query.shape
-    if sequence == 0:
-        raise ValueError("sequence length must be greater than zero")
-    if value.shape[:3] != (batch, heads, sequence):
-        raise ValueError("value must match query in its batch, head, and sequence dimensions")
-    if gate.shape != (batch, heads, sequence) or beta.shape != (batch, heads, sequence):
-        raise ValueError("gate and beta must match query's batch, head, and sequence dimensions")
-    if initial_state is not None:
-        expected_state_shape = (batch, heads, key_dimension, value.shape[-1])
-        if initial_state.shape != expected_state_shape:
-            raise ValueError(
-                f"initial_state must have shape {expected_state_shape}, got {initial_state.shape}"
-            )
-
-    tensors = (query, key, value, gate, beta)
-    if initial_state is not None:
-        tensors += (initial_state,)
+    validate_delta_rule_inputs(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        op_name="gated delta rule",
+        gate_name="gate",
+        vector_gate=False,
+        allow_grouped_heads=True,
+    )
+    tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if not all(tensor.is_floating_point() for tensor in tensors):
         raise ValueError("all inputs must have floating-point dtypes")
-    if any(tensor.device != query.device for tensor in tensors[1:]):
-        raise ValueError("all inputs must be on the same device")
-    if key.dtype != query.dtype or value.dtype != query.dtype:
-        raise ValueError("query, key, and value must have the same dtype")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
 
-    compute_dtype = torch.promote_types(query.dtype, torch.float32)
+    compute_dtype = torch.promote_types(q.dtype, torch.float32)
     if initial_state is not None and initial_state.dtype != compute_dtype:
         raise ValueError(
-            f"initial_state must have dtype {compute_dtype} for {query.dtype} query, "
+            f"initial_state must have dtype {compute_dtype} for {q.dtype} q, "
             f"got {initial_state.dtype}"
         )
 

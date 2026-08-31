@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 from functools import partial, wraps
 from typing import Literal
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from jsonargparse import CLI
@@ -699,9 +698,12 @@ def get_average_speedups(
         calculate_speedup(r.results["flex_attn"], r.results[backend], type) for r in results
     ]
 
-    # Find indices of max and min speedups
-    max_speedup_index = np.nanargmax(speedups)
-    min_speedup_index = np.nanargmin(speedups)
+    speedups_tensor = torch.tensor(speedups, dtype=torch.float64)
+    nan_mask = torch.isnan(speedups_tensor)
+    if nan_mask.all():
+        raise ValueError("All speedups are NaN")
+    max_speedup_index = speedups_tensor.masked_fill(nan_mask, -torch.inf).argmax().item()
+    min_speedup_index = speedups_tensor.masked_fill(nan_mask, torch.inf).argmin().item()
 
     # Get the config dictionaries
     max_config_dict = results[max_speedup_index].config.asdict()
@@ -711,7 +713,7 @@ def get_average_speedups(
     table_data = [
         {
             "Type": "Average",
-            "Speedup": np.nanmean(speedups),
+            "Speedup": torch.nanmean(speedups_tensor).item(),
             **dict.fromkeys(max_config_dict),
         },
         {"Type": "Max", "Speedup": speedups[max_speedup_index], **max_config_dict},
@@ -780,7 +782,9 @@ def print_results(
         for backend in results[0].config.backends:
             if (
                 f"fwd_{backend}_speedup" in table_data
-                and not np.isnan(table_data[f"fwd_{backend}_speedup"]).all()
+                and not torch.isnan(torch.tensor(table_data[f"fwd_{backend}_speedup"]))
+                .all()
+                .item()
             ):
                 print("\n")
                 print(f"FWD Speedups vs. {backend}".center(125, "="))
@@ -1384,9 +1388,7 @@ def main(
     # Always calculate throughput
     throughput = True
 
-    seed = 123
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    torch.manual_seed(123)
     results = []
     for experiment_count, exp_config in enumerate(
         tqdm(

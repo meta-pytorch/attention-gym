@@ -34,19 +34,11 @@ from attn_gym._backends.cute import (
     tune,
 )
 from attn_gym._backends.cute.device import upper_bound
+from attn_gym._backends.cute.ragged import load_ragged_token_count
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda import ops as kda_ops
-from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_token_count
-from attn_gym.linear.kda.short_conv.activations import Activation, resolve_activation
+from attn_gym.linear.short_conv import ops as short_conv_ops
+from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.utils import ceildiv
-
-_forward_op = kda_ops.short_conv_forward_op
-_backward_op = kda_ops.short_conv_backward_op
-_decode_op = kda_ops.short_conv_decode_op
-_configured_forward_op = kda_ops.short_conv_configured_forward_op
-_configured_backward_op = kda_ops.short_conv_configured_backward_op
-_configured_backward_with_state_grad_op = kda_ops.short_conv_configured_backward_with_state_grad_op
-_configured_decode_op = kda_ops.short_conv_configured_decode_op
 
 
 @dataclass(frozen=True)
@@ -323,6 +315,11 @@ class ShortConvKernel:
         return name
 
 
+# NOTE [Long-sequence launch grids]
+# CUDA limits grid.y and grid.z to 65,535 blocks, while grid.x supports over two billion.
+# Time is the only practically unbounded launch axis, so every time-tiled kernel maps time
+# to grid.x, channels to grid.y, and batch to grid.z.
+
 # NOTE [Packed forward active endpoint]
 # CUDA Graph capture fixes the physical token capacity T, while cu_seqlens[-1]
 # supplies the runtime active token count L. Keep the natural capacity launch grid
@@ -372,7 +369,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
     ):
         """Compute the physical time tile owned by this CTA."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -476,7 +473,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         initial_state: cute.Tensor | None,
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
-        _, time_block, _ = cute.arch.block_idx()
+        time_block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(cu_seqlens is not None):
             active_endpoint = load_ragged_token_count(cu_seqlens)
             if active_endpoint == self.tokens:
@@ -506,8 +503,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -568,7 +565,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
 
             x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
-            state_groups = cute.zipped_divide(state, (1, self.channels_per_thread))
+            state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
 
             if active:
                 weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
@@ -578,13 +575,12 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                             weight[channel + channel_offset, tap]
                         )
 
-                history_base = slot * (self.width - 1)
                 taps = cute.make_rmem_tensor(
                     (self.channels_per_thread, self.width), self.dtype.cute_type
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
                     taps[(None, row)].store(
-                        state_groups[((0, None), (history_base + row, channel_group))].load()
+                        state_groups[((0, 0, None), (slot, row, channel_group))].load()
                     )
                 taps[(None, self.width - 1)].store(
                     x_groups[((0, None), (sequence, channel_group))].load()
@@ -596,7 +592,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                     )
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
-                    state_groups[((0, None), (history_base + row, channel_group))].store(
+                    state_groups[((0, 0, None), (slot, row, channel_group))].store(
                         taps[(None, row + 1)].load()
                     )
             else:
@@ -667,7 +663,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
     ):
         """Compute one packed channel group and ten input-gradient tokens."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -838,8 +834,8 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -887,7 +883,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
     ):
         """Compute one FP32 weight-gradient partial per tap and owned channel."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
@@ -1000,8 +996,8 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             initial_state,
         ).launch(
             grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -1430,7 +1426,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Run one staged logical time tile with an optional sequence fast path."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, _, batch = cute.arch.block_idx()
+        _, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
         time_start = time_block * self.times_per_block
@@ -1640,7 +1636,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Compute boundary-aware input gradients while retaining one convolution window."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         time_start = time_block * self.times_per_block
         stage_tokens = self.tma_stage_tokens
@@ -1789,7 +1785,7 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Stride a fixed TMA worker grid over runtime-active input-gradient tiles."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, worker, batch = cute.arch.block_idx()
+        worker, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         (
             tile_pipeline,
@@ -1886,8 +1882,8 @@ class CausalConv1dSiluInputGradientTma(
                 tma_tensor_dy,
             ).launch(
                 grid=(
-                    self.channels // (self.threads * self.channels_per_thread),
                     self.time_workers,
+                    self.channels // (self.threads * self.channels_per_thread),
                     self.batches,
                 ),
                 block=(self.threads, 1, 1),
@@ -1908,8 +1904,8 @@ class CausalConv1dSiluInputGradientTma(
                 tma_tensor_dy,
             ).launch(
                 grid=(
-                    self.channels // (self.threads * self.channels_per_thread),
                     cute.ceil_div(self.tokens, self.times_per_block),
+                    self.channels // (self.threads * self.channels_per_thread),
                     self.batches,
                 ),
                 block=(self.threads, 1, 1),
@@ -1939,7 +1935,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
     ):
         """Compute boundary-aware weight-gradient partials from asynchronously staged tiles."""
         tidx, _, _ = cute.arch.thread_idx()
-        channel_block, time_block, batch = cute.arch.block_idx()
+        time_block, channel_block, batch = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         channel_group = channel_block * self.threads + tidx
         channel = channel_group * self.channels_per_thread
@@ -2171,8 +2167,8 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             tma_tensor_dy,
         ).launch(
             grid=(
-                self.channels // (self.threads * self.channels_per_thread),
                 cute.ceil_div(self.tokens, self.times_per_block),
+                self.channels // (self.threads * self.channels_per_thread),
                 self.batches,
             ),
             block=(self.threads, 1, 1),
@@ -2719,8 +2715,12 @@ def _validate_decode_inputs(
     expected_state = (slots, weight.shape[1] - 1, channels)
     if slots < 1 or state.ndim != 3 or state.shape != expected_state:
         raise ValueError(f"state must have shape {expected_state}, got {tuple(state.shape)}")
-    if state.dtype != x.dtype or state.device != x.device or not state.is_contiguous():
-        raise ValueError("state must match x dtype and be contiguous on x.device")
+    if state.dtype != x.dtype or state.device != x.device:
+        raise ValueError("state must match x dtype and be on x.device")
+    if state.stride()[1:] != (channels, 1):
+        raise ValueError("state must be contiguous within each [W - 1, C] slot")
+    if state.stride(0) < (weight.shape[1] - 1) * channels:
+        raise ValueError("state slots must not overlap")
 
     if state_indices is not None and (
         tuple(state_indices.shape) != (sequences,)
@@ -2898,6 +2898,29 @@ def _compatible_config(config: ShortConvConfig, channels: int) -> ShortConvConfi
             channels_per_thread = divisor
             break
     return ShortConvConfig(config.threads, channels_per_thread, config.times_per_block)
+
+
+def _default_decode_config(x: torch.Tensor, width: int, activation: str | None) -> ShortConvConfig:
+    """Select the measured one-token schedule for the active architecture."""
+    default = ShortConvTunedConfig.default(x.dtype).forward
+    if x.dtype is torch.bfloat16 and width == 4 and activation == "silu":
+        major = get_device_properties(x.device).major
+        if major == 9:
+            # Narrower channel ownership gives Qwen's small H100 decode grids more CTAs.
+            default = ShortConvConfig(
+                default.threads,
+                1 if x.shape[0] <= 8 else 2,
+                default.times_per_block,
+            )
+        elif major == 10 and x.shape[0] <= 256 and x.shape[1] in (768, 1536, 3072, 6144):
+            local_heads = x.shape[1] // (3 * 128)
+            sequence_heads = x.shape[0] * local_heads
+            default = ShortConvConfig(
+                default.threads,
+                1 if sequence_heads <= 128 else 2,
+                default.times_per_block,
+            )
+    return _compatible_config(default, x.shape[1])
 
 
 def _candidate_configs(
@@ -3126,6 +3149,20 @@ def _fake_state_indices(paged: bool):
     )
 
 
+def _fake_decode_state(dtype: ShortConvDType, width: int, channels: int):
+    """Create a state pool with a dynamic slot stride and compact slot contents."""
+    return cute.runtime.make_fake_tensor(
+        dtype.cute_type,
+        (cute.sym_int32(), width - 1, channels),
+        stride=(
+            cute.sym_int64(),
+            channels,
+            1,
+        ),
+        assumed_align=16,
+    )
+
+
 @jit_cache
 def _compile_decode(
     channels: int,
@@ -3142,7 +3179,7 @@ def _compile_decode(
         _fake_dynamic_rows(dtype, channels),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels),
-        _fake_dynamic_rows(dtype, channels),
+        _fake_decode_state(dtype, width, channels),
         _fake_state_indices(paged),
     )
 
@@ -3174,7 +3211,7 @@ def _launch_decode(
         state_indices is not None,
         resolved_activation,
     )
-    compiled(x, weight, output, state.flatten(0, 1), state_indices)
+    compiled(x, weight, output, state, state_indices)
     return output
 
 
@@ -3223,7 +3260,7 @@ def _cute_short_conv_decode_cuda(
 ) -> torch.Tensor:
     """Launch the tuned forward defaults through the decode schema."""
     _validate_decode_inputs(x, weight, state, state_indices)
-    config = _compatible_config(ShortConvTunedConfig.default(x.dtype).forward, x.shape[1])
+    config = _default_decode_config(x, weight.shape[1], activation)
     return _launch_decode(
         x,
         weight,
@@ -3568,7 +3605,7 @@ class _ShortConv(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         activation: str | None,
     ) -> torch.Tensor:
-        output = kda_ops.short_conv_forward_op(
+        output = short_conv_ops.short_conv_forward_op(
             x, weight, cu_seqlens, initial_state, activation=activation
         )
         ctx.save_for_backward(x, weight, cu_seqlens, initial_state)
@@ -3581,7 +3618,7 @@ class _ShortConv(torch.autograd.Function):
         x, weight, cu_seqlens, initial_state = ctx.saved_tensors
         activation = ctx.activation
         if initial_state is None:
-            grad_x, grad_weight = kda_ops.short_conv_backward_op(
+            grad_x, grad_weight = short_conv_ops.short_conv_backward_op(
                 x, weight, grad_output, cu_seqlens, activation=activation
             )
             grad_initial_state = None
@@ -3603,7 +3640,7 @@ class _ShortConv(torch.autograd.Function):
             )
             if ctx.needs_input_grad[3]:
                 grad_x, grad_weight, grad_initial_state = (
-                    kda_ops.short_conv_configured_backward_with_state_grad_op(
+                    short_conv_ops.short_conv_configured_backward_with_state_grad_op(
                         x,
                         weight,
                         grad_output,
@@ -3614,7 +3651,7 @@ class _ShortConv(torch.autograd.Function):
                     )
                 )
             else:
-                grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
+                grad_x, grad_weight = short_conv_ops.short_conv_configured_backward_op(
                     x,
                     weight,
                     grad_output,
@@ -3647,7 +3684,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         weight_times: int,
         persistent_tma_input_gradient: bool,
     ) -> torch.Tensor:
-        output = kda_ops.short_conv_configured_forward_op(
+        output = short_conv_ops.short_conv_configured_forward_op(
             x,
             weight,
             cu_seqlens,
@@ -3685,7 +3722,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
         configs = ctx.backward_config
         if initial_state is not None and ctx.needs_input_grad[3]:
             grad_x, grad_weight, grad_initial_state = (
-                kda_ops.short_conv_configured_backward_with_state_grad_op(
+                short_conv_ops.short_conv_configured_backward_with_state_grad_op(
                     x,
                     weight,
                     grad_output,
@@ -3696,7 +3733,7 @@ class _ConfiguredShortConv(torch.autograd.Function):
                 )
             )
         else:
-            grad_x, grad_weight = kda_ops.short_conv_configured_backward_op(
+            grad_x, grad_weight = short_conv_ops.short_conv_configured_backward_op(
                 x,
                 weight,
                 grad_output,
@@ -3942,9 +3979,9 @@ def causal_conv1d_decode(
         state: Causal history ``[num_slots, W - 1, C]`` holding each slot's trailing
             ``W - 1`` inputs, oldest first -- the layout :func:`causal_conv1d` takes as
             ``initial_state`` and returns as its final state. Advanced **in place**: the
-            rows shift left and ``x`` becomes the newest. Its storage must be contiguous
-            and 16-byte aligned, since the launcher cannot realign it without losing the
-            update.
+            rows shift left and ``x`` becomes the newest. Each slot must be contiguous,
+            but padding between slots is supported. The storage must be 16-byte aligned,
+            since the launcher cannot realign it without losing the update.
         activation: Any name registered with :func:`register_activation`, or ``None``.
         state_indices: Optional contiguous int32 slot indices, one per sequence, selecting
             rows of a paged ``state`` pool. Without them, sequence ``i`` uses slot ``i``.
@@ -3965,19 +4002,19 @@ def causal_conv1d_decode(
             "causal_conv1d_decode is inference-only and has no backward; use "
             "causal_conv1d for training or call under torch.no_grad()"
         )
-    default = ShortConvTunedConfig.default(x.dtype).forward
-    config = _compatible_config(default, x.shape[1]) if forward_config is None else forward_config
-    _validate_config(config, x.shape[1], "forward_config")
-    if forward_config is None and config == default:
-        return kda_ops.short_conv_decode_op(x, weight, state, state_indices, activation=activation)
-    return kda_ops.short_conv_configured_decode_op(
+    if forward_config is None:
+        return short_conv_ops.short_conv_decode_op(
+            x, weight, state, state_indices, activation=activation
+        )
+    _validate_config(forward_config, x.shape[1], "forward_config")
+    return short_conv_ops.short_conv_configured_decode_op(
         x,
         weight,
         state,
         state_indices,
-        config.threads,
-        config.channels_per_thread,
-        config.times_per_block,
+        forward_config.threads,
+        forward_config.channels_per_thread,
+        forward_config.times_per_block,
         activation=activation,
     )
 

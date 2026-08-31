@@ -1,8 +1,9 @@
 import math
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import TypeVar
 
-import numpy as np
 import torch
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
@@ -12,17 +13,19 @@ from torch.nn.attention.flex_attention import (
     _vmap_for_bhqkv,
 )
 from torch.profiler import ProfilerActivity, profile
+from torch.utils._pytree import tree_map_only_
 
 # TODO This was moved on nightly, this enables 2.5 and 2.6 | we should remove this once 2.5 is no longer supported
 try:
     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
 except ImportError:
     from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
-from collections.abc import Callable
 
 from torch._inductor.utils import do_bench_using_profiling
 
 Tensor = torch.Tensor
+CurrentOutputT = TypeVar("CurrentOutputT")
+SideOutputT = TypeVar("SideOutputT")
 
 
 def ceildiv(number: int, divisor: int) -> int:
@@ -35,6 +38,49 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
     return time * 1e3
+
+
+def fork_join_streams(
+    current_stream: torch.cuda.Stream,
+    side_stream: torch.cuda.Stream,
+    side_work: Callable[[], SideOutputT],
+    current_work: Callable[[], CurrentOutputT],
+) -> tuple[CurrentOutputT, SideOutputT]:
+    """Run independent work on a current CUDA stream and a forked side stream.
+
+    The side stream first waits for work already queued on the current stream. Both
+    callbacks then run on their designated streams, after which the current stream
+    joins the side stream even if either callback raises. Every tensor leaf in the
+    side result is recorded on the current stream so returned allocations remain live
+    while later current-stream consumers use them.
+
+    Args:
+        current_stream: Caller stream that runs ``current_work`` and receives the join.
+        side_stream: Auxiliary stream that runs ``side_work``.
+        side_work: Zero-argument callback launched on ``side_stream``.
+        current_work: Zero-argument callback launched on ``current_stream``.
+
+    Returns:
+        A ``(current_output, side_output)`` pair preserving both callbacks' result
+        types and PyTree structures.
+    """
+    side_stream.wait_stream(current_stream)
+    try:
+        with torch.cuda.stream(side_stream):
+            side_output = side_work()
+        with torch.cuda.stream(current_stream):
+            current_output = current_work()
+    finally:
+        current_stream.wait_stream(side_stream)
+    if isinstance(side_output, torch.Tensor):
+        side_output.record_stream(current_stream)
+    else:
+        tree_map_only_(
+            torch.Tensor,
+            lambda tensor: tensor.record_stream(current_stream),
+            side_output,
+        )
+    return current_output, side_output
 
 
 def merge_attention(
@@ -203,8 +249,8 @@ def visualize_attention_scores(
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
-        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.set_xticks(torch.arange(-0.5, num_kv_tokens, 1), minor=True)
+        ax.set_yticks(torch.arange(-0.5, num_query_tokens, 1), minor=True)
         ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()
@@ -305,8 +351,8 @@ def plot_attention_scores(
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
-        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.set_xticks(torch.arange(-0.5, num_kv_tokens, 1), minor=True)
+        ax.set_yticks(torch.arange(-0.5, num_query_tokens, 1), minor=True)
         ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()

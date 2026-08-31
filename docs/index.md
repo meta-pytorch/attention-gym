@@ -1,6 +1,6 @@
 # Attention Gym
 
-![Attention Gym](assets/hero.png)
+![Attention Gym](assets/hero-friends.jpg)
 
 Attention Gym is a collection of tools and examples for working with PyTorch's [FlexAttention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html) API.
 
@@ -10,7 +10,7 @@ It provides ready-to-use **mask functions** and **score mods** that you can comp
 
 - **[Getting Started](getting-started.md)** — install Attention Gym and build your first mask
 - **[Core Concepts](concepts.md)** — understand how `mask_mod`, `score_mod`, and `BlockMask` work together
-- **Guides** — learn about [CUDA Graphs for ragged training](tutorials/cuda-graphs.md) and [deterministic FlexAttention](determinism.md)
+- **Guides** — learn about [ragged CUDA Graphs](guides/ragged-cuda-graphs.md) and [deterministic FlexAttention](determinism.md)
 - **Reference** — browse [masks](masks.md), [score mods](mods.md), [linear attention](linear.md), and [utilities](utilities.md)
 - **[Examples](examples.md)** — explore benchmarks, MLA, paged attention, distributed attention, and advanced patterns
 

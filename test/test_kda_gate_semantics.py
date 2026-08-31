@@ -33,15 +33,29 @@ def test_bound_gate_returns_fp32_natural_log_decay(dtype: torch.dtype):
     a_log = torch.randn(2, device="cuda")
     dt_bias = torch.randn(2, 128, device="cuda")
 
-    actual = bound_gate(raw_gate, a_log, dt_bias, lower_bound=-3.25)
+    actual = bound_gate(raw_gate, a_log, dt_bias, lower_bound=-3.25, impl="reference")
     expected = -3.25 * torch.sigmoid(a_log.exp().view(1, 1, 2, 1) * (raw_gate.float() + dt_bias))
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    assert torch.isfinite(bound_gate(raw_gate, a_log, dt_bias, lower_bound=-6.0)).all()
+    assert torch.isfinite(
+        bound_gate(raw_gate, a_log, dt_bias, lower_bound=-6.0, impl="reference")
+    ).all()
     for invalid_lower_bound in (1.0, float("-inf")):
         with pytest.raises(ValueError, match="lower_bound"):
             bound_gate(raw_gate, a_log, dt_bias, lower_bound=invalid_lower_bound)
+
+
+def test_bound_gate_defaults_to_fused():
+    torch.manual_seed(11)
+    inputs = (
+        torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2, device="cuda"),
+        torch.randn(2, 128, device="cuda"),
+    )
+    actual = bound_gate(*inputs)
+    expected = bound_gate(*inputs, impl="fused")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_bound_gate_fullgraph_backward():
@@ -54,8 +68,10 @@ def test_bound_gate_fullgraph_backward():
     )
     expected_inputs = tuple(value.requires_grad_() for value in inputs)
     actual_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
-    expected = bound_gate(*expected_inputs, lower_bound=-3.25)
-    actual = torch.compile(bound_gate, fullgraph=True)(*actual_inputs, lower_bound=-3.25)
+    expected = bound_gate(*expected_inputs, lower_bound=-3.25, impl="reference")
+    actual = torch.compile(partial(bound_gate, impl="reference"), fullgraph=True)(
+        *actual_inputs, lower_bound=-3.25
+    )
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
     cotangent = torch.randn_like(expected)
@@ -82,7 +98,7 @@ def test_bound_gate_fused_backward_matches_pytorch(
         torch.randn(3, 128, device="cuda", requires_grad=True),
     )
     actual_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
-    expected = bound_gate(*inputs, lower_bound=-3.25)
+    expected = bound_gate(*inputs, lower_bound=-3.25, impl="reference")
     actual = bound_gate(
         *actual_inputs,
         lower_bound=-3.25,
@@ -107,13 +123,10 @@ def test_bound_gate_fused_backward_matches_pytorch(
 
 def test_bound_gate_fused_backward_fullgraph_dynamic_tokens():
     """Reuse one fullgraph callable across batch and partial-token shapes."""
+    torch.compiler.reset()
     torch.manual_seed(29)
     with torch._dynamo.config.patch(error_on_recompile=True):
-        compiled = torch.compile(
-            partial(bound_gate, impl="fused"),
-            fullgraph=True,
-            dynamic=True,
-        )
+        compiled = torch.compile(bound_gate, fullgraph=True, dynamic=True)
         for batch, tokens in ((2, 65), (3, 97)):
             expected_inputs = (
                 torch.randn(
@@ -131,7 +144,7 @@ def test_bound_gate_fused_backward_fullgraph_dynamic_tokens():
             actual_inputs = tuple(
                 value.detach().clone().requires_grad_() for value in expected_inputs
             )
-            expected = bound_gate(*expected_inputs)
+            expected = bound_gate(*expected_inputs, impl="reference")
             actual = compiled(*actual_inputs)
             torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
@@ -181,7 +194,7 @@ def test_bound_gate_supports_general_layouts(layout: str):
         value.detach().clone().requires_grad_() for value in (raw_gate, a_log, dt_bias)
     )
     actual_inputs = tuple(value.requires_grad_() for value in (raw_gate, a_log, dt_bias))
-    expected = bound_gate(*expected_inputs)
+    expected = bound_gate(*expected_inputs, impl="reference")
     actual = bound_gate(*actual_inputs, fastmath=True, impl="fused")
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
@@ -216,7 +229,7 @@ def test_bound_gate_supports_large_grid_axes(batch: int, tokens: int):
     )
     expected_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
     actual = bound_gate(*inputs, impl="fused")
-    expected = bound_gate(*expected_inputs)
+    expected = bound_gate(*expected_inputs, impl="reference")
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
     cotangent = torch.randn_like(actual)
@@ -251,18 +264,28 @@ def test_bound_gate_operator_registration():
     )
 
 
-def test_fused_chunk_gate_range_boundary_is_finite():
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="the fused chunk KDA core requires CUDA capability 10.0 or newer",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_chunk_gate_range_boundary_is_finite(dtype):
     """Exercise the strongest documented per-token decay accepted by the fused rebase."""
     torch.manual_seed(17)
     shape = (1, 64, 1, 128)
-    q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
-    k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(torch.bfloat16)
-    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    gate = torch.full(shape, -MAX_GATE_LOWER_BOUND_MAGNITUDE, device="cuda")
-    beta = torch.rand(shape[:3], device="cuda")
+    inputs = (
+        F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype),
+        F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype),
+        torch.randn(shape, device="cuda", dtype=dtype),
+        torch.full(shape, -MAX_GATE_LOWER_BOUND_MAGNITUDE, device="cuda"),
+        torch.rand(shape[:3], device="cuda"),
+    )
+    inputs = tuple(tensor.requires_grad_() for tensor in inputs)
 
-    output, _ = chunk_kda(q, k, v, gate, beta, autotune=False)
+    output, _ = chunk_kda(*inputs, autotune=False)
+    gradients = torch.autograd.grad(output.float().square().mean(), inputs)
     assert torch.isfinite(output).all()
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_plain_gate_scan_accepts_strided_dense_input():

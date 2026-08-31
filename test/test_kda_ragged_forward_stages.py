@@ -23,12 +23,13 @@ def _metadata(lengths: list[int]):
     return prepare_ragged_chunk_metadata(offsets, sum(lengths), 64)
 
 
-def test_ragged_forward_stages_match_independent_sequences():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ragged_forward_stages_match_independent_sequences(dtype: torch.dtype):
     torch.manual_seed(13)
     lengths = [65, 0, 63]
     tokens = sum(lengths)
     shape = (1, tokens, 1, 128)
-    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    q = torch.randn(shape, device="cuda", dtype=dtype) / 8
     k = torch.randn_like(q) / 8
     v = torch.randn_like(q) / 8
     gk = -torch.rand(shape, device="cuda")
@@ -60,11 +61,12 @@ def test_ragged_forward_stages_match_independent_sequences():
         torch.testing.assert_close(packed, expected, rtol=0, atol=0)
 
 
-def test_ragged_forward_stages_replay_aligned_to_ragged():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ragged_forward_stages_replay_aligned_to_ragged(dtype: torch.dtype):
     torch.manual_seed(17)
     tokens = 128
     shape = (1, tokens, 1, 128)
-    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    q = torch.randn(shape, device="cuda", dtype=dtype) / 8
     k = torch.randn_like(q) / 8
     v = torch.randn_like(q) / 8
     gk = -torch.rand(shape, device="cuda")

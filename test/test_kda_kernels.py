@@ -29,6 +29,7 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     _l2norm_bwd_op,
     _l2norm_fwd_op,
+    _l2norm_launch_config,
     l2norm,
     l2norm_fwd_kernel,
 )
@@ -187,6 +188,32 @@ _L2NORM_CASES = [(torch.float32, T, D, strided) for T, D, strided in L2NORM_SHAP
 
 
 # l2norm forward
+@pytest.mark.parametrize(
+    ("rows", "tuned_major", "expected"),
+    [
+        (1, 9, (1, 1)),
+        (2, 9, (1, 1)),
+        (9, 9, (1, 1)),
+        (10, 9, (4, 2)),
+        (2048, 9, (4, 2)),
+        (2049, 9, (16, 4)),
+        (8, 10, (1, 1)),
+        (10, 10, (1, 4)),
+        (32, 10, (1, 4)),
+        (34, 10, (4, 4)),
+        (512, 10, (4, 4)),
+        (514, 10, (8, 4)),
+        (128, None, (16, 4)),
+    ],
+)
+def test_l2norm_launch_config(
+    rows: int,
+    tuned_major: int | None,
+    expected: tuple[int, int],
+):
+    assert _l2norm_launch_config(rows, tuned_major) == expected
+
+
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_fwd(dtype, T, D, strided):
     torch.manual_seed(0)
@@ -208,8 +235,7 @@ def test_l2norm_fwd(dtype, T, D, strided):
     y = _empty_strided_like(x) if strided else torch.empty_like(x)
     rstd_template = torch.empty(T, device=DEV, dtype=torch.float32)
     rstd = _empty_strided_like(rstd_template) if strided else rstd_template
-    grid = lambda meta: (triton.cdiv(T, meta["BT"]),)
-    l2norm_fwd_kernel[grid](
+    l2norm_fwd_kernel[(triton.cdiv(T, 16),)](
         x,
         y,
         rstd,
@@ -223,9 +249,11 @@ def test_l2norm_fwd(dtype, T, D, strided):
         H=1,
         D=D,
         BD=BD,
-        NB=triton.cdiv(T, 16),
         NUM_SEQUENCES=0,
         IS_VARLEN=False,
+        BT=16,
+        num_warps=4,
+        num_stages=3,
     )
     assert_golden(y, golden, ref, dtype, f"l2norm_fwd_kernel T={T} D={D}")
     assert_golden(rstd, rstd_golden, rstd_ref, dtype, f"l2norm_fwd_kernel rstd T={T} D={D}")
@@ -273,6 +301,33 @@ def test_l2norm_op_registration():
             cu_seqlens,
         ),
     )
+
+
+def test_l2norm_blackwell_kda_decode_matches_reference_and_replays():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Blackwell-specific decode schedule")
+    torch.manual_seed(2)
+    tokens, heads = 32, 4
+    qkv = torch.randn(1, tokens, 3, heads, 128, device=DEV, dtype=torch.bfloat16)
+    x = qkv[:, :, 0]
+    cu_seqlens = torch.arange(tokens + 1, device=DEV, dtype=torch.int32)
+
+    output = l2norm(x, cu_seqlens=cu_seqlens)
+    compiled_output = torch.compile(l2norm, fullgraph=True)(x, cu_seqlens=cu_seqlens)
+    expected = l2norm_fwd_ref(x.float())
+    torch.testing.assert_close(output.float(), expected, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(compiled_output, output, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = l2norm(x, cu_seqlens=cu_seqlens)
+
+    x.add_(0.25)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()
+    expected = l2norm(x, cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
 
 
 def test_l2norm_ragged_matches_exact_active_prefix():
@@ -614,7 +669,11 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     h = torch.zeros(B, num_chunks, H, K, V, dtype=acc, device=k.device)
     v_new = torch.zeros(B, T, H, V, dtype=acc, device=k.device)
     # State recurrence is sequential across chunks; batch (B, H) into the matmuls.
-    state = torch.zeros(B, H, K, V, dtype=acc, device=k.device) if h0 is None else h0.to(acc)
+    state = (
+        torch.zeros(B, H, K, V, dtype=acc, device=k.device)
+        if h0 is None
+        else h0.transpose(-1, -2).to(acc)
+    )
     for it in range(num_chunks):
         s = it * chunk_size
         e = min(s + chunk_size, T)
@@ -627,7 +686,7 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
         v_new[:, s:e] = vn
         state = state * gkc[:, e - 1].exp2()[..., None]
         state = state + torch.einsum("blhk,blhv->bhkv", kc[:, s:e], vn.to(acc))
-    return h.reshape(B * num_chunks, H, K, V), v_new, state
+    return h.reshape(B * num_chunks, H, K, V), v_new, state.transpose(-1, -2)
 
 
 @pytest.mark.parametrize(
@@ -651,7 +710,7 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     # Since prod keeps initial and final state in fp32, do that here to match.
-    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
+    h0 = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_h0 else None
 
     gh, gvn, ght = _fwd_h_ref(
         k.double(), w.double(), v.double(), gk.double(), h0.double() if use_h0 else None
@@ -902,7 +961,7 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
     dv2 = torch.zeros(B, T, H, V, dtype=acc, device=q.device)
     # Reverse recurrence is sequential across chunks; batch (B, H) into the matmuls.
     D = (
-        dht.to(acc).clone()
+        dht.transpose(-1, -2).to(acc).clone()
         if dht is not None
         else torch.zeros(B, H, K, V, dtype=acc, device=q.device)
     )
@@ -917,7 +976,7 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
             + scale * torch.einsum("blhk,blhv->bhkv", qf[:, s:e], dof[:, s:e])
             - torch.einsum("blhk,blhv->bhkv", wf[:, s:e], dv2c)
         )
-    dh0 = D if h0 is not None else None
+    dh0 = D.transpose(-1, -2) if h0 is not None else None
     return dh_out, dh0, dv2
 
 
@@ -944,8 +1003,8 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     aqk = aqk * _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
     # gk is the cumulative per-channel log2-decay (<= 0), so 2^{gk_last} <= 1.
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
-    h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_h0 else None
-    dht = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) if use_dht else None
+    h0 = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_h0 else None
+    dht = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_dht else None
 
     qb, kb, wb, dob, aqkb = (t.to(torch.bfloat16) for t in (q, k, w, do, aqk))
     dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_dv_fused(
@@ -1226,6 +1285,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
         dh,
         dv,
         None,
+        scale=scale,
         chunk_size=64,
     )
 

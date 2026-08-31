@@ -6,6 +6,10 @@ import math
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
+
+from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.naive import naive_recurrent_kda
 
 
 def cumulative_sequence_offsets(
@@ -20,6 +24,35 @@ def cumulative_sequence_offsets(
     return torch.tensor(offsets, device=device, dtype=torch.int32)
 
 
+def strided_state_pool(
+    num_slots: int,
+    heads: int,
+    key_dim: int,
+    value_dim: int,
+    *,
+    prefix: int = 11,
+    suffix: int = 17,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the slot-strided FP32 recurrent state view produced by vLLM's packed byte pages.
+
+    Returns the flat backing storage plus a non-contiguous ``[num_slots, heads, V, K]`` view
+    whose slots are separated by padding, matching how serving engines carve recurrent state
+    out of larger per-slot pages. Keep the storage alive while the view is in use.
+
+    The default ``prefix`` deliberately misaligns the pool base to stress the Triton paths,
+    which tolerate arbitrary element offsets. CuTe backends declare ``assumed_align=16`` on
+    the pool pointer, so their tests must pass ``prefix=0`` to keep the base 16-byte aligned.
+    """
+    state_elements = heads * key_dim * value_dim
+    storage = torch.randn(
+        num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
+    )
+    state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
+    assert not state.is_contiguous()
+    assert state.stride()[1:] == (value_dim * key_dim, key_dim, 1)
+    return storage, state
+
+
 def make_kda_test_inputs(
     tokens: int,
     *,
@@ -27,24 +60,78 @@ def make_kda_test_inputs(
     heads: int = 1,
     seed: int = 41,
     gate_scale: float = 1.0,
+    gate_value: float | None = None,
+    log_uniform_gate: bool = False,
+    sigmoid_beta: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+    normalize_qk: bool = False,
+    value_scale: float = 0.125,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Create deterministic public KDA inputs with per-token natural-log gates."""
     torch.manual_seed(seed)
     shape = (batch, tokens, heads, 128)
-    values = (
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8,
-        -torch.rand(shape, device="cuda") * gate_scale,
-        torch.rand(batch, tokens, heads, device="cuda"),
+    if normalize_qk:
+        q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
+        k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
+    else:
+        q = torch.randn(shape, device="cuda", dtype=dtype) / 8
+        k = torch.randn(shape, device="cuda", dtype=dtype) / 8
+    value = torch.randn(shape, device="cuda", dtype=dtype) * value_scale
+    if gate_value is not None:
+        gate = torch.full(shape, gate_value, device="cuda")
+    elif log_uniform_gate:
+        gate = torch.empty(shape, device="cuda").uniform_(math.exp(-gate_scale), 1.0).log_()
+    else:
+        gate = -torch.rand(shape, device="cuda") * gate_scale
+    beta = (
+        torch.randn(batch, tokens, heads, device="cuda").sigmoid_()
+        if sigmoid_beta
+        else torch.rand(batch, tokens, heads, device="cuda")
     )
+    values = (q, k, value, gate, beta)
     return tuple(value.requires_grad_(requires_grad) for value in values)
 
 
-def clone_kda_inputs(inputs: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-    """Clone KDA inputs into independent autograd leaves."""
-    return tuple(value.detach().clone().requires_grad_(value.requires_grad) for value in inputs)
+def clone_kda_inputs(
+    inputs: Sequence[torch.Tensor],
+    *,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Clone KDA inputs into independent autograd leaves, optionally changing precision."""
+    return tuple(
+        value.detach()
+        .to(dtype=value.dtype if dtype is None else dtype)
+        .clone()
+        .requires_grad_(value.requires_grad)
+        for value in inputs
+    )
+
+
+def kda_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    scale: float | None = None,
+    output_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the eager recurrent KDA oracle using natural-log public gates."""
+    return naive_recurrent_kda(
+        q,
+        k,
+        value,
+        gate * LOG2_E,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
 
 
 def assert_matches_low_precision_reference(
@@ -52,10 +139,12 @@ def assert_matches_low_precision_reference(
     high_precision: torch.Tensor,
     low_precision: torch.Tensor,
     name: str,
+    *,
+    source_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    """Bound kernel error by an independent low-precision reference's FP64 error."""
+    """Bound kernel error by the reference error and source-operand precision."""
     high_precision = high_precision.double()
-    rounding_band = torch.finfo(torch.bfloat16).eps * high_precision.abs().max().item()
+    rounding_band = torch.finfo(source_dtype).eps * high_precision.abs().max().item()
     actual_error = (actual.double() - high_precision).abs().max().item()
     reference_error = (low_precision.double() - high_precision).abs().max().item()
     budget = 2 * (reference_error + rounding_band)
@@ -275,5 +364,6 @@ __all__ = [
     "bwd_wy_dqkg_reference",
     "clone_kda_inputs",
     "cumulative_sequence_offsets",
+    "kda_reference",
     "make_kda_test_inputs",
 ]

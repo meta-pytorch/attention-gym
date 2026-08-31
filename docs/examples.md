@@ -89,6 +89,32 @@ Implements a generic single-node ring-attention example launched with `torchrun`
 torchrun --standalone --nproc_per_node=4 examples/ring_attention.py --seq-len 131072
 ```
 
+## KDA Context Parallelism
+
+[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
+— Run the complete transformer-style module from `kda_training.py` over packed context-parallel
+shards. This includes projections, Q/K/V short convolution, KDA, normalization, gating, and the
+output projection.
+
+The short convolution all-gathers one fixed-size `W - 1` token halo per rank and routes its initial-
+state gradient back to the ranks that own those tokens. The KDA recurrence separately computes
+forward and reverse `[bias; transition]` state summaries with Blackwell TMA/UMMA kernels, all-gathers
+them, and composes the relevant prefix or suffix before running the ordinary local KDA kernel. A
+contiguous rank boundary is one cut in the packed token stream, so it can split at most one logical
+sequence. The example validates local outputs, convolution and KDA endpoint states, input gradients,
+and all-reduced parameter gradients against the complete unsharded module. It can also capture the
+full forward, NCCL communication, and backward in one CUDA Graph and validate a changed-input
+replay. Add `--profile` to use transformer-nuggets to export one merged multi-rank trace in native
+Perfetto `.pftrace` format.
+
+```bash
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
+
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
+
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --profile
+```
+
 ## Kernel Tuning
 
 ### Autotune Replay

@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# CuTe DSL KDA forward intra-chunk path: the persistent engine produces Aqk and
-# K3-compatible factors, then K4b assembles the dense or ragged Akk inverse.
+# KDA forward factor composition. BF16 uses the persistent intra engine; FP16
+# uses the FP32/TF32 diagonal stage plus CuTe K3b/K4b to preserve gate range.
 
 from __future__ import annotations
 
@@ -17,11 +17,16 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
+    chunk_kda_fwd_inter_solve_cute,
+    chunk_kda_fwd_inter_solve_ragged_cute,
     chunk_kda_fwd_k4b_dense_cute,
     chunk_kda_fwd_k4b_ragged_cute,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
+    chunk_kda_fwd_intra_diagonal,
+)
 
 
 def chunk_kda_fwd_factors(
@@ -45,6 +50,34 @@ def chunk_kda_fwd_factors(
         shape = (batch, tokens, heads, chunk_size)
         return k.new_empty(shape), k.new_empty(shape)
 
+    if q.dtype == torch.float16:
+        # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their
+        # public gate-bound exponent fits BF16 but can overflow FP16, so keep the
+        # diagonal products in FP32/TF32 and use FP16 only for the safe solved factors.
+        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(q, k, gk, beta, scale, metadata, chunk_size)
+        if metadata is None:
+            return chunk_kda_fwd_inter_solve_cute(
+                q,
+                k,
+                gk,
+                beta,
+                Akkd,
+                scale,
+                chunk_size,
+                Aqk=Aqk,
+                profile_ranges=profile_ranges,
+            )
+        return chunk_kda_fwd_inter_solve_ragged_cute(
+            q,
+            k,
+            gk,
+            beta,
+            Akkd,
+            Aqk,
+            scale,
+            metadata,
+        )
+
     with (
         torch.profiler.record_function("kda/cute/intra_engine")
         if profile_ranges
@@ -52,9 +85,9 @@ def chunk_kda_fwd_factors(
     ):
         Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata)
         Akk = (
-            chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size)
+            chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size, output_dtype=q.dtype)
             if metadata is None
-            else chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, metadata)
+            else chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, metadata, output_dtype=q.dtype)
         )
     return Aqk, Akk
 

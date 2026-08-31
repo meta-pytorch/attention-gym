@@ -21,13 +21,13 @@ def naive_recurrent_kda(
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Reference O(T) KDA delta rule. State S in [K, V], per (batch, head).
+    """Reference O(T) KDA delta rule with V-major state storage.
 
     Per step t (per-channel decay a_t = 2^{g_t} in R^K):
-        S <- diag(a_t) S ;  delta = beta_t * (v_t - k^T S) ;  S <- S + outer(k_t, delta) ;  o_t = q^T S
+        S <- S diag(a_t) ; delta = beta_t * (v_t - S k) ; S <- S + outer(delta, k_t) ; o_t = S q
 
-    Shapes: q, k, g (B, T, H, K); v (B, T, H, V); beta (B, T, H); state (B, H, K, V),
-    or (N, H, K, V) over the N documents of a packed row in varlen mode.
+    Shapes: q, k, g (B, T, H, K); v (B, T, H, V); beta (B, T, H); state (B, H, V, K),
+    or (N, H, V, K) over the N documents of a packed row in varlen mode.
 
     Args:
         q: query tensor
@@ -36,7 +36,7 @@ def naive_recurrent_kda(
         g: per-channel log2-decay, a_t = 2^{g_t} in R^K (the KDA diagonal gate)
         beta: scalar-per-head delta step size / write gate
         scale: query scale for q k^T (optional; default 1/sqrt(K))
-        initial_state: initial recurrent state (B, H, K, V) (optional)
+        initial_state: initial recurrent state (B, H, V, K) (optional)
         output_final_state: also return the final state (optional; in the compute dtype)
         cu_seqlens: optional int32 offsets (varlen mode) with the public packed
             contract: the recurrence restarts at each document boundary, empty
@@ -56,7 +56,7 @@ def naive_recurrent_kda(
             initial_state.to(compute_dtype).clone()
             if initial_state is not None
             else torch.zeros(
-                num_documents, h, k_dim, v.shape[-1], dtype=compute_dtype, device=q.device
+                num_documents, h, v.shape[-1], k_dim, dtype=compute_dtype, device=q.device
             )
         )
         for doc, (bos, eos) in enumerate(pairwise(offsets)):
@@ -84,15 +84,15 @@ def naive_recurrent_kda(
         initial_state = initial_state.to(dtype)
 
     q = q * scale if scale is not None else q * k_dim**-0.5
-    state = initial_state if initial_state is not None else q.new_zeros(b, h, k_dim, v.shape[-1])
+    state = initial_state if initial_state is not None else q.new_zeros(b, h, v.shape[-1], k_dim)
     outputs = []
 
     for i in range(t):
-        state = state * g[:, i].exp2()[..., None]  # per-channel decay: diag(2^{g_t}) over V
-        delta = v[:, i] - torch.einsum("bhk,bhkv->bhv", k[:, i], state)  # vt - k^T S (v_old)
+        state = state * g[:, i].exp2()[..., None, :]
+        delta = v[:, i] - torch.einsum("bhvk,bhk->bhv", state, k[:, i])
         delta = delta * beta[:, i][..., None]
-        state = state + torch.einsum("bhk,bhv->bhkv", k[:, i], delta)  # + outer(k, delta)
-        outputs.append(torch.einsum("bhk,bhkv->bhv", q[:, i], state))  # q^T S
+        state = state + torch.einsum("bhv,bhk->bhvk", delta, k[:, i])
+        outputs.append(torch.einsum("bhvk,bhk->bhv", state, q[:, i]))
     return torch.stack(outputs, dim=1).to(output_dtype), (state if output_final_state else None)
 
 
@@ -173,7 +173,7 @@ def _naive_chunk_kda_from_cumulative(
         raise ValueError(f"v must have shape [B, T, H, V], got {v.shape}")
     if beta.shape != (batch, tokens, heads):
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {beta.shape}")
-    expected_state = (batch, heads, key_dim, v.shape[-1])
+    expected_state = (batch, heads, v.shape[-1], key_dim)
     if initial_state is not None and initial_state.shape != expected_state:
         raise ValueError(
             f"initial_state must have shape {expected_state}, got {initial_state.shape}"
@@ -211,7 +211,7 @@ def _naive_chunk_kda_from_cumulative(
     state = (
         q.new_zeros(batch, heads, key_dim, value_dim)
         if initial_state is None
-        else initial_state.to(compute_dtype)
+        else initial_state.transpose(-1, -2).to(compute_dtype)
     )
     outputs = []
     for index in range(chunks):
@@ -238,7 +238,10 @@ def _naive_chunk_kda_from_cumulative(
 
     output = torch.stack(outputs, dim=2).reshape(batch, heads, length, value_dim)
     output = output[:, :, :tokens].transpose(1, 2).to(output_dtype)
-    return output, (state.to(output_dtype) if output_final_state else None)
+    final_state = (
+        state.transpose(-1, -2).contiguous().to(output_dtype) if output_final_state else None
+    )
+    return output, final_state
 
 
 def naive_chunk_kda(

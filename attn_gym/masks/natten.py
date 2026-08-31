@@ -4,6 +4,10 @@ import torch
 from torch import BoolTensor, IntTensor
 from torch.nn.attention.flex_attention import _mask_mod_signature
 
+# NOTE [Avoid integer abs in Hopper FlexAttention]
+# CUDA 13 ptxas can miscompile the integer abs predicate in FlexAttention's dQ kernel. Keep
+# neighborhood bounds as direct comparisons, which are equivalent for valid token indices.
+
 
 def generate_natten(
     canvas_w: int,
@@ -34,8 +38,12 @@ def generate_natten(
         # is clamped to a fixed distance (kernel half-length) from the canvas edge
         kernel_center_x = q_x.clamp(kernel_w // 2, (canvas_w - 1) - kernel_w // 2)
         kernel_center_y = q_y.clamp(kernel_h // 2, (canvas_h - 1) - kernel_h // 2)
-        hori_mask = (kernel_center_x - kv_x).abs() <= kernel_w // 2
-        vert_mask = (kernel_center_y - kv_y).abs() <= kernel_h // 2
+        hori_mask = (kernel_center_x - kernel_w // 2 <= kv_x) & (
+            kv_x <= kernel_center_x + kernel_w // 2
+        )
+        vert_mask = (kernel_center_y - kernel_h // 2 <= kv_y) & (
+            kv_y <= kernel_center_y + kernel_h // 2
+        )
         return hori_mask & vert_mask
 
     natten_mask_mod.__name__ = f"natten_c{canvas_w}x{canvas_h}_k{kernel_w}x{kernel_h}"
@@ -80,8 +88,8 @@ def generate_tiled_natten(
         kv_x, kv_y = get_x_y_tiled(kv_idx)
         kernel_x = q_x.clamp(K_W // 2, (W - 1) - K_W // 2)
         kernel_y = q_y.clamp(K_H // 2, (H - 1) - K_H // 2)
-        hori_mask = (kernel_x - kv_x).abs() <= K_W // 2
-        vert_mask = (kernel_y - kv_y).abs() <= K_H // 2
+        hori_mask = (kernel_x - K_W // 2 <= kv_x) & (kv_x <= kernel_x + K_W // 2)
+        vert_mask = (kernel_y - K_H // 2 <= kv_y) & (kv_y <= kernel_y + K_H // 2)
         return hori_mask & vert_mask
 
     tiled_natten_mask.__name__ = f"tiled_natten_c{W}x{H}_k{K_W}x{K_H}_t{T_W}x{T_H}"
@@ -168,8 +176,12 @@ def generate_morton_natten(
         # is clamped to a fixed distance (kernel half-length) from the canvas edge
         kernel_center_x = q_x.clamp(kernel_w // 2, (canvas_w - 1) - kernel_w // 2)
         kernel_center_y = q_y.clamp(kernel_h // 2, (canvas_h - 1) - kernel_h // 2)
-        hori_mask = (kernel_center_x - kv_x).abs() <= kernel_w // 2
-        vert_mask = (kernel_center_y - kv_y).abs() <= kernel_h // 2
+        hori_mask = (kernel_center_x - kernel_w // 2 <= kv_x) & (
+            kv_x <= kernel_center_x + kernel_w // 2
+        )
+        vert_mask = (kernel_center_y - kernel_h // 2 <= kv_y) & (
+            kv_y <= kernel_center_y + kernel_h // 2
+        )
         return hori_mask & vert_mask
 
     natten_mask_mod.__name__ = f"morton_natten_c{canvas_w}x{canvas_h}_k{kernel_w}x{kernel_h}"

@@ -1,5 +1,9 @@
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
+
 from examples import cuda_graph_trace_comparison
 
 
