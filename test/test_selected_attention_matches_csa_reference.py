@@ -398,6 +398,39 @@ def test_selected_attention_matches_csa_reference_cuda_fp64():
 # ---------------------------------------------------------------------------
 
 
+def _indexer_loss_oracle(
+    main_query: torch.Tensor,
+    selected_compressed_kv: torch.Tensor,
+    attention_lse: torch.Tensor,
+    selected_indexer_logits: torch.Tensor,
+    selected_is_valid: torch.Tensor,
+) -> torch.Tensor:
+    query = main_query.detach().to(torch.float32)
+    keys = selected_compressed_kv.detach().to(torch.float32)
+    selected_attention_logits = torch.matmul(query.unsqueeze(-2), keys.transpose(-2, -1)).squeeze(
+        -2
+    ) / math.sqrt(query.shape[-1])
+    teacher_mass = torch.exp(
+        selected_attention_logits - attention_lse.detach().to(torch.float32).unsqueeze(-1)
+    ).sum(dim=1)
+    teacher_mass = torch.where(selected_is_valid, teacher_mass, 0.0)
+    teacher_probs = teacher_mass / teacher_mass.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+
+    valid_rows = selected_is_valid.any(dim=-1)
+    student_logits = selected_indexer_logits.to(torch.float32).masked_fill(
+        ~selected_is_valid, float("-inf")
+    )
+    student_logits = torch.where(valid_rows.unsqueeze(-1), student_logits, 0.0)
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    student_log_probs = torch.where(selected_is_valid, student_log_probs, 0.0)
+    row_kl = (
+        torch.special.xlogy(teacher_probs, teacher_probs) - teacher_probs * student_log_probs
+    ).sum(dim=-1)
+    return row_kl.masked_select(valid_rows).mean()
+
+
 @pytest.mark.parametrize(
     "device",
     [
@@ -417,7 +450,7 @@ def test_end_to_end_indexer_loss(device):
     validity mask.
     """
     dtype = torch.float64
-    inputs = _make_inputs(share_kv=True, num_topk_blocks=1, dtype=dtype, device=device)
+    inputs = _make_inputs(share_kv=True, num_topk_blocks=2, dtype=dtype, device=device)
     (
         Q,
         Q_I,
@@ -530,15 +563,72 @@ def test_end_to_end_indexer_loss(device):
         b, num_heads, sequence_length, num_topk_blocks, head_dim
     )
 
-    selected_indexer_logits = scores.gather(dim=-1, index=topk_blocks)
+    selected_indexer_logits = scores.gather(dim=-1, index=topk_blocks).detach()
+    actual_logits = selected_indexer_logits.clone().requires_grad_()
+    expected_logits = selected_indexer_logits.clone().requires_grad_()
 
     loss = csa_example.indexer_loss(
-        Q_roped, selected_compressed_kv, lse, selected_indexer_logits, selected_is_valid
+        Q_roped, selected_compressed_kv, lse, actual_logits, selected_is_valid
     )
+    expected_loss = _indexer_loss_oracle(
+        Q_roped,
+        selected_compressed_kv,
+        lse,
+        expected_logits,
+        selected_is_valid,
+    )
+    (actual_grad,) = torch.autograd.grad(loss, actual_logits)
+    (expected_grad,) = torch.autograd.grad(expected_loss, expected_logits)
 
     assert loss.shape == ()
-    assert torch.isfinite(loss), f"end-to-end loss is not finite: {loss}"
-    assert loss >= 0, f"KL divergence should be non-negative, got {loss.item()}"
+    torch.testing.assert_close(loss, expected_loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(actual_grad[selected_is_valid]) > 0
+    assert torch.count_nonzero(actual_grad[~selected_is_valid]) == 0
 
     # Position 0 has no completed blocks (compression_rate=2, seq_len=5)
     assert not selected_is_valid[:, 0, :].any(), "Position 0 should have no valid blocks"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_indexer_loss_teacher_logits_use_fp32(dtype):
+    generator = torch.Generator().manual_seed(1234)
+    b, h, s, k, d = 2, 3, 4, 3, 64
+    query = torch.randn(b, h, s, d, generator=generator, dtype=dtype)
+    selected_kv = torch.randn(b, h, s, k, d, generator=generator, dtype=dtype)
+    selected_is_valid = torch.tensor(
+        [
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+        ]
+    )
+    attention_logits = torch.matmul(
+        query.float().unsqueeze(-2), selected_kv.float().transpose(-2, -1)
+    ).squeeze(-2) / math.sqrt(d)
+    other_logits = torch.randn(b, h, s, 5, generator=generator)
+    attention_lse = torch.logsumexp(torch.cat([attention_logits, other_logits], dim=-1), dim=-1)
+    logits = torch.randn(b, s, k, generator=generator)
+    actual_logits = logits.clone().requires_grad_()
+    expected_logits = logits.clone().requires_grad_()
+
+    actual_loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, actual_logits, selected_is_valid
+    )
+    expected_loss = _indexer_loss_oracle(
+        query, selected_kv, attention_lse, expected_logits, selected_is_valid
+    )
+    (actual_grad,) = torch.autograd.grad(actual_loss, actual_logits)
+    (expected_grad,) = torch.autograd.grad(expected_loss, expected_logits)
+
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)

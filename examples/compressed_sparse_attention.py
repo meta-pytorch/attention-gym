@@ -400,13 +400,11 @@ def indexer_loss(
     head_dim = main_query.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    # Recompute main-attention logits for selected compressed keys.
-    # Selected attention doesn't store an attention matrix, so we have to do this
     compressed_attention_logits = (
         torch.einsum(
             "bhsd,bhskd->bhsk",
-            main_query.detach(),
-            selected_compressed_kv.detach(),
+            main_query.detach().float(),
+            selected_compressed_kv.detach().float(),
         )
         * softmax_scale
     )

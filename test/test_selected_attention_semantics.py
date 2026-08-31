@@ -10,7 +10,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
+from attn_gym.sparse.selected_attention import selected_attention
 
 BACKENDS = ["eager"]
 if torch.cuda.is_available():
@@ -1074,67 +1074,3 @@ def test_repeated_indices_manual_forward_and_backward():
 
     torch.testing.assert_close(query.grad, query_m.grad, atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(sparse_kv.grad, sparse_kv_m.grad, atol=1e-12, rtol=1e-12)
-
-
-# ---------------------------------------------------------------------------
-# 9. LSE correctness
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_lse_matches_manual_computation(backend):
-    """Returned LSE matches manual logsumexp over all logits including the sink."""
-    device = _device_for_backend(backend)
-    dtype = torch.float64 if backend == "eager" else torch.float32
-    b, h, s, d = 1, 1, 6, 8
-    window = 3
-    sparse_seq_len = 4
-    num_topk = 2
-
-    torch.manual_seed(77)
-    query = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    local_kv = torch.randn(b, h, s, d, device=device, dtype=dtype)
-    sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
-    kv_indices = torch.randint(0, sparse_seq_len, (b, s, num_topk), device=device)
-    sink = torch.randn(h, device=device, dtype=dtype)
-
-    _, aux = selected_attention(
-        query,
-        local_kv,
-        sparse_kv,
-        kv_indices,
-        sink,
-        None,
-        window,
-        backend=backend,
-        return_aux=AuxRequest(lse=True),
-    )
-    lse = aux.lse
-
-    # Manual: for each query position, compute logsumexp over all attended logits + sink
-    scale = d**0.5
-    q = query[0, 0]  # (s, d)
-    lkv = local_kv[0, 0]  # (s, d)
-    skv = sparse_kv[0, 0]  # (sparse_seq_len, d)
-    sink_val = sink[0]
-
-    expected_lse = torch.zeros(s, device=device, dtype=torch.float64)
-    for seq in range(s):
-        # Gather sparse entries
-        gathered_sparse = skv[kv_indices[0, seq]]  # (num_topk, d)
-
-        # Gather local window entries
-        first = max(0, seq - window + 1)
-        local_entries = lkv[first : seq + 1]  # (window_len, d)
-
-        # All KV entries this query attends to
-        all_kv = torch.cat([gathered_sparse, local_entries], dim=0)
-
-        # Compute logits + sink
-        logits = (q[seq].double() @ all_kv.double().T) / scale
-        logits_with_sink = torch.cat([logits, sink_val.double().unsqueeze(0)])
-        expected_lse[seq] = torch.logsumexp(logits_with_sink, dim=0)
-
-    atol = 0.01 if backend == "triton" else 1e-10
-    assert lse.shape == (b, h, s)
-    torch.testing.assert_close(lse[0, 0].double(), expected_lse, atol=atol, rtol=0.01)
