@@ -131,7 +131,7 @@ from .tile_dsl.barrier import (
 )
 from .tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from .tile_dsl.mma import mma_step, mma_ts_step
-from .tile_dsl.swizzle import swizzle_lin_S, swizzle_xor_128b
+from .tile_dsl.swizzle import swizzle_box_offset_32b, swizzle_box_offset_128b
 from .tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from .tile_dsl.pointwise import (
     opaque_f32_zero,
@@ -494,7 +494,11 @@ def super_mma_warp(
         stsm_row_coord = stsm_row_coord + cutlass.Int32(8)
     if lane // 8 >= 2:
         stsm_col_coord = cutlass.Int32(8)
-    stsm_idx = swizzle_lin_S(stsm_row_coord * cfg.b_t + (stsm_col_coord ^ (cfg.b_t // 2)), bbits=1, mbase=3, sshift=3)
+    stsm_idx = swizzle_box_offset_32b(
+        stsm_row_coord,
+        stsm_col_coord ^ (cfg.b_t // 2),
+        box_rows=cfg.b_t,
+    )
     cum_chunk_base = cutlass.Int32(0)
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -521,24 +525,17 @@ def super_mma_warp(
             for k_block in cutlass.range_constexpr((cfg.d_k // 16)):
                 # Load B operand
                 k_inv_col = k_block * 16 + rhs_col_offset
-                k_inv_segment = k_inv_col // 64
-                rhs_frag = nvvm.ldmatrix(
-                    sK_inv_ptr
-                    + k_inv_segment * (cfg.b_t * 64)
-                    + rhs_row_coord * 64
-                    + swizzle_xor_128b(rhs_row_coord, k_inv_col - k_inv_segment * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                rhs_offset = swizzle_box_offset_128b(
+                    rhs_row_coord, k_inv_col, box_rows=cfg.b_t
                 )
+                rhs_frag = nvvm.ldmatrix(sK_inv_ptr + rhs_offset, 4, nvvm.MMALayout.ROW)
                 # Load A operand
                 storage_key = (k_block * 16 + lhs_col_offset) ^ decay_key_mask
-                storage_slice = storage_key // 64
+                lhs_offset = swizzle_box_offset_128b(
+                    lhs_row_coord, storage_key, box_rows=cfg.b_t
+                )
                 kk_lhs_frag = nvvm.ldmatrix(
-                    sK_decay_ptr
-                    + storage_slice * (cfg.b_t * 64)
-                    + swizzle_xor_128b(lhs_row_coord, lhs_row_coord * 64 + storage_key - storage_slice * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                    sK_decay_ptr + lhs_offset, 4, nvvm.MMALayout.ROW
                 )
 
                 mma_step(
@@ -942,7 +939,11 @@ def epilogue_warp(
         stsm_row_coord = stsm_row_coord + cutlass.Int32(8)
     if lane // 8 >= 2:
         stsm_col_coord = cutlass.Int32(8)
-    stsm_idx = swizzle_lin_S(stsm_row_coord * cfg.b_t + (stsm_col_coord ^ (cfg.b_t // 2)), bbits=1, mbase=3, sshift=3)
+    stsm_idx = swizzle_box_offset_32b(
+        stsm_row_coord,
+        stsm_col_coord ^ (cfg.b_t // 2),
+        box_rows=cfg.b_t,
+    )
     cum_chunk_base = cutlass.Int32(0)
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -974,24 +975,17 @@ def epilogue_warp(
             for k_block in cutlass.range_constexpr((cfg.d_k // 16)):
                 # Load B operand
                 k_inv_col = k_block * 16 + rhs_col_offset
-                k_inv_segment = k_inv_col // 64
-                rhs_frag = nvvm.ldmatrix(
-                    sK_inv_ptr
-                    + k_inv_segment * (cfg.b_t * 64)
-                    + rhs_row_coord * 64
-                    + swizzle_xor_128b(rhs_row_coord, k_inv_col - k_inv_segment * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                rhs_offset = swizzle_box_offset_128b(
+                    rhs_row_coord, k_inv_col, box_rows=cfg.b_t
                 )
+                rhs_frag = nvvm.ldmatrix(sK_inv_ptr + rhs_offset, 4, nvvm.MMALayout.ROW)
                 # Load A operand
                 storage_key = (k_block * 16 + lhs_col_offset) ^ decay_key_mask
-                storage_slice = storage_key // 64
+                lhs_offset = swizzle_box_offset_128b(
+                    lhs_row_coord, storage_key, box_rows=cfg.b_t
+                )
                 a_lhs_frag = nvvm.ldmatrix(
-                    sQ_decay_ptr
-                    + storage_slice * (cfg.b_t * 64)
-                    + swizzle_xor_128b(lhs_row_coord, lhs_row_coord * 64 + storage_key - storage_slice * 64, elem_bytes=2),
-                    4,
-                    nvvm.MMALayout.ROW,
+                    sQ_decay_ptr + lhs_offset, 4, nvvm.MMALayout.ROW
                 )
 
                 mma_step(
@@ -1165,12 +1159,14 @@ def compute0_warp_group(
             prefix_dim = cg0_local_warp * cfg.threads_per_warp + lane
 
             # ---- Gate prefix scan -----------------------------------------------
-            f32_segment = prefix_dim // 32
-            prefix_seg_base = f32_segment * (cfg.b_t * 32)
-            prefix_col = prefix_dim - f32_segment * 32
             gate_raw = cute.make_rmem_tensor((cfg.b_t,), cutlass.Float32)
             for row in cutlass.range_constexpr(cfg.b_t):
-                prefix_idx = prefix_seg_base + swizzle_xor_128b(row, row * 32 + prefix_col, elem_bytes=4)
+                prefix_idx = swizzle_box_offset_128b(
+                    row,
+                    prefix_dim,
+                    box_rows=cfg.b_t,
+                    elem_bytes=4,
+                )
                 gate_raw[row] = (sGate_ptr + prefix_idx).load()
             g_prefix_regs = cute.make_rmem_tensor((cfg.b_t,), cutlass.Float32)
             if cutlass.const_expr(cfg.safe_gate):
@@ -1224,7 +1220,12 @@ def compute0_warp_group(
 
             exp_g_last = g_prefix_regs[cfg.b_t - 1]
             for row in cutlass.range_constexpr(cfg.b_t):
-                prefix_idx = prefix_seg_base + swizzle_xor_128b(row, row * 32 + prefix_col, elem_bytes=4)
+                prefix_idx = swizzle_box_offset_128b(
+                    row,
+                    prefix_dim,
+                    box_rows=cfg.b_t,
+                    elem_bytes=4,
+                )
                 (sGate_ptr + prefix_idx).store(g_prefix_regs[row])
 
             # ---- state-scale diag: stage exp2(G_last) decay blocks ---------------
@@ -1232,8 +1233,11 @@ def compute0_warp_group(
             block = prefix_dim // cutlass.Int32(16)
             coord = prefix_dim - block * cutlass.Int32(16)
             storage_col = coord ^ cutlass.Int32((cfg.b_t // 2))
-            linear_idx = block * cutlass.Int32(256) + coord * cutlass.Int32(16) + storage_col
-            diag_idx = swizzle_lin_S(linear_idx, bbits=1, mbase=3, sshift=3)
+            diag_idx = block * cutlass.Int32(256) + swizzle_box_offset_32b(
+                coord,
+                storage_col,
+                box_rows=16,
+            )
             sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
 
             nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
@@ -1253,9 +1257,11 @@ def compute0_warp_group(
             for dim_half in cutlass.range_constexpr(2):
                 dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
                 reg_base = dim_half * 8
-                f16_segment = dim_base // 64
-                f16_segment_dim = dim_base - f16_segment * 64
-                raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
+                raw_f16_idx = swizzle_box_offset_128b(
+                    decay_row,
+                    dim_base,
+                    box_rows=cfg.b_t,
+                )
                 raw_q_frag = (sQ_ptr + raw_f16_idx).load(count=8, alignment=16)
                 raw_k_frag = (sK_ptr + raw_f16_idx).load(count=8, alignment=16)
                 raw_q_vec_f32 = raw_q_frag.to(cutlass.Float32)
@@ -1294,11 +1300,19 @@ def compute0_warp_group(
                 reg_base = dim_half * 8
                 for f32_group in cutlass.range_constexpr(2):
                     f32_dim_base = dim_base + f32_group * 4
-                    f32_segment = f32_dim_base // 32
-                    f32_segment_dim = f32_dim_base - f32_segment * 32
-                    g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row, f32_segment_dim, elem_bytes=4)
+                    g_prefix_idx = swizzle_box_offset_128b(
+                        decay_row,
+                        f32_dim_base,
+                        box_rows=cfg.b_t,
+                        elem_bytes=4,
+                    )
                     exp_g_frag = (sGate_ptr + g_prefix_idx).load(count=4, alignment=16)
-                    exp_g_last_idx = f32_segment * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b((cfg.b_t - 1), f32_segment_dim, elem_bytes=4)
+                    exp_g_last_idx = swizzle_box_offset_128b(
+                        cfg.b_t - 1,
+                        f32_dim_base,
+                        box_rows=cfg.b_t,
+                        elem_bytes=4,
+                    )
                     exp_g_last_frag = (sGate_ptr + exp_g_last_idx).load(count=4, alignment=16)
                     f32_reg_base = reg_base + f32_group * 4
                     for j in cutlass.range_constexpr(4):
@@ -1347,14 +1361,17 @@ def compute0_warp_group(
                     operand_done_phase = ((cum_chunk // cfg.smem_decay_stages) + 1) % 2
                     bars.mb_decay_super_done[decay_stage].wait(operand_done_phase)
                     bars.mb_decay_tcgen05_done[decay_stage].wait(operand_done_phase)
-                f16_segment = dim_base // 64
-                f16_segment_dim = dim_base - f16_segment * 64
-                k_inv_swizzled_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
+                k_inv_swizzled_idx = swizzle_box_offset_128b(
+                    decay_row,
+                    dim_base,
+                    box_rows=cfg.b_t,
+                )
                 (sK_inv_ptr + k_inv_swizzled_idx).store(k_inv_vec, alignment=16)
                 storage_key = dim_base ^ decay_key_mask
-                storage_slice = storage_key // 64
-                decay_swizzled_idx = storage_slice * (cfg.b_t * 64) + swizzle_xor_128b(
-                    decay_row, decay_row * 64 + storage_key - storage_slice * 64, elem_bytes=2
+                decay_swizzled_idx = swizzle_box_offset_128b(
+                    decay_row,
+                    storage_key,
+                    box_rows=cfg.b_t,
                 )
                 (sK_decay_ptr + decay_swizzled_idx).store(k_decay_vec, alignment=16)
             nvvm.fence_proxy("async.shared", space="cta")
@@ -1388,9 +1405,10 @@ def compute0_warp_group(
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
                 storage_key = dim_base ^ decay_key_mask
-                storage_slice = storage_key // 64
-                decay_swizzled_idx = storage_slice * (cfg.b_t * 64) + swizzle_xor_128b(
-                    decay_row, decay_row * 64 + storage_key - storage_slice * 64, elem_bytes=2
+                decay_swizzled_idx = swizzle_box_offset_128b(
+                    decay_row,
+                    storage_key,
+                    box_rows=cfg.b_t,
                 )
                 (sQ_decay_ptr + decay_swizzled_idx).store(q_decay_vec, alignment=16)
 
@@ -1406,9 +1424,11 @@ def compute0_warp_group(
                     exp_g_last_pair = fp32_to_fp16(exp_g_last_regs[reg_base + dim0], exp_g_last_regs[reg_base + dim1], dtype=cfg.io_dtype)
                     k_restore_pack[pair_idx] = mul_f16x2(k_inv_pack[dim_half * 4 + pair_idx], exp_g_last_pair, cfg.io_dtype)
                 storage_row = decay_row ^ (cfg.b_t // 2)
-                f16_segment = dim_base // 64
-                f16_segment_dim = dim_base - f16_segment * 64
-                k_restore_idx = f16_segment * (cfg.b_t * 64) + storage_row * 64 + swizzle_xor_128b(storage_row, f16_segment_dim, elem_bytes=2)
+                k_restore_idx = swizzle_box_offset_128b(
+                    storage_row,
+                    dim_base,
+                    box_rows=cfg.b_t,
+                )
                 k_restore_vec = cutlass.Vector.from_elements(
                     (
                         k_restore_pack[0],
@@ -1475,15 +1495,15 @@ def compute1_warp_group(
     u_acc_addr = row_addr + tmem_col + cfg.tmem_u_acc_offset
     u_inp_addr = st_row_addr + tmem_col + cfg.tmem_u_inp_offset
     q_state_col_base = tmem_col + cfg.tmem_q_state_acc_offset
-    ov_swz_off0 = (
-        (value_dim_base + ov_col_coord) // 64 * (cfg.b_t * 64)
-        + ov_token_coord * 64
-        + swizzle_xor_128b(ov_token_coord, (value_dim_base + ov_col_coord) % 64, elem_bytes=2)
+    ov_swz_off0 = swizzle_box_offset_128b(
+        ov_token_coord,
+        value_dim_base + ov_col_coord,
+        box_rows=cfg.b_t,
     )
-    ov_swz_off = (
-        (value_dim_base + 16 + ov_col_coord) // 64 * (cfg.b_t * 64)
-        + ov_token_coord * 64
-        + swizzle_xor_128b(ov_token_coord, (value_dim_base + 16 + ov_col_coord) % 64, elem_bytes=2)
+    ov_swz_off = swizzle_box_offset_128b(
+        ov_token_coord,
+        value_dim_base + 16 + ov_col_coord,
+        box_rows=cfg.b_t,
     )
     state_k_acc_index = PipelineState.start(phase=0)
     u_acc_index = PipelineState.start(phase=0)
