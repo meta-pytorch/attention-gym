@@ -8,6 +8,7 @@ import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym.linear._delta_rule.mega.kernels.common.host import tensormap_workspace_bytes
+from attn_gym.linear._delta_rule.mega.kernels.compat import initialized_cuda_device
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
 
@@ -36,7 +37,7 @@ def chunk_delta_rule_bwd_mega_packed(
     scale = resolve_scale(scale, q.shape[-1])
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
-    with torch.cuda.device(q.device):
+    with initialized_cuda_device(q):
         if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
             raise ValueError("q must have shape [1, T, H, 128]")
         if any(tensor.shape != q.shape for tensor in (k, value, gate, d_output)):
