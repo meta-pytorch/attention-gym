@@ -17,6 +17,13 @@ from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 
 ATOL = 1e-8
 RTOL = 1e-5
+INDEXER_LOSS_DEVICES = [
+    torch.device("cpu"),
+    pytest.param(
+        torch.device("cuda"),
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    ),
+]
 
 pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
 
@@ -428,19 +435,107 @@ def _indexer_loss_oracle(
     row_kl = (
         torch.special.xlogy(teacher_probs, teacher_probs) - teacher_probs * student_log_probs
     ).sum(dim=-1)
-    return row_kl.masked_select(valid_rows).mean()
+    valid_row_kl = torch.where(valid_rows, row_kl, 0.0)
+    return valid_row_kl.sum() / valid_rows.sum().clamp_min(1)
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        torch.device("cpu"),
-        pytest.param(
-            torch.device("cuda"),
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-        ),
-    ],
-)
+def _make_indexer_loss_inputs(device, all_invalid):
+    generator = torch.Generator(device=device).manual_seed(1234)
+    batch, heads, sequence_length, num_topk_blocks, head_dim = 2, 2, 4, 3, 8
+    query = torch.randn(
+        batch,
+        heads,
+        sequence_length,
+        head_dim,
+        device=device,
+        generator=generator,
+    )
+    selected_kv = torch.randn(
+        batch,
+        heads,
+        sequence_length,
+        num_topk_blocks,
+        head_dim,
+        device=device,
+        generator=generator,
+    )
+    attention_logits = torch.matmul(query.unsqueeze(-2), selected_kv.transpose(-2, -1)).squeeze(
+        -2
+    ) / math.sqrt(head_dim)
+    other_logits = torch.randn(
+        batch, heads, sequence_length, 5, device=device, generator=generator
+    )
+    attention_lse = torch.logsumexp(torch.cat((attention_logits, other_logits), dim=-1), dim=-1)
+    indexer_logits = torch.randn(
+        batch, sequence_length, num_topk_blocks, device=device, generator=generator
+    )
+    selected_is_valid = torch.tensor(
+        [
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+        ],
+        device=device,
+    )
+    if all_invalid:
+        selected_is_valid = torch.zeros_like(selected_is_valid)
+    return query, selected_kv, attention_lse, indexer_logits, selected_is_valid
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
+def test_indexer_loss_all_invalid_backward(device):
+    query, selected_kv, attention_lse, indexer_logits, selected_is_valid = (
+        _make_indexer_loss_inputs(device, all_invalid=True)
+    )
+    indexer_logits.requires_grad_()
+
+    loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, indexer_logits, selected_is_valid
+    )
+
+    torch.testing.assert_close(loss, loss.new_zeros(()), atol=0.0, rtol=0.0)
+    loss.backward()
+    assert indexer_logits.grad is not None
+    torch.testing.assert_close(
+        indexer_logits.grad, torch.zeros_like(indexer_logits), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
+def test_indexer_loss_fullgraph_forward_backward(device):
+    query, selected_kv, attention_lse, indexer_logits, selected_is_valid = (
+        _make_indexer_loss_inputs(device, all_invalid=False)
+    )
+    eager_logits = indexer_logits.clone().requires_grad_()
+    compiled_logits = indexer_logits.clone().requires_grad_()
+
+    expected_loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, eager_logits, selected_is_valid
+    )
+    actual_loss = torch.compile(csa_example.indexer_loss, fullgraph=True)(
+        query, selected_kv, attention_lse, compiled_logits, selected_is_valid
+    )
+    expected_loss.backward()
+    actual_loss.backward()
+
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-6, rtol=1e-6)
+    assert eager_logits.grad is not None
+    assert compiled_logits.grad is not None
+    torch.testing.assert_close(compiled_logits.grad, eager_logits.grad, atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(compiled_logits.grad[selected_is_valid]) > 0
+    assert torch.count_nonzero(compiled_logits.grad[~selected_is_valid]) == 0
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
 def test_end_to_end_indexer_loss(device):
     """Run compress → index → selected_attention → indexer_loss end-to-end.
 
