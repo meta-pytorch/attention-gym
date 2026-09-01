@@ -10,6 +10,7 @@ from attn_gym._backends.cute import (
     normalize_tma_rows,
 )
 from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
@@ -41,6 +42,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
+from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
 
 def validate_supported_device(q: torch.Tensor) -> None:
@@ -218,6 +220,63 @@ def _gdn_chunk_fwd_packed_with_state_cuda(
     """Registered packed forward with final state and inverse tape."""
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     return chunk_gdn_fwd_packed(q, k, v, cumulative_gate, beta, initial_state, metadata, scale)
+
+
+def _gdn_chunk_fwd_packed_paged_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    capacity: int,
+    scale: float,
+) -> torch.Tensor:
+    """Run packed scalar GDN while advancing selected cache slots in place."""
+    if get_device_properties(q.device).major < 10:
+        raise ValueError("paged fused chunk_gdn requires CUDA capability 10.0 or newer")
+    metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
+    batch, _tokens, key_heads, key_dim = q.shape
+    value_heads, value_dim = v.shape[2:]
+    if batch != 1 or (key_dim, value_dim) != (128, 128):
+        raise ValueError("paged fused chunk GDN requires B=1 and K=V=128")
+    if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
+        raise ValueError("paged fused chunk GDN requires matching Q/K and H % HK == 0")
+    if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
+        raise ValueError("cumulative_gate and beta must have shape [B,T,H]")
+    validate_paged_state(
+        q,
+        v,
+        state_cache,
+        cu_seqlens,
+        state_indices,
+        has_initial_state,
+    )
+    reject_int64_offsets(q, k, v, cumulative_gate, beta)
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
+    cumulative_gate, beta = (
+        normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta)
+    )
+
+    w, u, restored_k, _inverse = chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata)
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        restored_k,
+        w,
+        u,
+        cumulative_gate,
+        state_cache,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
+        output_final_state=False,
+        metadata=metadata,
+        autotune=False,
+    )
+    assert final_state is None
+    return chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
 
 
 def chunk_gdn_bwd(

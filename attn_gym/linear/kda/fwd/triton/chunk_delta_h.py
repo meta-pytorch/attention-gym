@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Inter-chunk KDA state recurrence.
+"""Inter-chunk scalar- and vector-gated delta-rule state recurrence.
 
 A single kernel (B=1, K=V=128, 64-token chunks, Blackwell) keeps the full
 [K, BV] state in one accumulator and overlaps next-chunk descriptor loads with
@@ -53,6 +53,7 @@ def _run_chunk_delta_h_sequence(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     i_nh,
@@ -73,6 +74,7 @@ def _run_chunk_delta_h_sequence(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
 ):
     """Process one sequence, head, and value tile through the state recurrence.
 
@@ -157,8 +159,12 @@ def _run_chunk_delta_h_sequence(
             [0, tok, i_h, i_v * BV],
             tl.reshape(b_vnew.to(k.dtype.element_ty), [1, BT, 1, BV]),
         )
-        b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
-        b_h = b_h * exp2(b_decay)[:, None]
+        if SCALAR_GATE:
+            b_decay = tl.load(gk + (tok + BT - 1) * H + i_h)
+            b_h = b_h * exp2(b_decay)
+        else:
+            b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
+            b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
@@ -190,8 +196,12 @@ def _run_chunk_delta_h_sequence(
             b_vnew.to(k.dtype.element_ty),
             mask=m_t[:, None],
         )
-        b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
-        b_h = b_h * exp2(b_decay)[:, None]
+        if SCALAR_GATE:
+            b_decay = tl.load(gk + (bos + T - 1) * H + i_h)
+            b_h = b_h * exp2(b_decay)
+        else:
+            b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
+            b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.load(
             k + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
             mask=m_t[:, None],
@@ -223,6 +233,7 @@ def chunk_delta_h_kernel_k128_wsp(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     h0_stride_0,
@@ -247,6 +258,7 @@ def chunk_delta_h_kernel_k128_wsp(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
 ):
     """Warp-specialized K=128 inter-chunk recurrence."""
     _run_chunk_delta_h_sequence(
@@ -265,6 +277,7 @@ def chunk_delta_h_kernel_k128_wsp(
         k,
         w,
         u,
+        gk,
         v_new,
         T,
         tl.program_id(0),
@@ -285,6 +298,7 @@ def chunk_delta_h_kernel_k128_wsp(
         USE_STATE_INDICES,
         USE_HAS_INITIAL_STATE,
         USE_INT64_OFFSETS,
+        SCALAR_GATE,
     )
 
 
@@ -305,6 +319,7 @@ def chunk_delta_h_kernel_k128_persistent(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     h0_stride_0,
@@ -328,6 +343,7 @@ def chunk_delta_h_kernel_k128_persistent(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
     NUM_SEQUENCES: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
@@ -354,6 +370,7 @@ def chunk_delta_h_kernel_k128_persistent(
             k,
             w,
             u,
+            gk,
             v_new,
             T,
             i_nh,
@@ -374,6 +391,7 @@ def chunk_delta_h_kernel_k128_persistent(
             USE_STATE_INDICES,
             USE_HAS_INITIAL_STATE,
             USE_INT64_OFFSETS,
+            SCALAR_GATE,
         )
 
 
@@ -431,7 +449,10 @@ def _delta_h_launch(
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
     v_new = torch.empty_like(u)
-    if not can_use_tma(gk):
+    scalar_gate = gk.ndim == 3
+    if scalar_gate:
+        gk = gk.contiguous()
+    elif not can_use_tma(gk):
         gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
@@ -449,7 +470,7 @@ def _delta_h_launch(
         TensorDescriptor.from_tensor(u, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(v_new, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(h, [1, 1, 1, key_dim, block_value_dim]),
-        TensorDescriptor.from_tensor(gk, [1, 1, 1, key_dim]),
+        TensorDescriptor.from_tensor(k if scalar_gate else gk, [1, 1, 1, key_dim]),
     )
     kernel_args = (
         *descriptors,
@@ -462,6 +483,7 @@ def _delta_h_launch(
         k,
         w,
         u,
+        gk,
         v_new,
         tokens,
         *h0_strides,
@@ -484,6 +506,7 @@ def _delta_h_launch(
         "USE_INT64_OFFSETS": requires_int64_offsets(
             k, w, u, gk, v_new, h, initial_state, final_state
         ),
+        "SCALAR_GATE": scalar_gate,
         "num_warps": 4,
     }
     value_tiles = value_dim // block_value_dim
@@ -612,9 +635,11 @@ def chunk_gated_delta_rule_fwd_h(
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Run the fixed-length or packed inter-chunk KDA state recurrence.
+    """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
-    ``autotune`` is accepted for launcher-ABI parity with the other stages;
+    ``gk`` may hold one cumulative log2 decay per key channel (KDA) or one
+    scalar decay per head (GDN). ``autotune`` is accepted for launcher-ABI
+    parity with the other stages;
     the warp-specialized kernel has a single fixed configuration, so pinned
     and autotuned launches are identical.
     """
@@ -649,8 +674,8 @@ def chunk_gated_delta_rule_fwd_h(
         )
     if not (k.dtype == w.dtype == u.dtype):
         raise TypeError("the inter-chunk state recurrence requires matching k, w, and u dtypes")
-    if w.shape != k.shape or gk.shape != k.shape:
-        raise ValueError("k, w, and gk must have the same shape")
+    if w.shape != k.shape or gk.shape not in (k.shape, k.shape[:3]):
+        raise ValueError("w must match k and gk must have shape [B,T,H,K] or [B,T,H]")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
     if torch.cuda.get_device_capability(k.device)[0] < 10:

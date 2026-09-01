@@ -9,7 +9,7 @@
 import importlib
 from typing import TYPE_CHECKING
 
-from attn_gym.linear.gdn import chunk_gdn, recurrent_gdn, recurrent_gdn_decode
+from attn_gym.linear.gdn import chunk_gdn, paged_chunk_gdn, recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear.kda import (
     KernelOptions,
     active_token_mask,
@@ -43,6 +43,7 @@ KDA_OPS = [
 
 GDN_OPS = [
     "chunk_gdn",
+    "paged_chunk_gdn",
     "recurrent_gdn",
     "recurrent_gdn_decode",
 ]
