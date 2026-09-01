@@ -105,6 +105,23 @@ elementwise kernels run per decode step.
 
 ::: attn_gym.linear.recurrent_gdn_decode
 
+## Stateful Short Convolution
+
+`causal_conv1d` is the differentiable dense or packed operation. It accepts compact
+per-sequence history and can return a newly allocated final history. Serving callers can keep
+history in a shared `[num_slots, W - 1, C]` pool instead: `paged_causal_conv1d` reads selected
+slots during multi-token prefill and advances them in place, while `causal_conv1d_decode` does
+the same for one token per sequence. Both are inference-only and support padding between slots.
+Positive `state_indices` must be unique and within the pool; non-positive routes return zero without
+touching it. `has_initial_state=False` gives paged prefill a zero history before it overwrites a
+fresh slot.
+
+::: attn_gym.linear.causal_conv1d
+
+::: attn_gym.linear.paged_causal_conv1d
+
+::: attn_gym.linear.causal_conv1d_decode
+
 ## Kimi Delta Attention
 
 The KDA references use token-major tensors: query, key, and per-channel gate are

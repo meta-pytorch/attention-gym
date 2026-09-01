@@ -70,6 +70,7 @@ def test_base_import_does_not_require_numpy():
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_short_conv_decode_uses_decode_name():
+def test_short_conv_operations_are_exported():
     assert "causal_conv1d_decode" in attn_gym.linear.__all__
+    assert "paged_causal_conv1d" in attn_gym.linear.__all__
     assert "causal_conv1d_update" not in attn_gym.linear.__all__
