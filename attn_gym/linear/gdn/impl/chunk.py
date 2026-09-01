@@ -237,8 +237,7 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     scale: float,
 ) -> torch.Tensor:
     """Run packed scalar GDN while advancing selected cache slots in place."""
-    if get_device_properties(q.device).major < 10:
-        raise ValueError("paged fused chunk_gdn requires CUDA capability 10.0 or newer")
+    validate_supported_device(q)
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     batch, _tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]

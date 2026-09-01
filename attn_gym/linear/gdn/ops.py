@@ -541,6 +541,10 @@ def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
         raise TypeError("chunk_gdn(impl='fused') requires matching float16 or bfloat16 QKV")
     if q.shape[-1] != 128 or v.shape[-1] != 128:
         raise ValueError("chunk_gdn(impl='fused') requires K=V=128")
+    # The recurrence uses Hopper TensorDescriptors/TMA; Blackwell additionally selects the CuTe
+    # backward, while Hopper uses the portable Triton backward.
+    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 9:
+        raise ValueError("fused chunk GDN requires CUDA capability 9.0 or newer")
 
 
 def chunk_forward(
@@ -557,10 +561,6 @@ def chunk_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Route dense inputs and invoke the fused scalar chunk forward operator."""
     _validate_fused_chunk_qkv(q, k, v)
-    # The dense recurrence uses Hopper TensorDescriptors/TMA; Blackwell additionally selects
-    # the CuTe backward, while Hopper uses the portable Triton backward.
-    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 9:
-        raise ValueError("chunk_gdn(impl='fused') requires CUDA capability 9.0 or newer")
     output_shape = v.shape
     batch, tokens = q.shape[:2]
     if cu_seqlens is not None and batch != 1:
@@ -620,8 +620,6 @@ def paged_chunk_forward(
 ) -> torch.Tensor:
     """Normalize inputs and advance selected state-cache slots with chunk GDN."""
     _validate_fused_chunk_qkv(q, k, v)
-    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 10:
-        raise ValueError("paged_chunk_gdn requires CUDA capability 10.0 or newer")
     tensors = (q, k, v, gate, beta, state_cache)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         raise RuntimeError(

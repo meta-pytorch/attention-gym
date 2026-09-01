@@ -46,7 +46,7 @@ output, final_state = chunk_gdn(
 - CPU and CUDA execution through eager PyTorch operations.
 - A repo-local fused chunk pipeline on CUDA capability 9.0+ with dense and packed inputs, grouped
   Q/K heads, tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph
-  support. On CUDA capability 10.0+, `paged_chunk_gdn` advances selected
+  support. On CUDA capability 9.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
 - An opt-in Mega fused chunk implementation with the same public training/state contract.
