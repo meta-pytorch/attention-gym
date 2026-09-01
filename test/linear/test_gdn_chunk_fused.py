@@ -40,10 +40,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
     reason="fused chunk GDN requires CUDA capability 9.0 or newer",
 )
-requires_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="paged chunk GDN requires CUDA capability 10.0 or newer",
-)
 
 
 def make_inputs(
@@ -346,20 +342,22 @@ def test_chunk_state_continues_in_recurrent_decode():
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
 
 
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability() >= (10, 0),
-    reason="pre-Blackwell capability guard only",
-)
-def test_paged_chunk_rejects_pre_blackwell():
-    """Keep the Blackwell-only paged prefill boundary explicit on Hopper."""
+def test_paged_chunk_rejects_pre_hopper(monkeypatch):
+    """Keep the minimum device capability guard at the public boundary."""
+    import attn_gym.linear.gdn.ops as gdn_ops
+
+    monkeypatch.setattr(
+        gdn_ops,
+        "get_device_properties",
+        lambda device: SimpleNamespace(major=8),
+    )
     q, k, v, gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=2)
     state_cache = torch.randn(3, 2, 128, 128, device="cuda")
     state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
-    with torch.no_grad(), pytest.raises(ValueError, match="CUDA capability 10.0"):
+    with torch.no_grad(), pytest.raises(ValueError, match="CUDA capability 9.0"):
         paged_chunk_gdn(q, k, v, gate, beta, state_cache, state_indices)
 
 
-@requires_blackwell
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_paged_chunk_rejects_unsupported_qkv_dtype(dtype: torch.dtype):
     q, k, v, gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=2)
@@ -378,7 +376,6 @@ def test_paged_chunk_rejects_unsupported_qkv_dtype(dtype: torch.dtype):
         )
 
 
-@requires_blackwell
 def test_paged_chunk_raw_operator_registration():
     """Validate mutation, fake output layout, and dynamic AOT dispatch."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128, key_heads=1, value_heads=2)
@@ -411,7 +408,6 @@ def test_paged_chunk_raw_operator_registration():
     )
 
 
-@requires_blackwell
 def test_paged_chunk_matches_gather_scatter():
     """Advance selected slots directly without copying state through the caller."""
     q, k, v, gate, beta, _state = make_inputs(
@@ -462,7 +458,6 @@ def test_paged_chunk_matches_gather_scatter():
     torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
 
 
-@requires_blackwell
 def test_paged_chunk_dense_batch_matches_gather_scatter():
     q, k, v, gate, beta, _state = make_inputs(
         batch=2,
@@ -502,7 +497,6 @@ def test_paged_chunk_dense_batch_matches_gather_scatter():
     torch.testing.assert_close(state_cache, expected_cache, rtol=0, atol=0)
 
 
-@requires_blackwell
 def test_paged_chunk_state_continues_in_recurrent_decode():
     """Use one paged pool directly across chunk prefill and recurrent decode."""
     q, k, v, gate, beta, _state = make_inputs(tokens=65, key_heads=1, value_heads=2)
@@ -563,7 +557,6 @@ def test_paged_chunk_state_continues_in_recurrent_decode():
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
 
 
-@requires_blackwell
 def test_paged_chunk_handles_padding_and_empty_fresh_slots():
     """Null routes stay untouched while an empty newly assigned slot is cleared."""
     q, k, v, gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=2)
@@ -593,7 +586,6 @@ def test_paged_chunk_handles_padding_and_empty_fresh_slots():
     )
 
 
-@requires_blackwell
 def test_paged_chunk_fullgraph_compile():
     """Keep paged mutation opaque and correctly aliased under fullgraph compilation."""
     q, k, v, gate, beta, _state = make_inputs(tokens=65, key_heads=1, value_heads=2)
@@ -625,7 +617,6 @@ def test_paged_chunk_fullgraph_compile():
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
 
 
-@requires_blackwell
 def test_paged_chunk_cuda_graph_replay():
     """Replay changed cache routing, values, and packed boundaries."""
     q, k, v, gate, beta, _state = make_inputs(tokens=192, key_heads=1, value_heads=2)

@@ -125,7 +125,7 @@ def paged_chunk_gdn(
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
-    Requires CUDA capability 10.0 or newer.
+    Requires CUDA capability 9.0 or newer.
 
     Args:
         q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value-head count.

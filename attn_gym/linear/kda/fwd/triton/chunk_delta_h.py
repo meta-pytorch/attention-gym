@@ -678,8 +678,8 @@ def chunk_gated_delta_rule_fwd_h(
         raise ValueError("w must match k and gk must have shape [B,T,H,K] or [B,T,H]")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
-    if torch.cuda.get_device_capability(k.device)[0] < 10:
-        raise ValueError("the inter-chunk state recurrence requires CUDA capability 10.0 or newer")
+    if torch.cuda.get_device_capability(k.device)[0] < 9:
+        raise ValueError("the inter-chunk state recurrence requires CUDA capability 9.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state_shape = (state_batch, heads, value_dim, key_dim)
     if state_indices is not None:
