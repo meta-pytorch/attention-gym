@@ -8,15 +8,15 @@
 #
 # Computes the diagonal 16x16 Aqk/Akk sub-blocks of each 64-token chunk and
 # inverts each diagonal Akk block by forward substitution. The off-diagonal
-# blocks and the full 64x64 block-triangular inverse are handled by the CuTe
-# K3b/K4b kernels. Only ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop`` is
-# consumed by the CuTe forward path
-# (attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra).
+# blocks and the full 64x64 block-triangular inverse are handled by the
+# architecture-selected K3/K4 stages. ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop``
+# is consumed by the composed forward path in ``fwd.cute.chunk_kda_fwd_intra``.
 
 import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
@@ -251,10 +251,7 @@ def chunk_kda_fwd_intra_diagonal(
     subchunk_size = 16
     subchunks = triton.cdiv(chunk_size, subchunk_size)
     capacity = triton.cdiv(tokens, chunk_size) if metadata is None else metadata.capacity
-    grid_chunks = min(
-        torch.cuda.get_device_properties(k.device).multi_processor_count,
-        capacity,
-    )
+    grid_chunks = min(get_device_properties(k.device).multi_processor_count, capacity)
     Aqk = torch.empty(
         (batch, tokens, heads, chunk_size),
         device=k.device,

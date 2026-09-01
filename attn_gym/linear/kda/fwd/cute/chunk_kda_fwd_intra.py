@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# KDA forward factor composition. BF16 uses the persistent intra engine; FP16
-# uses the FP32/TF32 diagonal stage plus CuTe K3b/K4b to preserve gate range.
+# KDA forward factor composition. Pre-Blackwell GPUs use the FP32/TF32 BC16
+# diagonal stage plus Triton K3/K4; Blackwell retains its CuTe factor engines.
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from contextlib import nullcontext
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
@@ -26,6 +27,12 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_en
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k3_triton import (
+    chunk_kda_fwd_k3b_triton,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k4_triton import (
+    chunk_kda_fwd_k4b_triton,
 )
 
 
@@ -49,6 +56,11 @@ def chunk_kda_fwd_factors(
     if isinstance(k, FakeTensor):
         shape = (batch, tokens, heads, chunk_size)
         return k.new_empty(shape), k.new_empty(shape)
+
+    if get_device_properties(k.device).major < 10:
+        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(q, k, gk, beta, scale, metadata, chunk_size)
+        AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata)
+        return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
 
     if q.dtype == torch.float16:
         # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their

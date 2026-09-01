@@ -124,8 +124,8 @@ def test_masking_cuda_falls_back_without_triton():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="cold fused chunk compilation requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="cold fused chunk compilation requires CUDA capability 8.0 or newer",
 )
 def test_chunk_kda_cold_public_fullgraph_compile():
     """Register operator contracts before the first fused call enters Dynamo."""
