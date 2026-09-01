@@ -27,6 +27,7 @@ from attn_gym.linear._delta_rule.validation import (
     validate_paged_state,
 )
 from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.impl.fla import chunk_forward as _fla_chunk_forward
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
 from attn_gym.linear.kda.impl.mega import chunk_forward as _mega_chunk_forward
@@ -131,6 +132,18 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
+        if backend == "fla":
+            return _fla_chunk_forward(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial_state,
+                cu_seqlens=cu_seqlens,
+                scale=scale,
+                output_final_state=output_final_state,
+            )
         if backend == "mega":
             return _mega_chunk_forward(
                 q,

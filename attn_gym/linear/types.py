@@ -13,8 +13,10 @@ from typing import Literal, TypedDict
 class BackendOptions(TypedDict, total=False):
     """Backend selection shared by optimized linear-attention operations."""
 
-    backend: Literal["fused", "mega"]
-    """Select the repo-local fused backend or the optional Mega backend."""
+    backend: Literal["fused", "mega", "fla"]
+    """Select the repo-local fused backend, the optional Mega backend, or the
+    flash-linear-attention triton backend, which covers architectures the cute
+    kernels do not."""
 
 
 class KernelOptions(BackendOptions, total=False):

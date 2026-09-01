@@ -25,7 +25,7 @@ _KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward"})
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
-) -> tuple[Literal["fused", "mega"], bool]:
+) -> tuple[Literal["fused", "mega", "fla"], bool]:
     """Validate chunk backend options and resolve their defaults."""
     if kernel_options is None:
         return "fused", False
@@ -34,8 +34,8 @@ def resolve_kernel_options(
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported chunk_kda kernel options: {names}")
     backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "mega"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    if backend not in ("fused", "mega", "fla"):
+        raise ValueError("kernel_options['backend'] must be 'fused', 'mega' or 'fla'")
     split_backward = kernel_options.get("split_backward", False)
     if not isinstance(split_backward, bool):
         raise TypeError("kernel_options['split_backward'] must be a bool")
