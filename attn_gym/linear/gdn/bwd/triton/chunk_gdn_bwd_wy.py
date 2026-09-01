@@ -152,10 +152,10 @@ def chunk_gdn_bwd_dqkwg_kernel(
             other=0.0,
         )
 
-        b_dg_last += tl.sum(b_h * b_dh)
+        b_dg_last += tl.sum(b_h.to(b_dh.dtype) * b_dh)
         b_ds += tl.dot(b_do, tl.trans(b_v_new))
         b_dq += tl.dot(b_do, b_h)
-        b_dk += tl.dot(b_v_new, b_dh)
+        b_dk += tl.dot(b_v_new.to(b_dh.dtype), b_dh)
         b_dw -= tl.dot(b_du, b_h)
 
     gate_offsets = ptr_offset((token, head), (H, 1))
@@ -279,9 +279,10 @@ def chunk_gdn_bwd_wy_kernel(
         values = value_start + tl.arange(0, BV)
         value_mask = values < V
         v_offsets = ptr_offset((token[:, None], head, values[None, :]), (v_stride_t, V, 1))
+        gradient_offsets = ptr_offset((token[:, None], head, values[None, :]), (H * V, V, 1))
         b_v = tl.load(v + v_offsets, mask=token_mask[:, None] & value_mask[None, :], other=0.0)
         b_du = tl.load(
-            d_v_in + v_offsets,
+            d_v_in + gradient_offsets,
             mask=token_mask[:, None] & value_mask[None, :],
             other=0.0,
         )
@@ -291,7 +292,7 @@ def chunk_gdn_bwd_wy_kernel(
         b_dvb = tl.dot(b_inverse, b_du)
         b_dbeta += tl.sum(b_dvb * b_v, axis=1)
         tl.store(
-            d_v + v_offsets,
+            d_v + gradient_offsets,
             b_dvb * b_beta[:, None],
             mask=token_mask[:, None] & value_mask[None, :],
         )
@@ -484,6 +485,16 @@ def chunk_gdn_bwd_wy(
     d_gate_wy = output_factory(cumulative_gate.shape, dtype=cumulative_gate.dtype, **output_kwargs)
     d_gate = output_factory(cumulative_gate.shape, dtype=cumulative_gate.dtype, **output_kwargs)
     d_beta = output_factory(beta.shape, dtype=beta.dtype, **output_kwargs)
+
+    compact_value_strides = (
+        tokens * value_heads * value_dim,
+        value_heads * value_dim,
+        value_dim,
+        1,
+    )
+    assert dv.stride() == d_value.stride() == compact_value_strides, (
+        "dV buffers must match the compact [B,T,H,V] kernel ABI"
+    )
 
     if chunk_slots:
         direct_grid = (key_dim // block_key, chunk_slots, value_heads)

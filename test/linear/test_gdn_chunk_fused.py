@@ -118,6 +118,20 @@ def run_with_gradients(
     return output, state, *gradients
 
 
+def run_final_state_gradients(
+    inputs: tuple[torch.Tensor, ...],
+    impl: str,
+) -> tuple[torch.Tensor, ...]:
+    """Run a no-initial-state final-state loss and return its five input gradients."""
+    _output, state = chunk_gdn(*inputs, output_final_state=True, impl=impl)
+    assert state is not None
+    gradients = torch.autograd.grad(state.float().square().mean(), inputs, allow_unused=True)
+    return state, *(
+        torch.zeros_like(value) if gradient is None else gradient
+        for value, gradient in zip(inputs, gradients, strict=True)
+    )
+
+
 def force_portable_backward(monkeypatch) -> None:
     """Force the Hopper Triton backward while retaining the current GPU forward."""
     import attn_gym.linear.gdn.impl.chunk as chunk_impl
@@ -285,6 +299,64 @@ def test_packed_tail_ignores_nan_capacity_slack():
         atol=2e-3,
     )
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
+
+
+def test_chunk_state_continues_in_recurrent_decode():
+    """Carry the fused training/prefill state directly into Hopper decode."""
+    q, k, v, gate, beta, initial_state = make_inputs(
+        tokens=65,
+        key_heads=1,
+        value_heads=4,
+    )
+    with torch.no_grad():
+        _prefill_output, prefill_state = chunk_gdn(
+            q[:, :64],
+            k[:, :64],
+            v[:, :64],
+            gate[:, :64],
+            beta[:, :64],
+            initial_state,
+            output_final_state=True,
+            impl="fused",
+        )
+        assert prefill_state is not None
+        expected_output, expected_state = recurrent_gdn(
+            q[:, 64:],
+            k[:, 64:],
+            v[:, 64:],
+            gate[:, 64:],
+            beta[:, 64:],
+            prefill_state,
+            output_final_state=True,
+            impl="reference",
+        )
+        actual_output, actual_state = recurrent_gdn(
+            q[:, 64:],
+            k[:, 64:],
+            v[:, 64:],
+            gate[:, 64:],
+            beta[:, 64:],
+            prefill_state,
+            output_final_state=True,
+            autotune=False,
+            impl="fused",
+        )
+
+    torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() >= (10, 0),
+    reason="pre-Blackwell capability guard only",
+)
+def test_paged_chunk_rejects_pre_blackwell():
+    """Keep the Blackwell-only paged prefill boundary explicit on Hopper."""
+    q, k, v, gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=2)
+    state_cache = torch.randn(3, 2, 128, 128, device="cuda")
+    state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    with torch.no_grad(), pytest.raises(ValueError, match="CUDA capability 10.0"):
+        paged_chunk_gdn(q, k, v, gate, beta, state_cache, state_indices)
 
 
 @requires_blackwell
@@ -750,6 +822,43 @@ def test_no_state_output_only_and_state_only_gradients():
     assert all(torch.isfinite(gradient).all() for gradient in state_gradients)
 
 
+@pytest.mark.parametrize(("batch", "tokens"), [(1, 65), (2, 129)])
+def test_fp16_no_initial_state_final_state_gradients(batch: int, tokens: int):
+    """Preserve small FP32 state cotangents across a partial FP16 chunk."""
+    inputs = make_inputs(
+        batch=batch,
+        tokens=tokens,
+        key_heads=1,
+        value_heads=1,
+        dtype=torch.float16,
+        requires_grad=True,
+    )[:5]
+
+    fused_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+    reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+    golden_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
+    actual = run_final_state_gradients(fused_inputs, "fused")
+    expected = run_final_state_gradients(reference_inputs, "reference")
+    golden = run_final_state_gradients(golden_inputs, "reference")
+    for name, result, high_precision, reference in zip(
+        ("state", "dq", "dk", "dv", "dgate", "dbeta"),
+        actual,
+        golden,
+        expected,
+        strict=True,
+    ):
+        if high_precision.abs().max().item() < 1e-12:
+            torch.testing.assert_close(result.double(), high_precision, rtol=0, atol=1e-12)
+        else:
+            assert_matches_low_precision_reference(
+                result,
+                high_precision,
+                reference,
+                name,
+                source_dtype=torch.float16,
+            )
+
+
 def test_int64_layouts_fail_before_kernel_launch(monkeypatch):
     """Reject wide layouts until every new Triton kernel has an i64 specialization."""
     import attn_gym.linear.gdn.impl.chunk as chunk_impl
@@ -850,12 +959,24 @@ def test_packed_raw_operator_registration():
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("portable", [False, True])
-def test_public_fullgraph_forward_backward(packed: bool, portable: bool, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_public_fullgraph_forward_backward(
+    packed: bool,
+    portable: bool,
+    dtype: torch.dtype,
+    monkeypatch,
+):
     """Compile both backward implementations with strict forward/backward capture."""
     if portable:
         force_portable_backward(monkeypatch)
     tokens = 128 if packed else 64
-    inputs = make_inputs(tokens=tokens, key_heads=1, value_heads=4, requires_grad=True)
+    inputs = make_inputs(
+        tokens=tokens,
+        key_heads=1,
+        value_heads=4,
+        dtype=dtype,
+        requires_grad=True,
+    )
     cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32) if packed else None
     if packed:
         inputs = (
