@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         ShortConvTunedConfig,
         causal_conv1d,
         causal_conv1d_decode,
+        paged_causal_conv1d,
         tune_causal_conv1d,
     )
 
@@ -30,6 +31,7 @@ _BACKEND_EXPORTS = {
     "ShortConvTunedConfig": "attn_gym.linear.short_conv.cute",
     "causal_conv1d": "attn_gym.linear.short_conv.cute",
     "causal_conv1d_decode": "attn_gym.linear.short_conv.cute",
+    "paged_causal_conv1d": "attn_gym.linear.short_conv.cute",
     "register_activation": "attn_gym.linear.short_conv.activations",
     "tune_causal_conv1d": "attn_gym.linear.short_conv.cute",
 }

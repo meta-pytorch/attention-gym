@@ -26,6 +26,11 @@ torch.library.define(
     " *, str? activation=None) -> Tensor",
 )
 torch.library.define(
+    "attn_gym::_cute_short_conv_paged_fwd",
+    "(Tensor x, Tensor weight, Tensor(a!) state, Tensor state_indices,"
+    " Tensor? has_initial_state, Tensor? cu_seqlens, *, str? activation=None) -> Tensor",
+)
+torch.library.define(
     "attn_gym::_cute_short_conv_configured_decode",
     "(Tensor x, Tensor weight, Tensor(a!) state, Tensor? state_indices,"
     " int forward_threads, int forward_channels, int forward_times,"
@@ -65,6 +70,7 @@ torch.library.define(
 short_conv_forward_op = torch.ops.attn_gym._cute_short_conv_fwd.default
 short_conv_backward_op = torch.ops.attn_gym._cute_short_conv_bwd.default
 short_conv_decode_op = torch.ops.attn_gym._cute_short_conv_decode.default
+short_conv_paged_forward_op = torch.ops.attn_gym._cute_short_conv_paged_fwd.default
 short_conv_configured_forward_op = torch.ops.attn_gym._cute_short_conv_configured_fwd.default
 short_conv_configured_backward_op = torch.ops.attn_gym._cute_short_conv_configured_bwd.default
 short_conv_configured_backward_with_state_grad_op = (
@@ -80,4 +86,5 @@ __all__ = [
     "short_conv_configured_forward_op",
     "short_conv_decode_op",
     "short_conv_forward_op",
+    "short_conv_paged_forward_op",
 ]
