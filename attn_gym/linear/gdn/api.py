@@ -13,6 +13,7 @@ from attn_gym.linear._delta_rule.validation import (
 from attn_gym.linear.gdn.impl.mega import chunk_forward as mega_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
+from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
@@ -106,6 +107,59 @@ def chunk_gdn(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         output_final_state=output_final_state,
+    )
+
+
+def paged_chunk_gdn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Apply inference-only chunk GDN while advancing a paged state cache in place.
+
+    Requires CUDA capability 10.0 or newer.
+
+    Args:
+        q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value-head count.
+        k: Keys shaped like ``q`` and using the same dtype.
+        v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
+        gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
+        beta: Floating per-token write gate shaped ``[B, T, H]``.
+        state_cache: Mutable FP32 state pool shaped ``[num_slots, H, V, K]``.
+        state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
+            unique indices select slots to advance; non-positive indices produce zero output
+            and leave the cache untouched.
+        cu_seqlens: Optional packed offsets shaped ``[N + 1]`` for batch-one inputs. Values
+            must start at zero, be nondecreasing, and end at or before the physical token
+            capacity ``T``; the tensor defines one interval per ``state_indices`` entry.
+        has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
+            entries start from zero and overwrite the selected slot.
+        scale: Query scale. Defaults to ``1 / sqrt(K)``.
+
+    Returns:
+        The output in ``q.dtype``. ``state_cache`` is advanced in place.
+    """
+    validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
+    validate_paged_state(q, v, state_cache, cu_seqlens, state_indices, has_initial_state)
+    return fused_paged_chunk_forward(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        cu_seqlens=cu_seqlens,
+        has_initial_state=has_initial_state,
+        scale=resolve_scale(scale, q.shape[-1]),
     )
 
 
@@ -312,4 +366,10 @@ def recurrent_gdn_decode(
     )
 
 
-__all__ = ["KernelOptions", "chunk_gdn", "recurrent_gdn", "recurrent_gdn_decode"]
+__all__ = [
+    "KernelOptions",
+    "chunk_gdn",
+    "paged_chunk_gdn",
+    "recurrent_gdn",
+    "recurrent_gdn_decode",
+]

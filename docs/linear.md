@@ -45,8 +45,10 @@ output, final_state = chunk_gdn(
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
 - A repo-local fused chunk pipeline on CUDA capability 9.0+ with dense and packed inputs, grouped
-  Q/K heads,
-  tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph support.
+  Q/K heads, tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph
+  support. On CUDA capability 10.0+, `paged_chunk_gdn` advances selected
+  `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
+  gather/scatter copies.
 - An opt-in Mega fused chunk implementation with the same public training/state contract.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
@@ -96,6 +98,8 @@ advances the paged FP32 state pool in place through `state_indices`, so no separ
 elementwise kernels run per decode step.
 
 ::: attn_gym.linear.chunk_gdn
+
+::: attn_gym.linear.paged_chunk_gdn
 
 ::: attn_gym.linear.recurrent_gdn
 
