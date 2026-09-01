@@ -136,9 +136,10 @@ use the same axis order with the leading dimension interpreted as cache slots.
 main Kimi block structure, projected Q/K/V pass through a causal depthwise SiLU
 convolution, the forget and output gates use two-stage factorized projections,
 and the per-head output uses learned RMS normalization before sigmoid gating.
-`--backend=reference` uses the PyTorch reference throughout. On Blackwell,
-`--backend=fused` uses the same public boundary: the model produces per-token natural-log decay
-and `chunk_kda` owns the BT64 scan. Implementations may inline that scan, but cumulative gates and
+`--backend=reference` uses the PyTorch reference throughout. The optimized `chunk_kda`
+core used by `--backend=fused` supports Ampere or newer and owns the BT64 scan behind the same
+public boundary. The complete fused example currently requires Hopper because its separate
+`bound_gate` producer uses TMA. Implementations may inline the scan, but cumulative gates and
 chunk boundaries are not caller-visible representations.
 
 The example explicitly runs projections in BF16 while retaining FP32 parameters and gate
@@ -148,18 +149,18 @@ casting activations inside `forward`. A module-wide BF16 FSDP policy violates th
 contract. A correctness-first integration can keep the KDA unit under an FP32 policy while
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
-The optimized core requires Blackwell and `head_dim=128`; its public boundary accepts
-FP16, BF16, or FP32 inputs. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
+The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
+boundary accepts FP16, BF16, or FP32 inputs. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
 FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
 equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
 explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
-forward,
-backward, and recurrent states; logical sequences may have tails or be empty. For
+forward, backward, and recurrent states; logical sequences may have tails or be empty. For
 fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
-forward values outside `[0, cu_seqlens[-1])` are unspecified. The internal reverse scan
-returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
+forward values outside `[0, cu_seqlens[-1])` are unspecified. `paged_chunk_kda` uses the same
+Ampere-or-newer forward route while updating selected FP32 state-cache slots in place. The
+internal reverse scan returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
 parameterized gate producers: callers still need the masking rules below because
 ``0 * NaN`` can poison their reductions.
 
@@ -315,7 +316,7 @@ not checked at runtime. The training example uses the Kimi-style FP32 transform
 part of the public KDA API.
 
 Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
-and enforces their constraints (the chunked core requires `head_dim=128` and Blackwell,
+and enforces their constraints (the chunked core requires `head_dim=128` and Ampere or newer,
 preserves homogeneous FP16/BF16 Q/K/V, normalizes FP32 or mixed inputs to BF16, and chunks at
 64 tokens; the fused recurrent scan is inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
