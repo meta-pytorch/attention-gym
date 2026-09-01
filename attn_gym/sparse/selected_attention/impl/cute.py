@@ -172,6 +172,5 @@ def selected_attention(
         return_lse=True,
     )
 
-    # Back to BHSD: (batch, nheads, seqlen, hdim)
-    # FA4 returns out as (batch, seqlen, nheads, hdim) and lse as (batch, nheads, seqlen).
-    return out.permute(0, 2, 1, 3), lse
+    # FA4's MLA path returns both tensors with sequence before heads.
+    return out.permute(0, 2, 1, 3), lse.permute(0, 2, 1)
