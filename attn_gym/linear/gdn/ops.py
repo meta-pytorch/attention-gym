@@ -541,10 +541,10 @@ def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
         raise TypeError("chunk_gdn(impl='fused') requires matching float16 or bfloat16 QKV")
     if q.shape[-1] != 128 or v.shape[-1] != 128:
         raise ValueError("chunk_gdn(impl='fused') requires K=V=128")
-    # The recurrence uses Hopper TensorDescriptors/TMA; Blackwell additionally selects the CuTe
-    # backward, while Hopper uses the portable Triton backward.
-    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 9:
-        raise ValueError("fused chunk GDN requires CUDA capability 9.0 or newer")
+    # Triton lowers TensorDescriptor accesses to pointer operations before Hopper. Blackwell
+    # additionally selects the CuTe backward; Ampere and Hopper use the portable Triton backward.
+    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 8:
+        raise ValueError("fused chunk GDN requires CUDA capability 8.0 or newer")
 
 
 def chunk_forward(

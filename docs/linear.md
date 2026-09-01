@@ -44,9 +44,9 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- A repo-local fused chunk pipeline on CUDA capability 9.0+ with dense and packed inputs, grouped
+- A repo-local fused chunk pipeline on CUDA capability 8.0+ with dense and packed inputs, grouped
   Q/K heads, tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph
-  support. On CUDA capability 9.0+, `paged_chunk_gdn` advances selected
+  support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
 - An opt-in Mega fused chunk implementation with the same public training/state contract.
@@ -59,14 +59,14 @@ output, final_state = chunk_gdn(
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
-The repo-local fused chunk backend requires CUDA capability 9.0+, matching FP16 or BF16 Q/K/V,
+The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and
 `K = V = 128`, but has no Mega runtime dependency. Its scalar natural-log gate is not lower-bounded:
 kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
 wide-address path. Backward uses the tuned CuTe kernels on SM100/SM103 and portable Triton
-kernels on Hopper and other supported architectures.
+kernels on Ampere, Hopper, and other supported architectures.
 
 The Mega chunk backend requires the optional `mega` dependencies and SM100/SM103,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log

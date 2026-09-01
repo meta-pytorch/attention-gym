@@ -58,7 +58,7 @@ def chunk_gdn(
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
         impl: ``"reference"`` uses eager PyTorch. ``"fused"`` uses the repo-local scalar chunk
-            pipeline on CUDA capability 9.0+ with FP16/BF16 QKV and ``K = V = 128``.
+            pipeline on CUDA capability 8.0+ with FP16/BF16 QKV and ``K = V = 128``.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
             default; ``{"backend": "mega"}`` selects the optional CuTeDSL 4.7 Mega backend.
 
@@ -125,7 +125,7 @@ def paged_chunk_gdn(
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
-    Requires CUDA capability 9.0 or newer.
+    Requires CUDA capability 8.0 or newer.
 
     Args:
         q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value-head count.
