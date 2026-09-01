@@ -1,4 +1,4 @@
-"""Benchmark the one-CTA-per-query CuTeDSL prefill indexer.
+"""Benchmark the two-query-per-CTA CuTeDSL prefill indexer.
 
 The workload is fixed to the DSA indexer contract used by this directory:
 BF16, B=2, H=128, D=128, and Top-K=128, with equal query/key sequence
@@ -220,6 +220,7 @@ def main() -> None:
         output_cute,
         score_scale,
         _TOPK,
+        prefill._selection_sort_span(_TOPK),
         args.causal,
     )
 
