@@ -699,8 +699,8 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     ids=["single-fp16", "multi-state-bf16", "tail-bf16"],
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="the KDA recurrence requires CUDA capability 9.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the KDA recurrence requires CUDA capability 8.0",
 )
 def test_chunk_delta_h_fwd(dtype, T, use_h0):
     torch.manual_seed(12)
@@ -735,8 +735,8 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="the KDA recurrence requires CUDA capability 9.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the KDA recurrence requires CUDA capability 8.0",
 )
 def test_chunk_delta_h_fwd_fp32_path():
     """FP32 takes the non-warp-specialized BV=32 launch; dots still run in TF32."""

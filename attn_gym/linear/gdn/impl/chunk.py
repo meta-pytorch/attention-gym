@@ -46,9 +46,9 @@ from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_
 
 
 def validate_supported_device(q: torch.Tensor) -> None:
-    """Reject devices older than the Hopper-capable fused implementation."""
-    if get_device_properties(q.device).major < 9:
-        raise ValueError("fused chunk_gdn requires CUDA capability 9.0 or newer")
+    """Reject devices older than the Ampere-capable fused implementation."""
+    if get_device_properties(q.device).major < 8:
+        raise ValueError("fused chunk_gdn requires CUDA capability 8.0 or newer")
 
 
 def use_blackwell_backward(q: torch.Tensor) -> bool:

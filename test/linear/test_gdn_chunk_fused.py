@@ -37,8 +37,8 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="fused chunk GDN requires CUDA capability 9.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="fused chunk GDN requires CUDA capability 8.0 or newer",
 )
 
 
@@ -342,19 +342,19 @@ def test_chunk_state_continues_in_recurrent_decode():
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
 
 
-def test_paged_chunk_rejects_pre_hopper(monkeypatch):
+def test_paged_chunk_rejects_pre_ampere(monkeypatch):
     """Keep the minimum device capability guard at the public boundary."""
     import attn_gym.linear.gdn.ops as gdn_ops
 
     monkeypatch.setattr(
         gdn_ops,
         "get_device_properties",
-        lambda device: SimpleNamespace(major=8),
+        lambda device: SimpleNamespace(major=7),
     )
     q, k, v, gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=2)
     state_cache = torch.randn(3, 2, 128, 128, device="cuda")
     state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
-    with torch.no_grad(), pytest.raises(ValueError, match="CUDA capability 9.0"):
+    with torch.no_grad(), pytest.raises(ValueError, match="CUDA capability 8.0"):
         paged_chunk_gdn(q, k, v, gate, beta, state_cache, state_indices)
 
 
@@ -860,7 +860,7 @@ def test_int64_layouts_fail_before_kernel_launch(monkeypatch):
         chunk_gdn(*inputs[:5], impl="fused")
 
 
-def test_raw_ops_reject_pre_hopper_devices(monkeypatch):
+def test_raw_ops_reject_pre_ampere_devices(monkeypatch):
     """Keep capability validation inside the real registered CUDA launcher."""
     import attn_gym.linear.gdn.impl.chunk as chunk_impl
 
@@ -868,9 +868,9 @@ def test_raw_ops_reject_pre_hopper_devices(monkeypatch):
     monkeypatch.setattr(
         chunk_impl,
         "get_device_properties",
-        lambda device: SimpleNamespace(major=8),
+        lambda device: SimpleNamespace(major=7),
     )
-    with pytest.raises(ValueError, match="capability 9.0"):
+    with pytest.raises(ValueError, match="capability 8.0"):
         chunk_fwd_with_state_op(*args)
 
 
