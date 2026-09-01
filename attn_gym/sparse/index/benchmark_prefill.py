@@ -1,7 +1,7 @@
 """Benchmark the two-query-per-CTA CuTeDSL prefill indexer.
 
 The workload is fixed to the DSA indexer contract used by this directory:
-BF16, B=2, H=128, D=128, and Top-K=128, with equal query/key sequence
+BF16, B=8, H=128, D=128, and Top-K=128, with equal query/key sequence
 lengths.  The cuDNN reference is the exact H=128 construction supported by
 its dense indexer API: two prepacked H=64 forward calls, an FP32 score add,
 and one standalone cuDNN Top-K call.
@@ -24,7 +24,7 @@ from cudnn import DSA
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
-_BATCH = 2
+_BATCH = 8
 _HEADS = 128
 _HEAD_DIM = 128
 _TOPK = 128
