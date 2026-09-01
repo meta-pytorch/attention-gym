@@ -368,9 +368,11 @@ def chunk_gdn_bwd_delta_h(
     output_factory = torch.zeros if metadata is not None else torch.empty
     dv_local = output_factory(d_output.shape, dtype=d_output.dtype, device=d_output.device)
     dv = output_factory(d_output.shape, dtype=d_output.dtype, device=d_output.device)
+    # Packed execution can contain short tails whose FP32 state cotangents are subnormal in FP16.
+    dh_dtype = torch.bfloat16 if metadata is not None and q.dtype is torch.float16 else q.dtype
     dh = output_factory(
         (chunk_slots, value_heads, key_dim, value_dim),
-        dtype=q.dtype,
+        dtype=dh_dtype,
         device=q.device,
     )
     d_initial_state = (
