@@ -2,9 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Literal
+
 import torch
 
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
+
+_KERNEL_OPTION_NAMES = frozenset({"backend"})
+
+
+def resolve_kernel_options(
+    kernel_options: Mapping[str, object] | None,
+) -> Literal["fused", "mega"]:
+    """Validate chunk backend options while keeping the repo-local path as default."""
+    if kernel_options is None:
+        return "fused"
+    unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported chunk_gdn kernel options: {names}")
+    backend = kernel_options.get("backend", "fused")
+    if backend not in ("fused", "mega"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    return backend
 
 
 def validate_gdn_inputs(
@@ -44,4 +65,4 @@ def validate_gdn_inputs(
         )
 
 
-__all__ = ["validate_gdn_inputs"]
+__all__ = ["resolve_kernel_options", "validate_gdn_inputs"]

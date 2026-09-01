@@ -8,8 +8,11 @@ from .utils import (
     compile_tvm_ffi,
     get_device_properties,
     make_fake_strided_tensor,
+    normalize_compact_tensor,
+    normalize_tma_rows,
     tensor_supports_contiguous_dim,
     tensor_supports_tma,
+    tensor_supports_tma_rows,
 )
 
 __all__ = [
@@ -21,8 +24,11 @@ __all__ = [
     "get_device_properties",
     "jit_cache",
     "make_fake_strided_tensor",
+    "normalize_compact_tensor",
+    "normalize_tma_rows",
     "run_tunable",
     "tensor_supports_contiguous_dim",
     "tensor_supports_tma",
+    "tensor_supports_tma_rows",
     "tune",
 ]

@@ -14,7 +14,7 @@ pytest.importorskip(
     reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
 )
 
-from attn_gym.linear import chunk_gdn
+from attn_gym.linear import chunk_gdn as public_chunk_gdn
 from attn_gym.linear.gdn.impl.mega_ops import (
     chunk_gdn_mega_packed_bwd_op,
     chunk_gdn_mega_packed_bwd_with_state_op,
@@ -30,6 +30,15 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
 )
+
+_MEGA_KERNEL_OPTIONS = {"backend": "mega"}
+
+
+def chunk_gdn(*args, **kwargs):
+    """Route fused calls in this module through the Mega backend."""
+    if kwargs.get("impl") == "fused":
+        kwargs.setdefault("kernel_options", _MEGA_KERNEL_OPTIONS)
+    return public_chunk_gdn(*args, **kwargs)
 
 
 def reference_results(
@@ -304,7 +313,16 @@ v = torch.randn_like(q)
 gate = -torch.rand(shape[:3], device='cuda')
 beta = torch.rand(shape[:3], device='cuda')
 cu = torch.tensor({offsets!r}, dtype=torch.int32, device='cuda')
-chunk_gdn(q, k, v, gate, beta, cu_seqlens=cu, impl='fused')
+chunk_gdn(
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    cu_seqlens=cu,
+    impl='fused',
+    kernel_options={{"backend": "mega"}},
+)
 torch.cuda.synchronize()
 """
     try:
