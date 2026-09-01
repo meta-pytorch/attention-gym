@@ -893,6 +893,32 @@ def test_bad_fork_check_precedes_cached_target_lookup(monkeypatch):
         cute_target._query_compile_target.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("configured_arch", "physical", "expected"),
+    (
+        ("sm_90a", (10, 0), (9, 0)),
+        ("sm_100a", (9, 0), (10, 0)),
+        ("sm_103a", (10, 0), (10, 3)),
+        (None, (10, 3), (10, 3)),
+        (None, None, None),
+    ),
+)
+def test_compile_target_effective_capability(configured_arch, physical, expected):
+    """Prefer an explicit code-generation architecture over the physical GPU."""
+    target = cute_target.CompileTarget(
+        device_type="cuda",
+        configured_arch=configured_arch,
+        capability=physical,
+    )
+    assert target.effective_capability == expected
+
+
+def test_compile_target_rejects_invalid_configured_architecture():
+    target = cute_target.CompileTarget(device_type="cuda", configured_arch="native")
+    with pytest.raises(ValueError, match="configured CUDA architecture"):
+        _ = target.effective_capability
+
+
 def test_explicit_target_avoids_device_discovery(monkeypatch):
     target = cute_target.CompileTarget(
         device_type="cuda",

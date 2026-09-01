@@ -18,6 +18,16 @@ class CompileTarget:
     name: str | None = None
     sm_count: int | None = None
 
+    @property
+    def effective_capability(self) -> tuple[int, int] | None:
+        """Return the configured code-generation target or the physical capability."""
+        if self.configured_arch is None:
+            return self.capability
+        arch = self.configured_arch.removeprefix("sm_").removesuffix("a")
+        if not arch.isdecimal() or len(arch) < 2:
+            raise ValueError(f"invalid configured CUDA architecture {self.configured_arch!r}")
+        return divmod(int(arch), 10)
+
 
 _target: CompileTarget | None = None
 _target_lock = threading.Lock()

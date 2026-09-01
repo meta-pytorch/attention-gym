@@ -19,8 +19,8 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTe KDA backward stage requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="the CuTe KDA backward stage requires CUDA capability 9.0 or newer",
 )
 
 

@@ -6,12 +6,12 @@
 
 """Inter-chunk scalar- and vector-gated delta-rule state recurrence.
 
-A single kernel (B=1, K=V=128, 64-token chunks, Blackwell) keeps the full
-[K, BV] state in one accumulator and overlaps next-chunk descriptor loads with
-the serially dependent state MMAs; 16-bit inputs run the tuned warp-specialized
-schedule and FP32 a smaller ordinarily pipelined one. Host-side tensor
-descriptors do not survive dynamo/inductor tracing, so the launch sits behind a
-compiler-opaque ``torch.library`` op pair.
+A single kernel (B=1, K=V=128, 64-token chunks) keeps the full [K, BV] state in
+one accumulator. Blackwell overlaps descriptor loads with the serial state MMAs
+through warp specialization; Hopper and FP32 use ordinary pipelining because the
+Hopper warp-specialization pass cannot commit this kernel's descriptor stores.
+Host-side tensor descriptors do not survive Dynamo/Inductor tracing, so the
+launch sits behind a compiler-opaque ``torch.library`` op pair.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import (
     GridScheduler,
@@ -260,7 +261,7 @@ def chunk_delta_h_kernel_k128_wsp(
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
 ):
-    """Warp-specialized K=128 inter-chunk recurrence."""
+    """Primary K=128 inter-chunk recurrence launcher."""
     _run_chunk_delta_h_sequence(
         k_desc,
         w_desc,
@@ -458,11 +459,11 @@ def _delta_h_launch(
     compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
     h0_strides = initial_state.stride() if initial_state is not None else compact_state_strides
     ht_strides = final_state.stride() if final_state is not None else compact_state_strides
-    # FP32 tiles double the descriptor staging past the shared-memory limit
-    # at the 16-bit tile shape, and warp specialization pins its own stage
-    # count; for 4-byte inputs halve the value tile and use an ordinarily
-    # pipelined loop instead. 16-bit inputs keep the tuned contract schedule.
+    # FP32 tiles double the descriptor staging past the shared-memory limit at
+    # the 16-bit tile shape. Hopper also uses ordinary pipelining: its Triton
+    # warp-specialization pass cannot commit the descriptor stores in this loop.
     use_16bit_config = k.element_size() == 2
+    use_warp_specialization = use_16bit_config and get_device_properties(k.device).major >= 10
     block_value_dim = _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2
     descriptors = (
         TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),
@@ -497,8 +498,8 @@ def _delta_h_launch(
         "V": value_dim,
         "BT": _CHUNK_SIZE,
         "BV": block_value_dim,
-        "WARP_SPECIALIZE": use_16bit_config,
-        "NUM_STAGES": 3 if use_16bit_config else 2,
+        "WARP_SPECIALIZE": use_warp_specialization,
+        "NUM_STAGES": 3 if use_warp_specialization else 2,
         "USE_INITIAL_STATE": initial_state is not None,
         "STORE_FINAL_STATE": final_state is not None,
         "USE_STATE_INDICES": state_indices is not None,
@@ -522,9 +523,10 @@ def _delta_h_launch(
             schedule,
         )
     if sequence_workers:
-        # Keep one machine-sized wave warp-specialized, then stride persistent workers
-        # over the remaining work; Triton cannot warp-specialize the nested loop. This
-        # reduced N=512, M=32 graph replay from 1.22 ms to 0.68 ms on B200.
+        # Keep one machine-sized wave on the primary schedule, then stride persistent
+        # workers over the remaining work. Blackwell warp-specializes the first launch;
+        # Hopper uses ordinary pipelining. This reduced N=512, M=32 graph replay from
+        # 1.22 ms to 0.68 ms on B200.
         chunk_delta_h_kernel_k128_wsp[(sequence_workers, value_tiles)](
             *kernel_args,
             **kernel_options,
@@ -678,7 +680,7 @@ def chunk_gated_delta_rule_fwd_h(
         raise ValueError("w must match k and gk must have shape [B,T,H,K] or [B,T,H]")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
-    if torch.cuda.get_device_capability(k.device)[0] < 8:
+    if not torch.compiler.is_compiling() and get_device_properties(k.device).major < 8:
         raise ValueError("the inter-chunk state recurrence requires CUDA capability 8.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state_shape = (state_batch, heads, value_dim, key_dim)
