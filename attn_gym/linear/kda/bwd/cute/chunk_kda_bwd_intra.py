@@ -888,6 +888,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     grid_chunks: Constexpr,
     ragged: Constexpr,
     use_int64_offsets: Constexpr,
+    use_packed_f32x2: Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
@@ -1679,7 +1680,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 )
                 dq_add0 = q_acc0 * qscale_prev0 + q_diag0 * qscale_diag0
                 dq_add1 = q_acc1 * qscale_prev1 + q_diag1 * qscale_diag1
-                dq_out0, dq_out1 = cute.arch.add_packed_f32x2((dq_in0, dq_in1), (dq_add0, dq_add1))
+                if cutlass.const_expr(use_packed_f32x2):
+                    dq_out0, dq_out1 = cute.arch.add_packed_f32x2(
+                        (dq_in0, dq_in1), (dq_add0, dq_add1)
+                    )
+                else:
+                    dq_out0, dq_out1 = dq_in0 + dq_add0, dq_in1 + dq_add1
                 if lane_row == 0:
                     dq_word0 = _cvt_half2_f32(dq_out0, dq_out1, mDq2.element_type)
                 else:
@@ -1692,7 +1698,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 dk_beta1 = dk_qk1 * beta_row
                 dk_add0 = dk_beta0 + dkt0
                 dk_add1 = dk_beta1 + dkt1
-                dk_out0, dk_out1 = cute.arch.add_packed_f32x2((dk_in0, dk_in1), (dk_add0, dk_add1))
+                if cutlass.const_expr(use_packed_f32x2):
+                    dk_out0, dk_out1 = cute.arch.add_packed_f32x2(
+                        (dk_in0, dk_in1), (dk_add0, dk_add1)
+                    )
+                else:
+                    dk_out0, dk_out1 = dk_in0 + dk_add0, dk_in1 + dk_add1
                 if lane_row == 0:
                     dk_word0 = _cvt_half2_f32(dk_out0, dk_out1, mDk2.element_type)
                 else:
@@ -1869,12 +1880,14 @@ class ChunkKdaBwdIntraHmmaGrid:
         capacity: int,
         grid_chunks: int,
         ragged: bool,
-        use_int64_offsets: bool = False,
+        use_int64_offsets: bool,
+        use_packed_f32x2: bool,
     ):
         self.capacity = capacity
         self.grid_chunks = grid_chunks
         self.ragged = ragged
         self.use_int64_offsets = use_int64_offsets
+        self.use_packed_f32x2 = use_packed_f32x2
 
     @cute.jit
     def __call__(
@@ -1917,6 +1930,7 @@ class ChunkKdaBwdIntraHmmaGrid:
             self.grid_chunks,
             self.ragged,
             self.use_int64_offsets,
+            self.use_packed_f32x2,
         ).launch(
             grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),
@@ -1942,11 +1956,14 @@ def _compile_chunk_kda_bwd_intra(
     """Compile one persistent intra-chunk backward specialization."""
     if not 1 <= grid_chunks <= capacity:
         raise ValueError(f"grid_chunks must be in [1, {capacity}], got {grid_chunks}")
+    target = get_compile_target()
+    capability = target.effective_capability
     op = ChunkKdaBwdIntraHmmaGrid(
         capacity=capacity,
         grid_chunks=grid_chunks,
         ragged=ragged,
         use_int64_offsets=use_int64_offsets,
+        use_packed_f32x2=capability is not None and capability >= (10, 0),
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int

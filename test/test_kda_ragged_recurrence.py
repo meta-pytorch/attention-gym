@@ -20,8 +20,8 @@ from attn_gym.linear.kda.fwd.triton.chunk_delta_h import (
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the KDA recurrence kernel requires CUDA capability 10.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the KDA recurrence kernel requires CUDA capability 8.0 or newer",
 )
 
 
