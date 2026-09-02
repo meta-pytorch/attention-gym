@@ -450,6 +450,57 @@ def test_public_ragged_forward_and_backward_cuda_graph_replay():
     _assert_run_close(actual, expected, active_tokens)
 
 
+def test_public_ragged_backward_overwrites_active_uninitialized_storage():
+    """Keep active results independent of undefined packed-capacity storage."""
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_fill = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+
+        capacity = 128
+        active_lengths = [17, 15, 33, 0]
+        active_tokens = sum(active_lengths)
+        inputs = make_kda_test_inputs(capacity, requires_grad=True)
+        initial_state = (torch.randn(4, 1, 128, 128, device="cuda") / 8).requires_grad_()
+        output_grad = torch.randn(1, capacity, 1, 128, device="cuda")
+        output_grad[:, active_tokens:].zero_()
+        state_grad = torch.randn_like(initial_state)
+        offsets = cumulative_sequence_offsets(active_lengths)
+
+        actual = _run_gradients(inputs, initial_state, offsets, output_grad, state_grad)
+        expected = _run_gradients(
+            tuple(
+                tensor[:, :active_tokens].detach().clone().requires_grad_() for tensor in inputs
+            ),
+            initial_state.detach().clone().requires_grad_(),
+            offsets,
+            output_grad[:, :active_tokens],
+            state_grad,
+        )
+        _assert_run_close(actual, expected, active_tokens)
+
+        empty_inputs = make_kda_test_inputs(capacity, requires_grad=True)
+        empty_state = (torch.randn(2, 1, 128, 128, device="cuda") / 8).requires_grad_()
+        empty_state_grad = torch.randn_like(empty_state)
+        _, _, empty_gradients = _run_gradients(
+            empty_inputs,
+            empty_state,
+            cumulative_sequence_offsets([0, 0]),
+            None,
+            empty_state_grad,
+        )
+        assert not empty_gradients[3].any()
+        torch.testing.assert_close(empty_gradients[-1], empty_state_grad, rtol=0, atol=0)
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = previous_fill
+        torch.use_deterministic_algorithms(
+            previous_deterministic,
+            warn_only=previous_warn_only,
+        )
+
+
 @pytest.mark.parametrize(
     ("captured_lengths", "active_lengths"),
     [

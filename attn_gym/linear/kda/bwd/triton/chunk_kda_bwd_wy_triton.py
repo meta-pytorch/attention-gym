@@ -489,7 +489,7 @@ def chunk_kda_bwd_wy_triton(
     Returns:
         ``(dq, dk, dv, dg, db, dA)``. ``dq``, ``dk``, ``dg``, ``db``, and ``dA``
         are FP32; the returned ``dv`` uses the QKV dtype. Packed capacity outside
-        active sequences is zero.
+        active sequences is undefined and must not be consumed.
     """
     if q.ndim != 4:
         raise ValueError(f"q must be 4D, got shape {tuple(q.shape)}")
@@ -551,13 +551,14 @@ def chunk_kda_bwd_wy_triton(
         if tensor.dtype != q.dtype or tensor.device != q.device or not tensor.is_contiguous():
             raise TypeError(f"{name} must be contiguous on q.device with dtype {q.dtype}")
 
-    output_factory = torch.zeros_like if metadata is not None else torch.empty_like
-    dq = output_factory(g, memory_format=torch.contiguous_format)
-    dk = output_factory(g, memory_format=torch.contiguous_format)
-    d_value = output_factory(v, memory_format=torch.contiguous_format)
-    dg = output_factory(g, memory_format=torch.contiguous_format)
-    db = output_factory(beta, memory_format=torch.contiguous_format)
-    dA = output_factory(A, dtype=torch.float32, memory_format=torch.contiguous_format)
+    # Each active output element is written before reuse. Inactive data may feed only
+    # inactive outputs, which caller gradient barriers discard at the packed boundary.
+    dq = torch.empty_like(g, memory_format=torch.contiguous_format)
+    dk = torch.empty_like(g, memory_format=torch.contiguous_format)
+    d_value = torch.empty_like(v, memory_format=torch.contiguous_format)
+    dg = torch.empty_like(g, memory_format=torch.contiguous_format)
+    db = torch.empty_like(beta, memory_format=torch.contiguous_format)
+    dA = torch.empty_like(A, dtype=torch.float32, memory_format=torch.contiguous_format)
     if isinstance(q, FakeTensor) or tokens == 0:
         return dq, dk, d_value, dg, db, dA
 

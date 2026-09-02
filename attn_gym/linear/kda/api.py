@@ -92,7 +92,10 @@ def chunk_kda(
         cu_seqlens: Packed offsets shaped ``[N + 1]`` for batch-one inputs, as
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences whose states pass through,
-            and may end before ``T``.
+            and may end before ``T``. When the endpoint is below ``T``, output
+            values and token-input gradients beyond it are undefined. Fixed-capacity
+            callers must sanitize outputs with ``mask_inactive_tokens`` and protect
+            parameterized input producers with ``mask_inactive_token_gradients``.
         scale: Query scale, applied inside the kernels in FP32. Defaults to
             ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
