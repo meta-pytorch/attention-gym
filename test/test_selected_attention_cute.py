@@ -12,6 +12,8 @@ import math
 import pytest
 import torch
 
+pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
+
 from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 
 
