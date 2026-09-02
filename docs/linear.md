@@ -389,3 +389,97 @@ forgetting-horizon splitting. Install the `mega` extra to use this backend.
 ::: attn_gym.linear.recurrent_kda_decode
 
 ::: attn_gym.linear.Impl
+
+## Context Parallelism
+
+Every delta-rule token step is affine in the V-major recurrent state, so any token range
+collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [bias; transition]`
+(one map per value head; GQA key heads are expanded by the factor kernels).
+Context parallelism is therefore a prefix scan over these summaries, and the same machinery serves
+KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel summary kernels). The
+public surface has three tiers so that new partitionings or communication topologies never add
+options to an op.
+
+**Primitives** (`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward`, and
+`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward`) split the fused core
+around the communication point without exposing its WY factors:
+
+```python
+from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
+
+prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+summary = prepared.state_summary(start, stop)  # [bias; transition] of one local sequence
+# ...exchange summaries and compose each sequence's entry state...
+output, final_state = prepared.run(initial_state, output_final_state=True)
+
+grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state)
+grad_summary = grads.state_grad_summary(start, stop)  # reverse map [bias; transition]
+# ...exchange and compose each sequence's exit cotangent...
+dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
+```
+
+`start`/`stop` are host integers naming exactly one local `cu_seqlens` segment, so CUDA Graph
+capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries
+(`merge_state`, `compose_summaries`, `neutral_summary`).
+
+**Ownership plans** (`attn_gym.linear.context_parallel.ContextParallelPlan`) describe which global
+token ranges each rank owns. You choose the ranges in plain Python; the plan cuts them at sequence
+boundaries into `Fragment`s, one local `cu_seqlens` segment each, and derives host-static routing:
+which fragments need a forward or reverse summary, which gathered slots to fold for each entry
+state or exit cotangent, and which local fragments end their sequence and therefore hold true final
+states. Two pieces of one document on the same rank are simply two local segments whose entry
+states the recipe supplies, so contiguous shards, zig-zag load balancing, and document-aligned
+partitions differ only in the range lists. The ranges must tile `[0, total_tokens)` exactly once.
+[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
+builds contiguous and zig-zag range lists in a dozen lines.
+
+**Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
+`attn_gym.linear.kda.context_parallel_kda` and `attn_gym.linear.gdn.context_parallel_gdn`) moves
+summaries with one padded all-gather per direction and owns the autograd function; it is generic
+over the op through a `StagedOp` pair of the two `prepare` entry points.
+`context_parallel_conv_history` builds the short convolution's `initial_state` from the same plan.
+The recipe is one composition, not an extension point: for a point-to-point pipeline, a
+recursive-doubling scan over `compose_summaries`, DTensor, or communication overlap, copy the
+autograd function and swap the collective; the primitives and plans are unchanged. Sharding does
+not cost accuracy: against an FP32 reference, sharded gradients match the unsharded fused op's error
+to within noise for both ops.
+
+```python
+from attn_gym.linear.context_parallel import ContextParallelPlan
+from attn_gym.linear.kda import context_parallel_kda
+
+# Two ranks; the packed stream split down the middle.
+total_tokens = global_cu_seqlens[-1]
+half = total_tokens // 2
+plan = ContextParallelPlan.from_token_ranges(
+    global_cu_seqlens, [[(0, half)], [(half, total_tokens)]], rank
+)
+token_ids = plan.global_token_ids(device)  # slice global tensors into local ones
+cu_seqlens = torch.tensor(plan.cu_seqlens, dtype=torch.int32, device=device)
+output, final_state = context_parallel_kda(
+    q, k, v, gate, beta, cu_seqlens=cu_seqlens, plan=plan, group=group
+)
+true_final_states = final_state[list(plan.terminal)]
+```
+
+The recipe starts each sequence from zero, always returns every fragment's exit state, and does
+not accept `initial_state` or `output_final_state=False`. A captured CUDA Graph is valid only for
+its fixed plan.
+
+::: attn_gym.linear.context_parallel.context_parallel_chunk
+
+::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
+
+::: attn_gym.linear.context_parallel.ContextParallelPlan
+
+::: attn_gym.linear.context_parallel.Fragment
+
+::: attn_gym.linear.kda.stages.chunk_kda_prepare
+
+::: attn_gym.linear.kda.stages.chunk_kda_prepare_backward
+
+::: attn_gym.linear.gdn.stages.chunk_gdn_prepare
+
+::: attn_gym.linear.gdn.stages.chunk_gdn_prepare_backward
