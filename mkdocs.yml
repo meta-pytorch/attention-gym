@@ -24,6 +24,7 @@ theme:
   features:
     - content.code.annotate
     - content.code.copy
+    - navigation.indexes
     - navigation.top
     - toc.follow
   logo: assets/hero.png
@@ -63,6 +64,7 @@ nav:
       - Getting Started: getting-started.md
       - Core Concepts: concepts.md
   - Guides:
+      - guides/index.md
       - Ragged CUDA Graphs: guides/ragged-cuda-graphs.md
       - Determinism: determinism.md
   - Reference:
@@ -72,6 +74,7 @@ nav:
       - Utilities: utilities.md
   - Examples: examples.md
   - Development:
+      - developers/index.md
       - CI Health: developers/ci-health.md
 
 markdown_extensions:
