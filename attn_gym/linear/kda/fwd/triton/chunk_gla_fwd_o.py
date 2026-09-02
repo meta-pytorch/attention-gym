@@ -16,6 +16,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import (
     PinnedConfigKernel,
     can_use_tma,
@@ -502,6 +503,17 @@ def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
 _PINNED_FWD_O = PinnedConfigKernel(chunk_gla_fwd_kernel_o)
 
 
+def _select_ragged_output_schedule_kind(
+    request: ScheduleRequest,
+    resolved_kind: ScheduleKind,
+    device_major: int,
+) -> ScheduleKind:
+    """Keep Hopper on its faster static ragged-TMA launch under automatic selection."""
+    if request is ScheduleRequest.AUTO and device_major == 9:
+        return ScheduleKind.STATIC
+    return resolved_kind
+
+
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -631,7 +643,12 @@ def chunk_gla_fwd_o_gk(
                 # past the dense register budget and loses a resident CTA.
                 "maxnreg": 136,
             }
-            if resolved.kind is ScheduleKind.PERSISTENT:
+            schedule_kind = _select_ragged_output_schedule_kind(
+                schedule,
+                resolved.kind,
+                get_device_properties(q.device).major,
+            )
+            if schedule_kind is ScheduleKind.PERSISTENT:
                 chunk_gla_fwd_kernel_o_ragged_tma_persistent[(resolved.workers,)](
                     *args, num_workers=resolved.workers, **kwargs
                 )
