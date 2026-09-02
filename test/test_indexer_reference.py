@@ -73,19 +73,3 @@ def test_output_dtype_and_shape():
 
     assert out.dtype == torch.int32
     assert out.shape == (B, T, K)
-
-
-def test_mode_auto_matches_prefill():
-    """mode="auto" and mode="prefill" produce identical results (auto defaults to prefill)."""
-    B, T, H, D, K = 2, 6, 4, 8, 3
-    torch.manual_seed(0)
-    q = torch.randn(B, T, H, D)
-    k = torch.randn(B, T, D)
-    w = torch.randn(B, T, H)
-
-    out_auto = index(q, k, w, K, mode="auto")
-    out_prefill = index(q, k, w, K, mode="prefill")
-    out_default = index(q, k, w, K)
-
-    assert torch.equal(out_auto, out_prefill)
-    assert torch.equal(out_auto, out_default)

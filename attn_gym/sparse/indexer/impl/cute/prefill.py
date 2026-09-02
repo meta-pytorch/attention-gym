@@ -44,7 +44,6 @@ _MMA_WARP = _CONSUMER_WARPS * 2
 _LOAD_WARP = _MMA_WARP + 1
 _THREADS = (_LOAD_WARP + 1) * 32
 _ACC_TMEM_STAGES = _QUERIES_PER_CTA * _ACC_STAGES
-_MIN_SORT_SPAN = 512
 _ALIGNMENT = 16
 _MAX_SEQUENCE = 1 << 20
 _INVALID_KEY = -(1 << 63)
@@ -188,56 +187,6 @@ def _merge_two_sorted_128_at_rank(
 
 
 @cute.jit
-def _merge_sorted_runs_at_rank(
-    keys: cute.Tensor,
-    a_base: Int32,
-    a_length: cutlass.Constexpr,
-    b_base: Int32,
-    b_length: cutlass.Constexpr,
-    rank: Int32,
-) -> Int64:
-    """Return one rank from two descending shared-memory runs.
-
-    The generalized selector uses incoming runs of at most 256 entries, so nine
-    fixed bisection steps suffice independently of a_length.  This keeps
-    both compile time and per-thread register use bounded as Top-K grows.
-    """
-    a_len = Int32(a_length)
-    b_len = Int32(b_length)
-    diagonal = rank + Int32(1)
-    lower = diagonal - b_len
-    lower = lower if lower > Int32(0) else Int32(0)  # noqa: FURB136
-    upper = diagonal if diagonal < a_len else a_len  # noqa: FURB136
-
-    for _iteration in cutlass.range_constexpr(9):
-        if lower < upper:
-            a_count = (lower + upper) >> Int32(1)
-            b_count = diagonal - a_count
-            move_right = cutlass.Boolean(False)
-            if a_count < a_len and b_count > Int32(0):
-                move_right = Int64(keys[a_base + a_count]) >= Int64(
-                    keys[b_base + b_count - Int32(1)]
-                )
-            if move_right:
-                lower = a_count + Int32(1)
-            else:
-                upper = a_count
-
-    a_count = lower
-    b_count = diagonal - a_count
-    result = Int64(_INVALID_KEY)
-    if a_count == Int32(0):
-        result = Int64(keys[b_base + b_count - Int32(1)])
-    elif b_count == Int32(0):
-        result = Int64(keys[a_base + a_count - Int32(1)])
-    else:
-        a_value = Int64(keys[a_base + a_count - Int32(1)])
-        b_value = Int64(keys[b_base + b_count - Int32(1)])
-        result = a_value if a_value < b_value else b_value  # noqa: FURB136
-    return result
-
-
-@cute.jit
 def _drain_hierarchical_512_128(
     keys: cute.Tensor,
     buffer_counts: cute.Tensor,
@@ -299,16 +248,19 @@ def _drain_long_term_buffer(
     logical_tid: Int32,
     query_slot: cutlass.Constexpr,
     selection_barrier,
-    topk: cutlass.Constexpr,
+    run_size: cutlass.Constexpr,
     sort_span: cutlass.Constexpr,
 ):
-    """Sort the long-term-buffer/buffer2 union and retain its first K keys.
+    """Sort the long-term-buffer/buffer2 union and retain its first run_size keys.
 
-    Global indices are striped across 128 threads.  Distances below a warp use
-    shuffles, distances of 32/64 exchange through shared memory, and distances
-    of at least 128 compare register pairs owned by the same thread.
+    ``run_size`` is the padded persistent-run size (a power of two, >= 128;
+    equal to the caller's requested topk only when topk is itself such a
+    power of two). Global indices are striped across 128 threads. Distances
+    below a warp use shuffles, distances of 32/64 exchange through shared
+    memory, and distances of at least 128 compare register pairs owned by
+    the same thread.
     """
-    if cutlass.const_expr(topk == 128 and sort_span == 512):
+    if cutlass.const_expr(run_size == 128 and sort_span == 512):
         _drain_hierarchical_512_128(
             keys,
             buffer_counts,
@@ -381,77 +333,6 @@ def _drain_long_term_buffer(
     for item in cutlass.range_constexpr(items_per_thread):
         global_index = logical_tid + Int32(item * _SELECTION_THREADS)
         keys[query_base + global_index] = values[item]
-    if logical_tid == Int32(0):
-        buffer_counts[query_slot] = Int32(0)
-    selection_barrier.arrive_and_wait()
-
-
-@cute.jit
-def _drain_generalized_runs(
-    keys: cute.Tensor,
-    buffer_counts: cute.Tensor,
-    query_base: Int32,
-    logical_tid: Int32,
-    warp_idx: Int32,
-    lane: Int32,
-    query_slot: cutlass.Constexpr,
-    selection_barrier,
-    topk: cutlass.Constexpr,
-    active_buffer: Int32,
-):
-    """Sort 256 incoming keys and merge them once into arbitrary Top-K.
-
-    Two M128 runs are sorted independently, merged into one M256 run, and then
-    co-rank-merged with the active persistent list.  The inactive K buffer is
-    fully overwritten before the caller toggles active_buffer.
-    """
-    long_a_base = query_base
-    long_b_base = query_base + Int32(topk)
-    incoming_raw_base = query_base + Int32(2 * topk)
-    incoming_sorted_base = incoming_raw_base + Int32(2 * _TILE_CANDIDATES)
-
-    if warp_idx < Int32(2):
-        _sort_warp_quarter_desc(
-            keys,
-            incoming_raw_base + warp_idx * Int32(_TILE_CANDIDATES),
-            lane,
-        )
-    selection_barrier.arrive_and_wait()
-
-    for output_round in cutlass.range_constexpr(2):
-        rank = logical_tid + Int32(output_round * _SELECTION_THREADS)
-        keys[incoming_sorted_base + rank] = _merge_sorted_runs_at_rank(
-            keys,
-            incoming_raw_base,
-            _TILE_CANDIDATES,
-            incoming_raw_base + Int32(_TILE_CANDIDATES),
-            _TILE_CANDIDATES,
-            rank,
-        )
-    selection_barrier.arrive_and_wait()
-
-    source_base = long_a_base if active_buffer == Int32(0) else long_b_base
-    destination_base = long_b_base if active_buffer == Int32(0) else long_a_base
-    output_rounds = cute.ceil_div(topk, _SELECTION_THREADS)
-    for output_round in cutlass.range(output_rounds, unroll=0):
-        rank = logical_tid + output_round * Int32(_SELECTION_THREADS)
-        if rank < Int32(topk):
-            keys[destination_base + rank] = _merge_sorted_runs_at_rank(
-                keys,
-                source_base,
-                topk,
-                incoming_sorted_base,
-                2 * _TILE_CANDIDATES,
-                rank,
-            )
-    selection_barrier.arrive_and_wait()
-
-    # Every slot must be reset: compacted appends in a later tile may be
-    # written by a different lane than the one that owned this slot here.
-    for run in cutlass.range_constexpr(2):
-        keys[incoming_raw_base + logical_tid + Int32(run * _SELECTION_THREADS)] = Int64(
-            _INVALID_KEY
-        )
     if logical_tid == Int32(0):
         buffer_counts[query_slot] = Int32(0)
     selection_barrier.arrive_and_wait()
@@ -910,9 +791,17 @@ def _run_query_selector_mailbox(
     query_slot: cutlass.Constexpr,
     candidate_tiles,
     topk: cutlass.Constexpr,
+    run_size: cutlass.Constexpr,
     sort_span: cutlass.Constexpr,
 ):
-    """Consume reduced ordinals and maintain the exact shared-memory Top-K."""
+    """Consume reduced ordinals and maintain the exact shared-memory Top-run_size.
+
+    ``run_size`` is the padded persistent-run size; the caller truncates the
+    final sorted run to its requested ``topk`` when writing output. The
+    unsorted direct-seed shortcut below is only safe when the caller reads
+    back the *entire* persistent run (topk == run_size); otherwise the
+    output truncation would read an arbitrary, unsorted subset.
+    """
     selection_barrier_id = 3
     if cutlass.const_expr(query_slot == 1):
         selection_barrier_id = 4
@@ -924,19 +813,19 @@ def _run_query_selector_mailbox(
     items_per_thread = sort_span // _SELECTION_THREADS
     for item in cutlass.range_constexpr(items_per_thread):
         if cutlass.const_expr(
-            not (topk == 128 and sort_span == 512 and item == 0)
+            not (topk == run_size and run_size == 128 and sort_span == 512 and item == 0)
         ):
             selection_keys[query_base + tidx + Int32(item * _SELECTION_THREADS)] = Int64(
                 _INVALID_KEY
             )
     if tidx == Int32(0):
         buffer_counts[query_slot] = Int32(0)
-    if cutlass.const_expr(not (topk == 128 and sort_span == 512)):
+    if cutlass.const_expr(not (topk == run_size and run_size == 128 and sort_span == 512)):
         selection_barrier.arrive_and_wait()
 
     cutoff_key = Int64(_INVALID_KEY)
     cutoff_ordinal = Int32(_INVALID_ORDINAL)
-    buffer_capacity = sort_span - topk
+    buffer_capacity = sort_span - run_size
     drain_threshold = buffer_capacity - _TILE_CANDIDATES
     lane_in_group = lane & Int32(3)
     candidate_group = lane >> Int32(2)
@@ -961,7 +850,7 @@ def _run_query_selector_mailbox(
             accept = candidate_key > cutoff_key
 
         direct_seed = cutlass.Boolean(False)
-        if cutlass.const_expr(topk == 128 and sort_span == 512):
+        if cutlass.const_expr(topk == run_size and run_size == 128 and sort_span == 512):
             direct_seed = candidate_tile == Int32(0)
 
         if direct_seed:
@@ -1010,7 +899,7 @@ def _run_query_selector_mailbox(
                 )
             warp_base = Int32(cute.arch.shuffle_sync(warp_base, 0))
             if accept:
-                selection_keys[query_base + Int32(topk) + warp_base + lane_rank] = candidate_key
+                selection_keys[query_base + Int32(run_size) + warp_base + lane_rank] = candidate_key
 
             selection_barrier.arrive_and_wait()
             occupied = Int32(buffer_counts[query_slot])
@@ -1022,10 +911,10 @@ def _run_query_selector_mailbox(
                     tidx,
                     query_slot,
                     selection_barrier,
-                    topk,
+                    run_size,
                     sort_span,
                 )
-                cutoff_key = Int64(selection_keys[query_base + Int32(topk - 1)])
+                cutoff_key = Int64(selection_keys[query_base + Int32(run_size - 1)])
                 cutoff_ordinal = Int32(cutoff_key >> Int64(32))
 
     occupied = Int32(buffer_counts[query_slot])
@@ -1037,136 +926,9 @@ def _run_query_selector_mailbox(
             tidx,
             query_slot,
             selection_barrier,
-            topk,
+            run_size,
             sort_span,
         )
-
-
-@cute.jit
-def _run_query_selector_generalized(
-    mailbox_ordinals,
-    mailbox_consumer,
-    selection_keys,
-    buffer_counts,
-    tidx,
-    warp_idx,
-    lane,
-    query_slot: cutlass.Constexpr,
-    candidate_tiles,
-    topk: cutlass.Constexpr,
-    workspace_span: cutlass.Constexpr,
-):
-    """Maintain arbitrary Top-K with bounded-run truncated co-rank merges."""
-    selection_barrier_id = 3
-    if cutlass.const_expr(query_slot == 1):
-        selection_barrier_id = 4
-    selection_barrier = pipeline.NamedBarrier(
-        barrier_id=selection_barrier_id,
-        num_threads=_SELECTION_THREADS,
-    )
-    buffer_capacity = 2 * _TILE_CANDIDATES
-    query_base = Int32(query_slot * workspace_span)
-    workspace_items = 2 * topk + 2 * buffer_capacity
-    initialization_rounds = cute.ceil_div(workspace_items, _SELECTION_THREADS)
-    for item in cutlass.range_constexpr(initialization_rounds):
-        offset = tidx + Int32(item * _SELECTION_THREADS)
-        if offset < Int32(workspace_items):
-            selection_keys[query_base + offset] = Int64(_INVALID_KEY)
-    if tidx == Int32(0):
-        buffer_counts[query_slot] = Int32(0)
-    selection_barrier.arrive_and_wait()
-
-    cutoff_key = Int64(_INVALID_KEY)
-    cutoff_ordinal = Int32(_INVALID_ORDINAL)
-    active_buffer = Int32(0)
-    drain_threshold = buffer_capacity - _TILE_CANDIDATES
-    lane_in_group = lane & Int32(3)
-    candidate_group = lane >> Int32(2)
-    candidate_offset = (
-        warp_idx * Int32(_WARP_SIZE)
-        + candidate_group
-        + (lane_in_group << Int32(3))
-    )
-    mailbox_query_base = Int32(query_slot * _MAILBOX_STAGES * _TILE_CANDIDATES)
-    incoming_base = query_base + Int32(2 * topk)
-
-    for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
-        mailbox_full = mailbox_consumer.wait_and_advance()
-        mailbox_stage_base = (
-            mailbox_query_base + mailbox_full.index * Int32(_TILE_CANDIDATES)
-        )
-        candidate_ordinal = Int32(mailbox_ordinals[mailbox_stage_base + tidx])
-        mailbox_full.release()
-
-        candidate_index = candidate_tile * Int32(_TILE_CANDIDATES) + candidate_offset
-        candidate_is_valid = candidate_ordinal != Int32(_INVALID_ORDINAL)
-        candidate_key = Int64(_INVALID_KEY)
-        accept = cutlass.Boolean(False)
-        might_beat_cutoff = candidate_is_valid and candidate_ordinal >= cutoff_ordinal
-        if might_beat_cutoff:
-            candidate_key = _pack_key(candidate_ordinal, candidate_index)
-            accept = candidate_key > cutoff_key
-
-        accepted_mask = cutlass.Uint32(cute.arch.vote_ballot_sync(accept))
-        warp_accepted = Int32(cute.arch.popc(accepted_mask))
-        lane_rank = Int32(cute.arch.popc(accepted_mask & cute.arch.lanemask_lt()))
-        warp_base = Int32(0)
-        if lane == Int32(0) and warp_accepted > Int32(0):
-            count_ptr = buffer_counts.iterator + buffer_counts.layout(query_slot)
-            warp_base = Int32(
-                cute.arch.atomic_add(
-                    count_ptr,
-                    warp_accepted,
-                    sem="relaxed",
-                    scope="cta",
-                )
-            )
-        warp_base = Int32(cute.arch.shuffle_sync(warp_base, 0))
-        if accept:
-            selection_keys[incoming_base + warp_base + lane_rank] = candidate_key
-
-        selection_barrier.arrive_and_wait()
-        occupied = Int32(buffer_counts[query_slot])
-        # Equality is safe: one subsequent M128 tile can fill the buffer
-        # exactly.  Drain only when another full tile could overflow it.
-        if occupied > Int32(drain_threshold):
-            _drain_generalized_runs(
-                selection_keys,
-                buffer_counts,
-                query_base,
-                tidx,
-                warp_idx,
-                lane,
-                query_slot,
-                selection_barrier,
-                topk,
-                active_buffer,
-            )
-            active_buffer = active_buffer ^ Int32(1)
-            active_base = query_base + active_buffer * Int32(topk)
-            cutoff_key = Int64(selection_keys[active_base + Int32(topk - 1)])
-            cutoff_ordinal = Int32(cutoff_key >> Int64(32))
-
-    occupied = Int32(buffer_counts[query_slot])
-    if occupied > Int32(0):
-        _drain_generalized_runs(
-            selection_keys,
-            buffer_counts,
-            query_base,
-            tidx,
-            warp_idx,
-            lane,
-            query_slot,
-            selection_barrier,
-            topk,
-            active_buffer,
-        )
-        active_buffer = active_buffer ^ Int32(1)
-    if tidx == Int32(0):
-        # Selection is complete; reuse the count slot to publish which K buffer
-        # owns the final list to the output phase.
-        buffer_counts[query_slot] = active_buffer
-    selection_barrier.arrive_and_wait()
 
 
 @cute.kernel
@@ -1190,6 +952,7 @@ def _prefill_index_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx & Int32(_WARP_SIZE - 1)
     query_pair, batch, _ = cute.arch.block_idx()
+    run_size = sort_span // 4
 
     num_candidates = cute.size(mK_sdb.shape[0])
     num_heads = cute.size(mQ_hdtb.shape[0])
@@ -1382,63 +1145,35 @@ def _prefill_index_kernel(
             causal,
         )
     elif warp_idx < Int32(_SELECTOR_WARP_BASE + _SELECTION_WARPS):
-        if cutlass.const_expr(topk == 128):
-            _run_query_selector_mailbox(
-                mailbox_ordinals,
-                mailbox0_consumer,
-                selection_keys,
-                buffer_counts,
-                tidx - Int32(_SELECTOR_WARP_BASE * _WARP_SIZE),
-                warp_idx - Int32(_SELECTOR_WARP_BASE),
-                lane,
-                0,
-                candidate_tiles,
-                topk,
-                sort_span,
-            )
-        else:
-            _run_query_selector_generalized(
-                mailbox_ordinals,
-                mailbox0_consumer,
-                selection_keys,
-                buffer_counts,
-                tidx - Int32(_SELECTOR_WARP_BASE * _WARP_SIZE),
-                warp_idx - Int32(_SELECTOR_WARP_BASE),
-                lane,
-                0,
-                candidate_tiles,
-                topk,
-                sort_span,
-            )
+        _run_query_selector_mailbox(
+            mailbox_ordinals,
+            mailbox0_consumer,
+            selection_keys,
+            buffer_counts,
+            tidx - Int32(_SELECTOR_WARP_BASE * _WARP_SIZE),
+            warp_idx - Int32(_SELECTOR_WARP_BASE),
+            lane,
+            0,
+            candidate_tiles,
+            topk,
+            run_size,
+            sort_span,
+        )
     elif warp_idx < Int32(_SELECTOR_WARP_BASE + _CONSUMER_WARPS):
-        if cutlass.const_expr(topk == 128):
-            _run_query_selector_mailbox(
-                mailbox_ordinals,
-                mailbox1_consumer,
-                selection_keys,
-                buffer_counts,
-                tidx - Int32((_SELECTOR_WARP_BASE + _SELECTION_WARPS) * _WARP_SIZE),
-                warp_idx - Int32(_SELECTOR_WARP_BASE + _SELECTION_WARPS),
-                lane,
-                1,
-                candidate_tiles,
-                topk,
-                sort_span,
-            )
-        else:
-            _run_query_selector_generalized(
-                mailbox_ordinals,
-                mailbox1_consumer,
-                selection_keys,
-                buffer_counts,
-                tidx - Int32((_SELECTOR_WARP_BASE + _SELECTION_WARPS) * _WARP_SIZE),
-                warp_idx - Int32(_SELECTOR_WARP_BASE + _SELECTION_WARPS),
-                lane,
-                1,
-                candidate_tiles,
-                topk,
-                sort_span,
-            )
+        _run_query_selector_mailbox(
+            mailbox_ordinals,
+            mailbox1_consumer,
+            selection_keys,
+            buffer_counts,
+            tidx - Int32((_SELECTOR_WARP_BASE + _SELECTION_WARPS) * _WARP_SIZE),
+            warp_idx - Int32(_SELECTOR_WARP_BASE + _SELECTION_WARPS),
+            lane,
+            1,
+            candidate_tiles,
+            topk,
+            run_size,
+            sort_span,
+        )
 
     if warp_idx == Int32(_LOAD_WARP):
         _run_paired_load(
@@ -1482,9 +1217,6 @@ def _prefill_index_kernel(
         _SELECTOR_WARP_BASE + _CONSUMER_WARPS
     )
     if is_selection_warp:
-        if cutlass.const_expr(topk != 128):
-            active_buffer = Int32(buffer_counts[selection_query])
-            selection_base = selection_base + active_buffer * Int32(topk)
         for write_round in cutlass.range_constexpr(cute.ceil_div(topk, _SELECTION_THREADS)):
             slot = selection_tid + Int32(write_round * _SELECTION_THREADS)
             if query_active and slot < Int32(topk):
@@ -1571,13 +1303,33 @@ def _launch(
     )
 
 
-def _selection_sort_span(topk: int, minimum: int = _MIN_SORT_SPAN) -> int:
-    """Return each query's compile-time shared selection-workspace stride."""
-    if topk == 128:
-        return minimum
-    # Two persistent K buffers, one raw M256 buffer, and one sorted M256
-    # buffer.  K=128 retains its original 512-entry specialized workspace.
-    return 2 * topk + 4 * _TILE_CANDIDATES
+_MAX_SUPPORTED_TOPK = 512
+
+
+def _selection_run_size(topk: int) -> int:
+    """Return the padded power-of-two persistent-run size for one query's Top-K.
+
+    Floored at 128 (the incoming candidate-tile granularity) and capped at
+    512. topk <= 128 always floors to 128, so it reuses the exact same
+    specialized fast path as topk == 128 -- there is no separate "small topk"
+    case.
+    """
+    if topk > _MAX_SUPPORTED_TOPK:
+        raise NotImplementedError(
+            f"topk > {_MAX_SUPPORTED_TOPK} is not supported by the CuTeDSL indexer, got {topk}."
+        )
+    padded = 1 << (max(topk, 1) - 1).bit_length()
+    return max(_TILE_CANDIDATES, padded)
+
+
+def _selection_sort_span(topk: int) -> int:
+    """Return each query's compile-time shared selection-workspace stride.
+
+    The workspace holds four runs of the padded run size: one persistent
+    run plus three buffer runs (raw accept buffer, plus the two scratch runs
+    a drain needs to sort and merge that buffer against the persistent run).
+    """
+    return 4 * _selection_run_size(topk)
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int) -> None:
@@ -1651,9 +1403,13 @@ def index(
     exhaustion, and launch errors propagate; there is no fallback.
 
     A compiled kernel is cached per (dtype, batch, queries, heads, head_dim,
-    topk, causal); the same shape/dtype/topk/causal combination reuses the
-    already-compiled kernel instead of retracing on every call. A new
-    sequence length recompiles.
+    topk, causal, device compute capability); the same shape/dtype/topk/
+    causal/capability combination reuses the already-compiled kernel instead
+    of retracing on every call. A new sequence length recompiles, and so
+    does a device whose compute capability differs from a cached entry's
+    (e.g. a heterogeneous multi-GPU host) -- the generated PTX/SASS bakes in
+    the compiling device's architecture, so a capability mismatch across
+    devices in the same process must never share a cache entry.
     """
     _validate(q, k, weights, topk)
     if topk == 0:
@@ -1661,7 +1417,8 @@ def index(
 
     output = torch.empty((*q.shape[:2], topk), dtype=torch.int32, device=q.device)
     batch, queries, heads, head_dim = q.shape
-    compile_key = (q.dtype, batch, queries, heads, head_dim, topk, causal)
+    capability = torch.cuda.get_device_capability(q.device)
+    compile_key = (q.dtype, batch, queries, heads, head_dim, topk, causal, capability)
     score_scale = 1.0 / math.sqrt(heads * head_dim)
     q_c = from_dlpack(q, assumed_align=_ALIGNMENT)
     k_c = from_dlpack(k, assumed_align=_ALIGNMENT)

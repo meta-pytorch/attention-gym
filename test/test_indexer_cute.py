@@ -150,39 +150,68 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     "batch,queries,heads,head_dim,topk",
     [
         (2, 128, 64, 128, 32),
         (2, 128, 128, 128, 128),
         (2, 64, 66, 128, 37),
+        (2, 65, 64, 128, 16),
+        (2, 127, 64, 128, 16),
+        (2, 129, 64, 128, 16),
+        (2, 128, 64, 16, 32),
+        (2, 128, 64, 32, 32),
+        (2, 128, 64, 48, 32),
+        (2, 128, 64, 64, 32),
+        (2, 128, 64, 96, 32),
+        (2, 128, 64, 128, 0),
+        (2, 128, 64, 128, 1),
+        (2, 128, 64, 128, 127),
+        (2, 256, 64, 128, 129),
+        (2, 512, 64, 128, 512),
     ],
     ids=[
         "base",
         "topk_eq_seq",
         "odd_heads_odd_topk",
+        "candidates_65",
+        "candidates_127",
+        "candidates_129",
+        "head_dim_16",
+        "head_dim_32",
+        "head_dim_48",
+        "head_dim_64",
+        "head_dim_96",
+        "topk_0",
+        "topk_1",
+        "topk_127",
+        "topk_129",
+        "topk_512",
     ],
 )
-def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal):
+def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal, dtype):
     """Every kernel-selected score is at or above the FP64 Top-K boundary.
 
-    Inputs are generated in bf16 then promoted to FP64, so all paths see the
-    same quantized values and the FP64 baseline isolates arithmetic error only.
-    The tolerance accounts for the reduction chain: D (dot product) and H
-    (weighted head sum).
+    Inputs are generated in the tested low-precision dtype then promoted to
+    FP64, so all paths see the same quantized values and the FP64 baseline
+    isolates arithmetic error only. The tolerance accounts for the reduction
+    chain: D (dot product) and H (weighted head sum).
     """
     _skip_no_sm100()
 
     torch.manual_seed(77)
     device = torch.device("cuda")
-    dtype = torch.bfloat16
 
-    # Generate in bf16 — the quantized source of truth
     q_lp = torch.randn(batch, queries, heads, head_dim, device=device, dtype=dtype)
     k_lp = torch.randn(batch, queries, head_dim, device=device, dtype=dtype)
     w_lp = torch.randn(batch, queries, heads, device=device, dtype=dtype)
 
-    # FP64 scores from the same quantized values
+    if topk == 0:
+        cute_indices = index(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
+        assert cute_indices.shape == (batch, queries, 0)
+        return
+
     scores_64 = _reference_scores(q_lp.double(), k_lp.double(), w_lp.double())
 
     # Apply causal mask
