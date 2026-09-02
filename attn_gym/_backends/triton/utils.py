@@ -76,9 +76,9 @@ def requires_int64_offsets(*tensors: torch.Tensor | None) -> bool:
     )
 
 
-def can_use_tma(tensor: torch.Tensor) -> bool:
-    """Return whether a tensor can be accessed with a TMA tensor descriptor."""
-    if not tensor.is_cuda or torch.cuda.get_device_capability(tensor.device)[0] < 9:
+def can_use_tensor_descriptor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor satisfies Triton tensor-descriptor layout constraints."""
+    if not tensor.is_cuda:
         return False
 
     element_size = tensor.element_size()
@@ -90,6 +90,15 @@ def can_use_tma(tensor: torch.Tensor) -> bool:
         and tensor.stride(-1) == 1
         and storage_is_aligned
         and all(stride * element_size % 16 == 0 for stride in tensor.stride()[:-1])
+    )
+
+
+def can_use_tma(tensor: torch.Tensor) -> bool:
+    """Return whether a compatible descriptor can use hardware TMA."""
+    return (
+        tensor.is_cuda
+        and torch.cuda.get_device_capability(tensor.device)[0] >= 9
+        and can_use_tensor_descriptor(tensor)
     )
 
 

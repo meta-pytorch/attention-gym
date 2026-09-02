@@ -84,6 +84,16 @@ def test_ragged_recurrence_matches_independent_sequences():
     torch.testing.assert_close(final_state, torch.stack(expected_final), rtol=0, atol=0)
 
 
+def test_tensor_descriptor_compatibility_does_not_require_hardware_tma(monkeypatch):
+    """Allow Triton descriptor fallback on SM80 without advertising hardware TMA."""
+    from attn_gym._backends.triton.utils import can_use_tensor_descriptor, can_use_tma
+
+    tensor = torch.empty(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (8, 0))
+    assert can_use_tensor_descriptor(tensor)
+    assert not can_use_tma(tensor)
+
+
 def test_recurrence_normalizes_misaligned_compact_gate():
     from attn_gym._backends.triton.utils import can_use_tma
 
