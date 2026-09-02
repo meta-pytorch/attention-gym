@@ -154,7 +154,7 @@ def _merge_two_sorted_128_at_rank(
     lower = Int32(0)
     upper = diagonal
 
-    # Find how many A elements occur in the first ``diagonal`` outputs.
+    # Find how many A elements occur in the first diagonal outputs.
     # A wins equal-key ties.  Eight fixed iterations cover the full [0, 128]
     # partition interval and avoid a divergent data-dependent loop backedge.
     for _iteration in cutlass.range_constexpr(8):
@@ -197,7 +197,7 @@ def _merge_sorted_runs_at_rank(
     """Return one rank from two descending shared-memory runs.
 
     The generalized selector uses incoming runs of at most 256 entries, so nine
-    fixed bisection steps suffice independently of ``a_length``.  This keeps
+    fixed bisection steps suffice independently of a_length.  This keeps
     both compile time and per-thread register use bounded as Top-K grows.
     """
     a_len = Int32(a_length)
@@ -401,7 +401,7 @@ def _drain_generalized_runs(
 
     Two M128 runs are sorted independently, merged into one M256 run, and then
     co-rank-merged with the active persistent list.  The inactive K buffer is
-    fully overwritten before the caller toggles ``active_buffer``.
+    fully overwritten before the caller toggles active_buffer.
     """
     long_a_base = query_base
     long_b_base = query_base + Int32(topk)
@@ -468,7 +468,7 @@ def _gemm_query_tile(
 ):
     """Accumulate one 128-candidate by 64-head tensor-core tile."""
     for d_block in cutlass.range_constexpr(cute.size(fragment_k, mode=[2])):
-        # ``TiledMma.set`` mutates its Python trait wrapper.  Clone it so an
+        # TiledMma.set mutates its Python trait wrapper.  Clone it so an
         # SSA value emitted in the MMA-warp branch cannot leak into another
         # warp-role branch during CuTeDSL IR construction.
         issue_mma = tiled_mma.with_()
@@ -1640,9 +1640,9 @@ def index(
 ) -> torch.Tensor:
     """Return the shared-key Top-K for every full-sequence query.
 
-    Inputs are contiguous BF16/FP16 tensors with layouts ``q[B,T,H,D]``,
-    ``k[B,T,D]``, and ``weights[B,T,H]``.  The INT32 result has shape
-    ``[B,T,topk]``.  Invalid contracts, compilation errors, shared-memory
+    Inputs are contiguous BF16/FP16 tensors with layouts q[B,T,H,D],
+    k[B,T,D], and weights[B,T,H].  The INT32 result has shape
+    [B,T,topk].  Invalid contracts, compilation errors, shared-memory
     exhaustion, and launch errors propagate; there is no fallback.
     """
     if not isinstance(causal, bool):

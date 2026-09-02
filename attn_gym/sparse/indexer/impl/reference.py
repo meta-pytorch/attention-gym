@@ -21,14 +21,14 @@ def index(
         
         
     Args:
-        q: ``[B, T, H, D]``
-        k: ``[B, S, D]``
-        weights: ``[B, T, H]``
+        q: [B, T, H, D]
+        k: [B, S, D]
+        weights: [B, T, H]
         topk: number of candidates to select per query
         causal: mask out candidates at positions beyond the query position
 
     Returns:
-        ``[B, T, topk]`` INT32 tensor of selected candidate indices.
+        [B, T, topk] INT32 tensor of selected candidate indices.
     """
     batch, queries, heads, head_dim = q.shape
     candidates = k.shape[1]
