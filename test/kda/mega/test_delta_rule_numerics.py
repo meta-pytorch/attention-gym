@@ -113,10 +113,6 @@ def test_kda_mega_model_range_backward(seed: int) -> None:
     _assert_result(actual, low_precision, high_precision)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="KDA Mega backward still rounds model-range operands and dA through BF16",
-)
 def test_kda_mega_raw_backward_precision() -> None:
     """Raw Mega backward must stay within the BF16 reference error budget."""
     for seed in (888, 889, 890):

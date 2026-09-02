@@ -58,6 +58,7 @@ class Cfg:
     SMEM_S_STAGES: int = 1
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2
+    SMEM_DA_DIAG_STAGES: int = 4
     SMEM_STATE_SCALE_DIAG_STAGES: int = 2
     SMEM_DQ_STAGES: int = 1
     SMEM_DK_STAGES: int = 1

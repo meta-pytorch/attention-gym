@@ -1247,6 +1247,7 @@ def compute0_warp_group(
             bars.mb_q_ready[raw_bar_stage].wait((cum_chunk // cfg.smem_raw_bar_stages) % 2)
             bars.mb_k_ready[raw_bar_stage].wait((cum_chunk // cfg.smem_raw_bar_stages) % 2)
             k_inv_pack = cute.make_rmem_tensor((2 * 4,), cutlass.Int32)
+            k_restore_pack = cute.make_rmem_tensor((2 * 4,), cutlass.Int32)
             raw_q_regs = cute.make_rmem_tensor((2 * 8,), cutlass.Float32)
             raw_k_regs = cute.make_rmem_tensor((2 * 8,), cutlass.Float32)
 
@@ -1333,13 +1334,30 @@ def compute0_warp_group(
                     raw_reg_idx0 = reg_base + dim0
                     raw_reg_idx1 = reg_base + dim1
                     k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                    k_pair = fp32_to_fp16(k_value0, k_value1, dtype=cfg.io_dtype)
-                    exp_g_pair = fp32_to_fp16(exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1], dtype=cfg.io_dtype)
-                    k_decay_pack[pair_idx] = mul_f16x2(k_pair, exp_g_pair, cfg.io_dtype)
+                    k_decay0, k_decay1 = fmul2(
+                        k_value0,
+                        k_value1,
+                        exp_g_regs[raw_reg_idx0],
+                        exp_g_regs[raw_reg_idx1],
+                    )
+                    k_decay_pack[pair_idx] = fp32_to_fp16(
+                        k_decay0, k_decay1, dtype=cfg.io_dtype
+                    )
                     exp_neg_g0 = cute.math.rcp(exp_g_regs[raw_reg_idx0], approx=True, ftz=True)
                     exp_neg_g1 = cute.math.rcp(exp_g_regs[raw_reg_idx1], approx=True, ftz=True)
-                    exp_neg_pair = fp32_to_fp16(exp_neg_g0, exp_neg_g1, dtype=cfg.io_dtype)
-                    k_inv_pack[dim_half * 4 + pair_idx] = mul_f16x2(k_pair, exp_neg_pair, cfg.io_dtype)
+                    k_inv0, k_inv1 = fmul2(k_value0, k_value1, exp_neg_g0, exp_neg_g1)
+                    k_inv_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(
+                        k_inv0, k_inv1, dtype=cfg.io_dtype
+                    )
+                    k_restore0, k_restore1 = fmul2(
+                        k_inv0,
+                        k_inv1,
+                        exp_g_last_regs[raw_reg_idx0],
+                        exp_g_last_regs[raw_reg_idx1],
+                    )
+                    k_restore_pack[dim_half * 4 + pair_idx] = fp32_to_fp16(
+                        k_restore0, k_restore1, dtype=cfg.io_dtype
+                    )
 
                 k_inv_vec = cutlass.Vector.from_elements(
                     (
@@ -1393,9 +1411,15 @@ def compute0_warp_group(
                     raw_reg_idx0 = reg_base + dim0
                     raw_reg_idx1 = reg_base + dim1
                     q_value0, q_value1 = fmul2(raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1], q_inv_norm, q_inv_norm)
-                    q_pair = fp32_to_fp16(q_value0, q_value1, dtype=cfg.io_dtype)
-                    exp_g_pair = fp32_to_fp16(exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1], dtype=cfg.io_dtype)
-                    q_decay_pack[pair_idx] = mul_f16x2(q_pair, exp_g_pair, cfg.io_dtype)
+                    q_decay0, q_decay1 = fmul2(
+                        q_value0,
+                        q_value1,
+                        exp_g_regs[raw_reg_idx0],
+                        exp_g_regs[raw_reg_idx1],
+                    )
+                    q_decay_pack[pair_idx] = fp32_to_fp16(
+                        q_decay0, q_decay1, dtype=cfg.io_dtype
+                    )
 
                 q_decay_vec = cutlass.Vector.from_elements(
                     (
@@ -1418,13 +1442,6 @@ def compute0_warp_group(
             bars.mb_k_restore_done[decay_stage].wait(((cum_chunk // cfg.smem_decay_stages + 1) % 2))
             for dim_half in cutlass.range_constexpr(2):
                 dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
-                reg_base = dim_half * 8
-                k_restore_pack = cute.make_rmem_tensor((4,), cutlass.Int32)
-                for pair_idx in cutlass.range_constexpr(4):
-                    dim0 = pair_idx * 2
-                    dim1 = dim0 + 1
-                    exp_g_last_pair = fp32_to_fp16(exp_g_last_regs[reg_base + dim0], exp_g_last_regs[reg_base + dim1], dtype=cfg.io_dtype)
-                    k_restore_pack[pair_idx] = mul_f16x2(k_inv_pack[dim_half * 4 + pair_idx], exp_g_last_pair, cfg.io_dtype)
                 storage_row = decay_row ^ (cfg.b_t // 2)
                 k_restore_idx = swizzle_box_offset_128b(
                     storage_row,
@@ -1433,10 +1450,10 @@ def compute0_warp_group(
                 )
                 k_restore_vec = cutlass.Vector.from_elements(
                     (
-                        k_restore_pack[0],
-                        k_restore_pack[1],
-                        k_restore_pack[2],
-                        k_restore_pack[3],
+                        k_restore_pack[dim_half * 4],
+                        k_restore_pack[dim_half * 4 + 1],
+                        k_restore_pack[dim_half * 4 + 2],
+                        k_restore_pack[dim_half * 4 + 3],
                     ),
                     cutlass.Int32,
                 ).bitcast(cfg.io_dtype)
