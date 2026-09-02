@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable
 from functools import partial
 from typing import NamedTuple
@@ -74,10 +75,25 @@ GDN = Op(
     value_heads=2,
     vector_gate=False,
 )
+MEGA = {"backend": "mega"}
+requires_mega = pytest.mark.skipif(
+    importlib.util.find_spec("cutlass.experimental") is None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Mega requires CuTeDSL>=4.7 on SM100/SM103",
+)
 op_param = pytest.mark.parametrize(
     "op",
     [
         pytest.param(KDA, id="kda"),
+        pytest.param(
+            KDA._replace(
+                chunk=partial(chunk_kda, kernel_options=MEGA),
+                prepare=partial(chunk_kda_prepare, kernel_options=MEGA),
+            ),
+            id="kda-mega",
+            marks=requires_mega,
+        ),
         pytest.param(GDN, id="gdn"),
         pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
     ],
@@ -148,7 +164,7 @@ def test_prepare_run_matches_chunk_op_unpacked_with_strided_qkv(op, tokens):
     assert q.stride(-1) == 2
 
     # The fused ops accept either layout and the stages normalize strided inputs themselves; the
-    # reference gets compact copies so the same call also serves ops that reject strides.
+    # public Mega op rejects strides, so every reference gets compact copies.
     expected, _ = op.chunk(q.contiguous(), k.contiguous(), v.contiguous(), gate, beta)
     output, final_state = op.prepare(q, k, v, gate, beta).run()
 
@@ -185,6 +201,47 @@ def test_state_summary_rejects_ranges_outside_the_stream():
         prepared.state_summary(64, 200)
     with pytest.raises(ValueError, match="summary range"):
         prepared.state_summary(64, 64)
+
+
+@requires_kda_target
+@requires_mega
+@pytest.mark.parametrize("bounds", [(0, 72), (72, 200)], ids=["partial-tail", "aligned-offset"])
+def test_mega_state_summary_replays_under_cuda_graph(bounds):
+    """The lazily factored fragment builds its boundaries on device, so capture never syncs."""
+    q, k, v, gate, beta = KDA.make_inputs(200, seed=7)
+    cu_seqlens = torch.tensor([0, 72, 200], dtype=torch.int32, device="cuda")
+    prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens, kernel_options=MEGA)
+    expected = prepared.state_summary(*bounds)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        prepared.state_summary(*bounds)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = prepared.state_summary(*bounds)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+    # Replay must recompute from the captured inputs rather than replay stale results.
+    prepared.saved.v.mul_(0.5)
+    fresh = prepared.state_summary(*bounds)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(captured, expected)
+    torch.testing.assert_close(captured, fresh, atol=0, rtol=0)
+
+
+@requires_kda_target
+@requires_mega
+def test_mega_prepare_rejects_split_schedules():
+    q, k, v, gate, beta = KDA.make_inputs(128, seed=8)
+    for option in ("split_backward", "split_forward"):
+        with pytest.raises(ValueError, match="split schedules"):
+            chunk_kda_prepare(
+                q, k, v, gate, beta, kernel_options={"backend": "mega", option: True}
+            )
 
 
 class RankResult(NamedTuple):
