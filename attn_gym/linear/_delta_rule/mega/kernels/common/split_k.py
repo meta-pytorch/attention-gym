@@ -115,6 +115,30 @@ ORDER_THREADS = 1024
 ORDER_ELEMS = 4
 ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMS  # sort capacity (32 KB SMEM); past this the device-side branch copies through unsorted
 
+# NOTE [Forgetting Horizon]
+# The state at any token is a decayed sum of everything before it, so tokens far enough back no
+# longer matter. The scan turns each chunk into one number: its log2 decay, taken from the slowest
+# channel. At a candidate boundary we walk that map backwards summing decays; once the sum from
+# chunk A to the boundary drops below the threshold (e^-10, in log2 units), everything before A has
+# been scaled by less than 2^threshold and is dropped. Candidates come from load balance (multiples of
+# the ideal span); the gates only accept or reject them, and both sides must saturate within
+# WARMUP_CAP_CHUNKS so the same table serves the reverse (gradient) recurrence.
+#
+# Example: 10 chunks, candidate boundary at 5. Walk back accumulating decay: {4} is not below the
+# threshold, {4,3} is not, {4,3,2} is. So chunks 2..4 are the warmup and the state entering chunk 2
+# (everything from chunks 0..1) is dropped:
+#     item 0: computes [0, 5)   writes [0, 5)    seeds the real initial state
+#     item 1: computes [2, 10)  writes [5, 10)   chunks 2..4 start from zero, outputs discarded
+#   The state item 1 reaches at chunk 5 is not the true one, but its error is at most
+#   2^threshold * |H_before|; from there the arithmetic is the serial kernel's. Items never exchange
+#   state; a rejected boundary just extends the open item, so a gate that never forgets yields the
+#   single uncut item, i.e. the serial kernel.
+#
+# This is a margin of bits past the output dtype's relative half-ulp. A rounding can flip only
+# where |H_window| < 2^-margin * |H_before| elementwise:
+#     e^-10 = 2^-14.4
+#     bf16 half-ulp 2^-8  -> 6.4-bit margin
+#     fp16 half-ulp 2^-11 -> 3.4-bit margin
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
 

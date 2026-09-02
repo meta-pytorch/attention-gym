@@ -40,9 +40,17 @@ def run_forward_on_current_device(
     *,
     scale: float | None,
     output_final_state: bool,
+    split: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Validate and launch one unsplit packed forward invocation."""
+    """Validate and launch one packed forward invocation.
+
+    ``split`` enables the forgetting-horizon work table: long sequences are cut where the gate has
+    saturated and each cut item rebuilds its entry state from zero over a warmup window, so it is
+    approximate and only offered for calls without recurrent state.
+    """
     paged_state = state if isinstance(state, PagedState) else None
+    if split and (state is not None or output_final_state):
+        raise ValueError("the split forward schedule requires a no-state call")
     initial_state = paged_state.cache if paged_state is not None else state
     scale = resolve_scale(scale, q.shape[-1])
     validate_available(q)
@@ -104,7 +112,7 @@ def run_forward_on_current_device(
         cu_seqlens,
         tile_tokens=kernel.CFG.B_T,
         counter_count=2,
-        split=False,
+        split=split,
         stream=stream,
     )
     tensormap_workspace = torch.empty(
@@ -145,6 +153,7 @@ def run_forward(
     *,
     scale: float | None,
     output_final_state: bool,
+    split: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -160,10 +169,11 @@ def run_forward(
             state,
             scale=scale,
             output_final_state=output_final_state,
+            split=split,
         )
 
 
-def chunk_delta_rule_fwd_mega_unsplit(
+def chunk_delta_rule_fwd_mega(
     q: torch.Tensor,
     k: torch.Tensor,
     value: torch.Tensor,
@@ -171,8 +181,10 @@ def chunk_delta_rule_fwd_mega_unsplit(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float | None = None,
+    *,
+    split: bool = False,
 ) -> torch.Tensor:
-    """Run an unsplit packed forward without recurrent state."""
+    """Run a packed forward without recurrent state, exact or forgetting-horizon split."""
     output, _ = run_forward(
         q,
         k,
@@ -183,6 +195,7 @@ def chunk_delta_rule_fwd_mega_unsplit(
         None,
         scale=scale,
         output_final_state=False,
+        split=split,
     )
     return output
 
@@ -239,7 +252,7 @@ def chunk_delta_rule_fwd_mega_unsplit_with_state(
 
 
 __all__ = [
-    "chunk_delta_rule_fwd_mega_unsplit",
+    "chunk_delta_rule_fwd_mega",
     "chunk_delta_rule_fwd_mega_unsplit_with_initial_state",
     "chunk_delta_rule_fwd_mega_unsplit_with_state",
 ]

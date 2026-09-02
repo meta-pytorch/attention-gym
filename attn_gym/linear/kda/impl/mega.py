@@ -52,14 +52,16 @@ class ChunkKdaMegaDense(torch.autograd.Function):
     """Attach autograd to the dense no-state Mega path."""
 
     @staticmethod
-    def forward(ctx, q, k, value, gate, beta, cu_seqlens, scale, split_backward):
+    def forward(ctx, q, k, value, gate, beta, cu_seqlens, scale, split_backward, split_forward):
         ctx.use_local_backward = split_backward and use_local_backward(
             q, _DENSE_LOCAL_BACKWARD_MIN_TOKENS
         )
         ctx.split_backward = split_backward
         ctx.scale = scale
         if ctx.use_local_backward:
-            output = chunk_mega_packed_fwd_op(q, k, value, gate, beta, cu_seqlens, scale)
+            output = chunk_mega_packed_fwd_op(
+                q, k, value, gate, beta, cu_seqlens, split_forward, scale
+            )
             ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
         else:
             output, cumulative_gate = chunk_mega_dense_training_fwd_op(
@@ -69,6 +71,7 @@ class ChunkKdaMegaDense(torch.autograd.Function):
                 gate,
                 beta,
                 cu_seqlens,
+                split_forward,
                 scale,
             )
             ctx.save_for_backward(q, k, value, cumulative_gate, beta)
@@ -95,6 +98,7 @@ class ChunkKdaMegaDense(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         q, k, value, cumulative_gate, beta = ctx.saved_tensors
@@ -114,7 +118,7 @@ class ChunkKdaMegaDense(torch.autograd.Function):
             False,
         )
         d_gate = plain_gate_bwd_dense_cute_op(d_cumulative.contiguous())
-        return dq, dk, dv, d_gate, d_beta, None, None, None
+        return dq, dk, dv, d_gate, d_beta, None, None, None, None
 
 
 class ChunkKdaMegaPacked(torch.autograd.Function):
@@ -133,6 +137,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
         chunk_offsets,
         scale,
         split_backward,
+        split_forward,
         output_final_state,
     ):
         ctx.has_initial_state = initial_state is not None
@@ -149,6 +154,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                 gate,
                 beta,
                 cu_seqlens,
+                split_forward,
                 scale,
             )
             ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
@@ -194,6 +200,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                 beta,
                 cu_seqlens,
                 chunk_offsets,
+                split_forward,
                 scale,
             )
             ctx.save_for_backward(q, k, value, cumulative_gate, beta, cu_seqlens, chunk_offsets)
@@ -220,6 +227,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                     ctx.split_backward,
                     ctx.scale,
                 ),
+                None,
                 None,
                 None,
                 None,
@@ -279,6 +287,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -332,6 +341,7 @@ def chunk_forward(
     fastmath: bool = False,
     autotune: bool = True,
     split_backward: bool = False,
+    split_forward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the optional Mega implementation behind the shared ``chunk_kda`` contract."""
     scale = resolve_scale(scale, q.shape[-1])
@@ -339,6 +349,8 @@ def chunk_forward(
         raise ValueError("fastmath is not supported by the Mega backend")
     if split_backward and (initial_state is not None or output_final_state):
         raise ValueError("split_backward currently requires a no-state call")
+    if split_forward and (initial_state is not None or output_final_state):
+        raise ValueError("split_forward currently requires a no-state call")
     del autotune
     if not torch.compiler.is_compiling():
         validate_mega_available(q)
@@ -356,6 +368,7 @@ def chunk_forward(
                 dense_cu_seqlens,
                 scale,
                 split_backward,
+                split_forward,
             ),
             None,
         )
@@ -384,6 +397,7 @@ def chunk_forward(
         metadata.chunk_offsets,
         scale,
         split_backward,
+        split_forward,
         output_final_state,
     )
     if output_final_state:

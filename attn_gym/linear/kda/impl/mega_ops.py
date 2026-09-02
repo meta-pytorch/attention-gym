@@ -14,17 +14,17 @@ from attn_gym.utils import fork_join_streams
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "float scale) -> Tensor",
+    "bool split, float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_mega_dense_training_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "float scale) -> (Tensor, Tensor)",
+    "bool split, float scale) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_training_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, float scale) -> (Tensor, Tensor)",
+    "Tensor cu_seqlens, Tensor chunk_offsets, bool split, float scale) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_fwd_with_initial_state",
@@ -80,9 +80,9 @@ def _stream(cache: dict[int, torch.cuda.Stream], device: torch.device, priority:
     return stream
 
 
-def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, scale, *, backend=None):
+def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, *, backend=None):
     backend = _backend(q) if backend is None else backend
-    return backend.chunk_delta_rule_fwd_mega_unsplit(
+    return backend.chunk_delta_rule_fwd_mega(
         q,
         k,
         value,
@@ -90,10 +90,11 @@ def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, scale, *, backend=None
         beta,
         cu_seqlens,
         scale,
+        split=split,
     )
 
 
-def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, scale):
+def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
     from attn_gym.linear.kda.fwd.triton.plain_gate import _plain_gate_scan_cuda
 
     backend = _backend(q)
@@ -108,6 +109,7 @@ def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, scale):
             gate,
             beta,
             cu_seqlens,
+            split,
             scale,
             backend=backend,
         ),
@@ -116,7 +118,7 @@ def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, scale):
     return output, cumulative_gate
 
 
-def _packed_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, chunk_offsets, scale):
+def _packed_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, chunk_offsets, split, scale):
     from attn_gym.linear.kda.fwd.triton.plain_gate import _plain_gate_scan_cuda
 
     backend = _backend(q)
@@ -131,6 +133,7 @@ def _packed_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, chunk_offsets
             gate,
             beta,
             cu_seqlens,
+            split,
             scale,
             backend=backend,
         ),
@@ -247,20 +250,20 @@ torch.library.impl("attn_gym::kda_plain_gate_bwd_dense_cute", "CUDA", _plain_gat
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_fwd")
-def _packed_fwd_fake(q, k, value, gate, beta, cu_seqlens, scale):
-    del q, k, gate, beta, cu_seqlens, scale
+def _packed_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale):
+    del q, k, gate, beta, cu_seqlens, split, scale
     return torch.empty_like(value)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_dense_training_fwd")
-def _dense_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, scale):
-    del q, k, beta, cu_seqlens, scale
+def _dense_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale):
+    del q, k, beta, cu_seqlens, split, scale
     return torch.empty_like(value), gate.new_empty(gate.shape)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_training_fwd")
-def _packed_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, chunk_offsets, scale):
-    del q, k, beta, cu_seqlens, chunk_offsets, scale
+def _packed_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, chunk_offsets, split, scale):
+    del q, k, beta, cu_seqlens, chunk_offsets, split, scale
     return torch.empty_like(value), gate.new_empty(gate.shape)
 
 
