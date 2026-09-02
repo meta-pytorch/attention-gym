@@ -10,7 +10,7 @@ It provides ready-to-use **mask functions** and **score mods** that you can comp
 
 - **[Getting Started](getting-started.md)** — install Attention Gym and build your first mask
 - **[Core Concepts](concepts.md)** — understand how `mask_mod`, `score_mod`, and `BlockMask` work together
-- **Guides** — learn about [ragged CUDA Graphs](guides/ragged-cuda-graphs.md) and [deterministic FlexAttention](determinism.md)
+- **[Guides](guides/index.md)** — learn about ragged CUDA Graphs and deterministic FlexAttention
 - **Reference** — browse [masks](masks.md), [score mods](mods.md), [linear attention](linear.md), and [utilities](utilities.md)
 - **[Examples](examples.md)** — explore benchmarks, MLA, paged attention, distributed attention, and advanced patterns
 
