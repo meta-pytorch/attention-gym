@@ -28,7 +28,7 @@ from attn_gym._backends.cute.target import CompileTarget, detect_compile_target,
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.constants import LN2
+from attn_gym.linear.kda.constants import LN2, is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
@@ -2012,7 +2012,7 @@ def _compile_chunk_kda_bwd_intra(
         grid_chunks=grid_chunks,
         ragged=ragged,
         use_int64_offsets=use_int64_offsets,
-        use_packed_f32x2=capability >= (10, 0),
+        use_packed_f32x2=is_sm100_kda_capability(capability),
         use_stmatrix=capability >= (9, 0),
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()

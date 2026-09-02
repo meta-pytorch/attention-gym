@@ -52,6 +52,7 @@ from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_sequence_extent
 from attn_gym.utils import ceildiv
 
@@ -2223,6 +2224,9 @@ def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
 @jit_cache
 def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout):
     """Compile one dense BlackwellDeltaHBwd variant."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
     K = V = 128
     chunk_size = 64
     kern = BlackwellDeltaHBwd(
@@ -2288,6 +2292,9 @@ def _compile_delta_h_bwd_packed(
     dynamic_state_layout: bool,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
     key_dim = value_dim = 128
     chunk_size = 64
     kernel = BlackwellDeltaHBwd(

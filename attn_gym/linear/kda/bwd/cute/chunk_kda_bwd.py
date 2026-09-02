@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
     blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
 )
@@ -22,7 +21,7 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from attn_gym.linear.kda.utils import profiler_range
+from attn_gym.linear.kda.utils import is_sm100_kda_target, profiler_range
 
 
 @dataclass
@@ -117,7 +116,7 @@ def _finish_chunk_kda_bwd(
 ]:
     """Finish local gradients while releasing prepared tensors at their last use."""
     assert prepared.qg is not None and prepared.kg is not None and prepared.w is not None
-    use_triton_backend = get_device_properties(q.device).major < 10
+    use_triton_backend = not is_sm100_kda_target(q.device)
     range_backend = "triton" if use_triton_backend else "cute"
     with profiler_range(f"kda/{range_backend}/backward_delta_h"):
         if use_triton_backend:

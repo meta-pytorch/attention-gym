@@ -44,6 +44,7 @@ from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.chunk_scheduler import (
     load_ragged_chunk_work as _tl_load_ragged_chunk_work,
 )
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
 
@@ -953,6 +954,9 @@ def _compile_intra_engine_fwd(
     varlen: bool,
     use_int64_offsets: bool,
 ):
+    target = get_compile_target()
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA intra engine requires an SM100 or SM103 target; got {target}")
     op = KdaIntraFwdEngine(
         head_dim=head_dim,
         num_heads=H,

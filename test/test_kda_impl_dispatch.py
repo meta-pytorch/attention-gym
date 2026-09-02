@@ -12,10 +12,29 @@ import torch.nn.functional as F
 
 from attn_gym.linear import Impl, KernelOptions, chunk_kda, recurrent_kda
 from attn_gym.linear._delta_rule.validation import validate_paged_state
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
+from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
 
 FUSED_CHUNK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((8, 0), False), ((9, 0), False), ((10, 0), True), ((10, 3), True), ((12, 0), False)],
+)
+def test_sm100_kda_route_is_exact(monkeypatch, capability, expected):
+    """Keep SM120 and earlier architectures off SM100-specific kernels."""
+    assert is_sm100_kda_capability(capability) is expected
+
+    class Properties:
+        major, minor = capability
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: Properties())
+    is_sm100_kda_target.cache_clear()
+    assert is_sm100_kda_target(torch.device("cuda")) is expected
+    is_sm100_kda_target.cache_clear()
 
 
 def _inputs(

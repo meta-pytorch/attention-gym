@@ -37,7 +37,7 @@ from attn_gym.linear.kda.ops import (
 from attn_gym.linear.kda.ops import (
     chunk_fwd_with_state_op as _chunk_kda_fwd_with_state_op,
 )
-from attn_gym.linear.kda.utils import profiler_range
+from attn_gym.linear.kda.utils import is_sm100_kda_target, profiler_range
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
@@ -501,7 +501,7 @@ def _prepare_chunk_kda_backward(
         d_output = normalize_tma_rows(d_output)
     if d_final_state is not None:
         d_final_state = _normalize_state_cotangent(d_final_state.float())
-    if get_device_properties(q.device).major < 10:
+    if not is_sm100_kda_target(q.device):
         d_output = d_output.contiguous()
         if d_final_state is not None:
             d_final_state = d_final_state.contiguous()
