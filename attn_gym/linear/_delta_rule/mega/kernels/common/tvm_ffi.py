@@ -56,6 +56,17 @@ def make_cu_seqlens_signature(entries: Any, *, assumed_align: int = 8):
     )
 
 
+def make_paged_route_signatures(sequences: Any, *, has_initial_state: bool):
+    """Create the shared route and optional seed-mask signatures."""
+    indices = make_compact_signature_tensor(cutlass.Int32, (sequences,), assumed_align=4)
+    mask = (
+        make_compact_signature_tensor(cutlass.Uint8, (sequences,), assumed_align=1)
+        if has_initial_state
+        else None
+    )
+    return indices, mask
+
+
 def make_work_items_signature(rows: Any):
     """Create a compact work-item table signature."""
     return make_compact_signature_tensor(

@@ -7,6 +7,8 @@ from numbers import Real
 
 import torch
 
+from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
+
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -88,26 +90,6 @@ def resolve_scale(scale: float | None, key_dim: int) -> float:
     ):
         raise ValueError(f"scale must be finite and positive, got {scale}")
     return scale
-
-
-def validate_has_initial_state(
-    has_initial_state: torch.Tensor | None,
-    num_sequences: int,
-    device: torch.device,
-) -> None:
-    """Validate the optional per-sequence fresh-slot mask shared by paged delta-rule ops."""
-    if has_initial_state is None:
-        return
-    if (
-        tuple(has_initial_state.shape) != (num_sequences,)
-        or has_initial_state.dtype != torch.bool
-        or not has_initial_state.is_contiguous()
-        or has_initial_state.device != device
-    ):
-        raise ValueError(
-            "has_initial_state must be a contiguous bool tensor with one entry "
-            "per sequence on the inputs' device"
-        )
 
 
 def validate_decode_inputs(
@@ -192,40 +174,22 @@ def validate_paged_state(
     cu_seqlens: torch.Tensor | None,
     state_indices: torch.Tensor,
     has_initial_state: torch.Tensor | None = None,
-) -> None:
-    """Validate the shared mutable ``[slots, H, V, K]`` state contract.
+) -> PagedState:
+    """Validate and package the shared mutable ``[slots, H, V, K]`` state contract.
 
     The pool carries one state per value head, so grouped-head callers size ``H`` from ``v``.
     """
-    expected_shape = (v.shape[2], v.shape[-1], q.shape[3])
-    if state_cache.ndim != 4 or state_cache.shape[1:] != expected_shape:
-        raise ValueError(
-            "the paged state pool must have shape "
-            f"[num_slots, {v.shape[2]}, {v.shape[-1]}, {q.shape[3]}], "
-            f"got {tuple(state_cache.shape)}"
-        )
-    if state_cache.device != q.device:
-        raise ValueError("the paged state pool must be on q.device")
-    if state_cache.dtype != torch.float32:
-        raise TypeError("the paged state pool must use float32")
-    expected_inner_strides = (v.shape[-1] * q.shape[3], q.shape[3], 1)
-    if state_cache.stride()[1:] != expected_inner_strides:
-        raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
-    if state_cache.stride(0) < v.shape[2] * q.shape[3] * v.shape[-1]:
-        raise ValueError("paged state pool slots must not overlap")
-
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    if (
-        tuple(state_indices.shape) != (num_sequences,)
-        or state_indices.dtype != torch.int32
-        or not state_indices.is_contiguous()
-        or state_indices.device != q.device
-    ):
-        raise ValueError(
-            f"state_indices must be a contiguous int32 tensor of shape ({num_sequences},) "
-            f"on q.device, got {tuple(state_indices.shape)} of {state_indices.dtype}"
-        )
-    validate_has_initial_state(has_initial_state, num_sequences, q.device)
+    return PagedState.validate(
+        state_cache,
+        state_indices,
+        has_initial_state,
+        num_sequences=num_sequences,
+        heads=v.shape[2],
+        value_dim=v.shape[-1],
+        key_dim=q.shape[3],
+        device=q.device,
+    )
 
 
 __all__ = [

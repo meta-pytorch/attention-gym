@@ -34,6 +34,7 @@ from attn_gym._backends.triton.utils import (
     configure_triton_allocator,
     ptr_offset,
 )
+from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 
 configure_triton_allocator()
 
@@ -109,28 +110,25 @@ def _recurrent_delta_rule_fwd_kernel(
     m_v = o_v < V
     m_kv = m_k[:, None] & m_v[None, :]
 
-    # Paged mode addresses the state pool by slot instead of by sequence position. Empty
-    # sequences still take the load/store path below so that a freshly assigned slot is
-    # initialized before a later decode reads it.
-    if USE_STATE_INDICES:
-        i_state = tl.load(state_indices + i_n).to(tl.int64)
-        if i_state <= 0:
-            for t in range(bos, eos):
-                row = t * H + i_h
-                tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
-            return
-        state_row = i_state
-    else:
-        state_row = i_n
+    # Empty sequences still take the load/store path so a fresh slot is initialized.
+    state_row, state_active, load_initial = resolve_paged_state(
+        i_n,
+        state_indices,
+        has_initial_state,
+        USE_STATE_INDICES,
+        USE_HAS_INITIAL_STATE,
+    )
+    if USE_STATE_INDICES and not state_active:
+        for t in range(bos, eos):
+            row = t * H + i_h
+            tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
+        return
     p_state = ptr_offset(
         (state_row, i_h, o_v[None, :], o_k[:, None]),
         (state_batch_stride, V * K, K, 1),
     )
     if USE_INITIAL_STATE:
-        m_state = m_kv
-        if USE_HAS_INITIAL_STATE:
-            m_state &= tl.load(has_initial_state + i_n)
-        b_state = tl.load(h0 + p_state, mask=m_state, other=0.0).to(tl.float32)
+        b_state = tl.load(h0 + p_state, mask=m_kv & load_initial, other=0.0).to(tl.float32)
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 

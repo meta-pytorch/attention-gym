@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
+from attn_gym.linear._delta_rule.paged_state import PagedState
 
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd",
@@ -29,6 +30,11 @@ torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor initial_state, "
     "Tensor cu_seqlens, Tensor chunk_offsets, float scale) -> (Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::gdn_chunk_mega_packed_fwd_paged",
+    "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
+    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_bwd",
@@ -200,6 +206,49 @@ def _packed_fwd_with_state_cuda(
     return _copy_to_layout(output, value_template), _copy_to_layout(final_state, state_template)
 
 
+def _packed_fwd_paged_cuda(
+    q: Tensor,
+    k: Tensor,
+    value: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    state_cache: Tensor,
+    state_indices: Tensor,
+    has_initial_state: Tensor | None,
+    cu_seqlens: Tensor,
+    scale: float,
+) -> Tensor:
+    """Advance selected pool slots in place; the pool itself is never copied."""
+    value_template = value
+    q, k, value = (_normalize_tma_tensor(tensor) for tensor in (q, k, value))
+    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
+    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    backend = _forward_backend()
+    paged_state = PagedState.validate(
+        state_cache,
+        state_indices,
+        has_initial_state,
+        num_sequences=cu_seqlens.shape[0] - 1,
+        heads=value.shape[2],
+        value_dim=value.shape[3],
+        key_dim=q.shape[3],
+        device=q.device,
+        read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
+    ).require_alignment(16)
+    output, _ = backend.run_forward(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        paged_state,
+        scale=scale,
+        output_final_state=False,
+    )
+    return _copy_to_layout(output, value_template)
+
+
 def _packed_bwd_cuda(
     q: Tensor,
     k: Tensor,
@@ -283,6 +332,7 @@ torch.library.impl(
     "CUDA",
     _packed_fwd_with_state_cuda,
 )
+torch.library.impl("attn_gym::gdn_chunk_mega_packed_fwd_paged", "CUDA", _packed_fwd_paged_cuda)
 torch.library.impl("attn_gym::gdn_chunk_mega_packed_bwd", "CUDA", _packed_bwd_cuda)
 torch.library.impl(
     "attn_gym::gdn_chunk_mega_packed_bwd_with_state",
@@ -338,6 +388,23 @@ def _packed_fwd_with_state_fake(
     return _empty_with_layout(value), _empty_with_layout(initial_state)
 
 
+@torch.library.register_fake("attn_gym::gdn_chunk_mega_packed_fwd_paged")
+def _packed_fwd_paged_fake(
+    q: Tensor,
+    k: Tensor,
+    value: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    state_cache: Tensor,
+    state_indices: Tensor,
+    has_initial_state: Tensor | None,
+    cu_seqlens: Tensor,
+    scale: float,
+) -> Tensor:
+    """Describe the paged forward launcher; the pool mutation is declared in the schema."""
+    return _empty_with_layout(value)
+
+
 def _gradient_allocation(tensor: Tensor) -> Tensor:
     """Match the CUDA wrapper's exact-layout gradient allocation."""
     return _empty_with_layout(tensor)
@@ -385,6 +452,7 @@ chunk_gdn_mega_packed_fwd_with_initial_state_op = (
 chunk_gdn_mega_packed_fwd_with_state_op = (
     torch.ops.attn_gym.gdn_chunk_mega_packed_fwd_with_state.default
 )
+chunk_gdn_mega_packed_fwd_paged_op = torch.ops.attn_gym.gdn_chunk_mega_packed_fwd_paged.default
 chunk_gdn_mega_packed_bwd_op = torch.ops.attn_gym.gdn_chunk_mega_packed_bwd.default
 chunk_gdn_mega_packed_bwd_with_state_op = (
     torch.ops.attn_gym.gdn_chunk_mega_packed_bwd_with_state.default
@@ -395,6 +463,7 @@ __all__ = [
     "chunk_gdn_mega_packed_bwd_op",
     "chunk_gdn_mega_packed_bwd_with_state_op",
     "chunk_gdn_mega_packed_fwd_op",
+    "chunk_gdn_mega_packed_fwd_paged_op",
     "chunk_gdn_mega_packed_fwd_with_initial_state_op",
     "chunk_gdn_mega_packed_fwd_with_state_op",
     "validate_mega_available",

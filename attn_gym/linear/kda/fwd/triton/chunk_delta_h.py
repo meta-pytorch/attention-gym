@@ -28,6 +28,7 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
+from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 from attn_gym.linear.kda.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -103,32 +104,35 @@ def _run_chunk_delta_h_sequence(
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    if USE_STATE_INDICES:
-        i_state = tl.load(state_indices + i_n).to(tl.int64)
-        if i_state <= 0:
-            for i_t in tl.range(0, NT):
-                chunk = boh + i_t
-                h_desc.store(
-                    [0, chunk, i_h, 0, i_v * BV],
-                    tl.reshape(
-                        tl.zeros([K, BV], dtype=k.dtype.element_ty),
-                        [1, 1, 1, K, BV],
-                    ),
-                )
-                o_t = bos + i_t * BT + tl.arange(0, BT)
-                m_t = o_t < bos + T
-                if USE_INT64_OFFSETS:
-                    o_t = o_t.to(tl.int64)
-                tl.store(
-                    v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
-                    0.0,
-                    mask=m_t[:, None],
-                )
-            return
-    elif USE_INT64_OFFSETS:
-        i_state = i_n.to(tl.int64)
-    else:
-        i_state = i_n
+    i_state, state_active, load_initial = resolve_paged_state(
+        i_n,
+        state_indices,
+        has_initial_state,
+        USE_STATE_INDICES,
+        USE_HAS_INITIAL_STATE,
+    )
+    if USE_STATE_INDICES and not state_active:
+        for i_t in tl.range(0, NT):
+            chunk = boh + i_t
+            h_desc.store(
+                [0, chunk, i_h, 0, i_v * BV],
+                tl.reshape(
+                    tl.zeros([K, BV], dtype=k.dtype.element_ty),
+                    [1, 1, 1, K, BV],
+                ),
+            )
+            o_t = bos + i_t * BT + tl.arange(0, BT)
+            m_t = o_t < bos + T
+            if USE_INT64_OFFSETS:
+                o_t = o_t.to(tl.int64)
+            tl.store(
+                v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
+                0.0,
+                mask=m_t[:, None],
+            )
+        return
+    if not USE_STATE_INDICES and USE_INT64_OFFSETS:
+        i_state = i_state.to(tl.int64)
     if DYNAMIC_STATE_LAYOUT:
         state_indices_4d = (i_state, i_h, o_v[None, :], o_k[:, None])
         p_h0 = ptr_offset(state_indices_4d, H0_STRIDES)
@@ -140,9 +144,7 @@ def _run_chunk_delta_h_sequence(
 
     b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        m_state = o_v[None, :] < V
-        if USE_HAS_INITIAL_STATE:
-            m_state &= tl.load(has_initial_state + i_n)
+        m_state = (o_v[None, :] < V) & load_initial
         b_h += tl.load(
             h0 + p_h0,
             mask=m_state,
