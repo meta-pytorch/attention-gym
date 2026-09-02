@@ -357,9 +357,9 @@ FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
 public CuTeDSL 4.7 primitives and has no cuDNN Frontend runtime dependency. Like the other
 implementations, it returns `(output, final_state)`; request the latter with
-`output_final_state=True`. Dense no-state calls require T divisible by 64 and omit `cu_seqlens`,
-while packed/stateful calls pass explicit contiguous int32 boundaries and FP32 `[N, H, V, K]`
-states. Q/K/V/gate/state accept TMA-compatible innermost modes with aligned dynamic outer strides;
+`output_final_state=True`. Dense no-state calls with complete 64-token chunks use the dense kernels
+and partial tails take the packed path with synthesized boundaries; packed/stateful calls pass
+explicit contiguous int32 boundaries and FP32 `[N, H, V, K]` states. Q/K/V/gate/state accept TMA-compatible innermost modes with aligned dynamic outer strides;
 beta requires an element-aligned contiguous inner mode. By default the forward is exact and
 unsplit: one persistent work item per sequence and head, which leaves the GPU underused for a few
 long sequences at low head counts. FP16 and BF16 use exact backward execution by default; eligible
@@ -507,6 +507,12 @@ true_final_states = final_state[list(plan.terminal)]
 The recipe starts each sequence from zero, always returns every subsequence's exit state, and does
 not accept `initial_state` or `output_final_state=False`. A captured CUDA Graph is valid only for
 its fixed plan.
+
+`kernel_options={"backend": "mega"}` makes `chunk_kda_prepare` and `context_parallel_kda` run each
+local pass with Mega from the composed entry state. Because Mega keeps WY factors on chip, the
+forward materializes fused factors only for fragments that send a summary, lazily and only over
+that fragment. Backward recomputes the local fused factors and uses Mega's existing with-state
+route through the fused staged backward.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
