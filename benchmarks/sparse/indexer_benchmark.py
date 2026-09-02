@@ -33,7 +33,7 @@ def useful_flops(args: argparse.Namespace) -> int:
     s = args.sequence_length
     h = args.heads
     d = args.head_dim
-    if args.causal:
+    if not args.causal:
         return b * h * s * s * d * 2
     else:
         return b * h * s * s * d
