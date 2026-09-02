@@ -24,11 +24,11 @@ _HEAD_DIM = 128
 def _validate_fused_constraints(q: torch.Tensor, v: torch.Tensor) -> None:
     """Validate constraints shared by every fused chunk launcher."""
     if not q.is_cuda:
-        raise ValueError("the CuTe KDA core requires CUDA tensors")
+        raise ValueError("the fused KDA core requires CUDA tensors")
     if q.shape[-1] != _HEAD_DIM or v.shape[-1] != _HEAD_DIM:
-        raise ValueError("the CuTe KDA core requires K=V=128")
-    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 10:
-        raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
+        raise ValueError("the fused KDA core requires K=V=128")
+    if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 8:
+        raise ValueError("the fused KDA core requires CUDA capability 8.0 or newer")
 
 
 class _ChunkKDA(torch.autograd.Function):

@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_kda requires CUDA"
 )
 
-BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
+FUSED_CHUNK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
 
 
 def _inputs(
@@ -263,7 +263,7 @@ def test_recurrent_grouped_heads_registration():
     )
 
 
-@pytest.mark.skipif(not BLACKWELL, reason="chunk_kda requires CUDA capability 10.0")
+@pytest.mark.skipif(not FUSED_CHUNK, reason="chunk_kda requires CUDA capability 8.0")
 def test_recurrent_agrees_with_chunked_core():
     """Cross-check the decode scan against the training core on shared inputs."""
     from attn_gym.linear import chunk_kda

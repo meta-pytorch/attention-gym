@@ -80,6 +80,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 
@@ -156,16 +157,16 @@ def _mma_config(precision: MmaPrecision):
             MMA_INST_SHAPE_MNK_BF16,
             tcgen05.CtaGroup.ONE,
             tcgen05.OperandSource.SMEM,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
         )
         return op, cutlass.BFloat16
     op = tcgen05.MmaTF32Op(
         MMA_INST_SHAPE_MNK,
         tcgen05.CtaGroup.ONE,
         tcgen05.OperandSource.SMEM,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.MN,
+        cute.nvgpu.OperandMajorMode.K,
+        cute.nvgpu.OperandMajorMode.MN,
     )
     return op, MMA_DTYPE
 
@@ -1331,13 +1332,11 @@ def _compile_recompute_w_u(
     target = get_compile_target()
     if (
         target.device_type != "cuda"
-        or target.capability is None
-        or target.capability < (10, 0)
+        or not is_sm100_kda_capability(target.effective_capability)
         or target.sm_count is None
     ):
         raise ValueError(
-            "KDA recompute requires a CUDA capability >= 10.0 target with a known SM count; "
-            f"got target={target}"
+            f"KDA recompute requires an SM100 or SM103 target with a known SM count; got {target}"
         )
     assert chunk_size == BT, f"KDA recompute requires chunk_size={BT}, got {chunk_size}"
     assert key_dim == KEY_DIM, f"KDA recompute requires key_dim={KEY_DIM}, got {key_dim}"

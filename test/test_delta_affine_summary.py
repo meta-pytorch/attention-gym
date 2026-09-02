@@ -1,4 +1,4 @@
-"""Tests for the shared CuTeDSL delta-rule affine-summary recurrence."""
+"""Tests for the architecture-routed delta-rule affine-summary recurrence."""
 
 from __future__ import annotations
 
@@ -8,12 +8,29 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
+import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
+import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTeDSL affine summary requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the affine summaries require CUDA capability 8.0 or newer",
 )
+
+
+def make_summary_inputs(seed: int):
+    """Create one nontrivial BF16 input set for summary infrastructure tests."""
+    torch.manual_seed(seed)
+    shape = (1, 64, 1, 128)
+    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
+    kg = torch.randn_like(qg) / 32
+    w = torch.randn_like(qg) / 32
+    u = torch.randn_like(qg) / 32
+    dout = torch.randn_like(qg) / 32
+    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
+    cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
+    return qg, kg, w, u, dout, aqk, cumulative_gate
 
 
 def int64_stride_copy(tensor: torch.Tensor) -> torch.Tensor:
@@ -127,15 +144,7 @@ def state_grad_summary_reference(
 
 def test_affine_summaries_support_int64_tensor_strides():
     """Compile wide-address kernels for realistic long-sequence batch strides."""
-    torch.manual_seed(19)
-    shape = (1, 64, 1, 128)
-    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
-    kg = torch.randn_like(qg) / 32
-    w = torch.randn_like(qg) / 32
-    u = torch.randn_like(qg) / 32
-    dout = torch.randn_like(qg) / 32
-    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
-    cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(19)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
     expected_reverse = build_state_grad_summary(
@@ -159,17 +168,45 @@ def test_affine_summaries_support_int64_tensor_strides():
     torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
 
 
+def test_portable_affine_summaries_support_forced_int64_offsets(monkeypatch):
+    """Keep the portable launchers' wide-address specialization executable."""
+    capability = torch.cuda.get_device_capability()
+    if is_sm100_kda_capability(capability):
+        pytest.skip("SM100 uses the native CuTeDSL affine summaries")
+
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20)
+
+    expected_forward = build_state_summary(kg, w, u, cumulative_gate)
+    expected_reverse = build_state_grad_summary(
+        qg,
+        kg,
+        w,
+        dout,
+        aqk,
+        cumulative_gate,
+        128**-0.5,
+    )
+    monkeypatch.setattr(portable_fwd, "requires_int64_offsets", lambda *_tensors: True)
+    monkeypatch.setattr(portable_rev, "requires_int64_offsets", lambda *_tensors: True)
+
+    actual_forward = build_state_summary(kg, w, u, cumulative_gate)
+    actual_reverse = build_state_grad_summary(
+        qg,
+        kg,
+        w,
+        dout,
+        aqk,
+        cumulative_gate,
+        128**-0.5,
+    )
+
+    torch.testing.assert_close(actual_forward, expected_forward, rtol=0, atol=0)
+    torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
+
+
 def test_affine_summaries_accept_misaligned_contiguous_storage():
     """Normalize ordinary storage-offset views before constructing TMA descriptors."""
-    torch.manual_seed(21)
-    shape = (1, 64, 1, 128)
-    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
-    kg = torch.randn_like(qg) / 32
-    w = torch.randn_like(qg) / 32
-    u = torch.randn_like(qg) / 32
-    dout = torch.randn_like(qg) / 32
-    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
-    cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(21)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
     expected_reverse = build_state_grad_summary(
@@ -194,7 +231,10 @@ def test_affine_summaries_accept_misaligned_contiguous_storage():
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("tokens,heads", [(64, 1), (65, 2), (256, 3)])
+@pytest.mark.parametrize(
+    "tokens,heads",
+    [(64, 1), (65, 2), (256, 3), (64, 8), (64, 12), (512, 2), (2048, 1)],
+)
 def test_affine_summary_matches_fp32_reference(dtype, tokens, heads):
     torch.manual_seed(23)
     shape = (1, tokens, heads, 128)
@@ -212,7 +252,10 @@ def test_affine_summary_matches_fp32_reference(dtype, tokens, heads):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("tokens,heads", [(64, 1), (65, 2), (256, 3)])
+@pytest.mark.parametrize(
+    "tokens,heads",
+    [(64, 1), (65, 2), (256, 3), (64, 8), (64, 12), (512, 2), (2048, 1)],
+)
 def test_build_state_grad_summary_matches_fp32_reference(dtype, tokens, heads):
     torch.manual_seed(27)
     shape = (1, tokens, heads, 128)

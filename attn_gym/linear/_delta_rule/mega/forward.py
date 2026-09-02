@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
+from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
 
@@ -35,12 +36,14 @@ def run_forward_on_current_device(
     gate: torch.Tensor,
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    initial_state: torch.Tensor | None,
+    state: torch.Tensor | PagedState | None,
     *,
     scale: float | None,
     output_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one unsplit packed forward invocation."""
+    paged_state = state if isinstance(state, PagedState) else None
+    initial_state = paged_state.cache if paged_state is not None else state
     scale = resolve_scale(scale, q.shape[-1])
     validate_available(q)
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
@@ -76,7 +79,10 @@ def run_forward_on_current_device(
         raise ValueError("cu_seqlens must be on the input CUDA device")
 
     num_sequences = cu_seqlens.shape[0] - 1
-    if initial_state is not None:
+    if paged_state is not None:
+        if output_final_state:
+            raise ValueError("paged state advances the pool in place; drop output_final_state")
+    elif initial_state is not None:
         expected_state = (num_sequences, heads, 128, 128)
         if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
             raise TypeError(f"initial_state must be float32 with shape {expected_state}")
@@ -89,6 +95,8 @@ def run_forward_on_current_device(
 
     # Empty sequences emit no token work. Cloning only when requested preserves their state.
     final_state = initial_state.clone() if output_final_state else None
+    if paged_state is not None:
+        final_state = paged_state.cache
     output = torch.empty_like(value)
     stream = torch.cuda.current_stream(q.device).cuda_stream
     schedule = prepare_mega_schedule(
@@ -120,8 +128,10 @@ def run_forward_on_current_device(
         sched_ctr=schedule.counters,
         work_item_scratch=schedule.item_scratch,
         tensormap_workspace=tensormap_workspace,
+        state_indices=None if paged_state is None else paged_state.indices,
+        has_initial_state=None if paged_state is None else paged_state.byte_mask,
     )
-    return output, final_state
+    return output, (None if paged_state is not None else final_state)
 
 
 def run_forward(
@@ -131,7 +141,7 @@ def run_forward(
     gate: torch.Tensor,
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    initial_state: torch.Tensor | None,
+    state: torch.Tensor | PagedState | None,
     *,
     scale: float | None,
     output_final_state: bool,
@@ -147,7 +157,7 @@ def run_forward(
             gate,
             beta,
             cu_seqlens,
-            initial_state,
+            state,
             scale=scale,
             output_final_state=output_final_state,
         )

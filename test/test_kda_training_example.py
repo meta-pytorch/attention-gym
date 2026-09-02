@@ -17,8 +17,8 @@ from examples import kda_training
 from examples.kda_training import KDAAttention, packed_sequence_metadata
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the fused KDA example requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="the fused KDA example requires CUDA capability 9.0 or newer",
 )
 
 

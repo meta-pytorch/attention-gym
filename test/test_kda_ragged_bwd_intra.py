@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import math
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -19,9 +23,31 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTe KDA backward stage requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the CuTe KDA backward stage requires CUDA capability 8.0 or newer",
 )
+
+
+@pytest.mark.parametrize("architecture", ["sm_80", "sm_120"])
+def test_bwd_intra_compiles_for_portable_targets(architecture: str):
+    """Compile the portable specialization without SM100-only instructions."""
+    source = """
+import torch
+from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
+
+module._compile_chunk_kda_bwd_intra(
+    heads=1,
+    capacity=1,
+    grid_chunks=1,
+    ragged=False,
+    io_type=module._IO_TYPES[torch.bfloat16],
+    use_int64_offsets=False,
+)
+"""
+    environment = os.environ.copy()
+    environment["CUTE_DSL_ARCH"] = architecture
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    subprocess.run([sys.executable, "-c", source], env=environment, check=True, timeout=180)
 
 
 def _metadata(lengths: list[int]):

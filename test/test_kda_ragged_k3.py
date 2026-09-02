@@ -12,8 +12,8 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTe K3 kernel requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the CuTe K3 kernel requires an SM100 or SM103 GPU",
 )
 
 _BLOCK_PAIRS = ((1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2))

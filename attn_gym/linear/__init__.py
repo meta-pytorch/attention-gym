@@ -9,7 +9,7 @@
 import importlib
 from typing import TYPE_CHECKING
 
-from attn_gym.linear.gdn import chunk_gdn, recurrent_gdn, recurrent_gdn_decode
+from attn_gym.linear.gdn import chunk_gdn, paged_chunk_gdn, recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear.kda import (
     KernelOptions,
     active_token_mask,
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from attn_gym.linear.short_conv import (
         causal_conv1d,
         causal_conv1d_decode,
+        paged_causal_conv1d,
         register_activation,
     )
 
@@ -43,6 +44,7 @@ KDA_OPS = [
 
 GDN_OPS = [
     "chunk_gdn",
+    "paged_chunk_gdn",
     "recurrent_gdn",
     "recurrent_gdn_decode",
 ]
@@ -55,6 +57,7 @@ GENERIC_OPS = [
     "causal_conv1d",
     "causal_conv1d_decode",
     "l2norm",
+    "paged_causal_conv1d",
     "mask_inactive_token_gradients",
     "mask_inactive_tokens",
     "register_activation",
@@ -62,7 +65,12 @@ GENERIC_OPS = [
 
 __all__ = GDN_OPS + GENERIC_OPS + KDA_OPS  # noqa: PLE0605 -- built from the op groups above
 
-_SHORT_CONV_EXPORTS = {"causal_conv1d", "causal_conv1d_decode", "register_activation"}
+_SHORT_CONV_EXPORTS = {
+    "causal_conv1d",
+    "causal_conv1d_decode",
+    "paged_causal_conv1d",
+    "register_activation",
+}
 
 
 def __getattr__(name: str):

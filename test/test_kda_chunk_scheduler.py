@@ -226,8 +226,8 @@ def _decode_ragged_chunk_work_cute(*args, **kwargs):
 
 
 requires_cute = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the CuTeDSL KDA scheduler test requires CUDA capability 10.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the CuTeDSL KDA scheduler test requires an SM100 or SM103 GPU",
 )
 
 

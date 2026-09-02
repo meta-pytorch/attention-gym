@@ -85,6 +85,7 @@ source = "vcs"
 # ---------- PYTEST ------------
 [tool.pytest.ini_options]
 testpaths = ["test"]
+norecursedirs = ["agent_space"]
 markers = ["full_autotune: exercise every production Triton autotuning candidate"]
 
 # ---------- RUFF ------------

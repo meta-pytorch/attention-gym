@@ -52,6 +52,7 @@ from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_sequence_extent
 from attn_gym.utils import ceildiv
 
@@ -515,8 +516,9 @@ class BlackwellDeltaHBwd:
         # MMA1: k @ dh → dv  — k is (BT,BK) as A K-major, dh is (BK,BV) as B K-major
         mma_dv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.K,  # A (k): K-major
-            tcgen05.OperandMajorMode.K,  # B (dh): K-major
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.K,  # A (k): K-major
+            cute.nvgpu.OperandMajorMode.K,  # B (dh): K-major
             self.acc_type,
             self.cta_group,
             self.dv_tile[:2],  # (BT=64, BV=16)
@@ -525,8 +527,9 @@ class BlackwellDeltaHBwd:
         # MMA2: q^T @ do → qdo  — q^T is (BK,BT) A MN-major, do is (BT,BV) B MN-major
         mma_qdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,  # A (q^T): MN-major
-            tcgen05.OperandMajorMode.MN,  # B (do): MN-major (V-contiguous)
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,  # A (q^T): MN-major
+            cute.nvgpu.OperandMajorMode.MN,  # B (do): MN-major (V-contiguous)
             self.acc_type,
             self.cta_group,
             self.qdo_tile[:2],  # (BK=128, BV=16)
@@ -536,8 +539,9 @@ class BlackwellDeltaHBwd:
         aqdo_tile = (self.BT, self.BV, self.BT)
         mma_aqdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_type,
             self.cta_group,
             aqdo_tile[:2],
@@ -547,8 +551,9 @@ class BlackwellDeltaHBwd:
         # MMA3: w @ dv2 → wdv  — w is (BK,BT) A MN-major, dv2 is (BT,BV) B K-major
         mma_wdv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,  # A (w^T): MN-major
-            tcgen05.OperandMajorMode.K,  # B (dv2): K-major
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,  # A (w^T): MN-major
+            cute.nvgpu.OperandMajorMode.K,  # B (dv2): K-major
             self.acc_type,
             self.cta_group,
             self.wdv_tile[:2],  # (BK=128, BV=16)
@@ -2223,6 +2228,9 @@ def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
 @jit_cache
 def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout):
     """Compile one dense BlackwellDeltaHBwd variant."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
     K = V = 128
     chunk_size = 64
     kern = BlackwellDeltaHBwd(
@@ -2288,6 +2296,9 @@ def _compile_delta_h_bwd_packed(
     dynamic_state_layout: bool,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
     key_dim = value_dim = 128
     chunk_size = 64
     kernel = BlackwellDeltaHBwd(

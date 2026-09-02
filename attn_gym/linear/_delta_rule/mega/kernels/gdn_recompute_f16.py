@@ -1116,8 +1116,6 @@ def mma_warp(
         for local_idx in cutlass.range(n_local):  # noqa: B007
             if cutlass.const_expr(cfg.use_initial_state):
                 if local_idx == 0:
-                    if elect_one:
-                        bars.mb_state_acc_ready[kv_acc_index.idx].arrive(cta_group=1)
                     kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
             have_state = (
                 cutlass.Boolean(True)
@@ -2003,8 +2001,11 @@ def compute1_warp_group(
                 # ---- state restage + rescale -------------------------------------
                 if valid_state:
                     kv_idx = kv_acc_index.idx
-                    bars.mb_state_acc_ready[kv_idx].wait(kv_acc_index.phase)
-                    kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
+                    # CG1 writes the seeded state itself; only subsequent states
+                    # arrive through the MMA-owned state accumulator barrier.
+                    if local_idx > 0:
+                        bars.mb_state_acc_ready[kv_idx].wait(kv_acc_index.phase)
+                        kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
                     kv_done_idx = kv_idx
 
                     state_regs = [
@@ -2848,41 +2849,42 @@ def kernel(
         beta_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) ---------------------------------------------
-    for s in range(cfg.smem_kq_stages):
-        bars.mb_kq_ready[s].init()
-        bars.mb_kq_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.smem_beta_stages):
-        bars.mb_beta_ready[s].init()
-        bars.mb_beta_done[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_ready[s].init()
-        bars.mb_state_acc_scale_done[s].init()
-    for s in range(cfg.tmem_cg0_acc_stages):
-        bars.mb_cg0_acc_ready[s].init()
-        bars.mb_cg0_acc_done[s].init()
-    bars.mb_k_state_acc_ready[0].init()
-    bars.mb_u_acc_ready[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.tmem_state_inp_stages):
-        bars.mb_state_inp_ready[s].init()
-    for b in (bars.mb_y_inp_ready, bars.mb_decay_u_inp_ready):
-        b[0].init()
-    for s in range(cfg.smem_checkpoint_stages):
-        bars.mb_checkpoint_tmastg_ready[s].init()
-        bars.mb_checkpoint_tmastg_done[s].init()
-    for s_ in range(cfg.sched_stages):
-        bars.mb_sched_ready[s_].init()
-        bars.mb_sched_done[s_].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init -----------------------------------------------------------
+    if tidx == 0:
+        for s in range(cfg.smem_kq_stages):
+            bars.mb_kq_ready[s].init()
+            bars.mb_kq_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.smem_beta_stages):
+            bars.mb_beta_ready[s].init()
+            bars.mb_beta_done[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_ready[s].init()
+            bars.mb_state_acc_scale_done[s].init()
+        for s in range(cfg.tmem_cg0_acc_stages):
+            bars.mb_cg0_acc_ready[s].init()
+            bars.mb_cg0_acc_done[s].init()
+        bars.mb_k_state_acc_ready[0].init()
+        bars.mb_u_acc_ready[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.tmem_state_inp_stages):
+            bars.mb_state_inp_ready[s].init()
+        for b in (bars.mb_y_inp_ready, bars.mb_decay_u_inp_ready):
+            b[0].init()
+        for s in range(cfg.smem_checkpoint_stages):
+            bars.mb_checkpoint_tmastg_ready[s].init()
+            bars.mb_checkpoint_tmastg_done[s].init()
+        for s_ in range(cfg.sched_stages):
+            bars.mb_sched_ready[s_].init()
+            bars.mb_sched_done[s_].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()

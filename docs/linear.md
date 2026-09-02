@@ -19,9 +19,10 @@ output = scale * state @ query
 Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace `N` with the
 slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
-tokens in order for decoding, inference prefill, and state-carrying correctness checks. The caller
-chooses the execution form explicitly. `impl="reference"` selects eager PyTorch;
-`recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
+tokens in order for decoding, inference prefill, and state-carrying correctness checks. `chunk_gdn`
+defaults to eager PyTorch (`impl="reference"`); `chunk_gdn(..., impl="fused")` selects the
+repo-local scalar chunk pipeline. Pass `kernel_options={"backend": "mega"}` to select the optional
+Mega CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -32,7 +33,7 @@ output, final_state = chunk_gdn(
     value,
     gate,
     beta,
-    impl="reference",
+    impl="fused",
     output_final_state=True,
 )
 ```
@@ -43,20 +44,40 @@ output, final_state = chunk_gdn(
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
+- A repo-local fused chunk pipeline on CUDA capability 8.0+ with dense and packed inputs, grouped
+  Q/K heads, tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph
+  support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
+  `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
+  gather/scatter copies.
+- An opt-in Mega fused chunk implementation with the same public training/state contract and
+  direct paged-cache prefill on SM100/SM103.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
-- Autograd for reference inputs and initial state.
+- Autograd for the reference and fused chunk implementations, including initial-state gradients.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.
 - Gate and beta may use independent floating dtypes and are converted to the recurrence compute
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
+The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
+and
+`K = V = 128`, but has no Mega runtime dependency. Its scalar natural-log gate is not lower-bounded:
+kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
+chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
+Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
+wide-address path. Backward uses the tuned CuTe kernels on SM100/SM103 and portable Triton
+kernels on Ampere, Hopper, and other supported architectures.
+
+The Mega chunk backend requires the optional `mega` dependencies and SM100/SM103,
+FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
+gate without a lower bound and uses exact execution without an approximate forgetting-horizon
+split.
+
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
-capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. The fused
-chunk implementation is not implemented yet; unsupported implementation choices fail rather than
-falling back to the reference.
+capacity. Output rows beyond the terminal offset are inactive capacity and unspecified. Unsupported
+implementation choices fail rather than falling back to the reference.
 
 ### Migration from the prototype API
 
@@ -79,9 +100,28 @@ elementwise kernels run per decode step.
 
 ::: attn_gym.linear.chunk_gdn
 
+::: attn_gym.linear.paged_chunk_gdn
+
 ::: attn_gym.linear.recurrent_gdn
 
 ::: attn_gym.linear.recurrent_gdn_decode
+
+## Stateful Short Convolution
+
+`causal_conv1d` is the differentiable dense or packed operation. It accepts compact
+per-sequence history and can return a newly allocated final history. Serving callers can keep
+history in a shared `[num_slots, W - 1, C]` pool instead: `paged_causal_conv1d` reads selected
+slots during multi-token prefill and advances them in place, while `causal_conv1d_decode` does
+the same for one token per sequence. Both are inference-only and support padding between slots.
+Positive `state_indices` must be unique and within the pool; non-positive routes return zero without
+touching it. `has_initial_state=False` gives paged prefill a zero history before it overwrites a
+fresh slot.
+
+::: attn_gym.linear.causal_conv1d
+
+::: attn_gym.linear.paged_causal_conv1d
+
+::: attn_gym.linear.causal_conv1d_decode
 
 ## Kimi Delta Attention
 
@@ -97,9 +137,10 @@ use the same axis order with the leading dimension interpreted as cache slots.
 main Kimi block structure, projected Q/K/V pass through a causal depthwise SiLU
 convolution, the forget and output gates use two-stage factorized projections,
 and the per-head output uses learned RMS normalization before sigmoid gating.
-`--backend=reference` uses the PyTorch reference throughout. On Blackwell,
-`--backend=fused` uses the same public boundary: the model produces per-token natural-log decay
-and `chunk_kda` owns the BT64 scan. Implementations may inline that scan, but cumulative gates and
+`--backend=reference` uses the PyTorch reference throughout. The optimized `chunk_kda`
+core used by `--backend=fused` supports Ampere or newer and owns the BT64 scan behind the same
+public boundary. The complete fused example currently requires Hopper because its separate
+`bound_gate` producer uses TMA. Implementations may inline the scan, but cumulative gates and
 chunk boundaries are not caller-visible representations.
 
 The example explicitly runs projections in BF16 while retaining FP32 parameters and gate
@@ -109,18 +150,20 @@ casting activations inside `forward`. A module-wide BF16 FSDP policy violates th
 contract. A correctness-first integration can keep the KDA unit under an FP32 policy while
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
-The optimized core requires Blackwell and `head_dim=128`; its public boundary accepts
-FP16, BF16, or FP32 inputs. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
+The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
+boundary accepts FP16, BF16, or FP32 inputs. SM100/SM103 select the specialized CuTe path;
+SM120 and earlier supported architectures use the portable Triton stages. Homogeneous FP16 and
+BF16 Q/K/V stay in their input dtype, while
 FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
 equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
 explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
-forward,
-backward, and recurrent states; logical sequences may have tails or be empty. For
+forward, backward, and recurrent states; logical sequences may have tails or be empty. For
 fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
-forward values outside `[0, cu_seqlens[-1])` are unspecified. The internal reverse scan
-returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
+forward values outside `[0, cu_seqlens[-1])` are unspecified. `paged_chunk_kda` uses the same
+Ampere-or-newer forward route while updating selected FP32 state-cache slots in place. The
+internal reverse scan returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
 parameterized gate producers: callers still need the masking rules below because
 ``0 * NaN`` can poison their reductions.
 
@@ -276,7 +319,7 @@ not checked at runtime. The training example uses the Kimi-style FP32 transform
 part of the public KDA API.
 
 Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
-and enforces their constraints (the chunked core requires `head_dim=128` and Blackwell,
+and enforces their constraints (the chunked core requires `head_dim=128` and Ampere or newer,
 preserves homogeneous FP16/BF16 Q/K/V, normalizes FP32 or mixed inputs to BF16, and chunks at
 64 tokens; the fused recurrent scan is inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
@@ -306,9 +349,13 @@ normalized keys, post-sigmoid beta, and nonpositive decay increments may explici
 approximate backward-only forgetting-horizon splitting with
 `kernel_options={"backend": "mega", "split_backward": True}`. The implementation chooses the
 split count from the input geometry; no public split-size knob is exposed. Split backward currently
-requires a no-state call. Install the `mega` extra to use this backend.
+requires a no-state call. `paged_chunk_kda(..., kernel_options={"backend": "mega"})` uses the
+same exact unsplit forward while updating selected cache slots directly; paged execution never uses
+forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
 ::: attn_gym.linear.chunk_kda
+
+::: attn_gym.linear.paged_chunk_kda
 
 ::: attn_gym.linear.recurrent_kda
 

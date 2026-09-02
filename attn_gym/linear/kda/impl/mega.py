@@ -12,6 +12,7 @@ from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.impl.mega_ops import (
     chunk_mega_dense_training_fwd_op,
     chunk_mega_packed_fwd_op,
+    chunk_mega_packed_fwd_paged_op,
     chunk_mega_packed_fwd_with_initial_state_op,
     chunk_mega_packed_fwd_with_state_op,
     chunk_mega_packed_local_bwd_op,
@@ -390,4 +391,56 @@ def chunk_forward(
     return result, None
 
 
-__all__ = ["chunk_forward"]
+def paged_chunk_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Advance selected state-cache slots with the Mega KDA kernel."""
+    tensors = (q, k, value, gate, beta, state_cache)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
+        raise RuntimeError(
+            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+    if not torch.compiler.is_compiling():
+        validate_mega_available(q)
+
+    batch = q.shape[0]
+    output_shape = value.shape
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+    elif batch != 1:
+        raise ValueError("packed cu_seqlens require q to have batch size one")
+    else:
+        cu_seqlens = cu_seqlens.contiguous()
+    if batch > 1:
+        q, k, value, gate, beta = (
+            tensor.reshape(1, -1, *tensor.shape[2:]) for tensor in (q, k, value, gate, beta)
+        )
+
+    validate_mega_constraints(q, k, value, gate, beta, state_cache, cu_seqlens)
+    output = chunk_mega_packed_fwd_paged_op(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        scale,
+    )
+    return output.reshape(output_shape)
+
+
+__all__ = ["chunk_forward", "paged_chunk_forward"]

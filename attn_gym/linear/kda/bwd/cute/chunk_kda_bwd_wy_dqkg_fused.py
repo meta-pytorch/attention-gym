@@ -44,6 +44,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
@@ -244,7 +245,7 @@ _torch_to_cutlass_dtype = {
 def require_blackwell_target() -> None:
     """Reject compilation targets that cannot execute this SM100/SM103 kernel."""
     target = get_compile_target()
-    if target.device_type != "cuda" or target.capability not in ((10, 0), (10, 3)):
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
         raise RuntimeError(
             f"chunk_kda_bwd_wy_dqkg_fused requires Blackwell (SM100/SM103), got target={target}"
         )
@@ -743,8 +744,9 @@ class ChunkKdaBwdWyDqkgFused:
         #    dq += do @ h, dk += vnew @ dh, dw += dv @ h
         vloop_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,  # A: K-major
-            tcgen05.OperandMajorMode.K,  # B: K-major
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.K,  # A: K-major
+            cute.nvgpu.OperandMajorMode.K,  # B: K-major
             self.acc_dtype,
             self.cta_group,
             self.vloop_gemm_tiler[:2],  # (64, 128)
@@ -755,8 +757,9 @@ class ChunkKdaBwdWyDqkgFused:
         #    dA += dv @ v^T, dA += dw @ kg^T
         dA_vloop_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.dA_vloop_tiler[:2],  # (64, 64)
@@ -767,8 +770,9 @@ class ChunkKdaBwdWyDqkgFused:
         #    dvb = A @ dv, dkgb = A @ dw
         dvb_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             self.dvb_tiler[:2],  # (64, 64)
@@ -777,8 +781,9 @@ class ChunkKdaBwdWyDqkgFused:
         # dkgb_tiled_mma: SS MN,MN (64,128) - dkgb
         dkgb_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             self.kloop_dkgb_tiler[:2],  # (64, 128)
@@ -788,8 +793,9 @@ class ChunkKdaBwdWyDqkgFused:
         # dA += dw @ kg^T
         dA_kloop_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.kloop_dA_tiler[:2],  # (64, 64)
@@ -799,8 +805,9 @@ class ChunkKdaBwdWyDqkgFused:
         # dA = dA @ A
         dA2post_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.dApost_tiler[:2],  # (64, 64)
@@ -811,8 +818,9 @@ class ChunkKdaBwdWyDqkgFused:
         # dA = A @ dA
         dA3post_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_dtype,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             self.dApost_tiler[:2],  # (64, 64)

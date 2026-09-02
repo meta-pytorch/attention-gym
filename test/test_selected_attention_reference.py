@@ -8,7 +8,7 @@ def _run_selected_attention(
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
 ):
     """Helper that calls selected_attention and returns the output."""
-    return selected_attention(
+    output = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -18,6 +18,7 @@ def _run_selected_attention(
         sliding_window_size,
         backend="eager",
     )
+    return output
 
 
 @pytest.mark.parametrize("share_kv", [False, True])

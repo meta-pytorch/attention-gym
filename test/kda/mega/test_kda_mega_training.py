@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from itertools import accumulate
 
 import pytest
@@ -750,6 +751,47 @@ def test_mega_rejects_mismatched_value_and_beta_shapes() -> None:
             inputs[4].repeat(2, 1, 1),
             kernel_options={"backend": "mega"},
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
+    reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
+)
+def test_mega_repeated_backward_with_empty_sequences() -> None:
+    """Empty work items must not advance the dstate handshake phase."""
+    from attn_gym.linear import chunk_kda
+
+    lengths = tuple(0 if index % 2 == 0 else 128 for index in range(29))
+    q, k, value, gate, beta = make_kda_test_inputs(
+        sum(lengths),
+        heads=16,
+        seed=421,
+        normalize_qk=True,
+        requires_grad=True,
+    )
+    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_()
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    d_output = torch.randn_like(value)
+    d_state = torch.randn_like(state)
+    for _ in range(500):
+        output, final_state = chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options={"backend": "mega"},
+        )
+        assert final_state is not None
+        torch.autograd.grad(
+            (output, final_state),
+            (q, k, value, gate, beta, state),
+            (d_output, d_state),
+        )
+        torch.cuda.synchronize()
 
 
 def test_mega_packed_h64_exact_tail_with_trailing_empty_is_finite() -> None:

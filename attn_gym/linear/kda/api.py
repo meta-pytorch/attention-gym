@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from functools import partial
 from numbers import Real
-from typing import Literal, TypedDict
+from typing import Literal
 
 import torch
 
@@ -30,28 +30,19 @@ from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
 from attn_gym.linear.kda.impl.mega import chunk_forward as _mega_chunk_forward
+from attn_gym.linear.kda.impl.mega import paged_chunk_forward as _mega_paged_chunk_forward
 from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
-from attn_gym.linear.types import Impl, resolve_impl
+from attn_gym.linear.types import Impl, KernelOptions, resolve_impl
 
 _CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
     "bounded": True,
     "softplus": False,
 }
-
-
-class KernelOptions(TypedDict, total=False):
-    """Backend and experimental scheduling controls for :func:`chunk_kda`."""
-
-    backend: Literal["fused", "mega"]
-    """Select the default fused backend or the optional Mega CuTeDSL backend."""
-
-    split_backward: bool
-    """Approximate only Mega backward with schedule-selected forgetting-horizon splits."""
 
 
 def _resolve_decode_gate_transform(gate_transform: str) -> bool:
@@ -195,6 +186,7 @@ def paged_chunk_kda(
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
+    kernel_options: KernelOptions | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
 
@@ -216,8 +208,11 @@ def paged_chunk_kda(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
-        autotune: Benchmark candidate kernel configurations when true (winners
-            are cached and reused); use fixed heuristics when false.
+        autotune: For the repo-local fused backend, benchmark candidate kernel
+            configurations when true; Mega uses its fixed schedule.
+        kernel_options: Backend-specific options. ``{"backend": "mega"}`` selects
+            the optional CuTeDSL 4.7 Mega backend. ``split_backward`` is not applicable
+            to this inference-only operation.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -241,6 +236,22 @@ def paged_chunk_kda(
         state_indices,
         has_initial_state=has_initial_state,
     )
+    backend, split_backward = resolve_kernel_options(kernel_options)
+    if split_backward:
+        raise ValueError("split_backward is not supported by paged_chunk_kda")
+    if backend == "mega":
+        return _mega_paged_chunk_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            scale=resolve_scale(None, q.shape[-1]),
+        )
     return _fused_paged_chunk_forward(
         q,
         k,

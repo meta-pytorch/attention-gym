@@ -4,14 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Inter-chunk KDA state recurrence.
+"""Inter-chunk scalar- and vector-gated delta-rule state recurrence.
 
-A single kernel (B=1, K=V=128, 64-token chunks, Blackwell) keeps the full
-[K, BV] state in one accumulator and overlaps next-chunk descriptor loads with
-the serially dependent state MMAs; 16-bit inputs run the tuned warp-specialized
-schedule and FP32 a smaller ordinarily pipelined one. Host-side tensor
-descriptors do not survive dynamo/inductor tracing, so the launch sits behind a
-compiler-opaque ``torch.library`` op pair.
+A single kernel (B=1, K=V=128, 64-token chunks) keeps the full [K, BV] state in
+one accumulator. Blackwell overlaps descriptor loads with the serial state MMAs
+through warp specialization; Hopper and FP32 use ordinary pipelining because the
+Hopper warp-specialization pass cannot commit this kernel's descriptor stores.
+Host-side tensor descriptors use hardware TMA where available and Triton
+fallback lowering on SM80. They do not survive Dynamo/Inductor tracing, so
+the launch sits behind a compiler-opaque ``torch.library`` op pair.
 """
 
 from __future__ import annotations
@@ -21,18 +22,25 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.cute.utils import get_device_properties
+from attn_gym._backends.triton.utils import (
+    can_use_tensor_descriptor,
+    ptr_offset,
+    requires_int64_offsets,
+)
+from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 from attn_gym.linear.kda.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
     ScheduleKind,
     ScheduleRequest,
     load_ragged_sequence_extent,
+    load_ragged_sequence_work,
 )
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
-from attn_gym.linear.kda.utils import exp2
+from attn_gym.linear.kda.utils import exp2, is_sm100_kda_target
 
 
 @triton.jit
@@ -52,6 +60,7 @@ def _run_chunk_delta_h_sequence(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     i_nh,
@@ -72,6 +81,7 @@ def _run_chunk_delta_h_sequence(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
 ):
     """Process one sequence, head, and value tile through the state recurrence.
 
@@ -82,9 +92,8 @@ def _run_chunk_delta_h_sequence(
     """
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        bos, eos, boh = load_ragged_sequence_work(cu_seqlens, chunk_offsets, i_n)
+        bos, eos, boh = bos.to(tl.int32), eos.to(tl.int32), boh.to(tl.int32)
         T = eos - bos
     else:
         bos = i_n * T
@@ -95,32 +104,35 @@ def _run_chunk_delta_h_sequence(
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    if USE_STATE_INDICES:
-        i_state = tl.load(state_indices + i_n).to(tl.int64)
-        if i_state <= 0:
-            for i_t in tl.range(0, NT):
-                chunk = boh + i_t
-                h_desc.store(
-                    [0, chunk, i_h, 0, i_v * BV],
-                    tl.reshape(
-                        tl.zeros([K, BV], dtype=k.dtype.element_ty),
-                        [1, 1, 1, K, BV],
-                    ),
-                )
-                o_t = bos + i_t * BT + tl.arange(0, BT)
-                m_t = o_t < bos + T
-                if USE_INT64_OFFSETS:
-                    o_t = o_t.to(tl.int64)
-                tl.store(
-                    v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
-                    0.0,
-                    mask=m_t[:, None],
-                )
-            return
-    elif USE_INT64_OFFSETS:
-        i_state = i_n.to(tl.int64)
-    else:
-        i_state = i_n
+    i_state, state_active, load_initial = resolve_paged_state(
+        i_n,
+        state_indices,
+        has_initial_state,
+        USE_STATE_INDICES,
+        USE_HAS_INITIAL_STATE,
+    )
+    if USE_STATE_INDICES and not state_active:
+        for i_t in tl.range(0, NT):
+            chunk = boh + i_t
+            h_desc.store(
+                [0, chunk, i_h, 0, i_v * BV],
+                tl.reshape(
+                    tl.zeros([K, BV], dtype=k.dtype.element_ty),
+                    [1, 1, 1, K, BV],
+                ),
+            )
+            o_t = bos + i_t * BT + tl.arange(0, BT)
+            m_t = o_t < bos + T
+            if USE_INT64_OFFSETS:
+                o_t = o_t.to(tl.int64)
+            tl.store(
+                v_new + ptr_offset((o_t[:, None], i_h, o_v[None, :]), (H * V, V, 1)),
+                0.0,
+                mask=m_t[:, None],
+            )
+        return
+    if not USE_STATE_INDICES and USE_INT64_OFFSETS:
+        i_state = i_state.to(tl.int64)
     if DYNAMIC_STATE_LAYOUT:
         state_indices_4d = (i_state, i_h, o_v[None, :], o_k[:, None])
         p_h0 = ptr_offset(state_indices_4d, H0_STRIDES)
@@ -132,9 +144,7 @@ def _run_chunk_delta_h_sequence(
 
     b_h = tl.zeros([K, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        m_state = o_v[None, :] < V
-        if USE_HAS_INITIAL_STATE:
-            m_state &= tl.load(has_initial_state + i_n)
+        m_state = (o_v[None, :] < V) & load_initial
         b_h += tl.load(
             h0 + p_h0,
             mask=m_state,
@@ -157,8 +167,12 @@ def _run_chunk_delta_h_sequence(
             [0, tok, i_h, i_v * BV],
             tl.reshape(b_vnew.to(k.dtype.element_ty), [1, BT, 1, BV]),
         )
-        b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
-        b_h = b_h * exp2(b_decay)[:, None]
+        if SCALAR_GATE:
+            b_decay = tl.load(gk + (tok + BT - 1) * H + i_h)
+            b_h = b_h * exp2(b_decay)
+        else:
+            b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
+            b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
@@ -190,8 +204,12 @@ def _run_chunk_delta_h_sequence(
             b_vnew.to(k.dtype.element_ty),
             mask=m_t[:, None],
         )
-        b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
-        b_h = b_h * exp2(b_decay)[:, None]
+        if SCALAR_GATE:
+            b_decay = tl.load(gk + (bos + T - 1) * H + i_h)
+            b_h = b_h * exp2(b_decay)
+        else:
+            b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
+            b_h = b_h * exp2(b_decay)[:, None]
         b_k = tl.load(
             k + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
             mask=m_t[:, None],
@@ -223,6 +241,7 @@ def chunk_delta_h_kernel_k128_wsp(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     h0_stride_0,
@@ -247,8 +266,9 @@ def chunk_delta_h_kernel_k128_wsp(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
 ):
-    """Warp-specialized K=128 inter-chunk recurrence."""
+    """Primary K=128 inter-chunk recurrence launcher."""
     _run_chunk_delta_h_sequence(
         k_desc,
         w_desc,
@@ -265,6 +285,7 @@ def chunk_delta_h_kernel_k128_wsp(
         k,
         w,
         u,
+        gk,
         v_new,
         T,
         tl.program_id(0),
@@ -285,6 +306,7 @@ def chunk_delta_h_kernel_k128_wsp(
         USE_STATE_INDICES,
         USE_HAS_INITIAL_STATE,
         USE_INT64_OFFSETS,
+        SCALAR_GATE,
     )
 
 
@@ -305,6 +327,7 @@ def chunk_delta_h_kernel_k128_persistent(
     k,
     w,
     u,
+    gk,
     v_new,
     T,
     h0_stride_0,
@@ -328,6 +351,7 @@ def chunk_delta_h_kernel_k128_persistent(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
     NUM_SEQUENCES: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
@@ -354,6 +378,7 @@ def chunk_delta_h_kernel_k128_persistent(
             k,
             w,
             u,
+            gk,
             v_new,
             T,
             i_nh,
@@ -374,6 +399,7 @@ def chunk_delta_h_kernel_k128_persistent(
             USE_STATE_INDICES,
             USE_HAS_INITIAL_STATE,
             USE_INT64_OFFSETS,
+            SCALAR_GATE,
         )
 
 
@@ -431,17 +457,21 @@ def _delta_h_launch(
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
     v_new = torch.empty_like(u)
-    if not can_use_tma(gk):
+    scalar_gate = gk.ndim == 3
+    if scalar_gate:
+        gk = gk.contiguous()
+    elif not can_use_tensor_descriptor(gk):
         gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
     h0_strides = initial_state.stride() if initial_state is not None else compact_state_strides
     ht_strides = final_state.stride() if final_state is not None else compact_state_strides
-    # FP32 tiles double the descriptor staging past the shared-memory limit
-    # at the 16-bit tile shape, and warp specialization pins its own stage
-    # count; for 4-byte inputs halve the value tile and use an ordinarily
-    # pipelined loop instead. 16-bit inputs keep the tuned contract schedule.
+    # FP32 tiles double the descriptor staging past the shared-memory limit at
+    # the 16-bit tile shape. Hopper also uses ordinary pipelining: its Triton
+    # warp-specialization pass cannot commit the descriptor stores in this loop.
+    # SM120 also uses ordinary pipelining because this schedule is SM100-specific.
     use_16bit_config = k.element_size() == 2
+    use_warp_specialization = use_16bit_config and is_sm100_kda_target(k.device)
     block_value_dim = _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2
     descriptors = (
         TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),
@@ -449,7 +479,7 @@ def _delta_h_launch(
         TensorDescriptor.from_tensor(u, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(v_new, [1, _CHUNK_SIZE, 1, block_value_dim]),
         TensorDescriptor.from_tensor(h, [1, 1, 1, key_dim, block_value_dim]),
-        TensorDescriptor.from_tensor(gk, [1, 1, 1, key_dim]),
+        TensorDescriptor.from_tensor(k if scalar_gate else gk, [1, 1, 1, key_dim]),
     )
     kernel_args = (
         *descriptors,
@@ -462,6 +492,7 @@ def _delta_h_launch(
         k,
         w,
         u,
+        gk,
         v_new,
         tokens,
         *h0_strides,
@@ -475,8 +506,8 @@ def _delta_h_launch(
         "V": value_dim,
         "BT": _CHUNK_SIZE,
         "BV": block_value_dim,
-        "WARP_SPECIALIZE": use_16bit_config,
-        "NUM_STAGES": 3 if use_16bit_config else 2,
+        "WARP_SPECIALIZE": use_warp_specialization,
+        "NUM_STAGES": 3 if use_warp_specialization else 2,
         "USE_INITIAL_STATE": initial_state is not None,
         "STORE_FINAL_STATE": final_state is not None,
         "USE_STATE_INDICES": state_indices is not None,
@@ -484,6 +515,7 @@ def _delta_h_launch(
         "USE_INT64_OFFSETS": requires_int64_offsets(
             k, w, u, gk, v_new, h, initial_state, final_state
         ),
+        "SCALAR_GATE": scalar_gate,
         "num_warps": 4,
     }
     value_tiles = value_dim // block_value_dim
@@ -499,9 +531,10 @@ def _delta_h_launch(
             schedule,
         )
     if sequence_workers:
-        # Keep one machine-sized wave warp-specialized, then stride persistent workers
-        # over the remaining work; Triton cannot warp-specialize the nested loop. This
-        # reduced N=512, M=32 graph replay from 1.22 ms to 0.68 ms on B200.
+        # Keep one machine-sized wave on the primary schedule, then stride persistent
+        # workers over the remaining work. Blackwell warp-specializes the first launch;
+        # Hopper uses ordinary pipelining. This reduced N=512, M=32 graph replay from
+        # 1.22 ms to 0.68 ms on B200.
         chunk_delta_h_kernel_k128_wsp[(sequence_workers, value_tiles)](
             *kernel_args,
             **kernel_options,
@@ -612,9 +645,11 @@ def chunk_gated_delta_rule_fwd_h(
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Run the fixed-length or packed inter-chunk KDA state recurrence.
+    """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
-    ``autotune`` is accepted for launcher-ABI parity with the other stages;
+    ``gk`` may hold one cumulative log2 decay per key channel (KDA) or one
+    scalar decay per head (GDN). ``autotune`` is accepted for launcher-ABI
+    parity with the other stages;
     the warp-specialized kernel has a single fixed configuration, so pinned
     and autotuned launches are identical.
     """
@@ -649,12 +684,12 @@ def chunk_gated_delta_rule_fwd_h(
         )
     if not (k.dtype == w.dtype == u.dtype):
         raise TypeError("the inter-chunk state recurrence requires matching k, w, and u dtypes")
-    if w.shape != k.shape or gk.shape != k.shape:
-        raise ValueError("k, w, and gk must have the same shape")
+    if w.shape != k.shape or gk.shape not in (k.shape, k.shape[:3]):
+        raise ValueError("w must match k and gk must have shape [B,T,H,K] or [B,T,H]")
     if u.shape != (batch, tokens, heads, value_dim):
         raise ValueError("u must have shape [B, T, H, V]")
-    if torch.cuda.get_device_capability(k.device)[0] < 10:
-        raise ValueError("the inter-chunk state recurrence requires CUDA capability 10.0 or newer")
+    if not torch.compiler.is_compiling() and get_device_properties(k.device).major < 8:
+        raise ValueError("the inter-chunk state recurrence requires CUDA capability 8.0 or newer")
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state_shape = (state_batch, heads, value_dim, key_dim)
     if state_indices is not None:
@@ -714,7 +749,7 @@ def chunk_gated_delta_rule_fwd_h(
             )
         return h, torch.empty_like(u), final_state
 
-    if not all(can_use_tma(t) for t in (k, w, u)):
+    if not all(can_use_tensor_descriptor(t) for t in (k, w, u)):
         raise ValueError(
             "the inter-chunk state recurrence requires 16-byte-aligned, "
             "last-dimension-contiguous k, w, and u"

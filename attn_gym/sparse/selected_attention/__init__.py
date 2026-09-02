@@ -1,5 +1,5 @@
 """Compressed sparse attention."""
 
-from .api import selected_attention
+from .api import AuxRequest, SelectedAttentionAux, selected_attention
 
-__all__ = ["selected_attention"]
+__all__ = ["AuxRequest", "SelectedAttentionAux", "selected_attention"]

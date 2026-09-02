@@ -183,6 +183,8 @@ def _selected_attention_with_causal_blocks(
     indexer_mask,
     attention_sink,
     sliding_window_size,
+    *,
+    return_aux=None,
 ):
     """Call selected_attention while preserving the completed-block constraint.
 
@@ -196,7 +198,7 @@ def _selected_attention_with_causal_blocks(
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
     backend = "triton" if query.device.type == "cuda" else "eager"
-    return selected_attention(
+    attn_result = selected_attention(
         query,
         local_kv,
         sparse_kv,
@@ -205,7 +207,12 @@ def _selected_attention_with_causal_blocks(
         None,
         sliding_window_size,
         backend=backend,
+        return_aux=return_aux,
     )
+
+    if return_aux is not None:
+        return *attn_result, selected_is_valid
+    return attn_result, selected_is_valid
 
 
 def CSA(
@@ -348,7 +355,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output = _selected_attention_with_causal_blocks(
+    attention_output, _selected_is_valid = _selected_attention_with_causal_blocks(
         Q,
         KV,
         compressed_kv,
@@ -365,6 +372,75 @@ def CSA(
         ],
         dim=-1,
     )
+
+
+def indexer_loss(
+    main_query: torch.Tensor,
+    selected_compressed_kv: torch.Tensor,
+    attention_lse: torch.Tensor,
+    selected_indexer_logits: torch.Tensor,
+    selected_is_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention
+
+    Args:
+        main_query: (B, H, S, D) — main attention queries (detached).
+        selected_compressed_kv: (B, H, S, K, D) — the K compressed keys selected
+            by the indexer for each query position (detached).
+        attention_lse: (B, H, S) — log-sum-exp returned by selected_attention.
+            This includes the sliding window, sparse, AND sink contributions.
+        selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
+            the K selected keys.
+        selected_is_valid: (B, S, K) — boolean mask that is True for causally
+            valid block selections and False for sentinel (-1) entries.
+
+    Returns:
+        Scalar KL-divergence loss (mean over batch and sequence).
+    """
+    head_dim = main_query.shape[-1]
+    softmax_scale = head_dim**-0.5
+
+    compressed_attention_logits = (
+        torch.einsum(
+            "bhsd,bhskd->bhsk",
+            main_query.detach().float(),
+            selected_compressed_kv.detach().float(),
+        )
+        * softmax_scale
+    )
+
+    full_attention_lse = attention_lse.detach().float()
+
+    per_head_compressed_probs = torch.exp(
+        compressed_attention_logits - full_attention_lse[..., None]
+    )
+    compressed_teacher_mass = per_head_compressed_probs.sum(dim=1)
+
+    # Normalize so we have a valid kl divergence
+    eps = torch.finfo(torch.float32).tiny
+    valid_f = selected_is_valid.float()
+    compressed_teacher_mass = compressed_teacher_mass * valid_f
+    compressed_teacher_probs = (
+        compressed_teacher_mass / compressed_teacher_mass.sum(dim=-1, keepdim=True).clamp_min(eps)
+    ).detach()
+
+    masked_logits = selected_indexer_logits.float().masked_fill(~selected_is_valid, float("-inf"))
+    row_has_valid = selected_is_valid.any(dim=-1)
+    masked_logits = torch.where(
+        row_has_valid[..., None],
+        masked_logits,
+        torch.zeros_like(masked_logits),
+    )
+    indexer_probs = F.softmax(masked_logits, dim=-1)
+
+    # Return KL
+    kl = (
+        compressed_teacher_probs
+        * (compressed_teacher_probs.clamp_min(eps).log() - indexer_probs.clamp_min(eps).log())
+    ).sum(dim=-1)
+
+    valid_kl = torch.where(row_has_valid, kl, torch.zeros_like(kl))
+    return valid_kl.sum() / row_has_valid.sum().clamp_min(1)
 
 
 def main() -> None:

@@ -29,6 +29,9 @@ Notes:
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
+- `[tests]` currently brings FlashAttention's CuTeDSL 4.6 pin and cannot be combined with the
+  CuTeDSL 4.7+ `[mega]` extra. For Mega worktrees, install `-e '.[mega,dev]' pytest pytest-xdist`
+  instead; Mega tests import-skip optional FlashAttention coverage.
 
 ## Running commands
 

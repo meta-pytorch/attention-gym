@@ -98,6 +98,7 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 from .common.elementwise import softplus
 from .common.host import get_dtype
+from .common.paged_state import resolve_paged_state
 from .common.split_k import (
     ORDER_CAPACITY,
     ORDER_ELEMS,
@@ -115,6 +116,7 @@ from .common.tvm_ffi import (
     make_compact_signature_tensor,
     make_counter_signature,
     make_cu_seqlens_signature,
+    make_paged_route_signatures,
     make_strided_signature_tensor,
     make_work_items_signature,
     make_workspace_signature,
@@ -1266,8 +1268,6 @@ def mma_warp(
         for local_idx in cutlass.range(n_local):  # noqa: B007
             if cutlass.const_expr(cfg.use_initial_state):
                 if local_idx == 0:
-                    if elect_one:
-                        bars.mb_state_acc_ready[kv_acc_index.idx].arrive(cta_group=1)
                     kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
             have_state = (
                 cutlass.Boolean(True)
@@ -2163,12 +2163,20 @@ def compute1_warp_group(
     sCheckpoint_raw,
     mState_init,
     mState_out,
+    mStateIndices,
+    mHasInitialState,
     checkpoint_every_n_tokens,
     sSched,
     bars,
 ):
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
-    running the per-chunk state-update and output epilogues."""
+    running the per-chunk state-update and output epilogues.
+
+    With ``cfg.paged_state`` the state tensors are one shared pool and
+    ``mStateIndices[batch_idx]`` selects the slot. Non-positive routes are
+    null: they zero the output tile and never touch the pool. A false
+    ``mHasInitialState[batch_idx]`` seeds a fresh slot from zero instead of
+    the pool contents."""
     elect_one = nvvm.elect_sync()
 
     v_index = PipelineState.start(phase=0)
@@ -2251,14 +2259,19 @@ def compute1_warp_group(
         if cutlass.const_expr(cfg.enable_checkpoints):
             ckpt_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = cstart % ckpt_chunks
+        state_slot, state_valid, seed_from_pool, clear_empty = resolve_paged_state(
+            batch_idx, mStateIndices, mHasInitialState
+        )
         if n_local > 0:
             if cutlass.const_expr(cfg.use_initial_state):
                 # ---- initial-state seed: initial_state GMEM -> state TMEM ---------------
-                gState_init = mState_init[None, None, head_idx, batch_idx]
+                gState_init = mState_init[None, None, head_idx, state_slot]
                 kv_init_idx = state_acc_seed_index.idx
                 bars.mb_state_acc_scale_done[kv_init_idx].wait(state_acc_seed_index.phase)
                 state_acc_seed_index = advance(state_acc_seed_index, cfg.tmem_state_acc_stages)
                 seed_from_initial_state = cstart == 0
+                if cutlass.const_expr(cfg.paged_state):
+                    seed_from_initial_state = seed_from_initial_state and seed_from_pool
                 if seed_from_initial_state:
                     for sub in cutlass.range_constexpr(num_state_subs):
                         words = []
@@ -2339,8 +2352,11 @@ def compute1_warp_group(
                 # ---- state restage + rescale -------------------------------------
                 if valid_state:
                     kv_idx = kv_acc_index.idx
-                    bars.mb_state_acc_ready[kv_idx].wait(kv_acc_index.phase)
-                    kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
+                    # CG1 writes the seeded state itself; only subsequent states
+                    # arrive through the MMA-owned state accumulator barrier.
+                    if local_idx > 0:
+                        bars.mb_state_acc_ready[kv_idx].wait(kv_acc_index.phase)
+                        kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
                     kv_done_idx = kv_idx
 
                     state_regs = [
@@ -2653,6 +2669,13 @@ def compute1_warp_group(
                     )
                     o_regs.append([o_vec[k] for k in range(32)])
                 nvvm.tcgen05_wait("load")
+                if cutlass.const_expr(cfg.paged_state):
+                    # NOTE: Select rather than multiply because null-route padding
+                    # may contain NaNs and must still produce exact zeros.
+                    o_regs = [
+                        [val if state_valid else cutlass.Float32(0.0) for val in regs]
+                        for regs in o_regs
+                    ]
                 o_idx = o_index.idx
                 bars.mb_o_tmastg_done[o_idx].wait(o_index.phase)
                 o_index = advance(o_index, cfg.smem_o_stages)
@@ -2686,8 +2709,11 @@ def compute1_warp_group(
             bars.mb_state_acc_ready[kv_last_idx].wait(kv_acc_index.phase)
             kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
             if cutlass.const_expr(cfg.store_final_state):
-                if wend == num_chunks_b:
-                    gState_out = mState_out[None, None, head_idx, batch_idx]
+                store_final = wend == num_chunks_b
+                if cutlass.const_expr(cfg.paged_state):
+                    store_final = store_final and state_valid
+                if store_final:
+                    gState_out = mState_out[None, None, head_idx, state_slot]
                     for sub in cutlass.range_constexpr(num_state_subs):
                         state_vec = nvvm.tcgen05_ld(
                             "32x32b",
@@ -2708,10 +2734,14 @@ def compute1_warp_group(
         else:
             if cutlass.const_expr(cfg.store_final_state):
                 write_passthrough = wend == num_chunks_b
+                if cutlass.const_expr(cfg.paged_state):
+                    # An empty sequence on a fresh slot clears it; a resumed slot is
+                    # already in place and a null route is left untouched.
+                    write_passthrough = write_passthrough and clear_empty
                 if write_passthrough:
-                    gState_out = mState_out[None, None, head_idx, batch_idx]
-                    if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_idx, batch_idx]
+                    gState_out = mState_out[None, None, head_idx, state_slot]
+                    if cutlass.const_expr(cfg.use_initial_state and not cfg.paged_state):
+                        gState_in = mState_init[None, None, head_idx, state_slot]
                         for sub in cutlass.range_constexpr(num_state_subs):
                             for k in cutlass.range_constexpr(32):
                                 gState_out[cg1_tidx, sub * ldtm_width + k] = gState_in[
@@ -3048,6 +3078,8 @@ def host(
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
+    state_indices: Optional[cute.Tensor],
+    has_initial_state: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
     sched_ctr: Optional[cute.Tensor],
@@ -3234,6 +3266,8 @@ def host(
         cu_seqlens,
         state_in,
         state_out,
+        state_indices,
+        has_initial_state,
         work_items,
         work_count,
         sched_ctr,
@@ -3267,6 +3301,8 @@ def kernel(
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
+    mStateIndices: Optional[cute.Tensor],
+    mHasInitialState: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mSched: Optional[cute.Tensor],
@@ -3299,6 +3335,12 @@ def kernel(
         assert mState_out is not None, "mState_out must be provided if store_final_state is True"
     else:
         assert mState_out is None, "mState_out must be None if store_final_state is False"
+    if cutlass.const_expr(cfg.paged_state):
+        assert mStateIndices is not None, "mStateIndices must be provided if paged_state is True"
+    else:
+        assert mStateIndices is None, "mStateIndices must be None if paged_state is False"
+    if cutlass.const_expr(not cfg.paged_state):
+        assert mHasInitialState is None, "mHasInitialState requires paged_state"
 
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -3409,51 +3451,52 @@ def kernel(
         beta_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) ---------------------------------------------
-    for s in range(cfg.smem_kq_stages):
-        bars.mb_kq_ready[s].init()
-        bars.mb_kq_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.smem_beta_stages):
-        bars.mb_beta_ready[s].init()
-        bars.mb_beta_done[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_ready[s].init()
-        bars.mb_state_acc_scale_done[s].init()
-    for s in range(cfg.tmem_q_state_acc_stages):
-        bars.mb_o_acc_ready[s].init()
-        bars.mb_o_final_acc_ready[s].init()
-        bars.mb_o_state_scale_acc_done[s].init()
-    for s in range(cfg.tmem_cg0_acc_stages):
-        bars.mb_cg0_acc_ready[s].init()
-        bars.mb_cg0_acc_done[s].init()
-    bars.mb_k_state_acc_ready[0].init()
-    bars.mb_u_acc_ready[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.smem_a_stages):
-        bars.mb_a_ready[s].init()
-        bars.mb_a_done[s].init()
-    for s in range(cfg.tmem_state_inp_stages):
-        bars.mb_state_inp_ready[s].init()
-    for b in (bars.mb_y_inp_ready, bars.mb_u_inp_ready, bars.mb_decay_u_inp_ready):
-        b[0].init()
-    for s in range(cfg.smem_o_stages):
-        bars.mb_o_tmastg_ready[s].init()
-        bars.mb_o_tmastg_done[s].init()
-    for s in range(cfg.smem_checkpoint_stages):
-        bars.mb_checkpoint_tmastg_ready[s].init()
-        bars.mb_checkpoint_tmastg_done[s].init()
-    for s_ in range(cfg.sched_stages):
-        bars.mb_sched_ready[s_].init()
-        bars.mb_sched_done[s_].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init -----------------------------------------------------------
+    if tidx == 0:
+        for s in range(cfg.smem_kq_stages):
+            bars.mb_kq_ready[s].init()
+            bars.mb_kq_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.smem_beta_stages):
+            bars.mb_beta_ready[s].init()
+            bars.mb_beta_done[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_ready[s].init()
+            bars.mb_state_acc_scale_done[s].init()
+        for s in range(cfg.tmem_q_state_acc_stages):
+            bars.mb_o_acc_ready[s].init()
+            bars.mb_o_final_acc_ready[s].init()
+            bars.mb_o_state_scale_acc_done[s].init()
+        for s in range(cfg.tmem_cg0_acc_stages):
+            bars.mb_cg0_acc_ready[s].init()
+            bars.mb_cg0_acc_done[s].init()
+        bars.mb_k_state_acc_ready[0].init()
+        bars.mb_u_acc_ready[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.smem_a_stages):
+            bars.mb_a_ready[s].init()
+            bars.mb_a_done[s].init()
+        for s in range(cfg.tmem_state_inp_stages):
+            bars.mb_state_inp_ready[s].init()
+        for b in (bars.mb_y_inp_ready, bars.mb_u_inp_ready, bars.mb_decay_u_inp_ready):
+            b[0].init()
+        for s in range(cfg.smem_o_stages):
+            bars.mb_o_tmastg_ready[s].init()
+            bars.mb_o_tmastg_done[s].init()
+        for s in range(cfg.smem_checkpoint_stages):
+            bars.mb_checkpoint_tmastg_ready[s].init()
+            bars.mb_checkpoint_tmastg_done[s].init()
+        for s_ in range(cfg.sched_stages):
+            bars.mb_sched_ready[s_].init()
+            bars.mb_sched_done[s_].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -3507,6 +3550,8 @@ def kernel(
             sCheckpoint_raw=sCheckpoint_raw,
             mState_init=mState_init,
             mState_out=mState_out,
+            mStateIndices=mStateIndices,
+            mHasInitialState=mHasInitialState,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             sSched=sSched,
             bars=bars,
@@ -3606,6 +3651,7 @@ class GdnCfg:
     use_initial_state: bool
     store_final_state: bool
     enable_checkpoints: bool
+    paged_state: bool = False
     log_gate: bool = False
     safe_gate: bool = False
     beta_sigmoid: bool = False
@@ -3688,6 +3734,7 @@ def build_cfg(
     safe_gate: bool = False,
     beta_sigmoid: bool = False,
     dyn_sched: bool = False,
+    paged_state: bool = False,
 ) -> GdnCfg:
     """Build the per-compile ``GdnCfg`` (io_dtype ∈ {Float16, BFloat16};
     acc is always Float32)."""
@@ -3695,6 +3742,8 @@ def build_cfg(
         raise ValueError(
             f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported"
         )
+    if paged_state and not (use_initial_state and store_final_state):
+        raise ValueError("paged_state requires use_initial_state and store_final_state")
     cfg = GdnCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
@@ -3704,6 +3753,7 @@ def build_cfg(
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        paged_state=paged_state,
         log_gate=log_gate,
         safe_gate=safe_gate,
         beta_sigmoid=beta_sigmoid,
@@ -3756,6 +3806,8 @@ def get_compiled_cache(
     dyn_sched: bool,
     order_gen: bool,
     use_int64_offsets: bool,
+    paged_state: bool,
+    has_initial_state_mask: bool,
     device_index: int,
     device_major: int,
     device_minor: int,
@@ -3785,8 +3837,14 @@ def compile(
     num_sm: int,
     checkpoint_every_n_tokens: int,
     scale: float,
+    paged_state: bool = False,
+    has_initial_state_mask: bool = False,
 ):
-    """JIT-compile one fake-tensor TVM-FFI GDN prefill signature."""
+    """JIT-compile one fake-tensor TVM-FFI GDN prefill signature.
+
+    ``has_initial_state_mask`` only selects whether the paged signature carries the
+    optional per-sequence seed mask; the kernel keys on the tensor's presence.
+    """
     cfg = build_cfg(
         io_dtype,
         state_dtype,
@@ -3799,17 +3857,38 @@ def compile(
         safe_gate=safe_gate,
         beta_sigmoid=beta_sigmoid,
         dyn_sched=dyn_sched,
+        paged_state=paged_state,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
         sym_int() for _ in range(6)
     )
+    # The paged pool has its own slot count, decoupled from the sequence count.
+    state_rows = sym_int() if paged_state else sequences
     tma_tensor = partial(
         make_strided_signature_tensor,
         assumed_align=16,
         use_int64_offsets=use_int64_offsets,
     )
     beta_dtype = io_dtype if beta_sigmoid else cutlass.Float32
+    state_input_signature = (
+        tma_tensor(state_dtype, (state_rows, n_heads_out, 128, 128))
+        if use_initial_state
+        else None
+    )
+    state_output_signature = (
+        state_input_signature
+        if paged_state
+        else tma_tensor(state_dtype, (state_rows, n_heads_out, 128, 128))
+        if store_final_state
+        else None
+    )
+    if paged_state:
+        state_indices_signature, state_mask_signature = make_paged_route_signatures(
+            sequences, has_initial_state=has_initial_state_mask
+        )
+    else:
+        state_indices_signature = state_mask_signature = None
     return compile_tvm_ffi(
         host,
         cfg,
@@ -3836,8 +3915,10 @@ def compile(
         ),
         tma_tensor(io_dtype, (tokens, n_heads_out, 128)),
         make_cu_seqlens_signature(sequence_entries),
-        tma_tensor(state_dtype, (sequences, n_heads_out, 128, 128)) if use_initial_state else None,
-        tma_tensor(state_dtype, (sequences, n_heads_out, 128, 128)) if store_final_state else None,
+        state_input_signature,
+        state_output_signature,
+        state_indices_signature,
+        state_mask_signature,
         make_work_items_signature(work_rows),
         make_counter_signature(),
         make_counter_signature(sched_entries) if dyn_sched else None,
@@ -3851,6 +3932,7 @@ def compile(
             f"_i{int(use_initial_state)}f{int(store_final_state)}c{int(enable_checkpoints)}"
             f"_l{int(log_gate)}s{int(safe_gate)}b{int(beta_sigmoid)}"
             f"_d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+            f"_p{int(paged_state)}m{int(has_initial_state_mask)}"
         ),
     )
 
@@ -3886,12 +3968,18 @@ def chunk_gdn_sm100(
     work_item_scratch=None,
     *,
     tensormap_workspace,
+    state_indices=None,
+    has_initial_state=None,
 ) -> None:
     """Execute the Blackwell BT=64 scalar-GDN prefill kernel.
 
     ``gate`` is scalar ``(total_tokens, HO)``. With ``log_gate=True``, its values are
     natural-log decays; the kernel converts them to the log2 domain internally.
     Outer tensor strides are dynamic, while innermost dimensions must be contiguous.
+
+    ``state_indices`` switches to paged mode: ``initial_state`` and ``output_state``
+    must then alias one ``(slots, HO, 128, 128)`` pool. Non-positive routes are null;
+    the optional uint8 ``has_initial_state`` mask selects resumed versus fresh slots.
     """
     for name, tensor in (("q", q), ("k", k), ("v", v), ("output", output)):
         validate_tma_tensor(name, tensor)
@@ -3958,6 +4046,10 @@ def chunk_gdn_sm100(
         and initial_state.dtype != output_state.dtype
     ):
         raise ValueError("initial_state and output_state dtypes must match")
+    paged_state = state_indices is not None
+    has_initial_state_mask = has_initial_state is not None
+    if paged_state and (initial_state is None or initial_state is not output_state):
+        raise ValueError("paged mode requires one aliased input/output state pool")
     if initial_state is not None:
         state_dtype_src = initial_state.dtype
     elif output_state is not None:
@@ -3993,6 +4085,8 @@ def chunk_gdn_sm100(
         work_count,
         sched_ctr,
         tensormap_workspace,
+        state_indices,
+        has_initial_state,
     )
     device_index = tensor_device_index(q)
     if current_device() != device_index:
@@ -4015,6 +4109,8 @@ def chunk_gdn_sm100(
         dyn_sched,
         order_gen,
         use_int64_offsets,
+        paged_state,
+        has_initial_state_mask,
         device_index,
         device_properties.major,
         device_properties.minor,
@@ -4042,6 +4138,8 @@ def chunk_gdn_sm100(
             num_sm=num_sm,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             scale=scale,
+            paged_state=paged_state,
+            has_initial_state_mask=has_initial_state_mask,
         )
 
     if "prologue" not in cache:
@@ -4108,6 +4206,8 @@ def chunk_gdn_sm100(
         cu_seqlens,
         initial_state if use_initial_state else None,
         output_state if store_final_state else None,
+        state_indices,
+        has_initial_state,
         work_items,
         work_count,
         sched_ctr,

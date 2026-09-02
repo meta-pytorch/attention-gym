@@ -98,17 +98,20 @@ output projection.
 
 The short convolution all-gathers one fixed-size `W - 1` token halo per rank and routes its initial-
 state gradient back to the ranks that own those tokens. The KDA recurrence separately computes
-forward and reverse `[bias; transition]` state summaries with Blackwell TMA/UMMA kernels, all-gathers
-them, and composes the relevant prefix or suffix before running the ordinary local KDA kernel. A
-contiguous rank boundary is one cut in the packed token stream, so it can split at most one logical
+forward and reverse `[bias; transition]` state summaries with portable Triton kernels on Hopper or
+native TMA/UMMA kernels on SM100, all-gathers them, and composes the relevant prefix or suffix
+before running the ordinary local KDA kernel. A contiguous rank boundary is one cut in the packed
+token stream, so it can split at most one logical
 sequence. The example validates local outputs, convolution and KDA endpoint states, input gradients,
 and all-reduced parameter gradients against the complete unsharded module. It can also capture the
 full forward, NCCL communication, and backward in one CUDA Graph and validate a changed-input
-replay. Add `--profile` to use transformer-nuggets to export one merged multi-rank trace in native
-Perfetto `.pftrace` format.
+replay. Use `--compute-dtype=float16` to exercise the FP16 route. Add `--profile` to use
+transformer-nuggets to export one merged multi-rank trace in native Perfetto `.pftrace` format.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
+
+torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --compute-dtype=float16
 
 torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
 

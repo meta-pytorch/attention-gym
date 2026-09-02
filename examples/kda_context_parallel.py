@@ -7,10 +7,11 @@ equal contiguous token shard. Launch with:
 
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 
-Add ``--cuda-graph`` to capture forward and backward together and validate a replay with
-changed inputs. Add ``--profile`` to export a merged native Perfetto trace using
-transformer-nuggets. The example requires one Blackwell GPU per rank because the fused KDA backend
-currently targets SM100 or newer.
+Add ``--compute-dtype=float16`` to validate the FP16 route. Add ``--cuda-graph`` to capture
+forward and backward together and validate a replay with changed inputs. Add ``--profile`` to
+export a merged native Perfetto trace using transformer-nuggets. The example requires one Hopper
+or datacenter Blackwell GPU per rank. Affine summaries use portable Triton kernels on Hopper and
+native UMMA kernels on SM100.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import torch.nn.functional as F
 import typer
 from torch.distributed._functional_collectives import all_gather_single
 
+from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
@@ -40,12 +42,11 @@ from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _finish_chunk_kda_fwd,
-    _normalize_packed_cotangent,
     _prepare_chunk_kda_fwd,
 )
 from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.testing import kernel_stage, record_distributed_profile
-from examples.kda_training import KDAAttention, KDAAttentionOutput
+from examples.kda_training import ComputeDTypeOption, KDAAttention, KDAAttentionOutput
 
 # The private prepare/finish seams avoid repeating factor computation around collectives.
 # TODO: Promote those seams before moving this orchestration out of the example.
@@ -305,9 +306,9 @@ class ContextParallelKDAFunction(torch.autograd.Function):
         if d_output is None:
             d_output = torch.zeros_like(v)
         else:
-            d_output = _normalize_packed_cotangent(d_output)
+            d_output = normalize_compact_tensor(d_output)
         if d_final_state is not None:
-            d_final_state = _normalize_packed_cotangent(d_final_state.float())
+            d_final_state = normalize_compact_tensor(d_final_state.float())
         prepared = _prepare_chunk_kda_bwd(
             q,
             k,
@@ -727,6 +728,10 @@ def main(
     ] = "256,1280,512",
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 256,
     heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 2,
+    compute_dtype: Annotated[
+        ComputeDTypeOption,
+        typer.Option(help="Use float16 or bfloat16 projection and kernel inputs."),
+    ] = ComputeDTypeOption.BFLOAT16,
     short_conv_kernel_size: Annotated[
         int,
         typer.Option(min=1, help="Causal Q/K/V convolution width."),
@@ -787,6 +792,7 @@ def main(
         "head_dim": 128,
         "short_conv_kernel_size": short_conv_kernel_size,
         "backend": "fused",
+        "compute_dtype": getattr(torch, compute_dtype.value),
         "device": device,
     }
     make_model = partial(
@@ -822,8 +828,8 @@ def main(
     profile_mode = "cuda_graph" if cuda_graph else "eager"
     profile_path = Path(
         "data",
-        f"kda_context_parallel_{profile_mode}_w{world_size}_t{tokens}_h{heads}"
-        f"_c{hidden_size}_conv{short_conv_kernel_size}",
+        f"kda_context_parallel_{profile_mode}_{compute_dtype.value}_w{world_size}_t{tokens}"
+        f"_h{heads}_c{hidden_size}_conv{short_conv_kernel_size}",
     ).resolve()
     if cuda_graph:
         validate_cuda_graph(

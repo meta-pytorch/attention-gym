@@ -20,7 +20,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         doc_ids: torch.Tensor | None,
         sliding_window_size: int,
         share_kv: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
             local_kv = local_kv.expand(-1, query.shape[1], -1, -1)
@@ -50,10 +50,11 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         ctx.doc_ids = doc_ids
         ctx.sliding_window_size = sliding_window_size
         ctx.share_kv = share_kv
-        return output
+        ctx.mark_non_differentiable(lse)
+        return output, lse
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor, grad_lse: torch.Tensor):
         (
             query,
             sparse_kv,
@@ -92,7 +93,7 @@ def selected_attention(
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton implementation of selected attention.
 
     Args:
@@ -106,7 +107,8 @@ def selected_attention(
         share_kv: if True, broadcast single-head KV and return single-head gradients.
 
     Returns:
-        Attention output with same shape as query.
+        Tuple of (output, lse) where output has same shape as query and lse has
+        shape (batch, heads, seq_len).
     """
     heads = query.shape[1]
 
@@ -143,4 +145,4 @@ def selected_attention(
         sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
     return _launch_forward(
         query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
-    )[0]
+    )

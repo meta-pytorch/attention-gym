@@ -130,6 +130,34 @@ def tensor_supports_tma(tensor: torch.Tensor) -> bool:
     )
 
 
+def tensor_supports_tma_rows(tensor: torch.Tensor) -> bool:
+    """Return whether the last two modes form aligned, compact rows for TMA kernels."""
+    return (
+        tensor.ndim >= 2 and tensor.stride(-2) == tensor.shape[-1] and tensor_supports_tma(tensor)
+    )
+
+
+def normalize_tma_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy unless the tensor satisfies the aligned, compact-row TMA contract."""
+    if tensor_supports_tma_rows(tensor):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+def normalize_compact_tensor(
+    tensor: torch.Tensor,
+    *,
+    alignment_bytes: int = 128,
+) -> torch.Tensor:
+    """Copy unless the full tensor is compact with aligned slice origins."""
+    if tensor.is_contiguous() and tensor_supports_contiguous_dim(
+        tensor,
+        alignment_bytes=alignment_bytes,
+    ):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
 def compile_tvm_ffi(
     entrypoint: Any,
     *compile_args: Any,
@@ -177,6 +205,9 @@ __all__ = [
     "compile_tvm_ffi",
     "get_device_properties",
     "make_fake_strided_tensor",
+    "normalize_compact_tensor",
+    "normalize_tma_rows",
     "tensor_supports_contiguous_dim",
     "tensor_supports_tma",
+    "tensor_supports_tma_rows",
 ]

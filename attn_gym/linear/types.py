@@ -7,6 +7,21 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
+from typing import Literal, TypedDict
+
+
+class BackendOptions(TypedDict, total=False):
+    """Backend selection shared by optimized linear-attention operations."""
+
+    backend: Literal["fused", "mega"]
+    """Select the repo-local fused backend or the optional Mega backend."""
+
+
+class KernelOptions(BackendOptions, total=False):
+    """KDA backend controls and experimental scheduling options."""
+
+    split_backward: bool
+    """Allow KDA Mega to use its approximate split-backward schedule."""
 
 
 class Impl(str, Enum):
@@ -25,4 +40,4 @@ def resolve_impl(impl: Impl | str) -> Impl:
         raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
 
 
-__all__ = ["Impl", "resolve_impl"]
+__all__ = ["BackendOptions", "Impl", "KernelOptions", "resolve_impl"]

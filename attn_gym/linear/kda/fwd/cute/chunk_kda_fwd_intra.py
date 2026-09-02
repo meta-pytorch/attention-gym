@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# KDA forward factor composition. BF16 uses the persistent intra engine; FP16
-# uses the FP32/TF32 diagonal stage plus CuTe K3b/K4b to preserve gate range.
+# KDA forward factor composition. SM100/SM103 retains its CuTe factor engines;
+# every other supported GPU uses the FP32/TF32 BC16 stage plus Triton K3/K4.
 
 from __future__ import annotations
 
@@ -27,6 +27,13 @@ from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k3_triton import (
+    chunk_kda_fwd_k3b_triton,
+)
+from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k4_triton import (
+    chunk_kda_fwd_k4b_triton,
+)
+from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
 def chunk_kda_fwd_factors(
@@ -49,6 +56,11 @@ def chunk_kda_fwd_factors(
     if isinstance(k, FakeTensor):
         shape = (batch, tokens, heads, chunk_size)
         return k.new_empty(shape), k.new_empty(shape)
+
+    if not is_sm100_kda_target(k.device):
+        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(q, k, gk, beta, scale, metadata, chunk_size)
+        AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata)
+        return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
 
     if q.dtype == torch.float16:
         # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their

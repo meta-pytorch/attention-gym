@@ -45,7 +45,10 @@ from attn_gym.testing.kda import (
     bwd_wy_dqkg_reference as _bwd_wy_dqkg_ref,
 )
 
-IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+    (10, 0),
+    (10, 3),
+)
 
 try:
     from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_bwd
@@ -699,8 +702,8 @@ def _fwd_h_ref(k, w, v, gk, h0, chunk_size=64):
     ids=["single-fp16", "multi-state-bf16", "tail-bf16"],
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the KDA recurrence requires CUDA capability 10.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the KDA recurrence requires CUDA capability 8.0",
 )
 def test_chunk_delta_h_fwd(dtype, T, use_h0):
     torch.manual_seed(12)
@@ -735,8 +738,8 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="the KDA recurrence requires CUDA capability 10.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the KDA recurrence requires CUDA capability 8.0",
 )
 def test_chunk_delta_h_fwd_fp32_path():
     """FP32 takes the non-warp-specialized BV=32 launch; dots still run in TF32."""

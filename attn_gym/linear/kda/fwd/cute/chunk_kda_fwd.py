@@ -1,4 +1,4 @@
-"""Composed fixed-length and packed Blackwell KDA core forward."""
+"""Composed fixed-length and packed architecture-routed KDA core forward."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import torch
 
 from attn_gym._backends.cute import (
     get_device_properties,
-    tensor_supports_contiguous_dim,
-    tensor_supports_tma,
+    normalize_compact_tensor,
+    normalize_tma_rows,
+    tensor_supports_tma_rows,
 )
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
@@ -36,31 +37,12 @@ from attn_gym.linear.kda.ops import (
 from attn_gym.linear.kda.ops import (
     chunk_fwd_with_state_op as _chunk_kda_fwd_with_state_op,
 )
-from attn_gym.linear.kda.utils import profiler_range
+from attn_gym.linear.kda.utils import is_sm100_kda_target, profiler_range
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
-
-
-def _has_supported_qkv_layout(tensor: torch.Tensor) -> bool:
-    """Return whether QKV rows satisfy the vectorized kernel input contract."""
-    return tensor.stride(-2) == tensor.shape[-1] and tensor_supports_tma(tensor)
-
-
-def _normalize_qkv_layout(tensor: torch.Tensor) -> torch.Tensor:
-    """Copy only layouts unsupported by one or more composed KDA stages."""
-    if _has_supported_qkv_layout(tensor):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
-
-
-def _normalize_packed_cotangent(tensor: torch.Tensor) -> torch.Tensor:
-    """Provide the compact 128-byte-aligned ABI required by packed token gradients."""
-    if tensor.is_contiguous() and tensor_supports_contiguous_dim(tensor, alignment_bytes=128):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 def _normalize_state_cotangent(tensor: torch.Tensor) -> torch.Tensor:
@@ -94,13 +76,13 @@ def _validate_private_abi(
         raise ValueError("the private chunk_kda ABI requires a contiguous state key mode")
     if not all(tensor.is_contiguous() for tensor in contiguous_tensors):
         raise ValueError("the private chunk_kda ABI requires contiguous gate and beta")
-    if not all(_has_supported_qkv_layout(tensor) for tensor in (q, k, v)):
+    if not all(tensor_supports_tma_rows(tensor) for tensor in (q, k, v)):
         raise ValueError(
             "the private chunk_kda ABI requires QKV to have contiguous heads and "
             "16-byte-aligned token rows"
         )
-    if get_device_properties(q.device).major < 10:
-        raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
+    if get_device_properties(q.device).major < 8:
+        raise ValueError("the fused KDA core requires CUDA capability 8.0 or newer")
 
 
 def _validate_paged_private_abi(
@@ -277,7 +259,7 @@ def _chunk_kda_fwd_shared(
     output_final_state: bool,
 ):
     """Keep the complete composed forward behind one compiler-opaque boundary."""
-    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     return _chunk_kda_fwd(
         q,
@@ -356,7 +338,7 @@ def _chunk_kda_fwd_ragged_shared(
     output_final_state: bool,
 ):
     """Run ragged forward with caller-prepared routing and fixed-schema factors."""
-    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     metadata = RaggedChunkMetadata(
         cu_seqlens,
@@ -448,7 +430,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     chunk_offsets: torch.Tensor,
     autotune: bool,
 ) -> torch.Tensor:
-    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
         q,
         k,
@@ -509,16 +491,20 @@ def _prepare_chunk_kda_backward(
             chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
             _CHUNK_SIZE,
         )
-    q, k, v = (_normalize_qkv_layout(tensor) for tensor in (q, k, v))
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
     if d_output is None:
         d_output = v.new_zeros(v.shape)
     elif metadata is not None:
-        d_output = _normalize_packed_cotangent(d_output)
+        d_output = normalize_compact_tensor(d_output)
     else:
-        d_output = _normalize_qkv_layout(d_output)
+        d_output = normalize_tma_rows(d_output)
     if d_final_state is not None:
         d_final_state = _normalize_state_cotangent(d_final_state.float())
+    if not is_sm100_kda_target(q.device):
+        d_output = d_output.contiguous()
+        if d_final_state is not None:
+            d_final_state = d_final_state.contiguous()
     return q, k, v, metadata, d_output, d_final_state
 
 

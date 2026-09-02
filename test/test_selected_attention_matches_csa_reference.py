@@ -13,8 +13,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
+
 ATOL = 1e-8
 RTOL = 1e-5
+INDEXER_LOSS_DEVICES = [
+    torch.device("cpu"),
+    pytest.param(
+        torch.device("cuda"),
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    ),
+]
 
 pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
 
@@ -389,3 +398,487 @@ def test_selected_attention_matches_csa_reference_cuda_fp64():
     assert actual.device.type == expected.device.type == "cuda"
     assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end indexer_loss tests.
+# ---------------------------------------------------------------------------
+
+
+def _indexer_loss_oracle(
+    main_query: torch.Tensor,
+    selected_compressed_kv: torch.Tensor,
+    attention_lse: torch.Tensor,
+    selected_indexer_logits: torch.Tensor,
+    selected_is_valid: torch.Tensor,
+) -> torch.Tensor:
+    query = main_query.detach().to(torch.float32)
+    keys = selected_compressed_kv.detach().to(torch.float32)
+    selected_attention_logits = torch.matmul(query.unsqueeze(-2), keys.transpose(-2, -1)).squeeze(
+        -2
+    ) / math.sqrt(query.shape[-1])
+    teacher_mass = torch.exp(
+        selected_attention_logits - attention_lse.detach().to(torch.float32).unsqueeze(-1)
+    ).sum(dim=1)
+    teacher_mass = torch.where(selected_is_valid, teacher_mass, 0.0)
+    teacher_probs = teacher_mass / teacher_mass.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+
+    valid_rows = selected_is_valid.any(dim=-1)
+    student_logits = selected_indexer_logits.to(torch.float32).masked_fill(
+        ~selected_is_valid, float("-inf")
+    )
+    student_logits = torch.where(valid_rows.unsqueeze(-1), student_logits, 0.0)
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    student_log_probs = torch.where(selected_is_valid, student_log_probs, 0.0)
+    row_kl = (
+        torch.special.xlogy(teacher_probs, teacher_probs) - teacher_probs * student_log_probs
+    ).sum(dim=-1)
+    valid_row_kl = torch.where(valid_rows, row_kl, 0.0)
+    return valid_row_kl.sum() / valid_rows.sum().clamp_min(1)
+
+
+def _make_indexer_loss_inputs(device, all_invalid):
+    generator = torch.Generator(device=device).manual_seed(1234)
+    batch, heads, sequence_length, num_topk_blocks, head_dim = 2, 2, 4, 3, 8
+    query = torch.randn(
+        batch,
+        heads,
+        sequence_length,
+        head_dim,
+        device=device,
+        generator=generator,
+    )
+    selected_kv = torch.randn(
+        batch,
+        heads,
+        sequence_length,
+        num_topk_blocks,
+        head_dim,
+        device=device,
+        generator=generator,
+    )
+    attention_logits = torch.matmul(query.unsqueeze(-2), selected_kv.transpose(-2, -1)).squeeze(
+        -2
+    ) / math.sqrt(head_dim)
+    other_logits = torch.randn(
+        batch, heads, sequence_length, 5, device=device, generator=generator
+    )
+    attention_lse = torch.logsumexp(torch.cat((attention_logits, other_logits), dim=-1), dim=-1)
+    indexer_logits = torch.randn(
+        batch, sequence_length, num_topk_blocks, device=device, generator=generator
+    )
+    selected_is_valid = torch.tensor(
+        [
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+        ],
+        device=device,
+    )
+    if all_invalid:
+        selected_is_valid = torch.zeros_like(selected_is_valid)
+    return query, selected_kv, attention_lse, indexer_logits, selected_is_valid
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
+def test_indexer_loss_all_invalid_backward(device):
+    query, selected_kv, attention_lse, indexer_logits, selected_is_valid = (
+        _make_indexer_loss_inputs(device, all_invalid=True)
+    )
+    indexer_logits.requires_grad_()
+
+    loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, indexer_logits, selected_is_valid
+    )
+
+    torch.testing.assert_close(loss, loss.new_zeros(()), atol=0.0, rtol=0.0)
+    loss.backward()
+    assert indexer_logits.grad is not None
+    torch.testing.assert_close(
+        indexer_logits.grad, torch.zeros_like(indexer_logits), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
+def test_indexer_loss_fullgraph_forward_backward(device):
+    query, selected_kv, attention_lse, indexer_logits, selected_is_valid = (
+        _make_indexer_loss_inputs(device, all_invalid=False)
+    )
+    eager_logits = indexer_logits.clone().requires_grad_()
+    compiled_logits = indexer_logits.clone().requires_grad_()
+
+    expected_loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, eager_logits, selected_is_valid
+    )
+    actual_loss = torch.compile(csa_example.indexer_loss, fullgraph=True)(
+        query, selected_kv, attention_lse, compiled_logits, selected_is_valid
+    )
+    expected_loss.backward()
+    actual_loss.backward()
+
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-6, rtol=1e-6)
+    assert eager_logits.grad is not None
+    assert compiled_logits.grad is not None
+    torch.testing.assert_close(compiled_logits.grad, eager_logits.grad, atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(compiled_logits.grad[selected_is_valid]) > 0
+    assert torch.count_nonzero(compiled_logits.grad[~selected_is_valid]) == 0
+
+
+@pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
+def test_end_to_end_indexer_loss(device):
+    """Run compress → index → selected_attention → indexer_loss end-to-end.
+
+    Uses share_kv=True with the standard _make_inputs config (num_heads=2,
+    per-head compression biases).  compression_rate=2 with sequence_length=5
+    means position 0 has no completed blocks, exercising the early-position
+    validity mask.
+    """
+    dtype = torch.float64
+    inputs = _make_inputs(share_kv=True, num_topk_blocks=2, dtype=dtype, device=device)
+    (
+        Q,
+        Q_I,
+        KV,
+        C_a,
+        C_b,
+        Z_a,
+        Z_b,
+        B_a,
+        B_b,
+        W_I,
+        K_Ia,
+        K_Ib,
+        Z_Ia,
+        Z_Ib,
+        B_Ia,
+        B_Ib,
+        KV_norm_weight,
+        compressed_indices_norm_weight,
+        compressed_kv_norm_weight,
+        attention_sink,
+        compression_rate,
+        num_topk_blocks,
+        sliding_window_size,
+        rope_dims,
+        _share_kv,
+    ) = inputs
+
+    b, num_heads, sequence_length, head_dim = Q.shape
+    _, num_index_heads, _, index_head_dim = Q_I.shape
+
+    # Expand shared KV heads (mirrors CSA internals)
+    KV = KV.expand(-1, num_heads, -1, -1)
+    C_a = C_a.expand(-1, num_heads, -1, -1)
+    C_b = C_b.expand(-1, num_heads, -1, -1)
+    Z_a = Z_a.expand(-1, num_heads, -1, -1)
+    Z_b = Z_b.expand(-1, num_heads, -1, -1)
+    K_Ia = K_Ia.expand(-1, num_index_heads, -1, -1)
+    K_Ib = K_Ib.expand(-1, num_index_heads, -1, -1)
+    Z_Ia = Z_Ia.expand(-1, num_index_heads, -1, -1)
+    Z_Ib = Z_Ib.expand(-1, num_index_heads, -1, -1)
+
+    compressed_kv = csa_example.compress(C_a, C_b, Z_a, Z_b, B_a, B_b, compression_rate)
+    compressed_indices = csa_example.compress(K_Ia, K_Ib, Z_Ia, Z_Ib, B_Ia, B_Ib, compression_rate)
+    num_total_blocks = compressed_kv.shape[-2]
+
+    Q_roped = torch.cat([Q[..., :-rope_dims], csa_example.apply_rope(Q[..., -rope_dims:])], dim=-1)
+    Q_I_roped = torch.cat(
+        [Q_I[..., :-rope_dims], csa_example.apply_rope(Q_I[..., -rope_dims:])], dim=-1
+    )
+    KV = F.rms_norm(KV, (head_dim,), weight=KV_norm_weight)
+    KV = torch.cat([KV[..., :-rope_dims], csa_example.apply_rope(KV[..., -rope_dims:])], dim=-1)
+
+    compressed_positions = torch.arange(num_total_blocks, device=device) * compression_rate
+    compressed_indices = F.rms_norm(
+        compressed_indices, (index_head_dim,), weight=compressed_indices_norm_weight
+    )
+    compressed_indices = torch.cat(
+        [
+            compressed_indices[..., :-rope_dims],
+            csa_example.apply_rope(
+                compressed_indices[..., -rope_dims:], positions=compressed_positions
+            ),
+        ],
+        dim=-1,
+    )
+    compressed_kv = F.rms_norm(compressed_kv, (head_dim,), weight=compressed_kv_norm_weight)
+    compressed_kv = torch.cat(
+        [
+            compressed_kv[..., :-rope_dims],
+            csa_example.apply_rope(
+                compressed_kv[..., -rope_dims:], positions=compressed_positions
+            ),
+        ],
+        dim=-1,
+    )
+
+    # Indexer scoring
+    indexer_mask = csa_example.make_block_mask(
+        sequence_length, num_total_blocks, compression_rate, device, dtype
+    )
+    indexer_scale = math.sqrt(index_head_dim * num_index_heads)
+    scores = F.relu(Q_I_roped @ compressed_indices.transpose(-2, -1)) / indexer_scale
+    index_head_weights = W_I.transpose(1, 2).unsqueeze(-1)
+    scores = torch.sum(index_head_weights * scores, dim=1) + indexer_mask
+
+    topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1).indices
+
+    # selected_attention with causal blocks → (output, aux, selected_is_valid)
+    _attn_output, aux, selected_is_valid = csa_example._selected_attention_with_causal_blocks(
+        Q_roped,
+        KV,
+        compressed_kv,
+        topk_blocks,
+        indexer_mask,
+        attention_sink,
+        sliding_window_size,
+        return_aux=AuxRequest(lse=True),
+    )
+    lse = aux.lse
+    assert lse is not None
+
+    # Gather selected compressed keys: (B, H, num_blocks, D) → (B, H, S, K, D)
+    idx = topk_blocks[:, None, :, :].expand(b, num_heads, sequence_length, num_topk_blocks)
+    idx_flat = idx.reshape(b, num_heads, -1)
+    gathered = compressed_kv.gather(
+        dim=2, index=idx_flat.unsqueeze(-1).expand(*idx_flat.shape, head_dim)
+    )
+    selected_compressed_kv = gathered.reshape(
+        b, num_heads, sequence_length, num_topk_blocks, head_dim
+    )
+
+    selected_indexer_logits = scores.gather(dim=-1, index=topk_blocks).detach()
+    actual_logits = selected_indexer_logits.clone().requires_grad_()
+    expected_logits = selected_indexer_logits.clone().requires_grad_()
+
+    loss = csa_example.indexer_loss(
+        Q_roped, selected_compressed_kv, lse, actual_logits, selected_is_valid
+    )
+    expected_loss = _indexer_loss_oracle(
+        Q_roped,
+        selected_compressed_kv,
+        lse,
+        expected_logits,
+        selected_is_valid,
+    )
+    (actual_grad,) = torch.autograd.grad(loss, actual_logits)
+    (expected_grad,) = torch.autograd.grad(expected_loss, expected_logits)
+
+    assert loss.shape == ()
+    torch.testing.assert_close(loss, expected_loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(actual_grad[selected_is_valid]) > 0
+    assert torch.count_nonzero(actual_grad[~selected_is_valid]) == 0
+
+    # Position 0 has no completed blocks (compression_rate=2, seq_len=5)
+    assert not selected_is_valid[:, 0, :].any(), "Position 0 should have no valid blocks"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_indexer_loss_teacher_logits_use_fp32(dtype):
+    generator = torch.Generator().manual_seed(1234)
+    b, h, s, k, d = 2, 3, 4, 3, 64
+    query = torch.randn(b, h, s, d, generator=generator, dtype=dtype)
+    selected_kv = torch.randn(b, h, s, k, d, generator=generator, dtype=dtype)
+    selected_is_valid = torch.tensor(
+        [
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+            [
+                [False, False, False],
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+        ]
+    )
+    attention_logits = torch.matmul(
+        query.float().unsqueeze(-2), selected_kv.float().transpose(-2, -1)
+    ).squeeze(-2) / math.sqrt(d)
+    other_logits = torch.randn(b, h, s, 5, generator=generator)
+    attention_lse = torch.logsumexp(torch.cat([attention_logits, other_logits], dim=-1), dim=-1)
+    logits = torch.randn(b, s, k, generator=generator)
+    actual_logits = logits.clone().requires_grad_()
+    expected_logits = logits.clone().requires_grad_()
+
+    actual_loss = csa_example.indexer_loss(
+        query, selected_kv, attention_lse, actual_logits, selected_is_valid
+    )
+    expected_loss = _indexer_loss_oracle(
+        query, selected_kv, attention_lse, expected_logits, selected_is_valid
+    )
+    (actual_grad,) = torch.autograd.grad(actual_loss, actual_logits)
+    (expected_grad,) = torch.autograd.grad(expected_loss, expected_logits)
+
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)
+
+
+LSE_BACKENDS = ["eager"]
+if torch.cuda.is_available():
+    LSE_BACKENDS.append("triton")
+
+
+def _dense_qk_softmax_oracle(
+    query,
+    local_kv,
+    sparse_kv,
+    kv_indices,
+    attention_sink,
+    doc_ids,
+    sliding_window_size,
+):
+    batch, heads, sequence_length, head_dim = query.shape
+    accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
+    query = query.to(accumulation_dtype)
+    local_kv = local_kv.to(accumulation_dtype).expand(batch, heads, -1, -1)
+    sparse_kv = sparse_kv.to(accumulation_dtype).expand(batch, heads, -1, -1)
+
+    scale = 1.0 / math.sqrt(head_dim)
+    sparse_logits = torch.matmul(query, sparse_kv.transpose(-2, -1)) * scale
+    local_logits = torch.matmul(query, local_kv.transpose(-2, -1)) * scale
+
+    query_positions = torch.arange(sequence_length, device=query.device)[:, None]
+    key_positions = torch.arange(sequence_length, device=query.device)[None, :]
+    local_is_valid = (key_positions <= query_positions) & (
+        key_positions >= query_positions - sliding_window_size + 1
+    )
+    local_is_valid = local_is_valid[None, None]
+    if doc_ids is not None:
+        same_document = doc_ids[:, None, :, None] == doc_ids[:, None, None, :]
+        local_is_valid = local_is_valid & same_document
+    local_logits = local_logits.masked_fill(~local_is_valid, float("-inf"))
+
+    selected_is_valid = kv_indices >= 0
+    selected_indices = kv_indices.clamp_min(0)[:, None].expand(-1, heads, -1, -1)
+    selected_logits = sparse_logits.gather(dim=-1, index=selected_indices)
+    selected_logits = selected_logits.masked_fill(~selected_is_valid[:, None], float("-inf"))
+
+    if attention_sink is None:
+        attention_sink = torch.full(
+            (heads,), float("-inf"), dtype=accumulation_dtype, device=query.device
+        )
+    sink_logits = attention_sink.to(accumulation_dtype)[None, :, None, None].expand(
+        batch, -1, sequence_length, -1
+    )
+    logits = torch.cat((selected_logits, local_logits, sink_logits), dim=-1)
+    probabilities = torch.softmax(logits, dim=-1)
+    return torch.logsumexp(logits, dim=-1), probabilities[..., : kv_indices.shape[-1]]
+
+
+def _make_lse_inputs(backend, share_kv, with_doc_ids, with_attention_sink):
+    device = torch.device("cuda" if backend == "triton" else "cpu")
+    dtype = torch.float32 if backend == "triton" else torch.float64
+    generator = torch.Generator(device=device).manual_seed(9384)
+    batch, heads, sequence_length, head_dim = 2, 3, 9, 32
+    sparse_sequence_length, num_topk_blocks = 7, 4
+    kv_heads = 1 if share_kv else heads
+
+    query = torch.randn(
+        batch, heads, sequence_length, head_dim, dtype=dtype, device=device, generator=generator
+    )
+    local_kv = torch.randn(
+        batch,
+        kv_heads,
+        sequence_length,
+        head_dim,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    sparse_kv = torch.randn(
+        batch,
+        kv_heads,
+        sparse_sequence_length,
+        head_dim,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    selection_scores = torch.randn(
+        batch, sequence_length, sparse_sequence_length, device=device, generator=generator
+    )
+    kv_indices = selection_scores.topk(num_topk_blocks, dim=-1).indices
+    kv_indices[:, ::3, -1] = -1
+    kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
+
+    attention_sink = None
+    if with_attention_sink:
+        attention_sink = torch.randn(heads, dtype=dtype, device=device, generator=generator)
+
+    doc_ids = None
+    if with_doc_ids:
+        doc_ids = torch.tensor(
+            [[0, 0, 0, 0, 1, 1, 1, 1, 1], [0, 0, 0, 1, 1, 1, 2, 2, 2]],
+            dtype=torch.int32,
+            device=device,
+        )
+
+    return {
+        "query": query,
+        "local_kv": local_kv,
+        "sparse_kv": sparse_kv,
+        "kv_indices": kv_indices,
+        "attention_sink": attention_sink,
+        "doc_ids": doc_ids,
+        "sliding_window_size": 4,
+    }
+
+
+@pytest.mark.parametrize("backend", LSE_BACKENDS)
+@pytest.mark.parametrize(
+    ("share_kv", "with_doc_ids", "with_attention_sink"),
+    [(False, False, True), (True, True, True), (True, False, False)],
+)
+def test_lse_and_selected_key_probabilities_match_dense_qk_softmax_oracle(
+    backend, share_kv, with_doc_ids, with_attention_sink
+):
+    inputs = _make_lse_inputs(backend, share_kv, with_doc_ids, with_attention_sink)
+
+    with torch.inference_mode():
+        expected_lse, expected_selected_probabilities = _dense_qk_softmax_oracle(**inputs)
+        _, aux = selected_attention(
+            **inputs,
+            backend=backend,
+            return_aux=AuxRequest(lse=True),
+        )
+
+    assert aux.lse is not None
+    assert aux.lse.shape == expected_lse.shape
+    tolerance = 1e-3 if backend == "triton" else 1e-12
+    torch.testing.assert_close(aux.lse, expected_lse, atol=tolerance, rtol=tolerance)
+
+    query = inputs["query"].to(expected_lse.dtype)
+    sparse_kv = (
+        inputs["sparse_kv"].to(expected_lse.dtype).expand(query.shape[0], query.shape[1], -1, -1)
+    )
+    sparse_logits = torch.matmul(query, sparse_kv.transpose(-2, -1)) / math.sqrt(query.shape[-1])
+    selected_indices = (
+        inputs["kv_indices"].clamp_min(0)[:, None].expand(-1, query.shape[1], -1, -1)
+    )
+    selected_logits = sparse_logits.gather(dim=-1, index=selected_indices)
+    actual_selected_probabilities = torch.exp(selected_logits - aux.lse[..., None])
+    actual_selected_probabilities = actual_selected_probabilities.masked_fill(
+        ~(inputs["kv_indices"] >= 0)[:, None], 0.0
+    )
+    torch.testing.assert_close(
+        actual_selected_probabilities,
+        expected_selected_probabilities,
+        atol=tolerance,
+        rtol=tolerance,
+    )

@@ -11,8 +11,9 @@ treats every batch row as an independent sequence. Dense inputs may supply their
 preceding ``W - 1`` input positions as functional state. An optional CUDA
 ``cu_seqlens`` tensor instead delimits independent sequences packed into ``[1, T, C]``.
 Its final offset is the dynamic active endpoint and may be smaller than the physical
-capacity ``T``. Each thread owns a compile-time number of adjacent channels. Forward
-stages its input window in registers, while backward computes input gradients and FP32
+capacity ``T``. Inference prefill and decode can instead address a mutable paged history
+pool directly. Each thread owns a compile-time number of adjacent channels. Forward stages
+its input window in registers, while backward computes input gradients and FP32
 weight-gradient partials followed by a Torch reduction.
 """
 
@@ -208,7 +209,7 @@ def load_history(
     channel_group: Int32,
     width: cutlass.Constexpr,
 ):
-    """Load one vector from a sequence's caller-provided causal history."""
+    """Load one vector from a sequence's compact caller-provided history."""
     state_offset = width - 1 + input_time - sequence_start
     return (
         initial_state[
@@ -220,6 +221,40 @@ def load_history(
         .load()
         .to(Float32)
     )
+
+
+@cute.jit
+def load_paged_history(
+    state: cute.Tensor,
+    state_indices: cute.Tensor,
+    has_initial_state: cute.Tensor | None,
+    sequence: Int32,
+    input_time: Int32,
+    sequence_start: Int32,
+    channel_group: Int32,
+    channels_per_thread: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+):
+    """Load selected paged history, using zeros for null and fresh slots."""
+    values = cute.make_rmem_tensor((channels_per_thread,), Float32)
+    values.fill(Float32(0.0))
+    slot = state_indices[sequence]
+    if slot > 0:
+        state_offset = width - 1 + input_time - sequence_start
+        state_groups = cute.zipped_divide(state, (1, 1, channels_per_thread))
+        if cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
+            values.store(
+                state_groups[((0, 0, None), (slot, state_offset, channel_group))]
+                .load()
+                .to(Float32)
+            )
+        elif has_initial_state[sequence]:
+            values.store(
+                state_groups[((0, 0, None), (slot, state_offset, channel_group))]
+                .load()
+                .to(Float32)
+            )
+    return values.load()
 
 
 @cute.jit
@@ -235,7 +270,7 @@ def history_dot(
     channels_per_thread: cutlass.Constexpr,
     width: cutlass.Constexpr,
 ):
-    """Evaluate an early convolution dot product from staged input and history."""
+    """Evaluate an early convolution dot product from staged input and compact history."""
     products = cute.make_rmem_tensor((channels_per_thread, width), Float32)
     for tap in cutlass.range_constexpr(width):
         input_time = output_time + tap - (width - 1)
@@ -250,6 +285,50 @@ def history_dot(
                     input_time,
                     sequence_start,
                     channel_group,
+                    width,
+                )
+            )
+        products[(None, tap)].store(input_value.load() * weights[(None, tap)].load())
+    return products.load().reduce(
+        cute.ReductionOp.ADD,
+        Float32(0.0),
+        reduction_profile=(None, 1),
+    )
+
+
+@cute.jit
+def paged_history_dot(
+    inputs: cute.Tensor,
+    weights: cute.Tensor,
+    state: cute.Tensor,
+    state_indices: cute.Tensor,
+    has_initial_state: cute.Tensor | None,
+    sequence: Int32,
+    output_time: Int32,
+    sequence_start: Int32,
+    input_offset: cutlass.Constexpr,
+    channel_group: Int32,
+    channels_per_thread: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+):
+    """Evaluate an early convolution dot product from staged input and paged history."""
+    products = cute.make_rmem_tensor((channels_per_thread, width), Float32)
+    for tap in cutlass.range_constexpr(width):
+        input_time = output_time + tap - (width - 1)
+        input_value = cute.make_rmem_tensor((channels_per_thread,), Float32)
+        if input_time >= sequence_start:
+            input_value.store(inputs[(None, input_offset + tap)].load().to(Float32))
+        else:
+            input_value.store(
+                load_paged_history(
+                    state,
+                    state_indices,
+                    has_initial_state,
+                    sequence,
+                    input_time,
+                    sequence_start,
+                    channel_group,
+                    channels_per_thread,
                     width,
                 )
             )
@@ -365,6 +444,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
         output: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
+        state_indices: cute.Tensor | None,
+        has_initial_state: cute.Tensor | None,
         full_endpoint: cutlass.Constexpr,
     ):
         """Compute the physical time tile owned by this CTA."""
@@ -386,7 +467,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
 
             x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
-            if cutlass.const_expr(initial_state is not None):
+            initial_groups = initial_state
+            if cutlass.const_expr(initial_state is not None and state_indices is None):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             inputs = cute.make_rmem_tensor(
                 (self.channels_per_thread, self.times_per_block + self.width - 1),
@@ -428,18 +510,34 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     if cutlass.const_expr(initial_state is not None):
                         value = unrolled_dot(inputs, weights, time_offset, self.width)
                         if time - (self.width - 1) < sequence_start:
-                            value = history_dot(
-                                inputs,
-                                weights,
-                                initial_groups,
-                                sequence,
-                                Int32(time),
-                                sequence_start,
-                                time_offset,
-                                channel_group,
-                                self.channels_per_thread,
-                                self.width,
-                            )
+                            if cutlass.const_expr(state_indices is None):
+                                value = history_dot(
+                                    inputs,
+                                    weights,
+                                    initial_groups,
+                                    sequence,
+                                    Int32(time),
+                                    sequence_start,
+                                    time_offset,
+                                    channel_group,
+                                    self.channels_per_thread,
+                                    self.width,
+                                )
+                            else:
+                                value = paged_history_dot(
+                                    inputs,
+                                    weights,
+                                    initial_state,
+                                    state_indices,
+                                    has_initial_state,
+                                    sequence,
+                                    Int32(time),
+                                    sequence_start,
+                                    time_offset,
+                                    channel_group,
+                                    self.channels_per_thread,
+                                    self.width,
+                                )
                     elif cutlass.const_expr(cu_seqlens is None):
                         value = unrolled_dot(inputs, weights, time_offset, self.width)
                     else:
@@ -459,9 +557,17 @@ class CausalConv1dSiluForward(ShortConvKernel):
                                         + inputs[(None, time_offset + tap)].load().to(Float32)
                                         * weights[(None, tap)].load()
                                     )
+                    value = self.activation(value).to(self.dtype.cute_type)
+                    if cutlass.const_expr(state_indices is not None):  # noqa: SIM102
+                        if state_indices[sequence] <= 0:
+                            padding = cute.make_rmem_tensor(
+                                (self.channels_per_thread,), self.dtype.cute_type
+                            )
+                            padding.fill(self.dtype.cute_type(0.0))
+                            value = padding.load()
                     output_groups[
                         ((0, None), (self.flattened_row(batch, time), channel_group))
-                    ].store(self.activation(value).to(self.dtype.cute_type))
+                    ].store(value)
 
     @cute.kernel
     def kernel(
@@ -471,17 +577,46 @@ class CausalConv1dSiluForward(ShortConvKernel):
         output: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
+        state_indices: cute.Tensor | None,
+        has_initial_state: cute.Tensor | None,
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
         time_block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(cu_seqlens is not None):
             active_endpoint = load_ragged_token_count(cu_seqlens)
             if active_endpoint == self.tokens:
-                self.run_tile(x, weight, output, cu_seqlens, initial_state, True)
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    initial_state,
+                    state_indices,
+                    has_initial_state,
+                    True,
+                )
             elif time_block * self.times_per_block < active_endpoint:
-                self.run_tile(x, weight, output, cu_seqlens, initial_state, False)
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    initial_state,
+                    state_indices,
+                    has_initial_state,
+                    False,
+                )
         else:
-            self.run_tile(x, weight, output, cu_seqlens, initial_state, True)
+            self.run_tile(
+                x,
+                weight,
+                output,
+                cu_seqlens,
+                initial_state,
+                state_indices,
+                has_initial_state,
+                True,
+            )
 
     @cute.jit
     def __call__(
@@ -493,7 +628,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         initial_state: cute.Tensor | None,
         stream,
     ):
-        """Launch the configured forward specialization."""
+        """Launch the configured functional forward specialization."""
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             x,
@@ -501,6 +636,46 @@ class CausalConv1dSiluForward(ShortConvKernel):
             output,
             cu_seqlens,
             initial_state,
+            None,
+            None,
+        ).launch(
+            grid=(
+                cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+                self.batches,
+            ),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+
+class CausalConv1dPagedForward(CausalConv1dSiluForward):
+    """Launch forward with direct paged-history addressing."""
+
+    kernel_kind = "paged_fwd"
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        state: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_state: cute.Tensor | None,
+        stream,
+    ):
+        """Launch the mutable-history forward specialization."""
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(
+            x,
+            weight,
+            output,
+            cu_seqlens,
+            state,
+            state_indices,
+            has_initial_state,
         ).launch(
             grid=(
                 cute.ceil_div(self.tokens, self.times_per_block),
@@ -616,6 +791,88 @@ class CausalConv1dSiluDecode(ShortConvKernel):
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.size(x, mode=[0]),
+                1,
+            ),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+
+class CausalConv1dPagedStateUpdate(ShortConvKernel):
+    """Write each sequence's final causal history directly into its selected slot."""
+
+    kernel_kind = "paged_state"
+    sequence_axis = "n"
+    time_tiled = False
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        state: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_state: cute.Tensor | None,
+        cu_seqlens: cute.Tensor | None,
+    ):
+        """Advance one selected history slot without a compact staging tensor."""
+        thread_idx, _, _ = cute.arch.thread_idx()
+        channel_block, sequence, _ = cute.arch.block_idx()
+        channel_group = channel_block * self.threads + thread_idx
+        channel = channel_group * self.channels_per_thread
+
+        if channel < self.channels:
+            slot = state_indices[sequence]
+            if slot > 0:
+                if cutlass.const_expr(cu_seqlens is None):
+                    sequence_start = self.upcast_offset(sequence) * self.tokens
+                    sequence_end = sequence_start + self.tokens
+                else:
+                    sequence_start = self.upcast_offset(Int32(cu_seqlens[sequence]))
+                    sequence_end = self.upcast_offset(Int32(cu_seqlens[sequence + 1]))
+                sequence_length = sequence_end - sequence_start
+                x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
+                state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
+
+                for row in cutlass.range_constexpr(self.width - 1):
+                    values = cute.make_rmem_tensor(
+                        (self.channels_per_thread,), self.dtype.cute_type
+                    )
+                    values.fill(self.dtype.cute_type(0.0))
+                    input_time = sequence_end - (self.width - 1) + row
+                    if input_time >= sequence_start:
+                        values.store(x_groups[((0, None), (input_time, channel_group))].load())
+                    # For short sequences the source row is ``row + sequence_length``,
+                    # so ascending stores cannot overwrite a value before it is read.
+                    elif cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
+                        values.store(
+                            state_groups[
+                                ((0, 0, None), (slot, row + sequence_length, channel_group))
+                            ].load()
+                        )
+                    elif has_initial_state[sequence]:
+                        values.store(
+                            state_groups[
+                                ((0, 0, None), (slot, row + sequence_length, channel_group))
+                            ].load()
+                        )
+                    state_groups[((0, 0, None), (slot, row, channel_group))].store(values.load())
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        state: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_state: cute.Tensor | None,
+        cu_seqlens: cute.Tensor | None,
+        stream,
+    ):
+        """Launch one state-update task per sequence and channel group."""
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens).launch(
+            grid=(
+                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+                self.sequences,
                 1,
             ),
             block=(self.threads, 1, 1),
@@ -2733,6 +2990,53 @@ def _validate_decode_inputs(
         )
 
 
+def _validate_paged_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> None:
+    """Validate multi-token convolution over a mutable paged history pool."""
+    _validate_inputs(x, weight, cu_seqlens)
+    if weight.shape[1] < 2:
+        raise ValueError("paged causal convolution requires W >= 2; width one carries no history")
+
+    sequences = x.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    channels = x.shape[2]
+    expected_tail = (weight.shape[1] - 1, channels)
+    if state.ndim != 3 or state.shape[1:] != expected_tail or state.shape[0] < 1:
+        raise ValueError(
+            f"state must have shape [num_slots, {expected_tail[0]}, {channels}], "
+            f"got {tuple(state.shape)}"
+        )
+    if state.dtype != x.dtype or state.device != x.device:
+        raise ValueError("state must match x dtype and be on x.device")
+    if state.stride()[1:] != (channels, 1):
+        raise ValueError("state must be contiguous within each [W - 1, C] slot")
+    if state.stride(0) < (weight.shape[1] - 1) * channels:
+        raise ValueError("state slots must not overlap")
+    if (
+        state_indices.shape != (sequences,)
+        or state_indices.dtype != torch.int32
+        or state_indices.device != x.device
+        or not state_indices.is_contiguous()
+    ):
+        raise ValueError(
+            f"state_indices must be contiguous int32 with shape ({sequences},) on x.device"
+        )
+    if has_initial_state is not None and (
+        has_initial_state.shape != (sequences,)
+        or has_initial_state.dtype != torch.bool
+        or has_initial_state.device != x.device
+        or not has_initial_state.is_contiguous()
+    ):
+        raise ValueError(
+            f"has_initial_state must be contiguous bool with shape ({sequences},) on x.device"
+        )
+
+
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
     """Materialize the uncommon contiguous view that misses the launcher ABI alignment."""
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
@@ -3163,6 +3467,88 @@ def _fake_decode_state(dtype: ShortConvDType, width: int, channels: int):
     )
 
 
+def _fake_has_initial_state(enabled: bool):
+    """Create a runtime-bound fresh-slot mask or preserve the all-resumed specialization."""
+    if not enabled:
+        return None
+    return cute.runtime.make_fake_compact_tensor(
+        cutlass.Boolean,
+        (cute.sym_int32(),),
+        stride_order=(0,),
+        assumed_align=1,
+    )
+
+
+@jit_cache
+def _compile_paged_forward(
+    batches: int,
+    tokens: int,
+    channels: int,
+    width: int,
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    num_sequences: int,
+    packed: bool,
+    use_has_initial_state: bool,
+    activation: Activation,
+    use_int64_offsets: bool = False,
+):
+    """Compile a forward specialization that reads history directly from paged slots."""
+    operation = CausalConv1dPagedForward(
+        batches,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        activation.forward,
+        use_int64_offsets,
+    )
+    return compile_tvm_ffi(
+        operation,
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_matrix(dtype, channels, width),
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_cu_seqlens(num_sequences if packed else None),
+        _fake_decode_state(dtype, width, channels),
+        _fake_state_indices(True),
+        _fake_has_initial_state(use_has_initial_state),
+    )
+
+
+@jit_cache
+def _compile_paged_state_update(
+    batches: int,
+    tokens: int,
+    channels: int,
+    width: int,
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    num_sequences: int,
+    packed: bool,
+    use_has_initial_state: bool,
+    use_int64_offsets: bool = False,
+):
+    """Compile the direct final-history write for paged prefill."""
+    operation = CausalConv1dPagedStateUpdate(
+        num_sequences,
+        tokens,
+        channels,
+        width,
+        config,
+        dtype,
+        use_int64_offsets,
+    )
+    return compile_tvm_ffi(
+        operation,
+        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_decode_state(dtype, width, channels),
+        _fake_state_indices(True),
+        _fake_has_initial_state(use_has_initial_state),
+        _fake_cu_seqlens(num_sequences if packed else None),
+    )
+
+
 @jit_cache
 def _compile_decode(
     channels: int,
@@ -3215,6 +3601,72 @@ def _launch_decode(
     return output
 
 
+def _launch_paged_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    config: ShortConvConfig,
+    *,
+    activation: str | None,
+) -> torch.Tensor:
+    """Run paged prefill and advance selected history slots in place."""
+    resolved_activation = resolve_activation(activation)
+    x, weight = _aligned(x), _aligned(weight)
+    if state.data_ptr() % 16 != 0:
+        raise ValueError("state storage must be 16-byte aligned for the in-place advance")
+    batches, tokens, channels = x.shape
+    width = weight.shape[1]
+    num_sequences = state_indices.shape[0]
+    packed = cu_seqlens is not None
+    _validate_config(config, channels, "forward_config")
+    dtype = SHORT_CONV_DTYPES[x.dtype]
+    output = torch.empty_like(x)
+    use_int64_offsets = requires_int64_abi(x, output)
+    _compile_paged_forward(
+        batches,
+        tokens,
+        channels,
+        width,
+        dtype,
+        config,
+        num_sequences,
+        packed,
+        has_initial_state is not None,
+        resolved_activation,
+        use_int64_offsets,
+    )(
+        x.view(batches * tokens, channels),
+        weight,
+        output.view(batches * tokens, channels),
+        cu_seqlens,
+        state,
+        state_indices,
+        has_initial_state,
+    )
+    _compile_paged_state_update(
+        batches,
+        tokens,
+        channels,
+        width,
+        dtype,
+        ShortConvConfig(config.threads, config.channels_per_thread, 1),
+        num_sequences,
+        packed,
+        has_initial_state is not None,
+        use_int64_offsets,
+    )(
+        x.view(batches * tokens, channels),
+        state,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+    )
+    return output
+
+
 def _cute_short_conv_fwd_cuda(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3247,6 +3699,50 @@ def _default_forward_fake(
     activation: str | None = None,
 ) -> torch.Tensor:
     del weight, cu_seqlens, initial_state, activation
+    return torch.empty_like(x)
+
+
+def _cute_short_conv_paged_fwd_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    """Launch paged prefill with the tuned forward defaults."""
+    _validate_paged_inputs(x, weight, state, state_indices, has_initial_state, cu_seqlens)
+    default = ShortConvTunedConfig.default(x.dtype, packed=cu_seqlens is not None).forward
+    config = _compatible_config(default, x.shape[2])
+    return _launch_paged_forward(
+        x,
+        weight,
+        state,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        config,
+        activation=activation,
+    )
+
+
+torch.library.impl("attn_gym::_cute_short_conv_paged_fwd", "CUDA", _cute_short_conv_paged_fwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::_cute_short_conv_paged_fwd")
+def _paged_forward_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    *,
+    activation: str | None = None,
+) -> torch.Tensor:
+    del weight, state, state_indices, has_initial_state, cu_seqlens, activation
     return torch.empty_like(x)
 
 
@@ -3956,6 +4452,68 @@ def causal_conv1d(
     )
 
 
+def paged_causal_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    activation: str | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply multi-token convolution while advancing a paged history in place.
+
+    Args:
+        x: Contiguous ``[B, T, C]`` input. With ``cu_seqlens``, ``B`` must be one
+            and the physical token axis contains packed logical sequences.
+        weight: Contiguous depthwise weights ``[C, W]`` with ``W >= 2``.
+        state_cache: Mutable history pool ``[num_slots, W - 1, C]``. Each slot
+            must be compact, while padding between slots is supported. The storage
+            base must be 16-byte aligned.
+        state_indices: Contiguous int32 slot indices, one per logical sequence.
+            Positive indices must be unique and less than ``state_cache.shape[0]``.
+            Non-positive entries produce zero output and leave the pool untouched.
+        activation: Any registered activation name, or ``None``.
+        cu_seqlens: Optional contiguous int32 packed boundaries ``[N + 1]``.
+        has_initial_state: Optional contiguous bool mask with one entry per
+            sequence. False entries read zero history before overwriting the slot.
+
+    Returns:
+        The activated output with the same shape and dtype as ``x``. For packed input,
+        only rows before ``cu_seqlens[-1]`` are defined. ``state_cache`` is advanced in place.
+        Empty fresh sequences clear their selected history; empty resumed sequences
+        preserve it.
+
+    This operation is inference-only. Use :func:`causal_conv1d` for autograd.
+    """
+    resolve_activation(activation)
+    _validate_paged_inputs(
+        x,
+        weight,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+    )
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (x, weight, state_cache)
+    ):
+        raise RuntimeError(
+            "paged_causal_conv1d is inference-only and has no backward; use "
+            "causal_conv1d for training or call under torch.no_grad()"
+        )
+    return short_conv_ops.short_conv_paged_forward_op(
+        x,
+        weight,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        activation=activation,
+    )
+
+
 def causal_conv1d_decode(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -4024,5 +4582,6 @@ __all__ = [
     "ShortConvTunedConfig",
     "causal_conv1d",
     "causal_conv1d_decode",
+    "paged_causal_conv1d",
     "tune_causal_conv1d",
 ]

@@ -18,6 +18,7 @@ from attn_gym.linear.short_conv.cute import (
     _candidate_configs,
     causal_conv1d,
     causal_conv1d_decode,
+    paged_causal_conv1d,
     tune_causal_conv1d,
 )
 from attn_gym.linear.short_conv.ops import (
@@ -41,6 +42,9 @@ from attn_gym.linear.short_conv.ops import (
 from attn_gym.linear.short_conv.ops import (
     short_conv_forward_op as _forward_op,
 )
+from attn_gym.linear.short_conv.ops import (
+    short_conv_paged_forward_op as _paged_forward_op,
+)
 
 
 def test_kda_backward_compatibility_exports():
@@ -54,8 +58,8 @@ def test_kda_backward_compatibility_exports():
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="the CuTeDSL short convolution requires CUDA capability 9.0 or newer",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the CuTeDSL short convolution requires CUDA capability 8.0 or newer",
 )
 
 
@@ -156,6 +160,48 @@ def _misaligned_inputs(tokens: int = 17, channels: int = 12, width: int = 4):
     assert x.is_contiguous() and x.data_ptr() % 16 != 0
     assert weight.is_contiguous() and weight.data_ptr() % 16 != 0
     return x, weight
+
+
+def _paged_prefill_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the existing compact-state path around explicit gather and scatter."""
+    sequences = x.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    initial_state = x.new_zeros(sequences, weight.shape[1] - 1, x.shape[2])
+    for sequence, slot in enumerate(state_indices.cpu().tolist()):
+        resumed = has_initial_state is None or bool(has_initial_state[sequence].item())
+        if slot > 0 and resumed:
+            initial_state[sequence].copy_(state[slot])
+    output, final_state = causal_conv1d(
+        x,
+        weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        return_final_state=True,
+    )
+    expected_state = state.clone()
+    if cu_seqlens is None:
+        for sequence, slot in enumerate(state_indices.cpu().tolist()):
+            if slot > 0:
+                expected_state[slot].copy_(final_state[sequence])
+            else:
+                output[sequence].zero_()
+    else:
+        offsets = cu_seqlens.cpu().tolist()
+        for sequence, (slot, (start, end)) in enumerate(
+            zip(state_indices.cpu().tolist(), pairwise(offsets), strict=True)
+        ):
+            if slot > 0:
+                expected_state[slot].copy_(final_state[sequence])
+            else:
+                output[:, start:end].zero_()
+    return output, expected_state
 
 
 def _decode_conv(x, weight, activation="silu"):
@@ -1784,6 +1830,350 @@ def test_short_conv_decode_registered_custom_activation():
     actual = _decode_conv(x, weight, "tanh")
     expected = torch.tanh(_plain_conv_reference(x, weight))
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("packed", [False, True])
+def test_paged_short_conv_prefill_matches_gather_scatter(
+    packed: bool,
+    dtype: torch.dtype,
+):
+    """Read and advance selected slots without compact caller-side state copies."""
+    torch.manual_seed(101)
+    channels, width = 12, 4
+    if packed:
+        lengths = (5, 16, 19)
+        offsets = torch.tensor((0, 5, 21, 40), device="cuda", dtype=torch.int32)
+        x = torch.randn(1, sum(lengths), channels, device="cuda", dtype=dtype)
+        state_indices = torch.tensor((4, 2, 5), device="cuda", dtype=torch.int32)
+    else:
+        offsets = None
+        x = torch.randn(3, 5, channels, device="cuda", dtype=dtype)
+        state_indices = torch.tensor((4, 0, 5), device="cuda", dtype=torch.int32)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    has_initial_state = torch.tensor((False, True, False), device="cuda")
+    state = torch.randn(7, width - 1, channels, device="cuda", dtype=x.dtype)
+    expected_output, expected_state = _paged_prefill_reference(
+        x,
+        weight,
+        state,
+        state_indices,
+        has_initial_state,
+        offsets,
+    )
+
+    with torch.no_grad():
+        actual = paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    torch.testing.assert_close(actual, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_forced_int64_matches_default(monkeypatch):
+    """Widen paged input addresses without changing output or state mutation."""
+    torch.manual_seed(107)
+    channels, width = 12, 4
+    offsets = torch.tensor((0, 2, 7), device="cuda", dtype=torch.int32)
+    x = torch.randn(1, 7, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+    initial_state = torch.randn(6, width - 1, channels, device="cuda", dtype=x.dtype)
+
+    expected_state = initial_state.clone()
+    actual_state = initial_state.clone()
+    with torch.no_grad():
+        expected = paged_causal_conv1d(
+            x,
+            weight,
+            expected_state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+        )
+        monkeypatch.setattr(cute_backend, "requires_int64_abi", lambda *tensors: True)
+        actual = paged_causal_conv1d(
+            x,
+            weight,
+            actual_state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_handles_null_routes_and_strided_slots():
+    """Leave null routes and page padding untouched while advancing live slots."""
+    torch.manual_seed(102)
+    channels, width = 12, 4
+    offsets = torch.tensor((0, 2, 5, 6), device="cuda", dtype=torch.int32)
+    x = torch.randn(1, 6, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((3, 0, -1), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((True, False, False), device="cuda")
+    state_elements = (width - 1) * channels
+    storage = torch.randn(6, state_elements + 8, device="cuda", dtype=x.dtype)
+    state = storage[:, :state_elements].view(6, width - 1, channels)
+    expected_output, expected_state = _paged_prefill_reference(
+        x,
+        weight,
+        state,
+        state_indices,
+        has_initial_state,
+        offsets,
+    )
+    expected_storage = storage.clone()
+    expected_storage[:, :state_elements].view_as(state).copy_(expected_state)
+
+    with torch.no_grad():
+        actual = paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    torch.testing.assert_close(actual, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_all_empty_fresh_and_resumed_slots():
+    """Clear fresh empty slots while preserving resumed empty histories."""
+    torch.manual_seed(106)
+    channels, width = 12, 4
+    x = torch.randn(1, 4, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state = torch.randn(6, width - 1, channels, device="cuda", dtype=x.dtype)
+    original = state.clone()
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((False, True), device="cuda")
+    offsets = torch.tensor((0, 0, 0), device="cuda", dtype=torch.int32)
+
+    with torch.no_grad():
+        paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    torch.testing.assert_close(state[4], torch.zeros_like(state[4]), rtol=0, atol=0)
+    torch.testing.assert_close(state[2], original[2], rtol=0, atol=0)
+    torch.testing.assert_close(state[[0, 1, 3, 5]], original[[0, 1, 3, 5]], rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_continues_in_decode():
+    """Share one paged history pool directly between prefill and one-token decode."""
+    torch.manual_seed(103)
+    channels, width = 12, 4
+    offsets = torch.tensor((0, 2, 7), device="cuda", dtype=torch.int32)
+    x = torch.randn(1, 7, channels, device="cuda", dtype=torch.bfloat16)
+    next_token = torch.randn(2, channels, device="cuda", dtype=x.dtype)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((False, True), device="cuda")
+    state = torch.randn(6, width - 1, channels, device="cuda", dtype=x.dtype)
+    _expected_prefill, expected_state = _paged_prefill_reference(
+        x,
+        weight,
+        state,
+        state_indices,
+        has_initial_state,
+        offsets,
+    )
+
+    with torch.no_grad():
+        expected_decode = causal_conv1d_decode(
+            next_token,
+            weight,
+            expected_state,
+            activation="silu",
+            state_indices=state_indices,
+        )
+        paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+        actual_decode = causal_conv1d_decode(
+            next_token,
+            weight,
+            state,
+            activation="silu",
+            state_indices=state_indices,
+        )
+
+    torch.testing.assert_close(actual_decode, expected_decode, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_fullgraph_and_registration():
+    """Keep paged mutation opaque under opcheck and strict graph capture."""
+    torch.manual_seed(104)
+    channels, width = 6, 4
+    offsets = torch.tensor((0, 2, 7), device="cuda", dtype=torch.int32)
+    x = torch.randn(1, 7, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((True, False), device="cuda")
+    initial_state = torch.randn(6, width - 1, channels, device="cuda", dtype=x.dtype)
+    torch.library.opcheck(
+        _paged_forward_op,
+        (x, weight, initial_state.clone(), state_indices, has_initial_state, offsets),
+    )
+    dense_x = torch.randn(2, 5, channels, device="cuda", dtype=x.dtype)
+    torch.library.opcheck(
+        _paged_forward_op,
+        (dense_x, weight, initial_state.clone(), state_indices, None, None),
+    )
+
+    def run(state):
+        return paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    expected_state = initial_state.clone()
+    actual_state = initial_state.clone()
+    with torch.no_grad():
+        expected = run(expected_state)
+        actual = torch.compile(run, fullgraph=True)(actual_state)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_dynamic_dense_tokens():
+    """Reuse one strict graph across dense token counts without recompilation."""
+    torch.manual_seed(108)
+    channels, width = 12, 4
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+
+    def run(x, state):
+        return paged_causal_conv1d(x, weight, state, state_indices, activation="silu")
+
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    with torch._dynamo.config.patch(error_on_recompile=True), torch.no_grad():
+        for tokens in (5, 9):
+            x = torch.randn(2, tokens, channels, device="cuda", dtype=weight.dtype)
+            initial_state = torch.randn(6, width - 1, channels, device="cuda", dtype=weight.dtype)
+            expected_state = initial_state.clone()
+            actual_state = initial_state.clone()
+            expected_output, expected_state = _paged_prefill_reference(
+                x,
+                weight,
+                expected_state,
+                state_indices,
+                None,
+                None,
+            )
+            actual_output = compiled(x, actual_state)
+            torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+            torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_cuda_graph_replays_routing():
+    """Replay changed boundaries, freshness, slot routing, and input values."""
+    torch.manual_seed(105)
+    channels, width = 12, 4
+    x = torch.randn(1, 8, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state = torch.randn(7, width - 1, channels, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((True, False), device="cuda")
+    offsets = torch.tensor((0, 3, 8), device="cuda", dtype=torch.int32)
+
+    with torch.no_grad():
+        paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        output = paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    with torch.no_grad():
+        x.add_(0.25)
+        state.normal_()
+        state_indices.copy_(torch.tensor((5, 1), device="cuda", dtype=torch.int32))
+        has_initial_state.copy_(torch.tensor((False, True), device="cuda"))
+        offsets.copy_(torch.tensor((0, 5, 8), device="cuda", dtype=torch.int32))
+        expected_output, expected_state = _paged_prefill_reference(
+            x,
+            weight,
+            state,
+            state_indices,
+            has_initial_state,
+            offsets,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_rejects_autograd_and_malformed_state():
+    x, weight = _inputs(tokens=4, channels=12, width=4)
+    state = torch.randn(4, 3, 12, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((2,), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        paged_causal_conv1d(x, weight, state, state_indices)
+    with pytest.raises(ValueError, match="W >= 2"):
+        paged_causal_conv1d(
+            x.detach(),
+            weight[:, :1].detach().contiguous(),
+            state[:, :0],
+            state_indices,
+        )
+    with pytest.raises(ValueError, match="has_initial_state"):
+        paged_causal_conv1d(
+            x.detach(),
+            weight.detach(),
+            state,
+            state_indices,
+            has_initial_state=torch.ones(2, device="cuda", dtype=torch.bool),
+        )
 
 
 def test_short_conv_decode_activation_registration_contract():

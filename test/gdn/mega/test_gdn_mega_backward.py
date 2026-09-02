@@ -234,6 +234,22 @@ def test_gdn_mega_backward_uniform_negative_twenty_is_finite(
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+def test_gdn_mega_backward_rejects_mismatched_output_gradient_dtype() -> None:
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (64,), key_heads=1, value_heads=1, dtype=torch.bfloat16, seed=143
+    )
+    with pytest.raises(TypeError, match="d_output must use q.dtype"):
+        chunk_gdn_bwd_mega_packed(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            torch.randn_like(value, dtype=torch.float32),
+            cu_seqlens,
+        )
+
+
 def test_gdn_mega_backward_checkpoint_uses_v_by_k_state_at_token_64() -> None:
     """Regression for loading the BT64 entering-state checkpoint with transposed V/K axes."""
     inputs = make_gdn_test_inputs((65,), key_heads=2, value_heads=2, dtype=torch.float16, seed=149)
