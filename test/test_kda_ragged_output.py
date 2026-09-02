@@ -6,12 +6,36 @@ import pytest
 import torch
 
 import attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o as output_module
-from attn_gym.linear.kda.chunk_scheduler import ScheduleRequest, prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.chunk_scheduler import (
+    ScheduleKind,
+    ScheduleRequest,
+    prepare_ragged_chunk_metadata,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="the KDA output kernel requires CUDA",
 )
+
+
+@pytest.mark.parametrize(
+    ("schedule_request", "resolved", "device_major", "expected"),
+    [
+        (ScheduleRequest.AUTO, ScheduleKind.PERSISTENT, 9, ScheduleKind.STATIC),
+        (ScheduleRequest.AUTO, ScheduleKind.PERSISTENT, 10, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.PERSISTENT, ScheduleKind.PERSISTENT, 9, ScheduleKind.PERSISTENT),
+        (ScheduleRequest.STATIC, ScheduleKind.STATIC, 9, ScheduleKind.STATIC),
+    ],
+)
+def test_ragged_output_schedule_selection(schedule_request, resolved, device_major, expected):
+    assert (
+        output_module._select_ragged_output_schedule_kind(
+            schedule_request,
+            resolved,
+            device_major,
+        )
+        is expected
+    )
 
 
 def _reference(
