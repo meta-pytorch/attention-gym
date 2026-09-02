@@ -1,4 +1,4 @@
-"""Composed fixed-length and packed Blackwell KDA core forward."""
+"""Composed fixed-length and packed architecture-routed KDA core forward."""
 
 from __future__ import annotations
 
@@ -81,8 +81,8 @@ def _validate_private_abi(
             "the private chunk_kda ABI requires QKV to have contiguous heads and "
             "16-byte-aligned token rows"
         )
-    if get_device_properties(q.device).major < 10:
-        raise ValueError("the CuTe KDA core requires CUDA capability 10.0 or newer")
+    if get_device_properties(q.device).major < 8:
+        raise ValueError("the fused KDA core requires CUDA capability 8.0 or newer")
 
 
 def _validate_paged_private_abi(
@@ -501,6 +501,10 @@ def _prepare_chunk_kda_backward(
         d_output = normalize_tma_rows(d_output)
     if d_final_state is not None:
         d_final_state = _normalize_state_cotangent(d_final_state.float())
+    if get_device_properties(q.device).major < 10:
+        d_output = d_output.contiguous()
+        if d_final_state is not None:
+            d_final_state = d_final_state.contiguous()
     return q, k, v, metadata, d_output, d_final_state
 
 

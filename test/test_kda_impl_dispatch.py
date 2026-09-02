@@ -15,7 +15,7 @@ from attn_gym.linear._delta_rule.validation import validate_paged_state
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
 
-BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
+FUSED_CHUNK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
 
 
 def _inputs(
@@ -136,7 +136,7 @@ def test_recurrent_reference_is_differentiable():
     assert q.grad is not None and v.grad is not None
 
 
-@pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
+@pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk_kda requires CUDA capability 8.0")
 def test_chunk_reference_matches_fused():
     """Agree across implementations through the per-token gate contract."""
     q, k, v, gate, beta = _inputs(tokens=100, head_dim=128, dtype=torch.bfloat16, seed=2)
@@ -149,7 +149,7 @@ def test_chunk_reference_matches_fused():
     torch.testing.assert_close(fused_state, reference_state, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
+@pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk_kda requires CUDA capability 8.0")
 def test_chunk_reference_packed_matches_fused():
     """Match the fused ragged path per sequence, including empty slots."""
     q, k, v, gate, beta = _inputs(batch=1, tokens=150, head_dim=128, dtype=torch.bfloat16, seed=3)
@@ -229,7 +229,7 @@ def test_chunk_reference_rejects_fastmath():
         chunk_kda(q, k, v, gate, beta, fastmath=True, impl="reference")
 
 
-@pytest.mark.skipif(not BLACKWELL, reason="fused chunk_kda requires CUDA capability 10.0")
+@pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk_kda requires CUDA capability 8.0")
 def test_chunk_autotune_flag_is_deterministic_and_accurate():
     """autotune=False pins fixed heuristic configs without changing the math contract."""
     q, k, v, gate, beta = _inputs(tokens=128, head_dim=128, dtype=torch.bfloat16, seed=5)

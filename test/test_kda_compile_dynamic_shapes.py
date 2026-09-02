@@ -22,8 +22,8 @@ def offsets(sequence_count: int) -> torch.Tensor:
 
 def test_compiled_chunk_kda_accepts_varying_packed_sequence_count():
     """Vary sequence counts through the composed core and shared scheduler."""
-    if torch.cuda.get_device_capability() < (10, 0):
-        pytest.skip("the CuTe KDA core requires CUDA capability 10.0 or newer")
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("the fused KDA core requires CUDA capability 8.0 or newer")
     inputs = make_kda_test_inputs(TOKENS)
     compiled = torch.compile(chunk_kda, fullgraph=True, dynamic=True)
     for sequence_count in (2, 4):
