@@ -66,6 +66,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 BT = 64  # chunk size
 KEY_DIM = 128
@@ -973,11 +974,8 @@ def _compile_affine_summary(
 ):
     """Compile one dtype/head-count specialization from fake tensors."""
     target = get_compile_target()
-    if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
-        raise ValueError(
-            f"affine_summary_fwd requires an SM100 (CUDA capability >= 10.0) target; "
-            f"got target={target}"
-        )
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"affine_summary_fwd requires an SM100/SM103 target; got {target}")
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens = sym_int(divisibility=BT)
 
@@ -1026,13 +1024,15 @@ def build_state_summary(
         FP32 tensor of shape ``[H, 256, 128]``, V-first packed as state bias then
         state transition for ``H_out = H_in @ transition + bias``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous inputs on SM100.
+    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs.
+    SM100 uses the native UMMA kernel; other capability 8.0+ targets use Triton.
     A partial final chunk is neutral-padded by the wrapper.
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
     assert batch == 1, f"build_state_summary requires B=1, got B={batch}"
     assert tokens > 0, "build_state_summary requires at least one token"
+    assert heads > 0, "build_state_summary requires at least one head"
     assert key_dim == KEY_DIM, f"build_state_summary requires K={KEY_DIM}, got {key_dim}"
     assert w.shape == kg.shape, f"w must match kg shape {tuple(kg.shape)}, got {tuple(w.shape)}"
     assert u.shape == (1, tokens, heads, VAL_DIM), (
@@ -1065,7 +1065,6 @@ def build_state_summary(
     for name, tensor in (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate)):
         assert tensor.device == kg.device, f"{name} must be on {kg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-    kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
     pad = (-tokens) % BT
     if pad:
         padding = (0, 0, 0, 0, 0, pad)
@@ -1077,12 +1076,30 @@ def build_state_summary(
             ),
             dim=1,
         )
+    properties = get_device_properties(kg.device)
+    capability = (properties.major, properties.minor)
+    if capability < (8, 0):
+        raise ValueError(f"affine_summary_fwd requires CUDA capability 8.0+, got {capability}")
+    if not is_sm100_kda_capability(capability):
+        if capability[0] in (10, 12):
+            from attn_gym._backends.triton.utils import configure_triton_allocator
+
+            with torch.cuda.device(kg.device):
+                configure_triton_allocator()
+        from attn_gym.linear._delta_rule.triton.affine_summary_fwd import (
+            launch_affine_summary_fwd,
+        )
+
+        launch_affine_summary_fwd(kg, w, u, cumulative_gate, out, capability)
+        return out
+
+    kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
     use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, out)
 
     # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
     # BN=64 only when the extra column tiles would spill past one CTA wave and
     # serialize whole recurrence chains.
-    sm_count = get_device_properties(kg.device).multi_processor_count
+    sm_count = properties.multi_processor_count
     state_bn = 32 if heads * (SUMMARY_DIM // 32) <= sm_count else 64
     compiled = _compile_affine_summary(
         _IO_TYPE_NAMES[kg.dtype], heads, state_bn, use_int64_offsets

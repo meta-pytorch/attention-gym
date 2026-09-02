@@ -38,6 +38,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 BT = 64
 KEY_DIM = 128
@@ -1274,10 +1275,8 @@ def _compile_affine_summary_rev(
 ):
     """Compile one reverse-summary dtype/head/tile specialization."""
     target = get_compile_target()
-    if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
-        raise ValueError(
-            f"affine_summary_rev requires a CUDA capability >= 10.0 target; got {target}"
-        )
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"affine_summary_rev requires an SM100/SM103 target; got {target}")
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens = sym_int(divisibility=BT)
 
@@ -1339,13 +1338,15 @@ def build_state_grad_summary(
         FP32 tensor of shape ``[H, 256, 128]``, V-first packed as local bias then
         reverse transition for ``dH_in = dH_out @ transition + bias``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous inputs on Blackwell.
+    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs.
+    SM100 uses the native UMMA kernel; other capability 8.0+ targets use Triton.
     A partial final chunk is neutral-padded by the wrapper.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
     assert batch == 1, f"build_state_grad_summary requires B=1, got B={batch}"
     assert tokens > 0, "build_state_grad_summary requires at least one token"
+    assert heads > 0, "build_state_grad_summary requires at least one head"
     assert key_dim == KEY_DIM, f"build_state_grad_summary requires K={KEY_DIM}, got {key_dim}"
     for name, tensor in (("kg", kg), ("w", w), ("dout", dout)):
         assert tensor.shape == qg.shape, (
@@ -1390,7 +1391,6 @@ def build_state_grad_summary(
     for name, tensor in inputs:
         assert tensor.device == qg.device, f"{name} must be on {qg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-    qg, kg, w, dout, Aqk, cumulative_gate = (_aligned(tensor) for _name, tensor in inputs)
     pad = (-tokens) % BT
     if pad:
         padding = (0, 0, 0, 0, 0, pad)
@@ -1402,6 +1402,34 @@ def build_state_grad_summary(
             ),
             dim=1,
         )
+    properties = get_device_properties(qg.device)
+    capability = (properties.major, properties.minor)
+    if capability < (8, 0):
+        raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
+    if not is_sm100_kda_capability(capability):
+        if capability[0] in (10, 12):
+            from attn_gym._backends.triton.utils import configure_triton_allocator
+
+            with torch.cuda.device(qg.device):
+                configure_triton_allocator()
+        from attn_gym.linear._delta_rule.triton.affine_summary_rev import (
+            launch_affine_summary_rev,
+        )
+
+        launch_affine_summary_rev(
+            qg,
+            kg,
+            w,
+            dout,
+            Aqk,
+            cumulative_gate,
+            scale,
+            out,
+            capability,
+        )
+        return out
+
+    qg, kg, w, dout, Aqk, cumulative_gate = (_aligned(tensor) for _name, tensor in inputs)
     use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out)
 
     state_tile_width = select_summary_tile_width(heads, qg.device)
