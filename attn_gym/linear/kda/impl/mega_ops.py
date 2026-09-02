@@ -8,6 +8,7 @@ import importlib
 
 import torch
 
+from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.utils import fork_join_streams
 
 torch.library.define(
@@ -34,6 +35,11 @@ torch.library.define(
     "attn_gym::kda_chunk_mega_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
     "Tensor initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_mega_packed_fwd_paged",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
+    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_local_bwd",
@@ -160,6 +166,44 @@ def _packed_fwd_with_state_cuda(q, k, value, gate, beta, initial_state, cu_seqle
     )
 
 
+def _packed_fwd_paged_cuda(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    state_cache,
+    state_indices,
+    has_initial_state,
+    cu_seqlens,
+    scale,
+):
+    backend = _backend(q)
+    paged_state = PagedState.validate(
+        state_cache,
+        state_indices,
+        has_initial_state,
+        num_sequences=cu_seqlens.shape[0] - 1,
+        heads=value.shape[2],
+        value_dim=value.shape[3],
+        key_dim=q.shape[3],
+        device=q.device,
+        read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
+    ).require_alignment(16)
+    output, _ = backend.run_forward(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        paged_state,
+        scale=scale,
+        output_final_state=False,
+    )
+    return output
+
+
 def _packed_local_bwd_cuda(q, k, value, gate, beta, d_output, cu_seqlens, split, scale):
     from attn_gym.linear._delta_rule.mega.backward import chunk_delta_rule_bwd_mega_packed
 
@@ -197,6 +241,7 @@ torch.library.impl(
 torch.library.impl(
     "attn_gym::kda_chunk_mega_packed_fwd_with_state", "CUDA", _packed_fwd_with_state_cuda
 )
+torch.library.impl("attn_gym::kda_chunk_mega_packed_fwd_paged", "CUDA", _packed_fwd_paged_cuda)
 torch.library.impl("attn_gym::kda_chunk_mega_packed_local_bwd", "CUDA", _packed_local_bwd_cuda)
 torch.library.impl("attn_gym::kda_plain_gate_bwd_dense_cute", "CUDA", _plain_gate_bwd_cuda)
 
@@ -231,6 +276,22 @@ def _packed_fwd_with_state_fake(q, k, value, gate, beta, initial_state, cu_seqle
     return torch.empty_like(value), torch.empty_like(initial_state)
 
 
+@torch.library.register_fake("attn_gym::kda_chunk_mega_packed_fwd_paged")
+def _packed_fwd_paged_fake(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    state_cache,
+    state_indices,
+    has_initial_state,
+    cu_seqlens,
+    scale,
+):
+    return torch.empty_like(value)
+
+
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_local_bwd")
 def _packed_local_bwd_fake(q, k, value, gate, beta, d_output, cu_seqlens, split, scale):
     del d_output, cu_seqlens, split, scale
@@ -243,6 +304,7 @@ def _plain_gate_bwd_fake(d_cumulative):
 
 
 chunk_mega_packed_fwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_fwd.default
+chunk_mega_packed_fwd_paged_op = torch.ops.attn_gym.kda_chunk_mega_packed_fwd_paged.default
 chunk_mega_dense_training_fwd_op = torch.ops.attn_gym.kda_chunk_mega_dense_training_fwd.default
 chunk_mega_packed_training_fwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_training_fwd.default
 chunk_mega_packed_fwd_with_initial_state_op = (
@@ -258,6 +320,7 @@ plain_gate_bwd_dense_cute_op = torch.ops.attn_gym.kda_plain_gate_bwd_dense_cute.
 __all__ = [
     "chunk_mega_dense_training_fwd_op",
     "chunk_mega_packed_fwd_op",
+    "chunk_mega_packed_fwd_paged_op",
     "chunk_mega_packed_fwd_with_initial_state_op",
     "chunk_mega_packed_fwd_with_state_op",
     "chunk_mega_packed_local_bwd_op",

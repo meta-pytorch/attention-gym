@@ -11,6 +11,7 @@ from attn_gym.linear.gdn.impl.mega_ops import (
     chunk_gdn_mega_packed_bwd_op,
     chunk_gdn_mega_packed_bwd_with_state_op,
     chunk_gdn_mega_packed_fwd_op,
+    chunk_gdn_mega_packed_fwd_paged_op,
     chunk_gdn_mega_packed_fwd_with_initial_state_op,
     chunk_gdn_mega_packed_fwd_with_state_op,
     validate_mega_available,
@@ -211,4 +212,59 @@ def chunk_forward(
     return result.reshape(output_shape), None
 
 
-__all__ = ["chunk_forward"]
+def paged_chunk_forward(
+    q: Tensor,
+    k: Tensor,
+    value: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    state_cache: Tensor,
+    state_indices: Tensor,
+    *,
+    cu_seqlens: Tensor | None,
+    has_initial_state: Tensor | None,
+    scale: float,
+) -> Tensor:
+    """Advance selected ``state_cache`` slots in place with the Mega chunk kernel."""
+    if not q.is_cuda:
+        raise ValueError("the Mega GDN backend requires CUDA tensors")
+    if not torch.compiler.is_compiling():
+        validate_mega_available(q)
+    tensors = (q, k, value, gate, beta, state_cache)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
+        raise RuntimeError(
+            "paged_chunk_gdn is inference-only; call under torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+
+    gate, beta = (tensor.to(dtype=torch.float32) for tensor in (gate, beta))
+    batch = q.shape[0]
+    output_shape = value.shape
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+    elif batch != 1:
+        raise ValueError("packed cu_seqlens require q to have batch size one")
+    else:
+        cu_seqlens = cu_seqlens.contiguous()
+
+    if batch > 1:
+        q, k, value, gate, beta = (_pack_dense(tensor) for tensor in (q, k, value, gate, beta))
+
+    _validate_mega_constraints(q, k, value, gate, beta, state_cache)
+
+    output = chunk_gdn_mega_packed_fwd_paged_op(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        scale,
+    )
+    return output.reshape(output_shape)
+
+
+__all__ = ["chunk_forward", "paged_chunk_forward"]

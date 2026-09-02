@@ -40,6 +40,7 @@ import triton.language as tl
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.recurrent import GateKind
+from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 
 
 class GateTransform(Enum):
@@ -121,20 +122,23 @@ def _recurrent_delta_rule_decode_kernel(
     m_v = o_v < V
     m_vk = m_v[:, None] & m_k[None, :]
 
-    i_state = tl.load(state_indices + i_n).to(tl.int64)
+    state_slot, state_active, load_initial = resolve_paged_state(
+        i_n,
+        state_indices,
+        has_initial_state,
+        True,
+        USE_HAS_INITIAL_STATE,
+    )
     row = i_n * H + i_h
-    if i_state <= 0:
+    if not state_active:
         tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
         return
 
     p_state = ptr_offset(
-        (i_state, i_h, o_v[:, None], o_k[None, :]),
+        (state_slot, i_h, o_v[:, None], o_k[None, :]),
         (state_batch_stride, V * K, K, 1),
     )
-    m_state = m_vk
-    if USE_HAS_INITIAL_STATE:
-        m_state &= tl.load(has_initial_state + i_n)
-    b_state = tl.load(state_cache + p_state, mask=m_state, other=0.0).to(tl.float32)
+    b_state = tl.load(state_cache + p_state, mask=m_vk & load_initial, other=0.0).to(tl.float32)
 
     p_qkv = packed_qkv + i_n * qkv_token_stride
     b_q = tl.load(p_qkv + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)

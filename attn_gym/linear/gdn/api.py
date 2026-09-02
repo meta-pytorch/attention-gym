@@ -11,6 +11,7 @@ from attn_gym.linear._delta_rule.validation import (
     validate_paged_state,
 )
 from attn_gym.linear.gdn.impl.mega import chunk_forward as mega_chunk_forward
+from attn_gym.linear.gdn.impl.mega import paged_chunk_forward as mega_paged_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
@@ -122,6 +123,7 @@ def paged_chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
+    kernel_options: KernelOptions | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
@@ -143,13 +145,20 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
+        kernel_options: Backend options. The repo-local path is the default;
+            ``{"backend": "mega"}`` selects the optional CuTeDSL 4.7 Mega backend, which
+            requires 16-byte-aligned pool bases and slot origins.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
+    backend = resolve_kernel_options(kernel_options)
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     validate_paged_state(q, v, state_cache, cu_seqlens, state_indices, has_initial_state)
-    return fused_paged_chunk_forward(
+    paged_chunk_forward = (
+        mega_paged_chunk_forward if backend == "mega" else fused_paged_chunk_forward
+    )
+    return paged_chunk_forward(
         q,
         k,
         v,

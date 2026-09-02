@@ -49,7 +49,8 @@ output, final_state = chunk_gdn(
   support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
-- An opt-in Mega fused chunk implementation with the same public training/state contract.
+- An opt-in Mega fused chunk implementation with the same public training/state contract and
+  direct paged-cache prefill on SM100/SM103.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
 - Autograd for the reference and fused chunk implementations, including initial-state gradients.
@@ -348,9 +349,13 @@ normalized keys, post-sigmoid beta, and nonpositive decay increments may explici
 approximate backward-only forgetting-horizon splitting with
 `kernel_options={"backend": "mega", "split_backward": True}`. The implementation chooses the
 split count from the input geometry; no public split-size knob is exposed. Split backward currently
-requires a no-state call. Install the `mega` extra to use this backend.
+requires a no-state call. `paged_chunk_kda(..., kernel_options={"backend": "mega"})` uses the
+same exact unsplit forward while updating selected cache slots directly; paged execution never uses
+forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
 ::: attn_gym.linear.chunk_kda
+
+::: attn_gym.linear.paged_chunk_kda
 
 ::: attn_gym.linear.recurrent_kda
 
