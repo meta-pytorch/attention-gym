@@ -8,8 +8,8 @@
 
 One ``(sequence, head, BV=64)`` Triton program computes each chunk's
 ``Aqk^T @ dO`` contribution and keeps the K-by-BV state cotangent in FP32 while
-traversing chunks in reverse. Packed tails use masked pointer accesses, and
-capacity slots without runtime work remain zero.
+traversing chunks in reverse. Packed tails use masked pointer accesses; capacity
+slots without runtime work are left undefined and never consumed.
 """
 
 from __future__ import annotations
@@ -320,13 +320,14 @@ def chunk_kda_bwd_delta_h_triton(
     if d_final_state is not None and not d_final_state.is_contiguous():
         raise TypeError("d_final_state must be contiguous")
 
-    output_factory = torch.zeros if metadata is not None else torch.empty
-    dh = output_factory(
+    # Every active chunk/token is fully written, and downstream stages use the same
+    # metadata to avoid inactive capacity. Caller gradient barriers sanitize escaped rows.
+    dh = torch.empty(
         (1, capacity, heads, _HEAD_DIM, _VALUE_DIM),
         dtype=qg.dtype,
         device=qg.device,
     )
-    dv = output_factory(d_output.shape, dtype=d_output.dtype, device=d_output.device)
+    dv = torch.empty(d_output.shape, dtype=d_output.dtype, device=d_output.device)
     d_initial_state = (
         torch.empty(state_shape, dtype=torch.float32, device=qg.device)
         if initial_state is not None
