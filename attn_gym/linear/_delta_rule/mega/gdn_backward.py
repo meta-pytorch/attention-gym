@@ -44,6 +44,8 @@ def chunk_gdn_bwd_mega_packed(
 ]:
     """Run exact BT64 checkpoint recompute followed by scalar-GDN backward."""
     scale = resolve_scale(scale, q.shape[-1])
+    if d_output.dtype != q.dtype:
+        raise TypeError(f"d_output must use q.dtype ({q.dtype}), got {d_output.dtype}")
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
     with initialized_cuda_device(q):

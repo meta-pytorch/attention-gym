@@ -1538,8 +1538,9 @@ def tcgen05_mma_warp(
                 bars.mb_decay_done[decay_stage].arrive(cta_group=1)
 
         # ---- tile end: WG1's dstate0 drain gates the next tile's dstate reuse ------------
-        bars.mb_dstate0_acc_stored.wait(dstate0_index.phase)
-        dstate0_index = advance(dstate0_index, 1)
+        if num_compute_chunks > 0:
+            bars.mb_dstate0_acc_stored.wait(dstate0_index.phase)
+            dstate0_index = advance(dstate0_index, 1)
         chunk_serial_base += num_compute_chunks
         tile_idx, sched_state = sched_next_tile(cfg, bars, sSched, sched_state, tile_idx, num_ctas)
     bars.mb_tmem_done[0].wait(0)
@@ -2598,7 +2599,8 @@ def compute1_warp_group(
                             mDstate0[batch_idx, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd]
                         else:
                             mDstate0[batch_idx, head_idx, value_dim, kd] = cutlass.Float32(0.0)
-        bars.mb_dstate0_acc_stored.arrive()
+        if num_compute_chunks > 0:
+            bars.mb_dstate0_acc_stored.arrive()
         chunk_serial_base += num_compute_chunks
         tile_idx, sched_state = sched_next_tile(cfg, bars, sSched, sched_state, tile_idx, num_ctas)
 

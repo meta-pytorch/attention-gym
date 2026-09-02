@@ -548,6 +548,73 @@ def test_public_gdn_mega_dynamic_dense_tokens() -> None:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
+    reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
+)
+def test_public_gdn_mega_repeated_stateful_launches_cross_wave_boundary() -> None:
+    """Persistent CTAs must preserve barrier phases across their fourth logical item."""
+    inputs = make_gdn_test_inputs(
+        (128,) * 29,
+        key_heads=8,
+        value_heads=16,
+        requires_grad=False,
+        seed=353,
+    )
+    q, k, value, gate, beta, state, cu_seqlens = inputs
+    with torch.no_grad():
+        for _ in range(1000):
+            chunk_gdn(
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                state,
+                cu_seqlens=cu_seqlens,
+                output_final_state=True,
+                impl="fused",
+            )
+            torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(
+    os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
+    reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
+)
+def test_public_gdn_mega_repeated_backward_crosses_wave_boundary() -> None:
+    """Recompute and backward barriers must survive persistent CTA reuse."""
+    inputs = make_gdn_test_inputs(
+        (128,) * 29,
+        key_heads=8,
+        value_heads=16,
+        requires_grad=True,
+        seed=419,
+    )
+    q, k, value, gate, beta, state, cu_seqlens = inputs
+    d_output = torch.randn_like(value)
+    d_state = torch.randn_like(state)
+    for _ in range(500):
+        output, final_state = chunk_gdn(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            impl="fused",
+        )
+        assert final_state is not None
+        torch.autograd.grad(
+            (output, final_state),
+            (q, k, value, gate, beta, state),
+            (d_output, d_state),
+        )
+        torch.cuda.synchronize()
+
+
 def test_public_gdn_mega_cuda_graph_replay() -> None:
     """Compiled packed stateful forward/backward must capture and replay bitwise."""
     inputs = make_gdn_test_inputs(
