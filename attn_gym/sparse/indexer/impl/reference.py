@@ -15,14 +15,11 @@ def index(
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
-    Computes::
-
-        dots[b, t, h, s] = q[b, t, h, :] · k[b, s, :]
-        score[b, t, s]   = sum_h(w[b, t, h] * relu(dots[b, t, h, s]))
-                           / sqrt(H * D)
-        if causal: score[b, t, s] = -inf  where s > t
-        output[b, t, :]  = topk(score[b, t, :]).indices
-
+    Computes:
+        Attention matrix between q and k, reduces across heads (sum of scaled relu),
+        then takes topk q_i* k_j attention score positions for each q_i
+        
+        
     Args:
         q: ``[B, T, H, D]``
         k: ``[B, S, D]``
