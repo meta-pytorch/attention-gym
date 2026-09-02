@@ -10,6 +10,17 @@ from attn_gym.linear.kda.naive import (
     naive_chunk_kda,
     naive_recurrent_kda,
 )
+from attn_gym.testing.kda import assert_relative_rms_within
+
+
+def test_relative_rms_zero_reference_requires_exact_zero() -> None:
+    """A zero reference must not give small nonzero results an artificial budget."""
+    expected = torch.zeros(4)
+    assert_relative_rms_within(expected, expected, "zero", max_eps=1.25)
+
+    tiny_nonzero = torch.full_like(expected, torch.finfo(torch.bfloat16).tiny)
+    with pytest.raises(AssertionError, match="expected exact zero"):
+        assert_relative_rms_within(tiny_nonzero, expected, "zero", max_eps=1.25)
 
 
 def make_inputs(seq_len: int) -> tuple[torch.Tensor, ...]:

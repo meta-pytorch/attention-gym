@@ -155,24 +155,44 @@ def assert_matches_low_precision_reference(
     name: str,
     *,
     source_dtype: torch.dtype = torch.bfloat16,
-    rms: bool = False,
 ) -> None:
-    """Bound kernel error by the reference error and source-operand precision."""
+    """Bound pointwise kernel error by reference error and source precision."""
     high_precision = high_precision.double()
-    if rms:
-        error = lambda value: value.square().mean().sqrt().item()
-        reference_scale = error(high_precision)
-    else:
-        error = lambda value: value.abs().max().item()
-        reference_scale = high_precision.abs().max().item()
-    rounding_band = torch.finfo(source_dtype).eps * reference_scale
-    actual_error = error(actual.double() - high_precision)
-    reference_error = error(low_precision.double() - high_precision)
+    rounding_band = torch.finfo(source_dtype).eps * high_precision.abs().max().item()
+    actual_error = (actual.double() - high_precision).abs().max().item()
+    reference_error = (low_precision.double() - high_precision).abs().max().item()
     budget = 2 * (reference_error + rounding_band)
     assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
     assert actual_error <= budget, (
         f"{name}: kernel error {actual_error:.3e} exceeds {budget:.3e} "
         f"(reference error {reference_error:.3e})"
+    )
+
+
+def assert_relative_rms_within(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    name: str,
+    *,
+    max_eps: float,
+    source_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Bound aggregate relative RMS error in units of source-dtype epsilon.
+
+    A zero reference has a zero budget and therefore requires an exactly zero result.
+    """
+    assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
+    expected = expected.double()
+    error = (actual.double() - expected).square().mean().sqrt().item()
+    scale = expected.square().mean().sqrt().item()
+    if scale == 0:
+        assert error == 0, f"{name}: expected exact zero, got RMS error {error:.3e}"
+        return
+    relative_error = error / scale
+    limit = max_eps * torch.finfo(source_dtype).eps
+    assert relative_error <= limit, (
+        f"{name}: relative RMS error {relative_error:.3e} exceeds {limit:.3e} "
+        f"({relative_error / torch.finfo(source_dtype).eps:.2f} {source_dtype} eps)"
     )
 
 
@@ -380,6 +400,7 @@ def bwd_wy_dqkg_reference(
 
 __all__ = [
     "assert_matches_low_precision_reference",
+    "assert_relative_rms_within",
     "bwd_daqk_reference",
     "bwd_intra_reference",
     "bwd_wy_dqkg_reference",
