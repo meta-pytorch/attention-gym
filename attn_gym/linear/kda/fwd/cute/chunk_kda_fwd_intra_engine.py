@@ -254,8 +254,9 @@ class KdaIntraFwdEngine:
 
         mma_s = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_type,
             self.cta_group,
             self.s_tile[:2],
@@ -267,8 +268,9 @@ class KdaIntraFwdEngine:
         strip_tile = (self.mma_rows, 16, BK)
         mma16 = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_type,
             self.cta_group,
             strip_tile[:2],

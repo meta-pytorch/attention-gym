@@ -157,16 +157,16 @@ def _mma_config(precision: MmaPrecision):
             MMA_INST_SHAPE_MNK_BF16,
             tcgen05.CtaGroup.ONE,
             tcgen05.OperandSource.SMEM,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
         )
         return op, cutlass.BFloat16
     op = tcgen05.MmaTF32Op(
         MMA_INST_SHAPE_MNK,
         tcgen05.CtaGroup.ONE,
         tcgen05.OperandSource.SMEM,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.MN,
+        cute.nvgpu.OperandMajorMode.K,
+        cute.nvgpu.OperandMajorMode.MN,
     )
     return op, MMA_DTYPE
 
