@@ -118,7 +118,8 @@ def index(
         mode: Currently only prefill is supported; auto defaults to prefill.
 
     Returns:
-        [B, T, topk] INT32 tensor of selected candidate indices.
+        [B, T, topk] INT32 tensor of selected candidate indices. 
+        Not guaranteed to be sorted
     """
     if not torch.compiler.is_compiling():
         _validate_inputs(q, k, weights, topk, causal)
