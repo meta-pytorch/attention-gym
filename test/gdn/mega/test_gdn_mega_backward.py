@@ -89,6 +89,8 @@ def reference_gradients(
     precision: torch.dtype | None,
     initial_state: torch.Tensor | None,
     d_final_state: torch.Tensor | None,
+    *,
+    scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate public eager GDN at source precision or independently in FP64."""
     q, k, value, gate, beta, _state, cu_seqlens = inputs
@@ -109,6 +111,7 @@ def reference_gradients(
         state,
         cu_seqlens=cu_seqlens,
         output_final_state=d_final_state is not None,
+        scale=scale,
         impl="reference",
     )
     outputs = (output,) if final_state is None else (output, final_state)
@@ -232,6 +235,55 @@ def test_gdn_mega_backward_uniform_negative_twenty_is_finite(
     d_output, _ = make_cotangents(inputs[2], None, seed=137 + key_heads, state_cotangent=False)
     gradients = chunk_gdn_bwd_mega_packed(*inputs[:5], d_output, inputs[6])[:5]
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("beta_value", (0.0, 1e-12, 1e-10, 1e-8))
+def test_gdn_mega_backward_preserves_small_beta_gradient(
+    dtype: torch.dtype, beta_value: float
+) -> None:
+    """dBeta must remain defined when the write gate is zero or very small."""
+    shape = (1, 2, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    value = torch.zeros_like(q)
+    q[..., 0] = 1
+    k[..., 0] = 1
+    value[0, 0, 0, 0] = 1
+    value[0, 1, 0, 0] = 2  # Makes both the residual and strict-lower dBeta terms nonzero.
+    gate = torch.zeros(shape[:-1], device="cuda")
+    beta = torch.tensor([[[1.0], [beta_value]]], device="cuda")
+    d_output = torch.zeros_like(value)
+    d_output[0, 1, 0, 0] = 1
+    cu_seqlens = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    inputs = (q, k, value, gate, beta, None, cu_seqlens)
+
+    gradients = chunk_gdn_bwd_mega_packed(*inputs[:5], d_output, cu_seqlens, scale=1.0)
+    expected_gradients = reference_gradients(
+        inputs, d_output, torch.float64, None, None, scale=1.0
+    )
+
+    for actual, expected in zip(gradients[:5], expected_gradients, strict=True):
+        assert torch.equal(actual, expected.to(actual.dtype))
+    assert gradients[4][0, 1, 0].item() == 1.0
+
+
+def test_gdn_mega_backward_mixed_small_beta_matches_reference() -> None:
+    """Direct dBeta must survive zero and small beta across persistent chunks."""
+    inputs = make_gdn_test_inputs(
+        (64, 65, 0),
+        key_heads=1,
+        value_heads=2,
+        dtype=torch.bfloat16,
+        seed=151,
+    )
+    beta = inputs[4]
+    beta[:, ::4] = 0.0
+    beta[:, 1::4] = 1e-12
+    beta[:, 2::4] = 1e-8
+    d_output, d_final_state = make_cotangents(inputs[2], inputs[5], seed=157, state_cotangent=True)
+
+    assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
 
 
 def test_gdn_mega_backward_rejects_mismatched_output_gradient_dtype() -> None:
