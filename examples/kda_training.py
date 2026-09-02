@@ -5,15 +5,15 @@ we have in attn_gym to build a performant KDA implementation. It roughly follows
 There is a reason though that this is in examples/ and not the core package. We want to encourage people
 to own their own implementation and surrounding ops. Don't wont short convs then dont add em!
 
-Below is a reference where you can run an unfused vs fused implementation an get profiles
-as well as full graph compile. The kernels primarily focus blackwell for the fused implementation.
+Below is a reference where you can run an unfused vs fused implementation and get profiles
+as well as full graph compile. The fused training path supports Hopper and Blackwell.
 Like all good things the only thing this training run proves is that it can overfit a fixed target - much success!
 
 Run a reference training step with::
 
     python examples/kda_training.py --backend=reference
 
-On a Blackwell GPU, exercise the fused backend with::
+On a Hopper or Blackwell GPU, exercise the fused backend with::
 
     python examples/kda_training.py --backend=fused
 
