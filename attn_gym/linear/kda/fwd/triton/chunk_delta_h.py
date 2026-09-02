@@ -10,8 +10,9 @@ A single kernel (B=1, K=V=128, 64-token chunks) keeps the full [K, BV] state in
 one accumulator. Blackwell overlaps descriptor loads with the serial state MMAs
 through warp specialization; Hopper and FP32 use ordinary pipelining because the
 Hopper warp-specialization pass cannot commit this kernel's descriptor stores.
-Host-side tensor descriptors do not survive Dynamo/Inductor tracing, so the
-launch sits behind a compiler-opaque ``torch.library`` op pair.
+Host-side tensor descriptors use hardware TMA where available and Triton
+fallback lowering on SM80. They do not survive Dynamo/Inductor tracing, so
+the launch sits behind a compiler-opaque ``torch.library`` op pair.
 """
 
 from __future__ import annotations
@@ -22,7 +23,11 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    can_use_tensor_descriptor,
+    ptr_offset,
+    requires_int64_offsets,
+)
 from attn_gym.linear.kda.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -453,7 +458,7 @@ def _delta_h_launch(
     scalar_gate = gk.ndim == 3
     if scalar_gate:
         gk = gk.contiguous()
-    elif not can_use_tma(gk):
+    elif not can_use_tensor_descriptor(gk):
         gk = gk.clone(memory_format=torch.contiguous_format)
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     compact_state_strides = (heads * value_dim * key_dim, value_dim * key_dim, key_dim, 1)
@@ -742,7 +747,7 @@ def chunk_gated_delta_rule_fwd_h(
             )
         return h, torch.empty_like(u), final_state
 
-    if not all(can_use_tma(t) for t in (k, w, u)):
+    if not all(can_use_tensor_descriptor(t) for t in (k, w, u)):
         raise ValueError(
             "the inter-chunk state recurrence requires 16-byte-aligned, "
             "last-dimension-contiguous k, w, and u"

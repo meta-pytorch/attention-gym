@@ -19,8 +19,8 @@ from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTe KDA core requires CUDA capability 10.0 or 10.3",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the fused KDA core requires CUDA capability 8.0 or newer",
 )
 
 
