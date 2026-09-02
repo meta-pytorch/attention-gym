@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Literal
 
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from .kda import cumulative_sequence_offsets
 
 GatePattern = Literal[
+    "model_range",
     "mild",
     "softplus",
     "uniform_negative_twenty",
@@ -27,7 +29,7 @@ def make_gdn_test_inputs(
     batch: int = 1,
     key_heads: int = 1,
     value_heads: int = 2,
-    gate_pattern: GatePattern = "mild",
+    gate_pattern: GatePattern = "model_range",
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 31,
     value_scale: float = 0.125,
@@ -63,6 +65,12 @@ def make_gdn_test_inputs(
     )
 
     match gate_pattern:
+        case "model_range":
+            gate = (
+                torch.empty(gate_shape, device="cuda")
+                .uniform_(math.exp(-5.0), 1.0, generator=generator)
+                .log_()
+            )
         case "mild":
             gate = (
                 torch.empty(gate_shape, device="cuda")
