@@ -1,8 +1,9 @@
 """Tests for the CuTeDSL (SM100) indexer backend.
 
 Validates that the cute backend produces the same Top-K index sets as the
-eager reference, and that FP64 scores at kernel-selected positions are at
-or above the FP64 Top-K boundary within reduction tolerance.
+eager reference, that FP64 scores at kernel-selected positions are at or
+above the FP64 Top-K boundary within reduction tolerance, and that the
+backend runs and matches eager output under torch.compile.
 """
 
 import math
@@ -249,3 +250,37 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
         f"kernel selected a candidate below the FP64 boundary "
         f"(worst gap: {(min_allowed.expand_as(kernel_scores_64)[violations] - kernel_scores_64[violations]).max().item():.6g})"
     )
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_cute_backend_under_torch_compile(causal):
+    """torch.compile over the cute backend runs and matches uncompiled output.
+
+    fullgraph=True is not supported: `_validate`'s alignment check
+    (`tensor.data_ptr() % _ALIGNMENT`) is not traceable, so this compiles with
+    the default graph-break-tolerant mode instead.
+    """
+    _skip_no_sm100()
+
+    torch.manual_seed(2026)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch, queries, heads, head_dim, topk = 2, 128, 64, 128, 32
+
+    q = torch.randn(batch, queries, heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch, queries, head_dim, device=device, dtype=dtype)
+    w = torch.randn(batch, queries, heads, device=device, dtype=dtype)
+
+    def run(q, k, w):
+        return index(q, k, w, topk, causal=causal, backend="cute")
+
+    eager_out = run(q, k, w)
+    assert eager_out.shape == (batch, queries, topk)
+    assert eager_out.dtype == torch.int32
+
+    compiled_run = torch.compile(run)
+    compiled_out = compiled_run(q, k, w)
+    assert compiled_out.shape == (batch, queries, topk)
+    assert compiled_out.dtype == torch.int32
+
+    torch.testing.assert_close(compiled_out, eager_out, rtol=0, atol=0)
