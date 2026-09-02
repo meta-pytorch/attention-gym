@@ -1365,6 +1365,8 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         raise TypeError(f"topk must be an int, got {type(topk).__name__}")
     if topk < 0 or topk > queries:
         raise ValueError(f"topk must be in [0, {queries}], got {topk}")
+    if topk > 512:
+        raise ValueError(f"topk must be <= 512 for the CuTeDSL indexer, got {topk}")
 
     tensors = (q, k, weights)
     if any(not tensor.is_cuda for tensor in tensors):
