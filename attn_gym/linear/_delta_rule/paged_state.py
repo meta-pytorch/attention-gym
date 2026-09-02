@@ -31,7 +31,19 @@ def validate_has_initial_state(
 
 @dataclass(frozen=True, slots=True)
 class PagedState:
-    """A mutable state pool and its per-sequence device routing metadata."""
+    """A mutable state pool and its per-sequence device routing metadata.
+
+    Attributes:
+        cache: FP32 state pool shaped ``[slots, heads, value_dim, key_dim]``.
+            Active routes update their selected slots in place.
+        indices: Contiguous int32 route for each sequence. Positive values
+            select cache slots; non-positive values produce zero output and
+            leave the cache untouched. Positive routes must be in bounds and
+            unique among concurrently processed sequences.
+        has_initial_state: Optional bool mask with one value per sequence.
+            ``True`` resumes the selected slot. ``False`` starts from zero and
+            overwrites the slot; if omitted, every active route resumes.
+    """
 
     cache: torch.Tensor
     indices: torch.Tensor

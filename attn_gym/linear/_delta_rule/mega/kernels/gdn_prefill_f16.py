@@ -2670,8 +2670,8 @@ def compute1_warp_group(
                     o_regs.append([o_vec[k] for k in range(32)])
                 nvvm.tcgen05_wait("load")
                 if cutlass.const_expr(cfg.paged_state):
-                    # Selection, rather than multiplication, keeps null routes zero
-                    # even if their padding tokens contain NaNs.
+                    # NOTE: Select rather than multiply because null-route padding
+                    # may contain NaNs and must still produce exact zeros.
                     o_regs = [
                         [val if state_valid else cutlass.Float32(0.0) for val in regs]
                         for regs in o_regs
