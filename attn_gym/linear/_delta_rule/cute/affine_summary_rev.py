@@ -213,8 +213,9 @@ class BlackwellDeltaAffineSummaryRev:
         # MMA1: kg [BT,K] reads X [K,BN] to begin the local write gradient dv.
         mma_dv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_type,
             self.cta_group,
             self.dv_tile[:2],
@@ -223,8 +224,9 @@ class BlackwellDeltaAffineSummaryRev:
         # MMA2: qg^T [K,BT] reads dO [BT,BN] for the direct query contribution.
         mma_qdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_type,
             self.cta_group,
             self.qdo_tile[:2],
@@ -233,8 +235,9 @@ class BlackwellDeltaAffineSummaryRev:
         # MMA3: Aqk^T [BT,BT] reads dO and accumulates the local term into dv.
         mma_aqdo = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_type,
             self.cta_group,
             self.aqdo_tile[:2],
@@ -243,8 +246,9 @@ class BlackwellDeltaAffineSummaryRev:
         # MMA4: w^T [K,BT] reads the completed dv for the subtractive WY term.
         mma_wdv = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_type,
             self.cta_group,
             self.wdv_tile[:2],
@@ -1429,7 +1433,9 @@ def build_state_grad_summary(
         )
         return out
 
-    qg, kg, w, dout, Aqk, cumulative_gate = (_aligned(tensor) for _name, tensor in inputs)
+    qg, kg, w, dout, Aqk, cumulative_gate = (
+        _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
+    )
     use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out)
 
     state_tile_width = select_summary_tile_width(heads, qg.device)

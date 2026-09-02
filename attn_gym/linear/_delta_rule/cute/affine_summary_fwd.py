@@ -220,8 +220,9 @@ class _AffineSummaryFwdOp:
         # MMA1: w (A, K-major) × X snapshot (B, K-major) → wx.
         mma_wx = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.ONE,
             self.wx_tile[:2],
@@ -230,8 +231,9 @@ class _AffineSummaryFwdOp:
         # MMA2: kg^T (A, MN-major) × Tmp (B, K-major) → kt.
         mma_kt = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.K,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.ONE,
             self.kt_tile[:2],
@@ -241,8 +243,9 @@ class _AffineSummaryFwdOp:
         # Same accumulator tile as MMA2; only the B major mode differs.
         mma_ktu = sm100_utils.make_trivial_tiled_mma(
             self.io_type,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.io_type,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             tcgen05.CtaGroup.ONE,
             self.kt_tile[:2],
