@@ -53,41 +53,55 @@ def strided_state_pool(
     return storage, state
 
 
+def _model_rows(shape: tuple[int, ...], generator: torch.Generator) -> torch.Tensor:
+    """Generate heterogeneous, model-scale rows without poorly conditioned extremes."""
+    rows = math.prod(shape[:-1])
+    means = torch.randn(rows, 1, device="cuda", generator=generator) * 0.05
+    values = means + torch.rand(rows, shape[-1], device="cuda", generator=generator) * 0.5 - 0.25
+    return values.reshape(shape)
+
+
 def make_kda_test_inputs(
     tokens: int,
     *,
     batch: int = 1,
     heads: int = 1,
     seed: int = 41,
-    gate_scale: float = 1.0,
+    gate_scale: float = 5.0,
     gate_value: float | None = None,
-    log_uniform_gate: bool = False,
+    log_uniform_gate: bool = True,
     sigmoid_beta: bool = False,
     dtype: torch.dtype = torch.bfloat16,
     normalize_qk: bool = False,
-    value_scale: float = 0.125,
+    value_scale: float = 1.0,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Create deterministic public KDA inputs with per-token natural-log gates."""
-    torch.manual_seed(seed)
+    """Create deterministic public KDA inputs with model-range values and log gates."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     shape = (batch, tokens, heads, 128)
     if normalize_qk:
-        q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
-        k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
+        q = F.normalize(torch.randn(shape, device="cuda", generator=generator), dim=-1)
+        k = F.normalize(torch.randn(shape, device="cuda", generator=generator), dim=-1)
     else:
-        q = torch.randn(shape, device="cuda", dtype=dtype) / 8
-        k = torch.randn(shape, device="cuda", dtype=dtype) / 8
-    value = torch.randn(shape, device="cuda", dtype=dtype) * value_scale
+        q = _model_rows(shape, generator)
+        k = F.normalize(_model_rows(shape, generator), dim=-1)
+    q = q.to(dtype)
+    k = k.to(dtype)
+    value = (_model_rows(shape, generator) * value_scale).to(dtype)
     if gate_value is not None:
         gate = torch.full(shape, gate_value, device="cuda")
     elif log_uniform_gate:
-        gate = torch.empty(shape, device="cuda").uniform_(math.exp(-gate_scale), 1.0).log_()
+        gate = (
+            torch.empty(shape, device="cuda")
+            .uniform_(math.exp(-gate_scale), 1.0, generator=generator)
+            .log_()
+        )
     else:
-        gate = -torch.rand(shape, device="cuda") * gate_scale
+        gate = -torch.rand(shape, device="cuda", generator=generator) * gate_scale
     beta = (
-        torch.randn(batch, tokens, heads, device="cuda").sigmoid_()
+        torch.randn(batch, tokens, heads, device="cuda", generator=generator).sigmoid_()
         if sigmoid_beta
-        else torch.rand(batch, tokens, heads, device="cuda")
+        else torch.rand(batch, tokens, heads, device="cuda", generator=generator)
     )
     values = (q, k, value, gate, beta)
     return tuple(value.requires_grad_(requires_grad) for value in values)
@@ -141,12 +155,19 @@ def assert_matches_low_precision_reference(
     name: str,
     *,
     source_dtype: torch.dtype = torch.bfloat16,
+    rms: bool = False,
 ) -> None:
     """Bound kernel error by the reference error and source-operand precision."""
     high_precision = high_precision.double()
-    rounding_band = torch.finfo(source_dtype).eps * high_precision.abs().max().item()
-    actual_error = (actual.double() - high_precision).abs().max().item()
-    reference_error = (low_precision.double() - high_precision).abs().max().item()
+    if rms:
+        error = lambda value: value.square().mean().sqrt().item()
+        reference_scale = error(high_precision)
+    else:
+        error = lambda value: value.abs().max().item()
+        reference_scale = high_precision.abs().max().item()
+    rounding_band = torch.finfo(source_dtype).eps * reference_scale
+    actual_error = error(actual.double() - high_precision)
+    reference_error = error(low_precision.double() - high_precision)
     budget = 2 * (reference_error + rounding_band)
     assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
     assert actual_error <= budget, (
