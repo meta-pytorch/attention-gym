@@ -32,6 +32,8 @@ def index(
     """
     batch, queries, heads, head_dim = q.shape
     candidates = k.shape[1]
+    if topk == 0:
+        return torch.empty((batch, queries, 0), dtype=torch.int32, device=q.device)
     scale = 1.0 / math.sqrt(heads * head_dim)
 
     # dots: [B, T, H, S]

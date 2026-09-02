@@ -4,8 +4,10 @@ Each CTA owns two adjacent query rows, reuses every staged key tile across both
 queries for each 64-head tile, and overlaps the tensor-core producer with two
 independent CUDA-warpgroup Top-K consumers.  Both final Top-K lists remain
 entirely in shared memory.  There are no global partial lists and no merge
-kernel.  The public operation is deliberately a direct CuTeDSL launch: it has
-no dispatcher registration, compilation cache, or fallback implementation.
+kernel.  The public operation is a direct CuTeDSL launch guarded by an
+in-process compile cache keyed on the static shape/dtype contract (dtype,
+batch, queries, heads, head_dim, topk, causal); it has no dispatcher
+registration or fallback implementation.
 """
 
 import math
@@ -1596,8 +1598,8 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         raise ValueError(
             f"weights must have shape {(batch, queries, heads)}, got {tuple(weights.shape)}"
         )
-    if batch <= 0 or batch % 2:
-        raise ValueError(f"batch must be a positive multiple of 2, got {batch}")
+    if batch <= 0:
+        raise ValueError(f"batch must be positive, got {batch}")
     if queries <= 0 or queries > _MAX_SEQUENCE:
         raise ValueError(f"sequence length must be in [1, {_MAX_SEQUENCE}], got {queries}")
     if heads <= 0 or heads % 2:
@@ -1631,6 +1633,9 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         raise RuntimeError("this tcgen05 kernel requires an SM100 GPU")
 
 
+_compile_cache: dict[tuple, object] = {}
+
+
 def index(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1644,25 +1649,41 @@ def index(
     k[B,T,D], and weights[B,T,H].  The INT32 result has shape
     [B,T,topk].  Invalid contracts, compilation errors, shared-memory
     exhaustion, and launch errors propagate; there is no fallback.
+
+    A compiled kernel is cached per (dtype, batch, queries, heads, head_dim,
+    topk, causal); the same shape/dtype/topk/causal combination reuses the
+    already-compiled kernel instead of retracing on every call. A new
+    sequence length recompiles.
     """
-    if not isinstance(causal, bool):
-        raise TypeError(f"causal must be a bool, got {type(causal).__name__}")
     _validate(q, k, weights, topk)
     if topk == 0:
         return torch.empty((*q.shape[:2], 0), dtype=torch.int32, device=q.device)
 
     output = torch.empty((*q.shape[:2], topk), dtype=torch.int32, device=q.device)
-    _launch(
-        from_dlpack(q, assumed_align=_ALIGNMENT),
-        from_dlpack(k, assumed_align=_ALIGNMENT),
-        from_dlpack(weights, assumed_align=_ALIGNMENT),
-        from_dlpack(output, assumed_align=_ALIGNMENT),
-        1.0 / math.sqrt(q.shape[2] * q.shape[3]),
-        topk,
-        _selection_sort_span(topk),
-        causal,
-    )
+    batch, queries, heads, head_dim = q.shape
+    compile_key = (q.dtype, batch, queries, heads, head_dim, topk, causal)
+    score_scale = 1.0 / math.sqrt(heads * head_dim)
+    q_c = from_dlpack(q, assumed_align=_ALIGNMENT)
+    k_c = from_dlpack(k, assumed_align=_ALIGNMENT)
+    weights_c = from_dlpack(weights, assumed_align=_ALIGNMENT)
+    output_c = from_dlpack(output, assumed_align=_ALIGNMENT)
+    compiled = _compile_cache.get(compile_key)
+    if compiled is None:
+        compiled = cute.compile(
+            _launch,
+            q_c,
+            k_c,
+            weights_c,
+            output_c,
+            score_scale,
+            topk,
+            _selection_sort_span(topk),
+            causal,
+        )
+        _compile_cache[compile_key] = compiled
+    compiled(q_c, k_c, weights_c, output_c, score_scale)
     return output
 
 
 __all__ = ["index"]
+

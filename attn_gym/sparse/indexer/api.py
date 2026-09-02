@@ -104,7 +104,7 @@ def index(
         q: Query tensor, [B, T, H, D].
 
         k: Key candidate pool shared across heads, [B, S, D].
-            S may differ from T (nonsquare) unless causal=True.
+            Nonsquare inputs (S != T) are not supported yet.
 
         weights: Per-head weights, [B, T, H].  May be negative.
 
@@ -122,9 +122,6 @@ def index(
     """
     if not torch.compiler.is_compiling():
         _validate_inputs(q, k, weights, topk, causal)
-
-    if topk == 0:
-        return torch.empty((*q.shape[:2], 0), dtype=torch.int32, device=q.device)
 
     match mode:
         case "auto":
