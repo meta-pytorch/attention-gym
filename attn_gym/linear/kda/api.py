@@ -113,7 +113,7 @@ def chunk_kda(
         per logical sequence or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    backend, split_backward = resolve_kernel_options(kernel_options)
+    backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
     if selected_impl is Impl.REFERENCE:
         if fastmath:
             raise ValueError("fastmath applies only to impl='fused'")
@@ -146,6 +146,7 @@ def chunk_kda(
                 fastmath=fastmath,
                 autotune=autotune,
                 split_backward=split_backward,
+                split_forward=split_forward,
             )
         return _fused_chunk_forward(
             q,
@@ -236,9 +237,9 @@ def paged_chunk_kda(
         state_indices,
         has_initial_state=has_initial_state,
     )
-    backend, split_backward = resolve_kernel_options(kernel_options)
-    if split_backward:
-        raise ValueError("split_backward is not supported by paged_chunk_kda")
+    backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
+    if split_backward or split_forward:
+        raise ValueError("split schedules are not supported by paged_chunk_kda")
     if backend == "mega":
         return _mega_paged_chunk_forward(
             q,

@@ -23,6 +23,9 @@ class KernelOptions(BackendOptions, total=False):
     split_backward: bool
     """Allow KDA Mega to use its approximate split-backward schedule."""
 
+    split_forward: bool
+    """Allow KDA Mega to use its approximate forgetting-horizon split forward schedule."""
+
 
 class Impl(str, Enum):
     """Select a fused or reference implementation without automatic fallback."""
