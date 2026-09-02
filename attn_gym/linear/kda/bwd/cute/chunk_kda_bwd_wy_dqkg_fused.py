@@ -44,6 +44,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
@@ -244,7 +245,7 @@ _torch_to_cutlass_dtype = {
 def require_blackwell_target() -> None:
     """Reject compilation targets that cannot execute this SM100/SM103 kernel."""
     target = get_compile_target()
-    if target.device_type != "cuda" or target.capability not in ((10, 0), (10, 3)):
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
         raise RuntimeError(
             f"chunk_kda_bwd_wy_dqkg_fused requires Blackwell (SM100/SM103), got target={target}"
         )

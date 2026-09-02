@@ -34,7 +34,7 @@ from attn_gym.linear.kda.chunk_scheduler import (
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
-from attn_gym.linear.kda.utils import exp2
+from attn_gym.linear.kda.utils import exp2, is_sm100_kda_target
 
 
 @triton.jit
@@ -462,8 +462,9 @@ def _delta_h_launch(
     # FP32 tiles double the descriptor staging past the shared-memory limit at
     # the 16-bit tile shape. Hopper also uses ordinary pipelining: its Triton
     # warp-specialization pass cannot commit the descriptor stores in this loop.
+    # SM120 also uses ordinary pipelining because this schedule is SM100-specific.
     use_16bit_config = k.element_size() == 2
-    use_warp_specialization = use_16bit_config and get_device_properties(k.device).major >= 10
+    use_warp_specialization = use_16bit_config and is_sm100_kda_target(k.device)
     block_value_dim = _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2
     descriptors = (
         TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),

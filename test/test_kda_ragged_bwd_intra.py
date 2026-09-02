@@ -28,8 +28,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_bwd_intra_compiles_for_sm80():
-    """Compile the scalar-store specialization without emitting stmatrix."""
+@pytest.mark.parametrize("architecture", ["sm_80", "sm_120"])
+def test_bwd_intra_compiles_for_portable_targets(architecture: str):
+    """Compile the portable specialization without SM100-only instructions."""
     source = """
 import torch
 from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
@@ -44,7 +45,7 @@ module._compile_chunk_kda_bwd_intra(
 )
 """
     environment = os.environ.copy()
-    environment["CUTE_DSL_ARCH"] = "sm_80"
+    environment["CUTE_DSL_ARCH"] = architecture
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     subprocess.run([sys.executable, "-c", source], env=environment, check=True, timeout=180)
 

@@ -45,7 +45,10 @@ from attn_gym.testing.kda import (
     bwd_wy_dqkg_reference as _bwd_wy_dqkg_ref,
 )
 
-IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+    (10, 0),
+    (10, 3),
+)
 
 try:
     from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_bwd

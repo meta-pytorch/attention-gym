@@ -150,7 +150,9 @@ contract. A correctness-first integration can keep the KDA unit under an FP32 po
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
 The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
-boundary accepts FP16, BF16, or FP32 inputs. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
+boundary accepts FP16, BF16, or FP32 inputs. SM100/SM103 select the specialized CuTe path;
+SM120 and earlier supported architectures use the portable Triton stages. Homogeneous FP16 and
+BF16 Q/K/V stay in their input dtype, while
 FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to

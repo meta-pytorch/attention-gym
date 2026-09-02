@@ -11,6 +11,13 @@ import math
 LN2 = math.log(2.0)
 LOG2_E = math.log2(math.e)
 DEFAULT_CHUNK_SIZE = 64
+SM100_KDA_CAPABILITIES = frozenset(((10, 0), (10, 3)))
+
+
+def is_sm100_kda_capability(capability: tuple[int, int] | None) -> bool:
+    """Return whether a CUDA capability supports the SM100-specific KDA kernels."""
+    return capability in SM100_KDA_CAPABILITIES
+
 
 # The causal intra-chunk reference spans 15 steps. Keep the rebase exponent below
 # FP32's overflow boundary; equality can round to exp2(128) and produce non-finite values.
@@ -29,4 +36,6 @@ __all__ = [
     "LN2",
     "LOG2_E",
     "MAX_GATE_LOWER_BOUND_MAGNITUDE",
+    "SM100_KDA_CAPABILITIES",
+    "is_sm100_kda_capability",
 ]

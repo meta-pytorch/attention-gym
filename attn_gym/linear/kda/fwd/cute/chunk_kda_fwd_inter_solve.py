@@ -32,7 +32,7 @@ from attn_gym.linear.kda.chunk_schedule import (
     validate_schedule_request,
 )
 from attn_gym.linear.kda.chunk_scheduler import GridScheduler
-from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
+from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE, is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
 )
@@ -58,8 +58,8 @@ _IO_TYPES = {
 
 def _check_compile_target() -> None:
     target = get_compile_target()
-    if target.device_type != "cuda" or target.capability is None or target.capability < (10, 0):
-        raise ValueError(f"KDA inter-solve requires CUDA capability >= 10.0; got target={target}")
+    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+        raise ValueError(f"KDA inter-solve requires an SM100 or SM103 target; got {target}")
 
 
 def _validate_specialization(head_dim: int, chunk_size: int, subchunk_size: int) -> int:

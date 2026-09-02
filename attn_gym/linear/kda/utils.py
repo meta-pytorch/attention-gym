@@ -30,6 +30,7 @@ from packaging import version
 from triton.language.extra import libdevice
 
 from attn_gym._backends.triton import utils as triton_utils
+from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 SUPPORTS_AUTOTUNE_CACHE = triton_utils.SUPPORTS_AUTOTUNE_CACHE
 autotune_cache_kwargs = triton_utils.autotune_cache_kwargs
@@ -105,6 +106,14 @@ IS_NVIDIA = device_platform == "cuda"
 IS_NVIDIA_BLACKWELL = IS_NVIDIA and torch.cuda.get_device_capability()[0] in (10, 12)
 IS_TF32_SUPPORTED = IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
+
+
+@lru_cache(maxsize=8)
+def is_sm100_kda_target(device: torch.device) -> bool:
+    """Return whether a physical device should use the SM100-specific KDA route."""
+    properties = torch.cuda.get_device_properties(device)
+    return is_sm100_kda_capability((properties.major, properties.minor))
+
 
 if IS_NVIDIA and not IS_TF32_SUPPORTED:
     # Make old cards happy, since triton will use tf32 by default.
