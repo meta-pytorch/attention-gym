@@ -32,10 +32,12 @@ from attn_gym.linear.kda.masking import (
 # Note: Lazy Imports (see attn_gym/linear/__init__.py)
 _BACKEND_EXPORTS = {
     "l2norm": "attn_gym.linear.kda.fwd.triton.l2norm_fwd",
-    # Staged primitives around the affine state boundary (stages.py).
+    # Staged primitives around the affine state boundary (stages.py) and the all-gather recipe
+    # over them. Ownership plans live in attn_gym.linear.context_parallel.
     "ChunkKDASaved": "attn_gym.linear.kda.stages",
     "chunk_kda_prepare": "attn_gym.linear.kda.stages",
     "chunk_kda_prepare_backward": "attn_gym.linear.kda.stages",
+    "context_parallel_kda": "attn_gym.linear.kda.context_parallel",
 }
 # Backward compat: these moved to attn_gym.linear.short_conv, which owns their
 # lazy resolution and error message; import them from attn_gym.linear instead.

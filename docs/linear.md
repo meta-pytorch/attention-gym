@@ -390,15 +390,15 @@ forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
 ::: attn_gym.linear.Impl
 
-## Staged Primitives
+## Context Parallelism
 
 Every delta-rule token step is affine in the V-major recurrent state, so any token range
 collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [bias; transition]`
-(one map per value head; GQA key heads are expanded by the factor kernels). Moving state between
-devices (context parallelism, pipelined state handoff, ...) is therefore a prefix scan over these
-summaries, and it needs the fused core split around the communication point in both directions.
-The same machinery serves KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel
-summary kernels).
+(one map per value head; GQA key heads are expanded by the factor kernels).
+Context parallelism is therefore a prefix scan over these summaries, and the same machinery serves
+KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel summary kernels). The
+public surface has three tiers so that new partitionings or communication topologies never add
+options to an op.
 
 ### Terminology and index spaces
 
@@ -438,9 +438,9 @@ subsequence: `start = sub_start + 64·i`, `stop = sub_start + 64·j` or the subs
 crossing a `cu_seqlens` boundary. The recipe always passes one whole subsequence,
 `(cu_seqlens[i], cu_seqlens[i + 1])`.
 
-`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` and
-`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward` do that split without
-exposing the WY factors:
+**Primitives** (`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward`, and
+`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward`) split the fused core
+around the communication point without exposing its WY factors:
 
 ```python
 from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
@@ -472,6 +472,48 @@ differ only in the fragment lists. The fragments must tile `[0, total_tokens)` e
 and `compose_entry_states` / `compose_exit_cotangents` fold the gathered `[world, slots, ...]`
 buffers into each subsequence's entry state or exit cotangent; the collective in between is the
 caller's.
+[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
+builds contiguous and zig-zag fragment lists in a dozen lines.
+
+**Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
+`attn_gym.linear.kda.context_parallel_kda` and `attn_gym.linear.gdn.context_parallel_gdn`) moves
+summaries with one padded all-gather per direction and owns the autograd function; it is generic
+over the op through a `StagedOp` pair of the two `prepare` entry points.
+`context_parallel_conv_history` builds the short convolution's `initial_state` from the same plan.
+The recipe is one composition, not an extension point: for a point-to-point pipeline, a
+recursive-doubling scan over `compose_summaries`, DTensor, or communication overlap, copy the
+autograd function and swap the collective; the primitives and plans are unchanged. Sharding does
+not cost accuracy: against an FP32 reference, sharded gradients match the unsharded fused op's error
+to within noise for both ops.
+
+```python
+from attn_gym.linear.context_parallel import ContextParallelPlan
+from attn_gym.linear.kda import context_parallel_kda
+
+# Two ranks, one fragment each: the global stream split down the middle.
+total_tokens = cu_seqlens_global[-1]
+half = total_tokens // 2
+plan = ContextParallelPlan.from_fragments(
+    cu_seqlens_global, [[(0, half)], [(half, total_tokens)]], cp_rank
+)
+token_ids = plan.global_token_ids(device)  # gather global tensors into this rank's span
+cu_seqlens = torch.tensor(plan.cu_seqlens, dtype=torch.int32, device=device)
+output, final_state = context_parallel_kda(
+    q, k, v, gate, beta, cu_seqlens=cu_seqlens, plan=plan, group=group
+)
+true_final_states = final_state[list(plan.terminal)]
+```
+
+The recipe starts each sequence from zero, always returns every subsequence's exit state, and does
+not accept `initial_state` or `output_final_state=False`. A captured CUDA Graph is valid only for
+its fixed plan.
+
+::: attn_gym.linear.context_parallel.context_parallel_chunk
+
+::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
+
 ::: attn_gym.linear.context_parallel.ContextParallelPlan
 
 ::: attn_gym.linear.context_parallel.Subsequence

@@ -8,8 +8,8 @@
 
 The gated delta rule is KDA with one scalar decay per head instead of a per-channel vector, so
 its summaries reuse the per-channel summary kernels with the gate broadcast across channels. The
-handles follow the same protocol as the KDA stages, so anything built on those handles runs GDN
-unchanged.
+handles follow the same protocol as the KDA stages and plug into
+``attn_gym.linear.context_parallel`` unchanged.
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Context parallelism for delta-rule attention: ownership plans and state routing.
+"""Context parallelism for delta-rule attention: ownership plans, state routing, one recipe.
 
 Data model (NOTE [Terminology] in ``attn_gym.linear.state_summary``). The global stream is a list
 of sequences. Each rank owns a list of fragments, contiguous global token ranges, and lays them out
@@ -15,24 +15,33 @@ recurrence is affine, a subsequence's entry state is its predecessors' summaries
 and its exit cotangent is its successors' reverse summaries folded from zero.
 
 Communication model. Every rank fills ``plan.slots`` summary slots in span order (identity where
-nobody downstream needs one) and exchanges them once per direction, so every
+nobody downstream needs one) and all-gathers them once per direction, so every
 ``gathered[rank][slot]`` index is a host-static integer and CUDA Graph capture works as long as the
 plan does not change. The short-convolution halo reuses the plan: each subsequence's history is the
-tail of its predecessor subsequences. The composition helpers here are pure tensor code over the
-gathered ``[world, slots, ...]`` buffers; the collective that fills them is the caller's.
+tail of its predecessor subsequences.
+
+Ops. ``context_parallel_chunk`` is generic over the delta-rule variant through a :class:`StagedOp`
+pair of ``prepare`` / ``prepare_backward`` callables whose handles expose ``state_summary``,
+``run``, and ``saved`` (``attn_gym.linear.kda.stages``, ``attn_gym.linear.gdn.stages``). It is one
+recipe, not an extension point: for a point-to-point pipeline, a recursive-doubling scan over
+``compose_summaries``, DTensor, or communication overlap, copy the autograd function and swap the
+collective.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
 from typing import NamedTuple, Protocol
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.distributed._functional_collectives import all_gather_single
 
 from attn_gym.linear.kda.utils import profiler_range
-from attn_gym.linear.state_summary import merge_state
+from attn_gym.linear.state_summary import merge_state, neutral_summary
 
 
 @dataclass(frozen=True)
@@ -167,6 +176,30 @@ class ContextParallelPlan:
         return torch.cat([torch.arange(s.start, s.stop, device=device) for s in self.subsequences])
 
 
+def _check_group(plan: ContextParallelPlan, group: dist.ProcessGroup, tokens: int) -> None:
+    """Reject a plan built for a different group, rank, or local token count (host-only)."""
+    if dist.get_world_size(group) != len(plan.table):
+        raise ValueError(
+            f"plan has {len(plan.table)} ranks but the group has {dist.get_world_size(group)}"
+        )
+    if dist.get_rank(group) != plan.cp_rank:
+        raise ValueError(
+            f"plan was built for cp_rank {plan.cp_rank}, running on {dist.get_rank(group)}"
+        )
+    if tokens != plan.cu_seqlens[-1]:
+        raise ValueError(
+            f"plan owns {plan.cu_seqlens[-1]} local tokens but the input has {tokens}"
+        )
+
+
+def _all_gather_slots(local_slots: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather every rank's ``[slots, ...]`` buffer into ``[world, slots, ...]``."""
+    gathered = local_slots.new_empty(dist.get_world_size(group), *local_slots.shape)
+    with profiler_range("cp/all_gather"):
+        dist.all_gather_single(gathered, local_slots.contiguous(), group=group)
+    return gathered
+
+
 def _fold_chains(gathered: torch.Tensor, chains: Sequence[Sequence[Slot]]) -> list[torch.Tensor]:
     """Apply each chain of gathered summaries to the zero state, sharing common prefixes.
 
@@ -233,6 +266,32 @@ def compose_conv_histories(
     return torch.stack(histories) + gathered_tails.flatten()[0] * 0
 
 
+def context_parallel_conv_history(
+    qkv: torch.Tensor,
+    plan: ContextParallelPlan,
+    group: dist.ProcessGroup,
+    history_length: int,
+) -> torch.Tensor | None:
+    """Exchange subsequence tails and return ``causal_conv1d``'s packed ``initial_state``.
+
+    ``qkv`` is the rank's ``[1, T, C]`` span. The collective is differentiable, so
+    gradients flow back to the ranks that own the history tokens.
+    """
+    if history_length == 0:
+        return None
+    _check_group(plan, group, qkv.shape[1])
+    tails = []
+    for piece, (start, stop) in zip(plan.subsequences, pairwise(plan.cu_seqlens), strict=True):
+        stored = min(history_length, piece.length)
+        tails.append(F.pad(qkv[0, stop - stored : stop], (0, 0, history_length - stored, 0)))
+    tails.extend([qkv.new_zeros(history_length, qkv.shape[-1])] * (plan.slots - len(tails)))
+    with profiler_range("cp/conv_halo"):
+        gathered = all_gather_single(torch.stack(tails), gather_dim=0, group=group).view(
+            len(plan.table), plan.slots, history_length, qkv.shape[-1]
+        )
+    return compose_conv_histories(gathered, plan)
+
+
 class PreparedForward(Protocol):
     """Forward handle of a staged delta-rule op."""
 
@@ -252,6 +311,20 @@ class PreparedBackward(Protocol):
     def state_grad_summary(self, start: int, stop: int) -> torch.Tensor: ...
 
     def run(self, d_final_state: torch.Tensor | None) -> tuple[torch.Tensor, ...]: ...
+
+
+class StagedOp(NamedTuple):
+    """A delta-rule variant's staged entry points with every op-specific option already bound.
+
+    ``prepare(q, k, v, gate, beta, *, cu_seqlens)`` returns a :class:`PreparedForward`;
+    ``prepare_backward(saved, d_output, initial_state)`` returns a :class:`PreparedBackward`,
+    where ``saved`` is the forward handle's ``saved`` NamedTuple rebuilt from
+    ``ctx.saved_tensors``. Options both stages must agree on, such as the resolved ``scale``,
+    are bound into both callables by the op's binding (``attn_gym.linear.kda.context_parallel``).
+    """
+
+    prepare: Callable[..., PreparedForward]
+    prepare_backward: Callable[..., PreparedBackward]
 
 
 def summary_slots(
@@ -292,14 +365,94 @@ def grad_summary_slots(
     return torch.stack(slots)
 
 
+class _ContextParallelChunk(torch.autograd.Function):
+    """Explicit-adjoint delta rule: summaries and one all-gather in each direction."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, gate, beta, cu_seqlens, plan, group, stages):
+        prepared = stages.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+        neutral = neutral_summary(v.shape[2], v.shape[-1], q.shape[-1], device=q.device)
+        gathered = _all_gather_slots(summary_slots(prepared, plan, neutral), group)
+        initial_state = compose_entry_states(gathered, plan)
+        with profiler_range("cp/run"):
+            output, final_state = prepared.run(initial_state, output_final_state=True)
+        assert final_state is not None
+
+        saved = prepared.saved
+        ctx.save_for_backward(*saved, initial_state)
+        ctx.saved_type = type(saved)
+        ctx.plan = plan
+        ctx.group = group
+        ctx.stages = stages
+        ctx.set_materialize_grads(False)
+        return output, final_state
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, d_output, d_final_state):
+        *saved, initial_state = ctx.saved_tensors
+        grads = ctx.stages.prepare_backward(ctx.saved_type._make(saved), d_output, initial_state)
+        neutral = neutral_summary(*initial_state.shape[1:], device=initial_state.device)
+        gathered = _all_gather_slots(
+            grad_summary_slots(grads, d_final_state, ctx.plan, neutral), ctx.group
+        )
+        exit_cotangent = compose_exit_cotangents(gathered, d_final_state, ctx.plan)
+        with profiler_range("cp/run"):
+            dq, dk, dv, dgate, dbeta, _d_initial_state = grads.run(exit_cotangent)
+        return dq, dk, dv, dgate, dbeta, None, None, None, None
+
+
+def context_parallel_chunk(
+    stages: StagedOp,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    plan: ContextParallelPlan,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a staged delta-rule op over this rank's span with state exchanged by all-gather.
+
+    Args:
+        stages: The op's entry points; ``attn_gym.linear.kda.context_parallel_kda`` and
+            ``attn_gym.linear.gdn.context_parallel_gdn`` bind them with the op's options.
+        q: This rank's span of queries, laid out as ``plan.subsequences``; ``k``, ``v``,
+            ``gate``, and ``beta`` follow the same layout and the op's ``chunk_*`` contract.
+        cu_seqlens: Device ``int32`` copy of ``plan.cu_seqlens``.
+        plan: Routing for this rank from ``ContextParallelPlan.from_fragments``.
+        group: Process group containing exactly the plan's ranks, in order.
+
+    Returns:
+        The span's output and one FP32 ``[N, HV, V, K]`` exit state per subsequence. Only the
+        entries listed in ``plan.terminal`` are the sequences' true final states; the others are
+        intermediate states that the owner of the next subsequence continued from.
+
+    ``initial_state`` is not accepted: every sequence starts from zero and the plan supplies the
+    entry states. Every rank in ``group`` must call this function the same number of times.
+    """
+    _check_group(plan, group, q.shape[1])
+    if cu_seqlens.shape[0] != len(plan.subsequences) + 1:
+        raise ValueError(
+            f"cu_seqlens describes {cu_seqlens.shape[0] - 1} segments but the plan has "
+            f"{len(plan.subsequences)} subsequences"
+        )
+    return _ContextParallelChunk.apply(q, k, v, gate, beta, cu_seqlens, plan, group, stages)
+
+
 __all__ = [
     "ContextParallelPlan",
     "PreparedBackward",
     "PreparedForward",
+    "StagedOp",
     "Subsequence",
     "compose_conv_histories",
     "compose_entry_states",
     "compose_exit_cotangents",
+    "context_parallel_chunk",
+    "context_parallel_conv_history",
     "grad_summary_slots",
     "summary_slots",
 ]

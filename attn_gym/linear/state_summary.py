@@ -14,7 +14,7 @@ head ``HV``; GQA key heads are already expanded by the factor kernels)::
 so any token range collapses to one FP32 map ``H_out = H_in @ A + B``, packed here as
 ``[HV, V + K, K] = [bias; transition]``. Reverse summaries pack the cotangent map
 ``dH_in = dH_out @ R + C`` the same way. These helpers are pure PyTorch; the per-op ``stages``
-modules produce the summaries and the caller moves them between devices.
+modules produce the summaries and ``attn_gym.linear.context_parallel`` moves them between ranks.
 
 NOTE [Terminology]
 The staged primitives, ownership plans, and the context-parallel recipe share one vocabulary and

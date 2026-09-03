@@ -1,28 +1,29 @@
 """Train a complete packed KDA attention module with context parallelism.
 
-This reuses the transformer-style module from ``kda_training.py`` and distributes both
-stateful operations: a halo exchange supplies the short convolution's finite history, then
-native affine summaries supply the KDA recurrence's full-prefix state. Each rank owns an
-equal contiguous token shard. Launch with:
+This reuses the transformer-style module from ``kda_training.py`` and distributes both stateful
+operations through the reference recipe in ``attn_gym.linear.context_parallel``: a halo
+exchange supplies the short convolution's finite history, then affine state summaries supply the
+KDA recurrence's full-prefix state. Each rank owns a list of fragments (global token ranges) chosen
+here in plain Python (``fragments``), so the same code validates contiguous shards and zig-zag load
+balancing; see NOTE [Terminology] in ``attn_gym.linear.state_summary``. Launch with:
 
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 
-Add ``--compute-dtype=float16`` to validate the FP16 route. Add ``--cuda-graph`` to capture
-forward and backward together and validate a replay with changed inputs. Add ``--profile`` to
-export a merged native Perfetto trace using transformer-nuggets. The example requires one Hopper
-or datacenter Blackwell GPU per rank. Affine summaries use portable Triton kernels on Hopper and
-native UMMA kernels on SM100.
+Add ``--partition zigzag`` to give each rank two mirrored blocks, ``--compute-dtype=float16``
+to validate the FP16 route, ``--cuda-graph`` to capture forward and backward together and validate
+a replay with changed inputs, and ``--profile`` to export a merged native Perfetto trace using
+transformer-nuggets. The example requires one Hopper or datacenter Blackwell GPU per rank.
 """
 
 from __future__ import annotations
 
-import bisect
 import gc
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from functools import partial
-from itertools import accumulate, pairwise
+from itertools import accumulate
 from pathlib import Path
 from typing import Annotated
 
@@ -30,48 +31,47 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import typer
-from torch.distributed._functional_collectives import all_gather_single
 
-from attn_gym._backends.cute import normalize_compact_tensor
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
-    _finish_chunk_kda_bwd,
-    _prepare_chunk_kda_bwd,
-)
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    _finish_chunk_kda_fwd,
-    _prepare_chunk_kda_fwd,
-)
-from attn_gym.linear.kda.ops import _plain_gate_scan_op
+from attn_gym.linear.context_parallel import ContextParallelPlan, context_parallel_conv_history
+from attn_gym.linear.kda.context_parallel import context_parallel_kda
 from attn_gym.testing import kernel_stage, record_distributed_profile
 from examples.kda_training import ComputeDTypeOption, KDAAttention, KDAAttentionOutput
 
-# The private prepare/finish seams avoid repeating factor computation around collectives.
-# TODO: Promote those seams before moving this orchestration out of the example.
-CHUNK_SIZE = 64
 
-# NOTE [One crossing sequence per contiguous rank boundary]
-# A rank owns one contiguous interval of the globally ordered packed token stream. Its boundary
-# is one cut point and can split at most one logical sequence: only the last local fragment can
-# continue forward, and only the first can receive a reverse cotangent. Therefore every rank
-# exchanges one fixed `[H,V+K,K]` summary in each direction regardless of how many complete packed
-# sequences it owns. A boundary between sequences sends an unused placeholder so collective shapes
-# and ordering remain uniform.
+class PartitionOption(str, Enum):
+    CONTIGUOUS = "contiguous"
+    ZIGZAG = "zigzag"
 
 
-@dataclass(frozen=True)
-class PackedShard:
-    """Packed sequence fragments intersecting one contiguous rank shard."""
+def fragments(
+    tokens: int, world_size: int, partition: PartitionOption
+) -> list[list[tuple[int, int]]]:
+    """Choose each rank's fragments (global token ranges), in span order.
 
-    cu_seqlens: tuple[int, ...]
-    sequence_ids: tuple[int, ...]
+    Contiguous gives rank ``r`` block ``r`` of ``W`` equal blocks. Zig-zag gives it blocks ``r``
+    and ``2W - 1 - r`` of ``2W``: the load-balanced layout ring softmax attention uses for causal
+    masks, which a hybrid model's KDA layers inherit. Any other assignment is just a different
+    list; the plan cuts fragments at sequence boundaries itself.
+    """
+    blocks = world_size if partition is PartitionOption.CONTIGUOUS else 2 * world_size
+    if tokens % blocks:
+        raise ValueError(f"{tokens} tokens do not split into {blocks} equal blocks")
+    size = tokens // blocks
+    owned = [
+        [rank] if partition is PartitionOption.CONTIGUOUS else [rank, blocks - 1 - rank]
+        for rank in range(world_size)
+    ]
+    return [[(block * size, (block + 1) * size) for block in blocks_of] for blocks_of in owned]
 
 
 @dataclass(frozen=True)
 class PackedTrainingBatch:
-    """Global reference tensors and the corresponding rank-local packed shard."""
+    """Global reference tensors and this rank's span of them.
+
+    ``token_ids`` maps span positions to global token ids; ``terminal_index`` lists the local
+    subsequences that end their sequence and ``terminal_sequences`` the matching global sequence
+    ids, so endpoint states can be compared with the unsharded run.
+    """
 
     global_hidden: torch.Tensor
     global_target: torch.Tensor
@@ -79,343 +79,10 @@ class PackedTrainingBatch:
     local_hidden: torch.Tensor
     local_target: torch.Tensor
     local_offsets: torch.Tensor
-    local_slice: slice
-    first_sequence: int
-    completed_sequences: int
-    sequence_count: int
+    token_ids: torch.Tensor
+    terminal_index: torch.Tensor
+    terminal_sequences: torch.Tensor
     loss_scale: float
-
-
-def partition_packed_sequences(
-    global_cu_seqlens: tuple[int, ...],
-    world_size: int,
-) -> tuple[PackedShard, ...]:
-    """Partition nonempty packed sequences into equal contiguous token shards."""
-    if len(global_cu_seqlens) < 2 or global_cu_seqlens[0] != 0:
-        raise ValueError("global_cu_seqlens must start at zero and contain at least one sequence")
-    if any(end <= start for start, end in pairwise(global_cu_seqlens)):
-        raise ValueError("this example requires strictly increasing global_cu_seqlens")
-    total_tokens = global_cu_seqlens[-1]
-    if total_tokens % world_size:
-        raise ValueError("total tokens must be divisible by the context-parallel world size")
-
-    shard_tokens = total_tokens // world_size
-    shards = []
-    for rank in range(world_size):
-        rank_start = rank * shard_tokens
-        rank_end = rank_start + shard_tokens
-        first_sequence = bisect.bisect_right(global_cu_seqlens[1:], rank_start)
-        sequence_end = bisect.bisect_left(global_cu_seqlens[:-1], rank_end)
-        sequence_ids = tuple(range(first_sequence, sequence_end))
-        interior_offsets = (
-            offset - rank_start
-            for offset in global_cu_seqlens[first_sequence + 1 : sequence_end]
-            if rank_start < offset < rank_end
-        )
-        shards.append(
-            PackedShard(
-                cu_seqlens=(0, *interior_offsets, shard_tokens),
-                sequence_ids=sequence_ids,
-            )
-        )
-    return tuple(shards)
-
-
-def merge_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
-    """Merge a packed V-first affine summary into a recurrent state."""
-    value_dim = state.shape[-2]
-    bias = summary[..., :value_dim, :]
-    transition = summary[..., value_dim:, :]
-    return state @ transition + bias
-
-
-class ContextParallelKDAFunction(torch.autograd.Function):
-    """Join native affine summaries, NCCL collectives, and the existing KDA core."""
-
-    @staticmethod
-    def compose_forward_initial_states(
-        gathered: torch.Tensor,
-        q: torch.Tensor,
-        v: torch.Tensor,
-        rank: int,
-        shards: tuple[PackedShard, ...],
-    ) -> torch.Tensor:
-        """Compose predecessor transfers into the first local sequence state."""
-        shard = shards[rank]
-        states = q.new_zeros(
-            len(shard.sequence_ids),
-            q.shape[2],
-            v.shape[-1],
-            q.shape[-1],
-            dtype=torch.float32,
-        )
-        first_state = states[0]
-        first_sequence = shard.sequence_ids[0]
-        for predecessor, predecessor_shard in zip(gathered[:rank], shards[:rank], strict=True):
-            if predecessor_shard.sequence_ids[-1] == first_sequence:
-                first_state = merge_state(first_state, predecessor)
-        return torch.cat((first_state.unsqueeze(0), states[1:]), dim=0)
-
-    @staticmethod
-    def compose_reverse_final_states(
-        gathered: torch.Tensor,
-        d_final_state: torch.Tensor | None,
-        initial_state: torch.Tensor,
-        rank: int,
-        shards: tuple[PackedShard, ...],
-    ) -> torch.Tensor:
-        """Compose successor reverse transfers into the last local state cotangent."""
-        incoming = torch.zeros_like(initial_state) if d_final_state is None else d_final_state
-        shard = shards[rank]
-        last_sequence = shard.sequence_ids[-1]
-        # See NOTE [One crossing sequence per contiguous rank boundary].
-        continues = rank + 1 < len(shards) and shards[rank + 1].sequence_ids[0] == last_sequence
-        if not continues:
-            return incoming
-
-        last_gradient = torch.zeros_like(incoming[-1])
-        for successor_rank in range(len(shards) - 1, rank, -1):
-            successor = shards[successor_rank]
-            if successor.sequence_ids[0] != last_sequence:
-                continue
-            last_gradient = merge_state(last_gradient, gathered[successor_rank])
-        incoming = incoming.clone()
-        incoming[-1] += last_gradient
-        return incoming
-
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        local_cu_seqlens,
-        group,
-        shards,
-        scale,
-        fastmath,
-        autotune,
-        annotate,
-    ):
-        rank = dist.get_rank(group)
-        metadata = prepare_ragged_chunk_metadata(local_cu_seqlens, q.shape[1], CHUNK_SIZE)
-        cumulative_gate = _plain_gate_scan_op(
-            gate, metadata.cu_seqlens, metadata.chunk_offsets, False
-        )
-        factors = _prepare_chunk_kda_fwd(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            metadata,
-            scale=scale,
-            autotune=autotune,
-        )
-
-        shard = shards[rank]
-        # See NOTE [One crossing sequence per contiguous rank boundary].
-        continues = (
-            rank + 1 < len(shards) and shard.sequence_ids[-1] == shards[rank + 1].sequence_ids[0]
-        )
-        if continues:
-            start = shard.cu_seqlens[-2]
-            with kernel_stage("cp/fwd/summary", annotate):
-                summary = build_state_summary(
-                    factors.kg[:, start:],
-                    factors.w[:, start:],
-                    factors.u[:, start:],
-                    cumulative_gate[:, start:],
-                )
-        else:
-            summary = q.new_zeros(
-                q.shape[2],
-                v.shape[-1] + q.shape[-1],
-                q.shape[-1],
-                dtype=torch.float32,
-            )
-        with kernel_stage("cp/fwd/all_gather", annotate):
-            gathered = summary.new_empty(dist.get_world_size(group), *summary.shape)
-            dist.all_gather_single(gathered, summary.contiguous(), group=group)
-        with kernel_stage("cp/fwd/exclusive_prefix", annotate):
-            initial_state = ContextParallelKDAFunction.compose_forward_initial_states(
-                gathered, q, v, rank, shards
-            )
-        with kernel_stage("cp/fwd/local_output", annotate):
-            output, final_state = _finish_chunk_kda_fwd(
-                q,
-                cumulative_gate,
-                factors,
-                initial_state,
-                None,
-                None,
-                metadata,
-                scale=scale,
-                output_final_state=True,
-                autotune=autotune,
-            )
-        assert final_state is not None
-
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            factors.aqk,
-            factors.akk,
-            initial_state,
-            metadata.cu_seqlens,
-            metadata.chunk_offsets,
-        )
-        ctx.group = group
-        ctx.shards = shards
-        ctx.scale = scale
-        ctx.fastmath = fastmath
-        ctx.autotune = autotune
-        ctx.annotate = annotate
-        ctx.set_materialize_grads(False)
-        return output, final_state
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, d_output, d_final_state):
-        (
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            aqk,
-            akk,
-            initial_state,
-            cu_seqlens,
-            chunk_offsets,
-        ) = ctx.saved_tensors
-        rank = dist.get_rank(ctx.group)
-        shards = ctx.shards
-        shard = shards[rank]
-        metadata = RaggedChunkMetadata(
-            cu_seqlens,
-            chunk_offsets,
-            chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, CHUNK_SIZE),
-            CHUNK_SIZE,
-        )
-        if d_output is None:
-            d_output = torch.zeros_like(v)
-        else:
-            d_output = normalize_compact_tensor(d_output)
-        if d_final_state is not None:
-            d_final_state = normalize_compact_tensor(d_final_state.float())
-        prepared = _prepare_chunk_kda_bwd(
-            q,
-            k,
-            v,
-            cumulative_gate,
-            beta,
-            akk,
-            d_output,
-            initial_state,
-            metadata,
-            scale=ctx.scale,
-            chunk_size=CHUNK_SIZE,
-            autotune=ctx.autotune,
-        )
-
-        continues_from_previous = (
-            rank > 0 and shards[rank - 1].sequence_ids[-1] == shard.sequence_ids[0]
-        )
-        if continues_from_previous:
-            stop = shard.cu_seqlens[1]
-            with kernel_stage("cp/bwd/summary", ctx.annotate, backward=False):
-                summary = build_state_grad_summary(
-                    prepared.qg[:, :stop],
-                    prepared.kg[:, :stop],
-                    prepared.w[:, :stop],
-                    d_output[:, :stop],
-                    aqk[:, :stop],
-                    cumulative_gate[:, :stop],
-                    ctx.scale,
-                )
-            if d_final_state is not None:
-                value_dim = v.shape[-1]
-                bias = merge_state(d_final_state[0], summary)
-                summary = torch.cat((bias, summary[..., value_dim:, :]), dim=-2)
-        else:
-            summary = q.new_zeros(
-                q.shape[2],
-                v.shape[-1] + q.shape[-1],
-                q.shape[-1],
-                dtype=torch.float32,
-            )
-        with kernel_stage("cp/bwd/all_gather", ctx.annotate, backward=False):
-            gathered = summary.new_empty(dist.get_world_size(ctx.group), *summary.shape)
-            dist.all_gather_single(gathered, summary.contiguous(), group=ctx.group)
-        with kernel_stage("cp/bwd/exclusive_suffix", ctx.annotate, backward=False):
-            incoming = ContextParallelKDAFunction.compose_reverse_final_states(
-                gathered,
-                d_final_state,
-                initial_state,
-                rank,
-                shards,
-            )
-        with kernel_stage("cp/bwd/local", ctx.annotate, backward=False):
-            dq, dk, dv, d_cumulative, db, _d_initial_state = _finish_chunk_kda_bwd(
-                q,
-                k,
-                v,
-                cumulative_gate,
-                beta,
-                aqk,
-                akk,
-                d_output,
-                incoming,
-                initial_state,
-                metadata,
-                prepared,
-                scale=ctx.scale,
-                chunk_size=CHUNK_SIZE,
-                fastmath=ctx.fastmath,
-                autotune=ctx.autotune,
-            )
-        d_gate = _plain_gate_scan_op(
-            d_cumulative,
-            metadata.cu_seqlens,
-            metadata.chunk_offsets,
-            True,
-        )
-        return dq, dk, dv, d_gate, db, None, None, None, None, None, None, None
-
-
-def context_parallel_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    group: dist.ProcessGroup,
-    shards: tuple[PackedShard, ...],
-    local_cu_seqlens: torch.Tensor,
-    annotate: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply packed KDA with native CuTeDSL forward/reverse affine summaries."""
-    return ContextParallelKDAFunction.apply(
-        q,
-        k,
-        v,
-        gate.float(),
-        beta.float().contiguous(),
-        local_cu_seqlens,
-        group,
-        shards,
-        q.shape[-1] ** -0.5,
-        False,
-        False,
-        annotate,
-    )
 
 
 class ContextParallelKDAAttention(KDAAttention):
@@ -425,63 +92,12 @@ class ContextParallelKDAAttention(KDAAttention):
         self,
         *args,
         group: dist.ProcessGroup,
-        shards: tuple[PackedShard, ...],
-        global_cu_seqlens: tuple[int, ...],
+        plan: ContextParallelPlan,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.cp_group = group
-        self.shards = shards
-        self.global_cu_seqlens = global_cu_seqlens
-
-    @staticmethod
-    def compose_conv_initial_states(
-        gathered_tails: torch.Tensor,
-        shard_tokens: int,
-        rank: int,
-        shards: tuple[PackedShard, ...],
-        global_cu_seqlens: tuple[int, ...],
-    ) -> torch.Tensor:
-        """Build packed short-convolution histories from fixed-size rank tails."""
-        state_length = gathered_tails.shape[1]
-        states = gathered_tails.new_zeros(
-            len(shards[rank].sequence_ids), state_length, gathered_tails.shape[-1]
-        )
-        boundary = rank * shard_tokens
-        sequence_start = global_cu_seqlens[shards[rank].sequence_ids[0]]
-        valid_length = min(state_length, boundary - sequence_start)
-        if valid_length:
-            stored_per_rank = min(state_length, shard_tokens)
-            predecessor_tokens = gathered_tails[:rank, -stored_per_rank:].flatten(0, 1)
-            states[0, -valid_length:] = predecessor_tokens[-valid_length:]
-        # Keep all ranks in the collective backward when the first sequence starts locally.
-        return states + gathered_tails.flatten()[0] * 0
-
-    @staticmethod
-    def build_conv_initial_states(
-        qkv: torch.Tensor,
-        group: dist.ProcessGroup,
-        shards: tuple[PackedShard, ...],
-        global_cu_seqlens: tuple[int, ...],
-        state_length: int,
-        annotate: bool,
-    ) -> torch.Tensor | None:
-        """All-gather rank tails and construct packed short-convolution histories."""
-        if state_length == 0:
-            return None
-        stored = min(state_length, qkv.shape[1])
-        tail = F.pad(qkv[0, -stored:], (0, 0, state_length - stored, 0))
-        with kernel_stage("cp/conv/halo", annotate):
-            gathered = all_gather_single(tail, gather_dim=0, group=group).view(
-                dist.get_world_size(group), state_length, qkv.shape[-1]
-            )
-        return ContextParallelKDAAttention.compose_conv_initial_states(
-            gathered,
-            qkv.shape[1],
-            dist.get_rank(group),
-            shards,
-            global_cu_seqlens,
-        )
+        self.plan = plan
 
     def short_convolution(
         self,
@@ -493,15 +109,10 @@ class ContextParallelKDAAttention(KDAAttention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if initial_state is not None:
             raise ValueError("context parallelism constructs the short-convolution state")
-        state_length = self.qkv_conv1d.kernel_size[0] - 1
-        initial_state = self.build_conv_initial_states(
-            qkv,
-            self.cp_group,
-            self.shards,
-            self.global_cu_seqlens,
-            state_length,
-            self.enable_graph_annotations,
-        )
+        with kernel_stage("cp/conv/halo", self.enable_graph_annotations):
+            initial_state = context_parallel_conv_history(
+                qkv, self.plan, self.cp_group, self.qkv_conv1d.kernel_size[0] - 1
+            )
         return super().short_convolution(
             qkv,
             initial_state,
@@ -531,10 +142,10 @@ class ContextParallelKDAAttention(KDAAttention):
             v,
             gate,
             beta,
+            cu_seqlens=cu_seqlens,
+            plan=self.plan,
             group=self.cp_group,
-            shards=self.shards,
-            local_cu_seqlens=cu_seqlens,
-            annotate=self.enable_graph_annotations,
+            fastmath=self.fastmath,
         )
         return output, final_state if return_final_state else None
 
@@ -544,7 +155,7 @@ def run_training_step(
     hidden_states: torch.Tensor,
     target: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    state_count: int,
+    state_index: torch.Tensor,
     loss_scale: float,
     *,
     annotate: bool = False,
@@ -559,9 +170,9 @@ def run_training_step(
     assert result.final_state is not None
     assert result.final_conv_state is not None
     loss = F.mse_loss(result.hidden_states.float(), target, reduction="sum") * loss_scale
-    if state_count:
-        loss = loss + 1e-4 * result.final_state[:state_count].square().sum()
-        loss = loss + 1e-4 * result.final_conv_state[:state_count].float().square().sum()
+    # Only true sequence ends carry a loss; intermediate subsequence states are handed downstream.
+    loss = loss + 1e-4 * result.final_state[state_index].square().sum()
+    loss = loss + 1e-4 * result.final_conv_state[state_index].float().square().sum()
     inputs = (hidden_states, *tuple(module.parameters()))
     with kernel_stage("cp/bwd", annotate, backward=False):
         gradients = torch.autograd.grad(loss, inputs)
@@ -579,7 +190,7 @@ def validate_against_reference(
         batch.local_hidden,
         batch.local_target,
         batch.local_offsets,
-        batch.completed_sequences,
+        batch.terminal_index,
         batch.loss_scale,
     )
     reference_hidden = batch.global_hidden.detach().clone().requires_grad_()
@@ -588,7 +199,7 @@ def validate_against_reference(
         reference_hidden,
         batch.global_target,
         batch.global_offsets,
-        batch.sequence_count,
+        torch.arange(batch.global_offsets.shape[0] - 1, device=reference_hidden.device),
         batch.loss_scale,
     )
 
@@ -598,19 +209,16 @@ def validate_against_reference(
         atol=torch.finfo(model.compute_dtype).eps,
         rtol=torch.finfo(model.compute_dtype).eps,
     )
-    assert_close(result.hidden_states, reference_result.hidden_states[:, batch.local_slice])
-    assert_close(gradients[0], reference_gradients[0][:, batch.local_slice])
-    if batch.completed_sequences:
-        local_states = slice(0, batch.completed_sequences)
-        global_states = slice(
-            batch.first_sequence,
-            batch.first_sequence + batch.completed_sequences,
-        )
-        assert_close(result.final_state[local_states], reference_result.final_state[global_states])
-        assert_close(
-            result.final_conv_state[local_states],
-            reference_result.final_conv_state[global_states],
-        )
+    assert_close(result.hidden_states, reference_result.hidden_states[:, batch.token_ids])
+    assert_close(gradients[0], reference_gradients[0][:, batch.token_ids])
+    assert_close(
+        result.final_state[batch.terminal_index],
+        reference_result.final_state[batch.terminal_sequences],
+    )
+    assert_close(
+        result.final_conv_state[batch.terminal_index],
+        reference_result.final_conv_state[batch.terminal_sequences],
+    )
     for actual, expected in zip(gradients[1:], reference_gradients[1:], strict=True):
         reduced = actual.detach().clone()
         dist.all_reduce(reduced)
@@ -639,7 +247,7 @@ def validate_cuda_graph(
             capture_hidden.detach().clone().requires_grad_(),
             batch.local_target,
             batch.local_offsets,
-            batch.completed_sequences,
+            batch.terminal_index,
             batch.loss_scale,
         )
     warmup_stream.synchronize()
@@ -654,7 +262,7 @@ def validate_cuda_graph(
                 capture_hidden,
                 batch.local_target,
                 batch.local_offsets,
-                batch.completed_sequences,
+                batch.terminal_index,
                 batch.loss_scale,
                 annotate=annotations,
             )
@@ -671,7 +279,7 @@ def validate_cuda_graph(
                 eager_hidden,
                 batch.local_target,
                 batch.local_offsets,
-                batch.completed_sequences,
+                batch.terminal_index,
                 batch.loss_scale,
             )
         warmup_stream.synchronize()
@@ -710,7 +318,7 @@ def profile_eager_step(
             hidden_states,
             batch.local_target,
             batch.local_offsets,
-            batch.completed_sequences,
+            batch.terminal_index,
             batch.loss_scale,
         ),
         profile_path,
@@ -726,6 +334,10 @@ def main(
         str,
         typer.Option(help="Comma-separated nonempty packed sequence lengths."),
     ] = "256,1280,512",
+    partition: Annotated[
+        PartitionOption,
+        typer.Option(help="How ranks own fragments of the global stream."),
+    ] = PartitionOption.CONTIGUOUS,
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 256,
     heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 2,
     compute_dtype: Annotated[
@@ -768,22 +380,12 @@ def main(
             )
 
     lengths = tuple(int(length) for length in sequence_lengths.split(","))
-    global_cu_seqlens = tuple(accumulate(lengths, initial=0))
-    shards = partition_packed_sequences(global_cu_seqlens, world_size)
-    tokens = global_cu_seqlens[-1]
-    shard_tokens = tokens // world_size
-    local_slice = slice(rank * shard_tokens, (rank + 1) * shard_tokens)
-    local_shard = shards[rank]
-    local_cu_seqlens = torch.tensor(
-        local_shard.cu_seqlens,
-        dtype=torch.int32,
-        device=device,
+    cu_seqlens_global = tuple(accumulate(lengths, initial=0))
+    tokens = cu_seqlens_global[-1]
+    plan = ContextParallelPlan.from_fragments(
+        cu_seqlens_global, fragments(tokens, world_size, partition), rank
     )
-    global_offsets = torch.tensor(global_cu_seqlens, dtype=torch.int32, device=device)
-    continues = (
-        rank + 1 < world_size and local_shard.sequence_ids[-1] == shards[rank + 1].sequence_ids[0]
-    )
-    final_state_count = len(local_shard.sequence_ids) - int(continues)
+    token_ids = plan.global_token_ids(device)
 
     torch.manual_seed(0)
     model_options = {
@@ -796,11 +398,7 @@ def main(
         "device": device,
     }
     make_model = partial(
-        ContextParallelKDAAttention,
-        **model_options,
-        group=dist.group.WORLD,
-        shards=shards,
-        global_cu_seqlens=global_cu_seqlens,
+        ContextParallelKDAAttention, **model_options, group=dist.group.WORLD, plan=plan
     )
     model = make_model()
     reference_model = KDAAttention(**model_options)
@@ -812,14 +410,17 @@ def main(
     batch = PackedTrainingBatch(
         global_hidden=global_hidden,
         global_target=global_target,
-        global_offsets=global_offsets,
-        local_hidden=global_hidden[:, local_slice].clone().requires_grad_(),
-        local_target=global_target[:, local_slice],
-        local_offsets=local_cu_seqlens,
-        local_slice=local_slice,
-        first_sequence=local_shard.sequence_ids[0],
-        completed_sequences=final_state_count,
-        sequence_count=len(lengths),
+        global_offsets=torch.tensor(cu_seqlens_global, dtype=torch.int32, device=device),
+        local_hidden=global_hidden[:, token_ids].clone().requires_grad_(),
+        local_target=global_target[:, token_ids],
+        local_offsets=torch.tensor(plan.cu_seqlens, dtype=torch.int32, device=device),
+        token_ids=token_ids,
+        terminal_index=torch.tensor(plan.terminal, dtype=torch.long, device=device),
+        terminal_sequences=torch.tensor(
+            [plan.subsequences[index].sequence for index in plan.terminal],
+            dtype=torch.long,
+            device=device,
+        ),
         loss_scale=1.0 / global_target.numel(),
     )
     validate_against_reference(model, reference_model, batch)
@@ -828,8 +429,8 @@ def main(
     profile_mode = "cuda_graph" if cuda_graph else "eager"
     profile_path = Path(
         "data",
-        f"kda_context_parallel_{profile_mode}_{compute_dtype.value}_w{world_size}_t{tokens}"
-        f"_h{heads}_c{hidden_size}_conv{short_conv_kernel_size}",
+        f"kda_context_parallel_{profile_mode}_{partition.value}_{compute_dtype.value}"
+        f"_w{world_size}_t{tokens}_h{heads}_c{hidden_size}_conv{short_conv_kernel_size}",
     ).resolve()
     if cuda_graph:
         validate_cuda_graph(
@@ -844,7 +445,7 @@ def main(
         profile_eager_step(model, batch, profile_path, device)
 
     mode = " with CUDA Graph replay" if cuda_graph else ""
-    print(f"rank {rank}: full packed KDA CP passed{mode}", flush=True)
+    print(f"rank {rank}: full packed KDA CP ({partition.value}) passed{mode}", flush=True)
     torch.cuda.synchronize(device)
     dist.destroy_process_group()
 

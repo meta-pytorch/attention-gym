@@ -22,8 +22,8 @@ a communication point in both directions::
 
 The handles keep the factor tensors private, so the contract is the affine summary described in
 ``attn_gym.linear.state_summary``: an FP32 ``[HV, V + K, K]`` map packed as ``[bias; transition]``.
-Which tokens a device owns and how summaries travel are the caller's decisions; a context-parallel
-recipe is one composition built only on these handles.
+Which tokens a device owns and how summaries travel are the caller's decisions;
+``attn_gym.linear.context_parallel`` is one all-gather composition built only on these handles.
 """
 
 from __future__ import annotations

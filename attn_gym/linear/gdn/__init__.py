@@ -11,11 +11,12 @@ from attn_gym.linear.gdn.api import (
 )
 
 # Note: Lazy Imports (see attn_gym/linear/__init__.py). Staged primitives around the affine
-# state boundary (stages.py).
+# state boundary (stages.py) and the all-gather recipe over them.
 _BACKEND_EXPORTS = {
     "ChunkGDNSaved": "attn_gym.linear.gdn.stages",
     "chunk_gdn_prepare": "attn_gym.linear.gdn.stages",
     "chunk_gdn_prepare_backward": "attn_gym.linear.gdn.stages",
+    "context_parallel_gdn": "attn_gym.linear.gdn.context_parallel",
 }
 
 
