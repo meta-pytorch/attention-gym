@@ -7,7 +7,11 @@ description: Sets up an isolated per-worktree Python environment for attention-g
 
 Each attention-gym worktree gets its own `.venv` so editable installs, concurrent
 agents, and test runs never cross-import another checkout. Never reuse a shared
-env's editable install across worktrees.
+env's editable install across worktrees, and never `ln -s` another worktree's
+`.venv` as a shortcut: an editable install is a `.pth` file naming one checkout,
+so a shared env makes every other worktree run that checkout's sources. A fresh
+`uv venv` plus hard-linked wheels costs seconds; a wrong import costs hours. If
+`.venv` already exists as a symlink, `rm .venv` and rebuild it below.
 
 ## Setup
 
