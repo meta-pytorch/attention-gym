@@ -60,6 +60,21 @@ output, final_state = chunk_gdn(
   dtype. A provided initial state uses FP32 for low-precision QKV.
 - FP64 reference inputs retain FP64 recurrence math and state.
 
+!!! note "What the fused paths keep in FP32"
+
+    Every optimized GDN and KDA path (repo-local fused and Mega) carries the recurrent state
+    from `initial_state` to `final_state`, and the state cotangent from `d_final_state` to
+    `d_initial_state`, in FP32 accumulators with FP32 decay. The chunk-entry state that each
+    chunk reads, the per-chunk state checkpoints, and the per-chunk state-cotangent tape are
+    staged in the Q/K/V dtype because they are tensor-core operands. BF16 shares the FP32
+    exponent range, so this only costs mantissa precision. FP16 also limits the range: state
+    values above 65504 become non-finite when a chunk reads them, and cotangent values below
+    `2^-24` vanish (and lose precision below `2^-14`) before they reach `dgate`, `dk`, and `dv`.
+    Keep FP16 states and state cotangents within the FP16 normal range, for example through loss
+    scaling, or use BF16 when state magnitudes can leave it. The Mega KDA backend additionally
+    applies the per-chunk decay to the carried state through a low-precision diagonal MMA, so
+    its `final_state` carries Q/K/V-dtype rounding instead of the FP32 carry.
+
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and
 `K = V = 128`, but has no Mega runtime dependency. Its scalar natural-log gate is not lower-bounded:
@@ -171,11 +186,14 @@ parameterized gate producers: callers still need the masking rules below because
 
     Use L2-normalized Q/K with FP16, as the training example does. Unnormalized Q/K can easily
     produce attention or solve factors outside the FP16 range. Unusually large V or initial-state
-    carries can likewise overflow the FP16 chunk-state and value intermediates. The GEMMs
-    accumulate in FP32, but their results are converted back to FP16 when used as inputs to the
-    next GEMM; an overflow at that conversion cannot be recovered by the next FP32 accumulator.
-    BF16 uses the same storage size with a much larger exponent range, so it is substantially less
-    likely to hit these issues, although sufficiently large values can overflow any finite dtype.
+    carries can likewise overflow the FP16 chunk-state and value intermediates, and small
+    final-state cotangents underflow the FP16 state-cotangent tape in the backward pass. The
+    GEMMs accumulate in FP32, but their results are converted back to FP16 when used as inputs to
+    the next GEMM; an overflow or underflow at that conversion cannot be recovered by the next
+    FP32 accumulator. BF16 uses the same storage size with a much larger exponent range, so it is
+    substantially less likely to hit these issues, although sufficiently large values can overflow
+    any finite dtype. See the FP32-state note in the Gated Delta Rule section for the exact
+    boundary between the FP32 carry and the low-precision staging.
 
 A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
 replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal

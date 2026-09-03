@@ -33,6 +33,7 @@ from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
+    assert_relative_rms_within,
     cumulative_sequence_offsets,
 )
 
@@ -848,6 +849,43 @@ def test_fp16_no_initial_state_final_state_gradients(batch: int, tokens: int):
                 name,
                 source_dtype=torch.float16,
             )
+
+
+@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_state_gate_term_contracts_in_fp32(dtype: torch.dtype, portable: bool, monkeypatch):
+    """The <state, state cotangent> gate term must not round to source-dtype precision.
+
+    Zero Q/K/V leave the gate gradient with only the per-chunk state term. Positive operands
+    avoid cancellation, so tape rounding averages out and any remaining error comes from
+    contracting the tapes in low precision.
+    """
+    if portable:
+        force_portable_backward(monkeypatch)
+    tokens = 64
+    generator = torch.Generator(device="cuda").manual_seed(2)
+    shape = (1, tokens, 1, 128)
+    q, k, v = (torch.zeros(shape, device="cuda", dtype=dtype) for _ in range(3))
+    gate = -torch.rand((1, tokens, 1), device="cuda", generator=generator) * 0.02
+    beta = torch.full((1, tokens, 1), 0.5, device="cuda")
+    initial_state = torch.rand((1, 1, 128, 128), device="cuda", generator=generator) * 0.1
+    d_state = torch.rand((1, 1, 128, 128), device="cuda", generator=generator) * 0.01
+
+    def d_gate(impl: str, qkv_dtype: torch.dtype, state_dtype: torch.dtype) -> torch.Tensor:
+        gate_leaf = gate.to(state_dtype).requires_grad_(True)
+        args = (q.to(qkv_dtype), k.to(qkv_dtype), v.to(qkv_dtype), gate_leaf, beta.to(state_dtype))
+        state = initial_state.to(state_dtype)
+        if impl == "fused":
+            _, final_state = chunk_gdn(*args, state, impl=impl, output_final_state=True)
+        else:
+            _, final_state = recurrent_gdn(*args, state, impl=impl, output_final_state=True)
+        return torch.autograd.grad((final_state,), (gate_leaf,), (d_state.to(state_dtype),))[0]
+
+    actual = d_gate("fused", dtype, torch.float32)
+    expected = d_gate("reference", torch.float64, torch.float64)
+    # Measured: 0.001--0.009 eps with FP32 contraction versus 0.02--0.34 eps when the portable
+    # kernel rounded the product and reduction to the source dtype.
+    assert_relative_rms_within(actual, expected, "dgate", max_eps=0.05, source_dtype=dtype)
 
 
 def test_int64_layouts_fail_before_kernel_launch(monkeypatch):
