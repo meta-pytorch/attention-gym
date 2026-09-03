@@ -1,6 +1,7 @@
 """Correctness and integration tests for the CuTeDSL short convolution."""
 
 import sys
+from inspect import signature
 from itertools import pairwise
 from types import FunctionType
 
@@ -1006,6 +1007,38 @@ def test_short_conv_accepts_misaligned_contiguous_storage():
     x, weight = _misaligned_inputs()
 
     _assert_conv_matches(causal_conv1d, x, weight)
+
+
+def test_short_conv_tuning_projects_device_capability(monkeypatch):
+    """Keep every tuning compile projection compatible with its cached compiler."""
+    compile_calls = {}
+
+    def fake_tune(configs, compile_fn, launch, *, compile_call, parallel_compile):
+        config = next(iter(configs))
+        projected = compile_call(config)
+        signature(compile_fn.__wrapped__).bind(*projected)
+        compile_calls[compile_fn] = projected
+        return config
+
+    class AmpereProperties:
+        major = 8
+        minor = 6
+
+    monkeypatch.setattr(cute_backend, "get_device_properties", lambda _device: AmpereProperties())
+    monkeypatch.setattr(cute_backend, "tune", fake_tune)
+    x, weight = _inputs(channels=6, width=3)
+    config = ShortConvConfig(128, 2, 8)
+    tune_causal_conv1d(
+        x,
+        weight,
+        torch.randn_like(x),
+        forward_configs=(config,),
+        input_grad_configs=(config,),
+        weight_grad_configs=(config,),
+    )
+
+    assert compile_calls[cute_backend._compile_input_gradient][-1] == (8, 6)
+    assert compile_calls[cute_backend._compile_weight_gradient][-1] == (8, 6)
 
 
 def test_short_conv_explicit_config_and_tuning_flow():

@@ -3334,6 +3334,8 @@ def tune_causal_conv1d(
     batches, tokens, channels = x.shape
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
+    properties = get_device_properties(x.device)
+    capability = (properties.major, properties.minor)
     packed = cu_seqlens is not None
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
     x_matrix = x.view(batches * tokens, channels)
@@ -3397,6 +3399,7 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
+            capability,
         ),
         parallel_compile=parallel_compile,
     )
@@ -3440,6 +3443,7 @@ def tune_causal_conv1d(
             num_sequences,
             kernel_initial_state is not None,
             resolved_activation,
+            capability,
         ),
         parallel_compile=parallel_compile,
     )
