@@ -20,7 +20,6 @@ import torch
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward", "split_forward"})
 
 
 class ResolvedKernelOptions(NamedTuple):
@@ -37,7 +36,7 @@ def resolve_kernel_options(
     """Validate chunk backend options and resolve their defaults."""
     if kernel_options is None:
         return ResolvedKernelOptions("fused", False, False)
-    unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
+    unknown = kernel_options.keys() - ResolvedKernelOptions._fields
     if unknown:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported chunk_kda kernel options: {names}")
