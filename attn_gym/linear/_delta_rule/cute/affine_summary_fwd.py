@@ -26,9 +26,12 @@ rows ``[0:V]`` hold the state bias and rows ``[V:V+K]`` the state transition.
 These are distinct from KDA's token-token query/key matrix ``A``.
 
 Architecture (SM100 warp specialization, mirrors ``kda/bwd/cute/chunk_delta_h_bwd.py``):
-  - One CTA per (BN-column tile of the augmented state, head); 6 warps.
-  - CUDA warps (0-3) keep the fp32 ``[K, BN]`` state tile in registers across all
-    chunks and produce the two SMEM MMA B operands per chunk.
+  - One CTA per (BN-column tile of the augmented state, head, chunk segment); 6 warps.
+    The recurrence is a serial latency chain (~1.1 us per chunk at BN=32), so when
+    ``heads * tiles`` leaves SMs idle the wrapper splits the chunks into segments that
+    each scan from ``[0 | I]`` and composes the segment maps on the host.
+  - CUDA warps (0-3) keep the fp32 ``[K, BN]`` state tile in registers across the
+    segment's chunks and produce the two SMEM MMA B operands per chunk.
   - Load warp (4) TMA-stages ``w``, ``kg^T``, ``u``, and the chunk-final gate row.
   - MMA warp (5) issues two SS-mode UMMA groups per chunk into TMEM:
       MMA1: W  @ X          -> wx  (BT=64, BN, K=128)
@@ -67,6 +70,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
+from attn_gym.utils import cdiv
 
 BT = 64  # chunk size
 KEY_DIM = 128
@@ -207,9 +211,10 @@ class _AffineSummaryFwdOp:
         mU: cute.Tensor,
         mG: cute.Tensor,
         mOut: cute.Tensor,
+        chunks_per_segment: Int32,
         stream: cuda.CUstream,
     ):
-        """Launch one CTA per (augmented-state column tile, head)."""
+        """Launch one CTA per (augmented-state column tile, head, chunk segment)."""
         # Re-rank the dense [1, T, H, D] inputs into the logical TMA views.
         g_w = _sequence_feature_head_batch_view(mW)
         g_kgt = _feature_sequence_head_batch_view(mKg)
@@ -384,8 +389,9 @@ class _AffineSummaryFwdOp:
                 s_tmpb_store_staged,
             ),
             num_chunks,
+            chunks_per_segment,
         ).launch(
-            grid=(SUMMARY_DIM // self.BN, self.heads, 1),
+            grid=(SUMMARY_DIM // self.BN, self.heads, cute.size(mOut.shape[0])),
             block=(self.CTA_THREADS, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -418,7 +424,8 @@ class _AffineSummaryFwdOp:
         head,
         col_tile,
         is_value,
-        num_chunks,
+        chunk_begin,
+        chunk_end,
         tma,
         mma_wx,
         mma_kt,
@@ -440,7 +447,7 @@ class _AffineSummaryFwdOp:
         gGK_l = tma.gk.desc[None, None, (head, batch)]
         sGKp, gGKp = self._part_epi(tma.gk.atom, gGK_l, (KEY_DIM, 1), gk_3d)
 
-        for ct in cutlass.range(0, num_chunks, unroll=0):
+        for ct in cutlass.range(chunk_begin, chunk_end, unroll=0):
             wh = pw_P.acquire_and_advance()
             cute.copy(
                 atom=tma.w.atom,
@@ -560,6 +567,7 @@ class _AffineSummaryFwdOp:
     def run_state(
         self,
         head,
+        segment,
         col_base,
         num_chunks,
         mOut,
@@ -703,10 +711,10 @@ class _AffineSummaryFwdOp:
             for ei in cutlass.range_constexpr(cute.size(st)):
                 st[ei] = st[ei] + kt_reg[ei]
 
-        # Epilogue: store the V-first packed transpose out[h, col, k] = X[k, col].
+        # Epilogue: store the V-first packed transpose out[s, h, col, k] = X[k, col].
         for ei in cutlass.range(cute.size(st), unroll_full=True):
             kc, nc = coords_kv[ei]
-            mOut[head, col_base + nc, kc] = st[ei]
+            mOut[segment, head, col_base + nc, kc] = st[ei]
 
     # ------------------------------------------------------------------
     # Device kernel
@@ -720,6 +728,7 @@ class _AffineSummaryFwdOp:
         mOut: cute.Tensor,
         smem_layouts: SmemLayouts,
         num_chunks: Int32,
+        chunks_per_segment: Int32,
     ):
         mma_wx, mma_kt, mma_ktu = mmas
         (
@@ -836,6 +845,10 @@ class _AffineSummaryFwdOp:
             allocator_warp_id=WarpRole.LOAD,
         )
         tmem.allocate(self.tm_tot)
+        # Relinquish the permit immediately: it only promises this CTA allocates no more TMEM,
+        # while the columns just allocated stay owned until ``tmem.free``. Holding it to exit
+        # blocks a co-resident CTA's allocation and serializes chains that would overlap.
+        tmem.relinquish_alloc_permit()
         tmem.wait_for_alloc()
         tp = tmem.retrieve_ptr(Float32)
 
@@ -867,17 +880,21 @@ class _AffineSummaryFwdOp:
         t_kt_acc = cute.make_tensor(tp + self.tm_kt, kt_fk.layout)
 
         # #
-        # Role dispatch: one CTA owns one (column tile, head) state slice.
+        # Role dispatch: one CTA owns one (column tile, head, chunk segment) state slice.
         #
-        col_tile, head, _ = cute.arch.block_idx()
+        col_tile, head, segment = cute.arch.block_idx()
         col_base = col_tile * self.BN
         is_value = col_base < VAL_DIM
+        # Each segment scans its own chunk range from [0 | I]; the host composes them.
+        chunk_begin = segment * chunks_per_segment  # < num_chunks: plan_segments drops empties
+        chunk_end = cutlass.min(chunk_begin + chunks_per_segment, num_chunks)
 
         if warp_id in self.CUDA_WARP_IDS:
             self.run_state(
                 head=head,
+                segment=segment,
                 col_base=col_base,
-                num_chunks=num_chunks,
+                num_chunks=chunk_end - chunk_begin,
                 mOut=mOut,
                 t_wx_acc=t_wx_acc,
                 t_kt_acc=t_kt_acc,
@@ -895,7 +912,8 @@ class _AffineSummaryFwdOp:
                 head=head,
                 col_tile=col_tile,
                 is_value=is_value,
-                num_chunks=num_chunks,
+                chunk_begin=chunk_begin,
+                chunk_end=chunk_end,
                 tma=tma,
                 mma_wx=mma_wx,
                 mma_kt=mma_kt,
@@ -912,7 +930,7 @@ class _AffineSummaryFwdOp:
         elif warp_id == WarpRole.MMA:
             self.run_mma(
                 is_value=is_value,
-                num_chunks=num_chunks,
+                num_chunks=chunk_end - chunk_begin,
                 mma_wx=mma_wx,
                 mma_kt=mma_kt,
                 mma_ktu=mma_ktu,
@@ -934,7 +952,6 @@ class _AffineSummaryFwdOp:
             )
 
         # TMEM teardown (all warps)
-        tmem.relinquish_alloc_permit()
         self.tmem_free_bar.arrive_and_wait()
         tmem.free(tp)
 
@@ -1002,8 +1019,8 @@ def _compile_affine_summary(
     io_dtype = _CUTE_IO_TYPES[dtype_name]
     out = make_fake_compact_tensor(
         Float32,
-        (heads, SUMMARY_DIM, KEY_DIM),
-        stride_order=(2, 1, 0),
+        (sym_int(), heads, SUMMARY_DIM, KEY_DIM),
+        stride_order=(3, 2, 1, 0),
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
@@ -1013,7 +1030,52 @@ def _compile_affine_summary(
         factor(io_dtype, VAL_DIM),
         factor(Float32, KEY_DIM),
         out,
+        Int32(1),
     )
+
+
+# Each pairwise fold level costs two small launches (~8 us) while a chunk costs ~1.1-1.3 us, so a
+# segment must carry enough chunks for the shortened chain to pay for the fold. Measured crossover
+# on GB200 is ~32 chunks total; 16 chunks per segment keeps every split a win.
+MIN_CHUNKS_PER_SEGMENT = 16
+
+
+def plan_segments(num_chunks: int, work_tiles: int, sm_count: int) -> tuple[int, int]:
+    """Return ``(segments, chunks_per_segment)`` filling idle SMs with chunk segments.
+
+    The chunk recurrence is a serial chain per CTA, so when ``work_tiles`` (column tiles times
+    heads) leaves SMs idle the chunks are split into segments that each scan from ``[0 | I]``
+    and ``compose_segment_summaries`` folds the segment maps.
+    """
+    # ``segments`` is an upper bound from available SMs and the minimum useful segment length.
+    # After rounding up the chunks per segment, recompute how many non-empty segments are needed.
+    segments = max(1, min(num_chunks // MIN_CHUNKS_PER_SEGMENT, sm_count // work_tiles))
+    chunks_per_segment = cdiv(num_chunks, segments)
+    return cdiv(num_chunks, chunks_per_segment), chunks_per_segment
+
+
+def compose_segment_summaries(summaries: torch.Tensor) -> torch.Tensor:
+    """Fold ``[S, H, V + K, K]`` consecutive segment maps into one, pairwise from the left.
+
+    ``(A0, B0)`` then ``(A1, B1)`` composes to ``(A0 @ A1, B0 @ A1 + B1)``; each level composes
+    adjacent pairs with two launches (one matmul, one bias add), so the fold costs log2(S) levels
+    rather than S - 1 sequential compositions. The fold runs in FP64 so its precision does not
+    depend on the caller's float32 matmul mode (TF32 would otherwise leak into the summary); the
+    operands are at most a few megabytes, so the cast is negligible next to the kernel.
+    """
+    if summaries.shape[0] == 1:
+        return summaries[0]
+    value_dim = summaries.shape[-2] - summaries.shape[-1]
+    summaries = summaries.double()
+    while summaries.shape[0] > 1:
+        pairs = 2 * (summaries.shape[0] // 2)
+        first, then = summaries[0:pairs:2], summaries[1:pairs:2]
+        composed = first @ then[..., value_dim:, :]
+        composed[..., :value_dim, :] += then[..., :value_dim, :]
+        summaries = (
+            composed if pairs == summaries.shape[0] else torch.cat((composed, summaries[pairs:]))
+        )
+    return summaries[0].float()
 
 
 @torch.compiler.disable
@@ -1062,11 +1124,6 @@ def build_state_summary(
         f"cumulative_gate must be fp32, got {cumulative_gate.dtype}"
     )
 
-    out = torch.empty(
-        (heads, SUMMARY_DIM, KEY_DIM),
-        dtype=torch.float32,
-        device=kg.device,
-    )
     if isinstance(kg, FakeTensor):
         raise TypeError(
             "build_state_summary does not support torch.export; run the context-parallel "
@@ -1102,19 +1159,32 @@ def build_state_summary(
             launch_affine_summary_fwd,
         )
 
+        out = torch.empty((heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device)
         launch_affine_summary_fwd(kg, w, u, cumulative_gate, out, capability)
         return out
 
     kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
-    use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, out)
-
     # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
     # BN=64 only when the extra column tiles would spill past one CTA wave and
     # serialize whole recurrence chains.
     sm_count = properties.multi_processor_count
     state_bn = 32 if heads * (SUMMARY_DIM // 32) <= sm_count else 64
+    segments, chunks_per_segment = plan_segments(
+        kg.shape[1] // BT, heads * (SUMMARY_DIM // state_bn), sm_count
+    )
+    segment_out = torch.empty(
+        (segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
+    )
+    use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, segment_out)
     compiled = _compile_affine_summary(
         _IO_TYPE_NAMES[kg.dtype], heads, state_bn, use_int64_offsets
     )
-    compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), out)
-    return out
+    compiled(
+        kg.detach(),
+        w.detach(),
+        u.detach(),
+        cumulative_gate.detach(),
+        segment_out,
+        chunks_per_segment,
+    )
+    return compose_segment_summaries(segment_out)
