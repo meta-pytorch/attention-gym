@@ -460,6 +460,22 @@ dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries
 (`merge_state`, `compose_summaries`, `neutral_summary`).
 
+**Ownership plans** (`attn_gym.linear.context_parallel.ContextParallelPlan.from_fragments`) take
+every rank's fragments. You choose them in plain Python; the plan cuts each fragment at sequence
+boundaries into `Subsequence`s, one span `cu_seqlens` segment each, and derives host-static routing:
+which subsequences need a forward or reverse summary, which gathered slots to fold for each entry
+state or exit cotangent, and which subsequences end their sequence and therefore hold true final
+states. Two pieces of one document on the same rank are simply two span segments whose entry states
+the routing supplies, so contiguous shards, zig-zag load balancing, and document-aligned partitions
+differ only in the fragment lists. The fragments must tile `[0, total_tokens)` exactly once.
+`summary_slots` / `grad_summary_slots` fill a rank's `[slots, ...]` buffer from a prepared handle,
+and `compose_entry_states` / `compose_exit_cotangents` fold the gathered `[world, slots, ...]`
+buffers into each subsequence's entry state or exit cotangent; the collective in between is the
+caller's.
+::: attn_gym.linear.context_parallel.ContextParallelPlan
+
+::: attn_gym.linear.context_parallel.Subsequence
+
 ::: attn_gym.linear.kda.stages.chunk_kda_prepare
 
 ::: attn_gym.linear.kda.stages.chunk_kda_prepare_backward

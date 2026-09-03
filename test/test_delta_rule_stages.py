@@ -1,4 +1,4 @@
-"""Staged KDA/GDN primitives: ``prepare`` / ``run`` / state summaries against the public ops."""
+"""Staged KDA/GDN primitives and the context-parallel routing simulated in one process."""
 
 from __future__ import annotations
 
@@ -11,6 +11,13 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear.context_parallel import (
+    ContextParallelPlan,
+    compose_entry_states,
+    compose_exit_cotangents,
+    grad_summary_slots,
+    summary_slots,
+)
 from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 from attn_gym.linear.kda import chunk_kda
@@ -49,6 +56,11 @@ class Op(NamedTuple):
         return self.factory(
             tokens, key_heads=self.key_heads, value_heads=self.value_heads, seed=seed, dtype=dtype
         )
+
+
+def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    """Relative RMS error against an FP32 oracle."""
+    return ((actual.float() - reference).square().mean() / reference.square().mean()).sqrt().item()
 
 
 def kda_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtype) -> Inputs:
@@ -353,3 +365,126 @@ def test_state_summary_rejects_ranges_outside_the_stream():
         prepared.state_summary(64, 200)
     with pytest.raises(ValueError, match="summary range"):
         prepared.state_summary(64, 64)
+
+
+class RankResult(NamedTuple):
+    plan: ContextParallelPlan
+    token_ids: torch.Tensor
+    output: torch.Tensor
+    final_state: torch.Tensor
+    grads: tuple[torch.Tensor, ...]  # dq, dk, dv, dgate, dbeta
+
+
+def simulate_context_parallel(
+    op: Op, cu_seqlens_global, fragments, inputs, d_output, d_final_state
+) -> list[RankResult]:
+    """Run the recipe for every rank in one process, replacing each all-gather with a stack."""
+    q, _, v, _, _ = inputs
+    device = q.device
+    ranks = range(len(fragments))
+    plans = [
+        ContextParallelPlan.from_fragments(cu_seqlens_global, fragments, rank) for rank in ranks
+    ]
+    token_ids = [plan.global_token_ids(device) for plan in plans]
+    prepared = [
+        op.prepare(
+            *(tensor[:, token_ids[r]] for tensor in inputs),
+            cu_seqlens=torch.tensor(plans[r].cu_seqlens, dtype=torch.int32, device=device),
+        )
+        for r in ranks
+    ]
+    neutral = neutral_summary(v.shape[2], v.shape[-1], q.shape[-1], device=device)
+
+    gathered = torch.stack([summary_slots(prepared[r], plans[r], neutral) for r in ranks])
+    initial_states = [compose_entry_states(gathered, plans[r]) for r in ranks]
+    forward = [prepared[r].run(initial_states[r], output_final_state=True) for r in ranks]
+
+    # The loss's state cotangent reaches only the subsequences that end their sequence.
+    d_exit_states = [
+        torch.stack(
+            [
+                d_final_state[subsequence.sequence]
+                if index in plan.terminal
+                else torch.zeros_like(d_final_state[0])
+                for index, subsequence in enumerate(plan.subsequences)
+            ]
+        )
+        for plan in plans
+    ]
+    grads = [
+        op.prepare_backward(
+            prepared[r].saved,
+            d_output[:, token_ids[r]],
+            initial_states[r],
+            scale=prepared[r].scale,
+        )
+        for r in ranks
+    ]
+    gathered = torch.stack(
+        [grad_summary_slots(grads[r], d_exit_states[r], plans[r], neutral) for r in ranks]
+    )
+    input_grads = [
+        grads[r].run(compose_exit_cotangents(gathered, d_exit_states[r], plans[r]))[:5]
+        for r in ranks
+    ]
+    return [RankResult(plans[r], token_ids[r], *forward[r], input_grads[r]) for r in ranks]
+
+
+# Sequences [0, 40), [40, 232), [232, 384); each entry lists one rank's fragments.
+CU_SEQLENS = (0, 40, 232, 384)
+LAYOUTS = [
+    pytest.param([[(0, 192)], [(192, 384)]], id="contiguous-2"),
+    pytest.param([[(0, 96), (288, 384)], [(96, 192), (192, 288)]], id="zigzag-2"),
+    pytest.param(
+        [[(0, 64), (320, 384)], [(64, 128), (256, 320)], [(128, 192), (192, 256)]], id="zigzag-3"
+    ),
+    # Uneven ownership: rank 0 holds one short piece, rank 1 the rest in reversed order.
+    pytest.param([[(96, 160)], [(160, 384), (0, 96)]], id="uneven-reordered"),
+]
+
+
+@requires_kda_target
+@op_param
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_simulated_context_parallel_matches_unsharded_op(op, layout, dtype):
+    q, k, v, gate, beta = op.make_inputs(CU_SEQLENS[-1], seed=4, dtype=dtype)
+    inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in (q, k, v, gate, beta))
+    offsets = torch.tensor(CU_SEQLENS, dtype=torch.int32, device="cuda")
+
+    output, final_state = op.chunk(*inputs, cu_seqlens=offsets, output_final_state=True)
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
+    d_final_state = torch.randn(final_state.shape, device="cuda", generator=generator)
+    expected_grads = torch.autograd.grad(
+        (output, final_state), inputs, grad_outputs=(d_output, d_final_state)
+    )
+
+    # Sharding must not cost accuracy: measure both paths against the FP32 eager oracle.
+    f32 = tuple(tensor.detach().float().requires_grad_() for tensor in (q, k, v, gate, beta))
+    ref_output, ref_final = op.reference(*f32, cu_seqlens=offsets, output_final_state=True)
+    ref_grads = torch.autograd.grad(
+        (ref_output, ref_final), f32, grad_outputs=(d_output.float(), d_final_state)
+    )
+
+    results = simulate_context_parallel(
+        op, CU_SEQLENS, layout, (q, k, v, gate, beta), d_output, d_final_state
+    )
+    # Sharding changes accumulation order, so compare both paths against the FP32 oracle: the
+    # pointwise budget is derived from the unsharded op's own error, and a systematic precision
+    # loss in the summary path would show up as a multiple of its relative RMS error.
+    for result in results:
+        ids = result.token_ids
+        budget = partial(assert_matches_low_precision_reference, source_dtype=dtype)
+        budget(result.output, ref_output[:, ids], output[:, ids], "output")
+        for index in result.plan.terminal:
+            sequence = result.plan.subsequences[index].sequence
+            budget(result.final_state[index], ref_final[sequence], final_state[sequence], "state")
+        names = ("dq", "dk", "dv", "dgate", "dbeta")
+        for name, actual, expected, reference in zip(
+            names, result.grads, expected_grads, ref_grads, strict=True
+        ):
+            budget(actual, reference[:, ids], expected[:, ids], name)
+            sharded = relative_rms_error(actual, reference[:, ids])
+            unsharded = relative_rms_error(expected[:, ids], reference[:, ids])
+            assert sharded <= 1.5 * unsharded + 1e-6, (name, sharded, unsharded)
