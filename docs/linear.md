@@ -365,17 +365,18 @@ unsplit: one persistent work item per sequence and head, which leaves the GPU un
 long sequences at low head counts. FP16 and BF16 use exact backward execution by default; eligible
 packed no-state long contexts may use the Mega backward with one unsplit work item per sequence and
 head. Callers that guarantee normalized keys, post-sigmoid beta, and nonpositive decay increments may
-explicitly opt into approximate forgetting-horizon splitting with
-`kernel_options={"backend": "mega", "split_backward": True}` and/or `"split_forward": True`: a
-sequence is cut only where its cumulative decay has saturated below the kernel's threshold, and each
-cut item rebuilds its entry state from zero over a short warmup window. Gates that never forget yield
-no cuts and reproduce the unsplit result exactly; contracting gates produce results within the
-low-precision budget (bitwise identical in bf16 in practice) with several times the parallelism. The
-threshold is a margin of bits past the output dtype's half-ulp, not an underflow; see
-`NOTE [Forgetting Horizon]` in
-`attn_gym/linear/_delta_rule/mega/kernels/common/split_k.py` for the exact statement. The
-implementation chooses the split count from the input geometry; no public split-size knob is exposed.
-Split schedules currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "mega"})` uses the
+set `split_backward` and/or `split_forward` to `True` in a Mega `kernel_options` mapping to opt into
+approximate forgetting-horizon splitting: a sequence is cut only where its cumulative decay has
+crossed the kernel's threshold, and each cut item rebuilds its entry state from zero over a short
+warmup window. Gates that never forget produce no cuts and reproduce the unsplit result exactly; when
+cuts are accepted the result stays within the low-precision error budget while exposing several
+times the parallel work. The threshold is a margin of bits past the output dtype's half-ulp, not an
+underflow; see `NOTE [Forgetting Horizon]` in
+`attn_gym/linear/_delta_rule/mega/kernels/common/split_k.py`. `split_forward` affects only the
+forward recurrence: unless `split_backward` is also enabled, backward computes the exact unsplit
+recurrence's gradient rather than the derivative of the split forward. The implementation chooses
+the split count from the input geometry; no public split-size knob is exposed. Split schedules
+currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "mega"})` uses the
 same exact unsplit forward while updating selected cache slots directly; paged execution never uses
 forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
