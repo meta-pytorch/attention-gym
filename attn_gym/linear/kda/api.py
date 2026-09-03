@@ -82,10 +82,13 @@ def chunk_kda(
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. The fused chunk implementation requires values to remain in
-            approximately ``[-5.914, 0]`` for its FP32 intra-chunk rebase; this
-            implementation limit is not shared by reference or recurrent execution and
-            is documented rather than checked with a runtime tensor reduction.
+            are internal. The repo-local fused implementation requires approximately
+            ``[-5.914, 0]``. Mega BF16 instead requires every aligned 16-token
+            per-channel sum to exceed ``-126 * ln(2)``; a uniform
+            ``lower_bound >= -5.45`` is safe, including
+            the common ``-5`` bound. Mega stages these MMA operands in the Q/K dtype rather
+            than TF32, so Mega FP16 does not support usual model-range gates. These limits
+            are not checked at runtime and do not apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.

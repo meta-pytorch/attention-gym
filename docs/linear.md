@@ -327,9 +327,12 @@ natural-log decay before any prefix sum. `chunk_kda` owns the natural-log-to-log
 conversion and its sequence-local BT64 cumulative sum; `recurrent_kda` performs only the
 conversion because recurrence consumes one token decay at a time. This keeps chunking out
 of model code and lets callers switch execution modes without changing gate
-representation. Custom producers should return finite, nonpositive values; the fused chunk
-backend additionally requires approximately `[-5.914, 0]`; this tensor-value range is
-not checked at runtime. The training example uses the Kimi-style FP32 transform
+representation. Custom producers should return finite, nonpositive values. The repo-local fused
+backend requires approximately `[-5.914, 0]`. Mega BF16 instead requires every aligned 16-token
+per-channel sum to exceed `-126 * ln(2)`; a uniform `lower_bound >= -5.45` is safe, including the
+common `-5` bound. Mega stages these MMA operands in the Q/K dtype rather than TF32, so Mega FP16 does
+not support usual model-range gates. These limits are not checked at runtime. The training example
+uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
