@@ -883,8 +883,12 @@ def test_state_gate_term_contracts_in_fp32(dtype: torch.dtype, portable: bool, m
 
     actual = d_gate("fused", dtype, torch.float32)
     expected = d_gate("reference", torch.float64, torch.float64)
-    # Measured: 0.001--0.009 eps with FP32 contraction versus 0.02--0.34 eps when the portable
-    # kernel rounded the product and reduction to the source dtype.
+    low_precision = d_gate("reference", torch.float32, torch.float32)
+    # Measured for this seed: below 0.01 eps with FP32 accumulation on both backends versus
+    # 0.21 (BF16) and 0.22 (FP16) eps when the portable kernel accumulated in the source dtype.
+    assert_matches_low_precision_reference(
+        actual, expected, low_precision, "dgate", source_dtype=dtype
+    )
     assert_relative_rms_within(actual, expected, "dgate", max_eps=0.05, source_dtype=dtype)
 
 

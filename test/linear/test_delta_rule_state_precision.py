@@ -15,7 +15,11 @@ import pytest
 import torch
 
 from attn_gym.linear import chunk_gdn, chunk_kda, recurrent_gdn
-from attn_gym.testing.kda import assert_relative_rms_within, kda_reference
+from attn_gym.testing.kda import (
+    assert_matches_low_precision_reference,
+    assert_relative_rms_within,
+    kda_reference,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
@@ -35,18 +39,24 @@ _MEGA_SKIP = pytest.mark.skipif(
     not _mega_available(),
     reason="the Mega backend requires nvidia-cutlass-dsl>=4.7 on SM100/SM103",
 )
+# Documented limitations: only the contract assertions may fail, and they must keep failing.
 _FP16_STATE_RANGE = pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="FP16 execution stages chunk-entry states as FP16 MMA operands; 65536 overflows",
 )
 _FP16_COTANGENT_RANGE = pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="FP16 execution stages state cotangents as FP16 tapes; 2^-25 flushes to zero",
 )
 _MEGA_KDA_CARRY = pytest.mark.xfail(
     strict=True,
-    reason="Mega KDA decays the carried state through a b16 diagonal MMA instead of FP32",
+    raises=AssertionError,
+    reason="Mega KDA decays the carried state through a Q/K/V-dtype diagonal MMA, not in FP32",
 )
+# The FP32 carry may differ from the eager reference only by log2-domain gate conversions.
+_FP32_CARRY_RTOL = 1e-5
 
 _FAMILIES = ("gdn", "kda")
 _DTYPES = (pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float16, id="fp16"))
@@ -91,6 +101,18 @@ def _run(
     return output, state
 
 
+def _assert_fp32_carry(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
+    """Check an FP32-carried result pointwise and in aggregate against the FP32 reference."""
+    torch.testing.assert_close(actual, expected, rtol=_FP32_CARRY_RTOL, atol=0.0)
+    assert_relative_rms_within(
+        actual,
+        expected,
+        name,
+        max_eps=_FP32_CARRY_RTOL / torch.finfo(torch.float32).eps,
+        source_dtype=torch.float32,
+    )
+
+
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("kernel_options", _BACKENDS)
 @pytest.mark.parametrize("family", _FAMILIES)
@@ -111,7 +133,7 @@ def test_large_state_decays_in_fp32(
 
     assert torch.equal(output, torch.zeros_like(output))
     assert expected[0, 0, 0, 0].item() == pytest.approx(65536.0 * math.exp(-4.0))
-    torch.testing.assert_close(state, expected, rtol=1e-5, atol=0.0)
+    _assert_fp32_carry(state, expected, "final_state")
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -137,5 +159,9 @@ def test_tiny_final_state_cotangent_reaches_gate_gradient(
     expected_d_gate, expected_d_initial_state = gradients("ref")
 
     assert (expected_d_gate != 0).all()
+    # The gate term reads the Q/K/V-dtype state checkpoint, so it carries source-dtype rounding.
+    assert_matches_low_precision_reference(
+        d_gate, expected_d_gate, expected_d_gate, "dgate", source_dtype=dtype
+    )
     assert_relative_rms_within(d_gate, expected_d_gate, "dgate", max_eps=1.25, source_dtype=dtype)
-    torch.testing.assert_close(d_initial_state, expected_d_initial_state, rtol=1e-5, atol=0.0)
+    _assert_fp32_carry(d_initial_state, expected_d_initial_state, "d_initial_state")

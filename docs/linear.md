@@ -68,12 +68,15 @@ output, final_state = chunk_gdn(
     chunk reads, the per-chunk state checkpoints, and the per-chunk state-cotangent tape are
     staged in the Q/K/V dtype because they are tensor-core operands. BF16 shares the FP32
     exponent range, so this only costs mantissa precision. FP16 also limits the range: state
-    values above 65504 become non-finite when a chunk reads them, and cotangent values below
-    `2^-24` vanish (and lose precision below `2^-14`) before they reach `dgate`, `dk`, and `dv`.
-    Keep FP16 states and state cotangents within the FP16 normal range, for example through loss
-    scaling, or use BF16 when state magnitudes can leave it. The Mega KDA backend additionally
-    applies the per-chunk decay to the carried state through a low-precision diagonal MMA, so
-    its `final_state` carries Q/K/V-dtype rounding instead of the FP32 carry.
+    values that round beyond the FP16 finite range (about 65504) become non-finite when a chunk
+    reads them, and cotangent values in the FP16 subnormal range (below `2^-14`) lose precision
+    or round to zero before they reach `dgate`, `dk`, and `dv`. Keep FP16 states and state
+    cotangents within the FP16 normal range, for example through loss scaling, or use BF16 when
+    state magnitudes can leave it. Use L2-normalized Q/K with FP16, as the training example does:
+    unnormalized Q/K or unusually large V can likewise push attention, solve, and value
+    intermediates outside the FP16 range between FP32-accumulating GEMMs. The Mega KDA backend
+    additionally applies the per-chunk decay to the carried state, and to the state cotangent of
+    its no-state local backward, through a diagonal MMA in the Q/K/V dtype rather than in FP32.
 
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and
@@ -184,16 +187,10 @@ parameterized gate producers: callers still need the masking rules below because
 
 !!! warning "FP16 intermediate range"
 
-    Use L2-normalized Q/K with FP16, as the training example does. Unnormalized Q/K can easily
-    produce attention or solve factors outside the FP16 range. Unusually large V or initial-state
-    carries can likewise overflow the FP16 chunk-state and value intermediates, and small
-    final-state cotangents underflow the FP16 state-cotangent tape in the backward pass. The
-    GEMMs accumulate in FP32, but their results are converted back to FP16 when used as inputs to
-    the next GEMM; an overflow or underflow at that conversion cannot be recovered by the next
-    FP32 accumulator. BF16 uses the same storage size with a much larger exponent range, so it is
-    substantially less likely to hit these issues, although sufficiently large values can overflow
-    any finite dtype. See the FP32-state note in the Gated Delta Rule section for the exact
-    boundary between the FP32 carry and the low-precision staging.
+    Use L2-normalized Q/K with FP16, as the training example does, and keep states and state
+    cotangents within the FP16 normal range. See "What the fused paths keep in FP32" in the
+    Gated Delta Rule section for the boundary between the FP32 carry and the Q/K/V-dtype staging
+    that this shares with GDN.
 
 A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
 replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal
