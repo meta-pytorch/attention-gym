@@ -282,28 +282,68 @@ def test_l2norm_autograd_wrapper(dtype):
     )
 
 
+@pytest.mark.parametrize("dtype", DTYPES[1:], ids=_case_id)
+@pytest.mark.parametrize("row_norm", [1e-2, 3e-2])
+@pytest.mark.parametrize("direction", ["radial", "random"])
+def test_l2norm_autograd_gradient_direction(dtype, row_norm, direction):
+    """Resolve the radial gradient ``y * eps * rstd^2``, which a rounded ``y`` tape cannot.
+
+    Row norms stay within ~30x of ``sqrt(eps)`` so the fp32 cancellation itself remains
+    well below half-precision rounding (see the header of bwd/triton/l2norm_bwd.py).
+    """
+    torch.manual_seed(2)
+    eps = 1e-6
+    x = torch.randn(1, 64, 2, 128, device=DEV, dtype=torch.float64)
+    x = (x / x.norm(dim=-1, keepdim=True) * row_norm).to(dtype).requires_grad_()
+    x32 = x.detach().float().requires_grad_()
+    expected = l2norm_fwd_ref(x32, eps)
+    d_output = expected.detach() if direction == "radial" else torch.randn_like(expected)
+    d_output = d_output.to(dtype)
+    expected_gradient = torch.autograd.grad(expected, x32, d_output.float())[0]
+
+    actual_gradient = torch.autograd.grad(l2norm(x, eps), x, d_output)[0]
+
+    # One output rounding, plus the same rounding at the shared row scale for near-zero
+    # elements.
+    rounding = torch.finfo(dtype).eps
+    torch.testing.assert_close(
+        actual_gradient.float(),
+        expected_gradient,
+        rtol=2 * rounding,
+        atol=rounding * expected_gradient.abs().max().item(),
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
+def test_l2norm_autograd_below_floor_rows(dtype):
+    """Check zero and sub-floor rows, where the projection term vanishes."""
+    torch.manual_seed(3)
+    eps = 1e-6
+    x = torch.zeros(1, 2, 1, 128, device=DEV, dtype=dtype)
+    x[0, 1] = 1e-5 / 128**0.5
+    x.requires_grad_()
+    x64 = x.detach().double().requires_grad_()
+    d_output = torch.randn_like(x)
+
+    actual_gradient = torch.autograd.grad(l2norm(x, eps), x, d_output)[0]
+
+    expected_gradient = torch.autograd.grad(l2norm_fwd_ref(x64, eps), x64, d_output.double())[0]
+    torch.testing.assert_close(
+        actual_gradient.double(), expected_gradient, rtol=2 * torch.finfo(dtype).eps, atol=0
+    )
+
+
 def test_l2norm_op_registration():
     x = torch.randn(1, 17, 3, 128, device=DEV, dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, 9, 17, 17], device=DEV, dtype=torch.int32)
     torch.library.opcheck(_l2norm_fwd_op, (x, 1e-6))
     torch.library.opcheck(_l2norm_fwd_op, (x, 1e-6, cu_seqlens))
 
-    output, rstd = _l2norm_fwd_op(x, 1e-6)
-    d_output = torch.randn_like(output)
-    torch.library.opcheck(
-        _l2norm_bwd_op,
-        (output.view(-1, output.shape[-1]), rstd, d_output),
-    )
-    ragged_output, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
-    torch.library.opcheck(
-        _l2norm_bwd_op,
-        (
-            ragged_output.view(-1, ragged_output.shape[-1]),
-            ragged_rstd,
-            d_output,
-            cu_seqlens,
-        ),
-    )
+    _, rstd = _l2norm_fwd_op(x, 1e-6)
+    d_output = torch.randn_like(x)
+    torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output))
+    _, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
+    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens))
 
 
 def test_l2norm_blackwell_kda_decode_matches_reference_and_replays():
@@ -484,7 +524,7 @@ def test_l2norm_rejects_empty_outer_dimension():
         l2norm(torch.empty(1, 0, 2, 128, device=DEV))
 
 
-# l2norm backward   dx = rstd * (dy - y * <dy, y>)
+# l2norm backward   dx = rstd * (dy - y * <dy, y>),  y = x * rstd
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
 def test_l2norm_bwd(dtype, T, D, strided):
     torch.manual_seed(1)
@@ -492,35 +532,32 @@ def test_l2norm_bwd(dtype, T, D, strided):
     x64 = torch.randn(T, D, device=DEV, dtype=torch.float64)
     dy64 = torch.randn(T, D, device=DEV, dtype=torch.float64)
     rstd64 = 1.0 / torch.sqrt((x64 * x64).sum(-1, keepdim=True) + eps)
-    y64 = x64 * rstd64
 
-    golden = l2norm_bwd_ref(y64, rstd64, dy64)
+    golden = l2norm_bwd_ref(x64, rstd64, dy64)
 
-    # kernel inputs are the low-precision y/rstd/dy
-    y = y64.to(dtype)
+    x = x64.to(dtype)
     dy = dy64.to(dtype)
     rstd = rstd64.squeeze(-1).to(torch.float32)
     if strided:
-        y, dy, rstd = map(_strided_copy, (y, dy, rstd))
+        x, dy, rstd = map(_strided_copy, (x, dy, rstd))
 
-    ref = l2norm_bwd_ref(y, rstd.unsqueeze(-1), dy)
+    ref = l2norm_bwd_ref(x, rstd.unsqueeze(-1), dy)
 
     BD = triton.next_power_of_2(D)
 
-    dx = _empty_strided_like(y) if strided else torch.empty_like(y)
+    dx = _empty_strided_like(x) if strided else torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(T, meta["BT"]),)
     # Present physical [T, D] storage to the kernel as logical [1, T, 1, D].
-    dy_strides = (0, dy.stride(0), 0, dy.stride(1))
     l2norm_bwd_kernel[grid](
-        y,
+        x,
         rstd,
         dy,
         dx,
         T,
         None,
-        Y_STRIDES=y.stride(),
+        X_STRIDES=(0, x.stride(0), 0, x.stride(1)),
         RSTD_STRIDES=rstd.stride(),
-        DY_STRIDES=dy_strides,
+        DY_STRIDES=(0, dy.stride(0), 0, dy.stride(1)),
         DX_STRIDES=dx.stride(),
         TOKENS=T,
         HEADS=1,

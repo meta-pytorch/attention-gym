@@ -12,10 +12,11 @@
 #
 # Differentiating y w.r.t. x gives the Jacobian
 #     dy_i/dx_j = rstd * delta_ij - rstd^3 * x_i * x_j ,
-# and contracting with the upstream gradient dy, then substituting x = y / rstd,
-# collapses to the row-local rule
+# and contracting with the upstream gradient dy gives the row-local rule
 #     dx = rstd * (dy - y * <dy, y>),      <dy, y> = sum_d dy_d * y_d.
-# Only y and rstd (both produced by the forward) are needed -- x is not.
+# y = x * rstd is recomputed in fp32 from the exact input rather than read back from the
+# rounded forward output: for a radial dy the bracket cancels down to y * eps * rstd^2,
+# which a bf16/fp16 y cannot resolve.
 
 from __future__ import annotations
 
@@ -35,13 +36,13 @@ _BT_LIST = [8, 16, 32, 64, 128]
 )
 @triton.jit(do_not_specialize=["N_ROWS"])
 def l2norm_bwd_kernel(
-    y,
+    x,
     rstd,
     dy,
     dx,
     N_ROWS,
     cu_seqlens,
-    Y_STRIDES: tl.constexpr,
+    X_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
     DY_STRIDES: tl.constexpr,
     DX_STRIDES: tl.constexpr,
@@ -67,29 +68,19 @@ def l2norm_bwd_kernel(
     m_row = o_row < N_ROWS
     mask = m_row[:, None] & (o_d[None, :] < D)
 
-    b_y = tl.load(
-        y + ptr_offset((o_row[:, None], o_d[None, :]), Y_STRIDES),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    b_dy = tl.load(
-        dy
-        + ptr_offset(
-            (
-                (o_bt // TOKENS)[:, None],
-                (o_bt % TOKENS)[:, None],
-                (o_row % HEADS)[:, None],
-                o_d[None, :],
-            ),
-            DY_STRIDES,
-        ),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
+    o_bthd = (
+        (o_bt // TOKENS)[:, None],
+        (o_bt % TOKENS)[:, None],
+        (o_row % HEADS)[:, None],
+        o_d[None, :],
+    )
+    b_x = tl.load(x + ptr_offset(o_bthd, X_STRIDES), mask=mask, other=0.0).to(tl.float32)
+    b_dy = tl.load(dy + ptr_offset(o_bthd, DY_STRIDES), mask=mask, other=0.0).to(tl.float32)
     b_rstd = tl.load(rstd + ptr_offset((o_row,), RSTD_STRIDES), mask=m_row, other=0.0).to(
         tl.float32
     )
 
+    b_y = b_x * b_rstd[:, None]
     b_dot = tl.sum(b_dy * b_y, 1)
     b_dx = b_rstd[:, None] * (b_dy - b_y * b_dot[:, None])
     tl.store(

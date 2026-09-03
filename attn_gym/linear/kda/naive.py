@@ -294,21 +294,22 @@ def l2norm_fwd_ref(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (xc * rstd).to(x.dtype)
 
 
-def l2norm_bwd_ref(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
-    """Gradient of the L2 norm: ``dx = rstd * (dy - y * <dy, y>)``.
+def l2norm_bwd_ref(x: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    """Gradient of the L2 norm: ``dx = rstd * (dy - y * <dy, y>)`` with ``y = x * rstd``.
 
-    Naive counterpart of ``l2norm_bwd_kernel``. Runs in fp32 (or fp64 when ``y`` is fp64)
-    to match the kernel's accumulation, then downcasts to ``y.dtype``.
+    Naive counterpart of ``l2norm_bwd_kernel``. Recomputes ``y`` from the exact input in
+    fp32 (or fp64 when ``x`` is fp64) to match the kernel, then downcasts to ``x.dtype``.
 
     Args:
-        y: normalized forward output; shape ``(..., D)``.
+        x: forward input; shape ``(..., D)``.
         rstd: reciprocal std saved by the forward pass, broadcastable over the last dim.
         dy: upstream gradient w.r.t. ``y``; shape ``(..., D)``.
     """
-    dtype = torch.promote_types(y.dtype, torch.float32)
-    yc, dyc, rc = y.to(dtype), dy.to(dtype), rstd.to(dtype)
+    dtype = torch.promote_types(x.dtype, torch.float32)
+    xc, dyc, rc = x.to(dtype), dy.to(dtype), rstd.to(dtype)
+    yc = xc * rc
     dot = (dyc * yc).sum(-1, keepdim=True)
-    return (rc * (dyc - yc * dot)).to(y.dtype)
+    return (rc * (dyc - yc * dot)).to(x.dtype)
 
 
 def chunk_cumsum_ref(
