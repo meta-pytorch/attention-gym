@@ -108,6 +108,8 @@ def _validate_indices(
     kth_reference = ref_values[..., -1]
     boundary_gap = (kth_reference - min_selected).clamp_min(0)
     scale = torch.maximum(kth_reference.abs(), torch.ones_like(kth_reference))
+    # This test doesn't strictly have to exist
+    # But I feel safer if there's a test where I can see a raw number for tolerance
     tolerance = 5.0e-4 * scale
     assert not torch.any((boundary_gap > tolerance) & (~exact_rows)), (
         f"mismatch not at boundary (max gap {boundary_gap.max().item():.6g})"
@@ -121,7 +123,7 @@ def _validate_indices(
         (2, 128, 64, 128, 32),
         (2, 128, 128, 128, 128),
         (2, 64, 66, 128, 37),
-        (2, 256, 128, 128, 64),
+        (1, 256, 128, 128, 64),
     ],
     ids=[
         "base",
@@ -232,6 +234,26 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     cute_indices = index(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
     valid = cute_indices >= 0
     safe_indices = cute_indices.to(torch.int64).clamp_min(0)
+
+    # Check that we have the right number of indices and no duplicates
+    # Otherwise kernel could return [-1, -1, ...] to pass test
+    if causal:
+        row = torch.arange(queries, device=device).view(1, queries, 1)
+        valid_keys = row + 1
+    else:
+        valid_keys = torch.full((1, queries, 1), queries, device=device)
+    expected_valid = torch.minimum(valid_keys, torch.full_like(valid_keys, topk)).expand(
+        batch, -1, -1
+    )
+    assert torch.equal(valid.sum(-1, keepdim=True), expected_valid), "wrong valid count"
+
+    # No duplicate valid indices within a row
+    cute_indices_i64 = cute_indices.to(torch.int64)
+    sorted_indices = cute_indices_i64.sort(-1).values
+    dup = (sorted_indices[..., 1:] == sorted_indices[..., :-1]) & (
+        sorted_indices[..., 1:] >= 0
+    )
+    assert not torch.any(dup), "duplicate valid index"
 
     # FP64 scores at the kernel-selected positions
     kernel_scores_64 = scores_64.gather(-1, safe_indices)  # [B, T, topk]

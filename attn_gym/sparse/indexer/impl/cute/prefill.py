@@ -12,6 +12,7 @@ registration or fallback implementation.
 
 import math
 
+import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
@@ -1238,6 +1239,7 @@ def _launch(
     topk: cutlass.Constexpr,
     sort_span: cutlass.Constexpr,
     causal: cutlass.Constexpr,
+    stream: cuda_driver.CUstream,
 ):
     """Build the SM100 TMA/MMA objects and launch exactly one kernel."""
     q_hdtb = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 3, 1, 0]))
@@ -1300,6 +1302,7 @@ def _launch(
         grid=(cute.ceil_div(q.shape[1], _QUERIES_PER_CTA), q.shape[0], 1),
         block=(_THREADS, 1, 1),
         min_blocks_per_mp=_MIN_BLOCKS_PER_MP,
+        stream=stream,
     )
 
 
@@ -1438,9 +1441,11 @@ def index(
             topk,
             _selection_sort_span(topk),
             causal,
+            cute.runtime.make_fake_stream(),
         )
         _compile_cache[compile_key] = compiled
-    compiled(q_c, k_c, weights_c, output_c, score_scale)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    compiled(q_c, k_c, weights_c, output_c, score_scale, stream)
     return output
 
 
