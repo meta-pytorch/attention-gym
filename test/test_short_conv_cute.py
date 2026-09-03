@@ -348,6 +348,7 @@ def test_short_conv_packed_defaults_select_tma(dtype: torch.dtype):
         cute_backend.tuned_config(descriptor, packed=True).input_gradient,
         512,
         4,
+        (9, 0),
     )
     assert cute_backend.supports_tma(
         cute_backend.CausalConv1dSiluWeightGradientPartialsTma,
@@ -355,7 +356,71 @@ def test_short_conv_packed_defaults_select_tma(dtype: torch.dtype):
         cute_backend.tuned_config(descriptor, packed=True).weight_gradient,
         512,
         4,
+        (9, 0),
     )
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6)])
+@pytest.mark.parametrize(
+    ("operation_type", "config_name"),
+    [
+        (cute_backend.CausalConv1dSiluInputGradientTma, "input_gradient"),
+        (cute_backend.CausalConv1dSiluWeightGradientPartialsTma, "weight_gradient"),
+    ],
+)
+def test_short_conv_ampere_defaults_reject_tma(capability, operation_type, config_name):
+    """Route Ampere gradient schedules through their portable fallbacks."""
+    descriptor = cute_backend.SHORT_CONV_DTYPES[torch.bfloat16]
+    defaults = cute_backend.tuned_config(descriptor, packed=True)
+    config = getattr(defaults, config_name)
+    assert not cute_backend.supports_tma(
+        operation_type,
+        config,
+        config,
+        512,
+        4,
+        capability,
+    )
+
+
+def test_short_conv_ampere_compiles_portable_gradients(monkeypatch):
+    """Construct portable gradient operations for otherwise TMA-eligible Ampere shapes."""
+    monkeypatch.setattr(
+        cute_backend,
+        "compile_tvm_ffi",
+        lambda operation, *args, **kwargs: operation,
+    )
+    descriptor = cute_backend.SHORT_CONV_DTYPES[torch.bfloat16]
+    defaults = cute_backend.tuned_config(descriptor, packed=True)
+    activation = cute_backend.resolve_activation("silu")
+
+    input_gradient = cute_backend._compile_input_gradient.__wrapped__(
+        1,
+        24,
+        512,
+        4,
+        descriptor,
+        defaults.input_gradient,
+        2,
+        False,
+        activation,
+        (8, 6),
+    )
+    weight_gradient = cute_backend._compile_weight_gradient.__wrapped__(
+        1,
+        24,
+        256,
+        4,
+        descriptor,
+        defaults.weight_gradient,
+        2,
+        False,
+        activation,
+        (8, 6),
+    )
+
+    assert type(input_gradient) is cute_backend.CausalConv1dSiluInputGradient
+    assert type(weight_gradient) is cute_backend.CausalConv1dSiluWeightGradientPartials
 
 
 def test_short_conv_tma_rejects_partial_channel_tiles():
