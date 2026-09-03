@@ -1273,14 +1273,16 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                             ak0, ak1, ak2, ak3, b0, b1, k30, k31, k32, k33
                         )
 
+        # Keep i == j out of the gate-factored MMAs. Its gate-independent
+        # dq/dk/dbeta contributions are restored directly in the epilogue.
         key_base = row_base
         for k_outer in cutlass.range_constexpr(2):
             key0 = key_base + k_outer * 8 + 2 * tid
             key1 = key0 + 1
-            keep00 = (k_outer * 8 + 2 * tid) <= gid
-            keep01 = (k_outer * 8 + 2 * tid + 1) <= gid
-            keep10 = (k_outer * 8 + 2 * tid) <= (gid + 8)
-            keep11 = (k_outer * 8 + 2 * tid + 1) <= (gid + 8)
+            keep00 = (k_outer * 8 + 2 * tid) < gid
+            keep01 = (k_outer * 8 + 2 * tid + 1) < gid
+            keep10 = (k_outer * 8 + 2 * tid) < (gid + 8)
+            keep11 = (k_outer * 8 + 2 * tid + 1) < (gid + 8)
             aq0, aq2 = _hmma_load_da_pair_pred(
                 mdAqk,
                 row_start,
@@ -1487,10 +1489,10 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
         for k_outer in cutlass.range_constexpr(2):
             query0 = row_base + k_outer * 8 + 2 * tid
             query1 = query0 + 1
-            keep00 = gid <= (k_outer * 8 + 2 * tid)
-            keep01 = gid <= (k_outer * 8 + 2 * tid + 1)
-            keep10 = (gid + 8) <= (k_outer * 8 + 2 * tid)
-            keep11 = (gid + 8) <= (k_outer * 8 + 2 * tid + 1)
+            keep00 = gid < (k_outer * 8 + 2 * tid)
+            keep01 = gid < (k_outer * 8 + 2 * tid + 1)
+            keep10 = (gid + 8) < (k_outer * 8 + 2 * tid)
+            keep11 = (gid + 8) < (k_outer * 8 + 2 * tid + 1)
             aq0 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row0, valid, keep00)
             aq1 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row1, valid, keep10)
             aq2 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query1, row0, valid, keep01)
@@ -1578,6 +1580,20 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                         ak0, ak1, ak2, ak3, c0, c1, d30, d31, d32, d33
                     )
 
+        daq_diag0 = z
+        daq_diag1 = z
+        dak_diag0 = z
+        dak_diag1 = z
+        if tid == 0:
+            daq_diag0 = _hmma_load_da(mdAqk, row_start, head_idx, row0, row0, valid)
+            daq_diag1 = _hmma_load_da(mdAqk, row_start, head_idx, row1, row1, valid)
+            dak_diag0 = _hmma_load_da(mdAkk, row_start, head_idx, row0, row0, valid)
+            dak_diag1 = _hmma_load_da(mdAkk, row_start, head_idx, row1, row1, valid)
+        diagonal_lane = gid * 4
+        daq_diag0 = cute.arch.shuffle_sync(daq_diag0, diagonal_lane)
+        daq_diag1 = cute.arch.shuffle_sync(daq_diag1, diagonal_lane)
+        dak_diag0 = cute.arch.shuffle_sync(dak_diag0, diagonal_lane)
+        dak_diag1 = cute.arch.shuffle_sync(dak_diag1, diagonal_lane)
         db_acc0 = z
         db_acc1 = z
         dq_top0 = Int32(0)
@@ -1722,8 +1738,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     mDg.iterator + out_row * dg_row_stride + head_idx * dg_head_stride + col0,
                     row_valid,
                 )
-                dq_add0 = q_acc0 * qscale_prev0 + q_diag0 * qscale_diag0
-                dq_add1 = q_acc1 * qscale_prev1 + q_diag1 * qscale_diag1
+                dq_strict0 = q_acc0 * qscale_prev0 + q_diag0 * qscale_diag0
+                dq_strict1 = q_acc1 * qscale_prev1 + q_diag1 * qscale_diag1
+                daq_diag = daq_diag0 if lane_row == 0 else daq_diag1
+                dak_diag = dak_diag0 if lane_row == 0 else dak_diag1
+                dq_add0 = dq_strict0 + daq_diag * kval0
+                dq_add1 = dq_strict1 + daq_diag * kval1
                 if cutlass.const_expr(use_packed_f32x2):
                     dq_out0, dq_out1 = cute.arch.add_packed_f32x2(
                         (dq_in0, dq_in1), (dq_add0, dq_add1)
@@ -1740,8 +1760,9 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 dkt1 = d_acc1 * dscale1 + t_acc1 * tscale1
                 dk_beta0 = dk_qk0 * beta_row
                 dk_beta1 = dk_qk1 * beta_row
-                dk_add0 = dk_beta0 + dkt0
-                dk_add1 = dk_beta1 + dkt1
+                dk_diag_scale = Float32(2.0) * dak_diag * beta_row
+                dk_add0 = dk_beta0 + dkt0 + daq_diag * qval0 + dk_diag_scale * kval0
+                dk_add1 = dk_beta1 + dkt1 + daq_diag * qval1 + dk_diag_scale * kval1
                 if cutlass.const_expr(use_packed_f32x2):
                     dk_out0, dk_out1 = cute.arch.add_packed_f32x2(
                         (dk_in0, dk_in1), (dk_add0, dk_add1)
@@ -1752,15 +1773,17 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     dk_word0 = _cvt_half2_f32(dk_out0, dk_out1, mDk2.element_type)
                 else:
                     dk_word1 = _cvt_half2_f32(dk_out0, dk_out1, mDk2.element_type)
-                dg_out0 = (dg_in0 + dq_add0 * qval0 + (dk_beta0 - dkt0) * kval0) * Float32(LN2)
-                dg_out1 = (dg_in1 + dq_add1 * qval1 + (dk_beta1 - dkt1) * kval1) * Float32(LN2)
+                dg_out0 = (dg_in0 + dq_strict0 * qval0 + (dk_beta0 - dkt0) * kval0) * Float32(LN2)
+                dg_out1 = (dg_in1 + dq_strict1 * qval1 + (dk_beta1 - dkt1) * kval1) * Float32(LN2)
                 if lane_row == 0:
                     dg_top0 = dg_out0
                     dg_top1 = dg_out1
                 else:
                     dg_bottom0 = dg_out0
                     dg_bottom1 = dg_out1
-                db_pair = dk_qk0 * kval0 + dk_qk1 * kval1
+                db_pair = (
+                    dk_qk0 * kval0 + dk_qk1 * kval1 + dak_diag * (kval0 * kval0 + kval1 * kval1)
+                )
                 if lane_row == 0:
                     db_acc0 = db_acc0 + db_pair
                 else:
