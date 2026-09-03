@@ -389,3 +389,74 @@ forgetting-horizon splitting. Install the `mega` extra to use this backend.
 ::: attn_gym.linear.recurrent_kda_decode
 
 ::: attn_gym.linear.Impl
+
+## Staged Primitives
+
+Every delta-rule token step is affine in the V-major recurrent state, so any token range
+collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [bias; transition]`
+(one map per value head; GQA key heads are expanded by the factor kernels). Moving state between
+devices (context parallelism, pipelined state handoff, ...) is therefore a prefix scan over these
+summaries, and it needs the fused core split around the communication point in both directions.
+
+### Terminology and index spaces
+
+Anything a plan is built from is **global**; anything that touches a tensor on a rank is
+**local**. `attn_gym.linear.state_summary` carries the canonical `NOTE [Terminology]`.
+
+| term | meaning | space |
+|---|---|---|
+| global stream | the whole packed token stream, `cu_seqlens_global` | global |
+| sequence | one document in the global stream | global |
+| fragment | one contiguous global token range a rank owns; may cover several sequences. A rank owns a list of them: one for a contiguous shard, two for zig-zag | global |
+| subsequence | the tokens of one fragment that belong to one sequence; a fragment covering several sequences has several subsequences, and each becomes one `cu_seqlens` segment of the owner's span | global |
+| span | the concatenation of a rank's fragments, in the order it listed them: the packed `q`/`k`/`v`/`output` tensors on that rank, with `cu_seqlens` marking its subsequence boundaries | local |
+| chunk | the `attn_gym.linear.kda.stages.CHUNK_SIZE` (64) token block the fused kernels work in (WY factors and one state step per block); every subsequence is chunked on its own, starting at its first token, so its last chunk may be partial and no fragment cut needs to be chunk-aligned | local |
+| summary | the `[bias; transition]` map of a token range of the span | local range |
+| slot | `gathered[rank][i]`: the summary of that rank's `i`-th subsequence, or the identity | (rank, index) |
+| predecessors / successors | subsequences of the same sequence earlier / later in global order | (rank, slot) |
+| terminal | subsequences that end their sequence; true final states live there | local index |
+
+Fragment cut points are arbitrary global tokens: chunking restarts at every subsequence, so they
+need no alignment to sequences or chunks. With `cu_seqlens_global = (0, 40, 232, 384)` and the
+zig-zag table `fragments_global = [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]`:
+
+```text
+global tokens   0     40             96       192   232      288      384
+sequences       |- s0 -|------------ s1 --------------|-------- s2 --------|
+rank 0           [====== frag A ======]                        [= frag B =]
+rank 1                                 [ frag C ][= frag D ==]
+
+rank 0 span:  A∩s0 | A∩s1 | B∩s2     local cu_seqlens (0, 40, 96, 192)
+rank 1 span:  C∩s1 | D∩s1 | D∩s2     local cu_seqlens (0, 96, 136, 192)
+chains:       s1 = A∩s1 -> C∩s1 -> D∩s1        s2 = D∩s2 -> B∩s2
+```
+
+`state_summary(start, stop)` takes **local** span offsets and is exact over whole chunks of one
+subsequence: `start = sub_start + 64·i`, `stop = sub_start + 64·j` or the subsequence end, never
+crossing a `cu_seqlens` boundary. The recipe always passes one whole subsequence,
+`(cu_seqlens[i], cu_seqlens[i + 1])`.
+
+`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` do that split without
+exposing the WY factors:
+
+```python
+from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
+
+prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+summary = prepared.state_summary(start, stop)  # [bias; transition] of one local sequence
+# ...exchange summaries and compose each sequence's entry state...
+output, final_state = prepared.run(initial_state, output_final_state=True)
+
+grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
+grad_summary = grads.state_grad_summary(start, stop)  # reverse map [bias; transition]
+# ...exchange and compose each sequence's exit cotangent...
+dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
+```
+
+`start`/`stop` are host integers naming exactly one local `cu_seqlens` segment, so CUDA Graph
+capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries
+(`merge_state`, `compose_summaries`, `neutral_summary`).
+
+::: attn_gym.linear.kda.stages.chunk_kda_prepare
+
+::: attn_gym.linear.kda.stages.chunk_kda_prepare_backward
