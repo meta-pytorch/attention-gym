@@ -17,6 +17,7 @@ import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
+from attn_gym.testing.kda import assert_relative_rms_within
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
@@ -398,6 +399,97 @@ def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, head
         transition - reverse_transition.transpose(-2, -1), ord=2
     )
     assert (adjoint_defect <= 2e-4).all(), adjoint_defect
+
+
+@pytest.mark.parametrize(
+    ("num_chunks", "work_tiles", "sm_count", "expected"),
+    [
+        pytest.param(512, 64, 148, (2, 256), id="two-segments"),
+        pytest.param(512, 128, 148, (1, 512), id="one-wave-already"),
+        pytest.param(512, 256, 148, (1, 512), id="oversubscribed"),
+        pytest.param(512, 8, 148, (18, 29), id="sm-bound"),
+        pytest.param(3, 8, 148, (1, 3), id="short-chain-stays-whole"),
+        pytest.param(31, 8, 148, (1, 31), id="just-below-two-segments"),
+        pytest.param(32, 8, 148, (2, 16), id="first-split"),
+        pytest.param(70, 8, 32, (4, 18), id="ragged-tail"),
+        pytest.param(65, 8, 32, (4, 17), id="rounding-drops-a-segment"),
+    ],
+)
+def test_plan_segments_fills_one_wave_without_empty_or_tiny_segments(
+    num_chunks, work_tiles, sm_count, expected
+):
+    segments, chunks_per_segment = native_fwd.plan_segments(num_chunks, work_tiles, sm_count)
+    assert (segments, chunks_per_segment) == expected
+    assert (segments - 1) * chunks_per_segment < num_chunks <= segments * chunks_per_segment
+    # A fold level costs more than several chunks, so no split may produce short segments.
+    assert segments == 1 or chunks_per_segment >= native_fwd.MIN_CHUNKS_PER_SEGMENT
+
+
+@pytest.mark.parametrize("segments", [1, 3, 5, 8])
+def test_compose_segment_summaries_matches_sequential_composition(segments):
+    """The pairwise fold, including its odd tail, equals left-to-right composition."""
+    generator = torch.Generator().manual_seed(5)
+    summaries = torch.randn(segments, 2, 256, 128, generator=generator) / 16
+    summaries[:, :, VALUE_DIM:] += torch.eye(128)
+    expected = reduce(compose_summaries, summaries.unbind(0))
+    torch.testing.assert_close(
+        native_fwd.compose_segment_summaries(summaries), expected, atol=1e-5, rtol=1e-5
+    )
+
+
+def test_compose_segment_summaries_ignores_the_float32_matmul_mode():
+    """The fold must not pick up TF32 from ``torch.set_float32_matmul_precision("high")``."""
+    generator = torch.Generator(device="cuda").manual_seed(6)
+    summaries = torch.randn(4, 2, 256, 128, device="cuda", generator=generator) / 16
+    summaries[:, :, VALUE_DIM:] += torch.eye(128, device="cuda")
+    exact = reduce(compose_summaries, summaries.double().unbind(0)).float()
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        folded = native_fwd.compose_segment_summaries(summaries)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    # TF32 rounds operands to 10 mantissa bits (~1e-3 relative); an FP64 fold stays within a few
+    # FP32 ulps of the exact composition.
+    torch.testing.assert_close(folded, exact, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
+    reason="segmented launches are specific to the native SM100 kernels",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_segmented_summaries_match_single_segment_scans(dtype, monkeypatch):
+    """Splitting the chunk chain across idle SMs must only reorder FP32 composition."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(
+        43, dtype, tokens=2048, heads=1, divisor=16
+    )
+    reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
+    segmented = (
+        build_state_summary(kg, w, u, cumulative_gate),
+        reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
+    )
+
+    plans = []
+    plan_segments = native_fwd.plan_segments
+
+    def single_segment(num_chunks, work_tiles, sm_count):
+        plans.append(plan_segments(num_chunks, work_tiles, sm_count))
+        return 1, num_chunks
+
+    monkeypatch.setattr(native_fwd, "plan_segments", single_segment)
+    monkeypatch.setattr(native_rev, "plan_segments", single_segment)
+    unsegmented = (
+        build_state_summary(kg, w, u, cumulative_gate),
+        reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
+    )
+    assert all(segments > 1 for segments, _ in plans), plans
+    for name, actual, expected in zip(("forward", "reverse"), segmented, unsegmented, strict=True):
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        assert_relative_rms_within(
+            actual, expected, f"segmented {name} summary", max_eps=64, source_dtype=torch.float32
+        )
 
 
 @pytest.mark.usefixtures("summary_backend")

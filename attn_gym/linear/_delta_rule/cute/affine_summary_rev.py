@@ -11,11 +11,17 @@ The local backward recurrence is affine in its incoming final-state cotangent:
 ``[K, BN]`` tiles of the augmented FP32 state ``X = [0 | I]`` and returns its
 V-first packed transpose ``[local_bias; reverse_transition]``.
 
-Each 224-thread CTA persistently owns augmented-column tiles. Four CUDA warps
-hold the FP32 state in registers, one warp issues TMA loads, one computes gate
-exponentials, and one issues the four UMMA operations. Bias tiles load the local
-output-gradient sources; transition tiles skip those streams entirely. Only the
-final FP32 summary is written to global memory.
+Each 224-thread CTA persistently owns work items, one (augmented-column tile,
+head, chunk segment) each. Four CUDA warps hold the FP32 state in registers, one
+warp issues TMA loads, one computes gate exponentials, and one issues the four
+UMMA operations. Bias tiles load the local output-gradient sources; transition
+tiles skip those streams entirely. Only the final FP32 summary is written to
+global memory.
+
+The chunk recurrence is a serial latency chain (~1.3 us per chunk at BN=32), so
+when ``heads * tiles`` leaves SMs idle the wrapper splits the chunks into
+segments that each scan from ``[0 | I]`` and composes the segment maps on the
+host; see ``compose_segment_summaries`` in the forward module.
 
 The fp32-valued MMA B operands (state ``X`` and the corrected write gradient
 ``dv``) are split into hi/lo halves of the I/O dtype and accumulated in two UMMA
@@ -43,6 +49,10 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
+    compose_segment_summaries,
+    plan_segments,
+)
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 BT = 64
@@ -131,27 +141,24 @@ class BlackwellDeltaAffineSummaryRev:
     STATE_WARP_IDS = tuple(range(WarpRole.STATE, WarpRole.LOAD))
     WARP_SIZE = cute.arch.WARP_SIZE
     CTA_THREADS = WarpRole.END * WARP_SIZE
+    # Augmented-state columns per CTA. A BN=16 tile covered half the columns for only ~25% less
+    # time per chunk; chunk segments fill idle SMs instead.
+    BN = 32
 
     def __init__(
         self,
         num_heads: int,
         io_type: type[cutlass.Numeric],
-        state_tile_width: int,
         use_int64_offsets: bool,
     ):
-        # This limits columns handled by one CTA, not the number of attention heads.
-        assert state_tile_width in (16, 32), (
-            f"state tile width must be 16 or 32, got {state_tile_width}"
-        )
         self.num_heads = num_heads
         self.io_type = io_type
         self.acc_type = cutlass.Float32
         self.BT = BT
         self.BK = KEY_DIM
-        self.BN = state_tile_width
         self.use_int64_offsets = use_int64_offsets
 
-        self.state_regs = 128 if state_tile_width == 16 else 160
+        self.state_regs = 160
         self.aux_regs = 40
 
         self.dv_tile = (self.BT, self.BN, self.BK)
@@ -159,7 +166,7 @@ class BlackwellDeltaAffineSummaryRev:
         self.aqdo_tile = (self.BT, self.BN, self.BT)
         self.wdv_tile = (self.BK, self.BN, self.BT)
 
-        self.k_depth = 6 if state_tile_width == 16 else 4
+        self.k_depth = 4
         self.q_depth = 2
         self.do_depth = 2
         self.w_depth = 2
@@ -196,6 +203,7 @@ class BlackwellDeltaAffineSummaryRev:
         cumulative_gate: cute.Tensor,
         out: cute.Tensor,
         scale: Float32,
+        chunks_per_segment: Int32,
         stream: cuda.CUstream,
     ):
         """Construct TMA/UMMA descriptors and launch the persistent kernel."""
@@ -455,8 +463,9 @@ class BlackwellDeltaAffineSummaryRev:
             smem_layouts,
             Int32(cute.size(w.shape[1])),
             scale,
+            chunks_per_segment,
         ).launch(
-            grid=self._launch_grid(),
+            grid=self._launch_grid(cute.size(out.shape[0])),
             block=(self.CTA_THREADS, 1, 1),
             cluster=self.cluster,
             stream=stream,
@@ -464,10 +473,20 @@ class BlackwellDeltaAffineSummaryRev:
         )
 
     @cute.jit
-    def _decode_work(self, work_index):
-        """Return the augmented-column tile and head for a work item."""
+    def _decode_work(self, work_index, chunks, chunks_per_segment):
+        """Return the augmented-column tile, head, and chunk range of a work item.
+
+        Each segment scans its own chunk range from ``[0 | I]``; the host composes them.
+        """
+        # ``column_tiles`` and ``num_heads`` are compile-time constants, so these divisions lower
+        # to shifts and multiply-high sequences; they also run once per work item, not per chunk.
         column_tiles = SUMMARY_DIM // self.BN
-        return work_index % column_tiles, work_index // column_tiles
+        column_tile = work_index % column_tiles
+        head = (work_index // column_tiles) % self.num_heads
+        segment = work_index // (column_tiles * self.num_heads)
+        chunk_begin = segment * chunks_per_segment  # < chunks: plan_segments drops empties
+        chunk_end = cutlass.min(chunk_begin + chunks_per_segment, chunks)
+        return column_tile, head, segment, chunk_begin, chunk_end
 
     @cute.jit
     def run_state(
@@ -476,6 +495,7 @@ class BlackwellDeltaAffineSummaryRev:
         grid,
         iterations,
         chunks,
+        chunks_per_segment,
         out,
         t_dv_acc,
         t_qdo_acc,
@@ -555,7 +575,9 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, head = self._decode_work(block + tile_index * grid)
+            column_tile, head, segment, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, chunks, chunks_per_segment
+            )
             has_source = column_tile < VAL_DIM // self.BN
 
             for element in cutlass.range(cute.size(state), unroll_full=True):
@@ -566,7 +588,7 @@ class BlackwellDeltaAffineSummaryRev:
                 else:
                     state[element] = Float32(0.0)
 
-            for _chunk in cutlass.range(chunks, unroll=0):
+            for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 # Publish the hi half as soon as it exists so MMA1 starts its first
                 # pass while the lo residual is still being formed and stored.
                 hi_handle = state_producer.acquire_and_advance()
@@ -657,7 +679,7 @@ class BlackwellDeltaAffineSummaryRev:
 
             for element in cutlass.range(cute.size(state), unroll_full=True):
                 key, column = state_coordinates[element]
-                out[head, column_tile * self.BN + column, key] = state[element]
+                out[segment, head, column_tile * self.BN + column, key] = state[element]
 
             tile_index = tile_index + 1
             has_work = tile_index < iterations
@@ -669,6 +691,7 @@ class BlackwellDeltaAffineSummaryRev:
         grid,
         iterations,
         chunks,
+        chunks_per_segment,
         mma_dv,
         mma_qdo,
         mma_aqdo,
@@ -699,7 +722,9 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, head = self._decode_work(block + tile_index * grid)
+            column_tile, head, _segment, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, chunks, chunks_per_segment
+            )
             has_source = column_tile < VAL_DIM // self.BN
 
             k_smem, k_gmem = self._partition_a(atom_k, desc_k, s_k, self.dv_tile, mma_dv, head)
@@ -742,8 +767,8 @@ class BlackwellDeltaAffineSummaryRev:
                 head,
             )
 
-            for chunk in cutlass.range(chunks, unroll=0):
-                reverse_chunk = chunks - 1 - chunk
+            for chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
+                reverse_chunk = chunk_end - 1 - (chunk - chunk_begin)
 
                 gate_handle = gate_producer.acquire_and_advance()
                 cute.copy(
@@ -801,6 +826,7 @@ class BlackwellDeltaAffineSummaryRev:
         grid,
         iterations,
         chunks,
+        chunks_per_segment,
         gate,
         gate_exp,
         gate_consumer,
@@ -814,7 +840,10 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            for _chunk in cutlass.range(chunks, unroll=0):
+            _, _, _, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, chunks, chunks_per_segment
+            )
+            for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 gate_handle = gate_consumer.wait_and_advance()
                 ready_handle = gate_ready_producer.acquire_and_advance()
                 for index in cutlass.range(4, unroll_full=True):
@@ -834,6 +863,7 @@ class BlackwellDeltaAffineSummaryRev:
         grid,
         iterations,
         chunks,
+        chunks_per_segment,
         mmas,
         t_dv_acc,
         t_k,
@@ -868,10 +898,12 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, _head = self._decode_work(block + tile_index * grid)
+            column_tile, _head, _segment, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, chunks, chunks_per_segment
+            )
             has_source = column_tile < VAL_DIM // self.BN
 
-            for _chunk in cutlass.range(chunks, unroll=0):
+            for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 # The source products do not depend on the state, so they run while
                 # the state warps are still producing the X snapshot: Aqk^T dO seeds
                 # the dv accumulator and qg^T dO completes off the recurrence chain.
@@ -958,6 +990,7 @@ class BlackwellDeltaAffineSummaryRev:
         smem_layouts: SmemLayouts,
         tokens: Int32,
         scale: Float32,
+        chunks_per_segment: Int32,
     ):
         """Dispatch the persistent state, TMA, gate, and MMA warp roles."""
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
@@ -1100,6 +1133,10 @@ class BlackwellDeltaAffineSummaryRev:
             allocator_warp_id=WarpRole.LOAD,
         )
         tmem.allocate(self.tm_total)
+        # Relinquish the permit immediately: it only promises this CTA allocates no more TMEM,
+        # while the columns just allocated stay owned until ``tmem.free``. Holding it to exit
+        # blocks a co-resident CTA's allocation and serializes chains that would overlap.
+        tmem.relinquish_alloc_permit()
         tmem.wait_for_alloc()
         tmem_pointer = tmem.retrieve_ptr(self.acc_type)
 
@@ -1145,8 +1182,8 @@ class BlackwellDeltaAffineSummaryRev:
 
         block = cute.arch.block_idx()[0]
         grid = cute.arch.grid_dim()[0]
-        work_tiles = self.num_heads * (SUMMARY_DIM // self.BN)
-        iterations = (work_tiles - block + grid - 1) // grid
+        work_items = self.num_heads * (SUMMARY_DIM // self.BN) * cute.size(out.shape[0])
+        iterations = (work_items - block + grid - 1) // grid
         chunks = tokens // self.BT
 
         if warp_id in self.STATE_WARP_IDS:
@@ -1155,6 +1192,7 @@ class BlackwellDeltaAffineSummaryRev:
                 grid,
                 iterations,
                 chunks,
+                chunks_per_segment,
                 out,
                 t_dv_acc,
                 t_qdo_acc,
@@ -1176,6 +1214,7 @@ class BlackwellDeltaAffineSummaryRev:
                 grid,
                 iterations,
                 chunks,
+                chunks_per_segment,
                 mma_dv,
                 mma_qdo,
                 mma_aqdo,
@@ -1200,6 +1239,7 @@ class BlackwellDeltaAffineSummaryRev:
                 grid,
                 iterations,
                 chunks,
+                chunks_per_segment,
                 gate,
                 gate_exp,
                 gate_consumer,
@@ -1211,6 +1251,7 @@ class BlackwellDeltaAffineSummaryRev:
                 grid,
                 iterations,
                 chunks,
+                chunks_per_segment,
                 mmas,
                 t_dv_acc,
                 t_k,
@@ -1235,7 +1276,6 @@ class BlackwellDeltaAffineSummaryRev:
                 wdv_producer,
             )
 
-        tmem.relinquish_alloc_permit()
         self.tmem_free_barrier.arrive_and_wait()
         tmem.free(tmem_pointer)
 
@@ -1301,29 +1341,22 @@ class BlackwellDeltaAffineSummaryRev:
         assert total <= 512, f"TMEM overflow: {total}>512"
         return dv_offset, qdo_offset, wdv_offset, total
 
-    def _launch_grid(self):
-        """Bound the persistent launch to the logical tile count and SM count."""
+    def _launch_grid(self, segments):
+        """Bound the persistent launch to the work-item count and SM count."""
         sm_count = get_compile_target().sm_count
         if sm_count is None:
             raise RuntimeError("affine_summary_rev compilation requires an SM count")
-        return (min(sm_count, self.num_heads * (SUMMARY_DIM // self.BN)), 1, 1)
-
-
-def select_summary_tile_width(heads: int, device: torch.device) -> int:
-    """Choose the per-CTA state-column width from the available SM count."""
-    work_tiles_at_width_16 = (SUMMARY_DIM // 16) * heads
-    sm_count = get_device_properties(device).multi_processor_count
-    return 32 if work_tiles_at_width_16 > sm_count else 16
+        work_items = self.num_heads * (SUMMARY_DIM // self.BN) * segments
+        return (cutlass.min(Int32(sm_count), work_items), 1, 1)
 
 
 @jit_cache
 def _compile_affine_summary_rev(
     dtype_name: str,
     heads: int,
-    state_tile_width: int,
     use_int64_offsets: bool,
 ):
-    """Compile one reverse-summary dtype/head/tile specialization."""
+    """Compile one reverse-summary dtype/head specialization."""
     target = get_compile_target()
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
         raise ValueError(f"affine_summary_rev requires an SM100/SM103 target; got {target}")
@@ -1341,15 +1374,14 @@ def _compile_affine_summary_rev(
     io_dtype = _CUTE_IO_TYPES[dtype_name]
     out = make_fake_compact_tensor(
         Float32,
-        (heads, SUMMARY_DIM, KEY_DIM),
-        stride_order=(2, 1, 0),
+        (sym_int(), heads, SUMMARY_DIM, KEY_DIM),
+        stride_order=(3, 2, 1, 0),
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
         BlackwellDeltaAffineSummaryRev(
             heads,
             io_dtype,
-            state_tile_width,
             use_int64_offsets,
         ),
         factor(io_dtype, KEY_DIM),
@@ -1360,6 +1392,7 @@ def _compile_affine_summary_rev(
         factor(Float32, KEY_DIM),
         out,
         Float32(1.0),
+        Int32(1),
     )
 
 
@@ -1418,11 +1451,6 @@ def build_state_grad_summary(
         f"cumulative_gate must be fp32, got {cumulative_gate.dtype}"
     )
 
-    out = torch.empty(
-        (heads, SUMMARY_DIM, KEY_DIM),
-        dtype=torch.float32,
-        device=qg.device,
-    )
     if isinstance(qg, FakeTensor):
         raise TypeError(
             "build_state_grad_summary does not support torch.export; run the context-parallel "
@@ -1466,6 +1494,7 @@ def build_state_grad_summary(
             launch_affine_summary_rev,
         )
 
+        out = torch.empty((heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device)
         launch_affine_summary_rev(
             qg,
             kg,
@@ -1482,12 +1511,16 @@ def build_state_grad_summary(
     qg, kg, w, dout, Aqk, cumulative_gate = (
         _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
     )
-    use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, out)
-
-    state_tile_width = select_summary_tile_width(heads, qg.device)
-    compiled = _compile_affine_summary_rev(
-        _IO_TYPE_NAMES[qg.dtype], heads, state_tile_width, use_int64_offsets
+    segments, chunks_per_segment = plan_segments(
+        qg.shape[1] // BT,
+        heads * (SUMMARY_DIM // BlackwellDeltaAffineSummaryRev.BN),
+        get_device_properties(qg.device).multi_processor_count,
     )
+    segment_out = torch.empty(
+        (segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
+    )
+    use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, segment_out)
+    compiled = _compile_affine_summary_rev(_IO_TYPE_NAMES[qg.dtype], heads, use_int64_offsets)
     compiled(
         qg.detach(),
         kg.detach(),
@@ -1495,7 +1528,11 @@ def build_state_grad_summary(
         dout.detach(),
         Aqk.detach(),
         cumulative_gate.detach(),
-        out,
+        segment_out,
         Float32(scale),
+        chunks_per_segment,
     )
-    return out
+    if segments == 1:
+        return segment_out[0]
+    # The cotangent flows through the last segment first.
+    return compose_segment_summaries(segment_out.flip(0))
