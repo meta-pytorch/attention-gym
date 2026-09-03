@@ -134,11 +134,11 @@ ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMS  # sort capacity (32 KB SMEM); past
 #   state; a rejected boundary just extends the open item, so a gate that never forgets yields the
 #   single uncut item, i.e. the serial kernel.
 #
-# This is a margin of bits past the output dtype's half-ulp. A rounding can flip only where
-# |H_window| < 2^-margin * |H_before| elementwise:
+# This is a margin of bits past the output dtype's relative half-ulp. A rounding can flip only
+# where |H_window| < 2^-margin * |H_before| elementwise:
 #     e^-10 = 2^-14.4
-#     bf16 half-ulp 2^-9  -> 5.4-bit margin
-#     fp16 half-ulp 2^-12 -> 2.4-bit margin
+#     bf16 half-ulp 2^-8  -> 6.4-bit margin
+#     fp16 half-ulp 2^-11 -> 3.4-bit margin
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
 

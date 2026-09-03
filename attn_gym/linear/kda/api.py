@@ -119,7 +119,7 @@ def chunk_kda(
         per logical sequence or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
+    options = resolve_kernel_options(kernel_options)
     if selected_impl is Impl.REFERENCE:
         if fastmath:
             raise ValueError("fastmath applies only to impl='fused'")
@@ -138,7 +138,7 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if backend == "mega":
+        if options.backend == "mega":
             return _mega_chunk_forward(
                 q,
                 k,
@@ -151,8 +151,8 @@ def chunk_kda(
                 output_final_state=output_final_state,
                 fastmath=fastmath,
                 autotune=autotune,
-                split_backward=split_backward,
-                split_forward=split_forward,
+                split_backward=options.split_backward,
+                split_forward=options.split_forward,
             )
         return _fused_chunk_forward(
             q,
@@ -218,8 +218,8 @@ def paged_chunk_kda(
         autotune: For the repo-local fused backend, benchmark candidate kernel
             configurations when true; Mega uses its fixed schedule.
         kernel_options: Backend-specific options. ``{"backend": "mega"}`` selects
-            the optional CuTeDSL 4.7 Mega backend. ``split_backward`` is not applicable
-            to this inference-only operation.
+            the optional CuTeDSL 4.7 Mega backend. ``split_backward`` and
+            ``split_forward`` are not supported by this paged operation.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -243,10 +243,10 @@ def paged_chunk_kda(
         state_indices,
         has_initial_state=has_initial_state,
     )
-    backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
-    if split_backward or split_forward:
+    options = resolve_kernel_options(kernel_options)
+    if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
-    if backend == "mega":
+    if options.backend == "mega":
         return _mega_paged_chunk_forward(
             q,
             k,
