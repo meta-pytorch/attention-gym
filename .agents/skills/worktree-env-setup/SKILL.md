@@ -48,9 +48,16 @@ another worktree or a shared `~/.venvs/*` env for attn_gym imports.
 ## Verifying isolation
 
 ```bash
-python -c "import attn_gym; print(attn_gym.__file__)"
+cd /tmp && python -c "import attn_gym; print(attn_gym.__file__)"
 ```
 
 The printed path must be inside the current worktree. If it points at another
 checkout, the editable install is wrong — rerun the `-e '.[tests,linear,dev]'`
 install from this worktree root.
+
+Run the check from outside the repo root. From the root, `python -c` puts the
+current directory first on `sys.path` and masks a wrong editable install, while
+`python agent_space/script.py` and `pytest` (whose `test/` has no `__init__.py`)
+put the *script* directory first and silently import the other checkout. A
+`.venv` symlinked to another worktree's env fails exactly this way: edits appear
+to have no effect because the kernels compile from the other tree.
