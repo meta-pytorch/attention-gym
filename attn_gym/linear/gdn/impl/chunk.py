@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from attn_gym._backends.cute import (
@@ -63,6 +65,59 @@ def reject_int64_offsets(*tensors: torch.Tensor | None) -> None:
         raise ValueError("fused chunk_gdn does not yet support int64 tensor offsets")
 
 
+class ChunkGDNFactors(NamedTuple):
+    """Local WY factors shared by context-parallel state summaries and output composition."""
+
+    w: torch.Tensor
+    u: torch.Tensor
+    kg: torch.Tensor
+    inverse: torch.Tensor
+
+
+def _prepare_chunk_gdn_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    metadata: RaggedChunkMetadata | None,
+) -> ChunkGDNFactors:
+    """Run the intra-chunk factorization on already normalized inputs."""
+    if metadata is None:
+        return ChunkGDNFactors(*chunk_gdn_fwd_intra_dense(k, v, cumulative_gate, beta))
+    return ChunkGDNFactors(*chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata))
+
+
+def _finish_chunk_gdn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    factors: ChunkGDNFactors,
+    cumulative_gate: torch.Tensor,
+    initial_state: torch.Tensor,
+    metadata: RaggedChunkMetadata | None,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the state recurrence and output composition from prepared factors."""
+    if metadata is None:
+        h, v_new, final_state = chunk_gdn_fwd_recurrence_dense(
+            factors.kg, factors.w, factors.u, cumulative_gate, initial_state
+        )
+        output = chunk_gdn_fwd_output_dense(q, k, v_new, h, cumulative_gate, scale)
+    else:
+        h, v_new, final_state = chunk_gdn_fwd_recurrence_packed(
+            factors.kg, factors.w, factors.u, cumulative_gate, initial_state, metadata
+        )
+        output = chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
+    return output, final_state
+
+
+def zero_state(
+    q: torch.Tensor, v: torch.Tensor, metadata: RaggedChunkMetadata | None
+) -> torch.Tensor:
+    """FP32 ``[N, HV, V, K]`` zeros, one per packed sequence (per batch row when dense)."""
+    sequences = q.shape[0] if metadata is None else metadata.cu_seqlens.shape[0] - 1
+    return q.new_zeros(sequences, v.shape[2], v.shape[-1], q.shape[-1], dtype=torch.float32)
+
+
 def chunk_gdn_fwd_dense(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,30 +138,18 @@ def chunk_gdn_fwd_dense(
     if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
         raise ValueError("cumulative_gate and beta must have shape [B,T,H]")
     if initial_state is None:
-        initial_state = torch.zeros(
-            batch,
-            value_heads,
-            value_dim,
-            key_dim,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        initial_state = zero_state(q, v, None)
     reject_int64_offsets(q, k, v, cumulative_gate, beta, initial_state)
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     cumulative_gate, beta, initial_state = (
         normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta, initial_state)
     )
 
-    w, u, restored_k, inverse = chunk_gdn_fwd_intra_dense(k, v, cumulative_gate, beta)
-    h, v_new, final_state = chunk_gdn_fwd_recurrence_dense(
-        restored_k,
-        w,
-        u,
-        cumulative_gate,
-        initial_state,
+    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, None)
+    output, final_state = _finish_chunk_gdn_fwd(
+        q, k, factors, cumulative_gate, initial_state, None, scale
     )
-    output = chunk_gdn_fwd_output_dense(q, k, v_new, h, cumulative_gate, scale)
-    return output, final_state, inverse
+    return output, final_state, factors.inverse
 
 
 def _gdn_chunk_fwd_cuda(
@@ -152,37 +195,23 @@ def chunk_gdn_fwd_packed(
     validate_supported_device(q)
     batch, _tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
-    num_sequences = metadata.cu_seqlens.shape[0] - 1
     if batch != 1 or (key_dim, value_dim) != (128, 128):
         raise ValueError("packed fused chunk GDN requires B=1 and K=V=128")
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("packed fused chunk GDN requires matching Q/K and H % HK == 0")
     if initial_state is None:
-        initial_state = torch.zeros(
-            num_sequences,
-            value_heads,
-            value_dim,
-            key_dim,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        initial_state = zero_state(q, v, metadata)
     reject_int64_offsets(q, k, v, cumulative_gate, beta, initial_state)
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     cumulative_gate, beta, initial_state = (
         normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta, initial_state)
     )
 
-    w, u, restored_k, inverse = chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata)
-    h, v_new, final_state = chunk_gdn_fwd_recurrence_packed(
-        restored_k,
-        w,
-        u,
-        cumulative_gate,
-        initial_state,
-        metadata,
+    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata)
+    output, final_state = _finish_chunk_gdn_fwd(
+        q, k, factors, cumulative_gate, initial_state, metadata, scale
     )
-    output = chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
-    return output, final_state, inverse
+    return output, final_state, factors.inverse
 
 
 def _gdn_chunk_fwd_packed_cuda(
@@ -278,6 +307,40 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     return chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
 
 
+class ChunkGDNBwdPrepared(NamedTuple):
+    """Recomputed local tensors shared across the context-parallel backward boundary."""
+
+    w: torch.Tensor
+    qg: torch.Tensor
+    kg: torch.Tensor
+    h: torch.Tensor
+    v_new: torch.Tensor
+
+
+def _prepare_chunk_gdn_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    inverse: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    metadata: RaggedChunkMetadata | None,
+) -> ChunkGDNBwdPrepared:
+    """Recompute local factors and forward state on normalized inputs before communication."""
+    recurrence_state = zero_state(q, v, metadata) if initial_state is None else initial_state
+    w, u, qg, kg = chunk_gdn_recompute_w_u_qg_kg(q, k, v, cumulative_gate, beta, inverse, metadata)
+    if metadata is None:
+        h, v_new, _final_state = chunk_gdn_fwd_recurrence_dense(
+            kg, w, u, cumulative_gate, recurrence_state
+        )
+    else:
+        h, v_new, _final_state = chunk_gdn_fwd_recurrence_packed(
+            kg, w, u, cumulative_gate, recurrence_state, metadata
+        )
+    return ChunkGDNBwdPrepared(w, qg, kg, h, v_new)
+
+
 def chunk_gdn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -312,28 +375,41 @@ def chunk_gdn_bwd(
         d_final_state = normalize_compact_tensor(d_final_state)
     if initial_state is not None:
         initial_state = normalize_compact_tensor(initial_state)
+    prepared = _prepare_chunk_gdn_bwd(
+        q, k, v, cumulative_gate, beta, inverse, initial_state, metadata
+    )
+    return _finish_chunk_gdn_bwd(
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        inverse,
+        d_output,
+        d_final_state,
+        initial_state,
+        metadata,
+        prepared,
+        scale,
+    )
 
-    state_batch = q.shape[0] if metadata is None else metadata.cu_seqlens.shape[0] - 1
-    recurrence_state = initial_state
-    if recurrence_state is None:
-        recurrence_state = torch.zeros(
-            state_batch,
-            v.shape[2],
-            v.shape[-1],
-            q.shape[-1],
-            dtype=torch.float32,
-            device=q.device,
-        )
-    w, u, qg, kg = chunk_gdn_recompute_w_u_qg_kg(q, k, v, cumulative_gate, beta, inverse, metadata)
-    if metadata is None:
-        h, v_new, _final_state = chunk_gdn_fwd_recurrence_dense(
-            kg, w, u, cumulative_gate, recurrence_state
-        )
-    else:
-        h, v_new, _final_state = chunk_gdn_fwd_recurrence_packed(
-            kg, w, u, cumulative_gate, recurrence_state, metadata
-        )
 
+def _finish_chunk_gdn_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    beta: torch.Tensor,
+    inverse: torch.Tensor,
+    d_output: torch.Tensor,
+    d_final_state: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    metadata: RaggedChunkMetadata | None,
+    prepared: ChunkGDNBwdPrepared,
+    scale: float,
+) -> tuple[torch.Tensor, ...]:
+    """Finish the local gradients from recomputed factors and the exit-state cotangent."""
+    w, qg, kg, h, v_new = prepared
     if not use_blackwell_backward(q):
         dh, d_initial_state, dv = chunk_gdn_bwd_delta_h(
             q,

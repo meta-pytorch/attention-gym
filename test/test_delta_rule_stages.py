@@ -1,4 +1,4 @@
-"""Staged delta-rule primitives: ``prepare`` / ``run`` / state summaries against the public ops."""
+"""Staged KDA/GDN primitives: ``prepare`` / ``run`` / state summaries against the public ops."""
 
 from __future__ import annotations
 
@@ -11,9 +11,12 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear.gdn import chunk_gdn
+from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 from attn_gym.linear.kda import chunk_kda
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.state_summary import compose_summaries, merge_state, neutral_summary
+from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     assert_relative_rms_within,
@@ -55,6 +58,12 @@ def kda_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtyp
     )
 
 
+def gdn_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtype) -> Inputs:
+    return make_gdn_test_inputs(
+        tokens, key_heads=key_heads, value_heads=value_heads, seed=seed, dtype=dtype
+    )[:5]
+
+
 KDA = Op(
     chunk_kda,
     partial(chunk_kda, impl="reference"),
@@ -64,7 +73,23 @@ KDA = Op(
     key_heads=2,
     value_heads=2,
 )
-op_param = pytest.mark.parametrize("op", [pytest.param(KDA, id="kda")])
+GDN = Op(
+    partial(chunk_gdn, impl="fused"),
+    partial(chunk_gdn, impl="reference"),
+    chunk_gdn_prepare,
+    chunk_gdn_prepare_backward,
+    gdn_inputs,
+    key_heads=2,
+    value_heads=2,
+)
+op_param = pytest.mark.parametrize(
+    "op",
+    [
+        pytest.param(KDA, id="kda"),
+        pytest.param(GDN, id="gdn"),
+        pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
+    ],
+)
 
 
 def test_summary_algebra_composes_like_sequential_merges():
