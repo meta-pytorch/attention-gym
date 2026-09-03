@@ -200,19 +200,6 @@ def chunk_delta_rule_fwd_mega(
     return output
 
 
-def chunk_delta_rule_fwd_mega_unsplit(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """Run an unsplit packed forward without recurrent state."""
-    return chunk_delta_rule_fwd_mega(q, k, value, gate, beta, cu_seqlens, scale)
-
-
 def chunk_delta_rule_fwd_mega_unsplit_with_initial_state(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -266,7 +253,6 @@ def chunk_delta_rule_fwd_mega_unsplit_with_state(
 
 __all__ = [
     "chunk_delta_rule_fwd_mega",
-    "chunk_delta_rule_fwd_mega_unsplit",
     "chunk_delta_rule_fwd_mega_unsplit_with_initial_state",
     "chunk_delta_rule_fwd_mega_unsplit_with_state",
 ]
