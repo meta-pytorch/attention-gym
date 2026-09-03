@@ -152,7 +152,8 @@ def chunk_gdn_bwd_dqkwg_kernel(
             other=0.0,
         )
 
-        b_dg_last += tl.sum(b_h.to(b_dh.dtype) * b_dh)
+        # Accumulate the state term of dGate in FP32 rather than the source dtype.
+        b_dg_last += tl.sum(b_h.to(tl.float32) * b_dh.to(tl.float32))
         b_ds += tl.dot(b_do, tl.trans(b_v_new))
         b_dq += tl.dot(b_do, b_h)
         b_dk += tl.dot(b_v_new.to(b_dh.dtype), b_dh)
