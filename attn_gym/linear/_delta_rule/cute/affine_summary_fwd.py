@@ -255,7 +255,7 @@ class _AffineSummaryFwdOp:
 
         # --- SMEM staged layouts ---
         # A operands ride their TMA rings; B operands hold hi/lo halves of the
-        # fp32-valued state and Tmp tiles (2 "stages" = the two MMA passes).
+        # fp32-valued state and Tmp tiles, one pipeline stage per half.
         s_w_staged = sm100_utils.make_smem_layout_a(
             mma_wx,
             self.wx_tile,
@@ -347,8 +347,8 @@ class _AffineSummaryFwdOp:
             bar_kg: cute.struct.MemRange[Int64, self.kg_depth * 2]
             bar_u: cute.struct.MemRange[Int64, self.u_depth * 2]
             bar_gk: cute.struct.MemRange[Int64, self.gk_depth * 2]
-            bar_xb: cute.struct.MemRange[Int64, 1 * 2]
-            bar_tmpb: cute.struct.MemRange[Int64, 1 * 2]
+            bar_xb: cute.struct.MemRange[Int64, 2 * 2]
+            bar_tmpb: cute.struct.MemRange[Int64, 2 * 2]
             bar_wx: cute.struct.MemRange[Int64, 1 * 2]
             bar_kt: cute.struct.MemRange[Int64, 1 * 2]
             tmem_buf: Int32
@@ -520,26 +520,27 @@ class _AffineSummaryFwdOp:
                 uh.release()
 
             # --- MMA1: w(SMEM A) × X snapshot(SMEM B) → wx(TMEM) ---
-            xbh = pxb_C.wait_and_advance()
             wh = pw_C.wait_and_advance()
             wxd = pwx_P.acquire_and_advance()
             for split in cutlass.range_constexpr(2):
+                # Each hi/lo half is one pipeline stage, published separately.
+                xbh = pxb_C.wait_and_advance()
                 for kp in cutlass.range_constexpr(cute.size(t_w_a, mode=[2])):
                     mma_wx.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(split != 0 or kp != 0))
                     cute.gemm(
                         mma_wx,
                         t_wx_acc[None, None, None, wxd.index],
                         t_w_a[None, None, kp, wh.index],
-                        t_xb_b[None, None, kp, split],
+                        t_xb_b[None, None, kp, xbh.index],
                         t_wx_acc[None, None, None, wxd.index],
                     )
+                xbh.release()
             wxd.commit()
             wh.release()
-            xbh.release()
 
             # --- MMA2b: kg^T(SMEM A) × -wx hi/lo(SMEM B) → kt(TMEM) ---
-            tmpbh = ptmpb_C.wait_and_advance()
             for split in cutlass.range_constexpr(2):
+                tmpbh = ptmpb_C.wait_and_advance()
                 for kp in cutlass.range_constexpr(cute.size(t_kg_a, mode=[2])):
                     # The first pass overwrites unless MMA2a already seeded kt.
                     first = split == 0 and kp == 0
@@ -548,12 +549,12 @@ class _AffineSummaryFwdOp:
                         mma_kt,
                         t_kt_acc[None, None, None, ktd.index],
                         t_kg_a[None, None, kp, kgh.index],
-                        t_tmpb_b[None, None, kp, split],
+                        t_tmpb_b[None, None, kp, tmpbh.index],
                         t_kt_acc[None, None, None, ktd.index],
                     )
+                tmpbh.release()
             ktd.commit()
             kgh.release()
-            tmpbh.release()
 
     @cute.jit
     def run_state(
@@ -632,20 +633,25 @@ class _AffineSummaryFwdOp:
 
         for _ct in cutlass.range(0, num_chunks, unroll=0):
             # ---- Phase 1: R2S X hi/lo → sXb (B operand for MMA1) ----
+            # Publish the hi half as soon as it exists so MMA1 starts its first
+            # pass while the lo residual is still being formed and stored.
             xbh = pxb_P.acquire_and_advance()
             st_hi = cute.make_rmem_tensor(st.shape, self.io_type)
             st_hi.store(st.load().to(self.io_type))
+            cute.copy(
+                tc_r2s_xb,
+                tc_r2s_xb.retile(st_hi),
+                thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            xbh.commit()
+            xbh = pxb_P.acquire_and_advance()
             st_lo = cute.make_rmem_tensor(st.shape, self.io_type)
             st_lo.store((st.load() - st_hi.load().to(Float32)).to(self.io_type))
             cute.copy(
                 tc_r2s_xb,
-                tc_r2s_xb.retile(st_hi),
-                thr_r2s_xb.partition_D(sXb_store[(None, None, 0)]),
-            )
-            cute.copy(
-                tc_r2s_xb,
                 tc_r2s_xb.retile(st_lo),
-                thr_r2s_xb.partition_D(sXb_store[(None, None, 1)]),
+                thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
             )
             cute.arch.fence_proxy("async.shared", space="cta")
             xbh.commit()
@@ -664,17 +670,20 @@ class _AffineSummaryFwdOp:
                 tmp[ei] = Float32(0.0) - wx_reg[ei]
             tmp_hi = cute.make_rmem_tensor(tmp.shape, self.io_type)
             tmp_hi.store(tmp.load().to(self.io_type))
+            cute.copy(
+                tc_r2s_tmpb,
+                tc_r2s_tmpb.retile(tmp_hi),
+                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            tmpbh.commit()
+            tmpbh = ptmpb_P.acquire_and_advance()
             tmp_lo = cute.make_rmem_tensor(tmp.shape, self.io_type)
             tmp_lo.store((tmp.load() - tmp_hi.load().to(Float32)).to(self.io_type))
             cute.copy(
                 tc_r2s_tmpb,
-                tc_r2s_tmpb.retile(tmp_hi),
-                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, 0)]),
-            )
-            cute.copy(
-                tc_r2s_tmpb,
                 tc_r2s_tmpb.retile(tmp_lo),
-                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, 1)]),
+                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
             )
             cute.arch.fence_proxy("async.shared", space="cta")
             tmpbh.commit()
@@ -785,17 +794,17 @@ class _AffineSummaryFwdOp:
             barrier_storage=sm.bar_gk.data_ptr(),
         ).make_participants()
 
-        # X snapshot → MMA1 (AsyncUmma, 1 stage covering both hi/lo halves)
+        # X snapshot → MMA1 (AsyncUmma, one stage per hi/lo half)
         pxb_P, pxb_C = pipeline.PipelineAsyncUmma.create(
-            num_stages=1,
+            num_stages=2,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             barrier_storage=sm.bar_xb.data_ptr(),
         ).make_participants()
 
-        # Tmp → MMA2 (AsyncUmma, 1 stage covering both hi/lo halves)
+        # Tmp → MMA2 (AsyncUmma, one stage per hi/lo half)
         ptmpb_P, ptmpb_C = pipeline.PipelineAsyncUmma.create(
-            num_stages=1,
+            num_stages=2,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             barrier_storage=sm.bar_tmpb.data_ptr(),

@@ -10,6 +10,11 @@ Each program keeps one FP32 ``[128, BN]`` augmented-state tile resident while
 scanning complete BT64 chunks backward. Raw compact-layout pointers avoid host
 tensor descriptors, allocations, and synchronization in the launch path, so a
 warmed specialization can be captured directly by a CUDA Graph.
+
+The fp32-valued ``tl.dot`` operands (state and corrected write gradient) are
+split into hi/lo halves of the I/O dtype and accumulated in two passes, exactly
+as the forward summary treats its state and residual, so the reverse transition
+is the transpose of the map the forward summary actually evaluates.
 """
 
 from __future__ import annotations
@@ -79,7 +84,10 @@ def affine_summary_rev_kernel(
             (H * K, K, 1),
         )
         kg_tile = tl.load(kg + token_key_offset)
-        corrected = tl.dot(kg_tile, state.to(kg_tile.dtype))
+        state_hi = state.to(kg_tile.dtype)
+        state_lo = (state - state_hi.to(tl.float32)).to(kg_tile.dtype)
+        corrected = tl.dot(kg_tile, state_hi)
+        corrected = tl.dot(kg_tile, state_lo, acc=corrected)
 
         dout_tile = tl.load(
             dout
@@ -108,7 +116,10 @@ def affine_summary_rev_kernel(
         qg_tile = tl.load(qg + token_key_offset)
         state += tl.dot(tl.trans(qg_tile), dout_tile) * scale
         w_tile = tl.load(w + token_key_offset)
-        state -= tl.dot(tl.trans(w_tile), corrected.to(w_tile.dtype))
+        corrected_hi = corrected.to(w_tile.dtype)
+        corrected_lo = (corrected - corrected_hi.to(tl.float32)).to(w_tile.dtype)
+        state -= tl.dot(tl.trans(w_tile), corrected_hi)
+        state -= tl.dot(tl.trans(w_tile), corrected_lo)
 
     out_offset = ptr_offset(
         (head, column[None, :], key[:, None]),
