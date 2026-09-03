@@ -48,6 +48,12 @@ python attn_gym/masks/causal.py
 
 ## Development
 
+Every worktree needs its own `.venv` with an editable install of *this* checkout (see the
+`worktree-env-setup` skill; `uv` hard-links wheels, so it takes seconds). Never symlink or
+reuse a sibling worktree's `.venv`: its editable install resolves `attn_gym` to the other
+checkout, so scripts and pytest silently run the wrong sources. `test/conftest.py` refuses to
+start when that happens.
+
 ```bash
 pytest -n 6                     # run tests in parallel (strongly preferred)
 pytest -n 6 test/test_kda.py    # one file, same parallelism

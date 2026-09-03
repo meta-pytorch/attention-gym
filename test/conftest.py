@@ -1,9 +1,26 @@
 """Shared pytest fixtures."""
 
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 import torch
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Refuse to test one checkout's sources through another worktree's editable install."""
+    import attn_gym
+
+    package_root = Path(attn_gym.__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parent.parent
+    if package_root == repo_root or "site-packages" in package_root.parts:
+        return
+    raise pytest.UsageError(
+        f"attn_gym imports from {package_root}, not this checkout {repo_root}. The active "
+        "environment's editable install (or a `.venv` symlinked to another worktree) points at "
+        "a sibling checkout; follow .agents/skills/worktree-env-setup/SKILL.md to create this "
+        "worktree's own .venv."
+    )
 
 
 @pytest.fixture
