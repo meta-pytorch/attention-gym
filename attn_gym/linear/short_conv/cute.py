@@ -57,6 +57,7 @@ SHORT_CONV_DTYPES = {
 }
 
 
+_MINIMUM_TMA_CAPABILITY = (9, 0)
 _PERSISTENT_TMA_DX_CTAS_PER_SM = 8
 
 
@@ -2706,14 +2707,16 @@ def supports_tma(
     selected_config: ShortConvConfig | None,
     channels: int,
     width: int,
+    capability: tuple[int, int],
 ) -> bool:
-    """Return whether the TMA gradient kernels support this static schedule.
+    """Return whether the target and static schedule support a TMA gradient kernel.
 
     TMA zero-fills out-of-bounds token rows, so any token count works; only the
-    schedule's channel and stage divisibility matter.
+    target capability and schedule's channel and stage divisibility matter.
     """
     return (
-        config == selected_config
+        capability >= _MINIMUM_TMA_CAPABILITY
+        and config == selected_config
         and width > 1
         and channels % (config.threads * config.channels_per_thread) == 0
         and config.times_per_block % operation_type.tma_stage_tokens == 0
@@ -2726,6 +2729,7 @@ def _input_gradient_uses_tma(
     num_sequences: int | None,
     channels: int,
     width: int,
+    capability: tuple[int, int],
 ) -> bool:
     """Return whether this specialization uses the staged input-gradient kernel."""
     return supports_tma(
@@ -2736,6 +2740,7 @@ def _input_gradient_uses_tma(
         else tuned_config(dtype, packed=num_sequences is not None).input_gradient,
         channels,
         width,
+        capability,
     )
 
 
@@ -2750,12 +2755,20 @@ def _compile_input_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    capability: tuple[int, int],
     time_workers: int = 0,
     use_int64_offsets: bool = False,
 ):
     """Compile one static or explicitly persistent TMA input-gradient specialization."""
     derivative = activation.derivative
-    use_tma = _input_gradient_uses_tma(dtype, config, num_sequences, channels, width)
+    use_tma = _input_gradient_uses_tma(
+        dtype,
+        config,
+        num_sequences,
+        channels,
+        width,
+        capability,
+    )
     if time_workers:
         assert use_tma and num_sequences is not None, (
             "persistent input-gradient scheduling requires a packed TMA specialization"
@@ -2812,6 +2825,7 @@ def _compile_weight_gradient(
     num_sequences: int | None,
     has_initial_state: bool,
     activation: Activation,
+    capability: tuple[int, int],
     use_int64_offsets: bool = False,
 ):
     """Compile one static weight-gradient specialization."""
@@ -2829,6 +2843,7 @@ def _compile_weight_gradient(
         tuned_config(dtype, packed=num_sequences is not None).weight_gradient,
         channels,
         width,
+        capability,
     )
     operation_type = (
         CausalConv1dSiluWeightGradientPartialsTma
@@ -3104,6 +3119,8 @@ def _launch_backward(
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
     num_sequences = None if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    properties = get_device_properties(x.device)
+    capability = (properties.major, properties.minor)
     input_time_workers = 0
     if persistent_tma_input_gradient:
         if num_sequences is None or not _input_gradient_uses_tma(
@@ -3112,6 +3129,7 @@ def _launch_backward(
             num_sequences,
             channels,
             width,
+            capability,
         ):
             raise ValueError(
                 "persistent TMA input gradients require a packed staged specialization"
@@ -3129,6 +3147,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        capability,
         input_time_workers,
         requires_int64_abi(x, grad_output, grad_x),
     )(
@@ -3162,6 +3181,7 @@ def _launch_backward(
         num_sequences,
         initial_state is not None,
         resolved_activation,
+        capability,
         requires_int64_abi(x, grad_output),
     )(
         x.view(batches * tokens, channels),
@@ -4402,12 +4422,18 @@ def causal_conv1d(
         if cu_seqlens is None:
             raise ValueError("persistent TMA input gradients require packed cu_seqlens")
         descriptor = SHORT_CONV_DTYPES[x.dtype]
+        # The opaque backward launcher validates the physical capability at execution time.
+        capability = _MINIMUM_TMA_CAPABILITY
+        if not torch.compiler.is_compiling():
+            properties = get_device_properties(x.device)
+            capability = (properties.major, properties.minor)
         if not _input_gradient_uses_tma(
             descriptor,
             input_grad,
             cu_seqlens.shape[0] - 1,
             channels,
             weight.shape[1],
+            capability,
         ):
             raise ValueError(
                 "persistent TMA input gradients require the staged input-gradient specialization"
