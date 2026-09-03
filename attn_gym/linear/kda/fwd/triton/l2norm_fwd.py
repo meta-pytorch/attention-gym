@@ -165,12 +165,12 @@ def _l2norm_fwd_fake(
 
 torch.library.define(
     "attn_gym::kda_l2norm_bwd",
-    "(Tensor output, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None) -> Tensor",
+    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None) -> Tensor",
 )
 
 
 def _l2norm_bwd_cuda(
-    output: torch.Tensor,
+    x: torch.Tensor,
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
@@ -178,19 +178,19 @@ def _l2norm_bwd_cuda(
     """Launch L2Norm backward behind the same opaque stride boundary."""
     from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 
-    rows, head_dim = output.shape
-    _, tokens, heads, _ = d_output.shape
-    d_input = torch.empty_like(output)
+    _, tokens, heads, head_dim = x.shape
+    rows = x.numel() // head_dim
+    d_input = torch.empty(rows, head_dim, dtype=x.dtype, device=x.device)
     block_dim = triton.next_power_of_2(head_dim)
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     l2norm_bwd_kernel[grid](
-        output,
+        x,
         rstd,
         d_output,
         d_input,
         rows,
         cu_seqlens,
-        Y_STRIDES=output.stride(),
+        X_STRIDES=x.stride(),
         RSTD_STRIDES=rstd.stride(),
         DY_STRIDES=d_output.stride(),
         DX_STRIDES=d_input.stride(),
@@ -202,7 +202,7 @@ def _l2norm_bwd_cuda(
         NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         IS_VARLEN=cu_seqlens is not None,
     )
-    return d_input
+    return d_input.view_as(x)
 
 
 torch.library.impl("attn_gym::kda_l2norm_bwd", "CUDA", _l2norm_bwd_cuda)
@@ -210,14 +210,14 @@ torch.library.impl("attn_gym::kda_l2norm_bwd", "CUDA", _l2norm_bwd_cuda)
 
 @torch.library.register_fake("attn_gym::kda_l2norm_bwd")
 def _l2norm_bwd_fake(
-    output: torch.Tensor,
+    x: torch.Tensor,
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Describe input-gradient metadata without reading the packed endpoint."""
     del rstd, d_output, cu_seqlens
-    return torch.empty_like(output)
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
 
 
 _l2norm_fwd_op = torch.ops.attn_gym.kda_l2norm_fwd.default
@@ -233,22 +233,20 @@ class _L2Norm(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
         output, rstd = _l2norm_fwd_op(x, eps, cu_seqlens)
-        output_2d = output.view(-1, x.shape[-1])
+        # Save the exact x, not the rounded output; see the numerics note in l2norm_bwd.py.
         if cu_seqlens is None:
-            ctx.save_for_backward(output_2d, rstd)
+            ctx.save_for_backward(x, rstd)
         else:
-            ctx.save_for_backward(output_2d, rstd, cu_seqlens)
-        ctx.input_shape = x.shape
+            ctx.save_for_backward(x, rstd, cu_seqlens)
         ctx.is_ragged = cu_seqlens is not None
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_output: torch.Tensor):
-        output, rstd, *metadata = ctx.saved_tensors
+        x, rstd, *metadata = ctx.saved_tensors
         cu_seqlens = metadata[0] if ctx.is_ragged else None
-        d_input = _l2norm_bwd_op(output, rstd, d_output, cu_seqlens)
-        return d_input.view(ctx.input_shape), None, None
+        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens), None, None
 
 
 def l2norm(
