@@ -33,9 +33,10 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_rows
+from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
-from attn_gym.linear._delta_rule.validation import check_summary_range, resolve_scale
+from attn_gym.linear._delta_rule.span import CHUNK_SIZE, prepare_span
+from attn_gym.linear._delta_rule.validation import check_summary_range
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     ChunkKDABwdPrepared,
     _finish_chunk_kda_bwd,
@@ -44,7 +45,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
 from attn_gym.linear.kda.chunk_schedule import (
     RaggedChunkMetadata,
     chunk_capacity,
-    prepare_ragged_chunk_metadata,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     ChunkKDAFactors,
@@ -55,7 +55,6 @@ from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
 from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.linear.kda.validation import validate_kda_inputs
 
-CHUNK_SIZE = 64
 """Token block of the fused kernels; see NOTE [Summary ranges are whole chunks of one subsequence]
 below."""
 
@@ -193,22 +192,9 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
-    if q.shape[0] != 1:
-        raise ValueError("chunk_kda_prepare requires B=1; pack sequences with cu_seqlens")
-    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
-    tokens = q.shape[1]
-    if cu_seqlens is None and tokens % CHUNK_SIZE:
-        # A partial tail runs as one packed sequence; arange keeps the launch capture-safe.
-        cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * tokens
-    metadata = (
-        None
-        if cu_seqlens is None
-        else prepare_ragged_chunk_metadata(cu_seqlens, tokens, CHUNK_SIZE)
+    q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
+        q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
     )
-    cu_seqlens = None if metadata is None else metadata.cu_seqlens
-    chunk_offsets = None if metadata is None else metadata.chunk_offsets
-    scale = resolve_scale(scale, q.shape[-1])
-    beta = normalize_compact_tensor(beta.float())
     cumulative_gate = _plain_gate_scan_op(gate.float(), cu_seqlens, chunk_offsets, False)
     factors = _prepare_chunk_kda_fwd(
         q, k, v, cumulative_gate, beta, metadata, scale=scale, autotune=autotune

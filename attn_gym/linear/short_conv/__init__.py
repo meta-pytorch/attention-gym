@@ -8,8 +8,9 @@
 
 from __future__ import annotations
 
-import importlib
 from typing import TYPE_CHECKING
+
+from attn_gym.linear._lazy import lazy_exports
 
 # Registers the torch-only operator schemas; the CuTeDSL backend stays unimported
 # until an exported name is first resolved.
@@ -39,14 +40,4 @@ _BACKEND_EXPORTS = {
 __all__ = sorted(_BACKEND_EXPORTS)  # noqa: PLE0605 -- backend exports resolve lazily
 
 
-def __getattr__(name: str):
-    module_name = _BACKEND_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as error:
-        raise ImportError(
-            f"{name} requires the optional CuTeDSL backend: pip install attn-gym[linear]"
-        ) from error
-    return getattr(module, name)
+__getattr__ = lazy_exports(__name__, _BACKEND_EXPORTS, requirement="CuTeDSL backend")

@@ -12,8 +12,7 @@ and the naive oracles in
 ``attn_gym.linear.kda.naive`` serve ``impl="reference"``.
 """
 
-import importlib
-
+from attn_gym.linear._lazy import lazy_exports
 from attn_gym.linear.kda.api import (
     KernelOptions,
     chunk_kda,
@@ -37,24 +36,15 @@ _BACKEND_EXPORTS = {
     "chunk_kda_prepare": "attn_gym.linear.kda.stages",
     "chunk_kda_prepare_backward": "attn_gym.linear.kda.stages",
 }
-# Backward compat: these moved to attn_gym.linear.short_conv, which owns their
-# lazy resolution and error message; import them from attn_gym.linear instead.
-_SHORT_CONV_BC = {"causal_conv1d", "causal_conv1d_decode", "register_activation"}
-
-
-def __getattr__(name: str):
-    if name in _SHORT_CONV_BC:
-        return getattr(importlib.import_module("attn_gym.linear.short_conv"), name)
-    module_name = _BACKEND_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as error:
-        raise ImportError(
-            f"{name} requires the optional CUDA kernel backends: pip install attn-gym[linear]"
-        ) from error
-    return getattr(module, name)
+# Backward compat: these moved to attn_gym.linear.short_conv, whose own lazy resolution supplies
+# the error message; import them from attn_gym.linear instead.
+_SHORT_CONV_BC = {
+    name: "attn_gym.linear.short_conv"
+    for name in ("causal_conv1d", "causal_conv1d_decode", "register_activation")
+}
+__getattr__ = lazy_exports(
+    __name__, _BACKEND_EXPORTS | _SHORT_CONV_BC, requirement="CUDA kernel backends"
+)
 
 
 __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
