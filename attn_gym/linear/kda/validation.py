@@ -13,22 +13,30 @@ here once; implementation-specific constraints stay with the implementation.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward"})
+_KERNEL_OPTION_NAMES = frozenset({"backend", "split_backward", "split_forward"})
+
+
+class ResolvedKernelOptions(NamedTuple):
+    """Validated ``chunk_kda`` backend selection and its Mega scheduling switches."""
+
+    backend: Literal["fused", "mega"]
+    split_backward: bool
+    split_forward: bool
 
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
-) -> tuple[Literal["fused", "mega"], bool]:
+) -> ResolvedKernelOptions:
     """Validate chunk backend options and resolve their defaults."""
     if kernel_options is None:
-        return "fused", False
+        return ResolvedKernelOptions("fused", False, False)
     unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
     if unknown:
         names = ", ".join(sorted(unknown))
@@ -36,12 +44,15 @@ def resolve_kernel_options(
     backend = kernel_options.get("backend", "fused")
     if backend not in ("fused", "mega"):
         raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
-    split_backward = kernel_options.get("split_backward", False)
-    if not isinstance(split_backward, bool):
-        raise TypeError("kernel_options['split_backward'] must be a bool")
-    if split_backward and backend != "mega":
-        raise ValueError("split_backward requires kernel_options['backend']='mega'")
-    return backend, split_backward
+    splits = {}
+    for name in ("split_backward", "split_forward"):
+        value = kernel_options.get(name, False)
+        if not isinstance(value, bool):
+            raise TypeError(f"kernel_options['{name}'] must be a bool")
+        if value and backend != "mega":
+            raise ValueError(f"{name} requires kernel_options['backend']='mega'")
+        splits[name] = value
+    return ResolvedKernelOptions(backend, splits["split_backward"], splits["split_forward"])
 
 
 def validate_kda_inputs(

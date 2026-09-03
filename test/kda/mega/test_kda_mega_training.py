@@ -586,28 +586,80 @@ def test_mega_public_packed_unsplit_local_backward_matches_exact_gradients(monke
 def test_mega_kernel_options_are_strict() -> None:
     from attn_gym.linear.kda.validation import resolve_kernel_options
 
-    assert resolve_kernel_options(None) == ("fused", False)
-    assert resolve_kernel_options({}) == ("fused", False)
-    assert resolve_kernel_options({"backend": "mega", "split_backward": True}) == ("mega", True)
+    assert resolve_kernel_options(None) == ("fused", False, False)
+    assert resolve_kernel_options({}) == ("fused", False, False)
+    assert resolve_kernel_options({"backend": "mega", "split_backward": True}) == (
+        "mega",
+        True,
+        False,
+    )
+    assert resolve_kernel_options({"backend": "mega", "split_forward": True}) == (
+        "mega",
+        False,
+        True,
+    )
     with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
         resolve_kernel_options({"unknown": True})
-    with pytest.raises(TypeError, match="must be a bool"):
-        resolve_kernel_options({"split_backward": 1})
-    with pytest.raises(ValueError, match="requires.*mega"):
-        resolve_kernel_options({"split_backward": True})
+    for name in ("split_backward", "split_forward"):
+        with pytest.raises(TypeError, match="must be a bool"):
+            resolve_kernel_options({name: 1})
+        with pytest.raises(ValueError, match="requires.*mega"):
+            resolve_kernel_options({name: True})
 
 
-def test_mega_split_backward_rejects_stateful_calls() -> None:
+@pytest.mark.parametrize("option", ["split_backward", "split_forward"])
+def test_mega_split_schedules_reject_stateful_calls(option: str) -> None:
     from attn_gym.linear import chunk_kda
 
     inputs = _make_inputs(requires_grad=False)
-    with pytest.raises(ValueError, match="split_backward currently requires a no-state call"):
+    with pytest.raises(ValueError, match=f"{option} currently requires a no-state call"):
         chunk_kda(
             *inputs[:6],
             cu_seqlens=inputs[-1],
             output_final_state=True,
-            kernel_options={"backend": "mega", "split_backward": True},
+            kernel_options={"backend": "mega", option: True},
         )
+
+
+def test_mega_split_forward_matches_exact_forward_within_horizon_budget() -> None:
+    """The forgetting-horizon forward cuts only where the gate has saturated, so on a
+    contracting gate it must match the unsplit forward to low-precision accuracy, and on a gate
+    that never forgets it must place no cuts and reproduce the unsplit result exactly."""
+    from attn_gym.linear import chunk_kda
+
+    tokens, heads = 8192, 1
+    for mode in ("contracting", "no_forgetting"):
+        torch.manual_seed(107)
+        shape = (1, tokens, heads, D)
+        q = F.normalize(torch.randn(shape, device="cuda"), dim=-1).bfloat16()
+        k = F.normalize(torch.randn(shape, device="cuda"), dim=-1).bfloat16()
+        value = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        gate = (
+            torch.empty(shape, device="cuda").uniform_(0.5, 1.0).log()
+            if mode == "contracting"
+            else torch.full(shape, -1e-5, device="cuda")
+        )
+        beta = torch.sigmoid(torch.randn(1, tokens, heads, device="cuda"))
+        unsplit, _ = chunk_kda(q, k, value, gate, beta, kernel_options={"backend": "mega"})
+        split, _ = chunk_kda(
+            q, k, value, gate, beta, kernel_options={"backend": "mega", "split_forward": True}
+        )
+        if mode == "no_forgetting":
+            torch.testing.assert_close(split, unsplit, atol=0, rtol=0)
+        else:
+            inputs = (
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                torch.empty(0, device="cuda"),
+                torch.empty(0, dtype=torch.int32, device="cuda"),
+            )
+            (high_out, _), (low_out, _), _, _ = _references(
+                inputs, initial_state=False, packed=False, output_final_state=False
+            )
+            _assert_reference(split, high_out, low_out, "split forward output", torch.bfloat16)
 
 
 def test_mega_cpu_inputs_fail_before_dispatch() -> None:
@@ -923,14 +975,14 @@ def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(
         chunk_mega_packed_fwd_op,
-        (*inputs[:5], inputs[-1], SCALE),
+        (*inputs[:5], inputs[-1], False, SCALE),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
     )
     torch.library.opcheck(
         chunk_mega_dense_training_fwd_op,
-        (*inputs[:5], dense_cu_seqlens, SCALE),
+        (*inputs[:5], dense_cu_seqlens, False, SCALE),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
@@ -957,6 +1009,7 @@ def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -
             *inputs[:5],
             backward_metadata.cu_seqlens,
             backward_metadata.chunk_offsets,
+            False,
             SCALE,
         ),
         test_utils=test_utils,
