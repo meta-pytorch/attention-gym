@@ -16,6 +16,11 @@ hold the FP32 state in registers, one warp issues TMA loads, one computes gate
 exponentials, and one issues the four UMMA operations. Bias tiles load the local
 output-gradient sources; transition tiles skip those streams entirely. Only the
 final FP32 summary is written to global memory.
+
+The fp32-valued MMA B operands (state ``X`` and the corrected write gradient
+``dv``) are split into hi/lo halves of the I/O dtype and accumulated in two UMMA
+passes, exactly as the forward summary treats ``X`` and ``wx``, so the reverse
+transition is the transpose of the map the forward summary actually evaluates.
 """
 
 # NOTE: no `from __future__ import annotations` — cute.struct requires
@@ -264,17 +269,19 @@ class BlackwellDeltaAffineSummaryRev:
             self.io_type,
             self.k_depth,
         )
+        # B operands hold hi/lo halves of the FP32 state and dv tiles; the two
+        # "stages" are the two accumulate passes of one MMA, not a pipeline ring.
         s_state = sm100_utils.make_smem_layout_b(
             mma_dv,
             self.dv_tile,
             self.io_type,
-            1,
+            2,
         )
         s_state_store = sm100_utils.make_smem_layout_epi(
             self.io_type,
             utils.LayoutEnum.COL_MAJOR,
             (self.BK, self.BN),
-            1,
+            2,
         )
         s_q = sm100_utils.make_smem_layout_a(
             mma_qdo,
@@ -298,13 +305,13 @@ class BlackwellDeltaAffineSummaryRev:
             mma_wdv,
             self.wdv_tile,
             self.io_type,
-            1,
+            2,
         )
         s_dv_store = sm100_utils.make_smem_layout_epi(
             self.io_type,
             utils.LayoutEnum.COL_MAJOR,
             (self.BT, self.BN),
-            1,
+            2,
         )
         s_aqk = sm100_utils.make_smem_layout_a(
             mma_aqdo,
@@ -561,12 +568,19 @@ class BlackwellDeltaAffineSummaryRev:
 
             for _chunk in cutlass.range(chunks, unroll=0):
                 state_handle = state_producer.acquire_and_advance()
-                state_io = cute.make_rmem_tensor(state.shape, self.io_type)
-                state_io.store(state.load().to(self.io_type))
+                state_hi = cute.make_rmem_tensor(state.shape, self.io_type)
+                state_hi.store(state.load().to(self.io_type))
+                state_lo = cute.make_rmem_tensor(state.shape, self.io_type)
+                state_lo.store((state.load() - state_hi.load().to(Float32)).to(self.io_type))
                 cute.copy(
                     r2s_state,
-                    r2s_state.retile(state_io),
+                    r2s_state.retile(state_hi),
                     r2s_state_slice.partition_D(s_state_store[(None, None, 0)]),
+                )
+                cute.copy(
+                    r2s_state,
+                    r2s_state.retile(state_lo),
+                    r2s_state_slice.partition_D(s_state_store[(None, None, 1)]),
                 )
                 cute.arch.fence_view_async_shared()
                 state_handle.commit()
@@ -582,12 +596,19 @@ class BlackwellDeltaAffineSummaryRev:
                 dv_handle.release()
 
                 dv_operand_handle = dv_operand_producer.acquire_and_advance()
-                dv_io = cute.make_rmem_tensor(dv.shape, self.io_type)
-                dv_io.store(dv.load().to(self.io_type))
+                dv_hi = cute.make_rmem_tensor(dv.shape, self.io_type)
+                dv_hi.store(dv.load().to(self.io_type))
+                dv_lo = cute.make_rmem_tensor(dv.shape, self.io_type)
+                dv_lo.store((dv.load() - dv_hi.load().to(Float32)).to(self.io_type))
                 cute.copy(
                     r2s_dv,
-                    r2s_dv.retile(dv_io),
+                    r2s_dv.retile(dv_hi),
                     r2s_dv_slice.partition_D(s_dv_store[(None, None, 0)]),
+                )
+                cute.copy(
+                    r2s_dv,
+                    r2s_dv.retile(dv_lo),
+                    r2s_dv_slice.partition_D(s_dv_store[(None, None, 1)]),
                 )
                 cute.arch.fence_view_async_shared()
                 dv_operand_handle.commit()
@@ -828,7 +849,11 @@ class BlackwellDeltaAffineSummaryRev:
         w_consumer,
         wdv_producer,
     ):
-        """Issue the four UMMA operations for each reverse chunk."""
+        """Issue the four UMMA operations for each reverse chunk.
+
+        MMA1 (``kg @ X``) and MMA4 (``w^T @ dv``) each run two accumulate passes
+        over the hi/lo halves of their fp32-valued B operand.
+        """
         cute.arch.setmaxregister_decrease(self.aux_regs)
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
 
@@ -842,15 +867,19 @@ class BlackwellDeltaAffineSummaryRev:
                 state_handle = state_consumer.wait_and_advance()
                 k_handle = k_consumer.wait_and_advance()
                 dv_handle = dv_producer.acquire_and_advance()
-                for k_block in cutlass.range(cute.size(t_k, mode=[2]), unroll_full=True):
-                    mma_dv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(k_block != 0))
-                    cute.gemm(
-                        mma_dv,
-                        t_dv_acc[None, None, None, dv_handle.index],
-                        t_k[None, None, k_block, k_handle.index],
-                        t_state[None, None, k_block, state_handle.index],
-                        t_dv_acc[None, None, None, dv_handle.index],
-                    )
+                for split in cutlass.range_constexpr(2):
+                    for k_block in cutlass.range(cute.size(t_k, mode=[2]), unroll_full=True):
+                        mma_dv.set(
+                            tcgen05.Field.ACCUMULATE,
+                            cutlass.Boolean(split != 0 or k_block != 0),
+                        )
+                        cute.gemm(
+                            mma_dv,
+                            t_dv_acc[None, None, None, dv_handle.index],
+                            t_k[None, None, k_block, k_handle.index],
+                            t_state[None, None, k_block, split],
+                            t_dv_acc[None, None, None, dv_handle.index],
+                        )
                 k_handle.release()
                 state_handle.release()
 
@@ -889,15 +918,19 @@ class BlackwellDeltaAffineSummaryRev:
                 dv_operand_handle = dv_operand_consumer.wait_and_advance()
                 w_handle = w_consumer.wait_and_advance()
                 wdv_handle = wdv_producer.acquire_and_advance()
-                for k_block in cutlass.range(cute.size(t_w, mode=[2]), unroll_full=True):
-                    mma_wdv.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(k_block != 0))
-                    cute.gemm(
-                        mma_wdv,
-                        t_wdv_acc[None, None, None, wdv_handle.index],
-                        t_w[None, None, k_block, w_handle.index],
-                        t_dv[None, None, k_block, dv_operand_handle.index],
-                        t_wdv_acc[None, None, None, wdv_handle.index],
-                    )
+                for split in cutlass.range_constexpr(2):
+                    for k_block in cutlass.range(cute.size(t_w, mode=[2]), unroll_full=True):
+                        mma_wdv.set(
+                            tcgen05.Field.ACCUMULATE,
+                            cutlass.Boolean(split != 0 or k_block != 0),
+                        )
+                        cute.gemm(
+                            mma_wdv,
+                            t_wdv_acc[None, None, None, wdv_handle.index],
+                            t_w[None, None, k_block, w_handle.index],
+                            t_dv[None, None, k_block, split],
+                            t_wdv_acc[None, None, None, wdv_handle.index],
+                        )
                 wdv_handle.commit()
                 w_handle.release()
                 dv_operand_handle.release()
@@ -957,6 +990,7 @@ class BlackwellDeltaAffineSummaryRev:
             tx_count=self.k_bytes,
             barrier_storage=storage.bar_k.data_ptr(),
         ).make_participants()
+        # X snapshot → MMA1 (AsyncUmma, 1 stage covering both hi/lo halves)
         state_producer, state_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(
@@ -1005,6 +1039,7 @@ class BlackwellDeltaAffineSummaryRev:
             tx_count=self.w_bytes,
             barrier_storage=storage.bar_w.data_ptr(),
         ).make_participants()
+        # dv snapshot → MMA4 (AsyncUmma, 1 stage covering both hi/lo halves)
         dv_operand_producer, dv_operand_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(

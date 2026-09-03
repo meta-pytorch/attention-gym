@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from functools import partial, reduce
+from itertools import pairwise
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
+import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
+import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
 import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
 from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
@@ -18,17 +23,51 @@ pytestmark = pytest.mark.skipif(
     reason="the affine summaries require CUDA capability 8.0 or newer",
 )
 
+VALUE_DIM = 128
 
-def make_summary_inputs(seed: int):
-    """Create one nontrivial BF16 input set for summary infrastructure tests."""
+
+@pytest.fixture(params=["routed", "portable"])
+def summary_backend(request, monkeypatch):
+    """Run the routed backend, or force the public wrappers onto the portable Triton path."""
+    if request.param == "portable":
+        if not is_sm100_kda_capability(torch.cuda.get_device_capability()):
+            pytest.skip("the routed backend is already the portable Triton path")
+        for module in (native_fwd, native_rev):
+            monkeypatch.setattr(module, "is_sm100_kda_capability", lambda _capability: False)
+
+
+def compose_summaries(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """Compose V-first packed summaries so ``state @ R1 + b1`` feeds ``@ R2 + b2``."""
+    bias_1, transition_1 = first[:, :VALUE_DIM], first[:, VALUE_DIM:]
+    bias_2, transition_2 = second[:, :VALUE_DIM], second[:, VALUE_DIM:]
+    return torch.cat((bias_1 @ transition_2 + bias_2, transition_1 @ transition_2), dim=1)
+
+
+def shard_summaries(summary, tensors, boundaries: tuple[int, ...]) -> list[torch.Tensor]:
+    """Summarize each token shard delimited by ``boundaries``, in token order."""
+    endpoints = (0, *boundaries, tensors[0].shape[1])
+    return [
+        summary(*(tensor[:, start:stop] for tensor in tensors))
+        for start, stop in pairwise(endpoints)
+    ]
+
+
+def make_summary_inputs(
+    seed: int,
+    dtype: torch.dtype = torch.bfloat16,
+    tokens: int = 64,
+    heads: int = 1,
+    divisor: float = 32,
+) -> tuple[torch.Tensor, ...]:
+    """Create one nontrivial deterministic input set for both affine summaries."""
     torch.manual_seed(seed)
-    shape = (1, 64, 1, 128)
-    qg = torch.randn(shape, dtype=torch.bfloat16, device="cuda") / 32
-    kg = torch.randn_like(qg) / 32
-    w = torch.randn_like(qg) / 32
-    u = torch.randn_like(qg) / 32
-    dout = torch.randn_like(qg) / 32
-    aqk = torch.randn(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda") / 32
+    shape = (1, tokens, heads, 128)
+    qg = torch.randn(shape, dtype=dtype, device="cuda") / divisor
+    kg = torch.randn_like(qg) / divisor
+    w = torch.randn_like(qg) / divisor
+    u = torch.randn_like(qg) / divisor
+    dout = torch.randn_like(qg) / divisor
+    aqk = torch.randn(1, tokens, heads, 64, dtype=dtype, device="cuda") / divisor
     cumulative_gate = -torch.rand(shape, dtype=torch.float32, device="cuda") / 8
     return qg, kg, w, u, dout, aqk, cumulative_gate
 
@@ -297,6 +336,96 @@ def test_affine_summary_selector_variants_and_persistent_work():
         state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
         atol=2e-4,
         rtol=2e-4,
+    )
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_reverse_summary_cancels_exactly_like_forward(dtype):
+    """Reverse must split its FP32 state hi/lo like forward so exact cancellations survive.
+
+    Chunk 0 zeroes transition entry (0, 0); chunk 1 then multiplies by ``-eps``, where
+    ``1 + eps`` is FP32-exact but rounds to ``1`` in ``dtype``. Forward returns an exact
+    zero; a reverse scan that narrows its state once returns ``eps`` instead.
+    """
+    eps = 2.0**-9 if dtype is torch.bfloat16 else 2.0**-12
+    shape = (1, 128, 1, 128)
+    zeros = torch.zeros(shape, dtype=dtype, device="cuda")
+    kg = zeros.clone()
+    w = zeros.clone()
+    kg[0, 0, 0, 0] = 1
+    w[0, 0, 0, 0] = 1
+    kg[0, 64, 0, 0] = 1
+    w[0, 64, 0, 0] = -eps
+    aqk = torch.zeros(1, 128, 1, 64, dtype=dtype, device="cuda")
+    cumulative_gate = torch.zeros(shape, dtype=torch.float32, device="cuda")
+
+    expected = torch.zeros(1, 256, 128, dtype=torch.float32, device="cuda")
+    expected[0, VALUE_DIM:] = torch.eye(128, device="cuda")
+    expected[0, VALUE_DIM, 0] = 0
+
+    torch.testing.assert_close(
+        build_state_summary(kg, w, zeros, cumulative_gate), expected, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        build_state_grad_summary(zeros, kg, w, zeros, aqk, cumulative_gate, 1.0),
+        expected,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tokens,heads", [(256, 2), (2048, 1), (512, 16)])
+def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, heads):
+    """Bound ``<state @ R, cotangent> - <state, cotangent @ R_rev>`` for every pair.
+
+    The operator norm of ``R - R_rev^T`` bounds that defect relative to the Frobenius
+    norms of any state/cotangent pair. A reverse scan that narrows its state once lands
+    at 5e-4 or worse on these shapes; the hi/lo scan stays below 1e-4.
+    """
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(
+        37, dtype, tokens, heads, divisor=16
+    )
+
+    transition = build_state_summary(kg, w, u, cumulative_gate)[:, VALUE_DIM:]
+    reverse_transition = build_state_grad_summary(
+        qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5
+    )[:, VALUE_DIM:]
+
+    adjoint_defect = torch.linalg.matrix_norm(
+        transition - reverse_transition.transpose(-2, -1), ord=2
+    )
+    assert (adjoint_defect <= 2e-4).all(), adjoint_defect
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("boundaries", [(256,), (64, 320), (128, 256, 384)])
+def test_affine_summaries_are_invariant_to_shard_boundaries(dtype, boundaries):
+    """Composing per-shard summaries must match the unsharded scan in both directions."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(
+        41, dtype, tokens=512, heads=2, divisor=16
+    )
+    reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
+
+    forward_shards = shard_summaries(build_state_summary, (kg, w, u, cumulative_gate), boundaries)
+    torch.testing.assert_close(
+        reduce(compose_summaries, forward_shards),
+        build_state_summary(kg, w, u, cumulative_gate),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    # The cotangent flows through the last shard first.
+    reverse_shards = shard_summaries(
+        reverse_summary, (qg, kg, w, dout, aqk, cumulative_gate), boundaries
+    )
+    torch.testing.assert_close(
+        reduce(compose_summaries, reversed(reverse_shards)),
+        reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
+        atol=2e-5,
+        rtol=2e-5,
     )
 
 
