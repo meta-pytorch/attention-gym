@@ -166,6 +166,39 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference(dtype: torch.d
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_bwd_intra_diagonal_is_gate_independent(dtype: torch.dtype) -> None:
+    """Diagonal pairwise terms affect Q/K/beta gradients, but never the gate."""
+    inputs = list(_inputs(64, dtype))
+    dAqk = torch.zeros_like(inputs[4])
+    dAkk = torch.zeros_like(inputs[5])
+    diagonal = torch.arange(64, device="cuda")
+    dAqk[0, diagonal, 0, diagonal] = torch.linspace(-2, 2, 64, device="cuda")
+    dAkk[0, diagonal, 0, diagonal] = torch.linspace(1, -1, 64, device="cuda")
+    inputs[4:6] = (dAqk, dAkk)
+    inputs[6:] = tuple(torch.zeros_like(tensor) for tensor in inputs[6:])
+
+    dq, dk, dg, db = _run(tuple(inputs), [64])
+    reference = bwd_intra_reference(*inputs[:6])
+    high_precision = bwd_intra_reference(*(tensor.double() for tensor in inputs[:6]))
+
+    assert torch.count_nonzero(dg) == 0
+    for name, actual, expected, low_precision in zip(
+        ("dq", "dk", "dbeta"),
+        (dq, dk, db),
+        high_precision[:3],
+        reference[:3],
+        strict=True,
+    ):
+        assert_matches_low_precision_reference(
+            actual,
+            expected,
+            low_precision,
+            name,
+            source_dtype=dtype,
+        )
+
+
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([64]), 64, 32)
     with pytest.raises(ValueError, match="metadata chunk size"):
