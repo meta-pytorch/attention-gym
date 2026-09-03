@@ -142,6 +142,57 @@ def test_mega_exact_orthogonal_writes(family: str) -> None:
     assert torch.equal(state, value[0, :, 0].T[None, None].to(state.dtype))
 
 
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_kda_mega_delta_residual_keeps_fp32_precision(dtype: torch.dtype) -> None:
+    """``beta * (v - state @ k)`` must not round ``state @ k`` to the I/O dtype first.
+
+    Tokens 0 and 1 write ``state[k0, v0] = 4096`` and ``state[k1, v0] = 2``. Token 16
+    reads both with ``k = e0 + e1`` and ``v = 4096 e0``, so ``state @ k = 4098`` and the
+    residual is exactly ``-2``; rounding the contraction to BF16 or FP16 first gives 4096
+    and a zero residual. Token 32 then reads ``state[k1]`` so the recomputed state used
+    by the raw backward also depends on the residual.
+    """
+    tokens = 64
+    shape = (1, tokens, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    value = torch.zeros_like(q)
+    gate = torch.zeros(shape, device="cuda", dtype=torch.float32)
+    beta = torch.zeros((1, tokens, 1), device="cuda", dtype=torch.float32)
+    k[0, 0, 0, 0] = 1
+    value[0, 0, 0, 0] = 4096
+    beta[0, 0, 0] = 1
+    k[0, 1, 0, 1] = 1
+    value[0, 1, 0, 0] = 2
+    beta[0, 1, 0] = 1
+    q[0, 16, 0, 1] = 1
+    k[0, 16, 0, :2] = 1
+    value[0, 16, 0, 0] = 4096
+    beta[0, 16, 0] = 0.25
+    q[0, 32, 0, 1] = 1
+    d_output = torch.zeros_like(value)
+    d_output[0, 16, 0, 0] = 64
+    d_output[0, 32, 0, 0] = 64
+
+    inputs = (q, k, value, gate, beta)
+    output = chunk_kda(*inputs, scale=1.0, autotune=False, kernel_options=_MEGA)[0]
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    dq, _, _, _, dbeta = chunk_mega_packed_local_bwd_op(*inputs, d_output, cu_seqlens, False, 1.0)
+
+    leaves = clone_kda_inputs(
+        tuple(tensor.requires_grad_() for tensor in inputs), dtype=torch.float64
+    )
+    expected_output = kda_reference(*leaves, scale=1.0, output_final_state=False)[0]
+    expected_dq, expected_dbeta = torch.autograd.grad(
+        expected_output, (leaves[0], leaves[4]), d_output.to(torch.float64)
+    )
+
+    assert output[0, 16, 0, 0].item() == expected_output[0, 16, 0, 0].item() == 1.5
+    assert output[0, 32, 0, 0].item() == expected_output[0, 32, 0, 0].item() == 1.5
+    assert dbeta[0, 16, 0].item() == expected_dbeta[0, 16, 0].item() == -256
+    assert dq[0, 32, 0, 1].item() == expected_dq[0, 32, 0, 1].item() == 96
+
+
 @pytest.mark.parametrize("seed", (888, 889, 890))
 def test_gdn_mega_model_range_backward(seed: int) -> None:
     """GDN output and gradients must remain within the BF16 reference error budget."""

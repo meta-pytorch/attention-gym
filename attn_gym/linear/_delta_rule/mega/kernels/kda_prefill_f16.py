@@ -142,9 +142,8 @@ from .tile_dsl.pointwise import (
     fmul2,
     ffma2,
     movmatrix_16b,
-    mul_f16x2,
+    beta_residual_f16x2,
     fp32_to_fp16,
-    sub_f16x2,
 )
 
 LOG2_E: float = 1.4426950408889634
@@ -1618,51 +1617,52 @@ def compute1_warp_group(
                 state_k_vec0 = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_addr + state_k_col_id, cutlass.Float32), num=2)
                 state_k_vec1 = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row16_addr + state_k_col_id, cutlass.Float32), num=2)
 
-            beta_pack = cute.make_rmem_tensor((4,), cutlass.Int32)
+            beta_regs = cute.make_rmem_tensor((8,), cutlass.Float32)
             for reg_idx in cutlass.range_constexpr(4):
                 token0 = (((reg_idx // 2) * 4 + (lane & 3)) ^ 4) * 2
-                beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
-                beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pack[reg_idx] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
+                beta_regs[2 * reg_idx] = (sBeta_ptr + token0).load().to(cutlass.Float32)
+                beta_regs[2 * reg_idx + 1] = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
             y_inp_pack0 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
                 if cutlass.const_expr(mState_init is not None):
-                    state_k_val0, state_k_val1 = state_k_vec0[frag_pair], state_k_vec0[frag_pair + 1]
-                    state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(
+                    y_inp_pack0[reg_idx], _, _ = beta_residual_f16x2(
                         raw_v_frag0[raw_matrix],
-                        state_k_pair,
-                        cfg.io_dtype,
+                        beta_regs[2 * reg_idx],
+                        beta_regs[2 * reg_idx + 1],
+                        state_k_vec0[frag_pair],
+                        state_k_vec0[frag_pair + 1],
+                        dtype=cfg.io_dtype,
                     )
                 else:
-                    diff_pair = raw_v_frag0[raw_matrix]
-                y_inp_pack0[reg_idx] = mul_f16x2(
-                    beta_pack[reg_idx],
-                    diff_pair,
-                    cfg.io_dtype,
-                )
+                    y_inp_pack0[reg_idx], _, _ = beta_residual_f16x2(
+                        raw_v_frag0[raw_matrix],
+                        beta_regs[2 * reg_idx],
+                        beta_regs[2 * reg_idx + 1],
+                        dtype=cfg.io_dtype,
+                    )
 
             y_inp_pack1 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
                 if cutlass.const_expr(mState_init is not None):
-                    state_k_val0, state_k_val1 = state_k_vec1[frag_pair], state_k_vec1[frag_pair + 1]
-                    state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(
+                    y_inp_pack1[reg_idx], _, _ = beta_residual_f16x2(
                         raw_v_frag1[raw_matrix],
-                        state_k_pair,
-                        cfg.io_dtype,
+                        beta_regs[2 * reg_idx],
+                        beta_regs[2 * reg_idx + 1],
+                        state_k_vec1[frag_pair],
+                        state_k_vec1[frag_pair + 1],
+                        dtype=cfg.io_dtype,
                     )
                 else:
-                    diff_pair = raw_v_frag1[raw_matrix]
-                y_inp_pack1[reg_idx] = mul_f16x2(
-                    beta_pack[reg_idx],
-                    diff_pair,
-                    cfg.io_dtype,
-                )
+                    y_inp_pack1[reg_idx], _, _ = beta_residual_f16x2(
+                        raw_v_frag1[raw_matrix],
+                        beta_regs[2 * reg_idx],
+                        beta_regs[2 * reg_idx + 1],
+                        dtype=cfg.io_dtype,
+                    )
 
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row_addr + y_inp_col_id, cutlass.Int8), y_inp_pack0.load())
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row16_addr + y_inp_col_id, cutlass.Int8), y_inp_pack1.load())
@@ -1785,44 +1785,35 @@ def compute1_warp_group(
             state_k_vec0 = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_addr + state_k_col_id, cutlass.Float32), num=2)
             state_k_vec1 = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row16_addr + state_k_col_id, cutlass.Float32), num=2)
 
-            beta_pack = cute.make_rmem_tensor((4,), cutlass.Int32)
+            beta_regs = cute.make_rmem_tensor((8,), cutlass.Float32)
             for reg_idx in cutlass.range_constexpr(4):
                 token0 = (((reg_idx // 2) * 4 + (lane & 3)) ^ 4) * 2
-                beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
-                beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pack[reg_idx] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
+                beta_regs[2 * reg_idx] = (sBeta_ptr + token0).load().to(cutlass.Float32)
+                beta_regs[2 * reg_idx + 1] = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
             y_inp_pack0 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
-                state_k_val0, state_k_val1 = state_k_vec0[frag_pair], state_k_vec0[frag_pair + 1]
-                state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                diff_pair = sub_f16x2(
+                y_inp_pack0[reg_idx], _, _ = beta_residual_f16x2(
                     raw_v_frag0[raw_matrix],
-                    state_k_pair,
-                    cfg.io_dtype,
-                )
-                y_inp_pack0[reg_idx] = mul_f16x2(
-                    beta_pack[reg_idx],
-                    diff_pair,
-                    cfg.io_dtype,
+                    beta_regs[2 * reg_idx],
+                    beta_regs[2 * reg_idx + 1],
+                    state_k_vec0[frag_pair],
+                    state_k_vec0[frag_pair + 1],
+                    dtype=cfg.io_dtype,
                 )
 
             y_inp_pack1 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
-                state_k_val0, state_k_val1 = state_k_vec1[frag_pair], state_k_vec1[frag_pair + 1]
-                state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                diff_pair = sub_f16x2(
+                y_inp_pack1[reg_idx], _, _ = beta_residual_f16x2(
                     raw_v_frag1[raw_matrix],
-                    state_k_pair,
-                    cfg.io_dtype,
-                )
-                y_inp_pack1[reg_idx] = mul_f16x2(
-                    beta_pack[reg_idx],
-                    diff_pair,
-                    cfg.io_dtype,
+                    beta_regs[2 * reg_idx],
+                    beta_regs[2 * reg_idx + 1],
+                    state_k_vec1[frag_pair],
+                    state_k_vec1[frag_pair + 1],
+                    dtype=cfg.io_dtype,
                 )
 
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row_addr + y_inp_col_id, cutlass.Int8), y_inp_pack0.load())
