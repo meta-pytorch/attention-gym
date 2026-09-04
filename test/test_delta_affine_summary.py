@@ -15,7 +15,13 @@ import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
 import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
 import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import (
+    build_state_grad_summaries,
+    build_state_grad_summary,
+    build_state_summaries,
+    build_state_summary,
+)
+from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, plan_work_items
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.testing.kda import assert_relative_rms_within
 
@@ -402,93 +408,147 @@ def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, head
 
 
 @pytest.mark.parametrize(
-    ("num_chunks", "work_tiles", "sm_count", "expected"),
+    ("max_chunks", "work_tiles", "sm_count", "expected"),
     [
-        pytest.param(512, 64, 148, (2, 256), id="two-segments"),
-        pytest.param(512, 128, 148, (1, 512), id="one-wave-already"),
-        pytest.param(512, 256, 148, (1, 512), id="oversubscribed"),
-        pytest.param(512, 8, 148, (18, 29), id="sm-bound"),
-        pytest.param(3, 8, 148, (1, 3), id="short-chain-stays-whole"),
-        pytest.param(31, 8, 148, (1, 31), id="just-below-two-segments"),
-        pytest.param(32, 8, 148, (2, 16), id="first-split"),
-        pytest.param(70, 8, 32, (4, 18), id="ragged-tail"),
-        pytest.param(65, 8, 32, (4, 17), id="rounding-drops-a-segment"),
+        pytest.param(512, 64, 148, 2, id="two-items"),
+        pytest.param(512, 128, 148, 1, id="one-wave-already"),
+        pytest.param(512, 256, 148, 1, id="oversubscribed"),
+        pytest.param(512, 8, 148, 18, id="sm-bound"),
+        pytest.param(3, 8, 148, 1, id="short-chain-stays-whole"),
+        pytest.param(31, 8, 148, 1, id="just-below-two-items"),
+        pytest.param(32, 8, 148, 2, id="first-split"),
     ],
 )
-def test_plan_segments_fills_one_wave_without_empty_or_tiny_segments(
-    num_chunks, work_tiles, sm_count, expected
+def test_plan_work_budget_fills_one_wave_without_tiny_items(
+    max_chunks, work_tiles, sm_count, expected
 ):
-    segments, chunks_per_segment = native_fwd.plan_segments(num_chunks, work_tiles, sm_count)
-    assert (segments, chunks_per_segment) == expected
-    assert (segments - 1) * chunks_per_segment < num_chunks <= segments * chunks_per_segment
-    # A fold level costs more than several chunks, so no split may produce short segments.
-    assert segments == 1 or chunks_per_segment >= native_fwd.MIN_CHUNKS_PER_SEGMENT
+    budget = native_fwd.plan_work_budget(max_chunks, work_tiles, sm_count)
+    assert budget == expected
+    # A scan level costs more than several chunks, so no split may produce short items.
+    assert budget == 1 or max_chunks // budget >= native_fwd.MIN_CHUNKS_PER_ITEM
 
 
-@pytest.mark.parametrize("segments", [1, 3, 5, 8])
-def test_compose_segment_summaries_matches_sequential_composition(segments):
-    """The pairwise fold, including its odd tail, equals left-to-right composition."""
-    generator = torch.Generator().manual_seed(5)
-    summaries = torch.randn(segments, 2, 256, 128, generator=generator) / 16
-    summaries[:, :, VALUE_DIM:] += torch.eye(128)
-    expected = reduce(compose_summaries, summaries.unbind(0))
-    torch.testing.assert_close(
-        native_fwd.compose_segment_summaries(summaries), expected, atol=1e-5, rtol=1e-5
-    )
+WORK_LAYOUTS = [
+    pytest.param([[0, 300], [300, 300], [300, 428], [428, 500], [500, 640]], 4, id="mixed"),
+    pytest.param([[0, 32768]] + [[32768, 32768]] * 7, 18, id="one-long-seven-empty"),
+    pytest.param([[0, 640]], 1, id="single-range-single-item"),
+    pytest.param([[0, 64], [64, 128]], 18, id="more-budget-than-chunks"),
+    pytest.param([[0, 100], [100, 30000], [30000, 32768]], 18, id="uneven"),
+]
 
 
-def test_compose_segment_summaries_ignores_the_float32_matmul_mode():
+@pytest.mark.parametrize(("layout", "budget"), WORK_LAYOUTS)
+def test_plan_work_items_tiles_every_range_in_order(layout, budget):
+    """Items cover each range's chunks exactly once, contiguously and in chunk order."""
+    bounds = torch.tensor(layout, dtype=torch.int32, device="cuda")
+    work, range_ids = (t.cpu() for t in plan_work_items(bounds, budget))
+    ranges = len(layout)
+    assert work.shape == (budget + ranges, 4) and range_ids.shape == (budget + ranges,)
+    assert torch.equal(work[range_ids == ranges], torch.zeros_like(work[range_ids == ranges]))
+    total = sum(-(-(stop - start) // 64) for start, stop in layout)
+    for range_id, (start, stop) in enumerate(layout):
+        rows = work[range_ids == range_id]
+        chunks = -(-(stop - start) // 64)
+        positions = (range_ids == range_id).nonzero().flatten().tolist()
+        assert (
+            positions == list(range(positions[0], positions[0] + len(positions)))
+            if positions
+            else chunks == 0
+        )
+        assert (rows[:, 0] == start).all() and (rows[:, 3] == stop - start).all()
+        begins, ends = rows[:, 1].tolist(), rows[:, 2].tolist()
+        assert begins == [0, *ends[:-1]][: len(ends)] and (ends[-1] if ends else 0) == chunks
+        # The flat split hands each range a share proportional to its length.
+        assert len(rows) >= min(chunks, max(1, budget * chunks // total - 1))
+
+
+@pytest.mark.parametrize(("layout", "budget"), WORK_LAYOUTS)
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+def test_compose_work_items_matches_sequential_composition(layout, budget, reverse):
+    """The segmented scan equals composing each range's items in (reverse) chunk order."""
+    bounds = torch.tensor(layout, dtype=torch.int32, device="cuda")
+    work, range_ids = plan_work_items(bounds, budget)
+    ranges = len(layout)
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    partials = torch.randn(work.shape[0], 2, 256, 128, device="cuda", generator=generator) / 16
+    partials[:, :, VALUE_DIM:] += torch.eye(128, device="cuda")
+    identity = torch.cat(
+        (torch.zeros(2, 128, 128), torch.eye(128).expand(2, -1, -1)), dim=1
+    ).cuda()
+
+    composed = compose_work_items(partials, range_ids, ranges, reverse=reverse)
+    for range_id in range(ranges):
+        items = [partials[i].double() for i in range(work.shape[0]) if range_ids[i] == range_id]
+        if reverse:
+            items.reverse()
+        expected = reduce(compose_summaries, items, identity.double()).float()
+        # IEEE fp32 dots over up to ``budget`` chained maps: ~1e-5, far inside the bf16 summary
+        # error and two decades inside what TF32 operands would produce.
+        torch.testing.assert_close(composed[range_id], expected, atol=1e-4, rtol=1e-4)
+        assert_relative_rms_within(
+            composed[range_id],
+            expected,
+            f"range {range_id} compose",
+            max_eps=64,
+            source_dtype=torch.float32,
+        )
+
+
+def test_compose_work_items_ignores_the_float32_matmul_mode():
     """The fold must not pick up TF32 from ``torch.set_float32_matmul_precision("high")``."""
     generator = torch.Generator(device="cuda").manual_seed(6)
-    summaries = torch.randn(4, 2, 256, 128, device="cuda", generator=generator) / 16
-    summaries[:, :, VALUE_DIM:] += torch.eye(128, device="cuda")
-    exact = reduce(compose_summaries, summaries.double().unbind(0)).float()
+    partials = torch.randn(4, 2, 256, 128, device="cuda", generator=generator) / 16
+    partials[:, :, VALUE_DIM:] += torch.eye(128, device="cuda")
+    range_ids = torch.zeros(4, dtype=torch.int64, device="cuda")
+    exact = reduce(compose_summaries, partials.double().unbind(0)).float()
     precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:
-        folded = native_fwd.compose_segment_summaries(summaries)
+        folded = compose_work_items(partials, range_ids, 1, reverse=False)[0]
     finally:
         torch.set_float32_matmul_precision(precision)
-    # TF32 rounds operands to 10 mantissa bits (~1e-3 relative); an FP64 fold stays within a few
-    # FP32 ulps of the exact composition.
-    torch.testing.assert_close(folded, exact, atol=1e-6, rtol=1e-6)
+    # TF32 rounds operands to 10 mantissa bits (~1e-3 relative); IEEE fp32 dots stay at ~1e-5.
+    torch.testing.assert_close(folded, exact, atol=1e-4, rtol=1e-4)
+    assert_relative_rms_within(
+        folded, exact, "compose under matmul mode", max_eps=64, source_dtype=torch.float32
+    )
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
-    reason="segmented launches are specific to the native SM100 kernels",
+    reason="work-item splitting is specific to the native SM100 kernels",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_segmented_summaries_match_single_segment_scans(dtype, monkeypatch):
+def test_native_split_summaries_match_single_item_scans(dtype, monkeypatch):
     """Splitting the chunk chain across idle SMs must only reorder FP32 composition."""
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(
         43, dtype, tokens=2048, heads=1, divisor=16
     )
     reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
-    segmented = (
+    split = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
     )
 
-    plans = []
-    plan_segments = native_fwd.plan_segments
+    budgets = []
+    plan_work_budget = native_fwd.plan_work_budget
 
-    def single_segment(num_chunks, work_tiles, sm_count):
-        plans.append(plan_segments(num_chunks, work_tiles, sm_count))
-        return 1, num_chunks
+    def single_item(max_chunks, work_tiles, sm_count):
+        budgets.append(plan_work_budget(max_chunks, work_tiles, sm_count))
+        return 1
 
-    monkeypatch.setattr(native_fwd, "plan_segments", single_segment)
-    monkeypatch.setattr(native_rev, "plan_segments", single_segment)
-    unsegmented = (
+    monkeypatch.setattr(native_fwd, "plan_work_budget", single_item)
+    monkeypatch.setattr(native_rev, "plan_work_budget", single_item)
+    unsplit = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
     )
-    assert all(segments > 1 for segments, _ in plans), plans
-    for name, actual, expected in zip(("forward", "reverse"), segmented, unsegmented, strict=True):
+    assert all(budget > 1 for budget in budgets), budgets
+    for name, actual, expected in zip(("forward", "reverse"), split, unsplit, strict=True):
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
         assert_relative_rms_within(
-            actual, expected, f"segmented {name} summary", max_eps=64, source_dtype=torch.float32
+            actual, expected, f"split {name} summary", max_eps=64, source_dtype=torch.float32
         )
 
 
@@ -544,10 +604,12 @@ def test_affine_summaries_reject_torch_export_instead_of_emitting_empty_outputs(
     x = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
     gate = torch.zeros(shape, dtype=torch.float32, device="cuda")
     aqk = torch.zeros(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(TypeError, match="build_state_summary does not support torch.export"):
+    with pytest.raises(TypeError, match="does not support torch.export"):
         torch.export.export(ForwardSummary(), (x, x, x, gate), strict=False)
-    with pytest.raises(TypeError, match="build_state_grad_summary does not support torch.export"):
+    with pytest.raises(TypeError, match="does not support torch.export"):
         torch.export.export(ReverseSummary(), (x, x, x, x, aqk, gate), strict=False)
+    # The rejected fake call must not poison the cached single-range bounds for real calls.
+    assert torch.isfinite(build_state_summary(x, x, x, gate)).all()
 
 
 def test_build_state_summary_cuda_graph_replay():
@@ -593,3 +655,168 @@ def test_build_state_grad_summary_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+RANGE_BOUNDS = [
+    (0, 300),  # partial tail chunk, five chunks
+    (300, 300),  # empty: the identity
+    (300, 428),  # two whole chunks starting mid-stream
+    (428, 500),  # one chunk plus an 8-token tail, ending inside the stream
+    (500, 640),  # to the end of the stream
+]
+
+
+def reference_summaries(tensors, start: int, stop: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager FP32 forward and reverse maps of one token range, computed on the slice."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = (t[:, start:stop] for t in tensors)
+    return (
+        state_summary_reference(kg, w, u, cumulative_gate),
+        state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
+    )
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_range_summaries_match_per_range_launches(dtype):
+    """Device ``bounds`` reproduce slicing each range on the host, tails and empties included."""
+    tensors = make_summary_inputs(41, dtype, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    bounds = torch.tensor(RANGE_BOUNDS, dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    assert forward.shape == reverse.shape == (len(RANGE_BOUNDS), 2, 256, 128)
+
+    identity = torch.cat((torch.zeros(2, 128, 128), torch.eye(128).expand(2, -1, -1)), dim=1)
+    for index, (start, stop) in enumerate(RANGE_BOUNDS):
+        if start == stop:
+            torch.testing.assert_close(forward[index].cpu(), identity, atol=0, rtol=0)
+            torch.testing.assert_close(reverse[index].cpu(), identity, atol=0, rtol=0)
+            continue
+        sliced = [t[:, start:stop] for t in tensors]
+        # Both launches pick one segment at these lengths, so the results are bitwise equal.
+        expected_forward = build_state_summary(sliced[1], sliced[2], sliced[3], sliced[6])
+        expected_reverse = build_state_grad_summary(
+            sliced[0], sliced[1], sliced[2], sliced[4], sliced[5], sliced[6], scale
+        )
+        torch.testing.assert_close(forward[index], expected_forward, atol=0, rtol=0)
+        torch.testing.assert_close(reverse[index], expected_reverse, atol=0, rtol=0)
+        # ...and exact against the eager FP32 recurrence on the slice, in both directions.
+        for name, actual, expected in zip(
+            ("forward", "reverse"),
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+            assert_relative_rms_within(
+                actual,
+                expected,
+                f"{name} [{start}, {stop})",
+                max_eps=64,
+                source_dtype=torch.float32,
+            )
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_range_tails_ignore_the_tokens_that_follow(dtype):
+    """A partial last chunk over-reads the next tokens; scaled-up neighbours must not leak in.
+
+    The single-range launch sees TMA zero fill past its slice instead of those tokens, so the two
+    must agree bitwise; the neighbours are finite, which the kernels require (``0 * inf`` is NaN).
+    """
+    tensors = make_summary_inputs(41, dtype, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    for tensor in (qg, kg, w, u, dout, aqk):
+        tensor[:, 300:364] *= 64  # never inside a range below
+    bounds = torch.tensor([[0, 300], [172, 300]], dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    for index, (start, stop) in enumerate(bounds.tolist()):
+        sliced = [t[:, start:stop] for t in tensors]
+        expected_forward = build_state_summary(sliced[1], sliced[2], sliced[3], sliced[6])
+        expected_reverse = build_state_grad_summary(
+            sliced[0], sliced[1], sliced[2], sliced[4], sliced[5], sliced[6], scale
+        )
+        torch.testing.assert_close(forward[index], expected_forward, atol=0, rtol=0)
+        torch.testing.assert_close(reverse[index], expected_reverse, atol=0, rtol=0)
+        for name, actual, expected in zip(
+            ("forward", "reverse"),
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+            assert_relative_rms_within(
+                actual,
+                expected,
+                f"{name} [{start}, {stop})",
+                max_eps=64,
+                source_dtype=torch.float32,
+            )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
+    reason="segmented launches are specific to the native SM100 kernels",
+)
+def test_range_summaries_survive_a_tiny_work_budget(monkeypatch):
+    """Three items over seven ranges: cuts inside ranges and one-chunk ranges compose."""
+    tensors = make_summary_inputs(47, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    monkeypatch.setattr(native_fwd, "plan_work_budget", lambda chunks, tiles, sms: 3)
+    monkeypatch.setattr(native_rev, "plan_work_budget", lambda chunks, tiles, sms: 3)
+    ranges = [*RANGE_BOUNDS, (500, 501), (0, 65)]
+    bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5, bounds)
+    for index, (start, stop) in enumerate(ranges):
+        if start == stop:
+            continue
+        for name, actual, expected in zip(
+            ("forward", "reverse"),
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+            assert_relative_rms_within(
+                actual,
+                expected,
+                f"{name} [{start}, {stop})",
+                max_eps=64,
+                source_dtype=torch.float32,
+            )
+
+
+@pytest.mark.usefixtures("summary_backend")
+def test_range_summaries_replay_across_layouts_in_one_cuda_graph():
+    """One captured graph serves any ``bounds`` values of the same shape: the routing is data."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(43, tokens=640, heads=2)
+    scale = 128**-0.5
+    bounds = torch.tensor([[0, 256], [256, 640], [640, 640]], dtype=torch.int32, device="cuda")
+
+    def launch():
+        return (
+            build_state_summaries(kg, w, u, cumulative_gate, bounds),
+            build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds),
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+
+    for layout in ([[0, 256], [256, 640], [640, 640]], [[0, 100], [100, 300], [300, 640]]):
+        bounds.copy_(torch.tensor(layout, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(captured, launch(), strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
