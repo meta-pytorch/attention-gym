@@ -15,7 +15,12 @@ import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
 import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
 import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import (
+    build_state_grad_summaries,
+    build_state_grad_summary,
+    build_state_summaries,
+    build_state_summary,
+)
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.testing.kda import assert_relative_rms_within
 
@@ -544,9 +549,9 @@ def test_affine_summaries_reject_torch_export_instead_of_emitting_empty_outputs(
     x = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
     gate = torch.zeros(shape, dtype=torch.float32, device="cuda")
     aqk = torch.zeros(1, 64, 1, 64, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(TypeError, match="build_state_summary does not support torch.export"):
+    with pytest.raises(TypeError, match="does not support torch.export"):
         torch.export.export(ForwardSummary(), (x, x, x, gate), strict=False)
-    with pytest.raises(TypeError, match="build_state_grad_summary does not support torch.export"):
+    with pytest.raises(TypeError, match="does not support torch.export"):
         torch.export.export(ReverseSummary(), (x, x, x, x, aqk, gate), strict=False)
 
 
@@ -593,3 +598,152 @@ def test_build_state_grad_summary_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+FRAGMENT_BOUNDS = [
+    (0, 300),  # partial tail chunk, five chunks
+    (300, 300),  # empty: the identity
+    (300, 428),  # two whole chunks starting mid-stream
+    (428, 500),  # one chunk plus an 8-token tail, ending inside the stream
+    (500, 640),  # to the end of the stream
+]
+
+
+def reference_summaries(tensors, start: int, stop: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager FP32 forward and reverse maps of one token range, computed on the slice."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = (t[:, start:stop] for t in tensors)
+    return (
+        state_summary_reference(kg, w, u, cumulative_gate),
+        state_grad_summary_reference(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5),
+    )
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fragment_summaries_match_per_range_launches(dtype):
+    """Device ``bounds`` reproduce slicing each range on the host, tails and empties included."""
+    tensors = make_summary_inputs(41, dtype, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    bounds = torch.tensor(FRAGMENT_BOUNDS, dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    assert forward.shape == reverse.shape == (len(FRAGMENT_BOUNDS), 2, 256, 128)
+
+    identity = torch.cat((torch.zeros(2, 128, 128), torch.eye(128).expand(2, -1, -1)), dim=1)
+    for index, (start, stop) in enumerate(FRAGMENT_BOUNDS):
+        if start == stop:
+            torch.testing.assert_close(forward[index].cpu(), identity, atol=0, rtol=0)
+            torch.testing.assert_close(reverse[index].cpu(), identity, atol=0, rtol=0)
+            continue
+        sliced = [t[:, start:stop] for t in tensors]
+        # Both launches pick one segment at these lengths, so the results are bitwise equal.
+        expected_forward = build_state_summary(sliced[1], sliced[2], sliced[3], sliced[6])
+        expected_reverse = build_state_grad_summary(
+            sliced[0], sliced[1], sliced[2], sliced[4], sliced[5], sliced[6], scale
+        )
+        torch.testing.assert_close(forward[index], expected_forward, atol=0, rtol=0)
+        torch.testing.assert_close(reverse[index], expected_reverse, atol=0, rtol=0)
+        # ...and exact against the eager FP32 recurrence on the slice, in both directions.
+        for actual, expected in zip(
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fragment_tails_ignore_the_tokens_that_follow(dtype):
+    """A partial last chunk over-reads the next tokens; scaled-up neighbours must not leak in.
+
+    The single-range launch sees TMA zero fill past its slice instead of those tokens, so the two
+    must agree bitwise; the neighbours are finite, which the kernels require (``0 * inf`` is NaN).
+    """
+    tensors = make_summary_inputs(41, dtype, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    for tensor in (qg, kg, w, u, dout, aqk):
+        tensor[:, 300:364] *= 64  # never inside a range below
+    bounds = torch.tensor([[0, 300], [172, 300]], dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    for index, (start, stop) in enumerate(bounds.tolist()):
+        sliced = [t[:, start:stop] for t in tensors]
+        expected_forward = build_state_summary(sliced[1], sliced[2], sliced[3], sliced[6])
+        expected_reverse = build_state_grad_summary(
+            sliced[0], sliced[1], sliced[2], sliced[4], sliced[5], sliced[6], scale
+        )
+        torch.testing.assert_close(forward[index], expected_forward, atol=0, rtol=0)
+        torch.testing.assert_close(reverse[index], expected_reverse, atol=0, rtol=0)
+        for actual, expected in zip(
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
+    reason="segmented launches are specific to the native SM100 kernels",
+)
+def test_fragment_summaries_survive_forced_segmentation(monkeypatch):
+    """Segments cut inside fragments, past their end, and in one-chunk fragments still compose."""
+    tensors = make_summary_inputs(47, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    monkeypatch.setattr(native_fwd, "plan_segments", lambda chunks, tiles, sms: (3, 1))
+    monkeypatch.setattr(native_rev, "plan_segments", lambda chunks, tiles, sms: (3, 1))
+    ranges = [*FRAGMENT_BOUNDS, (500, 501), (0, 65)]
+    bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
+
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
+    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5, bounds)
+    for index, (start, stop) in enumerate(ranges):
+        if start == stop:
+            continue
+        for name, actual, expected in zip(
+            ("forward", "reverse"),
+            (forward[index], reverse[index]),
+            reference_summaries(tensors, start, stop),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+            assert_relative_rms_within(
+                actual,
+                expected,
+                f"{name} [{start}, {stop})",
+                max_eps=64,
+                source_dtype=torch.float32,
+            )
+
+
+@pytest.mark.usefixtures("summary_backend")
+def test_fragment_summaries_replay_across_layouts_in_one_cuda_graph():
+    """One captured graph serves any ``bounds`` values of the same shape: the routing is data."""
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(43, tokens=640, heads=2)
+    scale = 128**-0.5
+    bounds = torch.tensor([[0, 256], [256, 640], [640, 640]], dtype=torch.int32, device="cuda")
+
+    def launch():
+        return (
+            build_state_summaries(kg, w, u, cumulative_gate, bounds),
+            build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds),
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+
+    for layout in ([[0, 256], [256, 640], [640, 640]], [[0, 100], [100, 300], [300, 640]]):
+        bounds.copy_(torch.tensor(layout, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(captured, launch(), strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)

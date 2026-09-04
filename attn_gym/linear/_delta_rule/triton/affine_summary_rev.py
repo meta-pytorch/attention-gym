@@ -42,7 +42,7 @@ def _select_block_columns(heads: int, capability: tuple[int, int]) -> int:
     return 32
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def affine_summary_rev_kernel(
     qg,
     kg,
@@ -50,9 +50,9 @@ def affine_summary_rev_kernel(
     dout,
     aqk,
     cumulative_gate,
+    bounds,
     out,
     scale,
-    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -60,30 +60,39 @@ def affine_summary_rev_kernel(
     BN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    """Scan one head and augmented-state column tile backward through BT64 chunks."""
+    """Scan one fragment, head, and augmented-state column tile backward through its chunks.
+
+    ``bounds[fragment] = (start, stop)`` are token offsets; the partial last chunk is masked so
+    tokens past ``stop`` contribute nothing and its gate row is the fragment's final token.
+    """
     head = tl.program_id(0)
     column_tile = tl.program_id(1)
+    fragment = tl.program_id(2)
     if USE_INT64_OFFSETS:
         head = head.to(tl.int64)
         column_tile = column_tile.to(tl.int64)
+        fragment = fragment.to(tl.int64)
+    start = tl.load(bounds + 2 * fragment)
+    stop = tl.load(bounds + 2 * fragment + 1)
+    if USE_INT64_OFFSETS:
+        start = start.to(tl.int64)
+        stop = stop.to(tl.int64)
 
     key = tl.arange(0, K)
     row = tl.arange(0, BT)
     column = column_tile * BN + tl.arange(0, BN)
     state = tl.where(column[None, :] == V + key[:, None], 1.0, 0.0).to(tl.float32)
 
-    for chunk in range(T // BT - 1, -1, -1):
-        if USE_INT64_OFFSETS:
-            token_start = chunk.to(tl.int64) * BT
-        else:
-            token_start = chunk * BT
+    for chunk in range((stop - start + BT - 1) // BT - 1, -1, -1):
+        token_start = start + chunk * BT
         token = token_start + row
+        valid = token[:, None] < stop
 
         token_key_offset = ptr_offset(
             (token[:, None], head, key[None, :]),
             (H * K, K, 1),
         )
-        kg_tile = tl.load(kg + token_key_offset)
+        kg_tile = tl.load(kg + token_key_offset, mask=valid, other=0.0)
         state_hi = state.to(kg_tile.dtype)
         state_lo = (state - state_hi.to(tl.float32)).to(kg_tile.dtype)
         corrected = tl.dot(kg_tile, state_hi)
@@ -95,7 +104,7 @@ def affine_summary_rev_kernel(
                 (token[:, None], head, column[None, :]),
                 (H * V, V, 1),
             ),
-            mask=column[None, :] < V,
+            mask=valid & (column[None, :] < V),
             other=0.0,
         )
         aqk_tile = tl.load(
@@ -103,27 +112,29 @@ def affine_summary_rev_kernel(
             + ptr_offset(
                 (token[:, None], head, row[None, :]),
                 (H * BT, BT, 1),
-            )
+            ),
+            mask=valid,
+            other=0.0,
         )
         corrected = tl.dot(tl.trans(aqk_tile), dout_tile, acc=corrected)
 
         gate_offset = ptr_offset(
-            (token_start + BT - 1, head, key),
+            (tl.minimum(token_start + BT - 1, stop - 1), head, key),
             (H * K, K, 1),
         )
         state *= tl.exp2(tl.load(cumulative_gate + gate_offset))[:, None]
 
-        qg_tile = tl.load(qg + token_key_offset)
+        qg_tile = tl.load(qg + token_key_offset, mask=valid, other=0.0)
         state += tl.dot(tl.trans(qg_tile), dout_tile) * scale
-        w_tile = tl.load(w + token_key_offset)
+        w_tile = tl.load(w + token_key_offset, mask=valid, other=0.0)
         corrected_hi = corrected.to(w_tile.dtype)
         corrected_lo = (corrected - corrected_hi.to(tl.float32)).to(w_tile.dtype)
         state -= tl.dot(tl.trans(w_tile), corrected_hi)
         state -= tl.dot(tl.trans(w_tile), corrected_lo)
 
     out_offset = ptr_offset(
-        (head, column[None, :], key[:, None]),
-        ((V + K) * K, K, 1),
+        (fragment, head, column[None, :], key[:, None]),
+        (H * (V + K) * K, (V + K) * K, K, 1),
     )
     tl.store(out + out_offset, state)
 
@@ -136,22 +147,23 @@ def launch_affine_summary_rev(
     aqk: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
+    bounds: torch.Tensor,
     out: torch.Tensor,
     capability: tuple[int, int],
 ) -> None:
-    """Launch a validated, BT64-padded summary into a preallocated FP32 output."""
-    _, tokens, heads, _ = qg.shape
+    """Launch validated inputs: one summary per ``bounds`` row into ``out[F, H, V + K, K]``."""
+    heads = qg.shape[2]
     block_columns = _select_block_columns(heads, capability)
-    affine_summary_rev_kernel[(heads, _SUMMARY_DIM // block_columns)](
+    affine_summary_rev_kernel[(heads, _SUMMARY_DIM // block_columns, bounds.shape[0])](
         qg,
         kg,
         w,
         dout,
         aqk,
         cumulative_gate,
+        bounds,
         out,
         float(scale),
-        tokens,
         H=heads,
         K=_KEY_DIM,
         V=_VALUE_DIM,

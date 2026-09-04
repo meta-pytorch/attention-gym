@@ -38,7 +38,6 @@ from typing import NamedTuple
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-import torch.nn.functional as F
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -54,6 +53,7 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     plan_segments,
 )
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
+from attn_gym.utils import cdiv
 
 BT = 64
 KEY_DIM = 128
@@ -201,12 +201,18 @@ class BlackwellDeltaAffineSummaryRev:
         dout: cute.Tensor,
         aqk: cute.Tensor,
         cumulative_gate: cute.Tensor,
+        bounds: cute.Tensor,
         out: cute.Tensor,
         scale: Float32,
-        chunks_per_segment: Int32,
+        segments: Int32,
         stream: cuda.CUstream,
     ):
-        """Construct TMA/UMMA descriptors and launch the persistent kernel."""
+        """Construct TMA/UMMA descriptors and launch the persistent kernel.
+
+        ``bounds[f] = (start, stop)`` are token offsets into the ``[1, T, H, D]`` inputs; each
+        fragment's chunks are split into ``segments`` ranges and ``out[f * segments + s]``
+        receives segment ``s`` of fragment ``f``.
+        """
         g_k = _sequence_feature_head_batch_view(kg)
         g_qt = _feature_sequence_head_batch_view(qg)
         g_wt = _feature_sequence_head_batch_view(w)
@@ -459,11 +465,11 @@ class BlackwellDeltaAffineSummaryRev:
         self.kernel(
             mmas,
             tma_ops,
+            bounds,
             out,
             smem_layouts,
-            Int32(cute.size(w.shape[1])),
             scale,
-            chunks_per_segment,
+            segments,
         ).launch(
             grid=self._launch_grid(cute.size(out.shape[0])),
             block=(self.CTA_THREADS, 1, 1),
@@ -473,20 +479,80 @@ class BlackwellDeltaAffineSummaryRev:
         )
 
     @cute.jit
-    def _decode_work(self, work_index, chunks, chunks_per_segment):
-        """Return the augmented-column tile, head, and chunk range of a work item.
+    def _decode_work(self, work_index, bounds, segments):
+        """Return the column tile, head, output row, token range, and chunk range of a work item.
 
-        Each segment scans its own chunk range from ``[0 | I]``; the host composes them.
+        ``bounds[fragment] = (start, stop)`` are token offsets; each fragment's chunks are split
+        into ``segments`` ranges that scan from ``[0 | I]``, and output row ``work`` is
+        ``fragment * segments + segment``. Empty ranges store the identity.
         """
         # ``column_tiles`` and ``num_heads`` are compile-time constants, so these divisions lower
         # to shifts and multiply-high sequences; they also run once per work item, not per chunk.
         column_tiles = SUMMARY_DIM // self.BN
         column_tile = work_index % column_tiles
         head = (work_index // column_tiles) % self.num_heads
-        segment = work_index // (column_tiles * self.num_heads)
-        chunk_begin = segment * chunks_per_segment  # < chunks: plan_segments drops empties
-        chunk_end = cutlass.min(chunk_begin + chunks_per_segment, chunks)
-        return column_tile, head, segment, chunk_begin, chunk_end
+        work = work_index // (column_tiles * self.num_heads)
+        fragment = work // segments
+        segment = work - fragment * segments
+        start = bounds[fragment, 0]
+        length = bounds[fragment, 1] - start
+        num_chunks = (length + self.BT - 1) // self.BT
+        chunks_per_segment = (num_chunks + segments - 1) // segments
+        chunk_begin = cutlass.min(segment * chunks_per_segment, num_chunks)
+        chunk_end = cutlass.min(chunk_begin + chunks_per_segment, num_chunks)
+        return column_tile, head, work, start, length, chunk_begin, chunk_end
+
+    @cute.jit
+    def _neutralize_do_tail(self, smem, stage, valid_rows, tid):
+        """Zero ``dO`` token rows ``>= valid_rows`` of one B-operand stage before UMMA reads it."""
+        column_atom = cute.size(smem, mode=[0, 0])
+        token_atom = cute.size(smem, mode=[0, 1])
+        assert column_atom * cute.size(smem, mode=[1]) == self.BN, "column modes must tile BN"
+        assert token_atom * cute.size(smem, mode=[2]) == self.BT, "token modes must tile BT"
+        for token in cutlass.range(valid_rows, self.BT, unroll=1):
+            for column_block in cutlass.range_constexpr(
+                (self.BN + self.WARP_SIZE - 1) // self.WARP_SIZE
+            ):
+                column = tid + column_block * self.WARP_SIZE
+                if column < self.BN:
+                    coordinate = (
+                        (column % column_atom, token % token_atom),
+                        column // column_atom,
+                        token // token_atom,
+                        stage,
+                    )
+                    smem[coordinate] = self.io_type(0.0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _neutralize_w_tail(self, smem, stage, valid_rows, tid):
+        """Zero ``w^T`` token columns ``>= valid_rows`` of one A-operand stage before UMMA reads it."""
+        row_atom = cute.size(smem, mode=[0, 0, 0])
+        token_atom = cute.size(smem, mode=[0, 1])
+        assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
+        assert row_atom * cute.size(smem, mode=[0, 0, 1]) == self.BK
+        assert token_atom * cute.size(smem, mode=[2]) == self.BT
+        for token in cutlass.range(valid_rows, self.BT, unroll=1):
+            for row_block in cutlass.range_constexpr(self.BK // self.WARP_SIZE):
+                row = tid + row_block * self.WARP_SIZE
+                coordinate = (
+                    ((row % row_atom, row // row_atom), token % token_atom),
+                    0,
+                    token // token_atom,
+                    stage,
+                )
+                smem[coordinate] = self.io_type(0.0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _tail_valid_rows(self, length):
+        """Valid token rows of a fragment's last chunk, or zero when that chunk is full."""
+        rows = length - ((length + self.BT - 1) // self.BT - 1) * self.BT
+        if rows == self.BT:
+            rows = Int32(0)
+        return rows
 
     @cute.jit
     def run_state(
@@ -494,8 +560,8 @@ class BlackwellDeltaAffineSummaryRev:
         block,
         grid,
         iterations,
-        chunks,
-        chunks_per_segment,
+        bounds,
+        segments,
         out,
         t_dv_acc,
         t_qdo_acc,
@@ -575,8 +641,8 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, head, segment, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, chunks, chunks_per_segment
+            column_tile, head, segment, _start, _length, chunk_begin, chunk_end = (
+                self._decode_work(block + tile_index * grid, bounds, segments)
             )
             has_source = column_tile < VAL_DIM // self.BN
 
@@ -690,8 +756,8 @@ class BlackwellDeltaAffineSummaryRev:
         block,
         grid,
         iterations,
-        chunks,
-        chunks_per_segment,
+        bounds,
+        segments,
         mma_dv,
         mma_qdo,
         mma_aqdo,
@@ -722,15 +788,25 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, head, _segment, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, chunks, chunks_per_segment
+            column_tile, head, _work, start, length, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, bounds, segments
             )
             has_source = column_tile < VAL_DIM // self.BN
 
-            k_smem, k_gmem = self._partition_a(atom_k, desc_k, s_k, self.dv_tile, mma_dv, head)
+            # The fragment starts at token ``start``: offset every descriptor along its token mode
+            # so chunk ``ct`` reads tokens ``start + ct * BT`` onward. A partial last chunk
+            # over-reads the following tokens; the MMA warp neutralizes them through ``do`` and
+            # ``w`` and the gate row is clamped to the fragment's final token.
+            k_desc = cute.domain_offset((start, 0, (0, 0)), desc_k)
+            w_desc = cute.domain_offset((0, start, (0, 0)), desc_w)
+            gate_desc = cute.domain_offset((0, start, (0, 0)), desc_gate)
+            q_desc = cute.domain_offset((0, start, (0, 0)), desc_q)
+            do_desc = cute.domain_offset((0, start, (0, 0)), desc_do)
+            aqk_desc = cute.domain_offset((0, start, (0, 0)), desc_aqk)
+            k_smem, k_gmem = self._partition_a(atom_k, k_desc, s_k, self.dv_tile, mma_dv, head)
             w_smem, w_gmem = self._partition_a(
                 atom_w,
-                desc_w,
+                w_desc,
                 s_w,
                 self.wdv_tile,
                 mma_wdv,
@@ -738,13 +814,13 @@ class BlackwellDeltaAffineSummaryRev:
             )
             gate_smem, gate_gmem = self._partition_epilogue(
                 atom_gate,
-                desc_gate[None, None, (head, 0)],
+                gate_desc[None, None, (head, 0)],
                 (self.BK, 1),
                 s_gate,
             )
             q_smem, q_gmem = self._partition_a(
                 atom_q,
-                desc_q,
+                q_desc,
                 s_q,
                 self.qdo_tile,
                 mma_qdo,
@@ -752,7 +828,7 @@ class BlackwellDeltaAffineSummaryRev:
             )
             do_smem, do_gmem = self._partition_b(
                 atom_do,
-                desc_do,
+                do_desc,
                 s_do,
                 self.qdo_tile,
                 mma_qdo,
@@ -760,7 +836,7 @@ class BlackwellDeltaAffineSummaryRev:
             )
             aqk_smem, aqk_gmem = self._partition_a(
                 atom_aqk,
-                desc_aqk,
+                aqk_desc,
                 s_aqk,
                 self.aqdo_tile,
                 mma_aqdo,
@@ -773,7 +849,9 @@ class BlackwellDeltaAffineSummaryRev:
                 gate_handle = gate_producer.acquire_and_advance()
                 cute.copy(
                     atom=atom_gate,
-                    src=gate_gmem[(None, 0, reverse_chunk * self.BT + self.BT - 1)],
+                    src=gate_gmem[
+                        (None, 0, cutlass.min(reverse_chunk * self.BT + self.BT - 1, length - 1))
+                    ],
                     dst=gate_smem[None, gate_handle.index],
                     tma_bar_ptr=gate_handle.barrier,
                 )
@@ -825,8 +903,8 @@ class BlackwellDeltaAffineSummaryRev:
         block,
         grid,
         iterations,
-        chunks,
-        chunks_per_segment,
+        bounds,
+        segments,
         gate,
         gate_exp,
         gate_consumer,
@@ -840,8 +918,8 @@ class BlackwellDeltaAffineSummaryRev:
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            _, _, _, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, chunks, chunks_per_segment
+            _, _, _, _, _, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, bounds, segments
             )
             for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 gate_handle = gate_consumer.wait_and_advance()
@@ -862,8 +940,8 @@ class BlackwellDeltaAffineSummaryRev:
         block,
         grid,
         iterations,
-        chunks,
-        chunks_per_segment,
+        bounds,
+        segments,
         mmas,
         t_dv_acc,
         t_k,
@@ -876,6 +954,8 @@ class BlackwellDeltaAffineSummaryRev:
         t_wdv_acc,
         t_w,
         t_dv,
+        s_do,
+        s_w,
         state_consumer,
         k_consumer,
         dv_producer,
@@ -890,20 +970,29 @@ class BlackwellDeltaAffineSummaryRev:
         """Issue the four UMMA operations for each reverse chunk.
 
         MMA1 (``kg @ X``) and MMA4 (``w^T @ dv``) each run two accumulate passes
-        over the hi/lo halves of their fp32-valued B operand.
+        over the hi/lo halves of their fp32-valued B operand. On a fragment's partial last
+        chunk the ``dO`` and ``w`` stages are zeroed past the valid rows before UMMA reads
+        them, so over-read tokens contribute nothing.
         """
         cute.arch.setmaxregister_decrease(self.aux_regs)
+        tid, _, _ = cute.arch.thread_idx()
+        mma_tid = tid - WarpRole.MMA * self.WARP_SIZE
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
 
         tile_index = Int32(0)
         has_work = tile_index < iterations
         while has_work:
-            column_tile, _head, _segment, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, chunks, chunks_per_segment
+            column_tile, _head, _work, _start, length, chunk_begin, chunk_end = self._decode_work(
+                block + tile_index * grid, bounds, segments
             )
             has_source = column_tile < VAL_DIM // self.BN
+            # The fragment's last chunk is the first one this range visits when it owns it.
+            tail_valid_rows = self._tail_valid_rows(length)
+            last_chunk = (length + self.BT - 1) // self.BT - 1
 
-            for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
+            for chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
+                reverse_chunk = chunk_end - 1 - (chunk - chunk_begin)
+                is_tail = reverse_chunk == last_chunk and tail_valid_rows != 0
                 # The source products do not depend on the state, so they run while
                 # the state warps are still producing the X snapshot: Aqk^T dO seeds
                 # the dv accumulator and qg^T dO completes off the recurrence chain.
@@ -912,6 +1001,9 @@ class BlackwellDeltaAffineSummaryRev:
                     q_handle = q_consumer.wait_and_advance()
                     do_handle = do_consumer.wait_and_advance()
                     aqk_handle = aqk_consumer.wait_and_advance()
+                    if is_tail:
+                        # Tokens past the fragment feed both Aqk^T dO and qg^T dO through dO.
+                        self._neutralize_do_tail(s_do, do_handle.index, tail_valid_rows, mma_tid)
                     for k_block in cutlass.range(cute.size(t_aqk, mode=[2]), unroll_full=True):
                         mma_aqdo.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(k_block != 0))
                         cute.gemm(
@@ -959,6 +1051,9 @@ class BlackwellDeltaAffineSummaryRev:
                 dv_handle.commit()
 
                 w_handle = w_consumer.wait_and_advance()
+                if is_tail:
+                    # dv rows past the fragment hold k @ X of foreign tokens; w^T drops them.
+                    self._neutralize_w_tail(s_w, w_handle.index, tail_valid_rows, mma_tid)
                 wdv_handle = wdv_producer.acquire_and_advance()
                 for split in cutlass.range_constexpr(2):
                     dv_operand_handle = dv_operand_consumer.wait_and_advance()
@@ -986,11 +1081,11 @@ class BlackwellDeltaAffineSummaryRev:
         self,
         mmas: Mmas,
         tma: TmaOps,
+        bounds: cute.Tensor,
         out: cute.Tensor,
         smem_layouts: SmemLayouts,
-        tokens: Int32,
         scale: Float32,
-        chunks_per_segment: Int32,
+        segments: Int32,
     ):
         """Dispatch the persistent state, TMA, gate, and MMA warp roles."""
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
@@ -1184,15 +1279,14 @@ class BlackwellDeltaAffineSummaryRev:
         grid = cute.arch.grid_dim()[0]
         work_items = self.num_heads * (SUMMARY_DIM // self.BN) * cute.size(out.shape[0])
         iterations = (work_items - block + grid - 1) // grid
-        chunks = tokens // self.BT
 
         if warp_id in self.STATE_WARP_IDS:
             self.run_state(
                 block,
                 grid,
                 iterations,
-                chunks,
-                chunks_per_segment,
+                bounds,
+                segments,
                 out,
                 t_dv_acc,
                 t_qdo_acc,
@@ -1213,8 +1307,8 @@ class BlackwellDeltaAffineSummaryRev:
                 block,
                 grid,
                 iterations,
-                chunks,
-                chunks_per_segment,
+                bounds,
+                segments,
                 mma_dv,
                 mma_qdo,
                 mma_aqdo,
@@ -1238,8 +1332,8 @@ class BlackwellDeltaAffineSummaryRev:
                 block,
                 grid,
                 iterations,
-                chunks,
-                chunks_per_segment,
+                bounds,
+                segments,
                 gate,
                 gate_exp,
                 gate_consumer,
@@ -1250,8 +1344,8 @@ class BlackwellDeltaAffineSummaryRev:
                 block,
                 grid,
                 iterations,
-                chunks,
-                chunks_per_segment,
+                bounds,
+                segments,
                 mmas,
                 t_dv_acc,
                 t_k,
@@ -1264,6 +1358,8 @@ class BlackwellDeltaAffineSummaryRev:
                 t_wdv_acc,
                 t_w,
                 t_dv,
+                s_do,
+                s_w,
                 state_consumer,
                 k_consumer,
                 dv_producer,
@@ -1361,7 +1457,7 @@ def _compile_affine_summary_rev(
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
         raise ValueError(f"affine_summary_rev requires an SM100/SM103 target; got {target}")
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-    tokens = sym_int(divisibility=BT)
+    tokens = sym_int()
 
     def factor(dtype, last_dim: int):
         return make_fake_compact_tensor(
@@ -1372,6 +1468,7 @@ def _compile_affine_summary_rev(
         )
 
     io_dtype = _CUTE_IO_TYPES[dtype_name]
+    bounds = make_fake_compact_tensor(Int32, (sym_int(), 2), stride_order=(1, 0))
     out = make_fake_compact_tensor(
         Float32,
         (sym_int(), heads, SUMMARY_DIM, KEY_DIM),
@@ -1390,6 +1487,7 @@ def _compile_affine_summary_rev(
         factor(io_dtype, VAL_DIM),
         factor(io_dtype, BT),
         factor(Float32, KEY_DIM),
+        bounds,
         out,
         Float32(1.0),
         Int32(1),
@@ -1397,7 +1495,7 @@ def _compile_affine_summary_rev(
 
 
 @torch.compiler.disable
-def build_state_grad_summary(
+def build_state_grad_summaries(
     qg: torch.Tensor,
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -1405,8 +1503,9 @@ def build_state_grad_summary(
     Aqk: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
+    bounds: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute one shard's packed reverse affine summary.
+    """Compute one packed reverse affine summary per token range of a stream.
 
     Args:
         qg: Gated queries, shape ``[1, T, H, 128]``, bf16 or fp16.
@@ -1416,21 +1515,25 @@ def build_state_grad_summary(
         Aqk: Intra-chunk query/key factor, shape ``[1, T, H, 64]``, same dtype as ``qg``.
         cumulative_gate: Cumulative log2 gates, shape ``[1, T, H, 128]``, fp32.
         scale: Query scaling factor used by the local backward recurrence.
+        bounds: ``int32 [F, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
+            same contract as ``build_state_summaries``.
 
     Returns:
-        FP32 tensor of shape ``[H, 256, 128]``, V-first packed as local bias then
-        reverse transition for ``dH_in = dH_out @ transition + bias``.
+        FP32 tensor of shape ``[F, H, 256, 128]``, V-first packed as local bias then reverse
+        transition for ``dH_in = dH_out @ transition + bias``, one per row of ``bounds``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs.
-    SM100 uses the native UMMA kernel; other capability 8.0+ targets use Triton.
-    A partial final chunk is neutral-padded by the wrapper.
+    The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
+    across different ``bounds`` values of the same shape. The tokens right after a partial last
+    chunk are read and then cancelled (through zeroed ``dO`` rows and ``w`` columns), so they must
+    be finite. Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses
+    the native UMMA kernel; other capability 8.0+ targets use Triton.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
-    assert batch == 1, f"build_state_grad_summary requires B=1, got B={batch}"
-    assert tokens > 0, "build_state_grad_summary requires at least one token"
-    assert heads > 0, "build_state_grad_summary requires at least one head"
-    assert key_dim == KEY_DIM, f"build_state_grad_summary requires K={KEY_DIM}, got {key_dim}"
+    assert batch == 1, f"build_state_grad_summaries requires B=1, got B={batch}"
+    assert tokens > 0, "build_state_grad_summaries requires at least one token"
+    assert heads > 0, "build_state_grad_summaries requires at least one head"
+    assert key_dim == KEY_DIM, f"build_state_grad_summaries requires K={KEY_DIM}, got {key_dim}"
     for name, tensor in (("kg", kg), ("w", w), ("dout", dout)):
         assert tensor.shape == qg.shape, (
             f"{name} must match qg shape {tuple(qg.shape)}, got {tuple(tensor.shape)}"
@@ -1450,14 +1553,18 @@ def build_state_grad_summary(
     assert cumulative_gate.dtype == torch.float32, (
         f"cumulative_gate must be fp32, got {cumulative_gate.dtype}"
     )
+    assert bounds.ndim == 2 and bounds.shape[1] == 2 and bounds.shape[0] > 0, (
+        f"bounds must have shape [F, 2] with F > 0, got {tuple(bounds.shape)}"
+    )
+    assert bounds.dtype == torch.int32, f"bounds must be int32, got {bounds.dtype}"
 
     if isinstance(qg, FakeTensor):
         raise TypeError(
-            "build_state_grad_summary does not support torch.export; run the context-parallel "
+            "build_state_grad_summaries does not support torch.export; run the context-parallel "
             "summary eagerly or under CUDA Graph capture"
         )
 
-    assert qg.is_cuda, "build_state_grad_summary requires CUDA tensors"
+    assert qg.is_cuda, "build_state_grad_summaries requires CUDA tensors"
     inputs = (
         ("qg", qg),
         ("kg", kg),
@@ -1465,21 +1572,12 @@ def build_state_grad_summary(
         ("dout", dout),
         ("Aqk", Aqk),
         ("cumulative_gate", cumulative_gate),
+        ("bounds", bounds),
     )
     for name, tensor in inputs:
         assert tensor.device == qg.device, f"{name} must be on {qg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-    pad = (-tokens) % BT
-    if pad:
-        padding = (0, 0, 0, 0, 0, pad)
-        qg, kg, w, dout, Aqk = (F.pad(tensor, padding) for tensor in (qg, kg, w, dout, Aqk))
-        cumulative_gate = torch.cat(
-            (
-                cumulative_gate,
-                cumulative_gate[:, -1:].expand(-1, pad, -1, -1),
-            ),
-            dim=1,
-        )
+    fragments = bounds.shape[0]
     properties = get_device_properties(qg.device)
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
@@ -1494,7 +1592,9 @@ def build_state_grad_summary(
             launch_affine_summary_rev,
         )
 
-        out = torch.empty((heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device)
+        out = torch.empty(
+            (fragments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
+        )
         launch_affine_summary_rev(
             qg,
             kg,
@@ -1503,6 +1603,7 @@ def build_state_grad_summary(
             Aqk,
             cumulative_gate,
             scale,
+            bounds,
             out,
             capability,
         )
@@ -1511,13 +1612,14 @@ def build_state_grad_summary(
     qg, kg, w, dout, Aqk, cumulative_gate = (
         _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
     )
-    segments, chunks_per_segment = plan_segments(
-        qg.shape[1] // BT,
-        heads * (SUMMARY_DIM // BlackwellDeltaAffineSummaryRev.BN),
-        get_device_properties(qg.device).multi_processor_count,
+    # Segment on the average fragment length, as the forward does; see its note on skew.
+    segments, _ = plan_segments(
+        max(1, cdiv(tokens, BT) // fragments),
+        fragments * heads * (SUMMARY_DIM // BlackwellDeltaAffineSummaryRev.BN),
+        properties.multi_processor_count,
     )
     segment_out = torch.empty(
-        (segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
+        (fragments * segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
     )
     use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, segment_out)
     compiled = _compile_affine_summary_rev(_IO_TYPE_NAMES[qg.dtype], heads, use_int64_offsets)
@@ -1528,11 +1630,31 @@ def build_state_grad_summary(
         dout.detach(),
         Aqk.detach(),
         cumulative_gate.detach(),
+        bounds,
         segment_out,
         Float32(scale),
-        chunks_per_segment,
+        segments,
     )
-    if segments == 1:
-        return segment_out[0]
+    segment_out = segment_out.view(fragments, segments, heads, SUMMARY_DIM, KEY_DIM)
     # The cotangent flows through the last segment first.
-    return compose_segment_summaries(segment_out.flip(0))
+    return compose_segment_summaries(segment_out.flip(1))
+
+
+@torch.compiler.disable
+def build_state_grad_summary(
+    qg: torch.Tensor,
+    kg: torch.Tensor,
+    w: torch.Tensor,
+    dout: torch.Tensor,
+    Aqk: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Compute one shard's packed reverse affine summary over all ``T`` tokens.
+
+    The single-range form of :func:`build_state_grad_summaries` (a partial final chunk is
+    handled in the kernel); see it for the argument contract. Returns FP32 ``[H, 256, 128]``.
+    """
+    # arange keeps the bounds device-built, so capture never sees a host-to-device copy.
+    bounds = (torch.arange(2, dtype=torch.int32, device=qg.device) * qg.shape[1]).view(1, 2)
+    return build_state_grad_summaries(qg, kg, w, dout, Aqk, cumulative_gate, scale, bounds)[0]

@@ -45,7 +45,9 @@ halves of the I/O dtype and accumulated in two UMMA passes. The A operands
 (``w``, ``kg``) and ``u`` retain their original bf16/fp16 storage.
 
 Limitations:
-  - B=1, dense complete chunks only (``T % 64 == 0``), fixed K=V=128, BT=64.
+  - B=1, fixed K=V=128, BT=64; any ``T``. Token ranges come from a device ``bounds`` tensor and
+    a partial last chunk is neutralized in-kernel (gate row clamped, over-read ``kg`` columns
+    zeroed), which assumes the over-read tokens are finite: ``0 * inf`` is NaN.
   - Contiguous inputs; SM100 (tcgen05) only.
 """
 
@@ -58,7 +60,6 @@ from typing import NamedTuple
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-import torch.nn.functional as F
 from cuda.bindings import driver as cuda
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -210,11 +211,17 @@ class _AffineSummaryFwdOp:
         mW: cute.Tensor,
         mU: cute.Tensor,
         mG: cute.Tensor,
+        mBounds: cute.Tensor,
         mOut: cute.Tensor,
-        chunks_per_segment: Int32,
+        segments: Int32,
         stream: cuda.CUstream,
     ):
-        """Launch one CTA per (augmented-state column tile, head, chunk segment)."""
+        """Launch one CTA per (augmented-state column tile, head, fragment segment).
+
+        ``mBounds[f] = (start, stop)`` are token offsets into the ``[1, T, H, D]`` inputs; each
+        fragment's chunks are split into ``segments`` ranges that scan from ``[0 | I]``, and
+        ``mOut[f * segments + s]`` receives segment ``s`` of fragment ``f``.
+        """
         # Re-rank the dense [1, T, H, D] inputs into the logical TMA views.
         g_w = _sequence_feature_head_batch_view(mW)
         g_kgt = _feature_sequence_head_batch_view(mKg)
@@ -368,7 +375,6 @@ class _AffineSummaryFwdOp:
 
         self.shared_type = Shared
 
-        num_chunks = Int32(cute.size(mW.shape[1])) // BT
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             Mmas(mma_wx, mma_kt, mma_ktu),
@@ -378,6 +384,7 @@ class _AffineSummaryFwdOp:
                 TmaOp(atom_u, desc_u),
                 TmaOp(atom_gk, desc_gk),
             ),
+            mBounds,
             mOut,
             SmemLayouts(
                 s_w_staged,
@@ -388,8 +395,7 @@ class _AffineSummaryFwdOp:
                 s_tmpb_staged,
                 s_tmpb_store_staged,
             ),
-            num_chunks,
-            chunks_per_segment,
+            segments,
         ).launch(
             grid=(SUMMARY_DIM // self.BN, self.heads, cute.size(mOut.shape[0])),
             block=(self.CTA_THREADS, 1, 1),
@@ -424,6 +430,8 @@ class _AffineSummaryFwdOp:
         head,
         col_tile,
         is_value,
+        start,
+        length,
         chunk_begin,
         chunk_end,
         tma,
@@ -439,12 +447,22 @@ class _AffineSummaryFwdOp:
         pu_P,
         pgk_P,
     ):
-        """Own the per-chunk TMA G2S loads for w, kg^T, u, and the gate row."""
+        """Own the per-chunk TMA G2S loads for w, kg^T, u, and the gate row.
+
+        The fragment starts at token ``start`` of the stream, so every descriptor is offset along
+        its token mode and chunk ``ct`` reads tokens ``start + ct * BT`` onward; a partial last
+        chunk over-reads into the next fragment's tokens (or TMA zero fill past ``T``), which the
+        MMA warp neutralizes through ``kg`` and the gate row clamp below.
+        """
         batch = Int32(0)
-        tWs, tWg = self._part_a(tma.w.atom, tma.w.desc, sW, self.wx_tile, mma_wx, batch, head)
-        tKgs, tKgg = self._part_a(tma.kg.atom, tma.kg.desc, sKg, self.kt_tile, mma_kt, batch, head)
-        sUp, gUp = self._part_b(tma.u.atom, tma.u.desc, sU, self.kt_tile, mma_ktu, batch, head)
-        gGK_l = tma.gk.desc[None, None, (head, batch)]
+        desc_w = cute.domain_offset((start, 0, (0, 0)), tma.w.desc)
+        desc_kg = cute.domain_offset((0, start, (0, 0)), tma.kg.desc)
+        desc_u = cute.domain_offset((0, start, (0, 0)), tma.u.desc)
+        desc_gk = cute.domain_offset((0, start, (0, 0)), tma.gk.desc)
+        tWs, tWg = self._part_a(tma.w.atom, desc_w, sW, self.wx_tile, mma_wx, batch, head)
+        tKgs, tKgg = self._part_a(tma.kg.atom, desc_kg, sKg, self.kt_tile, mma_kt, batch, head)
+        sUp, gUp = self._part_b(tma.u.atom, desc_u, sU, self.kt_tile, mma_ktu, batch, head)
+        gGK_l = desc_gk[None, None, (head, batch)]
         sGKp, gGKp = self._part_epi(tma.gk.atom, gGK_l, (KEY_DIM, 1), gk_3d)
 
         for ct in cutlass.range(chunk_begin, chunk_end, unroll=0):
@@ -470,10 +488,12 @@ class _AffineSummaryFwdOp:
                     dst=sUp[None, uh.index],
                     tma_bar_ptr=uh.barrier,
                 )
+            # The chunk-final gate row: the fragment's last token when the chunk is partial.
+            gk_t = cutlass.min(ct * BT + BT - 1, length - 1)
             gkh = pgk_P.acquire_and_advance()
             cute.copy(
                 atom=tma.gk.atom,
-                src=gGKp[(None, 0, ct * BT + BT - 1)],
+                src=gGKp[(None, 0, gk_t)],
                 dst=sGKp[None, gkh.index],
                 tma_bar_ptr=gkh.barrier,
             )
@@ -483,6 +503,9 @@ class _AffineSummaryFwdOp:
         self,
         is_value,
         num_chunks,
+        tail_chunk,
+        tail_valid_rows,
+        sKg,
         mma_wx,
         mma_kt,
         mma_ktu,
@@ -508,10 +531,18 @@ class _AffineSummaryFwdOp:
         TMA ring, off the recurrence critical path) plus two hi/lo accumulate
         passes over ``Kg^T @ (-wx)``; MMA1 likewise runs two passes over the
         hi/lo state snapshot, recovering ~fp32 operand precision.
+
+        Chunk ``tail_chunk`` (local index) holds only ``tail_valid_rows`` fragment tokens; its
+        remaining ``kg`` columns are zeroed before use so the over-read tokens contribute nothing
+        to either ``Kg^T @ U`` or ``Kg^T @ (-wx)``.
         """
-        for _ct in cutlass.range(0, num_chunks, unroll=0):
+        tid, _, _ = cute.arch.thread_idx()
+        mma_tid = tid - WarpRole.MMA * self.WARP_SZ
+        for ct in cutlass.range(0, num_chunks, unroll=0):
             # --- MMA2a: kg^T(SMEM A) × U(SMEM B) → kt(TMEM), value tiles only ---
             kgh = pkg_C.wait_and_advance()
+            if ct == tail_chunk and tail_valid_rows != 0:
+                self._neutralize_kg_tail(sKg, kgh.index, tail_valid_rows, mma_tid)
             ktd = pkt_P.acquire_and_advance()
             if is_value:
                 uh = pu_C.wait_and_advance()
@@ -562,6 +593,27 @@ class _AffineSummaryFwdOp:
                 tmpbh.release()
             ktd.commit()
             kgh.release()
+
+    @cute.jit
+    def _neutralize_kg_tail(self, smem, stage, valid_rows, tid):
+        """Zero ``kg^T`` token columns ``>= valid_rows`` of one stage before UMMA reads it."""
+        row_atom = cute.size(smem, mode=[0, 0, 0])
+        token_atom = cute.size(smem, mode=[0, 1])
+        assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
+        assert row_atom * cute.size(smem, mode=[0, 0, 1]) == KEY_DIM
+        assert token_atom * cute.size(smem, mode=[2]) == BT
+        for token in cutlass.range(valid_rows, BT, unroll=1):
+            for row_block in cutlass.range_constexpr(KEY_DIM // self.WARP_SZ):
+                row = tid + row_block * self.WARP_SZ
+                coordinate = (
+                    ((row % row_atom, row // row_atom), token % token_atom),
+                    0,
+                    token // token_atom,
+                    stage,
+                )
+                smem[coordinate] = self.io_type(0.0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
 
     @cute.jit
     def run_state(
@@ -725,10 +777,10 @@ class _AffineSummaryFwdOp:
         self,
         mmas: Mmas,
         tma: TmaOps,
+        mBounds: cute.Tensor,
         mOut: cute.Tensor,
         smem_layouts: SmemLayouts,
-        num_chunks: Int32,
-        chunks_per_segment: Int32,
+        segments: Int32,
     ):
         mma_wx, mma_kt, mma_ktu = mmas
         (
@@ -880,19 +932,30 @@ class _AffineSummaryFwdOp:
         t_kt_acc = cute.make_tensor(tp + self.tm_kt, kt_fk.layout)
 
         # #
-        # Role dispatch: one CTA owns one (column tile, head, chunk segment) state slice.
+        # Role dispatch: one CTA owns one (column tile, head, fragment segment) state slice.
         #
-        col_tile, head, segment = cute.arch.block_idx()
+        col_tile, head, work = cute.arch.block_idx()
         col_base = col_tile * self.BN
         is_value = col_base < VAL_DIM
-        # Each segment scans its own chunk range from [0 | I]; the host composes them.
-        chunk_begin = segment * chunks_per_segment  # < num_chunks: plan_segments drops empties
+        fragment = work // segments
+        segment = work - fragment * segments
+        start = mBounds[fragment, 0]
+        length = mBounds[fragment, 1] - start
+        num_chunks = (length + BT - 1) // BT
+        # Each segment scans its own chunk range from [0 | I]; the host composes them. Empty
+        # ranges (short or empty fragments) store the identity.
+        chunks_per_segment = (num_chunks + segments - 1) // segments
+        chunk_begin = cutlass.min(segment * chunks_per_segment, num_chunks)
         chunk_end = cutlass.min(chunk_begin + chunks_per_segment, num_chunks)
+        tail_valid_rows = length - (num_chunks - 1) * BT  # == BT when the last chunk is full
+        if tail_valid_rows == BT:
+            tail_valid_rows = Int32(0)
+        tail_chunk = num_chunks - 1 - chunk_begin  # local index of the fragment's last chunk
 
         if warp_id in self.CUDA_WARP_IDS:
             self.run_state(
                 head=head,
-                segment=segment,
+                segment=work,
                 col_base=col_base,
                 num_chunks=chunk_end - chunk_begin,
                 mOut=mOut,
@@ -912,6 +975,8 @@ class _AffineSummaryFwdOp:
                 head=head,
                 col_tile=col_tile,
                 is_value=is_value,
+                start=start,
+                length=length,
                 chunk_begin=chunk_begin,
                 chunk_end=chunk_end,
                 tma=tma,
@@ -931,6 +996,9 @@ class _AffineSummaryFwdOp:
             self.run_mma(
                 is_value=is_value,
                 num_chunks=chunk_end - chunk_begin,
+                tail_chunk=tail_chunk,
+                tail_valid_rows=tail_valid_rows,
+                sKg=sKg,
                 mma_wx=mma_wx,
                 mma_kt=mma_kt,
                 mma_ktu=mma_ktu,
@@ -1006,7 +1074,7 @@ def _compile_affine_summary(
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
         raise ValueError(f"affine_summary_fwd requires an SM100/SM103 target; got {target}")
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-    tokens = sym_int(divisibility=BT)
+    tokens = sym_int()
 
     def factor(dtype, last_dim: int):
         return make_fake_compact_tensor(
@@ -1017,6 +1085,7 @@ def _compile_affine_summary(
         )
 
     io_dtype = _CUTE_IO_TYPES[dtype_name]
+    bounds = make_fake_compact_tensor(Int32, (sym_int(), 2), stride_order=(1, 0))
     out = make_fake_compact_tensor(
         Float32,
         (sym_int(), heads, SUMMARY_DIM, KEY_DIM),
@@ -1029,6 +1098,7 @@ def _compile_affine_summary(
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, VAL_DIM),
         factor(Float32, KEY_DIM),
+        bounds,
         out,
         Int32(1),
     )
@@ -1055,14 +1125,16 @@ def plan_segments(num_chunks: int, work_tiles: int, sm_count: int) -> tuple[int,
 
 
 def compose_segment_summaries(summaries: torch.Tensor) -> torch.Tensor:
-    """Fold ``[S, H, V + K, K]`` consecutive segment maps into one, pairwise from the left.
+    """Fold ``[..., S, H, V + K, K]`` consecutive segment maps into ``[..., H, V + K, K]``.
 
     ``(A0, B0)`` then ``(A1, B1)`` composes to ``(A0 @ A1, B0 @ A1 + B1)``; each level composes
     adjacent pairs with two launches (one matmul, one bias add), so the fold costs log2(S) levels
-    rather than S - 1 sequential compositions. The fold runs in FP64 so its precision does not
-    depend on the caller's float32 matmul mode (TF32 would otherwise leak into the summary); the
-    operands are at most a few megabytes, so the cast is negligible next to the kernel.
+    rather than S - 1 sequential compositions, and every leading (fragment) mode folds in the same
+    launches. The fold runs in FP64 so its precision does not depend on the caller's float32
+    matmul mode (TF32 would otherwise leak into the summary); the operands are at most a few
+    megabytes, so the cast is negligible next to the kernel.
     """
+    summaries = summaries.movedim(summaries.ndim - 4, 0)
     if summaries.shape[0] == 1:
         return summaries[0]
     value_dim = summaries.shape[-2] - summaries.shape[-1]
@@ -1079,35 +1151,43 @@ def compose_segment_summaries(summaries: torch.Tensor) -> torch.Tensor:
 
 
 @torch.compiler.disable
-def build_state_summary(
+def build_state_summaries(
     kg: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
     cumulative_gate: torch.Tensor,
+    bounds: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute one shard's packed affine state summary from its WY chunk factors.
+    """Compute one packed affine state summary per token range of a stream's WY chunk factors.
 
     Args:
-        kg: Gated keys ``k * exp2(gk_last - gk)``, shape ``[1, T, H, 128]``,
-            bf16 or fp16.
+        kg: Gated keys ``k * exp2(gk_last - gk)``, shape ``[1, T, H, 128]``, bf16 or fp16.
         w: WY factor ``w``, same shape and dtype as ``kg``.
         u: WY pseudo-values ``u``, shape ``[1, T, H, 128]``, same dtype as ``kg``.
         cumulative_gate: Cumulative log2 gates, shape ``[1, T, H, 128]``, fp32.
+        bounds: ``int32 [F, 2]`` device tensor of half-open token ranges ``[start, stop)`` with
+            ``0 <= start <= stop <= T``; ``start == stop`` yields the identity map. A range is
+            exact only over whole chunks of one packed sequence: ``start`` on that sequence's
+            64-token chunk grid, ``stop`` on the grid or at the sequence's end (a partial last
+            chunk is neutralized in-kernel). The values are not checked (that would sync);
+            other ranges return a plausible but wrong map.
 
     Returns:
-        FP32 tensor of shape ``[H, 256, 128]``, V-first packed as state bias then
-        state transition for ``H_out = H_in @ transition + bias``.
+        FP32 tensor of shape ``[F, H, 256, 128]``, V-first packed as state bias then state
+        transition for ``H_out = H_in @ transition + bias``, one per row of ``bounds``.
 
-    Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs.
-    SM100 uses the native UMMA kernel; other capability 8.0+ targets use Triton.
-    A partial final chunk is neutral-padded by the wrapper.
+    The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
+    across different ``bounds`` values of the same shape. The tokens right after a partial last
+    chunk are read and then cancelled, so they must be finite. Supported scope: B=1, fixed
+    K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
+    capability 8.0+ targets use Triton.
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
-    assert batch == 1, f"build_state_summary requires B=1, got B={batch}"
-    assert tokens > 0, "build_state_summary requires at least one token"
-    assert heads > 0, "build_state_summary requires at least one head"
-    assert key_dim == KEY_DIM, f"build_state_summary requires K={KEY_DIM}, got {key_dim}"
+    assert batch == 1, f"build_state_summaries requires B=1, got B={batch}"
+    assert tokens > 0, "build_state_summaries requires at least one token"
+    assert heads > 0, "build_state_summaries requires at least one head"
+    assert key_dim == KEY_DIM, f"build_state_summaries requires K={KEY_DIM}, got {key_dim}"
     assert w.shape == kg.shape, f"w must match kg shape {tuple(kg.shape)}, got {tuple(w.shape)}"
     assert u.shape == (1, tokens, heads, VAL_DIM), (
         f"u must have shape {(1, tokens, heads, VAL_DIM)}, got {tuple(u.shape)}"
@@ -1123,28 +1203,23 @@ def build_state_summary(
     assert cumulative_gate.dtype == torch.float32, (
         f"cumulative_gate must be fp32, got {cumulative_gate.dtype}"
     )
+    assert bounds.ndim == 2 and bounds.shape[1] == 2 and bounds.shape[0] > 0, (
+        f"bounds must have shape [F, 2] with F > 0, got {tuple(bounds.shape)}"
+    )
+    assert bounds.dtype == torch.int32, f"bounds must be int32, got {bounds.dtype}"
 
     if isinstance(kg, FakeTensor):
         raise TypeError(
-            "build_state_summary does not support torch.export; run the context-parallel "
+            "build_state_summaries does not support torch.export; run the context-parallel "
             "summary eagerly or under CUDA Graph capture"
         )
 
-    assert kg.is_cuda, "build_state_summary requires CUDA tensors"
-    for name, tensor in (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate)):
+    assert kg.is_cuda, "build_state_summaries requires CUDA tensors"
+    tensors = (("kg", kg), ("w", w), ("u", u), ("cumulative_gate", cumulative_gate))
+    for name, tensor in (*tensors, ("bounds", bounds)):
         assert tensor.device == kg.device, f"{name} must be on {kg.device}, got {tensor.device}"
         assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-    pad = (-tokens) % BT
-    if pad:
-        padding = (0, 0, 0, 0, 0, pad)
-        kg, w, u = (F.pad(tensor, padding) for tensor in (kg, w, u))
-        cumulative_gate = torch.cat(
-            (
-                cumulative_gate,
-                cumulative_gate[:, -1:].expand(-1, pad, -1, -1),
-            ),
-            dim=1,
-        )
+    fragments = bounds.shape[0]
     properties = get_device_properties(kg.device)
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
@@ -1159,8 +1234,10 @@ def build_state_summary(
             launch_affine_summary_fwd,
         )
 
-        out = torch.empty((heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device)
-        launch_affine_summary_fwd(kg, w, u, cumulative_gate, out, capability)
+        out = torch.empty(
+            (fragments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
+        )
+        launch_affine_summary_fwd(kg, w, u, cumulative_gate, bounds, out, capability)
         return out
 
     kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
@@ -1168,12 +1245,16 @@ def build_state_summary(
     # BN=64 only when the extra column tiles would spill past one CTA wave and
     # serialize whole recurrence chains.
     sm_count = properties.multi_processor_count
-    state_bn = 32 if heads * (SUMMARY_DIM // 32) <= sm_count else 64
-    segments, chunks_per_segment = plan_segments(
-        kg.shape[1] // BT, heads * (SUMMARY_DIM // state_bn), sm_count
-    )
+    work_tiles = fragments * heads * (SUMMARY_DIM // 32)
+    state_bn = 32 if work_tiles <= sm_count else 64
+    work_tiles = fragments * heads * (SUMMARY_DIM // state_bn)
+    # The bounds live on the device, so segment on the average fragment length; the kernel splits
+    # each fragment's actual chunk count into this many ranges (empty ones store the identity).
+    # Skewed lengths (one long fragment among empty ones) keep the long chain under-split; the
+    # result is still exact, only slower.
+    segments, _ = plan_segments(max(1, cdiv(tokens, BT) // fragments), work_tiles, sm_count)
     segment_out = torch.empty(
-        (segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
+        (fragments * segments, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
     )
     use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, segment_out)
     compiled = _compile_affine_summary(
@@ -1184,7 +1265,28 @@ def build_state_summary(
         w.detach(),
         u.detach(),
         cumulative_gate.detach(),
+        bounds,
         segment_out,
-        chunks_per_segment,
+        segments,
     )
-    return compose_segment_summaries(segment_out)
+    return compose_segment_summaries(
+        segment_out.view(fragments, segments, heads, SUMMARY_DIM, KEY_DIM)
+    )
+
+
+@torch.compiler.disable
+def build_state_summary(
+    kg: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    cumulative_gate: torch.Tensor,
+) -> torch.Tensor:
+    """Compute one shard's packed affine state summary from its WY chunk factors.
+
+    The single-range form of :func:`build_state_summaries` over all ``T`` tokens (a partial
+    final chunk is handled in the kernel); see it for the argument contract. Returns FP32
+    ``[H, 256, 128]``.
+    """
+    # arange keeps the bounds device-built, so capture never sees a host-to-device copy.
+    bounds = (torch.arange(2, dtype=torch.int32, device=kg.device) * kg.shape[1]).view(1, 2)
+    return build_state_summaries(kg, w, u, cumulative_gate, bounds)[0]
