@@ -76,6 +76,16 @@ def validate_delta_rule_inputs(
         raise ValueError("all inputs must be on the same device")
 
 
+def check_summary_range(tokens: int, start: int, stop: int) -> None:
+    """Reject a summary range outside ``[0, tokens)``.
+
+    Only the bounds are checked; see NOTE [Summary ranges are whole chunks of one subsequence]
+    in ``attn_gym.linear.kda.stages``.
+    """
+    if not 0 <= start < stop <= tokens:
+        raise ValueError(f"summary range [{start}, {stop}) must lie inside [0, {tokens})")
+
+
 def resolve_scale(scale: float | None, key_dim: int) -> float:
     """Resolve a query-scale override to a validated float, defaulting to ``1/sqrt(K)``."""
     if scale is None:
