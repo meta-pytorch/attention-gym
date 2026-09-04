@@ -85,9 +85,9 @@ host Python integers; the only offsets tensor the kernels ever see is the span's
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
     slots = summary_slots(prepared, plan, neutral_summary(HV, 128, 128, device=device))
     #   one entry per local subsequence, in span order, padded to plan.slots:
-    #   slot 0: prepared.state_summary(0, 96)      C∩s1 has a successor (D∩s1)
-    #   slot 1: identity [0; I]                    D∩s1 ends s1, nobody needs it
-    #   slot 2: prepared.state_summary(136, 192)   D∩s2 has a successor (rank 0's B∩s2)
+    #   slot 0: state_summaries(bounds)[0] over [0, 96)     C∩s1 has a successor (D∩s1)
+    #   slot 1: identity [0; I]                             D∩s1 ends s1, nobody needs it
+    #   slot 2: state_summaries(bounds)[2] over [136, 192)  D∩s2 has a successor (rank 0's B∩s2)
     gathered = all_gather(slots)                              # [world, plan.slots, HV, V + K, K]
     initial_state = compose_entry_states(gathered, plan)      # one per subsequence
     #   C∩s1: merge(0, gathered[0][1])
@@ -115,11 +115,11 @@ What the table does not constrain:
 
 CUDA Graph capture is valid for one *plan*, not merely one set of shapes. Fixing shapes is the
 easy part: the loader pads the span with a padding *document* (its own sequence, loss-masked) and
-the subsequence count could be padded with empty ones. But ``state_summary(start, stop)`` bakes
-host offsets into the launch and ``compose_entry_states`` bakes the ``(rank, slot)`` chains into
+the subsequence count could be padded with empty ones. ``state_summaries(bounds)`` already reads
+its ranges on the device, but ``compose_entry_states`` bakes the ``(rank, slot)`` chains into
 indexing ops, so a replay also needs the same ``cu_seqlens_global`` and therefore the same
-subsequence layout. Replaying across sampled document layouts would need summaries over all
-``N`` local segments from device ``cu_seqlens`` and device-tensor routing; neither exists yet.
+subsequence layout. Replaying across sampled document layouts needs device-tensor routing as
+well; that does not exist yet.
 """
 
 from __future__ import annotations

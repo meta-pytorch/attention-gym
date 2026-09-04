@@ -33,7 +33,7 @@ import typer
 from torch.distributed._functional_collectives import all_gather_single
 
 from attn_gym._backends.cute import normalize_compact_tensor
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
     _prepare_chunk_kda_bwd,
@@ -221,14 +221,13 @@ class ContextParallelKDAFunction(torch.autograd.Function):
             rank + 1 < len(shards) and shard.sequence_ids[-1] == shards[rank + 1].sequence_ids[0]
         )
         if continues:
-            start = shard.cu_seqlens[-2]
+            # The last local sequence's range as a device row; ``full`` keeps it capturable.
+            bounds = torch.full((1, 2), q.shape[1], dtype=torch.int32, device=q.device)
+            bounds[0, 0] = shard.cu_seqlens[-2]
             with kernel_stage("cp/fwd/summary", annotate):
-                summary = build_state_summary(
-                    factors.kg[:, start:],
-                    factors.w[:, start:],
-                    factors.u[:, start:],
-                    cumulative_gate[:, start:],
-                )
+                summary = build_state_summaries(
+                    factors.kg, factors.w, factors.u, cumulative_gate, bounds
+                )[0]
         else:
             summary = q.new_zeros(
                 q.shape[2],
@@ -328,17 +327,19 @@ class ContextParallelKDAFunction(torch.autograd.Function):
             rank > 0 and shards[rank - 1].sequence_ids[-1] == shard.sequence_ids[0]
         )
         if continues_from_previous:
-            stop = shard.cu_seqlens[1]
+            bounds = torch.zeros((1, 2), dtype=torch.int32, device=q.device)
+            bounds[0, 1] = shard.cu_seqlens[1]  # the first local sequence's range
             with kernel_stage("cp/bwd/summary", ctx.annotate, backward=False):
-                summary = build_state_grad_summary(
-                    prepared.qg[:, :stop],
-                    prepared.kg[:, :stop],
-                    prepared.w[:, :stop],
-                    d_output[:, :stop],
-                    aqk[:, :stop],
-                    cumulative_gate[:, :stop],
+                summary = build_state_grad_summaries(
+                    prepared.qg,
+                    prepared.kg,
+                    prepared.w,
+                    d_output,
+                    aqk,
+                    cumulative_gate,
                     ctx.scale,
-                )
+                    bounds,
+                )[0]
             if d_final_state is not None:
                 value_dim = v.shape[-1]
                 bias = merge_state(d_final_state[0], summary)

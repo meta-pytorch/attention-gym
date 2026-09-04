@@ -208,10 +208,15 @@ def test_state_summary_matches_zero_and_identity_probes(op):
 
     fused = probe(op.chunk, q, k, v, gate, beta)
     oracle = probe(op.reference, q.float(), k.float(), v.float(), gate, beta)
-    for index, (start, stop) in enumerate(((0, 72), (72, 200))):
-        summary = prepared.state_summary(start, stop)
-        assert summary.shape == (op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
-        assert_summary_parts_match(summary, fused, oracle, index)
+    summaries = prepared.state_summaries(bounds_of((0, 72), (72, 200)))
+    assert summaries.shape == (2, op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
+    for index in range(2):
+        assert_summary_parts_match(summaries[index], fused, oracle, index)
+
+
+def bounds_of(*ranges: tuple[int, int]) -> torch.Tensor:
+    """``int32 [R, 2]`` device tensor of span ranges for ``state_summaries``."""
+    return torch.tensor(ranges, dtype=torch.int32, device="cuda")
 
 
 def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
@@ -277,7 +282,9 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
     prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens, scale=scale)
     prepared.run(initial_state, output_final_state=True)
     grads = op.prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
-    grads.state_grad_summary(0, 64)  # The exchange order: summary first, so run reuses its Aqk.
+    grads.state_grad_summaries(
+        bounds_of((0, 64))
+    )  # Exchange order: summary first, run reuses Aqk.
     actual = grads.run(d_final_state)
 
     assert len(actual) == 6
@@ -323,10 +330,10 @@ def test_state_grad_summary_matches_zero_and_identity_probes(op):
     prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
     prepared.run(zero, output_final_state=True)
     grads = op.prepare_backward(prepared.saved, d_output.to(v.dtype), zero, scale=prepared.scale)
-    for index, (start, stop) in enumerate(((0, 72), (72, 200))):
-        summary = grads.state_grad_summary(start, stop)
-        assert summary.shape == (op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
-        assert_summary_parts_match(summary, fused, oracle, index)
+    summaries = grads.state_grad_summaries(bounds_of((0, 72), (72, 200)))
+    assert summaries.shape == (2, op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
+    for index in range(2):
+        assert_summary_parts_match(summaries[index], fused, oracle, index)
 
 
 @requires_kda_target
@@ -376,17 +383,25 @@ def test_summaries_are_exact_over_whole_chunks_of_one_subsequence(op):
         own_grads = op.prepare_backward(
             own.saved, d_output[:, start:stop].to(v.dtype), one, scale=own.scale
         )
-        return own.state_summary(0, stop - start), own_grads.state_grad_summary(0, stop - start)
+        whole = bounds_of((0, stop - start))
+        return own.state_summaries(whole)[0], own_grads.state_grad_summaries(whole)[0]
 
-    # (start, stop) pairs on the second subsequence's chunk grid: interior runs, a single chunk,
-    # a run ending at the subsequence end, and the first chunk alone. The interior summary must
-    # match the same range summarized on its own, pointwise within that run's own error against
-    # the FP32 oracle and in aggregate.
-    for start, stop in ((136, 264), (200, 456), (136, 200), (392, 520), (72, 136)):
+    # Rows on the second subsequence's chunk grid: interior runs, a single chunk, a run ending at
+    # the subsequence end, the first chunk alone, and an empty range. One launch summarizes them
+    # all; each interior summary must match the same range summarized on its own, pointwise
+    # within that run's own error against the FP32 oracle and in aggregate.
+    ranges = ((136, 264), (200, 456), (136, 200), (392, 520), (72, 136), (300, 300))
+    forward = prepared.state_summaries(bounds_of(*ranges))
+    reverse = grads.state_grad_summaries(bounds_of(*ranges))
+    assert forward.shape == reverse.shape == (len(ranges), op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
+    empty = neutral_summary(op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
+    torch.testing.assert_close(forward[-1], empty, atol=0, rtol=0)
+    torch.testing.assert_close(reverse[-1], empty, atol=0, rtol=0)
+    for index, (start, stop) in enumerate(ranges[:-1]):
         oracles = oracle(start, stop)
         for name, actual, expected, low in zip(
             ("forward", "reverse"),
-            (prepared.state_summary(start, stop), grads.state_grad_summary(start, stop)),
+            (forward[index], reverse[index]),
             oracles,
             standalone(start, stop),
             strict=True,
@@ -394,13 +409,3 @@ def test_summaries_are_exact_over_whole_chunks_of_one_subsequence(op):
             label = f"{name} [{start}, {stop})"
             assert_matches_low_precision_reference(actual, expected, low, label)
             assert_relative_rms_within(actual, expected, label, max_eps=1.0)
-
-
-@requires_kda_target
-def test_state_summary_rejects_ranges_outside_the_stream():
-    q, k, v, gate, beta = KDA.make_inputs(128, seed=3)
-    prepared = chunk_kda_prepare(q, k, v, gate, beta)
-    with pytest.raises(ValueError, match="summary range"):
-        prepared.state_summary(64, 200)
-    with pytest.raises(ValueError, match="summary range"):
-        prepared.state_summary(64, 64)

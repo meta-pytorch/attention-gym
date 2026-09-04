@@ -433,10 +433,10 @@ rank 1 span:  C∩s1 | D∩s1 | D∩s2     local cu_seqlens (0, 96, 136, 192)
 chains:       s1 = A∩s1 -> C∩s1 -> D∩s1        s2 = D∩s2 -> B∩s2
 ```
 
-`state_summary(start, stop)` takes **local** span offsets and is exact over whole chunks of one
-subsequence: `start = sub_start + 64·i`, `stop = sub_start + 64·j` or the subsequence end, never
-crossing a `cu_seqlens` boundary. The recipe always passes one whole subsequence,
-`(cu_seqlens[i], cu_seqlens[i + 1])`.
+`state_summaries(bounds)` takes an `int32 [R, 2]` device tensor of **local** span ranges and is
+exact over whole chunks of one subsequence: `start = sub_start + 64·i`, `stop = sub_start + 64·j`
+or the subsequence end, never crossing a `cu_seqlens` boundary; `start == stop` is the identity.
+The recipe always passes whole subsequences, `(cu_seqlens[i], cu_seqlens[i + 1])`.
 
 `attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` and
 `attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward` do that split without
@@ -446,12 +446,12 @@ exposing the WY factors:
 from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
 
 prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
-summary = prepared.state_summary(start, stop)  # [bias; transition] of one local sequence
+summaries = prepared.state_summaries(bounds)  # [bias; transition] per range, one launch
 # ...exchange summaries and compose each sequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
 grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
-grad_summary = grads.state_grad_summary(start, stop)  # reverse map [bias; transition]
+grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; transition]
 # ...exchange and compose each sequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```

@@ -21,9 +21,8 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import prepare_span, zero_state
-from attn_gym.linear._delta_rule.validation import check_summary_range
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
     chunk_gdn_recompute_aqk_dense,
     chunk_gdn_recompute_aqk_packed,
@@ -69,26 +68,25 @@ class ChunkGDNSaved(NamedTuple):
 
 @dataclass
 class ChunkGDNPrepared:
-    """Local forward factors shared by ``state_summary`` and ``run``."""
+    """Local forward factors shared by ``state_summaries`` and ``run``."""
 
     saved: ChunkGDNSaved
     factors: ChunkGDNFactors
     metadata: RaggedChunkMetadata | None
     scale: float
 
-    def state_summary(self, start: int, stop: int) -> torch.Tensor:
-        """Return the FP32 ``[HV, V + K, K]`` map of tokens ``[start, stop)`` from the zero state.
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
-        See NOTE [Summary ranges are whole chunks of one subsequence] in
-        ``attn_gym.linear.kda.stages``.
+        See ``attn_gym.linear.kda.stages.ChunkKDAPrepared.state_summaries`` for the contract.
         """
         saved = self.saved
-        check_summary_range(saved.q.shape[1], start, stop)
-        return build_state_summary(
-            self.factors.kg[:, start:stop],
-            self.factors.w[:, start:stop],
-            self.factors.u[:, start:stop],
-            _vector_gate(saved.cumulative_gate[:, start:stop], saved.q.shape[-1]),
+        return build_state_summaries(
+            self.factors.kg,
+            self.factors.w,
+            self.factors.u,
+            _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
+            bounds,
         )
 
     def run(
@@ -151,7 +149,7 @@ def chunk_gdn_prepare(
 
 @dataclass
 class ChunkGDNBackward:
-    """Recomputed local backward tensors shared by ``state_grad_summary`` and ``run``."""
+    """Recomputed local backward tensors shared by ``state_grad_summaries`` and ``run``."""
 
     saved: ChunkGDNSaved
     d_output: torch.Tensor
@@ -176,21 +174,21 @@ class ChunkGDNBackward:
             q, k, saved.cumulative_gate, self.scale, self.metadata
         )
 
-    def state_grad_summary(self, start: int, stop: int) -> torch.Tensor:
-        """Return the FP32 ``[HV, V + K, K]`` reverse map of tokens ``[start, stop)``.
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
-        See ``ChunkKDABackward.state_grad_summary`` for the bias convention.
+        See ``attn_gym.linear.kda.stages.ChunkKDABackward.state_grad_summaries``.
         """
         saved = self.saved
-        check_summary_range(saved.q.shape[1], start, stop)
-        return build_state_grad_summary(
-            self.prepared.qg[:, start:stop],
-            self.prepared.kg[:, start:stop],
-            self.prepared.w[:, start:stop],
-            self.d_output[:, start:stop],
-            self.aqk[:, start:stop],
-            _vector_gate(saved.cumulative_gate[:, start:stop], saved.q.shape[-1]),
+        return build_state_grad_summaries(
+            self.prepared.qg,
+            self.prepared.kg,
+            self.prepared.w,
+            self.d_output,
+            self.aqk,
+            _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
             self.scale,
+            bounds,
         )
 
     def run(
