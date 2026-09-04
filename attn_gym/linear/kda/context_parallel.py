@@ -15,7 +15,11 @@ import torch
 import torch.distributed as dist
 
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.linear.context_parallel import ContextParallelPlan, StagedOp, context_parallel_chunk
+from attn_gym.linear.context_parallel import (
+    ContextParallelRouting,
+    StagedOp,
+    context_parallel_chunk,
+)
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.kda.validation import resolve_kernel_options
 
@@ -27,8 +31,7 @@ def context_parallel_kda(
     gate: torch.Tensor,
     beta: torch.Tensor,
     *,
-    cu_seqlens: torch.Tensor,
-    plan: ContextParallelPlan,
+    routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
     autotune: bool = True,
@@ -39,8 +42,8 @@ def context_parallel_kda(
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale``, ``autotune``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``. With
-    ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and fused factors are
-    computed only for fragments that must send a summary.
+    ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and the fused factors are
+    computed once over the span for the summaries.
     """
     # The unsharded Mega op rejects fastmath; the staged backward alone cannot see the backend.
     if fastmath and resolve_kernel_options(kernel_options).backend == "mega":
@@ -50,9 +53,7 @@ def context_parallel_kda(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
         partial(chunk_kda_prepare_backward, scale=scale, autotune=autotune, fastmath=fastmath),
     )
-    return context_parallel_chunk(
-        stages, q, k, v, gate, beta, cu_seqlens=cu_seqlens, plan=plan, group=group
-    )
+    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
 __all__ = ["context_parallel_kda"]

@@ -98,6 +98,7 @@ class ContextParallelKDAAttention(KDAAttention):
         super().__init__(*args, **kwargs)
         self.cp_group = group
         self.plan = plan
+        self.routing = plan.routing(torch.device("cuda", torch.cuda.current_device()))
 
     def short_convolution(
         self,
@@ -142,8 +143,7 @@ class ContextParallelKDAAttention(KDAAttention):
             v,
             gate,
             beta,
-            cu_seqlens=cu_seqlens,
-            plan=self.plan,
+            routing=self.routing,
             group=self.cp_group,
             fastmath=self.fastmath,
         )

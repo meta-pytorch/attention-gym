@@ -14,7 +14,11 @@ import torch
 import torch.distributed as dist
 
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.linear.context_parallel import ContextParallelPlan, StagedOp, context_parallel_chunk
+from attn_gym.linear.context_parallel import (
+    ContextParallelRouting,
+    StagedOp,
+    context_parallel_chunk,
+)
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 
 
@@ -25,8 +29,7 @@ def context_parallel_gdn(
     gate: torch.Tensor,
     beta: torch.Tensor,
     *,
-    cu_seqlens: torch.Tensor,
-    plan: ContextParallelPlan,
+    routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -39,9 +42,7 @@ def context_parallel_gdn(
     stages = StagedOp(
         partial(chunk_gdn_prepare, scale=scale), partial(chunk_gdn_prepare_backward, scale=scale)
     )
-    return context_parallel_chunk(
-        stages, q, k, v, gate, beta, cu_seqlens=cu_seqlens, plan=plan, group=group
-    )
+    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
 __all__ = ["context_parallel_gdn"]

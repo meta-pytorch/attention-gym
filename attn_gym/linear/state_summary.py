@@ -9,7 +9,9 @@
 Each delta-rule token step is affine in the V-major recurrent state ``H: [V, K]`` (one per value
 head ``HV``; GQA key heads are already expanded by the factor kernels)::
 
-    H_t = H_{t-1} @ A_t + B_t      A_t = diag(exp g_t) (I - beta_t k_t k_t^T),  B_t = beta_t v_t k_t^T
+    H_t = H_{t-1} @ A_t + B_t
+    A_t = diag(exp g_t) (I - beta_t k_t k_t^T)
+    B_t = beta_t v_t k_t^T
 
 so any token range collapses to one FP32 map ``H_out = H_in @ A + B``, packed here as
 ``[HV, V + K, K] = [bias; transition]``. Reverse summaries pack the cotangent map
@@ -42,9 +44,10 @@ LOCAL.
                     token, so its last chunk may be partial and no fragment cut
                     needs to be chunk-aligned
     summary         the ``[bias; transition]`` map of a token range of the span     LOCAL range
-    slot            ``gathered[rank][i]``: the summary of that rank's i-th          (rank, index)
-                    subsequence, or the identity ``[0; I]`` when nobody needs it
-    predecessors /  subsequences of the same sequence earlier / later in global     (rank, slot)
+    slot            ``gathered[rank][f]``: one per fragment. Forward, the summary   (rank, frag)
+                    of fragment f's last subsequence; backward, the reverse map of
+                    its first; the identity ``[0; I]`` when nobody needs it
+    predecessors /  slots of the same sequence's earlier / later pieces in global   (rank, slot)
     successors      order; the only cross-rank references a plan holds
     terminal        subsequences that end their sequence; true final states         LOCAL index
                     live there
@@ -65,8 +68,8 @@ How they nest, for ``cu_seqlens_global = (0, 40, 232, 384)`` and the zig-zag fra
     chains        s1: A∩s1 -> C∩s1 -> D∩s1        s2: D∩s2 -> B∩s2        s0: A∩s0 alone
 
 Who passes which indices, for rank 1 above. Names ending in ``_global`` live in the GLOBAL index
-space; everything else is LOCAL to this rank's span. The plan's inputs and every plan field are
-host Python integers; the only offsets tensor the kernels ever see is the span's own::
+space; everything else is LOCAL to this rank's span. The plan is host metadata built from Python
+integers; ``plan.routing(device)`` turns it into the span-local tensors the kernels read::
 
     # Host: routing; ``cp_rank`` picks this rank's row of the fragment table.
     cu_seqlens_global = (0, 40, 232, 384)
@@ -81,45 +84,52 @@ host Python integers; the only offsets tensor the kernels ever see is the span's
     q, k, v, gate, beta = embed / project / short-conv the span               # [1, 192, HV, 128]
     cu_seqlens = torch.tensor(plan.cu_seqlens, dtype=torch.int32, device=device)
 
-    # Device: all offsets LOCAL.
-    prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
-    slots = summary_slots(prepared, plan, neutral_summary(HV, 128, 128, device=device))
-    #   one entry per local subsequence, in span order, padded to plan.slots:
-    #   slot 0: prepared.state_summary(0, 96)      C∩s1 has a successor (D∩s1)
-    #   slot 1: identity [0; I]                    D∩s1 ends s1, nobody needs it
-    #   slot 2: prepared.state_summary(136, 192)   D∩s2 has a successor (rank 0's B∩s2)
+    # Device: all offsets LOCAL, all of them read from the routing tensors. This is what
+    # context_parallel_chunk does.
+    routing = plan.routing(device)
+    prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
+    slots = summary_slots(prepared, routing)                  # state_summaries(forward_bounds)
+    #   one entry per local fragment, in span order; routing.forward_bounds is
+    #   slot 0 (frag C): [0, 96)      C∩s1 is C's last subsequence, continued by D∩s1
+    #   slot 1 (frag D): [136, 192)   D∩s2 is D's last subsequence, continued by B∩s2
     gathered = all_gather(slots)                              # [world, plan.slots, HV, V + K, K]
-    initial_state = compose_entry_states(gathered, plan)      # one per subsequence
-    #   C∩s1: merge(0, gathered[0][1])
-    #   D∩s1: merge(merge(0, gathered[0][1]), gathered[1][0])
+    initial_state = compose_entry_states(gathered, routing)   # one per subsequence
+    #   C∩s1: merge(0, gathered[0][0])                        A∩s1 is rank 0's fragment A
+    #   D∩s1: merge(merge(0, gathered[0][0]), gathered[1][0])
     #   D∩s2: 0
     output, exit_states = prepared.run(initial_state, output_final_state=True)
-    #   exit_states holds one state per subsequence; only plan.terminal entries are a sequence's
+    #   exit_states holds one state per subsequence; only routing.terminal rows are a sequence's
     #   true final state (here D∩s1's, for s1), the rest are intermediate. Callers that never use
     #   final states pass output_final_state=False; the backward needs neither.
-    exit_states[list(plan.terminal)]
+    exit_states[routing.terminal]
 
-The key contract: ``state_summary`` is always called with consecutive entries of the span's own
-``plan.cu_seqlens`` (LOCAL), so every summary covers exactly one whole subsequence.
+The key contract: the routing hands the summaries exactly one whole subsequence per active
+fragment slot, as consecutive entries of the span's own ``cu_seqlens`` (LOCAL). Direct callers of
+``state_summary`` / ``state_summaries`` must obey that contract themselves; only the bounds are
+checked.
 
 What the table does not constrain:
 
 - Ranks need not own equal token counts. Nothing is exchanged per token; the gather is over
   ``plan.slots`` fixed-shape summaries, so spans of different lengths are fine.
-- Zero-length subsequences are legal: the kernels treat a repeated ``cu_seqlens`` entry as an
-  ordinary empty sequence with an unused state row, and the plan never asks one for a summary.
+- Zero-length sequences are legal. An empty global sequence owns no tokens, so the plan has no
+  subsequence for it; the empty span segments that ``routing(max_subsequences=N)`` pads with are
+  repeated ``cu_seqlens`` entries, which the kernels treat as empty sequences with unused state
+  rows, and no summary is ever requested for them.
 - Summary work is bounded by fragments, not documents. Only a fragment's last subsequence can have
   a successor and only its first can have predecessors; interior subsequences are whole documents
-  that start from zero. So a rank computes at most one summary per fragment it owns, and no chain
-  is longer than the number of fragments in the table.
+  that start from zero. So a rank computes at most one summary per fragment it owns, the gather
+  is one slot per fragment, and no chain is longer than the number of fragments in the table.
 
-CUDA Graph capture is valid for one *plan*, not merely one set of shapes. Fixing shapes is the
-easy part: the loader pads the span with a padding *document* (its own sequence, loss-masked) and
-the subsequence count could be padded with empty ones. But ``state_summary(start, stop)`` bakes
-host offsets into the launch and ``compose_entry_states`` bakes the ``(rank, slot)`` chains into
-indexing ops, so a replay also needs the same ``cu_seqlens_global`` and therefore the same
-subsequence layout. Replaying across sampled document layouts would need summaries over all
-``N`` local segments from device ``cu_seqlens`` and device-tensor routing; neither exists yet.
+CUDA Graph replay across document layouts follows from that bound. ``plan.routing(device,
+max_subsequences=N)`` turns a layout into device tensors whose shapes depend only on the fragment
+table and ``N``: the span's ``cu_seqlens`` padded with empty segments to ``N``, one ``[start,
+stop)`` per fragment for the summary launches (empty when the fragment sends nothing), per-fragment
+chains of flat slot indices padded with an identity slot, and per-segment source maps.
+``context_parallel_chunk`` reads every index from those tensors and returns ``N`` exit-state rows,
+so a graph captured once replays for any layout of the same fragment table with at most ``N`` local
+subsequences after copying the new layout's routing tensors in place. The fragment table fixes
+each span's length; the loader fills a short batch with a loss-masked padding document.
 """
 
 from __future__ import annotations

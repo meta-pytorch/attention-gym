@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-import attn_gym.linear.context_parallel as cpmod
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
+    Fragment,
     Subsequence,
     compose_conv_histories,
     compose_entry_states,
@@ -35,14 +35,6 @@ def summary(transition: list[list[float]], bias: list[list[float]]) -> torch.Ten
 def apply(state: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
     """Independent affine-map oracle for the routing tests."""
     return state @ packed[:, VALUE_DIM:, :] + packed[:, :VALUE_DIM, :]
-
-
-UNUSED = summary([[7, 7], [7, 7]], [[7, 7], [7, 7]])
-
-
-def with_unused_slot(first: torch.Tensor) -> torch.Tensor:
-    """One rank's two gather slots where only the first is consumed."""
-    return torch.stack((first, UNUSED))
 
 
 @pytest.mark.parametrize(
@@ -76,17 +68,23 @@ def test_plan_cuts_ranges_at_sequences_and_orders_neighbors():
 
     plan = ContextParallelPlan.from_fragments((0, 8, 12), fragments, cp_rank=0)
     assert plan.subsequences == (Subsequence(0, 0, 2), Subsequence(0, 6, 8), Subsequence(1, 8, 10))
-    assert plan.table[1] == (Subsequence(0, 2, 6), Subsequence(1, 10, 12))
+    assert plan.fragments[1] == Fragment(6, 10, (Subsequence(0, 6, 8), Subsequence(1, 8, 10)))
+    assert plan.table[1] == (
+        Fragment(2, 6, (Subsequence(0, 2, 6),)),
+        Fragment(10, 12, (Subsequence(1, 10, 12),)),
+    )
     assert plan.cu_seqlens == (0, 2, 4, 6)
-    assert plan.slots == 3
+    assert plan.slots == 2  # one per fragment, not per subsequence
+    # Slots address fragments: A's chain is rank 0 fragment 0, rank 1 fragment 0, rank 0 fragment 1.
     assert plan.predecessors == ((), ((0, 0), (1, 0)), ())
     assert plan.successors == (((0, 1), (1, 0)), (), ((1, 1),))
     assert plan.terminal == (1,)
     assert plan.global_token_ids("cpu").tolist() == [0, 1, 6, 7, 8, 9]
+    assert plan.fragment_spans() == [(0, 0), (1, 2)]
 
     other = ContextParallelPlan.from_fragments((0, 8, 12), fragments, cp_rank=1)
-    assert other.slots == 3
-    assert other.predecessors == (((0, 0),), ((0, 2),))
+    assert other.slots == 2
+    assert other.predecessors == (((0, 0),), ((0, 1),))
     assert other.successors == (((0, 1),), ())
     assert other.terminal == (1,)
 
@@ -103,23 +101,6 @@ def test_plan_skips_empty_sequences_and_chains_adjacent_ranges_on_one_rank():
     assert other.predecessors == ((),)
 
 
-def test_entry_states_share_prefixes_across_subsequences_of_one_sequence(monkeypatch):
-    """A rank holding many pieces of one sequence folds each predecessor once, not per piece."""
-    pieces = [(i * 4, (i + 1) * 4) for i in range(8)]
-    plan = ContextParallelPlan.from_fragments((0, 32), [pieces[:4], pieces[4:]], cp_rank=1)
-    gathered = torch.randn(2, 4, 1, 3, 2)
-    merges = []
-    merge_state = cpmod.merge_state
-    monkeypatch.setattr(cpmod, "merge_state", lambda s, a: merges.append(1) or merge_state(s, a))
-    entry = compose_entry_states(gathered, plan)
-    # Subsequences 4..7 have 4..7 predecessors each; the shared prefix means 7 merges, not 22.
-    assert len(merges) == 7
-    expected = torch.zeros(1, 1, 2)
-    for owner, slot in plan.predecessors[-1]:
-        expected = merge_state(expected, gathered[owner, slot])
-    torch.testing.assert_close(entry[-1], expected)
-
-
 def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence():
     """Independently derive each subsequence's chain from token order and compare both folds."""
     cu_seqlens = (0, 5, 5, 12, 16)
@@ -127,11 +108,17 @@ def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence(
     plans = [ContextParallelPlan.from_fragments(cu_seqlens, fragments, rank) for rank in range(3)]
     generator = torch.Generator().manual_seed(3)
     gathered = torch.randn(3, max(p.slots for p in plans), 1, 4, 2, generator=generator)
-    everything = [(r, s, f) for r, row in enumerate(plans[0].table) for s, f in enumerate(row)]
+    everything = [
+        (r, s, piece)
+        for r, row in enumerate(plans[0].table)
+        for s, fragment in enumerate(row)
+        for piece in fragment.subsequences
+    ]
     zero = torch.zeros(1, VALUE_DIM, KEY_DIM)
     for plan in plans:
-        entries = compose_entry_states(gathered, plan)
-        exits = compose_exit_cotangents(gathered, None, plan)
+        routing = plan.routing("cpu")
+        entries = compose_entry_states(gathered, routing)
+        exits = compose_exit_cotangents(gathered, None, routing)
         for index, subsequence in enumerate(plan.subsequences):
             siblings = [(r, s, f) for r, s, f in everything if f.sequence == subsequence.sequence]
             earlier = sorted(
@@ -160,21 +147,24 @@ def test_plan_handles_leading_and_trailing_empty_sequences():
 def test_entry_states_fold_predecessors_from_zero_in_token_order():
     fragments = [[(0, 2), (9, 10)], [(2, 4)], [(4, 9)]]
     plans = [ContextParallelPlan.from_fragments((0, 9, 10), fragments, rank) for rank in range(3)]
+    # Rank 0 owns two fragments, so every rank gathers two slots; only slot 0 is ever addressed.
+    unused = summary([[7, 7], [7, 7]], [[7, 7], [7, 7]])
     gathered = torch.stack(
         (
-            with_unused_slot(summary([[1, 2], [0, 1]], [[1, 0], [0, 2]])),
-            with_unused_slot(summary([[2, 0], [3, 1]], [[0, 1], [2, 0]])),
-            with_unused_slot(summary([[5, 5], [5, 5]], [[5, 5], [5, 5]])),
+            torch.stack((summary([[1, 2], [0, 1]], [[1, 0], [0, 2]]), unused)),
+            torch.stack((summary([[2, 0], [3, 1]], [[0, 1], [2, 0]]), unused)),
+            torch.stack((summary([[5, 5], [5, 5]], [[5, 5], [5, 5]]), unused)),
         )
     )
 
     zero = torch.zeros(1, VALUE_DIM, KEY_DIM)
     torch.testing.assert_close(
-        compose_entry_states(gathered, plans[2])[0],
+        compose_entry_states(gathered, plans[2].routing("cpu"))[0],
         apply(apply(zero, gathered[0, 0]), gathered[1, 0]),
     )
     torch.testing.assert_close(
-        compose_entry_states(gathered, plans[0]), torch.zeros(2, 1, VALUE_DIM, KEY_DIM)
+        compose_entry_states(gathered, plans[0].routing("cpu")),
+        torch.zeros(2, 1, VALUE_DIM, KEY_DIM),
     )
 
 
@@ -184,12 +174,12 @@ def test_exit_cotangents_fold_successors_in_reverse_and_add_the_direct_term():
     plan = ContextParallelPlan.from_fragments((0, 1, 5, 8), fragments, cp_rank=0)
     gathered = torch.stack(
         (
-            with_unused_slot(summary([[1, 0], [0, 1]], [[9, 9], [9, 9]])),
-            with_unused_slot(summary([[2, 1], [0, 1]], [[1, 0], [0, 1]])),
-            with_unused_slot(summary([[1, 0], [2, 3]], [[0, 2], [1, 0]])),
-            with_unused_slot(summary([[4, 0], [0, 4]], [[7, 7], [7, 7]])),
+            summary([[1, 0], [0, 1]], [[9, 9], [9, 9]]),
+            summary([[2, 1], [0, 1]], [[1, 0], [0, 1]]),
+            summary([[1, 0], [2, 3]], [[0, 2], [1, 0]]),
+            summary([[4, 0], [0, 4]], [[7, 7], [7, 7]]),
         )
-    )
+    ).unsqueeze(1)  # one fragment, hence one slot, per rank
     d_final_state = torch.arange(8, dtype=torch.float32).reshape(2, 1, VALUE_DIM, KEY_DIM)
 
     zero = torch.zeros(1, VALUE_DIM, KEY_DIM)
@@ -197,19 +187,22 @@ def test_exit_cotangents_fold_successors_in_reverse_and_add_the_direct_term():
     suffix = apply(apply(zero, gathered[2, 0]), gathered[1, 0])
     expected = d_final_state.clone()
     expected[1] += suffix
-    torch.testing.assert_close(compose_exit_cotangents(gathered, d_final_state, plan), expected)
+    routing = plan.routing("cpu")
+    torch.testing.assert_close(compose_exit_cotangents(gathered, d_final_state, routing), expected)
     torch.testing.assert_close(
-        compose_exit_cotangents(gathered, None, plan), torch.stack((zero, suffix))
+        compose_exit_cotangents(gathered, None, routing), torch.stack((zero, suffix))
     )
 
 
 def test_short_conv_histories_span_short_predecessors_and_reset_at_sequences():
+    # One slot per fragment holding the tail of its last subsequence: rank 0's is token 1 alone
+    # (sequence 1 starts there), ranks 1 and 2 hold two tokens, rank 3's is token 7 (sequence 2).
     tails = torch.tensor(
         [
-            [[[0.0], [0.0], [1.0]], [[0.0], [0.0], [1.5]]],
-            [[[0.0], [2.0], [3.0]], [[0.0], [0.0], [0.0]]],
-            [[[0.0], [4.0], [5.0]], [[0.0], [0.0], [0.0]]],
-            [[[0.0], [0.0], [6.0]], [[0.0], [0.0], [7.0]]],
+            [[[0.0], [0.0], [1.5]]],
+            [[[0.0], [2.0], [3.0]]],
+            [[[0.0], [4.0], [5.0]]],
+            [[[0.0], [0.0], [7.0]]],
         ]
     )
     rank_three = compose_conv_histories(tails, CONV_PLANS[3])
@@ -221,7 +214,7 @@ def test_short_conv_histories_span_short_predecessors_and_reset_at_sequences():
 
 
 def test_short_conv_history_backward_is_the_transpose_of_forward_routing():
-    tails = torch.zeros(4, 2, 3, 1, requires_grad=True)
+    tails = torch.zeros(4, 1, 3, 1, requires_grad=True)
     rank_two = compose_conv_histories(tails, CONV_PLANS[2])
     rank_three = compose_conv_histories(tails, CONV_PLANS[3])
     loss = (rank_two[0, :, 0] * torch.tensor([10.0, 20.0, 30.0])).sum()
@@ -234,3 +227,61 @@ def test_short_conv_history_backward_is_the_transpose_of_forward_routing():
     # Rank 0 starts both of its sequences yet must stay connected to the gathered tails so its
     # reduce-scatter participates in the collective's backward.
     assert compose_conv_histories(tails, CONV_PLANS[0]).requires_grad
+
+
+LAYOUTS = [
+    pytest.param((0, 5, 5, 12, 16), id="two-cuts-and-an-empty-sequence"),
+    pytest.param((0, 16), id="one-sequence"),
+    pytest.param((0, 1, 2, 3, 4, 8, 16), id="many-short-documents"),
+]
+FRAGMENTS = [[(0, 3), (13, 16)], [(3, 7), (11, 13)], [(7, 11)]]
+
+
+@pytest.mark.parametrize("cu_seqlens", LAYOUTS)
+def test_routing_tensors_follow_fragment_geometry(cu_seqlens):
+    """Bounds, chains, and source maps are per fragment; padded rows are empty and unrouted."""
+    plans = [ContextParallelPlan.from_fragments(cu_seqlens, FRAGMENTS, rank) for rank in range(3)]
+    generator = torch.Generator().manual_seed(11)
+    gathered = torch.randn(3, 2, 1, 4, 2, generator=generator)
+    for plan in plans:
+        routing = plan.routing("cpu", max_subsequences=8)
+        count = len(plan.subsequences)
+        assert routing.slots == 2 and routing.world == 3
+        assert routing.predecessors.shape == routing.successors.shape == (2, 4)  # 5 fragments
+        assert routing.cu_seqlens.tolist() == [*plan.cu_seqlens] + [plan.cu_seqlens[-1]] * (
+            8 - count
+        )
+        assert routing.terminal.tolist() == [i in plan.terminal for i in range(8)]
+        entries = compose_entry_states(gathered, routing)
+        exits = compose_exit_cotangents(gathered, None, routing)
+        assert entries.shape == exits.shape == (8, 1, VALUE_DIM, KEY_DIM)
+        assert torch.equal(entries[count:], torch.zeros_like(entries[count:]))
+        assert torch.equal(exits[count:], torch.zeros_like(exits[count:]))
+        for slot, (first, last) in enumerate(plan.fragment_spans()):
+            # A forward slot summarizes the fragment's last subsequence iff it has successors, and
+            # only that subsequence receives the folded successor chain.
+            active = bool(plan.successors[last])
+            assert (routing.forward_bounds[slot, 1] > routing.forward_bounds[slot, 0]) == active
+            assert (routing.exit_sources[last].item() == slot) == active
+            if active:
+                assert routing.forward_bounds[slot].tolist() == list(
+                    plan.cu_seqlens[last : last + 2]
+                )
+            # A reverse slot covers the first subsequence iff it has predecessors; its entry state
+            # is the folded predecessor chain and its loss cotangent is what the slot folds in.
+            active = bool(plan.predecessors[first])
+            assert (routing.reverse_bounds[slot, 1] > routing.reverse_bounds[slot, 0]) == active
+            assert (routing.entry_sources[first].item() == slot) == active
+            if active:
+                assert routing.reverse_sources[slot].item() == first
+        for index in range(count):
+            if index not in {first for first, _ in plan.fragment_spans()}:
+                assert routing.entry_sources[index].item() == routing.slots
+            if index not in {last for _, last in plan.fragment_spans()}:
+                assert routing.exit_sources[index].item() == routing.slots
+
+
+def test_routing_rejects_more_subsequences_than_the_cap():
+    plan = ContextParallelPlan.from_fragments((0, 1, 2, 3, 4, 8, 16), FRAGMENTS, cp_rank=0)
+    with pytest.raises(ValueError, match="max_subsequences"):
+        plan.routing("cpu", max_subsequences=len(plan.subsequences) - 1)

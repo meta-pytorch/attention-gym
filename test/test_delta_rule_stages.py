@@ -464,7 +464,6 @@ def test_mega_prepare_rejects_split_schedules():
 @requires_kda_target
 def test_mega_context_parallel_rejects_fastmath_like_the_unsharded_op():
     q, k, v, gate, beta = KDA.make_inputs(128, seed=8)
-    cu_seqlens = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
     plan = ContextParallelPlan.from_fragments((0, 128), [[(0, 128)]], cp_rank=0)
     with pytest.raises(ValueError, match="fastmath is not supported by the Mega backend"):
         context_parallel_kda(
@@ -473,8 +472,7 @@ def test_mega_context_parallel_rejects_fastmath_like_the_unsharded_op():
             v,
             gate,
             beta,
-            cu_seqlens=cu_seqlens,
-            plan=plan,
+            routing=plan.routing("cuda"),
             group=None,
             fastmath=True,
             kernel_options={"backend": "mega"},
@@ -493,24 +491,22 @@ def simulate_context_parallel(
     op: Op, cu_seqlens_global, fragments, inputs, d_output, d_final_state
 ) -> list[RankResult]:
     """Run the recipe for every rank in one process, replacing each all-gather with a stack."""
-    q, _, v, _, _ = inputs
-    device = q.device
+    device = inputs[0].device
     ranks = range(len(fragments))
     plans = [
         ContextParallelPlan.from_fragments(cu_seqlens_global, fragments, rank) for rank in ranks
     ]
     token_ids = [plan.global_token_ids(device) for plan in plans]
+    routings = [plan.routing(device) for plan in plans]
     prepared = [
         op.prepare(
-            *(tensor[:, token_ids[r]] for tensor in inputs),
-            cu_seqlens=torch.tensor(plans[r].cu_seqlens, dtype=torch.int32, device=device),
+            *(tensor[:, token_ids[r]] for tensor in inputs), cu_seqlens=routings[r].cu_seqlens
         )
         for r in ranks
     ]
-    neutral = neutral_summary(v.shape[2], v.shape[-1], q.shape[-1], device=device)
 
-    gathered = torch.stack([summary_slots(prepared[r], plans[r], neutral) for r in ranks])
-    initial_states = [compose_entry_states(gathered, plans[r]) for r in ranks]
+    gathered = torch.stack([summary_slots(prepared[r], routings[r]) for r in ranks])
+    initial_states = [compose_entry_states(gathered, routings[r]) for r in ranks]
     forward = [prepared[r].run(initial_states[r], output_final_state=True) for r in ranks]
 
     # The loss's state cotangent reaches only the subsequences that end their sequence.
@@ -535,10 +531,10 @@ def simulate_context_parallel(
         for r in ranks
     ]
     gathered = torch.stack(
-        [grad_summary_slots(grads[r], d_exit_states[r], plans[r], neutral) for r in ranks]
+        [grad_summary_slots(grads[r], d_exit_states[r], routings[r]) for r in ranks]
     )
     input_grads = [
-        grads[r].run(compose_exit_cotangents(gathered, d_exit_states[r], plans[r]))[:5]
+        grads[r].run(compose_exit_cotangents(gathered, d_exit_states[r], routings[r]))[:5]
         for r in ranks
     ]
     return [RankResult(plans[r], token_ids[r], *forward[r], input_grads[r]) for r in ranks]
