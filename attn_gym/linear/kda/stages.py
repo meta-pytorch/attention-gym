@@ -11,12 +11,12 @@ between devices (context parallelism, pipelined state handoff, ...) need the sam
 a communication point in both directions::
 
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)  # WY factors, once
-    summary = prepared.state_summary(start, stop)          # [bias; transition] of one subsequence
+    summaries = prepared.state_summaries(bounds)     # [bias; transition] per range, one launch
     ...exchange summaries, compose each subsequence's entry state...
     output, final_state = prepared.run(initial_state, output_final_state=True)
 
     grads = chunk_kda_prepare_backward(saved, d_output, initial_state, scale=prepared.scale)
-    grad_summary = grads.state_grad_summary(start, stop)
+    grad_summaries = grads.state_grad_summaries(bounds)
     ...exchange, compose each subsequence's exit cotangent...
     dq, dk, dv, dgate, dbeta, d_initial_state = grads.run(d_final_state)
 
@@ -34,9 +34,8 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import CHUNK_SIZE, prepare_span
-from attn_gym.linear._delta_rule.validation import check_summary_range
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     ChunkKDABwdPrepared,
     _finish_chunk_kda_bwd,
@@ -91,20 +90,20 @@ def _metadata_from_saved(saved: ChunkKDASaved) -> RaggedChunkMetadata | None:
 
 
 # NOTE [Summary ranges are whole chunks of one subsequence]
-# ``state_summary(start, stop)`` and ``state_grad_summary(start, stop)`` take LOCAL span offsets
-# (see NOTE [Terminology] in ``attn_gym.linear.state_summary``). The factor kernels lay 64-token
-# chunks from each subsequence's first token, and every chunk's factors are scaled toward that
-# chunk's last token, so a summary is exact only over whole chunks of one subsequence:
+# ``state_summaries(bounds)`` and ``state_grad_summaries(bounds)`` take an ``int32 [R, 2]``
+# device tensor of LOCAL span offsets (see NOTE [Terminology] in ``attn_gym.linear.state_summary``).
+# The factor kernels lay 64-token chunks from each subsequence's first token, and every chunk's
+# factors are scaled toward that chunk's last token, so a row is exact only over whole chunks of
+# one subsequence:
 #
 #     start = sub_start + CHUNK_SIZE * i
 #     stop  = sub_start + CHUNK_SIZE * j   or   stop = sub_end   (the partial tail chunk is fine)
-#     [start, stop) must not cross a ``cu_seqlens`` boundary
+#     [start, stop) must not cross a ``cu_seqlens`` boundary;  start == stop is the identity
 #
-# The recipe always passes one whole subsequence, ``(cu_seqlens[i], cu_seqlens[i + 1])``, which
-# satisfies this trivially. A range that starts or stops mid-chunk, or spans two subsequences,
-# returns a plausible but wrong map. The methods only bounds-check: the boundaries are host
-# integers the caller already holds, and comparing them against the device ``cu_seqlens`` would
-# force a sync inside CUDA Graph capture.
+# The context-parallel routing always passes whole subsequences, ``(cu_seqlens[i],
+# cu_seqlens[i + 1])``, which satisfies this trivially. A row that starts or stops mid-chunk, or
+# spans two subsequences, returns a plausible but wrong map. The values are not checked: they live
+# on the device so the launch replays under CUDA Graph capture, and reading them back would sync.
 
 
 def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
@@ -121,7 +120,7 @@ def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
 
 @dataclass
 class ChunkKDAPrepared:
-    """Local forward factors shared by ``state_summary`` and ``run``.
+    """Local forward factors shared by ``state_summaries`` and ``run``.
 
     The factors are large; release the handle once ``run`` has produced the output.
     """
@@ -132,17 +131,16 @@ class ChunkKDAPrepared:
     scale: float
     autotune: bool
 
-    def state_summary(self, start: int, stop: int) -> torch.Tensor:
-        """Return the FP32 ``[HV, V + K, K]`` map of tokens ``[start, stop)`` from the zero state.
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
-        See NOTE [Summary ranges are whole chunks of one subsequence].
+        ``bounds`` is an ``int32 [R, 2]`` device tensor of ``[start, stop)`` span offsets, each
+        obeying NOTE [Summary ranges are whole chunks of one subsequence]; ``start == stop``
+        yields the identity. The ranges are read on the device, so a CUDA Graph captured around
+        this call replays for any layout of the same shape.
         """
-        check_summary_range(self.saved.q.shape[1], start, stop)
-        return build_state_summary(
-            self.factors.kg[:, start:stop],
-            self.factors.w[:, start:stop],
-            self.factors.u[:, start:stop],
-            self.saved.cumulative_gate[:, start:stop],
+        return build_state_summaries(
+            self.factors.kg, self.factors.w, self.factors.u, self.saved.cumulative_gate, bounds
         )
 
     def run(
@@ -207,7 +205,7 @@ def chunk_kda_prepare(
 
 @dataclass
 class ChunkKDABackward:
-    """Recomputed local backward tensors shared by ``state_grad_summary`` and ``run``.
+    """Recomputed local backward tensors shared by ``state_grad_summaries`` and ``run``.
 
     ``run`` consumes the recomputed tensors at their last use, so call it once and last.
     """
@@ -221,24 +219,24 @@ class ChunkKDABackward:
     autotune: bool
     fastmath: bool
 
-    def state_grad_summary(self, start: int, stop: int) -> torch.Tensor:
-        """Return the FP32 ``[HV, V + K, K]`` reverse map of tokens ``[start, stop)``.
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         Packed as ``[C; R]`` with ``d_entry_state = d_exit_state @ R + C``, where ``C`` is the
-        cotangent the range's own ``d_output`` sends to its entry state. See
-        NOTE [Summary ranges are whole chunks of one subsequence].
+        cotangent the range's own ``d_output`` sends to its entry state. Rows follow the contract
+        of ``ChunkKDAPrepared.state_summaries``.
         """
-        check_summary_range(self.saved.q.shape[1], start, stop)
         assert self.prepared.qg is not None and self.prepared.kg is not None
         assert self.prepared.w is not None
-        return build_state_grad_summary(
-            self.prepared.qg[:, start:stop],
-            self.prepared.kg[:, start:stop],
-            self.prepared.w[:, start:stop],
-            self.d_output[:, start:stop],
-            self.saved.aqk[:, start:stop],
-            self.saved.cumulative_gate[:, start:stop],
+        return build_state_grad_summaries(
+            self.prepared.qg,
+            self.prepared.kg,
+            self.prepared.w,
+            self.d_output,
+            self.saved.aqk,
+            self.saved.cumulative_gate,
             self.scale,
+            bounds,
         )
 
     def run(

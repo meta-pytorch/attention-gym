@@ -54,7 +54,6 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     MAX_RANGES,
     decode_work_row,
-    full_range_bounds,
     plan_work_budget,
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
@@ -1631,22 +1630,3 @@ def build_state_grad_summaries(
     )
     # The cotangent flows through the later item first.
     return compose_work_items(partials, range_ids, ranges, reverse=True)
-
-
-@torch.compiler.disable
-def build_state_grad_summary(
-    qg: torch.Tensor,
-    kg: torch.Tensor,
-    w: torch.Tensor,
-    dout: torch.Tensor,
-    Aqk: torch.Tensor,
-    cumulative_gate: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    """Compute one shard's packed reverse affine summary over all ``T`` tokens.
-
-    The single-range form of :func:`build_state_grad_summaries` (a partial final chunk is
-    handled in the kernel); see it for the argument contract. Returns FP32 ``[H, 256, 128]``.
-    """
-    bounds = full_range_bounds(qg)
-    return build_state_grad_summaries(qg, kg, w, dout, Aqk, cumulative_gate, scale, bounds)[0]

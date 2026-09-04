@@ -79,7 +79,6 @@ Limitations:
 # NOTE: no `from __future__ import annotations` — cute.struct requires
 # eager-evaluated annotations.
 
-import functools
 from enum import IntEnum
 from typing import NamedTuple
 
@@ -1279,39 +1278,3 @@ def build_state_summaries(
     )
     compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), work, partials)
     return compose_work_items(partials, range_ids, ranges, reverse=False)
-
-
-@functools.lru_cache(maxsize=64)
-def _cached_full_range(tokens: int, device: torch.device) -> torch.Tensor:
-    return (torch.arange(2, dtype=torch.int32, device=device) * tokens).view(1, 2)
-
-
-def full_range_bounds(like: torch.Tensor) -> torch.Tensor:
-    """``[[0, T]]`` for the single-range summaries of a ``[1, T, ...]`` tensor.
-
-    Built with ``arange`` so it never needs a host-to-device copy. The tensor is cached per
-    ``(T, device)`` because three tiny eager ops cost as much as the summary kernel itself, except
-    under CUDA Graph capture (the graph's pool must own it) and for fake inputs (a cached fake
-    tensor would be handed to real calls later).
-    """
-    tokens, device = like.shape[1], like.device
-    if torch.cuda.is_current_stream_capturing() or isinstance(like, FakeTensor):
-        return (torch.arange(2, dtype=torch.int32, device=device) * tokens).view(1, 2)
-    return _cached_full_range(tokens, device)
-
-
-@torch.compiler.disable
-def build_state_summary(
-    kg: torch.Tensor,
-    w: torch.Tensor,
-    u: torch.Tensor,
-    cumulative_gate: torch.Tensor,
-) -> torch.Tensor:
-    """Compute one shard's packed affine state summary from its WY chunk factors.
-
-    The single-range form of :func:`build_state_summaries` over all ``T`` tokens (a partial
-    final chunk is handled in the kernel); see it for the argument contract. Returns FP32
-    ``[H, 256, 128]``.
-    """
-    bounds = full_range_bounds(kg)
-    return build_state_summaries(kg, w, u, cumulative_gate, bounds)[0]

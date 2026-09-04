@@ -15,15 +15,27 @@ import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
 import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
 import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
-from attn_gym.linear._delta_rule.cute import (
-    build_state_grad_summaries,
-    build_state_grad_summary,
-    build_state_summaries,
-    build_state_summary,
-)
+from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, plan_work_items
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.testing.kda import assert_relative_rms_within
+
+
+def whole_stream(like: torch.Tensor) -> torch.Tensor:
+    """``bounds`` covering all ``T`` tokens of a ``[1, T, ...]`` tensor; ``arange`` keeps it capturable."""
+    return (torch.arange(2, dtype=torch.int32, device=like.device) * like.shape[1]).view(1, 2)
+
+
+def build_state_summary(kg, w, u, cumulative_gate):
+    """The single whole-stream summary: ``R = 1`` of ``build_state_summaries``."""
+    return build_state_summaries(kg, w, u, cumulative_gate, whole_stream(kg))[0]
+
+
+def build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, scale):
+    """The single whole-stream reverse summary: ``R = 1`` of ``build_state_grad_summaries``."""
+    bounds = whole_stream(qg)
+    return build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)[0]
+
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
@@ -608,8 +620,6 @@ def test_affine_summaries_reject_torch_export_instead_of_emitting_empty_outputs(
         torch.export.export(ForwardSummary(), (x, x, x, gate), strict=False)
     with pytest.raises(TypeError, match="does not support torch.export"):
         torch.export.export(ReverseSummary(), (x, x, x, x, aqk, gate), strict=False)
-    # The rejected fake call must not poison the cached single-range bounds for real calls.
-    assert torch.isfinite(build_state_summary(x, x, x, gate)).all()
 
 
 def test_build_state_summary_cuda_graph_replay():
