@@ -1,4 +1,4 @@
-"""Staged delta-rule primitives: ``prepare`` / ``run`` / state summaries against the public ops."""
+"""Staged KDA/GDN primitives: ``prepare`` / ``run`` / state summaries against the public ops."""
 
 from __future__ import annotations
 
@@ -11,9 +11,12 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear.gdn import chunk_gdn
+from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 from attn_gym.linear.kda import chunk_kda
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.state_summary import compose_summaries, merge_state, neutral_summary
+from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     assert_relative_rms_within,
@@ -55,6 +58,12 @@ def kda_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtyp
     )
 
 
+def gdn_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtype) -> Inputs:
+    return make_gdn_test_inputs(
+        tokens, key_heads=key_heads, value_heads=value_heads, seed=seed, dtype=dtype
+    )[:5]
+
+
 KDA = Op(
     chunk_kda,
     partial(chunk_kda, impl="reference"),
@@ -64,7 +73,23 @@ KDA = Op(
     key_heads=2,
     value_heads=2,
 )
-op_param = pytest.mark.parametrize("op", [pytest.param(KDA, id="kda")])
+GDN = Op(
+    partial(chunk_gdn, impl="fused"),
+    partial(chunk_gdn, impl="reference"),
+    chunk_gdn_prepare,
+    chunk_gdn_prepare_backward,
+    gdn_inputs,
+    key_heads=2,
+    value_heads=2,
+)
+op_param = pytest.mark.parametrize(
+    "op",
+    [
+        pytest.param(KDA, id="kda"),
+        pytest.param(GDN, id="gdn"),
+        pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
+    ],
+)
 
 
 def test_summary_algebra_composes_like_sequential_merges():
@@ -205,17 +230,24 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
     "loss", ["both", "output-only", "final-state-only"], ids=lambda loss: f"loss-{loss}"
 )
 @pytest.mark.parametrize("state", ["contiguous", "strided-key", "none"])
-def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state):
+@pytest.mark.parametrize("packing", ["packed", "dense"])
+def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state, packing):
     """The staged backward is the op's own kernel sequence, so all six gradients are bitwise.
 
-    Covers the cotangents the staged API makes optional (``d_output=None``, no final-state loss)
-    and the entry-state layouts ``run`` accepts: none, contiguous, and a key-strided view.
+    Covers the cotangents the staged API makes optional (``d_output=None``, no final-state loss),
+    the entry-state layouts ``run`` accepts (none, contiguous, a key-strided view), and both chunk
+    schedules: packed ``cu_seqlens`` and a dense span of complete chunks (``metadata is None``).
     """
     inputs = op.make_inputs(320, seed=7)
-    cu_seqlens = torch.tensor([0, 100, 320], dtype=torch.int32, device="cuda")
+    if packing == "packed":
+        cu_seqlens = torch.tensor([0, 100, 320], dtype=torch.int32, device="cuda")
+        sequences = 2
+    else:
+        cu_seqlens = None
+        sequences = 1
     generator = torch.Generator(device="cuda").manual_seed(8)
     wide = torch.randn(
-        2, op.value_heads, HEAD_DIM, 2 * HEAD_DIM, device="cuda", generator=generator
+        sequences, op.value_heads, HEAD_DIM, 2 * HEAD_DIM, device="cuda", generator=generator
     )
     initial_state = {
         "contiguous": wide[..., :HEAD_DIM].contiguous(),
@@ -223,7 +255,7 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state)
         "none": None,
     }[state]
     d_final_state = torch.randn(
-        2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda", generator=generator
+        sequences, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda", generator=generator
     )
 
     leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs) + (
@@ -245,6 +277,7 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state)
     prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens, scale=scale)
     prepared.run(initial_state, output_final_state=True)
     grads = op.prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
+    grads.state_grad_summary(0, 64)  # The exchange order: summary first, so run reuses its Aqk.
     actual = grads.run(d_final_state)
 
     assert len(actual) == 6

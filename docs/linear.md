@@ -397,6 +397,8 @@ collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [b
 (one map per value head; GQA key heads are expanded by the factor kernels). Moving state between
 devices (context parallelism, pipelined state handoff, ...) is therefore a prefix scan over these
 summaries, and it needs the fused core split around the communication point in both directions.
+The same machinery serves KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel
+summary kernels).
 
 ### Terminology and index spaces
 
@@ -436,7 +438,8 @@ subsequence: `start = sub_start + 64·i`, `stop = sub_start + 64·j` or the subs
 crossing a `cu_seqlens` boundary. The recipe always passes one whole subsequence,
 `(cu_seqlens[i], cu_seqlens[i + 1])`.
 
-`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` do that split without
+`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` and
+`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward` do that split without
 exposing the WY factors:
 
 ```python
@@ -460,3 +463,7 @@ capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch alge
 ::: attn_gym.linear.kda.stages.chunk_kda_prepare
 
 ::: attn_gym.linear.kda.stages.chunk_kda_prepare_backward
+
+::: attn_gym.linear.gdn.stages.chunk_gdn_prepare
+
+::: attn_gym.linear.gdn.stages.chunk_gdn_prepare_backward
