@@ -371,6 +371,46 @@ def test_summaries_are_exact_over_whole_chunks_of_one_subsequence(op):
 
 
 @requires_kda_target
+@op_param
+def test_state_summaries_match_per_range_summaries(op):
+    """One device-``bounds`` launch reproduces ``state_summary`` per range, forward and reverse."""
+    q, k, v, gate, beta = op.make_inputs(520, seed=13)
+    gate = gate / 50
+    cu_seqlens = torch.tensor([0, 72, 520], dtype=torch.int32, device="cuda")
+    d_output = torch.randn(v.shape, device="cuda").to(v.dtype)
+    zero = torch.zeros(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
+    prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+    prepared.run(zero, output_final_state=True)
+    grads = op.prepare_backward(prepared.saved, d_output, zero, scale=prepared.scale)
+
+    # Both subsequences, an interior chunk run, an empty range, and a chunk-aligned prefix.
+    ranges = [(0, 72), (72, 520), (136, 264), (300, 300), (72, 200)]
+    bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
+    forward = prepared.state_summaries(bounds)
+    reverse = grads.state_grad_summaries(bounds)
+    assert forward.shape == reverse.shape == (len(ranges), op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
+    identity = neutral_summary(op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
+    for index, (start, stop) in enumerate(ranges):
+        if start == stop:
+            torch.testing.assert_close(forward[index], identity, atol=0, rtol=0)
+            torch.testing.assert_close(reverse[index], identity, atol=0, rtol=0)
+            continue
+        for name, actual, expected in (
+            ("forward", forward[index], prepared.state_summary(start, stop)),
+            ("reverse", reverse[index], grads.state_grad_summary(start, stop)),
+        ):
+            # Segmentation differs between the two launches, so agreement is FP32 rounding.
+            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+            assert_relative_rms_within(
+                actual,
+                expected,
+                f"{name} [{start}, {stop})",
+                max_eps=64,
+                source_dtype=torch.float32,
+            )
+
+
+@requires_kda_target
 def test_state_summary_rejects_ranges_outside_the_stream():
     q, k, v, gate, beta = KDA.make_inputs(128, seed=3)
     prepared = chunk_kda_prepare(q, k, v, gate, beta)

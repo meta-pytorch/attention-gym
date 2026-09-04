@@ -35,7 +35,12 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_rows
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import (
+    build_state_grad_summaries,
+    build_state_grad_summary,
+    build_state_summaries,
+    build_state_summary,
+)
 from attn_gym.linear._delta_rule.validation import check_summary_range, resolve_scale
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     ChunkKDABwdPrepared,
@@ -143,6 +148,18 @@ class ChunkKDAPrepared:
             self.saved.cumulative_gate[:, start:stop],
         )
 
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
+
+        ``bounds`` is an ``int32 [F, 2]`` device tensor of ``[start, stop)`` span offsets, each
+        obeying NOTE [Summary ranges are whole chunks of one subsequence]; ``start == stop``
+        yields the identity. The ranges are read on the device, so a CUDA Graph captured around
+        this call replays for any layout of the same shape.
+        """
+        return build_state_summaries(
+            self.factors.kg, self.factors.w, self.factors.u, self.saved.cumulative_gate, bounds
+        )
+
     def run(
         self,
         initial_state: torch.Tensor | None = None,
@@ -175,10 +192,9 @@ class ChunkKDAMegaPrepared:
     """Mega forward handle: on-chip factors for ``run``, fused factors only for summaries.
 
     Mega never materializes the WY factors, so ``run`` executes the Mega with-state kernel over the
-    whole local stream and ``state_summary`` computes the fused factors for just the requested
-    sequence. Ranks whose fragments all end their sequence never pay for them, and packed streams
-    pay only for the fragments that continue elsewhere. Backward recomputes the intra factors, as
-    Mega does today.
+    whole local stream and the summaries compute the fused factors separately: ``state_summary``
+    for just the requested sequence, ``state_summaries`` once for the whole stream (its ranges are
+    device values). Backward recomputes the intra factors, as Mega does today.
     """
 
     saved: ChunkKDASaved  # aqk/akk are None: Mega keeps them on chip
@@ -209,6 +225,28 @@ class ChunkKDAMegaPrepared:
             q, k, v, cumulative_gate, beta, metadata, scale=self.scale, autotune=self.autotune
         )
         return build_state_summary(factors.kg, factors.w, factors.u, cumulative_gate)
+
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
+
+        Mega keeps no WY factors, so this factors the whole local stream once (the fused
+        forward's factor half) and summarizes every range from it; see
+        ``ChunkKDAPrepared.state_summaries`` for the contract.
+        """
+        saved = self.saved
+        factors = _prepare_chunk_kda_fwd(
+            saved.q,
+            saved.k,
+            saved.v,
+            saved.cumulative_gate,
+            saved.beta,
+            self.metadata,
+            scale=self.scale,
+            autotune=self.autotune,
+        )
+        return build_state_summaries(
+            factors.kg, factors.w, factors.u, saved.cumulative_gate, bounds
+        )
 
     def run(
         self,
@@ -261,7 +299,7 @@ def chunk_kda_prepare(
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.state_summary``).
     ``kernel_options={"backend": "mega"}`` runs the local pass with Mega and computes fused factors
-    only when a summary is requested; the split schedules are not available with entry states.
+    only for the summaries; the split schedules are not available with entry states.
     """
     backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
     if split_backward or split_forward:
@@ -345,6 +383,25 @@ class ChunkKDABackward:
             self.saved.aqk[:, start:stop],
             self.saved.cumulative_gate[:, start:stop],
             self.scale,
+        )
+
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
+
+        Same contract as ``ChunkKDAPrepared.state_summaries``; the bias convention is that of
+        ``state_grad_summary``.
+        """
+        assert self.prepared.qg is not None and self.prepared.kg is not None
+        assert self.prepared.w is not None
+        return build_state_grad_summaries(
+            self.prepared.qg,
+            self.prepared.kg,
+            self.prepared.w,
+            self.d_output,
+            self.saved.aqk,
+            self.saved.cumulative_gate,
+            self.scale,
+            bounds,
         )
 
     def run(

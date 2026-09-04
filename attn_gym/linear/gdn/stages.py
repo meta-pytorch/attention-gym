@@ -21,7 +21,12 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_rows
-from attn_gym.linear._delta_rule.cute import build_state_grad_summary, build_state_summary
+from attn_gym.linear._delta_rule.cute import (
+    build_state_grad_summaries,
+    build_state_grad_summary,
+    build_state_summaries,
+    build_state_summary,
+)
 from attn_gym.linear._delta_rule.validation import check_summary_range, resolve_scale
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
     chunk_gdn_recompute_aqk_dense,
@@ -85,6 +90,20 @@ class ChunkGDNPrepared:
             self.factors.w[:, start:stop],
             self.factors.u[:, start:stop],
             _vector_gate(saved.cumulative_gate[:, start:stop], saved.q.shape[-1]),
+        )
+
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
+
+        See ``attn_gym.linear.kda.stages.ChunkKDAPrepared.state_summaries`` for the contract.
+        """
+        saved = self.saved
+        return build_state_summaries(
+            self.factors.kg,
+            self.factors.w,
+            self.factors.u,
+            _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
+            bounds,
         )
 
     def run(
@@ -197,6 +216,23 @@ class ChunkGDNBackward:
             self.aqk[:, start:stop],
             _vector_gate(saved.cumulative_gate[:, start:stop], saved.q.shape[-1]),
             self.scale,
+        )
+
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
+
+        See ``attn_gym.linear.kda.stages.ChunkKDABackward.state_grad_summaries``.
+        """
+        saved = self.saved
+        return build_state_grad_summaries(
+            self.prepared.qg,
+            self.prepared.kg,
+            self.prepared.w,
+            self.d_output,
+            self.aqk,
+            _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
+            self.scale,
+            bounds,
         )
 
     def run(
