@@ -12,6 +12,7 @@ from attn_gym._backends.cute import (
     normalize_tma_rows,
     tensor_supports_tma_rows,
 )
+from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -37,7 +38,7 @@ from attn_gym.linear.kda.ops import (
 from attn_gym.linear.kda.ops import (
     chunk_fwd_with_state_op as _chunk_kda_fwd_with_state_op,
 )
-from attn_gym.linear.kda.utils import is_sm100_kda_target, profiler_range
+from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.

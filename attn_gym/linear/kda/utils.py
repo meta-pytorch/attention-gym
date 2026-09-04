@@ -248,10 +248,3 @@ def input_guard(
     if fn is not None:
         return decorator(fn)
     return decorator
-
-
-def profiler_range(name: str):
-    """A named profiler range, free when no torch profiler is active (~4us each)."""
-    if torch.autograd.profiler._is_profiler_enabled:
-        return torch.profiler.record_function(name)
-    return contextlib.nullcontext()

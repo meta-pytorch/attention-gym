@@ -390,15 +390,15 @@ forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
 ::: attn_gym.linear.Impl
 
-## Staged Primitives
+## Context Parallelism
 
 Every delta-rule token step is affine in the V-major recurrent state, so any token range
 collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [bias; transition]`
-(one map per value head; GQA key heads are expanded by the factor kernels). Moving state between
-devices (context parallelism, pipelined state handoff, ...) is therefore a prefix scan over these
-summaries, and it needs the fused core split around the communication point in both directions.
-The same machinery serves KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel
-summary kernels).
+(one map per value head; GQA key heads are expanded by the factor kernels).
+Context parallelism is therefore a prefix scan over these summaries, and the same machinery serves
+KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel summary kernels). The
+public surface has three tiers so that new partitionings or communication topologies never add
+options to an op.
 
 ### Terminology and index spaces
 
@@ -438,27 +438,28 @@ exact over whole chunks of one subsequence: `start = sub_start + 64·i`, `stop =
 or the subsequence end, never crossing a `cu_seqlens` boundary; `start == stop` is the identity.
 The recipe always passes whole subsequences, `(cu_seqlens[i], cu_seqlens[i + 1])`.
 
-`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward` and
-`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward` do that split without
-exposing the WY factors:
+**Primitives** (`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward`, and
+`attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward`) split the fused core
+around the communication point without exposing its WY factors:
 
 ```python
 from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
 
 prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
 summaries = prepared.state_summaries(bounds)  # [bias; transition] per range, one launch
-# ...exchange summaries and compose each sequence's entry state...
+# ...exchange summaries and compose each subsequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
 grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
 grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; transition]
-# ...exchange and compose each sequence's exit cotangent...
+# ...exchange and compose each subsequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```
 
-`start`/`stop` are host integers naming exactly one local `cu_seqlens` segment, so CUDA Graph
-capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries
-(`merge_state`, `compose_summaries`, `neutral_summary`).
+Each `bounds` row names one local `cu_seqlens` segment (or a whole-chunk run inside one), and
+one launch returns every row's map; the context-parallel routing supplies the rows.
+`attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries (`merge_state`,
+`compose_summaries`, `neutral_summary`).
 
 **Ownership plans** (`attn_gym.linear.context_parallel.ContextParallelPlan.from_fragments`) take
 every rank's fragments. You choose them in plain Python; the plan cuts each fragment at sequence
@@ -473,6 +474,53 @@ fixed-shape device tensors; `summary_slots` / `grad_summary_slots` fill a rank's
 buffer from a prepared handle and a routing, and `compose_entry_states` /
 `compose_exit_cotangents` fold the gathered `[world, slots, ...]` buffers into each subsequence's
 entry state or exit cotangent; the collective in between is the caller's.
+[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
+builds contiguous and zig-zag fragment lists in a dozen lines.
+
+**Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
+`attn_gym.linear.kda.context_parallel_kda` and `attn_gym.linear.gdn.context_parallel_gdn`) moves
+summaries with one padded all-gather per direction and owns the autograd function; it is generic
+over the delta-rule variant through a `StagedOp` pair of the two `prepare` entry points, but not
+over the communication topology. `context_parallel_conv_history` builds the short convolution's
+`initial_state` from the same routing (`plan.routing(device, conv_history=W - 1)`). For a
+point-to-point pipeline, a recursive-doubling scan over `compose_summaries`, DTensor, or
+communication overlap, compose the staged primitives and the routing helpers (`summary_slots`,
+`compose_entry_states`, ...) around your own collective; the primitives and plans are unchanged.
+Sharding does not cost accuracy: against an FP32 reference, sharded gradients match the unsharded
+fused op's error to within noise for both ops.
+
+```python
+from attn_gym.linear.context_parallel import ContextParallelPlan
+from attn_gym.linear.kda import context_parallel_kda
+
+# Two ranks, one fragment each: the global stream split down the middle.
+total_tokens = cu_seqlens_global[-1]
+half = total_tokens // 2
+plan = ContextParallelPlan.from_fragments(
+    cu_seqlens_global, [[(0, half)], [(half, total_tokens)]], cp_rank=dist.get_rank(group)
+)
+token_ids = plan.global_token_ids(device)  # gather global tensors into this rank's span
+routing = plan.routing(device)  # the layout as fixed-shape device tensors
+output, final_state = context_parallel_kda(q, k, v, gate, beta, routing=routing, group=group)
+true_final_states = final_state[routing.terminal]  # boolean indexing syncs; see below
+```
+
+The recipe starts each sequence from zero, always returns every subsequence's exit state, and does
+not accept `initial_state` or `output_final_state=False`. Every index it uses comes from the
+routing tensors, so a CUDA Graph captured around it replays for any document layout and fragment
+table within the routing caps: capture with `plan.routing(device, slots=S, max_subsequences=N)`
+(at most `S` fragments per rank, `N` segments per span, the same span length), then copy each new
+layout's routing tensors into the captured ones (`test/test_context_parallel_distributed.py`
+replays three layouts times three tables). Eager callers pass no caps. The recipe returns
+`N` exit-state rows; only those where `routing.terminal` is set are true final states. Inside a
+captured region select them with the host-side `plan.terminal` (or a per-row cotangent mask, as the
+test does) rather than boolean indexing, which syncs.
+
+::: attn_gym.linear.context_parallel.context_parallel_chunk
+
+::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
 
 ::: attn_gym.linear.context_parallel.ContextParallelPlan
 
