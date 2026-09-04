@@ -414,8 +414,8 @@ Anything a plan is built from is **global**; anything that touches a tensor on a
 | span | the concatenation of a rank's fragments, in the order it listed them: the packed `q`/`k`/`v`/`output` tensors on that rank, with `cu_seqlens` marking its subsequence boundaries | local |
 | chunk | the `attn_gym.linear.kda.stages.CHUNK_SIZE` (64) token block the fused kernels work in (WY factors and one state step per block); every subsequence is chunked on its own, starting at its first token, so its last chunk may be partial and no fragment cut needs to be chunk-aligned | local |
 | summary | the `[bias; transition]` map of a token range of the span | local range |
-| slot | `gathered[rank][i]`: the summary of that rank's `i`-th subsequence, or the identity | (rank, index) |
-| predecessors / successors | subsequences of the same sequence earlier / later in global order | (rank, slot) |
+| slot | `gathered[cp_rank][f]`: one per fragment. Forward, the summary of fragment `f`'s last subsequence; backward, the reverse map of its first; the identity when nobody needs it | (cp_rank, fragment) |
+| predecessors / successors | the slots holding a fragment's sequence's earlier / later pieces, in token order | (cp_rank, fragment) |
 | terminal | subsequences that end their sequence; true final states live there | local index |
 
 Fragment cut points are arbitrary global tokens: chunking restarts at every subsequence, so they
@@ -430,7 +430,7 @@ rank 1                                 [ frag C ][= frag D ==]
 
 rank 0 span:  A∩s0 | A∩s1 | B∩s2     local cu_seqlens (0, 40, 96, 192)
 rank 1 span:  C∩s1 | D∩s1 | D∩s2     local cu_seqlens (0, 96, 136, 192)
-chains:       s1 = A∩s1 -> C∩s1 -> D∩s1        s2 = D∩s2 -> B∩s2
+slot order:   s1 = A∩s1 -> C∩s1 -> D∩s1        s2 = D∩s2 -> B∩s2
 ```
 
 `state_summaries(bounds)` takes an `int32 [R, 2]` device tensor of **local** span ranges and is
@@ -459,6 +459,26 @@ dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 `start`/`stop` are host integers naming exactly one local `cu_seqlens` segment, so CUDA Graph
 capture never syncs. `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries
 (`merge_state`, `compose_summaries`, `neutral_summary`).
+
+**Ownership plans** (`attn_gym.linear.context_parallel.ContextParallelPlan.from_fragments`) take
+every rank's fragments. You choose them in plain Python; the plan cuts each fragment at sequence
+boundaries into `Subsequence`s, one span `cu_seqlens` segment each, and derives the routing:
+which fragments need a forward or reverse summary (one gather slot per fragment), which slots to
+fold for each entry state or exit cotangent, and which subsequences end their sequence and
+therefore hold true final states. Two pieces of one document on the same rank are simply two span
+segments whose entry states the routing supplies, so contiguous shards, zig-zag load balancing, and
+document-aligned partitions differ only in the fragment lists. The fragments must tile
+`[0, total_tokens)` exactly once. `plan.routing(device)` materializes the same routing as
+fixed-shape device tensors; `summary_slots` / `grad_summary_slots` fill a rank's `[slots, ...]`
+buffer from a prepared handle and a routing, and `compose_entry_states` /
+`compose_exit_cotangents` fold the gathered `[world, slots, ...]` buffers into each subsequence's
+entry state or exit cotangent; the collective in between is the caller's.
+
+::: attn_gym.linear.context_parallel.ContextParallelPlan
+
+::: attn_gym.linear.context_parallel.Subsequence
+
+::: attn_gym.linear.context_parallel.ContextParallelRouting
 
 ::: attn_gym.linear.kda.stages.chunk_kda_prepare
 
