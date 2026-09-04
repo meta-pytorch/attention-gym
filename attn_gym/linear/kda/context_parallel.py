@@ -19,6 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
+from attn_gym.linear.types import KernelOptions
 
 
 def context_parallel_kda(
@@ -33,14 +34,18 @@ def context_parallel_kda(
     scale: float | None = None,
     autotune: bool = True,
     fastmath: bool = False,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run ``chunk_kda`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale``, ``autotune``, and ``fastmath`` follow ``chunk_kda``.
+    ``scale``, ``autotune``, and ``kernel_options`` follow ``chunk_kda``. With
+    ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and the fused factors are
+    computed once over the span for the summaries; ``fastmath`` applies to the staged backward,
+    which is the fused one for either backend.
     """
     stages = StagedOp(
-        partial(chunk_kda_prepare, scale=scale, autotune=autotune),
+        partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
         partial(chunk_kda_prepare_backward, autotune=autotune, fastmath=fastmath),
     )
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)

@@ -321,10 +321,6 @@ def validate_mega_constraints(
             raise TypeError("Mega beta requires a contiguous, element-aligned inner mode")
         if cu_seqlens is not None and cu_seqlens.data_ptr() % 8:
             raise TypeError("Mega cu_seqlens must be 8-byte aligned")
-    if cu_seqlens is None and q.shape[1] % _CHUNK_SIZE:
-        raise ValueError(
-            "dense Mega execution requires T divisible by 64; pass cu_seqlens for tails"
-        )
 
 
 def chunk_forward(
@@ -355,7 +351,14 @@ def chunk_forward(
     if not torch.compiler.is_compiling():
         validate_mega_available(q)
 
-    if cu_seqlens is None and initial_state is None and not output_final_state:
+    # The dense kernels specialize for complete BT64 chunks; a partial tail takes the packed path
+    # with synthesized boundaries, as the fused backend does.
+    if (
+        cu_seqlens is None
+        and initial_state is None
+        and not output_final_state
+        and q.shape[1] % _CHUNK_SIZE == 0
+    ):
         validate_mega_constraints(q, k, value, gate, beta, None, None)
         dense_cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
         return (

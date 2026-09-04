@@ -782,13 +782,24 @@ def test_mega_composed_state_only_backward(dtype: torch.dtype) -> None:
         _assert_reference(actual_grad, high_grad, low_grad, f"state-only gradient {index}", dtype)
 
 
-def test_mega_dense_tail_rejected_at_public_boundary() -> None:
+def test_mega_dense_tail_takes_the_packed_path() -> None:
+    """A partial final chunk without boundaries runs as one packed sequence, like fused does."""
     from attn_gym.linear import chunk_kda
 
-    inputs = _make_inputs(requires_grad=False)
-    dense_tail = tuple(tensor[:, :65].contiguous() for tensor in inputs[:5])
-    with pytest.raises(ValueError, match="T divisible by 64"):
-        chunk_kda(*dense_tail, kernel_options={"backend": "mega"})
+    inputs = _make_inputs(requires_grad=True)
+    implicit = tuple(tensor[:, :65].detach().clone().requires_grad_() for tensor in inputs[:5])
+    explicit = tuple(tensor.detach().clone().requires_grad_() for tensor in implicit)
+    offsets = torch.tensor([0, 65], dtype=torch.int32, device=implicit[0].device)
+    output, _ = chunk_kda(*implicit, kernel_options={"backend": "mega"})
+    expected, _ = chunk_kda(*explicit, cu_seqlens=offsets, kernel_options={"backend": "mega"})
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    d_output = torch.randn_like(output)
+    for actual, reference in zip(
+        torch.autograd.grad(output, implicit, d_output),
+        torch.autograd.grad(expected, explicit, d_output),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 def test_mega_rejects_mismatched_value_and_beta_shapes() -> None:

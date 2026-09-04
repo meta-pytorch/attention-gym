@@ -357,10 +357,11 @@ FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
 public CuTeDSL 4.7 primitives and has no cuDNN Frontend runtime dependency. Like the other
 implementations, it returns `(output, final_state)`; request the latter with
-`output_final_state=True`. Dense no-state calls require T divisible by 64 and omit `cu_seqlens`,
-while packed/stateful calls pass explicit contiguous int32 boundaries and FP32 `[N, H, V, K]`
-states. Q/K/V/gate/state accept TMA-compatible innermost modes with aligned dynamic outer strides;
-beta requires an element-aligned contiguous inner mode. By default the forward is exact and
+`output_final_state=True`. Dense no-state calls with complete 64-token chunks use the dense kernels
+and partial tails take the packed path with synthesized boundaries; packed/stateful calls pass
+explicit contiguous int32 boundaries and FP32 `[N, H, V, K]` states. Q/K/V/gate/state accept
+TMA-compatible innermost modes with aligned dynamic outer strides; beta requires an element-aligned
+contiguous inner mode. By default the forward is exact and
 unsplit: one persistent work item per sequence and head, which leaves the GPU underused for a few
 long sequences at low head counts. FP16 and BF16 use exact backward execution by default; eligible
 packed no-state long contexts may use the Mega backward with one unsplit work item per sequence and
@@ -515,6 +516,16 @@ replays three layouts times three tables). Eager callers pass no caps. The recip
 `N` exit-state rows; only those where `routing.terminal` is set are true final states. Inside a
 captured region select them with the host-side `plan.terminal` (or a per-row cotangent mask, as the
 test does) rather than boolean indexing, which syncs.
+
+`kernel_options={"backend": "mega"}` makes `chunk_kda_prepare` and `context_parallel_kda` run each
+local pass with Mega from the composed entry state. Because Mega keeps WY factors on chip,
+`state_summaries` computes the fused factors once over the whole local stream and summarizes
+every range from them; that factor pass is paid even when every fragment ends its document and
+the summaries are identities, since which ranges are empty is a device value under replay. A
+layout that never continues a document across ranks does not need this recipe. Backward
+recomputes the local fused factors and uses Mega's existing with-state route through the fused
+staged backward. The staged handles and this recipe are eager-only; `torch.compile` is not
+supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
