@@ -58,6 +58,12 @@ def load_work_item(
 ):
     """Load ``(start, stop, chunk_begin, chunk_end)`` from a whole-range or planned row.
 
+    ``WHOLE_RANGES`` selects unsplit versus planned rows. When true (budget 1), ``work``
+    is the original ``(start, stop)`` bounds and each item scans
+    an entire range, without planning or composition. When false, rows contain
+    ``(start, chunk_begin, chunk_end, length)`` and the partial maps are composed afterward.
+    Both paths support variable-length ranges, empty ranges, and partial tail chunks.
+
     Chunk indices are relative to the range's ``start``; ``stop`` remains its full token end
     so only its final chunk is masked. Unused planned rows return an empty chunk interval.
     Callers widen ``work_index`` before indexing when ``USE_INT64_OFFSETS`` is set.
