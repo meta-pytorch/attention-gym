@@ -89,13 +89,13 @@ Implements a generic single-node ring-attention example launched with `torchrun`
 torchrun --standalone --nproc_per_node=4 examples/ring_attention.py --seq-len 131072
 ```
 
-## KDA Context Parallelism
+## Delta-Rule Context Parallelism
 
-[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
-— Run the complete transformer-style module from `kda_training.py` over packed context-parallel
+[`examples/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/delta_rule_context_parallel.py)
+— Run the complete transformer-style module from `delta_rule_training.py` over packed context-parallel
 fragments using the reference recipe in `attn_gym.linear.context_parallel` (see
 [Context Parallelism](linear.md#context-parallelism)). This includes projections, Q/K/V short
-convolution, KDA, normalization, gating, and the output projection.
+convolution, the KDA or GDN core (`--variant`), normalization, gating, and the output projection.
 
 Each rank owns fragments (global token ranges) chosen in a dozen lines of plain Python (`fragments`
 in the example): `--partition contiguous` gives each rank one block, while `--partition zigzag`
@@ -112,15 +112,15 @@ NCCL communication, and backward in one CUDA Graph and validate a changed-input 
 export one merged multi-rank trace in native Perfetto `.pftrace` format.
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --partition zigzag
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --partition zigzag
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --compute-dtype=float16
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --compute-dtype=float16
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --cuda-graph
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --profile
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --profile
 ```
 
 ## Kernel Tuning

@@ -1,4 +1,4 @@
-"""Integration tests for the fused KDA training example."""
+"""Integration tests for the fused delta-rule (KDA/GDN) training example."""
 
 from contextlib import contextmanager
 from itertools import pairwise
@@ -13,18 +13,18 @@ pytest.importorskip("typer")
 pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
 
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
-from examples import kda_training
-from examples.kda_training import KDAAttention, packed_sequence_metadata
+from examples import delta_rule_training
+from examples.delta_rule_training import DeltaRuleAttention, packed_sequence_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="the fused KDA example requires CUDA capability 9.0 or newer",
+    reason="the fused delta-rule example requires CUDA capability 9.0 or newer",
 )
 
 
-def test_kda_example_validates_public_gate_configuration():
+def test_example_validates_public_gate_configuration():
     with pytest.raises(ValueError, match="lower_bound"):
-        KDAAttention(
+        DeltaRuleAttention(
             hidden_size=128,
             num_heads=1,
             head_dim=128,
@@ -32,7 +32,7 @@ def test_kda_example_validates_public_gate_configuration():
             backend="fused",
             device="cuda",
         )
-    KDAAttention(
+    DeltaRuleAttention(
         hidden_size=128,
         num_heads=1,
         head_dim=128,
@@ -41,7 +41,7 @@ def test_kda_example_validates_public_gate_configuration():
         device="cuda",
     )
     with pytest.raises(ValueError, match="finite and nonpositive"):
-        KDAAttention(
+        DeltaRuleAttention(
             hidden_size=128,
             num_heads=1,
             head_dim=128,
@@ -50,7 +50,7 @@ def test_kda_example_validates_public_gate_configuration():
             device="cuda",
         )
     with pytest.raises(ValueError, match="fastmath applies only"):
-        KDAAttention(
+        DeltaRuleAttention(
             hidden_size=128,
             num_heads=1,
             head_dim=128,
@@ -58,20 +58,53 @@ def test_kda_example_validates_public_gate_configuration():
             backend="reference",
             device="cuda",
         )
+    with pytest.raises(ValueError, match="fastmath applies only"):
+        DeltaRuleAttention(
+            hidden_size=128,
+            num_heads=1,
+            head_dim=128,
+            variant="gdn",
+            fastmath=True,
+            backend="fused",
+            device="cuda",
+        )
+    with pytest.raises(ValueError, match="variant must be"):
+        DeltaRuleAttention(hidden_size=128, num_heads=1, head_dim=128, variant="mamba")
+
+
+def test_gdn_variant_owns_a_per_head_softplus_gate():
+    """GDN keeps one log decay per head; KDA keeps one per channel."""
+    torch.manual_seed(5)
+    gdn = DeltaRuleAttention(hidden_size=32, num_heads=2, head_dim=128, variant="gdn")
+    kda = DeltaRuleAttention(hidden_size=32, num_heads=2, head_dim=128)
+    assert gdn.dt_bias.shape == (2,) and kda.dt_bias.shape == (2, 128)
+    assert not hasattr(gdn, "f_a_proj") and not hasattr(kda, "a_proj")
+    hidden = torch.randn(1, 8, 32)
+    raw_gate, beta = gdn.gate_projections(hidden)
+    assert raw_gate.shape == (1, 8, 2) and beta.shape == (1, 8, 2)
+    with torch.no_grad():
+        gdn.A_log.uniform_(-1.0, 1.0)
+        gdn.dt_bias.uniform_(-1.0, 1.0)
+    gate = gdn.gate_activation(raw_gate)
+    assert gate.dtype == torch.float32
+    assert (gate <= 0).all()
+    torch.testing.assert_close(
+        gate, -gdn.A_log.exp() * F.softplus(raw_gate + gdn.dt_bias), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize(
     ("width", "tokens", "with_initial_state"),
     [(5, 2, True), (5, 2, False)],
 )
-def test_kda_example_fused_short_conv_supports_generic_width_and_state(
+def test_example_fused_short_conv_supports_generic_width_and_state(
     width: int,
     tokens: int,
     with_initial_state: bool,
 ):
     """Keep the example on CuTeDSL when adapting optional convolution history."""
     torch.manual_seed(3)
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=128,
         num_heads=1,
         head_dim=128,
@@ -142,7 +175,7 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-1)
 
 
-def test_kda_example_builds_packed_sequence_metadata():
+def test_example_builds_packed_sequence_metadata():
     """Keep token-level Zipf samples bounded and cumulative."""
     torch.manual_seed(0)
     lengths, offsets = packed_sequence_metadata(4, 63)
@@ -155,7 +188,8 @@ def test_kda_example_builds_packed_sequence_metadata():
         packed_sequence_metadata(3, 0)
 
 
-def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_marks_cuda_graph_kernel_stages(monkeypatch, variant):
     labels = []
 
     @contextmanager
@@ -164,11 +198,12 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
         labels.append(annotation)
         yield
 
-    monkeypatch.setattr(kda_training, "mark_kernels", record_mark_kernels)
-    model = KDAAttention(
+    monkeypatch.setattr(delta_rule_training, "mark_kernels", record_mark_kernels)
+    model = DeltaRuleAttention(
         hidden_size=32,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         enable_graph_annotations=True,
@@ -179,26 +214,28 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
     model(hidden, cu_seqlens=offsets)
 
     assert labels == [
-        "kda/qkv_projection",
-        "kda/short_convolution",
-        "kda/qk_normalization",
-        "kda/gate_projections",
-        "kda/gate_activation",
-        "kda/core/fused",
-        "kda/output_normalization",
-        "kda/output_gate",
-        "kda/output_projection",
+        f"{variant}/qkv_projection",
+        f"{variant}/short_convolution",
+        f"{variant}/qk_normalization",
+        f"{variant}/gate_projections",
+        f"{variant}/gate_activation",
+        f"{variant}/core/fused",
+        f"{variant}/output_normalization",
+        f"{variant}/output_gate",
+        f"{variant}/output_projection",
     ]
 
 
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float16])
-def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype):
+def test_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype, variant):
     """Match packed BF16/FP16 training against independent sequence calls."""
     fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
-    short_conv = kda_training.causal_conv1d
-    fused_l2norm = kda_training.l2norm
-    gate = kda_training.bound_gate
-    core = kda_training.chunk_kda
+    core_name = "chunk_kda" if variant == "kda" else "chunk_gdn"
+    short_conv = delta_rule_training.causal_conv1d
+    fused_l2norm = delta_rule_training.l2norm
+    gate = delta_rule_training.bound_gate
+    core = getattr(delta_rule_training, core_name)
 
     def record_short_conv(*args, **kwargs):
         fused_calls["short_conv"] += 1
@@ -216,15 +253,16 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
         fused_calls["core"] += 1
         return core(*args, **kwargs)
 
-    monkeypatch.setattr(kda_training, "causal_conv1d", record_short_conv)
-    monkeypatch.setattr(kda_training, "l2norm", record_l2norm)
-    monkeypatch.setattr(kda_training, "bound_gate", record_gate)
-    monkeypatch.setattr(kda_training, "chunk_kda", record_core)
+    monkeypatch.setattr(delta_rule_training, "causal_conv1d", record_short_conv)
+    monkeypatch.setattr(delta_rule_training, "l2norm", record_l2norm)
+    monkeypatch.setattr(delta_rule_training, "bound_gate", record_gate)
+    monkeypatch.setattr(delta_rule_training, core_name, record_core)
     torch.manual_seed(19)
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=32,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         compute_dtype=compute_dtype,
         device="cuda",
@@ -235,7 +273,9 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
     cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
 
     actual = model(packed_hidden, cu_seqlens=cu_seqlens).hidden_states
-    assert fused_calls == {"short_conv": 1, "l2norm": 2, "gate": 1, "core": 1}
+    # GDN's per-head softplus gate has no fused training kernel yet.
+    fused_gate_calls = 1 if variant == "kda" else 0
+    assert fused_calls == {"short_conv": 1, "l2norm": 2, "gate": fused_gate_calls, "core": 1}
 
     loop_outputs = [
         model(loop_hidden[:, start:end]).hidden_states
@@ -263,17 +303,20 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
         ),
     ],
 )
-def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_masked_capacity_matches_active_run_under_graph_replay(
     captured_offsets,
     replayed_offsets,
+    variant,
 ):
     """Replay changing L and M over stale capacity and match an exactly sized run."""
     torch.manual_seed(31)
     capacity, hidden_size = captured_offsets[-1], 32
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=hidden_size,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         mask_inactive_capacity=True,
@@ -340,14 +383,16 @@ def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
         )
 
 
-def test_kda_example_masked_capacity_supports_strict_fullgraph_autograd():
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_masked_capacity_supports_strict_fullgraph_autograd(variant):
     """Compile the reusable gradient barriers through the complete example."""
     torch.manual_seed(32)
     capacity, active_tokens, hidden_size = 128, 96, 32
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=hidden_size,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         mask_inactive_capacity=True,

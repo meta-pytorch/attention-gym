@@ -501,7 +501,7 @@ Another sidequest but this one is important because I have seen many an issue th
 The training example therefore uses two different masks:
 
 ```python
---8<-- "examples/kda_training.py:kda-fixed-capacity-masking"
+--8<-- "examples/delta_rule_training.py:kda-fixed-capacity-masking"
 ```
 
 1. Build one reusable device mask from `cu_seqlens[-1]`. Because this happens inside capture, replay rebuilds it from the current device endpoint without a host read.
@@ -522,11 +522,11 @@ mini-TLDR: pure tokenwise operations with defined padded outputs and gradients d
 
 #### A real KDA module
 
-Putting whole `KDAAttention` module back together: QKV and output projections, normalization, short convolution, masking, the KDA core and backward. This Kimi-style shape uses {{ capacity_symbol("T_max") }} `=4096`, {{ capacity_symbol("N") }} `=32`, hidden size 2304 and 32 KDA heads.
+Putting whole `DeltaRuleAttention` module back together: QKV and output projections, normalization, short convolution, masking, the KDA core and backward. This Kimi-style shape uses {{ capacity_symbol("T_max") }} `=4096`, {{ capacity_symbol("N") }} `=32`, hidden size 2304 and 32 KDA heads.
 
 {{ plotly_chart(
     "kda_module_amdahl_scaling",
-    title="KDAAttention scaling and its fixed-shape module floor",
+    title="DeltaRuleAttention scaling and its fixed-shape module floor",
 ) }}
 
 At full capacity `chunk_kda` core is 1.23 ms versus 3.43 ms for the complete module. At half tokens kda falls to 0.77 ms -> a 38% reduction. However, the complete module only falls to 2.91 ms, or 15%. Amdahl's law strikes again! The padding-aware part scales while most surrounding work still processes {{ capacity_symbol("T_max") }} rows :(
@@ -535,8 +535,8 @@ Below is a merged trace of full and half tokens. Feel free to inspect for yourse
 
 {{ perfetto_trace(
     "kda_module_full_vs_half_replay",
-    title="Full versus half-token KDAAttention CUDA Graph replay",
-    alt="Annotated merged Perfetto crop comparing full and half-token replay of the same fixed-capacity KDAAttention graph",
+    title="Full versus half-token DeltaRuleAttention CUDA Graph replay",
+    alt="Annotated merged Perfetto crop comparing full and half-token replay of the same fixed-capacity DeltaRuleAttention graph",
 ) }}
 
 ### Could we use more than one graph?

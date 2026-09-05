@@ -1,4 +1,4 @@
-"""Exercise per-batch routing on one complete KDA module with two NCCL ranks."""
+"""Exercise per-batch routing on one complete delta-rule module with two NCCL ranks."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ pytest.importorskip("cutlass")
 pytest.importorskip("typer")
 
 from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParallelRouting
-from examples.kda_context_parallel import ContextParallelKDAAttention
-from examples.kda_training import KDAAttention, KDAAttentionOutput
+from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
+from examples.delta_rule_training import DeltaRuleAttention, DeltaRuleAttentionOutput
 
 pytestmark = [
     pytest.mark.skipif(
@@ -26,7 +26,7 @@ pytestmark = [
             torch.cuda.get_device_capability(i) < (9, 0)
             for i in range(min(2, torch.cuda.device_count()))
         ),
-        reason="the complete CP KDA module needs two Hopper-or-newer GPUs and NCCL",
+        reason="the complete CP delta-rule module needs two Hopper-or-newer GPUs and NCCL",
     ),
     pytest.mark.xdist_group("two-gpu"),
 ]
@@ -40,8 +40,8 @@ CAPS = {"slots": 2, "max_subsequences": 4, "conv_history": 3}
 
 
 def _gradients(
-    model: KDAAttention,
-    result: KDAAttentionOutput,
+    model: DeltaRuleAttention,
+    result: DeltaRuleAttentionOutput,
     hidden: torch.Tensor,
     target: torch.Tensor,
     terminal: torch.Tensor,
@@ -55,24 +55,24 @@ def _gradients(
 
 
 def _step(
-    model: ContextParallelKDAAttention,
+    model: ContextParallelDeltaRuleAttention,
     hidden: torch.Tensor,
     target: torch.Tensor,
     routing: ContextParallelRouting,
-) -> tuple[KDAAttentionOutput, tuple[torch.Tensor, ...]]:
+) -> tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]]:
     """Run the public per-call routing ABI, including full-module backward."""
     result = model(hidden, routing=routing, return_final_state=True)
     return result, _gradients(model, result, hidden, target, routing.terminal)
 
 
 def _assert_matches_reference(
-    model: ContextParallelKDAAttention,
-    reference: KDAAttention,
+    model: ContextParallelDeltaRuleAttention,
+    reference: DeltaRuleAttention,
     plan: ContextParallelPlan,
     global_hidden: torch.Tensor,
     global_target: torch.Tensor,
     offsets: tuple[int, ...],
-    actual: tuple[KDAAttentionOutput, tuple[torch.Tensor, ...]],
+    actual: tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]],
 ) -> None:
     """Check outputs, both endpoint states, input gradients, and every reduced parameter gradient."""
     hidden = global_hidden.detach().clone().requires_grad_()
@@ -110,7 +110,9 @@ def _assert_matches_reference(
         torch.testing.assert_close(value, expected_value, atol=eps, rtol=eps, msg=name)
 
 
-def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) -> None:
+def _rank_main(
+    rank: int, rendezvous: str, dtype: torch.dtype, capture: bool, variant: str
+) -> None:
     """Keep one model across layouts; captured runs update only caller-owned tensor buffers."""
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -133,12 +135,13 @@ def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) ->
                 "hidden_size": 32,
                 "num_heads": 1,
                 "head_dim": 128,
+                "variant": variant,
                 "backend": "fused",
                 "compute_dtype": dtype,
                 "device": device,
             }
-            model = ContextParallelKDAAttention(**options, group=dist.group.WORLD)
-            reference = KDAAttention(**options)
+            model = ContextParallelDeltaRuleAttention(**options, group=dist.group.WORLD)
+            reference = DeltaRuleAttention(**options)
             reference.load_state_dict(model.state_dict())
             global_hidden = torch.randn(1, 128, 32, device=device)
             global_target = torch.randn_like(global_hidden)
@@ -195,15 +198,16 @@ def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) ->
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
 def test_same_module_uses_each_batch_routing(
-    tmp_path: Path, dtype: torch.dtype, capture: bool
+    tmp_path: Path, dtype: torch.dtype, capture: bool, variant: str
 ) -> None:
     """One model must follow two incompatible layouts, including in-place graph metadata replay."""
     mp.spawn(
         _rank_main,
-        args=((tmp_path / "nccl-init").as_uri(), dtype, capture),
+        args=((tmp_path / "nccl-init").as_uri(), dtype, capture, variant),
         nprocs=2,
         join=True,
     )
