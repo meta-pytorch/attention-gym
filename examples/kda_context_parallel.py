@@ -601,16 +601,33 @@ def main(
     )
     model = make_model()
 
-    torch.manual_seed(123)
-    global_hidden = torch.randn(1, tokens, hidden_size, device=device)
-    global_target = torch.randn_like(global_hidden)
+    # Every rank draws the same global stream so shards agree with the reference. Only the
+    # reference needs it on the GPU; otherwise build it on the CPU and move just the shard.
+    # Materializing 2 x tokens x hidden fp32 on the device left tens of GiB of freed-but-pinned
+    # allocator segments behind at 1M tokens, which showed up as a spurious CUDA Graph "overhead".
+    stream_device = device if validate else torch.device("cpu")
+    global_hidden = torch.randn(
+        1,
+        tokens,
+        hidden_size,
+        device=stream_device,
+        generator=torch.Generator(stream_device).manual_seed(123),
+    )
+    global_target = torch.randn(
+        1,
+        tokens,
+        hidden_size,
+        device=stream_device,
+        generator=torch.Generator(stream_device).manual_seed(124),
+    )
+    shard_ids = token_ids.to(stream_device)
     batch = PackedTrainingBatch(
         # Only the reference needs the whole stream; drop it when not validating so large runs fit.
         global_hidden=global_hidden if validate else None,
         global_target=global_target if validate else None,
         global_offsets=torch.tensor(cu_seqlens_global, dtype=torch.int32, device=device),
-        local_hidden=global_hidden[:, token_ids].clone().requires_grad_(),
-        local_target=global_target[:, token_ids].clone(),
+        local_hidden=global_hidden[:, shard_ids].to(device).requires_grad_(),
+        local_target=global_target[:, shard_ids].to(device),
         local_offsets=model.routing.cu_seqlens,
         token_ids=token_ids,
         terminal_index=torch.tensor(plan.terminal, dtype=torch.long, device=device),
@@ -621,7 +638,7 @@ def main(
         ),
         loss_scale=1.0 / global_target.numel(),
     )
-    del global_hidden, global_target
+    del global_hidden, global_target, shard_ids
     if validate:
         reference_model = KDAAttention(**model_options)
         reference_model.load_state_dict(model.state_dict())
