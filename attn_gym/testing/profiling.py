@@ -69,11 +69,20 @@ def record_distributed_profile(
         active_profiler.step()
     dist.barrier()
 
+    # Ranks on other nodes may not share a filesystem with rank 0: ship the trace
+    # bytes over the process group so the merge only needs rank 0's local disk.
+    rank_paths = [
+        path.with_name(f"{path.stem}_rank_{index}.pftrace") for index in range(world_size)
+    ]
+    gathered: list[bytes | None] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(rank_paths[rank].read_bytes(), gathered, dst=0)
+
     merged_path = None
     if rank == 0:
-        rank_paths = [
-            path.with_name(f"{path.stem}_rank_{index}.pftrace") for index in range(world_size)
-        ]
+        assert gathered is not None
+        for rank_path, trace in zip(rank_paths, gathered, strict=True):
+            if trace is not None and not rank_path.exists():
+                rank_path.write_bytes(trace)
         merged_path = path.with_name(f"{path.stem}_merged.pftrace")
         merge_traces(
             [str(rank_path) for rank_path in rank_paths],
