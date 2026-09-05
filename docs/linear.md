@@ -2,6 +2,16 @@
 
 Attention Gym provides functional linear-attention operators with eager reference implementations.
 
+This page is the API and implementation reference. Start with the operation you need:
+
+- **Train or prefill:** [Gated Delta Rule](#gated-delta-rule) or
+  [Kimi Delta Attention](#kimi-delta-attention), using the `chunk_*` operations.
+- **Carry state between calls or decode:** the `recurrent_*` operations and the paged/decode
+  variants in those sections.
+- **Split a packed stream across ranks:** [Context Parallelism](#context-parallelism).
+- **Understand changing sequence lengths under capture:** the
+  [Ragged CUDA Graphs guide](guides/ragged-cuda-graphs.md).
+
 ## Gated Delta Rule
 
 `chunk_gdn` and `recurrent_gdn` use the token-major layout
@@ -439,6 +449,8 @@ exact over whole chunks of one subsequence: `start = sub_start + 64·i`, `stop =
 or the subsequence end, never crossing a `cu_seqlens` boundary; `start == stop` is the identity.
 The recipe always passes whole subsequences, `(cu_seqlens[i], cu_seqlens[i + 1])`.
 
+### Local computation: prepare, summarize, run
+
 **Primitives** (`attn_gym.linear.kda.chunk_kda_prepare` / `chunk_kda_prepare_backward`, and
 `attn_gym.linear.gdn.chunk_gdn_prepare` / `chunk_gdn_prepare_backward`) split the fused core
 around the communication point without exposing its WY factors:
@@ -462,6 +474,8 @@ one launch returns every row's map; the context-parallel routing supplies the ro
 `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries (`merge_state`,
 `compose_summaries`, `neutral_summary`).
 
+### Ownership: from global fragments to local routing
+
 **Ownership plans** (`attn_gym.linear.context_parallel.ContextParallelPlan.from_fragments`) take
 every rank's fragments. You choose them in plain Python; the plan cuts each fragment at sequence
 boundaries into `Subsequence`s, one span `cu_seqlens` segment each, and derives the routing:
@@ -477,6 +491,8 @@ buffer from a prepared handle and a routing, and `compose_entry_states` /
 entry state or exit cotangent; the collective in between is the caller's.
 [`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
 builds contiguous and zig-zag fragment lists in a dozen lines.
+
+### Communication: the all-gather recipe
 
 **Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
 `attn_gym.linear.kda.context_parallel_kda` and `attn_gym.linear.gdn.context_parallel_gdn`) moves
@@ -506,16 +522,30 @@ output, final_state = context_parallel_kda(q, k, v, gate, beta, routing=routing,
 true_final_states = final_state[routing.terminal]  # boolean indexing syncs; see below
 ```
 
+### CUDA Graph replay: fixed storage, changing layout
+
 The recipe starts each sequence from zero, always returns every subsequence's exit state, and does
 not accept `initial_state` or `output_final_state=False`. Every index it uses comes from the
 routing tensors, so a CUDA Graph captured around it replays for any document layout and fragment
 table within the routing caps: capture with `plan.routing(device, slots=S, max_subsequences=N)`
 (at most `S` fragments per rank, `N` segments per span, the same span length), then copy each new
 layout's routing tensors into the captured ones (`test/test_context_parallel_distributed.py`
-replays three layouts times three tables). Eager callers pass no caps. The recipe returns
-`N` exit-state rows; only those where `routing.terminal` is set are true final states. Inside a
-captured region select them with the host-side `plan.terminal` (or a per-row cotangent mask, as the
-test does) rather than boolean indexing, which syncs.
+checks three layout/table pairs). Eager callers pass no caps.
+
+The host plan is not rerun by graph replay. Before each replay, build the new plan outside
+capture, arrange the new inputs in its span order, and copy its routing values into the existing
+device tensors. Do not replace those tensors: the captured kernels use their original addresses.
+The process group, per-rank span length, routing caps, and convolution history width remain fixed.
+
+The recipe returns `N` exit-state rows; only those where `routing.terminal` is set are true final
+states. Boolean indexing produces a variable-size result and synchronizes, so keep all `N` rows
+inside capture and use a fixed-shape device mask or a per-row cotangent buffer. The replay test
+updates that cotangent buffer before each replay, setting nonterminal rows to zero. Host-side
+`plan.terminal` indices are useful outside capture, or when terminal rows never change; capturing
+an index selection from them does **not** make it follow later layouts. Update routing only
+between complete forward/backward steps, not while backward still needs the previous layout.
+
+### Mega local execution
 
 `kernel_options={"backend": "mega"}` makes `chunk_kda_prepare` and `context_parallel_kda` run each
 local pass with Mega from the composed entry state. Because Mega keeps WY factors on chip,

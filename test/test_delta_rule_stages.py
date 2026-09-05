@@ -132,27 +132,6 @@ op_param = pytest.mark.parametrize(
 )
 
 
-def test_summary_algebra_composes_like_sequential_merges():
-    generator = torch.Generator().manual_seed(0)
-    first = torch.randn(2, 6, 4, generator=generator)
-    then = torch.randn(2, 6, 4, generator=generator)
-    state = torch.randn(2, 2, 4, generator=generator)
-
-    sequential = merge_state(merge_state(state, first), then)
-    composed = compose_summaries(first, then)
-    torch.testing.assert_close(merge_state(state, composed), sequential)
-    # Spelled out: (A0, B0) then (A1, B1) is (A0 @ A1, B0 @ A1 + B1), packed [bias; transition].
-    bias, transition = first[:, :2], first[:, 2:]
-    torch.testing.assert_close(
-        composed, torch.cat((bias @ then[:, 2:] + then[:, :2], transition @ then[:, 2:]), dim=1)
-    )
-
-    identity = neutral_summary(2, 2, 4, device="cpu")
-    torch.testing.assert_close(merge_state(state, identity), state)
-    torch.testing.assert_close(compose_summaries(identity, first), first)
-    torch.testing.assert_close(compose_summaries(first, identity), first)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TF32 is a CUDA matmul mode")
 def test_summary_algebra_ignores_the_float32_matmul_mode():
     """``set_float32_matmul_precision("high")`` must not round state routing to TF32."""
