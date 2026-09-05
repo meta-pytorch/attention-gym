@@ -50,7 +50,6 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _finish_chunk_kda_fwd,
     _prepare_chunk_kda_fwd,
 )
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
 from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
 from attn_gym.linear.kda.impl.mega import validate_mega_constraints
 from attn_gym.linear.kda.impl.mega_ops import (
@@ -309,13 +308,13 @@ class ChunkKDABackward:
         of ``ChunkKDAPrepared.state_summaries``.
         """
         assert self.prepared.qg is not None and self.prepared.kg is not None
-        assert self.prepared.w is not None
+        assert self.prepared.w is not None and self.prepared.aqk is not None
         return build_state_grad_summaries(
             self.prepared.qg,
             self.prepared.kg,
             self.prepared.w,
             self.d_output,
-            self.saved.aqk,
+            self.prepared.aqk,
             self.saved.cumulative_gate,
             self.scale,
             bounds,
@@ -345,8 +344,6 @@ class ChunkKDABackward:
             saved.v,
             saved.cumulative_gate,
             saved.beta,
-            saved.aqk,
-            saved.akk,
             self.d_output,
             d_final_state,
             self.initial_state,
@@ -390,19 +387,13 @@ def chunk_kda_prepare_backward(
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     initial_state = _normalize_state(initial_state)  # The backward recomputes the chain from it.
     scale = float(scale)
-    if saved.aqk is None:
-        # Mega forwards keep the intra factors on chip; rebuild them as Mega's backward does.
-        aqk, akk = chunk_kda_fwd_factors(
-            saved.q, saved.k, saved.cumulative_gate, saved.beta, scale, metadata
-        )
-        saved = saved._replace(aqk=aqk, akk=akk)
-    assert saved.akk is not None
     prepared = _prepare_chunk_kda_bwd(
         saved.q,
         saved.k,
         saved.v,
         saved.cumulative_gate,
         saved.beta,
+        saved.aqk,
         saved.akk,
         d_output,
         initial_state,
