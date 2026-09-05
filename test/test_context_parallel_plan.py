@@ -12,6 +12,7 @@ from attn_gym.linear.context_parallel import (
     compose_entry_states,
     compose_exit_cotangents,
 )
+from attn_gym.linear.state_summary import compose_summaries, merge_state, neutral_summary
 
 VALUE_DIM = 2
 KEY_DIM = 2
@@ -40,6 +41,27 @@ LAYOUTS = [
     pytest.param((0, 16), id="one-sequence"),
     pytest.param((0, 1, 2, 3, 4, 8, 16), id="many-short-documents"),
 ]
+
+
+def test_summary_algebra_composes_like_sequential_merges():
+    generator = torch.Generator().manual_seed(0)
+    first = torch.randn(2, 6, 4, generator=generator)
+    then = torch.randn(2, 6, 4, generator=generator)
+    state = torch.randn(2, 2, 4, generator=generator)
+
+    sequential = merge_state(merge_state(state, first), then)
+    composed = compose_summaries(first, then)
+    torch.testing.assert_close(merge_state(state, composed), sequential)
+    # Spelled out: (A0, B0) then (A1, B1) is (A0 @ A1, B0 @ A1 + B1), packed [bias; transition].
+    bias, transition = first[:, :2], first[:, 2:]
+    torch.testing.assert_close(
+        composed, torch.cat((bias @ then[:, 2:] + then[:, :2], transition @ then[:, 2:]), dim=1)
+    )
+
+    identity = neutral_summary(2, 2, 4, device="cpu")
+    torch.testing.assert_close(merge_state(state, identity), state)
+    torch.testing.assert_close(compose_summaries(identity, first), first)
+    torch.testing.assert_close(compose_summaries(first, identity), first)
 
 
 def summary(transition: list[list[float]], bias: list[list[float]]) -> torch.Tensor:

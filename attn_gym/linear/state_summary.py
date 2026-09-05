@@ -102,7 +102,9 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
     #   exit_states holds one state per subsequence; only routing.terminal rows are a sequence's
     #   true final state (here D∩s1's, for s1), the rest are intermediate. Callers that never use
     #   final states pass output_final_state=False; the backward needs neither.
-    exit_states[routing.terminal]   # boolean indexing syncs; use plan.terminal under capture
+    exit_states[routing.terminal]   # eager only: boolean indexing syncs
+    # Under capture keep every row and mask with device data, or update a fixed-shape exit-state
+    # cotangent buffer before replay. Captured host plan.terminal indices do not follow new layouts.
 
 The key contract: the routing hands ``state_summaries`` / ``state_grad_summaries`` exactly one
 whole subsequence per active fragment slot, as consecutive entries of the span's own
