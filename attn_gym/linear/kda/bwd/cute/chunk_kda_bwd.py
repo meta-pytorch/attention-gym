@@ -20,6 +20,7 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd_wy_triton
 from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.utils import is_sm100_kda_target
@@ -27,8 +28,10 @@ from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 @dataclass
 class ChunkKDABwdPrepared:
-    """Consumable local tensors shared across the CP backward communication boundary."""
+    """Resolved intra factors and consumable tensors across the CP backward boundary."""
 
+    aqk: torch.Tensor | None
+    akk: torch.Tensor | None
     w: torch.Tensor | None
     qg: torch.Tensor | None
     kg: torch.Tensor | None
@@ -43,7 +46,8 @@ def _prepare_chunk_kda_bwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    Akk: torch.Tensor,
+    Aqk: torch.Tensor | None,
+    Akk: torch.Tensor | None,
     do: torch.Tensor,
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
@@ -52,7 +56,10 @@ def _prepare_chunk_kda_bwd(
     chunk_size: int,
     autotune: bool,
 ) -> ChunkKDABwdPrepared:
-    """Recompute local forward state and output factors before CP communication."""
+    """Resolve intra factors and recompute local state before CP communication."""
+    if Aqk is None:
+        Aqk, Akk = chunk_kda_fwd_factors(q, k, g, beta, scale, metadata, chunk_size=chunk_size)
+    assert Akk is not None
     with profiler_range("kda/cute/backward_recompute_w_u"):
         w, u, qg, kg = recompute_w_u_fwd(
             q=q,
@@ -86,7 +93,7 @@ def _prepare_chunk_kda_bwd(
             chunk_size=chunk_size,
             metadata=metadata,
         )
-    return ChunkKDABwdPrepared(w, qg, kg, h, v_new, d_aqk)
+    return ChunkKDABwdPrepared(Aqk, Akk, w, qg, kg, h, v_new, d_aqk)
 
 
 def _finish_chunk_kda_bwd(
@@ -95,8 +102,6 @@ def _finish_chunk_kda_bwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    Aqk: torch.Tensor,
-    Akk: torch.Tensor,
     do: torch.Tensor,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
@@ -116,6 +121,7 @@ def _finish_chunk_kda_bwd(
     torch.Tensor | None,
 ]:
     """Finish local gradients while releasing prepared tensors at their last use."""
+    assert prepared.aqk is not None and prepared.akk is not None
     assert prepared.qg is not None and prepared.kg is not None and prepared.w is not None
     use_triton_backend = not is_sm100_kda_target(q.device)
     range_backend = "triton" if use_triton_backend else "cute"
@@ -126,7 +132,7 @@ def _finish_chunk_kda_bwd(
                 prepared.kg,
                 prepared.w,
                 do,
-                Aqk,
+                prepared.aqk,
                 gk=g,
                 initial_state=initial_state,
                 d_final_state=d_final_state,
@@ -139,7 +145,7 @@ def _finish_chunk_kda_bwd(
                 prepared.kg,
                 prepared.w,
                 do,
-                Aqk,
+                prepared.aqk,
                 gk=g,
                 h0=initial_state,
                 dht=d_final_state,
@@ -147,7 +153,7 @@ def _finish_chunk_kda_bwd(
                 chunk_size=chunk_size,
                 metadata=metadata,
             )
-    prepared.qg = prepared.kg = prepared.w = None
+    prepared.aqk = prepared.qg = prepared.kg = prepared.w = None
 
     assert prepared.v_new is not None and prepared.h is not None
     with profiler_range(f"kda/{range_backend}/backward_wy_dqkg"):
@@ -159,7 +165,7 @@ def _finish_chunk_kda_bwd(
                 prepared.v_new,
                 g,
                 beta,
-                Akk,
+                prepared.akk,
                 prepared.h,
                 do,
                 dh,
@@ -176,7 +182,7 @@ def _finish_chunk_kda_bwd(
                 prepared.v_new,
                 g,
                 beta,
-                Akk,
+                prepared.akk,
                 prepared.h,
                 do,
                 dh,
@@ -187,7 +193,7 @@ def _finish_chunk_kda_bwd(
                 fastmath=fastmath,
                 autotune=autotune,
             )
-    prepared.h = prepared.v_new = None
+    prepared.akk = prepared.h = prepared.v_new = None
     del dh
 
     assert prepared.d_aqk is not None
@@ -216,8 +222,8 @@ def chunk_kda_bwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    Aqk: torch.Tensor,
-    Akk: torch.Tensor,
+    Aqk: torch.Tensor | None,
+    Akk: torch.Tensor | None,
     do: torch.Tensor,
     d_final_state: torch.Tensor | None,
     initial_state: torch.Tensor | None,
@@ -253,6 +259,7 @@ def chunk_kda_bwd(
         v,
         g,
         beta,
+        Aqk,
         Akk,
         do,
         initial_state,
@@ -267,8 +274,6 @@ def chunk_kda_bwd(
         v,
         g,
         beta,
-        Aqk,
-        Akk,
         do,
         d_final_state,
         initial_state,

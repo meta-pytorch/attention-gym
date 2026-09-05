@@ -339,6 +339,41 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
 
 
 @requires_kda_target
+@pytest.mark.parametrize("packing", ["dense", "packed"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("with_state", [False, True], ids=["no-state", "with-state"])
+def test_backward_from_a_tape_without_factors_matches_saved_factors(packing, dtype, with_state):
+    """Recomputed intra factors must give bit-identical reverse summaries, gradients, and states."""
+    inputs = KDA.make_inputs(128, seed=31, dtype=dtype)
+    cu_seqlens = (
+        torch.tensor([0, 65, 65, 128], dtype=torch.int32, device="cuda")
+        if packing == "packed"
+        else None
+    )
+    sequences = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else 1
+    generator = torch.Generator(device="cuda").manual_seed(32)
+    state = torch.randn(
+        sequences, KDA.value_heads, HEAD_DIM, HEAD_DIM, device="cuda", generator=generator
+    )
+    d_output = torch.randn(inputs[2].shape, device="cuda", dtype=dtype, generator=generator)
+    bounds = (
+        bounds_of((0, 65), (65, 65), (65, 128)) if packing == "packed" else bounds_of((0, 128))
+    )
+
+    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu_seqlens, scale=0.25, autotune=False)
+    # A Mega forward saves no factors; its backward must match one that did, bit for bit.
+    tapes = (prepared.saved, prepared.saved._replace(aqk=None, akk=None))
+    results = []
+    for saved in tapes:
+        backward = chunk_kda_prepare_backward(
+            saved, d_output, state if with_state else None, scale=prepared.scale, autotune=False
+        )
+        results.append((backward.state_grad_summaries(bounds), *backward.run(state)))
+    for expected, actual in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@requires_kda_target
 @op_param
 def test_state_grad_summary_matches_zero_and_identity_probes(op):
     """``d_entry = d_exit @ R + C``, so zero and identity exit cotangents recover ``[C; R]``."""

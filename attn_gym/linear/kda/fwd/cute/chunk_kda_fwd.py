@@ -528,20 +528,7 @@ def _chunk_kda_bwd_shared(
         d_final_state,
         initial_state,
     )
-    if Aqk is None:
-        assert Akk is None
-        from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
-
-        Aqk, Akk = chunk_kda_fwd_factors(
-            q,
-            k,
-            cumulative_gate,
-            beta,
-            scale,
-            metadata,
-        )
-    else:
-        assert Akk is not None
+    assert (Aqk is None) == (Akk is None)
     return chunk_kda_bwd(
         q,
         k,
