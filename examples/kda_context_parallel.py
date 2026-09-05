@@ -141,20 +141,51 @@ class ContextParallelKDAAttention(KDAAttention):
             raise ValueError(
                 "routing conv_history must match the model's convolution width minus one"
             )
-
-        hidden_states_compute, qkv = self.qkv_projection(hidden_states)
-        with kernel_stage("cp/conv/halo", self.enable_graph_annotations):
-            initial_conv_state = context_parallel_conv_history(qkv, routing, self.cp_group)
-        qkv, final_conv_state = self.short_convolution(
-            qkv,
-            initial_conv_state,
+        # Only the two stateful stages differ from the single-device module; the shared
+        # pipeline (masking, normalization, projections) receives the routing per call.
+        return self.run_stages(
+            hidden_states,
+            None,
+            None,
             cu_seqlens=routing.cu_seqlens,
             return_final_state=return_final_state,
+            routing=routing,
         )
-        q, k, v = qkv.view(1, hidden_states.shape[1], 3, self.num_heads, self.head_dim).unbind(2)
-        q, k = self.qk_normalization(q, k)
-        raw_gate, beta = self.gate_projections(hidden_states_compute)
-        gate = self.gate_activation(raw_gate)
+
+    def short_convolution(
+        self,
+        qkv: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+        return_final_state: bool,
+        routing: ContextParallelRouting,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert initial_state is None, "context parallelism constructs the convolution history"
+        with kernel_stage("cp/conv/halo", self.enable_graph_annotations):
+            initial_state = context_parallel_conv_history(qkv, routing, self.cp_group)
+        return super().short_convolution(
+            qkv,
+            initial_state,
+            cu_seqlens=cu_seqlens,
+            return_final_state=return_final_state,
+        )
+
+    def kda_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+        return_final_state: bool,
+        routing: ContextParallelRouting,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert initial_state is None, "context parallelism constructs the recurrent state"
+        del cu_seqlens  # routing.cu_seqlens is the same tensor
         output, final_state = context_parallel_kda(
             q,
             k,
@@ -166,14 +197,7 @@ class ContextParallelKDAAttention(KDAAttention):
             fastmath=self.fastmath,
             kernel_options=self.kernel_options,
         )
-        output = self.output_normalization(output)
-        output_gate = self.output_gate(hidden_states_compute, output)
-        output = self.output_projection(output, output_gate)
-        return KDAAttentionOutput(
-            output.to(hidden_states.dtype),
-            final_state if return_final_state else None,
-            final_conv_state,
-        )
+        return output, final_state if return_final_state else None
 
 
 def run_training_step(
