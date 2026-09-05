@@ -10,7 +10,7 @@ One local shard of a delta-rule sequence acts on the recurrent state as an affin
 map ``H_out = H_in @ A + B``. This kernel computes that summary directly from the
 shared per-chunk WY factors (``kg``, ``w``, ``u``, ``cumulative_gate`` as produced
 by ``chunk_kda_fwd_intra``) instead of running the full recurrence twice with
-zero/identity probe states (see ``examples/kda_context_parallel.py``).
+zero/identity probe states (see ``examples/delta_rule_context_parallel.py``).
 
 Math (K-first augmented state ``X`` of shape ``[K, V + K]``, fp32):
 

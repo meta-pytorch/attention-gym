@@ -1,4 +1,4 @@
-"""Exercise per-batch routing on one complete KDA module with two NCCL ranks."""
+"""Exercise per-batch routing on one complete delta-rule module with two NCCL ranks."""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ pytest.importorskip("cutlass")
 pytest.importorskip("typer")
 
 from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParallelRouting
-from examples.kda_context_parallel import ContextParallelKDAAttention
-from examples.kda_training import KDAAttention, KDAAttentionOutput
+from attn_gym.testing.kda import assert_relative_rms_within
+from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
+from examples.delta_rule_training import DeltaRuleAttention, DeltaRuleAttentionOutput
 
 pytestmark = [
     pytest.mark.skipif(
@@ -26,7 +27,7 @@ pytestmark = [
             torch.cuda.get_device_capability(i) < (9, 0)
             for i in range(min(2, torch.cuda.device_count()))
         ),
-        reason="the complete CP KDA module needs two Hopper-or-newer GPUs and NCCL",
+        reason="the complete CP delta-rule module needs two Hopper-or-newer GPUs and NCCL",
     ),
     pytest.mark.xdist_group("two-gpu"),
 ]
@@ -37,11 +38,15 @@ LAYOUTS = (
     ((0, 29, 91, 128), [[(0, 32), (96, 128)], [(32, 64), (64, 96)]]),
 )
 CAPS = {"slots": 2, "max_subsequences": 4, "conv_history": 3}
+# Aggregate budget in compute-dtype eps for CP vs unsharded: same kernels, different partition.
+# Token reductions (parameter gradients, dt_bias in particular) accumulate in a different order
+# per rank before the all-reduce; FP16 KDA dt_bias measured 7.2 eps on GB200, everything else <= 2.
+CP_RMS_EPS = 10.0
 
 
 def _gradients(
-    model: KDAAttention,
-    result: KDAAttentionOutput,
+    model: DeltaRuleAttention,
+    result: DeltaRuleAttentionOutput,
     hidden: torch.Tensor,
     target: torch.Tensor,
     terminal: torch.Tensor,
@@ -55,24 +60,24 @@ def _gradients(
 
 
 def _step(
-    model: ContextParallelKDAAttention,
+    model: ContextParallelDeltaRuleAttention,
     hidden: torch.Tensor,
     target: torch.Tensor,
     routing: ContextParallelRouting,
-) -> tuple[KDAAttentionOutput, tuple[torch.Tensor, ...]]:
+) -> tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]]:
     """Run the public per-call routing ABI, including full-module backward."""
     result = model(hidden, routing=routing, return_final_state=True)
     return result, _gradients(model, result, hidden, target, routing.terminal)
 
 
 def _assert_matches_reference(
-    model: ContextParallelKDAAttention,
-    reference: KDAAttention,
+    model: ContextParallelDeltaRuleAttention,
+    reference: DeltaRuleAttention,
     plan: ContextParallelPlan,
     global_hidden: torch.Tensor,
     global_target: torch.Tensor,
     offsets: tuple[int, ...],
-    actual: tuple[KDAAttentionOutput, tuple[torch.Tensor, ...]],
+    actual: tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]],
 ) -> None:
     """Check outputs, both endpoint states, input gradients, and every reduced parameter gradient."""
     hidden = global_hidden.detach().clone().requires_grad_()
@@ -108,9 +113,14 @@ def _assert_matches_reference(
     eps = torch.finfo(model.compute_dtype).eps
     for name, value, expected_value in pairs:
         torch.testing.assert_close(value, expected_value, atol=eps, rtol=eps, msg=name)
+        assert_relative_rms_within(
+            value, expected_value, name, max_eps=CP_RMS_EPS, source_dtype=model.compute_dtype
+        )
 
 
-def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) -> None:
+def _rank_main(
+    rank: int, rendezvous: str, dtype: torch.dtype, capture: bool, variant: str
+) -> None:
     """Keep one model across layouts; captured runs update only caller-owned tensor buffers."""
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -133,12 +143,13 @@ def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) ->
                 "hidden_size": 32,
                 "num_heads": 1,
                 "head_dim": 128,
+                "variant": variant,
                 "backend": "fused",
                 "compute_dtype": dtype,
                 "device": device,
             }
-            model = ContextParallelKDAAttention(**options, group=dist.group.WORLD)
-            reference = KDAAttention(**options)
+            model = ContextParallelDeltaRuleAttention(**options, group=dist.group.WORLD)
+            reference = DeltaRuleAttention(**options)
             reference.load_state_dict(model.state_dict())
             global_hidden = torch.randn(1, 128, 32, device=device)
             global_target = torch.randn_like(global_hidden)
@@ -180,6 +191,8 @@ def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) ->
                 else:
                     actual = _step(model, hidden, target, new_routing)
                 stream.synchronize()
+                # Routing is a per-call input; the module must not retain it between batches.
+                assert not any(isinstance(v, ContextParallelRouting) for v in vars(model).values())
                 _assert_matches_reference(
                     model, reference, plan, global_hidden, global_target, offsets, actual
                 )
@@ -195,15 +208,25 @@ def _rank_main(rank: int, rendezvous: str, dtype: torch.dtype, capture: bool) ->
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
+@pytest.mark.parametrize(
+    ("variant", "dtype", "capture"),
+    [
+        pytest.param("kda", torch.bfloat16, False, id="kda-bf16-eager"),
+        pytest.param("kda", torch.bfloat16, True, id="kda-bf16-cuda-graph"),
+        pytest.param("kda", torch.float16, False, id="kda-fp16-eager"),
+        pytest.param("kda", torch.float16, True, id="kda-fp16-cuda-graph"),
+        # context_parallel_gdn is covered at kernel level; here GDN only adds gate plumbing.
+        pytest.param("gdn", torch.bfloat16, True, id="gdn-bf16-cuda-graph"),
+        pytest.param("gdn", torch.float16, False, id="gdn-fp16-eager"),
+    ],
+)
 def test_same_module_uses_each_batch_routing(
-    tmp_path: Path, dtype: torch.dtype, capture: bool
+    tmp_path: Path, variant: str, dtype: torch.dtype, capture: bool
 ) -> None:
     """One model must follow two incompatible layouts, including in-place graph metadata replay."""
     mp.spawn(
         _rank_main,
-        args=((tmp_path / "nccl-init").as_uri(), dtype, capture),
+        args=((tmp_path / "nccl-init").as_uri(), dtype, capture, variant),
         nprocs=2,
         join=True,
     )

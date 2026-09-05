@@ -66,7 +66,7 @@ Attention Gym supports three complementary workflows:
    [`selected_attention`](attn_gym/sparse/selected_attention), GDN and KDA chunk, recurrent, and
    decode paths, and short-convolution primitives. See the
    [compressed sparse attention](examples/compressed_sparse_attention.py) and
-   [KDA training](examples/kda_training.py) for working examples.
+   [delta-rule (KDA/GDN) training](examples/delta_rule_training.py) for working examples.
 3. **Run real workloads and benchmarks.** The [`examples/`](examples) directory covers paged,
    ring, and variable sparse attention, CUDA Graphs, determinism, compilation, and profiling. Most
    of this should serve as inspiration for fun things you might build from our building blocks :)
