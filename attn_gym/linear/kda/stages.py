@@ -44,10 +44,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
     _prepare_chunk_kda_bwd,
 )
-from attn_gym.linear.kda.chunk_schedule import (
-    RaggedChunkMetadata,
-    chunk_capacity,
-)
+from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     ChunkKDAFactors,
     _finish_chunk_kda_fwd,
@@ -83,19 +80,6 @@ class ChunkKDASaved(NamedTuple):
     akk: torch.Tensor | None
     cu_seqlens: torch.Tensor | None
     chunk_offsets: torch.Tensor | None
-
-
-def _metadata_from_saved(saved: ChunkKDASaved) -> RaggedChunkMetadata | None:
-    if saved.cu_seqlens is None:
-        return None
-    assert saved.chunk_offsets is not None
-    tokens = saved.q.shape[1]
-    return RaggedChunkMetadata(
-        saved.cu_seqlens,
-        saved.chunk_offsets,
-        chunk_capacity(tokens, saved.cu_seqlens.shape[0] - 1, CHUNK_SIZE),
-        CHUNK_SIZE,
-    )
 
 
 # NOTE [Summary ranges are whole chunks of one subsequence]
@@ -394,7 +378,12 @@ def chunk_kda_prepare_backward(
     caller's autograd function owns them. ``fastmath`` applies to the gradient kernels as in
     ``chunk_kda``.
     """
-    metadata = _metadata_from_saved(saved)
+    metadata = None
+    if saved.cu_seqlens is not None:
+        assert saved.chunk_offsets is not None
+        metadata = RaggedChunkMetadata.from_offsets(
+            saved.cu_seqlens, saved.chunk_offsets, saved.q.shape[1], CHUNK_SIZE
+        )
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
     else:

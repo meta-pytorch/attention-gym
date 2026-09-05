@@ -90,6 +90,26 @@ class RaggedChunkMetadata(NamedTuple):
     capacity: int
     chunk_size: int
 
+    @classmethod
+    def from_offsets(
+        cls,
+        cu_seqlens: torch.Tensor,
+        chunk_offsets: torch.Tensor,
+        tokens: int,
+        chunk_size: int,
+    ) -> RaggedChunkMetadata:
+        """Restore metadata from existing offsets without reading or regenerating device values.
+
+        ``tokens`` is the physical token capacity, not the runtime active endpoint. Callers
+        retain ownership of optional-input validation at their respective boundaries.
+        """
+        return cls(
+            cu_seqlens,
+            chunk_offsets,
+            chunk_capacity(tokens, cu_seqlens.shape[0] - 1, chunk_size),
+            chunk_size,
+        )
+
     def validate_chunk_size(self, chunk_size: int) -> None:
         """Reject consumers configured for a different logical chunk size."""
         if self.chunk_size != chunk_size:
