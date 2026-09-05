@@ -29,6 +29,12 @@ CONV_ROUTINGS = [
 
 # Three ranks, five fragments, over stream layouts that cut them differently.
 FRAGMENTS = [[(0, 3), (13, 16)], [(3, 7), (11, 13)], [(7, 11)]]
+FRAGMENT_TABLES = [
+    pytest.param(FRAGMENTS, id="zigzag"),
+    pytest.param([list(reversed(row)) for row in FRAGMENTS], id="reversed-span-order"),
+    pytest.param([[(7, 11), (0, 3), (13, 16), (3, 7), (11, 13)]], id="one-rank-reordered"),
+    pytest.param([[(0, 16)]], id="one-fragment"),
+]
 LAYOUTS = [
     pytest.param((0, 5, 5, 12, 16), id="two-cuts-and-an-empty-sequence"),
     pytest.param((0, 16), id="one-sequence"),
@@ -123,14 +129,18 @@ def test_plan_skips_empty_sequences_and_links_adjacent_fragments_on_one_rank():
     assert plan.terminal == (0,)
 
 
+@pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
 @pytest.mark.parametrize("cu_seqlens", LAYOUTS)
-def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence(cu_seqlens):
+def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence(
+    cu_seqlens, fragments
+):
     """Independently derive each subsequence's neighbours from token order and compare both folds."""
     plans = [
-        ContextParallelPlan.from_fragments(cu_seqlens, FRAGMENTS, cp_rank) for cp_rank in range(3)
+        ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
+        for cp_rank in range(len(fragments))
     ]
     generator = torch.Generator().manual_seed(3)
-    gathered = torch.randn(3, max(p.slots for p in plans), 1, 4, 2, generator=generator)
+    gathered = torch.randn(len(plans), plans[0].slots, 1, 4, 2, generator=generator)
     everything = [
         (r, s, piece)
         for r, row in enumerate(plans[0].table)
@@ -209,27 +219,36 @@ def test_short_conv_history_backward_is_the_transpose_of_forward_routing():
     assert compose_conv_histories(tails, CONV_ROUTINGS[0]).requires_grad
 
 
+@pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
 @pytest.mark.parametrize("cu_seqlens", LAYOUTS)
-def test_routing_tensors_follow_fragment_geometry(cu_seqlens):
+def test_routing_tensors_follow_fragment_geometry(cu_seqlens, fragments):
     """Bounds, predecessors/successors, and source maps are per fragment; padding is unrouted."""
     plans = [
-        ContextParallelPlan.from_fragments(cu_seqlens, FRAGMENTS, cp_rank) for cp_rank in range(3)
+        ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
+        for cp_rank in range(len(fragments))
     ]
+    world, slots = len(plans), plans[0].slots
     generator = torch.Generator().manual_seed(11)
-    gathered = torch.randn(3, 2, 1, 4, 2, generator=generator)
+    gathered = torch.randn(world, slots, 1, 4, 2, generator=generator)
     for plan in plans:
-        routing = plan.routing("cpu", max_subsequences=8)
+        capacity = len(plan.subsequences) + 1
+        routing = plan.routing("cpu", max_subsequences=capacity)
         count = len(plan.subsequences)
-        assert routing.slots == 2 and routing.world == 3
-        assert routing.predecessors.shape == routing.successors.shape == (2, 5)  # world*slots-1
-        assert routing.tail_sources.shape == (2, 0) and routing.conv_sources.shape == (8, 0)
-        assert routing.cu_seqlens.tolist() == [*plan.cu_seqlens] + [plan.cu_seqlens[-1]] * (
-            8 - count
+        assert routing.slots == slots and routing.world == world
+        assert routing.predecessors.shape == routing.successors.shape == (slots, world * slots - 1)
+        assert routing.tail_sources.shape == (slots, 0) and routing.conv_sources.shape == (
+            capacity,
+            0,
         )
-        assert routing.terminal.tolist() == [i in plan.terminal for i in range(8)]
+        assert routing.cu_seqlens.tolist() == [*plan.cu_seqlens] + [plan.cu_seqlens[-1]] * (
+            capacity - count
+        )
+        assert routing.terminal.tolist() == [i in plan.terminal for i in range(capacity)]
         entries = compose_entry_states(gathered, routing)
-        exits = compose_exit_cotangents(gathered, torch.zeros(8, 1, VALUE_DIM, KEY_DIM), routing)
-        assert entries.shape == exits.shape == (8, 1, VALUE_DIM, KEY_DIM)
+        exits = compose_exit_cotangents(
+            gathered, torch.zeros(capacity, 1, VALUE_DIM, KEY_DIM), routing
+        )
+        assert entries.shape == exits.shape == (capacity, 1, VALUE_DIM, KEY_DIM)
         assert torch.equal(entries[count:], torch.zeros_like(entries[count:]))
         assert torch.equal(exits[count:], torch.zeros_like(exits[count:]))
         firsts = {first for first, _ in spans(plan)}
@@ -261,6 +280,34 @@ def test_routing_tensors_follow_fragment_geometry(cu_seqlens):
                 assert routing.entry_sources[index].item() == routing.slots
             if index not in lasts:
                 assert routing.exit_sources[index].item() == routing.slots
+
+
+@pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
+@pytest.mark.parametrize("cu_seqlens", LAYOUTS)
+@pytest.mark.parametrize("history", [0, 1, 7, 20])
+def test_conv_histories_match_global_tokens(cu_seqlens, fragments, history):
+    """Halo routing reads preceding tokens within a document, independent of rank/span order."""
+    plans = [
+        ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
+        for cp_rank in range(len(fragments))
+    ]
+    capacity = max(len(plan.subsequences) for plan in plans) + 1
+    routings = [
+        plan.routing("cpu", slots=plan.slots + 1, max_subsequences=capacity, conv_history=history)
+        for plan in plans
+    ]
+    tokens = torch.randn(cu_seqlens[-1], 2, generator=torch.Generator().manual_seed(19))
+    tails = []
+    for plan, routing in zip(plans, routings, strict=True):
+        span = tokens[plan.global_token_ids("cpu")]
+        tails.append(torch.cat((span, span.new_zeros(1, 2)))[routing.tail_sources])
+    gathered = torch.cat(tails)
+    for plan, routing in zip(plans, routings, strict=True):
+        expected = tokens.new_zeros(capacity, history, 2)
+        for index, piece in enumerate(plan.subsequences):
+            available = min(history, piece.start - cu_seqlens[piece.sequence])
+            expected[index, history - available :] = tokens[piece.start - available : piece.start]
+        torch.testing.assert_close(compose_conv_histories(gathered, routing), expected)
 
 
 def test_routing_rejects_layouts_beyond_the_caps():
