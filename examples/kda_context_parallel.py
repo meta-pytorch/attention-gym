@@ -376,6 +376,10 @@ def capture_training_graph(
             batch.loss_scale,
         )
     stream.synchronize()
+    # The warmup's activations are dead; release their segments so the graph's
+    # private pool does not sit on top of a fragmented copy of the same peak.
+    gc.collect()
+    torch.cuda.empty_cache()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
