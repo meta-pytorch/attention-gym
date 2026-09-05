@@ -1193,7 +1193,8 @@ def build_state_summaries(
     across different ``bounds`` values of the same shape. The tokens right after a partial last
     chunk are read and then cancelled, so they must be finite. Supported scope: B=1, fixed
     K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
-    capability 8.0+ targets use Triton.
+    capability 8.0+ targets use Triton. Both backends split long ranges into work items when
+    the static budget permits, then compose their partial maps on the device.
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
@@ -1239,28 +1240,26 @@ def build_state_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_fwd requires CUDA capability 8.0+, got {capability}")
-    if not is_sm100_kda_capability(capability):
+    portable = not is_sm100_kda_capability(capability)
+    sm_count = properties.multi_processor_count
+    if portable:
         if capability[0] in (10, 12):
             from attn_gym._backends.triton.utils import configure_triton_allocator
 
             with torch.cuda.device(kg.device):
                 configure_triton_allocator()
         from attn_gym.linear._delta_rule.triton.affine_summary_fwd import (
+            _select_block_columns,
             launch_affine_summary_fwd,
         )
 
-        out = torch.empty(
-            (ranges, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
-        )
-        launch_affine_summary_fwd(kg, w, u, cumulative_gate, bounds, out, capability)
-        return out
-
-    kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
-    # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
-    # BN=64 only when the extra column tiles would spill past one CTA wave and
-    # serialize whole recurrence chains.
-    sm_count = properties.multi_processor_count
-    state_bn = 32 if ranges * heads * (SUMMARY_DIM // 32) <= sm_count else 64
+        state_bn = _select_block_columns(heads, capability)
+    else:
+        kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
+        # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
+        # BN=64 only when the extra column tiles would spill past one CTA wave and
+        # serialize whole recurrence chains.
+        state_bn = 32 if ranges * heads * (SUMMARY_DIM // 32) <= sm_count else 64
     # The bounds live on the device, so the budget comes from the span's chunk count (a static
     # upper bound) and the device cuts the ranges' actual chunks into that many items.
     budget = plan_work_budget(cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), sm_count)
@@ -1268,13 +1267,18 @@ def build_state_summaries(
     partials = torch.empty(
         (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
     )
-    use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, partials)
-    compiled = _compile_affine_summary(
-        _IO_TYPE_NAMES[kg.dtype],
-        heads,
-        state_bn,
-        use_int64_offsets,
-        whole_ranges=range_ids is None,
-    )
-    compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), work, partials)
+    if portable:
+        launch_affine_summary_fwd(
+            kg, w, u, cumulative_gate, work, partials, capability, whole_ranges=range_ids is None
+        )
+    else:
+        use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, partials)
+        compiled = _compile_affine_summary(
+            _IO_TYPE_NAMES[kg.dtype],
+            heads,
+            state_bn,
+            use_int64_offsets,
+            whole_ranges=range_ids is None,
+        )
+        compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), work, partials)
     return compose_work_items(partials, range_ids, ranges, reverse=False)

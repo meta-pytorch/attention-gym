@@ -1515,7 +1515,8 @@ def build_state_grad_summaries(
     across different ``bounds`` values of the same shape. The tokens right after a partial last
     chunk are read and then cancelled (through zeroed ``dO`` rows and ``w`` columns), so they must
     be finite. Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses
-    the native UMMA kernel; other capability 8.0+ targets use Triton.
+    the native UMMA kernel; other capability 8.0+ targets use Triton. Both backends split long
+    ranges into work items when the static budget permits, then compose on the device.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
@@ -1573,19 +1574,33 @@ def build_state_grad_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
-    if not is_sm100_kda_capability(capability):
+    portable = not is_sm100_kda_capability(capability)
+    if portable:
         if capability[0] in (10, 12):
             from attn_gym._backends.triton.utils import configure_triton_allocator
 
             with torch.cuda.device(qg.device):
                 configure_triton_allocator()
         from attn_gym.linear._delta_rule.triton.affine_summary_rev import (
+            _select_block_columns,
             launch_affine_summary_rev,
         )
 
-        out = torch.empty(
-            (ranges, heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
+        state_bn = _select_block_columns(heads, capability)
+    else:
+        qg, kg, w, dout, Aqk, cumulative_gate = (
+            _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
         )
+        state_bn = BlackwellDeltaAffineSummaryRev.BN
+    # As in the forward: a static budget from the span's chunk count, ranges cut on the device.
+    budget = plan_work_budget(
+        cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
+    )
+    work, range_ids = work_table(bounds, budget)
+    partials = torch.empty(
+        (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
+    )
+    if portable:
         launch_affine_summary_rev(
             qg,
             kg,
@@ -1594,39 +1609,26 @@ def build_state_grad_summaries(
             Aqk,
             cumulative_gate,
             scale,
-            bounds,
-            out,
+            work,
+            partials,
             capability,
+            whole_ranges=range_ids is None,
         )
-        return out
-
-    qg, kg, w, dout, Aqk, cumulative_gate = (
-        _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
-    )
-    # As in the forward: a static budget from the span's chunk count, ranges cut on the device.
-    budget = plan_work_budget(
-        cdiv(tokens, BT),
-        heads * (SUMMARY_DIM // BlackwellDeltaAffineSummaryRev.BN),
-        properties.multi_processor_count,
-    )
-    work, range_ids = work_table(bounds, budget)
-    partials = torch.empty(
-        (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
-    )
-    use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, partials)
-    compiled = _compile_affine_summary_rev(
-        _IO_TYPE_NAMES[qg.dtype], heads, use_int64_offsets, whole_ranges=range_ids is None
-    )
-    compiled(
-        qg.detach(),
-        kg.detach(),
-        w.detach(),
-        dout.detach(),
-        Aqk.detach(),
-        cumulative_gate.detach(),
-        work,
-        partials,
-        Float32(scale),
-    )
+    else:
+        use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, partials)
+        compiled = _compile_affine_summary_rev(
+            _IO_TYPE_NAMES[qg.dtype], heads, use_int64_offsets, whole_ranges=range_ids is None
+        )
+        compiled(
+            qg.detach(),
+            kg.detach(),
+            w.detach(),
+            dout.detach(),
+            Aqk.detach(),
+            cumulative_gate.detach(),
+            work,
+            partials,
+            Float32(scale),
+        )
     # The cotangent flows through the later item first.
     return compose_work_items(partials, range_ids, ranges, reverse=True)

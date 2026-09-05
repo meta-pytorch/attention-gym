@@ -6,8 +6,8 @@
 
 """Portable Triton reverse affine summaries for delta-rule context parallelism.
 
-Each program keeps one FP32 ``[128, BN]`` augmented-state tile resident while
-scanning complete BT64 chunks backward. Raw compact-layout pointers avoid host
+Each program scans one work item (row layout in ``work_items.py``), keeping one
+FP32 ``[128, BN]`` augmented-state tile resident while scanning BT64 chunks backward. Raw compact-layout pointers avoid host
 tensor descriptors, allocations, and synchronization in the launch path, so a
 warmed specialization can be captured directly by a CUDA Graph.
 
@@ -50,7 +50,7 @@ def affine_summary_rev_kernel(
     dout,
     aqk,
     cumulative_gate,
-    bounds,
+    work,
     out,
     scale,
     H: tl.constexpr,
@@ -58,32 +58,47 @@ def affine_summary_rev_kernel(
     V: tl.constexpr,
     BT: tl.constexpr,
     BN: tl.constexpr,
+    WHOLE_RANGES: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    """Scan one range, head, and augmented-state column tile backward through its chunks.
+    """Scan one work item, head, and augmented-state column tile backward through its chunks.
 
-    ``bounds[range] = (start, stop)`` are token offsets; the partial last chunk is masked so
-    tokens past ``stop`` contribute nothing and its gate row is the range's final token.
+    ``work_items.py`` defines the work-row layout. The partial last chunk is masked so
+    tokens past the range's end contribute nothing; unused rows store the identity.
     """
     head = tl.program_id(0)
     column_tile = tl.program_id(1)
-    range_id = tl.program_id(2)
+    work_index = tl.program_id(2)
     if USE_INT64_OFFSETS:
         head = head.to(tl.int64)
         column_tile = column_tile.to(tl.int64)
-        range_id = range_id.to(tl.int64)
-    start = tl.load(bounds + 2 * range_id)
-    stop = tl.load(bounds + 2 * range_id + 1)
-    if USE_INT64_OFFSETS:
-        start = start.to(tl.int64)
-        stop = stop.to(tl.int64)
+        work_index = work_index.to(tl.int64)
+    if WHOLE_RANGES:
+        start = tl.load(work + 2 * work_index)
+        stop = tl.load(work + 2 * work_index + 1)
+        if USE_INT64_OFFSETS:
+            start = start.to(tl.int64)
+            stop = stop.to(tl.int64)
+        chunk_begin = 0
+        chunk_end = (stop - start + BT - 1) // BT
+    else:
+        start = tl.load(work + 4 * work_index)
+        chunk_begin = tl.load(work + 4 * work_index + 1)
+        chunk_end = tl.load(work + 4 * work_index + 2)
+        length = tl.load(work + 4 * work_index + 3)
+        if USE_INT64_OFFSETS:
+            start = start.to(tl.int64)
+            chunk_begin = chunk_begin.to(tl.int64)
+            chunk_end = chunk_end.to(tl.int64)
+            length = length.to(tl.int64)
+        stop = start + length
 
     key = tl.arange(0, K)
     row = tl.arange(0, BT)
     column = column_tile * BN + tl.arange(0, BN)
     state = tl.where(column[None, :] == V + key[:, None], 1.0, 0.0).to(tl.float32)
 
-    for chunk in range((stop - start + BT - 1) // BT - 1, -1, -1):
+    for chunk in range(chunk_end - 1, chunk_begin - 1, -1):
         token_start = start + chunk * BT
         token = token_start + row
         valid = token[:, None] < stop
@@ -133,7 +148,7 @@ def affine_summary_rev_kernel(
         state -= tl.dot(tl.trans(w_tile), corrected_lo)
 
     out_offset = ptr_offset(
-        (range_id, head, column[None, :], key[:, None]),
+        (work_index, head, column[None, :], key[:, None]),
         (H * (V + K) * K, (V + K) * K, K, 1),
     )
     tl.store(out + out_offset, state)
@@ -147,28 +162,31 @@ def launch_affine_summary_rev(
     aqk: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
-    bounds: torch.Tensor,
-    out: torch.Tensor,
+    work: torch.Tensor,
+    partials: torch.Tensor,
     capability: tuple[int, int],
+    *,
+    whole_ranges: bool,
 ) -> None:
-    """Launch validated inputs: one summary per ``bounds`` row into ``out[R, H, V + K, K]``."""
+    """Scan one item per work row into ``partials[W, H, V + K, K]``."""
     heads = qg.shape[2]
     block_columns = _select_block_columns(heads, capability)
-    affine_summary_rev_kernel[(heads, _SUMMARY_DIM // block_columns, bounds.shape[0])](
+    affine_summary_rev_kernel[(heads, _SUMMARY_DIM // block_columns, work.shape[0])](
         qg,
         kg,
         w,
         dout,
         aqk,
         cumulative_gate,
-        bounds,
-        out,
+        work,
+        partials,
         float(scale),
         H=heads,
         K=_KEY_DIM,
         V=_VALUE_DIM,
         BT=_CHUNK_SIZE,
         BN=block_columns,
+        WHOLE_RANGES=whole_ranges,
         USE_INT64_OFFSETS=requires_int64_offsets(
             qg,
             kg,
@@ -176,7 +194,7 @@ def launch_affine_summary_rev(
             dout,
             aqk,
             cumulative_gate,
-            out,
+            partials,
         ),
         num_warps=8 if block_columns == 32 else 4,
         num_stages=2,
