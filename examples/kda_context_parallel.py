@@ -81,8 +81,8 @@ class PackedTrainingBatch:
     ids, so endpoint states can be compared with the unsharded run.
     """
 
-    global_hidden: torch.Tensor
-    global_target: torch.Tensor
+    global_hidden: torch.Tensor | None
+    global_target: torch.Tensor | None
     global_offsets: torch.Tensor
     local_hidden: torch.Tensor
     local_target: torch.Tensor
@@ -202,6 +202,7 @@ def validate_against_reference(
         batch.terminal_index,
         batch.loss_scale,
     )
+    assert batch.global_hidden is not None and batch.global_target is not None
     reference_hidden = batch.global_hidden.detach().clone().requires_grad_()
     # Unsharded, every sequence in the stream ends here, so every exit state is a true final state.
     every_sequence = torch.arange(
@@ -255,14 +256,18 @@ def validate_cuda_graph(
         model = make_model()
         model.load_state_dict(eager_model.state_dict())
         capture_hidden = batch.local_hidden.detach().clone().requires_grad_()
-        run_training_step(
+        # The warmup step doubles as the replay oracle: run it on the changed input the replay
+        # will see, so its activations are gone before the graph pool holds the captured ones.
+        eager_hidden = (capture_hidden.detach() * 0.75).requires_grad_()
+        eager_result, eager_gradients = run_training_step(
             model,
-            capture_hidden.detach().clone().requires_grad_(),
+            eager_hidden,
             batch.local_target,
             batch.local_offsets,
             batch.terminal_index,
             batch.loss_scale,
         )
+        del eager_hidden
     warmup_stream.synchronize()
     gc.collect()
     dist.barrier()
@@ -285,17 +290,6 @@ def validate_cuda_graph(
 
         with torch.no_grad():
             capture_hidden.mul_(0.75)
-        with torch.cuda.stream(warmup_stream):
-            eager_hidden = capture_hidden.detach().clone().requires_grad_()
-            eager_result, eager_gradients = run_training_step(
-                model,
-                eager_hidden,
-                batch.local_target,
-                batch.local_offsets,
-                batch.terminal_index,
-                batch.loss_scale,
-            )
-        warmup_stream.synchronize()
         graph.replay()
         torch.cuda.synchronize(device)
         if torch.equal(graph_result.hidden_states, captured_output):
@@ -440,11 +434,12 @@ def main(
     global_hidden = torch.randn(1, tokens, hidden_size, device=device)
     global_target = torch.randn_like(global_hidden)
     batch = PackedTrainingBatch(
-        global_hidden=global_hidden,
-        global_target=global_target,
+        # Only the reference needs the whole stream; drop it when not validating so large runs fit.
+        global_hidden=global_hidden if validate else None,
+        global_target=global_target if validate else None,
         global_offsets=torch.tensor(cu_seqlens_global, dtype=torch.int32, device=device),
         local_hidden=global_hidden[:, token_ids].clone().requires_grad_(),
-        local_target=global_target[:, token_ids],
+        local_target=global_target[:, token_ids].clone(),
         local_offsets=model.routing.cu_seqlens,
         token_ids=token_ids,
         terminal_index=torch.tensor(plan.terminal, dtype=torch.long, device=device),
@@ -455,6 +450,7 @@ def main(
         ),
         loss_scale=1.0 / global_target.numel(),
     )
+    del global_hidden, global_target
     if validate:
         reference_model = KDAAttention(**model_options)
         reference_model.load_state_dict(model.state_dict())
