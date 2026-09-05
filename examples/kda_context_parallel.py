@@ -5,7 +5,7 @@ operations through the reference recipe in ``attn_gym.linear.context_parallel``:
 exchange supplies the short convolution's finite history, and the KDA recurrence's initial state
 is composed from the affine summaries of the ranks that hold the preceding tokens. Each rank owns a list of fragments (global token ranges) chosen
 here in plain Python (``fragments``), so the same code validates contiguous shards and zig-zag load
-balancing; see NOTE [Terminology] in ``attn_gym.linear.state_summary``. Launch with:
+balancing; see NOTE [Terminology] in ``attn_gym.linear.context_parallel``. Launch with:
 
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 

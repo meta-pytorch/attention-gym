@@ -16,14 +16,16 @@ from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
     compose_entry_states,
     compose_exit_cotangents,
+    compose_summaries,
     grad_summary_slots,
+    merge_state,
+    neutral_summary,
     summary_slots,
 )
 from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 from attn_gym.linear.kda import chunk_kda
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
-from attn_gym.linear.state_summary import compose_summaries, merge_state, neutral_summary
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -151,8 +153,15 @@ def test_summary_algebra_ignores_the_float32_matmul_mode():
     precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:
+        matmul_precision = torch.backends.cuda.matmul.fp32_precision
         merged = merge_state(state, then)
+        assert torch.backends.cuda.matmul.fp32_precision == matmul_precision
         composed = compose_summaries(first, then)
+        assert torch.backends.cuda.matmul.fp32_precision == matmul_precision
+        for operation, operand in ((merge_state, state), (compose_summaries, first)):
+            with pytest.raises(RuntimeError):
+                operation(operand, then[..., :-1, :])
+            assert torch.backends.cuda.matmul.fp32_precision == matmul_precision
     finally:
         torch.set_float32_matmul_precision(precision)
     # TF32 keeps 10 mantissa bits (~1e-3 relative); an FP64 product stays within FP32 rounding.

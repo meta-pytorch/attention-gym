@@ -414,7 +414,7 @@ options to an op.
 ### Terminology and index spaces
 
 Anything a plan is built from is **global**; anything that touches a tensor on a rank is
-**local**. `attn_gym.linear.state_summary` carries the canonical `NOTE [Terminology]`.
+**local**. `attn_gym.linear.context_parallel` carries the canonical `NOTE [Terminology]`.
 
 | term | meaning | space |
 |---|---|---|
@@ -476,7 +476,7 @@ static budget permits, then compose the partial maps on the device. The budget d
 span length, head count, backend tile size, and SM count; budget 1 scans whole ranges in one kernel
 without a planner or compose launch. Work planning reads only device values, preserving CUDA Graph
 replay across different `bounds` values of the same shape.
-`attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries (`merge_state`,
+`attn_gym.linear.context_parallel` holds the pure-PyTorch algebra on summaries (`merge_state`,
 `compose_summaries`, `neutral_summary`).
 
 ### Ownership: from global fragments to local routing

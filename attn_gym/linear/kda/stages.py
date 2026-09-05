@@ -21,7 +21,7 @@ a communication point in both directions::
     dq, dk, dv, dgate, dbeta, d_initial_state = grads.run(d_final_state)
 
 The handles keep the factor tensors private, so the contract is the affine summary described in
-``attn_gym.linear.state_summary``: an FP32 ``[HV, V + K, K]`` map packed as ``[bias; transition]``.
+``attn_gym.linear.context_parallel``: an FP32 ``[HV, V + K, K]`` map packed as ``[bias; transition]``.
 The staged tier is eager-only: it is meant to be wrapped by the caller's own autograd function
 around a collective, and the summary kernels reject fake tensors rather than trace under
 ``torch.compile``.
@@ -83,7 +83,7 @@ class ChunkKDASaved(NamedTuple):
 
 # NOTE [Summary ranges are whole chunks of one subsequence]
 # ``state_summaries(bounds)`` and ``state_grad_summaries(bounds)`` take an ``int32 [R, 2]``
-# device tensor of LOCAL span offsets (see NOTE [Terminology] in ``attn_gym.linear.state_summary``).
+# device tensor of LOCAL span offsets (see NOTE [Terminology] in ``attn_gym.linear.context_parallel``).
 # The factor kernels lay 64-token chunks from each subsequence's first token, and every chunk's
 # factors are scaled toward that chunk's last token, so a row is exact only over whole chunks of
 # one subsequence:
@@ -241,7 +241,7 @@ def chunk_kda_prepare(
     Arguments follow ``chunk_kda`` with two restrictions: ``q``/``k``/``v`` must already share a
     float16 or bfloat16 dtype (no silent cast, because the caller owns autograd), and the batch
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
-    ``attn_gym.linear.state_summary``).
+    ``attn_gym.linear.context_parallel``).
     ``kernel_options={"backend": "mega"}`` runs the local pass with Mega and computes fused factors
     only for the summaries; the split schedules are not available with entry states.
     """
