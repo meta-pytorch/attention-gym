@@ -48,6 +48,7 @@ tests = [
 dev = [
     "prek",
     "pytest",
+    "pytest-xdist",  # pytest addopts pass --dist, so xdist must be present even for -n 0
     "ruff",
     "typer",
     "jsonargparse",
@@ -86,6 +87,8 @@ source = "vcs"
 [tool.pytest.ini_options]
 testpaths = ["test"]
 norecursedirs = ["agent_space"]
+# `-n` honors `xdist_group` marks, so tests that pin specific GPUs never run concurrently.
+addopts = "--dist loadgroup"
 markers = ["full_autotune: exercise every production Triton autotuning candidate"]
 
 # ---------- RUFF ------------

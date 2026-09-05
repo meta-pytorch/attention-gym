@@ -19,11 +19,11 @@ so any token range collapses to one FP32 map ``H_out = H_in @ A + B``, packed he
 modules produce the summaries and ``attn_gym.linear.context_parallel`` moves them between ranks.
 
 NOTE [Terminology]
-The staged primitives, ownership plans, and any context-parallel recipe over them share one
-vocabulary and two index spaces. GLOBAL means the whole stream one context-parallel group
-processes: one data-parallel replica's tokens, so "global" here is DP-local. ``cp_rank`` is the
-rank within that CP group. Anything a plan is built from is GLOBAL; anything that touches a tensor
-on a rank is LOCAL.
+The staged primitives, ownership plans, and the context-parallel recipe share one vocabulary and
+two index spaces. GLOBAL means the whole stream one context-parallel group processes: one
+data-parallel replica's tokens, so "global" here is DP-local. ``cp_rank`` is the rank within that
+CP group. Anything a plan is built from is GLOBAL; anything that touches a tensor on a rank is
+LOCAL.
 
     global stream   the whole packed token stream, ``cu_seqlens_global``            GLOBAL
     sequence        one document in the global stream                               GLOBAL
@@ -85,7 +85,8 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
     input_ids = <fragments_global[1] flattened by the loader>                 # [1, 192]
     q, k, v, gate, beta = embed / project / short-conv the span               # [1, 192, HV, 128]
 
-    # Device: all offsets LOCAL, all of them read from the routing tensors.
+    # Device: all offsets LOCAL, all of them read from the routing tensors. This is what
+    # context_parallel_chunk does.
     routing = plan.routing(device)
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
     slots = summary_slots(prepared, routing)                  # state_summaries(forward_bounds)
@@ -101,7 +102,7 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
     #   exit_states holds one state per subsequence; only routing.terminal rows are a sequence's
     #   true final state (here D∩s1's, for s1), the rest are intermediate. Callers that never use
     #   final states pass output_final_state=False; the backward needs neither.
-    exit_states[routing.terminal]
+    exit_states[routing.terminal]   # boolean indexing syncs; use plan.terminal under capture
 
 The key contract: the routing hands ``state_summaries`` / ``state_grad_summaries`` exactly one
 whole subsequence per active fragment slot, as consecutive entries of the span's own
@@ -129,9 +130,9 @@ tensors: the span's ``cu_seqlens``, one ``[start, stop)`` per fragment for the s
 indices padded with an identity slot, and per-segment source maps. Eager callers take the default
 sizes. For replay, pass the caps the loader promises never to exceed, ``routing(device, slots=S,
 max_subsequences=N)``: every layout within them, whatever its documents or fragment table, yields
-identically shaped tensors, so a recipe that reads every index from them is captured once and
-replayed after copying the next layout's tensors in place. The span length is the one shape the
-loader must hold fixed (pad a short batch with a loss-masked padding document).
+identically shaped tensors, so ``context_parallel_chunk``, which reads every index from them, is
+captured once and replayed after copying the next layout's tensors in place. The span length is the
+one shape the loader must hold fixed (pad a short batch with a loss-masked padding document).
 """
 
 from __future__ import annotations

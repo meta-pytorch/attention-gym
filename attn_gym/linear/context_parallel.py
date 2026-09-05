@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Context parallelism for delta-rule attention: ownership plans and state routing.
+"""Context parallelism for delta-rule attention: ownership plans, state routing, one recipe.
 
 Data model (NOTE [Terminology] in ``attn_gym.linear.state_summary``). The global stream is a list
 of sequences. Each rank owns a list of fragments, contiguous global token ranges, and lays them out
@@ -17,26 +17,34 @@ and its exit cotangent is its successors' reverse summaries folded from zero.
 Communication model. Only a fragment's last subsequence can continue on another fragment and only
 its first can continue from one, so every rank fills one slot per fragment (``plan.slots`` is the
 widest fragment list): forward, the summary of the fragment's last subsequence; backward, the
-reverse map of its first; the identity where nobody downstream needs one. The slots are exchanged
-once per direction. :meth:`ContextParallelPlan.routing` materializes a layout as device tensors
-(token ranges for the summary launches, flat slot indices for the folds); by default sized for that
-layout, or padded to caller-given caps (fragments per rank, subsequences per span) so a recipe
-built on them replays under one CUDA Graph across document layouts and fragment tables. The
-composition helpers here are pure tensor code over the gathered ``[world, slots, ...]`` buffers;
-the collective that fills them is the caller's. The short-convolution halo reuses the same slots:
-each fragment's slot holds the tail of its last subsequence.
+reverse map of its first; the identity where nobody downstream needs one. The slots are
+all-gathered once per direction. :meth:`ContextParallelPlan.routing` materializes a layout as
+device tensors (token ranges for the summary launches, flat slot indices for the folds and the
+halo); by default sized for that layout, or padded to caller-given caps (fragments per rank,
+subsequences per span) so the recipe replays under one CUDA Graph across document layouts and
+fragment tables. The short-convolution halo reuses the same slots: each fragment's slot holds the
+tail of its last subsequence.
+
+Ops. ``context_parallel_chunk`` is generic over the delta-rule variant through a :class:`StagedOp`
+pair of ``prepare`` / ``prepare_backward`` callables whose handles expose ``state_summaries``,
+``run``, and ``saved`` (``attn_gym.linear.kda.stages``, ``attn_gym.linear.gdn.stages``). It is not
+generic over the communication topology: for a point-to-point pipeline, a recursive-doubling scan
+over ``compose_summaries``, DTensor, or communication overlap, compose the staged primitives and
+the routing helpers (``summary_slots``, ``compose_entry_states``, ...) around your own collective.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
 from typing import NamedTuple, Protocol
 
 import torch
+import torch.distributed as dist
+from torch.distributed._functional_collectives import all_gather_single
 
-from attn_gym.linear.kda.utils import profiler_range
+from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear.state_summary import merge_state, neutral_summary
 
 
@@ -99,7 +107,7 @@ class ContextParallelRouting:
     """One layout of a plan as fixed-shape device tensors; see :meth:`ContextParallelPlan.routing`.
 
     Every shape depends only on the caps (``slots``, ``max_subsequences``, ``conv_history``) and
-    the span length, so a CUDA Graph captured around a recipe that reads them replays with the
+    the span length, so a CUDA Graph captured around ``context_parallel_chunk`` replays with the
     tensors of another layout copied in place. Predecessors and successors are stored per local
     fragment, since only a fragment's first subsequence has predecessors and only its last has
     successors;
@@ -146,6 +154,20 @@ class ContextParallelRouting:
     terminal: torch.Tensor
     tail_sources: torch.Tensor
     conv_sources: torch.Tensor
+
+    def validate(self, span: torch.Tensor, group: dist.ProcessGroup) -> None:
+        """Reject a routing built for another group, rank, span length, or device (host-only)."""
+        world, cp_rank = dist.get_world_size(group), dist.get_rank(group)
+        if world != self.world:
+            raise ValueError(f"routing has {self.world} ranks but the group has {world}")
+        if cp_rank != self.cp_rank:
+            raise ValueError(f"routing was built for cp_rank {self.cp_rank}, running on {cp_rank}")
+        if span.shape[1] != self.tokens:
+            raise ValueError(
+                f"routing owns {self.tokens} local tokens but the input has {span.shape[1]}"
+            )
+        if self.cu_seqlens.device != span.device:
+            raise ValueError(f"routing lives on {self.cu_seqlens.device}, inputs on {span.device}")
 
 
 @dataclass(frozen=True)
@@ -346,6 +368,14 @@ class ContextParallelPlan:
         )
 
 
+def _all_gather_slots(local_slots: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather every rank's ``[slots, ...]`` buffer into ``[world, slots, ...]``."""
+    gathered = local_slots.new_empty(dist.get_world_size(group), *local_slots.shape)
+    with profiler_range("cp/all_gather"):
+        dist.all_gather_single(gathered, local_slots, group=group)
+    return gathered
+
+
 def fold_slots(gathered: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
     """Apply gathered summaries to the zero state, one row of slots at a time.
 
@@ -406,25 +436,76 @@ def compose_conv_histories(
     return torch.cat((flat, flat.new_zeros(1, flat.shape[-1])))[routing.conv_sources]
 
 
+def context_parallel_conv_history(
+    qkv: torch.Tensor, routing: ContextParallelRouting, group: dist.ProcessGroup
+) -> torch.Tensor | None:
+    """Exchange fragment tails and return ``causal_conv1d``'s packed ``initial_state``.
+
+    ``qkv`` is the rank's ``[1, T, C]`` span; the result is ``None`` when the routing was built
+    without ``conv_history``. Every index comes from the routing tensors, so the exchange replays
+    under a CUDA Graph like ``context_parallel_chunk``. The collective is differentiable, so
+    gradients flow back to the ranks that own the history tokens.
+    """
+    history = routing.tail_sources.shape[-1]
+    if history == 0:
+        return None
+    routing.validate(qkv, group)
+    tails = torch.cat((qkv[0], qkv.new_zeros(1, qkv.shape[-1])))[routing.tail_sources]
+    with profiler_range("cp/conv_halo"):
+        gathered = all_gather_single(tails, gather_dim=0, group=group)
+    return compose_conv_histories(gathered, routing)
+
+
 class PreparedForward(Protocol):
-    """Forward handle of a staged delta-rule op."""
+    """Forward handle of a staged delta-rule op (``chunk_kda_prepare`` / ``chunk_gdn_prepare``)."""
 
     @property
-    def saved(self) -> NamedTuple: ...
+    def saved(self) -> NamedTuple:
+        """Tensors the autograd function stores for ``prepare_backward``."""
+        ...
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor: ...
+    @property
+    def scale(self) -> float:
+        """The resolved query scale; the backward must reuse it."""
+        ...
+
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """One ``[HV, V + K, K]`` affine summary per ``[start, stop)`` row of ``bounds``."""
+        ...
 
     def run(
         self, initial_state: torch.Tensor | None, *, output_final_state: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Finish the local forward from one entry state per span segment."""
+        ...
 
 
 class PreparedBackward(Protocol):
-    """Backward handle of a staged delta-rule op."""
+    """Backward handle of a staged delta-rule op (``chunk_*_prepare_backward``)."""
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor: ...
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """One ``[C; R]`` reverse map per row of ``bounds``: ``d_entry = d_exit @ R + C``."""
+        ...
 
-    def run(self, d_final_state: torch.Tensor | None) -> tuple[torch.Tensor, ...]: ...
+    def run(self, d_final_state: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+        """Finish the local backward from one exit-state cotangent per span segment.
+
+        Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)``.
+        """
+        ...
+
+
+class StagedOp(NamedTuple):
+    """A delta-rule variant's staged entry points with the op-specific options already bound.
+
+    ``prepare(q, k, v, gate, beta, *, cu_seqlens)`` returns a :class:`PreparedForward`;
+    ``prepare_backward(saved, d_output, initial_state, *, scale)`` returns a
+    :class:`PreparedBackward`, where ``saved`` is the forward handle's ``saved`` NamedTuple
+    rebuilt from ``ctx.saved_tensors`` and ``scale`` is the forward handle's resolved value.
+    """
+
+    prepare: Callable[..., PreparedForward]
+    prepare_backward: Callable[..., PreparedBackward]
 
 
 def summary_slots(prepared: PreparedForward, routing: ContextParallelRouting) -> torch.Tensor:
@@ -453,16 +534,109 @@ def grad_summary_slots(
     return torch.cat((merge_state(direct, slots), slots[..., value_dim:, :]), dim=-2)
 
 
+class _ContextParallelChunk(torch.autograd.Function):
+    """Explicit-adjoint delta rule: summaries and one all-gather in each direction.
+
+    Every index the forward and backward use comes from the :class:`ContextParallelRouting`
+    tensors, so the captured launch sequence is the same for every layout within the routing caps.
+    The backward's routing tensors are saved with the activations, so mutating them between
+    forward and backward is caught by autograd's version check.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, gate, beta, routing, group, stages):
+        prepared = stages.prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
+        gathered = _all_gather_slots(summary_slots(prepared, routing), group)
+        initial_state = compose_entry_states(gathered, routing)
+        with profiler_range("cp/run"):
+            output, final_state = prepared.run(initial_state, output_final_state=True)
+        assert final_state is not None
+
+        saved = prepared.saved
+        # Saving the routing tensors the backward reads makes autograd's version check catch a
+        # layout copied in place between forward and backward.
+        ctx.save_for_backward(
+            *saved,
+            initial_state,
+            routing.reverse_bounds,
+            routing.reverse_sources,
+            routing.successors,
+            routing.exit_sources,
+        )
+        ctx.saved_type = type(saved)
+        ctx.scale = prepared.scale
+        ctx.routing = routing
+        ctx.group = group
+        ctx.stages = stages
+        ctx.set_materialize_grads(False)
+        return output, final_state
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, d_output, d_final_state):
+        *saved, initial_state = ctx.saved_tensors[:-4]
+        routing = ctx.routing
+        if d_final_state is None:  # set_materialize_grads(False): the loss ignores the states
+            d_final_state = torch.zeros_like(initial_state)
+        grads = ctx.stages.prepare_backward(
+            ctx.saved_type._make(saved), d_output, initial_state, scale=ctx.scale
+        )
+        gathered = _all_gather_slots(grad_summary_slots(grads, d_final_state, routing), ctx.group)
+        exit_cotangent = compose_exit_cotangents(gathered, d_final_state, routing)
+        with profiler_range("cp/run"):
+            dq, dk, dv, dgate, dbeta, _d_initial_state = grads.run(exit_cotangent)
+        return dq, dk, dv, dgate, dbeta, None, None, None
+
+
+def context_parallel_chunk(
+    stages: StagedOp,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    routing: ContextParallelRouting,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a staged delta-rule op over this rank's span with state exchanged by all-gather.
+
+    Args:
+        stages: The op's entry points; ``attn_gym.linear.kda.context_parallel_kda`` and
+            ``attn_gym.linear.gdn.context_parallel_gdn`` bind them with the op's options.
+        q: This rank's span of queries, laid out as ``plan.subsequences``; ``k``, ``v``,
+            ``gate``, and ``beta`` follow the same layout and the op's ``chunk_*`` contract.
+        routing: This layout's tensors from ``ContextParallelPlan.routing``.
+        group: Process group containing exactly the plan's ranks, in order.
+
+    Returns:
+        The span's output and one FP32 ``[max_subsequences, HV, V, K]`` exit state per span
+        segment. Only the entries where ``routing.terminal`` is set are the sequences' true final
+        states; the others are intermediate states that the owner of the next subsequence
+        continued from, or unused rows of padded segments.
+
+    ``initial_state`` is not accepted: every sequence starts from zero and the plan supplies the
+    entry states. Every rank in ``group`` must call this function the same number of times. A
+    CUDA Graph captured around a call replays for any layout whose routing has the same shapes:
+    copy the new layout's tensors into the captured ones.
+    """
+    routing.validate(q, group)
+    return _ContextParallelChunk.apply(q, k, v, gate, beta, routing, group, stages)
+
+
 __all__ = [
     "ContextParallelPlan",
     "ContextParallelRouting",
     "Fragment",
     "PreparedBackward",
     "PreparedForward",
+    "StagedOp",
     "Subsequence",
     "compose_conv_histories",
     "compose_entry_states",
     "compose_exit_cotangents",
+    "context_parallel_chunk",
+    "context_parallel_conv_history",
     "fold_slots",
     "grad_summary_slots",
     "summary_slots",
