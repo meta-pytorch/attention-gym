@@ -16,11 +16,9 @@ from attn_gym.linear.gdn.impl.mega_ops import (
     chunk_gdn_mega_packed_fwd_with_state_op,
     validate_mega_available,
 )
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 _MEGA_DIM = 128
-_CHUNK_SIZE = 64
 
 
 def _pack_dense(tensor: Tensor) -> Tensor:
@@ -62,16 +60,13 @@ class ChunkGdnMegaPacked(torch.autograd.Function):
         beta: Tensor,
         initial_state: Tensor | None,
         cu_seqlens: Tensor,
-        chunk_offsets: Tensor,
         scale: float,
         output_final_state: bool,
     ) -> Tensor | tuple[Tensor, Tensor]:
         ctx.has_initial_state = initial_state is not None
         ctx.scale = scale
         if initial_state is None:
-            output = chunk_gdn_mega_packed_fwd_op(
-                q, k, value, gate, beta, cu_seqlens, chunk_offsets, scale
-            )
+            output = chunk_gdn_mega_packed_fwd_op(q, k, value, gate, beta, cu_seqlens, scale)
             ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
         elif output_final_state:
             output, final_state = chunk_gdn_mega_packed_fwd_with_state_op(
@@ -82,7 +77,6 @@ class ChunkGdnMegaPacked(torch.autograd.Function):
                 beta,
                 initial_state,
                 cu_seqlens,
-                chunk_offsets,
                 scale,
             )
             ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
@@ -95,7 +89,6 @@ class ChunkGdnMegaPacked(torch.autograd.Function):
                 beta,
                 initial_state,
                 cu_seqlens,
-                chunk_offsets,
                 scale,
             )
             ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
@@ -124,7 +117,7 @@ class ChunkGdnMegaPacked(torch.autograd.Function):
                 cu_seqlens,
                 ctx.scale,
             )
-            return *gradients, None, None, None, None, None
+            return *gradients, None, None, None, None
 
         q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         return (
@@ -140,7 +133,6 @@ class ChunkGdnMegaPacked(torch.autograd.Function):
                 cu_seqlens,
                 ctx.scale,
             ),
-            None,
             None,
             None,
             None,
@@ -178,10 +170,6 @@ def chunk_forward(
     if batch > 1:
         q, k, value, gate, beta = (_pack_dense(tensor) for tensor in (q, k, value, gate, beta))
 
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], _CHUNK_SIZE)
-    cu_seqlens = metadata.cu_seqlens
-    chunk_offsets = metadata.chunk_offsets
-
     if output_final_state and initial_state is None:
         initial_state = torch.zeros(
             cu_seqlens.shape[0] - 1,
@@ -202,7 +190,6 @@ def chunk_forward(
         beta,
         initial_state,
         cu_seqlens,
-        chunk_offsets,
         scale,
         output_final_state,
     )
