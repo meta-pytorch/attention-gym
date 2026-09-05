@@ -450,7 +450,12 @@ def context_parallel_conv_history(
     if history == 0:
         return None
     routing.validate(qkv, group)
-    tails = torch.cat((qkv[0], qkv.new_zeros(1, qkv.shape[-1])))[routing.tail_sources]
+    span = qkv[0]
+    # ``tokens`` marks a zero row; clamp and mask instead of appending one, which would copy the
+    # whole span to pick out a few tail tokens.
+    sources = routing.tail_sources
+    tails = span[sources.clamp(max=span.shape[0] - 1)]
+    tails = torch.where((sources < span.shape[0]).unsqueeze(-1), tails, 0.0)
     with profiler_range("cp/conv_halo"):
         gathered = all_gather_single(tails, gather_dim=0, group=group)
     return compose_conv_histories(gathered, routing)

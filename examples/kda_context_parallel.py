@@ -10,9 +10,11 @@ balancing; see NOTE [Terminology] in ``attn_gym.linear.state_summary``. Launch w
     torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
 
 Add ``--partition zigzag`` to give each rank two mirrored blocks, ``--compute-dtype=float16``
-to validate the FP16 route, ``--cuda-graph`` to capture forward and backward together and validate
-a replay with changed inputs, and ``--profile`` to export a merged native Perfetto trace using
-transformer-nuggets. The example requires one Hopper or datacenter Blackwell GPU per rank.
+to validate the FP16 route, ``--kda-backend mega`` to run each local pass with the Mega backend
+(SM100/SM103), ``--cuda-graph`` to capture forward and backward together and validate a replay
+with changed inputs, ``--profile`` to export a merged native Perfetto trace using
+transformer-nuggets, and ``--no-validate`` to skip the unsharded reference at scales where it does
+not fit. The example requires one Hopper or datacenter Blackwell GPU per rank.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import typer
 
 from attn_gym.linear.context_parallel import ContextParallelPlan, context_parallel_conv_history
 from attn_gym.linear.kda.context_parallel import context_parallel_kda
+from attn_gym.linear.types import KernelOptions
 from attn_gym.testing import kernel_stage, record_distributed_profile
 from examples.kda_training import ComputeDTypeOption, KDAAttention, KDAAttentionOutput
 
@@ -41,6 +44,11 @@ from examples.kda_training import ComputeDTypeOption, KDAAttention, KDAAttention
 class PartitionOption(str, Enum):
     CONTIGUOUS = "contiguous"
     ZIGZAG = "zigzag"
+
+
+class KDABackendOption(str, Enum):
+    FUSED = "fused"
+    MEGA = "mega"
 
 
 def fragments(
@@ -93,10 +101,12 @@ class ContextParallelKDAAttention(KDAAttention):
         *args,
         group: dist.ProcessGroup,
         plan: ContextParallelPlan,
+        kernel_options: KernelOptions | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.cp_group = group
+        self.kernel_options = kernel_options
         self.routing = plan.routing(
             torch.device("cuda", torch.cuda.current_device()),
             conv_history=self.qkv_conv1d.kernel_size[0] - 1,
@@ -144,6 +154,7 @@ class ContextParallelKDAAttention(KDAAttention):
             routing=self.routing,
             group=self.cp_group,
             fastmath=self.fastmath,
+            kernel_options=self.kernel_options,
         )
         return output, final_state if return_final_state else None
 
@@ -314,6 +325,9 @@ def profile_eager_step(
 ) -> None:
     """Profile one complete eager context-parallel forward and backward."""
     hidden_states = batch.local_hidden.detach().clone().requires_grad_()
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    resident = torch.cuda.memory_allocated(device)
     merged_path = record_distributed_profile(
         lambda: run_training_step(
             model,
@@ -326,6 +340,12 @@ def profile_eager_step(
         profile_path,
         "iteration",
         device,
+    )
+    step_peak = torch.cuda.max_memory_allocated(device) - resident
+    print(
+        f"rank {dist.get_rank()}: step peak {step_peak / 2**30:.2f} GiB above "
+        f"{resident / 2**30:.2f} GiB resident",
+        flush=True,
     )
     if merged_path is not None:
         print(f"profile={merged_path}", flush=True)
@@ -350,10 +370,18 @@ def main(
         int,
         typer.Option(min=1, help="Causal Q/K/V convolution width."),
     ] = 4,
+    kda_backend: Annotated[
+        KDABackendOption,
+        typer.Option(help="Chunk backend for each rank's local KDA pass."),
+    ] = KDABackendOption.FUSED,
     cuda_graph: Annotated[
         bool,
         typer.Option(help="Capture forward and backward and validate a changed-input replay."),
     ] = False,
+    validate: Annotated[
+        bool,
+        typer.Option(help="Compare against the unsharded module on the whole stream."),
+    ] = True,
     profile: Annotated[
         bool,
         typer.Option(help="Export a merged native Perfetto trace with transformer-nuggets."),
@@ -400,11 +428,13 @@ def main(
         "device": device,
     }
     make_model = partial(
-        ContextParallelKDAAttention, **model_options, group=dist.group.WORLD, plan=plan
+        ContextParallelKDAAttention,
+        **model_options,
+        group=dist.group.WORLD,
+        plan=plan,
+        kernel_options={"backend": kda_backend.value},
     )
     model = make_model()
-    reference_model = KDAAttention(**model_options)
-    reference_model.load_state_dict(model.state_dict())
 
     torch.manual_seed(123)
     global_hidden = torch.randn(1, tokens, hidden_size, device=device)
@@ -425,14 +455,29 @@ def main(
         ),
         loss_scale=1.0 / global_target.numel(),
     )
-    validate_against_reference(model, reference_model, batch)
+    if validate:
+        reference_model = KDAAttention(**model_options)
+        reference_model.load_state_dict(model.state_dict())
+        validate_against_reference(model, reference_model, batch)
+        del reference_model
+    else:
+        # Warm up compilation and autotuning so the profiled step measures only the model.
+        run_training_step(
+            model,
+            batch.local_hidden,
+            batch.local_target,
+            batch.local_offsets,
+            batch.terminal_index,
+            batch.loss_scale,
+        )
     gc.collect()
 
     profile_mode = "cuda_graph" if cuda_graph else "eager"
     profile_path = Path(
         "data",
-        f"kda_context_parallel_{profile_mode}_{partition.value}_{compute_dtype.value}"
-        f"_w{world_size}_t{tokens}_h{heads}_c{hidden_size}_conv{short_conv_kernel_size}",
+        f"kda_context_parallel_{profile_mode}_{partition.value}_{kda_backend.value}"
+        f"_{compute_dtype.value}_w{world_size}_t{tokens}_h{heads}_c{hidden_size}"
+        f"_conv{short_conv_kernel_size}",
     ).resolve()
     if cuda_graph:
         validate_cuda_graph(
@@ -447,7 +492,11 @@ def main(
         profile_eager_step(model, batch, profile_path, device)
 
     mode = " with CUDA Graph replay" if cuda_graph else ""
-    print(f"rank {cp_rank}: full packed KDA CP ({partition.value}) passed{mode}", flush=True)
+    status = "passed" if validate else "ran"
+    print(
+        f"rank {cp_rank}: full packed KDA CP ({partition.value}, {kda_backend.value}) {status}{mode}",
+        flush=True,
+    )
     torch.cuda.synchronize(device)
     dist.destroy_process_group()
 
