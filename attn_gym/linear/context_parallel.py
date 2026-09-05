@@ -211,21 +211,15 @@ class ContextParallelPlan:
             tuple(_cut_at_sequences(cu_seqlens_global, start, stop) for start, stop in owned)
             for owned in fragments
         )
-        # Every fragment holds at most one piece of a given sequence, so each sequence's pieces
-        # order its ``(cp_rank, fragment)`` slots by token.
-        order: dict[int, list[tuple[int, Slot]]] = {}
-        for owner, row in enumerate(table):
-            for index, fragment in enumerate(row):
-                for piece in fragment:
-                    order.setdefault(piece.sequence, []).append((piece.start, (owner, index)))
-        for slots_of_sequence in order.values():
-            slots_of_sequence.sort()
-
         # Only a fragment's first subsequence can be continued and only its last can continue.
-        def neighbors(slot: int, piece: Subsequence) -> tuple[list[Slot], list[Slot]]:
-            sequence_slots = [address for _, address in order[piece.sequence]]
-            here = sequence_slots.index((cp_rank, slot))
-            return sequence_slots[:here], sequence_slots[here + 1 :]
+        # With an exact tiling, predecessors end inside the first sequence, at or before this
+        # fragment; successors start inside the last sequence, at or after it. Interior documents
+        # need no slot index. Sort globally, independently of each rank's chosen span order.
+        ordered = sorted(
+            (fragment[0].start, fragment[-1].stop, (owner, index))
+            for owner, row in enumerate(table)
+            for index, fragment in enumerate(row)
+        )
 
         local = table[cp_rank]
         subsequences = [piece for fragment in local for piece in fragment]
@@ -233,11 +227,20 @@ class ContextParallelPlan:
             table=table,
             cp_rank=cp_rank,
             predecessors=tuple(
-                tuple(neighbors(slot, fragment[0])[0]) for slot, fragment in enumerate(local)
+                tuple(
+                    address
+                    for _, stop, address in ordered
+                    if cu_seqlens_global[fragment[0].sequence] < stop <= fragment[0].start
+                )
+                for fragment in local
             ),
             successors=tuple(
-                tuple(reversed(neighbors(slot, fragment[-1])[1]))
-                for slot, fragment in enumerate(local)
+                tuple(
+                    address
+                    for start, _, address in reversed(ordered)
+                    if fragment[-1].stop <= start < cu_seqlens_global[fragment[-1].sequence + 1]
+                )
+                for fragment in local
             ),
             terminal=tuple(
                 index
