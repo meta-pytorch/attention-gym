@@ -447,7 +447,7 @@ around the communication point without exposing its WY factors:
 from attn_gym.linear.kda import chunk_kda_prepare, chunk_kda_prepare_backward
 
 prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
-summaries = prepared.state_summaries(bounds)  # [bias; transition] per range, one launch
+summaries = prepared.state_summaries(bounds)  # [bias; transition] per range
 # ...exchange summaries and compose each subsequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
@@ -458,7 +458,12 @@ dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```
 
 Each `bounds` row names one local `cu_seqlens` segment (or a whole-chunk run inside one), and
-one launch returns every row's map; the context-parallel routing supplies the rows.
+one call returns every row's map; the context-parallel routing supplies the rows. Both the native
+SM100 summaries and the portable Triton summaries split long ranges into work items when their
+static budget permits, then compose the partial maps on the device. The budget depends on the
+span length, head count, backend tile size, and SM count; budget 1 scans whole ranges in one kernel
+without a planner or compose launch. Work planning reads only device values, preserving CUDA Graph
+replay across different `bounds` values of the same shape.
 `attn_gym.linear.state_summary` holds the pure-PyTorch algebra on summaries (`merge_state`,
 `compose_summaries`, `neutral_summary`).
 

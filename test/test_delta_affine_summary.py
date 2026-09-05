@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import partial, reduce
 from itertools import pairwise
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -226,13 +227,14 @@ def test_affine_summaries_support_int64_tensor_strides():
     torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
 
 
-def test_portable_affine_summaries_support_forced_int64_offsets(monkeypatch):
-    """Keep the portable launchers' wide-address specialization executable."""
-    capability = torch.cuda.get_device_capability()
-    if is_sm100_kda_capability(capability):
-        pytest.skip("SM100 uses the native CuTeDSL affine summaries")
-
-    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20)
+@pytest.mark.parametrize("budget", [1, 3])
+def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypatch):
+    """Keep the portable single-item and split wide-address specializations executable."""
+    plan_budget = Mock(return_value=budget)
+    for module in (native_fwd, native_rev):
+        monkeypatch.setattr(module, "is_sm100_kda_capability", lambda _capability: False)
+        monkeypatch.setattr(module, "plan_work_budget", plan_budget)
+    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20, tokens=640)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
     expected_reverse = build_state_grad_summary(
@@ -244,8 +246,11 @@ def test_portable_affine_summaries_support_forced_int64_offsets(monkeypatch):
         cumulative_gate,
         128**-0.5,
     )
-    monkeypatch.setattr(portable_fwd, "requires_int64_offsets", lambda *_tensors: True)
-    monkeypatch.setattr(portable_rev, "requires_int64_offsets", lambda *_tensors: True)
+    assert plan_budget.call_count == 2
+    plan_budget.reset_mock()
+    wide_offsets = Mock(return_value=True)
+    monkeypatch.setattr(portable_fwd, "requires_int64_offsets", wide_offsets)
+    monkeypatch.setattr(portable_rev, "requires_int64_offsets", wide_offsets)
 
     actual_forward = build_state_summary(kg, w, u, cumulative_gate)
     actual_reverse = build_state_grad_summary(
@@ -260,6 +265,8 @@ def test_portable_affine_summaries_support_forced_int64_offsets(monkeypatch):
 
     torch.testing.assert_close(actual_forward, expected_forward, rtol=0, atol=0)
     torch.testing.assert_close(actual_reverse, expected_reverse, rtol=0, atol=0)
+    assert plan_budget.call_count == 2
+    assert wide_offsets.call_count == 2
 
 
 def test_affine_summaries_accept_misaligned_contiguous_storage():
@@ -526,37 +533,31 @@ def test_compose_work_items_ignores_the_float32_matmul_mode():
     )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
-    reason="work-item splitting is specific to the native SM100 kernels",
-)
+@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_split_summaries_match_single_item_scans(dtype, monkeypatch):
+def test_split_summaries_match_single_item_scans(dtype, monkeypatch):
     """Splitting the chunk chain across idle SMs must only reorder FP32 composition."""
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(
         43, dtype, tokens=2048, heads=1, divisor=16
     )
     reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
+    # Exercise splitting even on small devices where the production budget is one.
+    plan_budget = Mock(return_value=2)
+    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
     split = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
     )
+    assert plan_budget.call_count == 2
 
-    budgets = []
-    plan_work_budget = native_fwd.plan_work_budget
-
-    def single_item(max_chunks, work_tiles, sm_count):
-        budgets.append(plan_work_budget(max_chunks, work_tiles, sm_count))
-        return 1
-
-    monkeypatch.setattr(native_fwd, "plan_work_budget", single_item)
-    monkeypatch.setattr(native_rev, "plan_work_budget", single_item)
+    plan_budget.reset_mock()
+    plan_budget.return_value = 1
     unsplit = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
     )
-    assert all(budget > 1 for budget in budgets), budgets
+    assert plan_budget.call_count == 2
     for name, actual, expected in zip(("forward", "reverse"), split, unsplit, strict=True):
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
         assert_relative_rms_within(
@@ -770,32 +771,30 @@ def test_range_tails_ignore_the_tokens_that_follow(dtype):
             )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
-    reason="segmented launches are specific to the native SM100 kernels",
-)
-def test_range_summaries_survive_a_tiny_work_budget(monkeypatch):
+@pytest.mark.usefixtures("summary_backend")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_range_summaries_survive_a_tiny_work_budget(dtype, monkeypatch):
     """Three items over seven ranges: cuts inside ranges and one-chunk ranges compose."""
-    tensors = make_summary_inputs(47, tokens=640, heads=2)
+    tensors = make_summary_inputs(47, dtype, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
-    monkeypatch.setattr(native_fwd, "plan_work_budget", lambda chunks, tiles, sms: 3)
-    monkeypatch.setattr(native_rev, "plan_work_budget", lambda chunks, tiles, sms: 3)
+    plan_budget = Mock(return_value=3)
+    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
     ranges = [*RANGE_BOUNDS, (500, 501), (0, 65)]
     bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
 
     forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
     reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5, bounds)
+    assert plan_budget.call_count == 2
     for index, (start, stop) in enumerate(ranges):
-        if start == stop:
-            continue
         for name, actual, expected in zip(
             ("forward", "reverse"),
             (forward[index], reverse[index]),
             reference_summaries(tensors, start, stop),
             strict=True,
         ):
-            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+            tolerance = 0 if start == stop else 2e-4
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
             assert_relative_rms_within(
                 actual,
                 expected,
@@ -806,9 +805,14 @@ def test_range_summaries_survive_a_tiny_work_budget(monkeypatch):
 
 
 @pytest.mark.usefixtures("summary_backend")
-def test_range_summaries_replay_across_layouts_in_one_cuda_graph():
-    """One captured graph serves any ``bounds`` values of the same shape: the routing is data."""
-    qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(43, tokens=640, heads=2)
+@pytest.mark.parametrize("budget", [1, 3])
+def test_range_summaries_replay_across_layouts_in_one_cuda_graph(budget, monkeypatch):
+    """One captured graph serves changed bounds, including all-empty padded work tables."""
+    tensors = make_summary_inputs(43, tokens=640, heads=2)
+    qg, kg, w, u, dout, aqk, cumulative_gate = tensors
+    plan_budget = Mock(return_value=budget)
+    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
     scale = 128**-0.5
     bounds = torch.tensor([[0, 256], [256, 640], [640, 640]], dtype=torch.int32, device="cuda")
 
@@ -824,9 +828,31 @@ def test_range_summaries_replay_across_layouts_in_one_cuda_graph():
     with torch.cuda.graph(graph):
         captured = launch()
 
-    for layout in ([[0, 256], [256, 640], [640, 640]], [[0, 100], [100, 300], [300, 640]]):
+    assert plan_budget.call_count == 4
+    for layout in (
+        [[0, 256], [256, 640], [640, 640]],
+        [[0, 100], [100, 300], [300, 640]],
+        [[0, 0], [300, 300], [640, 640]],
+        [[0, 65], [65, 65], [65, 640]],
+    ):
         bounds.copy_(torch.tensor(layout, dtype=torch.int32, device="cuda"))
         graph.replay()
         torch.cuda.synchronize()
         for actual, expected in zip(captured, launch(), strict=True):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for index, (start, stop) in enumerate(layout):
+            for name, actual, expected in zip(
+                ("forward", "reverse"),
+                (captured[0][index], captured[1][index]),
+                reference_summaries(tensors, start, stop),
+                strict=True,
+            ):
+                tolerance = 0 if start == stop else 2e-4
+                torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+                assert_relative_rms_within(
+                    actual,
+                    expected,
+                    f"replayed {name} [{start}, {stop})",
+                    max_eps=64,
+                    source_dtype=torch.float32,
+                )

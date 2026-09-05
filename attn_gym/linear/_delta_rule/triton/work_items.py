@@ -49,6 +49,48 @@ CHUNK_SIZE = 64
 
 
 @triton.jit
+def load_work_item(
+    work,
+    work_index,
+    BT: tl.constexpr,
+    WHOLE_RANGES: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Load ``(start, stop, chunk_begin, chunk_end)`` from a whole-range or planned row.
+
+    ``WHOLE_RANGES`` selects unsplit versus planned rows. When true (budget 1), ``work``
+    is the original ``(start, stop)`` bounds and each item scans
+    an entire range, without planning or composition. When false, rows contain
+    ``(start, chunk_begin, chunk_end, length)`` and the partial maps are composed afterward.
+    Both paths support variable-length ranges, empty ranges, and partial tail chunks.
+
+    Chunk indices are relative to the range's ``start``; ``stop`` remains its full token end
+    so only its final chunk is masked. Unused planned rows return an empty chunk interval.
+    Callers widen ``work_index`` before indexing when ``USE_INT64_OFFSETS`` is set.
+    """
+    if WHOLE_RANGES:
+        start = tl.load(work + 2 * work_index)
+        stop = tl.load(work + 2 * work_index + 1)
+        if USE_INT64_OFFSETS:
+            start = start.to(tl.int64)
+            stop = stop.to(tl.int64)
+        chunk_begin = 0
+        chunk_end = (stop - start + BT - 1) // BT
+    else:
+        start = tl.load(work + 4 * work_index)
+        chunk_begin = tl.load(work + 4 * work_index + 1)
+        chunk_end = tl.load(work + 4 * work_index + 2)
+        length = tl.load(work + 4 * work_index + 3)
+        if USE_INT64_OFFSETS:
+            start = start.to(tl.int64)
+            chunk_begin = chunk_begin.to(tl.int64)
+            chunk_end = chunk_end.to(tl.int64)
+            length = length.to(tl.int64)
+        stop = start + length
+    return start, stop, chunk_begin, chunk_end
+
+
+@triton.jit
 def plan_work_items_kernel(
     bounds,
     work,
@@ -213,4 +255,4 @@ def compose_work_items(
     return out
 
 
-__all__ = ["compose_work_items", "plan_work_items", "work_table"]
+__all__ = ["compose_work_items", "load_work_item", "plan_work_items", "work_table"]
