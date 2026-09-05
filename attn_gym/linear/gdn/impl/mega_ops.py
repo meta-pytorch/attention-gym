@@ -3,7 +3,8 @@
 """Private registered operators around the optional scalar-GDN Mega launchers.
 
 The opaque operators keep CuTeDSL imports and launch-time setup outside captured graphs. Public
-input normalization and autograd live in :mod:`mega`; these operators own only fixed kernel ABIs.
+input normalization and autograd live in :mod:`mega`; these operators own fixed kernel ABIs and
+device-side boundary validation.
 """
 
 from __future__ import annotations
@@ -19,17 +20,17 @@ from attn_gym.linear._delta_rule.paged_state import PagedState
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "Tensor chunk_offsets, float scale) -> Tensor",
+    "float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd_with_initial_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, float scale) -> Tensor",
+    "Tensor cu_seqlens, float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, float scale) -> (Tensor, Tensor)",
+    "Tensor cu_seqlens, float scale) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_mega_packed_fwd_paged",
@@ -72,6 +73,21 @@ def _normalize_cu_seqlens(cu_seqlens: Tensor) -> Tensor:
     if cu_seqlens.is_contiguous() and cu_seqlens.data_ptr() % 8 == 0:
         return cu_seqlens
     return cu_seqlens.clone(memory_format=torch.contiguous_format)
+
+
+def _validate_packed_boundaries(cu_seqlens: Tensor, q: Tensor) -> None:
+    """Check metadata before device reads, inside the opaque op to prevent compiler DCE."""
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.shape[0] < 2
+        or cu_seqlens.dtype != torch.int32
+        or not cu_seqlens.is_cuda
+        or cu_seqlens.device != q.device
+    ):
+        raise TypeError("cu_seqlens must be a contiguous int32 vector on q.device")
+    from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
+
+    _prepare_ragged_chunk_offsets(cu_seqlens, q.shape[1], 64)
 
 
 def _empty_with_layout(template: Tensor) -> Tensor:
@@ -119,14 +135,14 @@ def _packed_fwd_cuda(
     gate: Tensor,
     beta: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> Tensor:
-    del chunk_offsets
+    """Validate packed boundaries and run the fixed-arity forward launcher."""
     value_template = value
     q, k, value = (_normalize_tma_tensor(tensor) for tensor in (q, k, value))
     gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
     cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    _validate_packed_boundaries(cu_seqlens, q)
     output, _ = _forward_backend().run_forward(
         q,
         k,
@@ -149,16 +165,16 @@ def _packed_fwd_with_initial_state_cuda(
     beta: Tensor,
     initial_state: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> Tensor:
-    del chunk_offsets
+    """Validate packed boundaries and run the fixed-arity forward launcher."""
     value_template = value
     q, k, value, initial_state = (
         _normalize_tma_tensor(tensor) for tensor in (q, k, value, initial_state)
     )
     gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
     cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    _validate_packed_boundaries(cu_seqlens, q)
     output, _ = _forward_backend().run_forward(
         q,
         k,
@@ -181,16 +197,16 @@ def _packed_fwd_with_state_cuda(
     beta: Tensor,
     initial_state: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> tuple[Tensor, Tensor]:
-    del chunk_offsets
+    """Validate packed boundaries and run the fixed-arity forward launcher."""
     value_template, state_template = value, initial_state
     q, k, value, initial_state = (
         _normalize_tma_tensor(tensor) for tensor in (q, k, value, initial_state)
     )
     gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
     cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    _validate_packed_boundaries(cu_seqlens, q)
     output, final_state = _forward_backend().run_forward(
         q,
         k,
@@ -349,7 +365,6 @@ def _packed_fwd_fake(
     gate: Tensor,
     beta: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> Tensor:
     """Describe the output allocation made by the no-state forward launcher."""
@@ -365,7 +380,6 @@ def _packed_fwd_with_initial_state_fake(
     beta: Tensor,
     initial_state: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> Tensor:
     """Describe the output-only stateful forward launcher."""
@@ -381,7 +395,6 @@ def _packed_fwd_with_state_fake(
     beta: Tensor,
     initial_state: Tensor,
     cu_seqlens: Tensor,
-    chunk_offsets: Tensor,
     scale: float,
 ) -> tuple[Tensor, Tensor]:
     """Describe the forward output and launcher-cloned final state."""
