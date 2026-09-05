@@ -20,6 +20,7 @@ not fit. The example requires one Hopper or datacenter Blackwell GPU per rank.
 from __future__ import annotations
 
 import gc
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -349,6 +350,152 @@ def profile_eager_step(
         print(f"profile={merged_path}", flush=True)
 
 
+def capture_training_graph(
+    make_model: Callable[[], ContextParallelKDAAttention],
+    eager_model: ContextParallelKDAAttention,
+    batch: PackedTrainingBatch,
+) -> tuple[torch.cuda.CUDAGraph, ContextParallelKDAAttention, torch.Tensor]:
+    """Capture one full training step.
+
+    Returns the graph with the model and static input it reads from; callers
+    must keep both alive for as long as they replay.
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # See validate_cuda_graph: AccumulateGrad nodes pin their first stream.
+        model = make_model()
+        model.load_state_dict(eager_model.state_dict())
+        static_hidden = batch.local_hidden.detach().clone().requires_grad_()
+        run_training_step(
+            model,
+            static_hidden,
+            batch.local_target,
+            batch.local_offsets,
+            batch.terminal_index,
+            batch.loss_scale,
+        )
+    stream.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run_training_step(
+            model,
+            static_hidden,
+            batch.local_target,
+            batch.local_offsets,
+            batch.terminal_index,
+            batch.loss_scale,
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph, model, static_hidden
+
+
+def run_benchmark(
+    make_model: Callable[[], ContextParallelKDAAttention],
+    model: ContextParallelKDAAttention,
+    batch: PackedTrainingBatch,
+    device: torch.device,
+    *,
+    steps: int,
+    warmup_steps: int,
+    cuda_graph: bool,
+    output_path: Path,
+    config: dict[str, object],
+) -> None:
+    """Time steady-state training steps and record per-rank memory; rank 0 writes JSON.
+
+    Step time is measured per rank with CUDA events; the reported step time is
+    the slowest rank per iteration, which is what gates training. Memory is the
+    peak above what is resident before the timed steps (parameters, inputs, and
+    the graph's static buffers when captured).
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    hidden_states = batch.local_hidden.detach().clone().requires_grad_()
+    if cuda_graph:
+        graph, graph_model, static_hidden = capture_training_graph(make_model, model, batch)
+        step: Callable[[], object] = graph.replay
+    else:
+
+        def step() -> object:
+            return run_training_step(
+                model,
+                hidden_states,
+                batch.local_target,
+                batch.local_offsets,
+                batch.terminal_index,
+                batch.loss_scale,
+            )
+
+    for _ in range(warmup_steps):
+        step()
+    torch.cuda.synchronize(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    dist.barrier()
+    torch.cuda.reset_peak_memory_stats(device)
+    resident = torch.cuda.memory_allocated(device)
+
+    step_ms: list[float] = []
+    for _ in range(steps):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        step()
+        end.record()
+        end.synchronize()
+        step_ms.append(start.elapsed_time(end))
+    peak = torch.cuda.max_memory_allocated(device)
+    if cuda_graph:
+        del graph, graph_model, static_hidden
+    local = {
+        "rank": rank,
+        "host": os.uname().nodename,
+        "local_tokens": int(batch.token_ids.numel()),
+        "step_ms": step_ms,
+        "resident_bytes": resident,
+        "peak_bytes": peak,
+        "step_peak_bytes": peak - resident,
+        "reserved_bytes": torch.cuda.max_memory_reserved(device),
+    }
+    gathered: list[dict | None] = [None] * world_size
+    dist.all_gather_object(gathered, local)
+    if rank != 0:
+        return
+    ranks = [entry for entry in gathered if entry is not None]
+    slowest = [max(entry["step_ms"][index] for entry in ranks) for index in range(steps)]
+    mean = sum(slowest) / steps
+    std = (sum((value - mean) ** 2 for value in slowest) / max(steps - 1, 1)) ** 0.5
+    tokens = int(config["tokens"])
+    report = {
+        **config,
+        "world_size": world_size,
+        "mode": "cuda_graph" if cuda_graph else "eager",
+        "steps": steps,
+        "warmup_steps": warmup_steps,
+        "step_ms_mean": mean,
+        "step_ms_std": std,
+        "step_ms_min": min(slowest),
+        "tokens_per_s": tokens / (mean / 1e3),
+        "step_peak_gib_max": max(entry["step_peak_bytes"] for entry in ranks) / 2**30,
+        "resident_gib_max": max(entry["resident_bytes"] for entry in ranks) / 2**30,
+        "peak_gib_max": max(entry["peak_bytes"] for entry in ranks) / 2**30,
+        # Graph replays allocate from the graph's private pool, which
+        # memory_allocated does not see; reserved is the footprint that matters there.
+        "reserved_gib_max": max(entry["reserved_bytes"] for entry in ranks) / 2**30,
+        "ranks": ranks,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=1))
+    print(
+        f"benchmark: W={world_size} tokens={tokens} ({tokens // world_size}/rank) "
+        f"{report['mode']} step {mean:.2f}±{std:.2f} ms  {report['tokens_per_s'] / 1e6:.2f} Mtok/s  "
+        f"peak {report['peak_gib_max']:.2f} GiB allocated (step +{report['step_peak_gib_max']:.2f}), "
+        f"{report['reserved_gib_max']:.2f} GiB reserved -> {output_path}",
+        flush=True,
+    )
+
+
 def main(
     sequence_lengths: Annotated[
         str,
@@ -392,6 +539,14 @@ def main(
             "steady state (as if deep inside a model) rather than launch skew.",
         ),
     ] = 5,
+    benchmark_steps: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Timed steady-state steps after warmup; rank 0 writes data/kda_cp_scaling_*.json "
+            "with step time, throughput, and per-rank memory (0 disables).",
+        ),
+    ] = 0,
 ) -> None:
     """Run and validate the complete packed context-parallel KDA module."""
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -487,7 +642,35 @@ def main(
         f"_{compute_dtype.value}_w{world_size}_t{tokens}_h{heads}_c{hidden_size}"
         f"_conv{short_conv_kernel_size}",
     ).resolve()
-    if cuda_graph:
+    if benchmark_steps:
+        run_benchmark(
+            make_model,
+            model,
+            batch,
+            device,
+            steps=benchmark_steps,
+            warmup_steps=warmup_steps,
+            cuda_graph=cuda_graph,
+            output_path=Path(
+                "data",
+                f"kda_cp_scaling_{profile_mode}_{partition.value}_{kda_backend.value}"
+                f"_{compute_dtype.value}_w{world_size}_t{tokens}_h{heads}_c{hidden_size}.json",
+            ).resolve(),
+            config={
+                "tokens": tokens,
+                "sequence_lengths": list(lengths),
+                "partition": partition.value,
+                "hidden_size": hidden_size,
+                "heads": heads,
+                "head_dim": 128,
+                "compute_dtype": compute_dtype.value,
+                "short_conv_kernel_size": short_conv_kernel_size,
+                "kda_backend": kda_backend.value,
+                "device_name": torch.cuda.get_device_name(device),
+                "torch": torch.__version__,
+            },
+        )
+    elif cuda_graph:
         validate_cuda_graph(
             make_model,
             model,
