@@ -34,7 +34,7 @@ receives proportionally more items and every item stays inside one range::
               (0, 0, 0, 0), (0, 0, 0, 0)]  # W = 3 + 2 = 5; unused rows have range id 2
 
 Composition is ``functools.reduce(compose_summaries, partials_of_range)`` from
-``attn_gym.linear.state_summary``, run on the device: ``(A0, B0)`` then ``(A1, B1)`` gives
+``attn_gym.linear.context_parallel``, run on the device: ``(A0, B0)`` then ``(A1, B1)`` gives
 ``(A0 @ A1, B0 @ A1 + B1)``. Forward folds a range's items in chunk order; reverse folds them
 backwards, the order a cotangent flows. A range with no items gets the identity.
 """
@@ -227,7 +227,7 @@ def compose_work_items(
     """Fold ``[W, H, V + K, K]`` partials into one ``[R, H, V + K, K]`` summary per range.
 
     The device form of ``reduce(compose_summaries, items)`` per range (see
-    ``attn_gym.linear.state_summary``); ``reverse`` applies the later item first, the order a
+    ``attn_gym.linear.context_parallel``); ``reverse`` applies the later item first, the order a
     cotangent flows. A range with no items gets the identity. ``range_ids=None`` (one item
     per range, see ``work_table``) returns the partials as they are.
     """

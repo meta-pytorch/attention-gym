@@ -25,7 +25,7 @@ The output is the V-first packed transpose ``X^T`` of shape ``[H, V + K, K]``:
 rows ``[0:V]`` hold the state bias and rows ``[V:V+K]`` the state transition.
 These are distinct from KDA's token-token query/key matrix ``A``.
 
-Terms (see also NOTE [Terminology] in ``attn_gym.linear.state_summary``):
+Terms (see also NOTE [Terminology] in ``attn_gym.linear.context_parallel``):
 
     chunk         64 tokens (``BT``). The factor kernels lay chunks from each subsequence's
                   first token, so every subsequence has its own chunk grid.

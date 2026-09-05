@@ -11,8 +11,10 @@ from attn_gym.linear.context_parallel import (
     compose_conv_histories,
     compose_entry_states,
     compose_exit_cotangents,
+    compose_summaries,
+    merge_state,
+    neutral_summary,
 )
-from attn_gym.linear.state_summary import compose_summaries, merge_state, neutral_summary
 
 VALUE_DIM = 2
 KEY_DIM = 2
