@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym.linear._delta_rule.triton.work_items import load_work_item
 
 _CHUNK_SIZE = 64
 _KEY_DIM = 128
@@ -73,25 +74,9 @@ def affine_summary_rev_kernel(
         head = head.to(tl.int64)
         column_tile = column_tile.to(tl.int64)
         work_index = work_index.to(tl.int64)
-    if WHOLE_RANGES:
-        start = tl.load(work + 2 * work_index)
-        stop = tl.load(work + 2 * work_index + 1)
-        if USE_INT64_OFFSETS:
-            start = start.to(tl.int64)
-            stop = stop.to(tl.int64)
-        chunk_begin = 0
-        chunk_end = (stop - start + BT - 1) // BT
-    else:
-        start = tl.load(work + 4 * work_index)
-        chunk_begin = tl.load(work + 4 * work_index + 1)
-        chunk_end = tl.load(work + 4 * work_index + 2)
-        length = tl.load(work + 4 * work_index + 3)
-        if USE_INT64_OFFSETS:
-            start = start.to(tl.int64)
-            chunk_begin = chunk_begin.to(tl.int64)
-            chunk_end = chunk_end.to(tl.int64)
-            length = length.to(tl.int64)
-        stop = start + length
+    start, stop, chunk_begin, chunk_end = load_work_item(
+        work, work_index, BT, WHOLE_RANGES, USE_INT64_OFFSETS
+    )
 
     key = tl.arange(0, K)
     row = tl.arange(0, BT)
