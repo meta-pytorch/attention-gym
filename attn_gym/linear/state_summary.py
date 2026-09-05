@@ -137,7 +137,34 @@ one shape the loader must hold fixed (pad a short batch with a loss-masked paddi
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
+
+
+@contextmanager
+def _ieee_fp32_matmul() -> Iterator[None]:
+    """Run FP32 matmuls without TF32 so results never depend on the caller's precision mode."""
+    previous = torch.backends.cuda.matmul.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = previous
+
+
+def _exact_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """FP32 IEEE product of two summary blocks.
+
+    These maps are ``[HV, 128, 128]``-ish, so FP32 accumulation over K=128 is
+    plenty; what matters is not silently rounding operands to TF32 under
+    ``torch.set_float32_matmul_precision("high")``. FP64 would also do that but
+    folds ``2 * world`` of these per rank per step and runs at ~1 TFLOP/s on
+    GB300, where it cost a quarter of a 32-rank step.
+    """
+    with _ieee_fp32_matmul():
+        return left.float() @ right.float()
 
 
 def neutral_summary(
@@ -156,12 +183,11 @@ def neutral_summary(
 def merge_state(state: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
     """Apply a packed ``[bias; transition]`` summary to a V-major state: ``state @ A + B``.
 
-    The product runs in FP64 so the result does not depend on the caller's
-    ``torch.get_float32_matmul_precision()``: under ``"high"`` an FP32 matmul silently rounds
-    the operands to TF32, and these maps are small enough that the cast is negligible.
+    The product runs in IEEE FP32 (see ``_exact_matmul``) so the result does not depend on
+    the caller's ``torch.get_float32_matmul_precision()``.
     """
     value_dim = state.shape[-2]
-    merged = state.double() @ summary[..., value_dim:, :].double() + summary[..., :value_dim, :]
+    merged = _exact_matmul(state, summary[..., value_dim:, :]) + summary[..., :value_dim, :]
     return merged.to(state.dtype)
 
 
@@ -174,7 +200,7 @@ def compose_summaries(first: torch.Tensor, then: torch.Tensor) -> torch.Tensor:
     """
     value_dim = first.shape[-2] - first.shape[-1]
     bias, transition = first[..., :value_dim, :], first[..., value_dim:, :]
-    composed_transition = (transition.double() @ then[..., value_dim:, :].double()).to(first.dtype)
+    composed_transition = _exact_matmul(transition, then[..., value_dim:, :]).to(first.dtype)
     return torch.cat((merge_state(bias, then), composed_transition), dim=-2)
 
 
