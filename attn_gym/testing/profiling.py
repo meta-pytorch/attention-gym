@@ -24,8 +24,8 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True) -> Iterato
 
 
 @contextmanager
-def profile_trace(path: Path) -> Iterator[torch.profiler.profile]:
-    """Record one native Perfetto trace per rank."""
+def profile_trace(path: Path, *, warmup: int = 0) -> Iterator[torch.profiler.profile]:
+    """Record one native Perfetto trace per rank, discarding ``warmup`` scheduled steps."""
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         profiler = import_module("transformer_nuggets.utils.benchmark").profiler
@@ -38,6 +38,7 @@ def profile_trace(path: Path) -> Iterator[torch.profiler.profile]:
         path.with_suffix(".pftrace"),
         record_shapes=True,
         trace_format="track_event",
+        warmup=warmup,
     ) as active_profiler:
         yield active_profiler
 
@@ -47,8 +48,17 @@ def record_distributed_profile(
     path: Path,
     label: str,
     device: torch.device,
+    *,
+    warmup_steps: int = 0,
 ) -> Path | None:
-    """Profile one synchronized world-group step and merge its native rank traces."""
+    """Profile one synchronized world-group step and merge its native rank traces.
+
+    ``warmup_steps`` extra steps run first with the profiler attached but are
+    dropped from the trace, so the recorded step is steady state: kernels,
+    NCCL communicators, allocator, and CUPTI are all hot, and the ranks
+    re-align on a barrier right before it. Without warmup the trace mostly
+    shows launch skew (ranks waiting inside the first collective).
+    """
     try:
         merge_traces = import_module("transformer_nuggets.utils.merge_traces").merge_traces
     except ImportError as error:
@@ -59,9 +69,18 @@ def record_distributed_profile(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     dist.barrier()
-    with profile_trace(path) as active_profiler:
-        # Profiler initialization is rank-local, so align again after every profiler is active.
-        dist.barrier()
+    with profile_trace(path, warmup=warmup_steps) as active_profiler:
+        for index in range(warmup_steps):
+            step()
+            if index == warmup_steps - 1:
+                # Still inside the discarded warmup phase: pay the re-alignment here so
+                # neither the barrier nor the skew it absorbs appears in the trace.
+                torch.cuda.synchronize(device)
+                dist.barrier()
+            active_profiler.step()
+        if warmup_steps == 0:
+            # Profiler initialization is rank-local, so align again after every profiler is active.
+            dist.barrier()
         torch.cuda.synchronize(device)
         with torch.profiler.record_function(f"cp/rank_{rank}/{label}"):
             step()
@@ -88,7 +107,7 @@ def record_distributed_profile(
             [str(rank_path) for rank_path in rank_paths],
             str(merged_path),
             labels=[f"Rank {index} · GPU {index}" for index in range(world_size)],
-            align_timestamps=False,
+            align_timestamps=True,
         )
     dist.barrier()
     return merged_path
