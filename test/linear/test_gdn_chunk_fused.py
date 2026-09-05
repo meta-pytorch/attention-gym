@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from attn_gym.linear import (
     paged_chunk_gdn,
     recurrent_gdn,
 )
+from attn_gym.linear.gdn import ops as gdn_ops
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
 )
@@ -794,24 +796,44 @@ def test_misaligned_contiguous_inputs_and_cotangent():
     assert all(torch.isfinite(result).all() for result in outputs)
 
 
-def test_no_state_output_only_and_state_only_gradients():
-    """Exercise no-state/no-final-state and a missing output cotangent."""
-    inputs = make_inputs(tokens=64, key_heads=1, value_heads=4, requires_grad=True)
-    output, state = chunk_gdn(*inputs[:5], impl="fused")
-    assert state is None
-    output_gradients = torch.autograd.grad(output.float().square().mean(), inputs[:5])
-    assert all(torch.isfinite(gradient).all() for gradient in output_gradients)
+@pytest.mark.parametrize("has_initial_state", [False, True])
+@pytest.mark.parametrize("state_loss", [False, True], ids=["output-only", "state-only"])
+def test_eager_backward_uses_registered_operator(has_initial_state: bool, state_loss: bool):
+    """Use the registered backward for both state arities, including either missing cotangent."""
+    inputs = make_inputs(tokens=65, key_heads=1, value_heads=4)
+    if not has_initial_state:
+        inputs = inputs[:5]
+    backward_op = chunk_bwd_with_state_grad_op if has_initial_state else chunk_bwd_op
+    backward_name = "chunk_bwd_with_state_grad_op" if has_initial_state else "chunk_bwd_op"
+    results = []
+    with patch.object(gdn_ops, backward_name, wraps=backward_op) as backward:
+        for impl, dtype in (("fused", None), ("reference", None), ("reference", torch.float64)):
+            leaves = tuple(
+                tensor.to(dtype=dtype).detach().clone().requires_grad_() for tensor in inputs
+            )
+            output, final_state = chunk_gdn(
+                *leaves[:5],
+                leaves[5] if has_initial_state else None,
+                output_final_state=state_loss,
+                impl=impl,
+            )
+            loss_output = final_state if state_loss else output
+            assert loss_output is not None
+            gradients = torch.autograd.grad(loss_output.square().mean(), leaves, allow_unused=True)
+            results.append(
+                tuple(
+                    torch.zeros_like(tensor) if gradient is None else gradient
+                    for tensor, gradient in zip(leaves, gradients, strict=True)
+                )
+            )
+        backward.assert_called_once()
 
-    state_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
-    _output, final_state = chunk_gdn(
-        *state_inputs[:5],
-        state_inputs[5],
-        output_final_state=True,
-        impl="fused",
-    )
-    assert final_state is not None
-    state_gradients = torch.autograd.grad(final_state.square().mean(), state_inputs)
-    assert all(torch.isfinite(gradient).all() for gradient in state_gradients)
+    names = ("dq", "dk", "dv", "dgate", "dbeta", "dstate")[: len(inputs)]
+    for name, actual, reference, golden in zip(names, *results, strict=True):
+        if golden.abs().max().item() < 1e-12:
+            torch.testing.assert_close(actual.double(), golden, rtol=0, atol=1e-12)
+        else:
+            assert_matches_low_precision_reference(actual, golden, reference, name)
 
 
 @pytest.mark.parametrize(("batch", "tokens"), [(1, 65), (2, 129)])
