@@ -35,7 +35,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import typer
 
-from attn_gym.linear.context_parallel import ContextParallelPlan, context_parallel_conv_history
+from attn_gym.linear.context_parallel import (
+    ContextParallelPlan,
+    ContextParallelRouting,
+    context_parallel_conv_history,
+)
 from attn_gym.linear.kda.context_parallel import context_parallel_kda
 from attn_gym.linear.types import KernelOptions
 from attn_gym.testing import kernel_stage, record_distributed_profile
@@ -75,7 +79,7 @@ def fragments(
 
 @dataclass(frozen=True)
 class PackedTrainingBatch:
-    """Global reference tensors and this rank's span of them.
+    """Global reference tensors and this rank's span and per-call routing.
 
     ``token_ids`` maps span positions to global token ids; ``terminal_index`` lists the local
     subsequences that end their sequence and ``terminal_sequences`` the matching global sequence
@@ -87,7 +91,7 @@ class PackedTrainingBatch:
     global_offsets: torch.Tensor
     local_hidden: torch.Tensor
     local_target: torch.Tensor
-    local_offsets: torch.Tensor
+    routing: ContextParallelRouting
     token_ids: torch.Tensor
     terminal_index: torch.Tensor
     terminal_sequences: torch.Tensor
@@ -101,16 +105,52 @@ class ContextParallelKDAAttention(KDAAttention):
         self,
         *args,
         group: dist.ProcessGroup,
-        plan: ContextParallelPlan,
         kernel_options: KernelOptions | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.cp_group = group
         self.kernel_options = kernel_options
-        self.routing = plan.routing(
-            torch.device("cuda", torch.cuda.current_device()),
-            conv_history=self.qkv_conv1d.kernel_size[0] - 1,
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        routing: ContextParallelRouting,
+        return_final_state: bool = False,
+    ) -> KDAAttentionOutput:
+        """Apply packed KDA using this batch's routing for both distributed state exchanges.
+
+        Routing covers every local token; recurrent and convolution entry states are
+        constructed from the other ranks, not supplied by the caller.
+        """
+        if (
+            hidden_states.ndim != 3
+            or hidden_states.shape[0] != 1
+            or hidden_states.shape[-1] != self.hidden_size
+        ):
+            raise ValueError(
+                f"hidden_states must have shape [1, T, {self.hidden_size}], "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[1] == 0:
+            raise ValueError("sequence length must be greater than zero")
+        if self.backend != "fused":
+            raise ValueError("packed context parallelism requires backend='fused'")
+        if routing.tail_sources.shape[1] != self.qkv_conv1d.kernel_size[0] - 1:
+            raise ValueError(
+                "routing conv_history must match the model's convolution width minus one"
+            )
+        # The base pipeline (projections, masking, normalization) is reused as is. Routing is
+        # passed per call and reaches only the two overrides below, short_convolution and
+        # kda_core, instead of being stored on the module.
+        return self.run_stages(
+            hidden_states,
+            None,
+            None,
+            cu_seqlens=routing.cu_seqlens,
+            return_final_state=return_final_state,
+            routing=routing,
         )
 
     def short_convolution(
@@ -120,11 +160,11 @@ class ContextParallelKDAAttention(KDAAttention):
         *,
         cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
+        routing: ContextParallelRouting,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if initial_state is not None:
-            raise ValueError("context parallelism constructs the short-convolution state")
+        assert initial_state is None, "context parallelism constructs the convolution history"
         with kernel_stage("cp/conv/halo", self.enable_graph_annotations):
-            initial_state = context_parallel_conv_history(qkv, self.routing, self.cp_group)
+            initial_state = context_parallel_conv_history(qkv, routing, self.cp_group)
         return super().short_convolution(
             qkv,
             initial_state,
@@ -143,16 +183,17 @@ class ContextParallelKDAAttention(KDAAttention):
         *,
         cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
+        routing: ContextParallelRouting,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if initial_state is not None:
-            raise ValueError("context parallelism constructs the KDA recurrent state")
+        assert initial_state is None, "context parallelism constructs the recurrent state"
+        del cu_seqlens  # routing.cu_seqlens is the same tensor
         output, final_state = context_parallel_kda(
             q,
             k,
             v,
             gate,
             beta,
-            routing=self.routing,
+            routing=routing,
             group=self.cp_group,
             fastmath=self.fastmath,
             kernel_options=self.kernel_options,
@@ -161,10 +202,10 @@ class ContextParallelKDAAttention(KDAAttention):
 
 
 def run_training_step(
-    module: KDAAttention,
+    module: ContextParallelKDAAttention,
     hidden_states: torch.Tensor,
     target: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    routing: ContextParallelRouting,
     state_index: torch.Tensor,
     loss_scale: float,
     *,
@@ -174,9 +215,25 @@ def run_training_step(
     module.enable_graph_annotations = annotate
     result = module(
         hidden_states,
-        cu_seqlens=cu_seqlens,
+        routing=routing,
         return_final_state=True,
     )
+    return result, training_gradients(
+        module, result, hidden_states, target, state_index, loss_scale, annotate=annotate
+    )
+
+
+def training_gradients(
+    module: KDAAttention,
+    result: KDAAttentionOutput,
+    hidden_states: torch.Tensor,
+    target: torch.Tensor,
+    state_index: torch.Tensor,
+    loss_scale: float,
+    *,
+    annotate: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Differentiate the same token and true-endpoint losses in CP and unsharded runs."""
     assert result.final_state is not None
     assert result.final_conv_state is not None
     loss = F.mse_loss(result.hidden_states.float(), target, reduction="sum") * loss_scale
@@ -185,8 +242,7 @@ def run_training_step(
     loss = loss + 1e-4 * result.final_conv_state[state_index].float().square().sum()
     inputs = (hidden_states, *tuple(module.parameters()))
     with kernel_stage("cp/bwd", annotate, backward=False):
-        gradients = torch.autograd.grad(loss, inputs)
-    return result, gradients
+        return torch.autograd.grad(loss, inputs)
 
 
 def validate_against_reference(
@@ -199,7 +255,7 @@ def validate_against_reference(
         model,
         batch.local_hidden,
         batch.local_target,
-        batch.local_offsets,
+        batch.routing,
         batch.terminal_index,
         batch.loss_scale,
     )
@@ -209,11 +265,14 @@ def validate_against_reference(
     every_sequence = torch.arange(
         batch.global_offsets.shape[0] - 1, device=reference_hidden.device
     )
-    reference_result, reference_gradients = run_training_step(
+    reference_result = reference_model(
+        reference_hidden, cu_seqlens=batch.global_offsets, return_final_state=True
+    )
+    reference_gradients = training_gradients(
         reference_model,
+        reference_result,
         reference_hidden,
         batch.global_target,
-        batch.global_offsets,
         every_sequence,
         batch.loss_scale,
     )
@@ -265,7 +324,7 @@ def validate_cuda_graph(
             model,
             eager_hidden,
             batch.local_target,
-            batch.local_offsets,
+            batch.routing,
             batch.terminal_index,
             batch.loss_scale,
         )
@@ -281,7 +340,7 @@ def validate_cuda_graph(
                 model,
                 capture_hidden,
                 batch.local_target,
-                batch.local_offsets,
+                batch.routing,
                 batch.terminal_index,
                 batch.loss_scale,
                 annotate=annotations,
@@ -331,7 +390,7 @@ def profile_eager_step(
             model,
             hidden_states,
             batch.local_target,
-            batch.local_offsets,
+            batch.routing,
             batch.terminal_index,
             batch.loss_scale,
         ),
@@ -371,7 +430,7 @@ def capture_training_graph(
             model,
             static_hidden,
             batch.local_target,
-            batch.local_offsets,
+            batch.routing,
             batch.terminal_index,
             batch.loss_scale,
         )
@@ -387,7 +446,7 @@ def capture_training_graph(
             model,
             static_hidden,
             batch.local_target,
-            batch.local_offsets,
+            batch.routing,
             batch.terminal_index,
             batch.loss_scale,
         )
@@ -427,7 +486,7 @@ def run_benchmark(
                 model,
                 hidden_states,
                 batch.local_target,
-                batch.local_offsets,
+                batch.routing,
                 batch.terminal_index,
                 batch.loss_scale,
             )
@@ -596,7 +655,6 @@ def main(
         ContextParallelKDAAttention,
         **model_options,
         group=dist.group.WORLD,
-        plan=plan,
         kernel_options={"backend": kda_backend.value},
     )
     model = make_model()
@@ -628,7 +686,7 @@ def main(
         global_offsets=torch.tensor(cu_seqlens_global, dtype=torch.int32, device=device),
         local_hidden=global_hidden[:, shard_ids].to(device).requires_grad_(),
         local_target=global_target[:, shard_ids].to(device),
-        local_offsets=model.routing.cu_seqlens,
+        routing=plan.routing(device, conv_history=short_conv_kernel_size - 1),
         token_ids=token_ids,
         terminal_index=torch.tensor(plan.terminal, dtype=torch.long, device=device),
         terminal_sequences=torch.tensor(
@@ -650,7 +708,7 @@ def main(
             model,
             batch.local_hidden,
             batch.local_target,
-            batch.local_offsets,
+            batch.routing,
             batch.terminal_index,
             batch.loss_scale,
         )
