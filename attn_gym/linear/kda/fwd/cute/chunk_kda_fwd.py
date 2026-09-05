@@ -13,7 +13,7 @@ from attn_gym._backends.cute import (
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
@@ -341,12 +341,7 @@ def _chunk_kda_fwd_ragged_shared(
     """Run ragged forward with caller-prepared routing and fixed-schema factors."""
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
-    metadata = RaggedChunkMetadata(
-        cu_seqlens,
-        chunk_offsets,
-        chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
-        _CHUNK_SIZE,
-    )
+    metadata = RaggedChunkMetadata.from_offsets(cu_seqlens, chunk_offsets, q.shape[1], _CHUNK_SIZE)
     return _chunk_kda_fwd(
         q,
         k,
@@ -443,12 +438,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         has_initial_state,
         cu_seqlens,
     )
-    metadata = RaggedChunkMetadata(
-        cu_seqlens,
-        chunk_offsets,
-        chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
-        _CHUNK_SIZE,
-    )
+    metadata = RaggedChunkMetadata.from_offsets(cu_seqlens, chunk_offsets, q.shape[1], _CHUNK_SIZE)
     output, _state, _aqk, _akk = _chunk_kda_fwd(
         q,
         k,
@@ -486,11 +476,8 @@ def _prepare_chunk_kda_backward(
     metadata = None
     if cu_seqlens is not None:
         assert chunk_offsets is not None
-        metadata = RaggedChunkMetadata(
-            cu_seqlens,
-            chunk_offsets,
-            chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, _CHUNK_SIZE),
-            _CHUNK_SIZE,
+        metadata = RaggedChunkMetadata.from_offsets(
+            cu_seqlens, chunk_offsets, q.shape[1], _CHUNK_SIZE
         )
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)

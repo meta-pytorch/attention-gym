@@ -44,7 +44,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, chunk_capacity
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
 
@@ -536,12 +536,7 @@ def resolve_backward_metadata(
         assert chunk_offsets is None
         return None
     assert chunk_offsets is not None
-    return RaggedChunkMetadata(
-        cu_seqlens,
-        chunk_offsets,
-        chunk_capacity(q.shape[1], cu_seqlens.shape[0] - 1, 64),
-        64,
-    )
+    return RaggedChunkMetadata.from_offsets(cu_seqlens, chunk_offsets, q.shape[1], 64)
 
 
 def _gdn_chunk_bwd_cuda(
