@@ -7,6 +7,7 @@ the CP world size, plus ideal-scaling references.
 
     python benchmarks/kda_cp_scaling_report.py ~/.mast_play/results/*/data/kda_cp_scaling_*.json
     python benchmarks/kda_cp_scaling_report.py results/*.json --csv scaling.csv
+    python benchmarks/kda_cp_scaling_report.py results/*.json --plot scaling.png
 """
 
 from __future__ import annotations
@@ -22,6 +23,12 @@ import typer
 def main(
     files: Annotated[list[Path], typer.Argument(help="kda_cp_scaling_*.json files.")],
     csv_path: Annotated[Path | None, typer.Option("--csv", help="Also write rows as CSV.")] = None,
+    plot_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--plot", help="Write step time, throughput, and memory vs world size (matplotlib)."
+        ),
+    ] = None,
 ) -> None:
     rows = [json.loads(path.read_text()) for path in files]
     rows.sort(key=lambda row: (row["tokens"], row["mode"], row["world_size"]))
@@ -65,6 +72,78 @@ def main(
             writer.writeheader()
             writer.writerows(rows)
         print(f"wrote {csv_path}")
+    if plot_path:
+        _plot(rows, plot_path)
+        print(f"wrote {plot_path}")
+
+
+def _plot(rows: list[dict], path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    styles = {"eager": "o-", "cuda_graph": "s--"}
+    for (tokens, mode), group in _grouped(rows):
+        worlds = [row["world_size"] for row in group]
+        label = f"{mode} · {tokens / 2**20:g}M tokens"
+        axes[0].plot(
+            worlds, [row["step_ms_mean"] for row in group], styles.get(mode, "o-"), label=label
+        )
+        axes[1].plot(
+            worlds,
+            [row["tokens_per_s"] / 1e6 for row in group],
+            styles.get(mode, "o-"),
+            label=label,
+        )
+        memory_key = "reserved_gib_max" if mode == "cuda_graph" else "peak_gib_max"
+        axes[2].plot(
+            worlds,
+            [row[memory_key] for row in group],
+            styles.get(mode, "o-"),
+            label=f"{label} ({'reserved' if mode == 'cuda_graph' else 'peak allocated'})",
+        )
+        if mode == "eager":
+            base = group[0]
+            axes[0].plot(
+                worlds,
+                [base["step_ms_mean"] * base["world_size"] / world for world in worlds],
+                ":",
+                color="gray",
+                label="ideal (1/W)" if tokens == rows[0]["tokens"] else None,
+            )
+            axes[2].plot(
+                worlds,
+                [base["peak_gib_max"] * base["world_size"] / world for world in worlds],
+                ":",
+                color="gray",
+                label="ideal (1/W)" if tokens == rows[0]["tokens"] else None,
+            )
+    for axis, title, ylabel in (
+        (axes[0], "Step time (fwd+bwd, slowest rank)", "ms"),
+        (axes[1], "Throughput", "Mtok/s"),
+        (axes[2], "Per-rank GPU memory", "GiB"),
+    ):
+        axis.set_title(title)
+        axis.set_xlabel("CP world size W (GPUs)")
+        axis.set_ylabel(ylabel)
+        axis.set_xscale("log", base=2)
+        axis.set_xticks(sorted({row["world_size"] for row in rows}))
+        axis.set_xticklabels([str(world) for world in sorted({row["world_size"] for row in rows})])
+        axis.grid(True, which="both", alpha=0.3)
+    axes[0].set_yscale("log", base=2)
+    axes[2].set_yscale("log", base=2)
+    axes[0].legend(fontsize=8)
+    axes[2].legend(fontsize=7)
+    first = rows[0]
+    fig.suptitle(
+        f"KDA context parallel: hidden {first['hidden_size']}, {first['heads']}×{first['head_dim']} heads, "
+        f"{first['device_name']}",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
 
 
 def _grouped(rows: list[dict]) -> list[tuple[tuple[int, str], list[dict]]]:
