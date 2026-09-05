@@ -494,42 +494,25 @@ class _ChunkGDN(torch.autograd.Function):
         ) = ctx.saved_tensors
         if d_output is None:
             d_output = torch.zeros_like(v)
-        if torch.compiler.is_compiling():
-            args = (
-                q,
-                k,
-                v,
-                cumulative_gate,
-                beta,
-                inverse,
-                d_output,
-                d_final_state,
-                initial_state,
-                cu_seqlens,
-                chunk_offsets,
-                ctx.scale,
-            )
-            if initial_state is not None:
-                dq, dk, dv, d_gate, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
-            else:
-                dq, dk, dv, d_gate, db = chunk_bwd_op(*args)
-                d_initial_state = None
+        args = (
+            q,
+            k,
+            v,
+            cumulative_gate,
+            beta,
+            inverse,
+            d_output,
+            d_final_state,
+            initial_state,
+            cu_seqlens,
+            chunk_offsets,
+            ctx.scale,
+        )
+        if initial_state is not None:
+            dq, dk, dv, d_gate, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
         else:
-            backend = _chunk_backend()
-            metadata = backend.resolve_backward_metadata(q, cu_seqlens, chunk_offsets)
-            dq, dk, dv, d_gate, db, d_initial_state = backend.chunk_gdn_bwd(
-                q,
-                k,
-                v,
-                cumulative_gate,
-                beta,
-                inverse,
-                d_output,
-                d_final_state,
-                initial_state,
-                metadata,
-                ctx.scale,
-            )
+            dq, dk, dv, d_gate, db = chunk_bwd_op(*args)
+            d_initial_state = None
         return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
 
 
