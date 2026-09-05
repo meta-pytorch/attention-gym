@@ -1,8 +1,11 @@
-"""Two-GPU NCCL check of the public context-parallel recipe against the unsharded ops.
+"""Check the public context-parallel recipe against the unsharded ops.
 
 The single-GPU stages tests drive ``prepare``/``run`` and the fold helpers directly; this test
 runs ``context_parallel_kda``/``context_parallel_gdn`` themselves, so the autograd Function, the
 all-gather, and the ``d_final_state=None`` backward path are exercised end to end.
+Numerical tests use NCCL on two GPUs or CPU Gloo between two processes sharing one GPU.
+Only the test transport changes; rank inputs, public ops, and numerical oracles stay the same.
+CUDA Graph replay remains NCCL-only: CPU staging cannot validate NCCL capture semantics.
 """
 
 from __future__ import annotations
@@ -13,25 +16,31 @@ import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import partial
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.distributed._functional_collectives import all_gather_single
 
 pytest.importorskip("cutlass")
 
+import attn_gym.linear.context_parallel as cp_impl
 from attn_gym.linear.context_parallel import ContextParallelPlan, context_parallel_conv_history
 from attn_gym.linear.gdn import chunk_gdn, context_parallel_gdn
 from attn_gym.linear.kda import chunk_kda, context_parallel_kda
 from attn_gym.testing.kda import assert_relative_rms_within
 
-# Every case spawns two ranks that pin cuda:0 and cuda:1, so xdist must not run them concurrently.
+# Both transports use fixed visible devices, so xdist must not run these cases concurrently.
 pytestmark = [
     pytest.mark.skipif(
-        torch.cuda.device_count() < 2
-        or any(torch.cuda.get_device_capability(i) < (8, 0) for i in range(2)),
-        reason="needs two CUDA devices of capability 8.0 or newer",
+        not torch.cuda.is_available()
+        or any(
+            torch.cuda.get_device_capability(i) < (8, 0)
+            for i in range(min(2, torch.cuda.device_count()))
+        ),
+        reason="needs a CUDA device of capability 8.0 or newer",
     ),
     pytest.mark.xdist_group("two-gpu"),
 ]
@@ -58,14 +67,42 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _cpu_gather_slots(local_slots: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather distinct rank summaries on CPU; Gloo needs flat rather than stacked outputs."""
+    gathered = local_slots.new_empty((group.size(), *local_slots.shape), device="cpu")
+    dist.all_gather_single(gathered.flatten(), local_slots.cpu().flatten(), group=group)
+    return gathered.to(local_slots.device)
+
+
+def _cpu_all_gather(
+    tensor: torch.Tensor, gather_dim: int, group: dist.ProcessGroup
+) -> torch.Tensor:
+    """Keep halo gradients connected through the CPU collective and both device copies."""
+    return all_gather_single(tensor.cpu(), gather_dim=gather_dim, group=group).to(tensor.device)
+
+
 @contextmanager
 def _process_group(cp_rank: int, world: int, port: int) -> Iterator[torch.device]:
-    device = torch.device("cuda", cp_rank)
+    """Use NCCL with distinct GPUs, or CPU collectives when the ranks share one GPU."""
+    shared_gpu = torch.cuda.device_count() == 1
+    device = torch.device("cuda", 0 if shared_gpu else cp_rank)
     torch.cuda.set_device(device)
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    dist.init_process_group("nccl", rank=cp_rank, world_size=world, device_id=device)
+    dist.init_process_group(
+        "gloo" if shared_gpu else "nccl",
+        rank=cp_rank,
+        world_size=world,
+        device_id=None if shared_gpu else device,
+    )
     try:
-        yield device
+        if shared_gpu:
+            with (
+                patch.object(cp_impl, "_all_gather_slots", _cpu_gather_slots),
+                patch.object(cp_impl, "all_gather_single", _cpu_all_gather),
+            ):
+                yield device
+        else:
+            yield device
     finally:
         dist.destroy_process_group()
 
@@ -157,6 +194,23 @@ def _rank_main(
         _assert_matches_unsharded(
             plan, ids, (local_output, grads, exit_states), (output, expected_grads, final)
         )
+
+        # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
+        qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)
+        d_histories = torch.randn(
+            2, MAX_SUBSEQUENCES, CONV_HISTORY, CHANNELS, device=device, generator=generator
+        )
+        local_qkv = qkv[:, ids].clone().requires_grad_()
+        routing = plan.routing(
+            device, max_subsequences=MAX_SUBSEQUENCES, conv_history=CONV_HISTORY
+        )
+        history = context_parallel_conv_history(local_qkv, routing, dist.group.WORLD)
+        (d_qkv,) = torch.autograd.grad(history, local_qkv, grad_outputs=d_histories[cp_rank])
+        expected_history, expected_d_qkv = _conv_history_oracle(
+            cu_seqlens, fragments, cp_rank, qkv, d_histories
+        )
+        torch.testing.assert_close(history, expected_history)
+        torch.testing.assert_close(d_qkv, expected_d_qkv[:, ids])
 
 
 @pytest.mark.parametrize("op_name", list(OPS))
@@ -303,6 +357,7 @@ def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
             graph.reset()
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="NCCL graph replay needs two GPUs")
 @pytest.mark.parametrize("op_name", list(OPS))
 def test_one_captured_graph_replays_across_document_layouts(op_name):
     mp.spawn(_replay_main, args=(2, _free_port(), op_name), nprocs=2, join=True)
