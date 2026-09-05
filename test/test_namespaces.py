@@ -4,7 +4,15 @@ import sys
 import attn_gym
 import attn_gym.linear
 import attn_gym.sparse
-from attn_gym.linear import Impl, chunk_gdn, paged_chunk_gdn, recurrent_gdn
+from attn_gym.linear import (
+    GateTransform,
+    Impl,
+    chunk_gdn,
+    gate_transform,
+    paged_chunk_gdn,
+    recurrent_gdn,
+)
+from attn_gym.linear._delta_rule.decode import GateTransform as DecodeGateTransform
 from attn_gym.linear.kda.api import Impl as KDAImpl
 from attn_gym.linear.types import Impl as SharedImpl
 from attn_gym.masks import (
@@ -27,6 +35,13 @@ def test_attention_namespaces_are_exported():
 def test_linear_impl_uses_shared_owner():
     assert Impl is SharedImpl
     assert KDAImpl is SharedImpl
+
+
+def test_gate_transform_is_shared_with_decode():
+    """The standalone op and the in-kernel decode transform use one public enum."""
+    assert callable(gate_transform)
+    assert GateTransform is DecodeGateTransform
+    assert {"gate_transform", "GateTransform"} <= set(attn_gym.linear.__all__)
 
 
 def test_gdn_operations_are_exported():

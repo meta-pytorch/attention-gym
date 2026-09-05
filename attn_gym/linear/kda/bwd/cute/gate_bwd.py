@@ -4,7 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""TMA CuTeDSL backward for the Kimi bounded-gate transform.
+"""TMA CuTeDSL backward for the bounded and softplus gate transforms.
+
+The softplus specialization (``gate = -a * softplus(z)``) shares the pipeline and differs only in
+the per-element math: ``d_raw = d_gate * (-a) * sigmoid(z)`` and ``dA_log = sum(d_gate * gate)``.
+The bounded transform is documented below.
 
 For raw projection output ``r``, per-head parameter ``A_log``, per-channel bias ``b``,
 and nonpositive lower bound ``L``, the model produces per-token natural-log decay as::
@@ -50,7 +54,12 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda.fwd.cute.gate_fwd import _BOUND_GATE_DTYPES, _BoundGateDType
+from attn_gym.linear.kda.fwd.cute.gate_fwd import (
+    _BOUND_GATE_DTYPES,
+    _BoundGateDType,
+    softplus_terms,
+)
+from attn_gym.linear.types import GateTransform
 from attn_gym.utils import ceildiv
 
 _TILE_TOKENS = 32
@@ -62,8 +71,8 @@ class _WarpRole(IntEnum):
     TMA_PRODUCER = 0
 
 
-class _BoundedGateBwdTmaOp:
-    """TMA-staged bounded-gate backward without a sequence scan."""
+class _GateTransformBwdTmaOp:
+    """TMA-staged gate-transform backward without a sequence scan."""
 
     def __init__(
         self,
@@ -73,13 +82,15 @@ class _BoundedGateBwdTmaOp:
         lower_bound: float,
         fastmath: bool,
         flatten_batch: bool,
-        use_int64_offsets: bool = False,
+        use_int64_offsets: bool,
+        transform: GateTransform,
     ):
         self.dtype = dtype
         self.heads = heads
         self.head_dim = head_dim
         self.chunk_size = _TILE_TOKENS
         self.lower_bound = lower_bound
+        self.transform = transform
         self.fastmath = fastmath
         self.flatten_batch = flatten_batch
         self.use_int64_offsets = use_int64_offsets
@@ -93,7 +104,7 @@ class _BoundedGateBwdTmaOp:
         """Return a stable profiler and artifact name for this specialization."""
         lower_bound = self.lower_bound.hex().replace("-", "m").replace("+", "p").replace(".", "_")
         return (
-            f"kda_bound_gate_bwd_{self.dtype.name}_h{self.heads}_d{self.head_dim}"
+            f"kda_{self.transform.value}_gate_bwd_{self.dtype.name}_h{self.heads}_d{self.head_dim}"
             f"_bt{self.chunk_size}"
             f"_lb{lower_bound}_tma_tps{self.tokens_per_stage}_s{self.stages}"
             f"_fb{int(self.flatten_batch)}_fm{int(self.fastmath)}"
@@ -267,12 +278,24 @@ class _BoundedGateBwdTmaOp:
                 local_token = subtile * self.tokens_per_stage + slot
                 if Int32(local_token) < valid:
                     z = sG[slot, tidx, stage].to(Float32) + dt_bias
-                    sigmoid = Float32(1.0) / (
-                        Float32(1.0) + cute.math.exp(-(gate_scale * z), fastmath=self.fastmath)
-                    )
-                    sigmoid_derivative = sigmoid + (-sigmoid) * sigmoid
-                    dg = sD[slot, tidx, stage] * (gradient_scale * sigmoid_derivative)
-                    dA_log = dA_log + dg * z
+                    if cutlass.const_expr(self.transform is GateTransform.SOFTPLUS):
+                        e, softplus = softplus_terms(z, self.fastmath)
+                        # sigmoid(z) from the same exponential: 1/(1+e) for z >= 0, else e/(1+e);
+                        # the product form keeps tiny gradients that 1 - 1/(1+e) would cancel.
+                        sigmoid = cute.math.rcp(Float32(1.0) + e, fastmath=self.fastmath)
+                        if z < Float32(0.0):
+                            sigmoid = e * sigmoid
+                        d_out = sD[slot, tidx, stage]
+                        dg = d_out * (-gate_scale * sigmoid)
+                        # d gate / d A_log is the gate itself.
+                        dA_log = dA_log + d_out * (-gate_scale * softplus)
+                    else:
+                        sigmoid = Float32(1.0) / (
+                            Float32(1.0) + cute.math.exp(-(gate_scale * z), fastmath=self.fastmath)
+                        )
+                        sigmoid_derivative = sigmoid + (-sigmoid) * sigmoid
+                        dg = sD[slot, tidx, stage] * (gradient_scale * sigmoid_derivative)
+                        dA_log = dA_log + dg * z
                     d_dt_bias = d_dt_bias + dg
                     mDg[batch, tile_start + Int64(local_token), head, tidx] = dg.to(
                         self.dtype.cute_type
@@ -363,17 +386,18 @@ class _BoundedGateBwdTmaOp:
 
 
 @jit_cache
-def _compile_bounded_gate_bwd(
+def _compile_gate_transform_bwd(
     dtype: _BoundGateDType,
     heads: int,
     head_dim: int,
     lower_bound: float,
     fastmath: bool,
     flatten_batch: bool,
-    use_int64_offsets: bool = False,
+    use_int64_offsets: bool,
+    transform: GateTransform,
 ):
     """Compile one fake-tensor TVM-FFI specialization."""
-    op = _BoundedGateBwdTmaOp(
+    op = _GateTransformBwdTmaOp(
         dtype,
         heads,
         head_dim,
@@ -381,6 +405,7 @@ def _compile_bounded_gate_bwd(
         fastmath,
         flatten_batch,
         use_int64_offsets=use_int64_offsets,
+        transform=transform,
     )
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (9, 0):
@@ -450,13 +475,14 @@ def _compile_bounded_gate_bwd(
     )
 
 
-def _bound_gate_bwd_cuda(
+def _gate_transform_bwd_cuda(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     d_gate: torch.Tensor,
     lower_bound: float,
     fastmath: bool,
+    transform: GateTransform,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Keep compilation and the CuTeDSL launcher behind an opaque operator."""
     if not tensor_supports_tma(raw_gate):
@@ -477,14 +503,14 @@ def _bound_gate_bwd_cuda(
     dtype = _BOUND_GATE_DTYPES.get(raw_gate.dtype)
     if dtype is None:
         raise TypeError(f"unsupported raw_gate dtype: {raw_gate.dtype}")
-    compiled = _compile_bounded_gate_bwd(
+    compiled = _compile_gate_transform_bwd(
         dtype,
         raw_gate.shape[2],
         raw_gate.shape[3],
         lower_bound,
         fastmath,
         raw_gate.shape[0] > 65535,
-        use_int64_offsets=requires_int64_abi(
+        requires_int64_abi(
             raw_gate,
             A_log,
             dt_bias,
@@ -493,6 +519,7 @@ def _bound_gate_bwd_cuda(
             dA_log_partial,
             d_dt_bias_partial,
         ),
+        transform,
     )
     compiled(
         raw_gate,
@@ -503,5 +530,6 @@ def _bound_gate_bwd_cuda(
         dA_log_partial,
         d_dt_bias_partial,
     )
-    # Reducing the per-chunk partials keeps the post-pass off the full [B, T, H, D] tensors.
-    return d_raw_gate, dA_log_partial, d_dt_bias_partial.sum((0, 1))
+    # Reducing the per-tile partials here keeps the post-pass off the full [B, T, H, D] tensors
+    # and gives every fused gate backend one reduced parameter-gradient contract.
+    return d_raw_gate, dA_log_partial.sum((0, 1)), d_dt_bias_partial.sum((0, 1))

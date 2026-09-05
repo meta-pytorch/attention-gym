@@ -11,15 +11,12 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
 from attn_gym.linear.kda import bound_gate, chunk_kda
 from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
-from attn_gym.linear.kda.ops import (
-    _bound_gate_bwd_op,
-    _bound_gate_fwd_op,
-    _plain_gate_scan_op,
-)
+from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA gate ops require CUDA")
@@ -253,13 +250,13 @@ def test_bound_gate_operator_registration():
     d_gate = torch.randn(shape, device="cuda")
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(
-        _bound_gate_fwd_op,
-        (raw_gate, a_log, dt_bias, -5.0, False),
+        _gate_transform_fwd_op,
+        (raw_gate, a_log, dt_bias, "bounded", -5.0, False),
         test_utils=utilities,
     )
     torch.library.opcheck(
-        _bound_gate_bwd_op,
-        (raw_gate, a_log, dt_bias, d_gate, -5.0, False),
+        _gate_transform_bwd_op,
+        (raw_gate, a_log, dt_bias, d_gate, "bounded", -5.0, False),
         test_utils=utilities,
     )
 

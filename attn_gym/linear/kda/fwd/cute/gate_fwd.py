@@ -4,7 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Direct-vector CuTeDSL forward for the Kimi bounded-gate transform.
+"""Direct-vector CuTeDSL forward for the bounded and softplus gate transforms.
+
+The transform kind is a compile-time specialization: ``lower_bound * sigmoid(a * z)`` (Kimi/KDA)
+or ``-a * softplus(z)`` (Mamba2/GDN) with ``z = raw + dt_bias`` and ``a = exp(A_log)``. Softplus
+uses the overflow-free form ``max(z, 0) + log1p(exp(-|z|))``; see NOTE [Fastmath Softplus] in
+``attn_gym/linear/_delta_rule/triton/softplus_gate.py`` for the fastmath accuracy contract.
 
 Each CTA owns eight heads of one physical token. The 128-thread/8-value thread-value map
 is::
@@ -24,6 +29,7 @@ Only an input whose last mode is noncontiguous is materialized into a supported 
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cutlass
@@ -39,6 +45,8 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.types import GateTransform
 from attn_gym.utils import ceildiv
 
 _HEAD_DIM = 128
@@ -46,6 +54,7 @@ _HEADS_PER_BLOCK = 8
 _THREADS = 128
 _VALUES_PER_THREAD = 8
 _ALIGNMENT = 16
+_LN_2 = math.log(2.0)
 
 
 @dataclass(frozen=True)
@@ -63,8 +72,31 @@ _BOUND_GATE_DTYPES = {
 }
 
 
-class _BoundGateForward:
-    """Apply one bounded-gate specialization with direct vector loads and stores."""
+@cute.jit
+def softplus_terms(z, fastmath: cutlass.Constexpr[bool]):
+    """Return ``(e, softplus(z))`` with ``e = exp(-|z|)`` for scalars or vectors.
+
+    The overflow-free form ``softplus(z) = max(z, 0) + log(1 + e)`` shares its one bounded
+    exponential with ``sigmoid(|z|) = 1 / (1 + e)``, which the backward needs as well.
+    fastmath trades the accurate ``log1p`` for the MUFU ``ex2``/``lg2`` intrinsics.
+    """
+    magnitude = cute.math.abs(z)
+    if cutlass.const_expr(fastmath):
+        e = cute.math.exp2(-magnitude * Float32(LOG2_E), fastmath=True)
+        tail = cute.math.log2(Float32(1.0) + e, fastmath=True) * Float32(_LN_2)
+    else:
+        e = cute.math.exp(-magnitude)
+        tail = cute.math.log1p(e)
+    # cute.math.max needs operands of one kind: a TensorSSA zero for vectors, a scalar otherwise.
+    if cutlass.const_expr(isinstance(z, cute.TensorSSA)):
+        positive = cute.math.max(z, cute.zeros_like(z))
+    else:
+        positive = cute.math.max(z, Float32(0.0))
+    return e, positive + tail
+
+
+class _GateTransformForward:
+    """Apply one gate-transform specialization with direct vector loads and stores."""
 
     def __init__(
         self,
@@ -75,11 +107,13 @@ class _BoundGateForward:
         compact_layout: bool,
         flatten_batch: bool,
         use_int64_offsets: bool,
+        transform: GateTransform,
     ) -> None:
         self.dtype = dtype
         self.heads = heads
         self.head_groups = ceildiv(heads, _HEADS_PER_BLOCK)
         self.lower_bound = lower_bound
+        self.transform = transform
         self.fastmath = fastmath
         self.compact_layout = compact_layout
         self.flatten_batch = flatten_batch
@@ -89,7 +123,7 @@ class _BoundGateForward:
         """Return a stable profiler name for this specialization."""
         lower_bound = self.lower_bound.hex().replace("-", "m").replace("+", "p").replace(".", "_")
         return (
-            f"kda_bound_gate_fwd_{self.dtype.name}_h{self.heads}_d{_HEAD_DIM}"
+            f"kda_{self.transform.value}_gate_fwd_{self.dtype.name}_h{self.heads}_d{_HEAD_DIM}"
             f"_v{_VALUES_PER_THREAD}"
             f"_lb{lower_bound}_c{int(self.compact_layout)}_fb{int(self.flatten_batch)}"
             f"_fm{int(self.fastmath)}_i64{int(self.use_int64_offsets)}"
@@ -135,10 +169,15 @@ class _BoundGateForward:
             raw = raw_vector.load().to(Float32)
             bias = bias_vector.load()
             amplitude = cute.math.exp(A_log[head].to(Float32), fastmath=self.fastmath)
-            sigmoid = Float32(1.0) / (
-                Float32(1.0) + cute.math.exp(-(amplitude * (raw + bias)), fastmath=self.fastmath)
-            )
-            gate_vector.store(Float32(self.lower_bound) * sigmoid)
+            if cutlass.const_expr(self.transform is GateTransform.SOFTPLUS):
+                _, softplus = softplus_terms(raw + bias, self.fastmath)
+                gate_vector.store(-amplitude * softplus)
+            else:
+                sigmoid = Float32(1.0) / (
+                    Float32(1.0)
+                    + cute.math.exp(-(amplitude * (raw + bias)), fastmath=self.fastmath)
+                )
+                gate_vector.store(Float32(self.lower_bound) * sigmoid)
 
     @cute.jit
     def __call__(
@@ -171,7 +210,7 @@ def _fake_compact(dtype: type[cutlass.Numeric], shape: tuple[object, ...]):
 
 
 @jit_cache
-def _compile_bound_gate_fwd(
+def _compile_gate_transform_fwd(
     dtype: _BoundGateDType,
     heads: int,
     lower_bound: float,
@@ -179,12 +218,13 @@ def _compile_bound_gate_fwd(
     compact_layout: bool,
     flatten_batch: bool,
     use_int64_offsets: bool,
+    transform: GateTransform,
 ):
     """Compile one dynamic-batch/token TVM-FFI specialization."""
     target = get_compile_target()
     if target.device_type != "cuda" or target.capability is None or target.capability < (9, 0):
-        raise ValueError(f"bound_gate requires CUDA capability >= 9.0; got target={target}")
-    op = _BoundGateForward(
+        raise ValueError(f"gate_transform requires CUDA capability >= 9.0; got target={target}")
+    op = _GateTransformForward(
         dtype,
         heads,
         lower_bound,
@@ -192,6 +232,7 @@ def _compile_bound_gate_fwd(
         compact_layout,
         flatten_batch,
         use_int64_offsets,
+        transform,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     batch = sym_int()
@@ -226,12 +267,13 @@ def _compile_bound_gate_fwd(
     )
 
 
-def _bound_gate_fwd_cuda(
+def _gate_transform_fwd_cuda(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     lower_bound: float,
     fastmath: bool,
+    transform: GateTransform,
 ) -> torch.Tensor:
     """Normalize vector alignment and launch the CuTeDSL forward."""
     dtype = _BOUND_GATE_DTYPES.get(raw_gate.dtype)
@@ -254,7 +296,7 @@ def _bound_gate_fwd_cuda(
         for tensor in inputs
     )
     gate = torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
-    compiled = _compile_bound_gate_fwd(
+    compiled = _compile_gate_transform_fwd(
         dtype,
         raw_gate.shape[2],
         lower_bound,
@@ -262,6 +304,7 @@ def _bound_gate_fwd_cuda(
         compact_layout,
         raw_gate.shape[0] > 65535,
         requires_int64_abi(raw_gate, A_log, dt_bias, gate),
+        transform,
     )
     compiled(raw_gate, A_log, dt_bias, gate)
     return gate
