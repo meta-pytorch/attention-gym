@@ -1,7 +1,7 @@
 """Tabulate KDA context-parallel scaling runs.
 
 Reads the ``kda_cp_scaling_*.json`` files written by
-``examples/kda_context_parallel.py --benchmark-steps N`` (one per world size and
+``examples/delta_rule_context_parallel.py --benchmark-steps N`` (one per world size and
 mode) and prints a table of step time, throughput, and per-rank memory against
 the CP world size, plus ideal-scaling references.
 

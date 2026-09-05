@@ -1,15 +1,16 @@
-"""Train a complete packed KDA attention module with context parallelism.
+"""Train a complete packed delta-rule attention module (KDA or GDN) with context parallelism.
 
-This reuses the transformer-style module from ``kda_training.py`` and distributes both stateful
+This reuses the transformer-style module from ``delta_rule_training.py`` and distributes both stateful
 operations through the reference recipe in ``attn_gym.linear.context_parallel``: a halo
-exchange supplies the short convolution's finite history, and the KDA recurrence's initial state
+exchange supplies the short convolution's finite history, and the delta-rule recurrence's initial state
 is composed from the affine summaries of the ranks that hold the preceding tokens. Each rank owns a list of fragments (global token ranges) chosen
 here in plain Python (``fragments``), so the same code validates contiguous shards and zig-zag load
 balancing; see NOTE [Terminology] in ``attn_gym.linear.context_parallel``. Launch with:
 
-    torchrun --standalone --nproc-per-node=2 examples/kda_context_parallel.py
+    torchrun --standalone --nproc-per-node=2 examples/delta_rule_context_parallel.py
 
-Add ``--partition zigzag`` to give each rank two mirrored blocks, ``--compute-dtype=float16``
+Add ``--variant gdn`` to run the Gated DeltaNet recipe instead of KDA, ``--partition zigzag`` to
+give each rank two mirrored blocks, ``--compute-dtype=float16``
 to validate the FP16 route, ``--kda-backend mega`` to run each local pass with the Mega backend
 (SM100/SM103), ``--cuda-graph`` to capture forward and backward together and validate a replay
 with changed inputs, ``--profile`` to export a merged native Perfetto trace using
@@ -40,10 +41,16 @@ from attn_gym.linear.context_parallel import (
     ContextParallelRouting,
     context_parallel_conv_history,
 )
+from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
 from attn_gym.linear.kda.context_parallel import context_parallel_kda
 from attn_gym.linear.types import KernelOptions
 from attn_gym.testing import kernel_stage, record_distributed_profile
-from examples.kda_training import ComputeDTypeOption, KDAAttention, KDAAttentionOutput
+from examples.delta_rule_training import (
+    ComputeDTypeOption,
+    DeltaRuleAttention,
+    DeltaRuleAttentionOutput,
+    VariantOption,
+)
 
 
 class PartitionOption(str, Enum):
@@ -98,8 +105,8 @@ class PackedTrainingBatch:
     loss_scale: float
 
 
-class ContextParallelKDAAttention(KDAAttention):
-    """The training example's complete KDA module with distributed state plumbing."""
+class ContextParallelDeltaRuleAttention(DeltaRuleAttention):
+    """The training example's complete delta-rule module with distributed state plumbing."""
 
     def __init__(
         self,
@@ -118,8 +125,8 @@ class ContextParallelKDAAttention(KDAAttention):
         *,
         routing: ContextParallelRouting,
         return_final_state: bool = False,
-    ) -> KDAAttentionOutput:
-        """Apply packed KDA using this batch's routing for both distributed state exchanges.
+    ) -> DeltaRuleAttentionOutput:
+        """Apply the packed delta rule using this batch's routing for both distributed state exchanges.
 
         Routing covers every local token; recurrent and convolution entry states are
         constructed from the other ranks, not supplied by the caller.
@@ -171,7 +178,7 @@ class ContextParallelKDAAttention(KDAAttention):
             return_final_state=return_final_state,
         )
 
-    def kda_core(
+    def delta_rule_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -184,24 +191,29 @@ class ContextParallelKDAAttention(KDAAttention):
         return_final_state: bool,
         routing: ContextParallelRouting,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        assert initial_state is None, "context parallelism constructs the recurrent state"
-        del cu_seqlens  # routing.cu_seqlens is the same tensor
-        output, final_state = context_parallel_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            routing=routing,
-            group=self.cp_group,
-            fastmath=self.fastmath,
-            kernel_options=self.kernel_options,
-        )
+        # cu_seqlens is routing.cu_seqlens; context parallelism constructs the recurrent state.
+        assert initial_state is None
+        if self.variant == "kda":
+            output, final_state = context_parallel_kda(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                routing=routing,
+                group=self.cp_group,
+                fastmath=self.fastmath,
+                kernel_options=self.kernel_options,
+            )
+        else:
+            output, final_state = context_parallel_gdn(
+                q, k, v, gate, beta, routing=routing, group=self.cp_group
+            )
         return output, final_state if return_final_state else None
 
 
 def run_training_step(
-    module: ContextParallelKDAAttention,
+    module: ContextParallelDeltaRuleAttention,
     hidden_states: torch.Tensor,
     target: torch.Tensor,
     routing: ContextParallelRouting,
@@ -209,7 +221,7 @@ def run_training_step(
     loss_scale: float,
     *,
     annotate: bool = False,
-) -> tuple[KDAAttentionOutput, tuple[torch.Tensor, ...]]:
+) -> tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]]:
     """Run the complete module and differentiate its token and endpoint losses."""
     module.enable_graph_annotations = annotate
     result = module(
@@ -223,8 +235,8 @@ def run_training_step(
 
 
 def training_gradients(
-    module: KDAAttention,
-    result: KDAAttentionOutput,
+    module: DeltaRuleAttention,
+    result: DeltaRuleAttentionOutput,
     hidden_states: torch.Tensor,
     target: torch.Tensor,
     state_index: torch.Tensor,
@@ -245,8 +257,8 @@ def training_gradients(
 
 
 def validate_against_reference(
-    model: ContextParallelKDAAttention,
-    reference_model: KDAAttention,
+    model: ContextParallelDeltaRuleAttention,
+    reference_model: DeltaRuleAttention,
     batch: PackedTrainingBatch,
 ) -> None:
     """Compare one sharded full-module backward with the unsharded module."""
@@ -299,8 +311,8 @@ def validate_against_reference(
 
 
 def validate_cuda_graph(
-    make_model: Callable[[], ContextParallelKDAAttention],
-    eager_model: ContextParallelKDAAttention,
+    make_model: Callable[[], ContextParallelDeltaRuleAttention],
+    eager_model: ContextParallelDeltaRuleAttention,
     batch: PackedTrainingBatch,
     annotations: bool,
     profile_path: Path | None,
@@ -373,7 +385,7 @@ def validate_cuda_graph(
 
 
 def profile_eager_step(
-    model: ContextParallelKDAAttention,
+    model: ContextParallelDeltaRuleAttention,
     batch: PackedTrainingBatch,
     profile_path: Path,
     device: torch.device,
@@ -409,10 +421,10 @@ def profile_eager_step(
 
 
 def capture_training_graph(
-    make_model: Callable[[], ContextParallelKDAAttention],
-    eager_model: ContextParallelKDAAttention,
+    make_model: Callable[[], ContextParallelDeltaRuleAttention],
+    eager_model: ContextParallelDeltaRuleAttention,
     batch: PackedTrainingBatch,
-) -> tuple[torch.cuda.CUDAGraph, ContextParallelKDAAttention, torch.Tensor]:
+) -> tuple[torch.cuda.CUDAGraph, ContextParallelDeltaRuleAttention, torch.Tensor]:
     """Capture one full training step.
 
     Returns the graph with the model and static input it reads from; callers
@@ -454,8 +466,8 @@ def capture_training_graph(
 
 
 def run_benchmark(
-    make_model: Callable[[], ContextParallelKDAAttention],
-    model: ContextParallelKDAAttention,
+    make_model: Callable[[], ContextParallelDeltaRuleAttention],
+    model: ContextParallelDeltaRuleAttention,
     batch: PackedTrainingBatch,
     device: torch.device,
     *,
@@ -567,8 +579,12 @@ def main(
         PartitionOption,
         typer.Option(help="How ranks own fragments of the global stream."),
     ] = PartitionOption.CONTIGUOUS,
+    variant: Annotated[
+        VariantOption,
+        typer.Option(help="Run the KDA or GDN recipe."),
+    ] = VariantOption.KDA,
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 256,
-    heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 2,
+    heads: Annotated[int, typer.Option(min=1, help="Number of attention heads.")] = 2,
     compute_dtype: Annotated[
         ComputeDTypeOption,
         typer.Option(help="Use float16 or bfloat16 projection and kernel inputs."),
@@ -579,7 +595,7 @@ def main(
     ] = 4,
     kda_backend: Annotated[
         KDABackendOption,
-        typer.Option(help="Chunk backend for each rank's local KDA pass."),
+        typer.Option(help="Chunk backend for each rank's local KDA pass (KDA variant only)."),
     ] = KDABackendOption.FUSED,
     cuda_graph: Annotated[
         bool,
@@ -605,12 +621,14 @@ def main(
         int,
         typer.Option(
             min=0,
-            help="Timed steady-state steps after warmup; rank 0 writes data/kda_cp_scaling_*.json "
+            help="Timed steady-state steps after warmup; rank 0 writes data/<variant>_cp_scaling_*.json "
             "with step time, throughput, and per-rank memory (0 disables).",
         ),
     ] = 0,
 ) -> None:
-    """Run and validate the complete packed context-parallel KDA module."""
+    """Run and validate the complete packed context-parallel delta-rule module."""
+    if variant is VariantOption.GDN and kda_backend is not KDABackendOption.FUSED:
+        raise ValueError("--kda-backend selects the KDA core; the GDN variant uses fused")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -645,16 +663,17 @@ def main(
         "hidden_size": hidden_size,
         "num_heads": heads,
         "head_dim": 128,
+        "variant": variant.value,
         "short_conv_kernel_size": short_conv_kernel_size,
         "backend": "fused",
         "compute_dtype": getattr(torch, compute_dtype.value),
         "device": device,
     }
     make_model = partial(
-        ContextParallelKDAAttention,
+        ContextParallelDeltaRuleAttention,
         **model_options,
         group=dist.group.WORLD,
-        kernel_options={"backend": kda_backend.value},
+        kernel_options={"backend": kda_backend.value} if variant is VariantOption.KDA else None,
     )
     model = make_model()
 
@@ -697,7 +716,7 @@ def main(
     )
     del global_hidden, global_target, shard_ids
     if validate:
-        reference_model = KDAAttention(**model_options)
+        reference_model = DeltaRuleAttention(**model_options)
         reference_model.load_state_dict(model.state_dict())
         validate_against_reference(model, reference_model, batch)
         del reference_model
@@ -716,7 +735,7 @@ def main(
     profile_mode = "cuda_graph" if cuda_graph else "eager"
     profile_path = Path(
         "data",
-        f"kda_context_parallel_{profile_mode}_{partition.value}_{kda_backend.value}"
+        f"{variant.value}_context_parallel_{profile_mode}_{partition.value}_{kda_backend.value}"
         f"_{compute_dtype.value}_w{world_size}_t{tokens}_h{heads}_c{hidden_size}"
         f"_conv{short_conv_kernel_size}",
     ).resolve()
@@ -731,7 +750,7 @@ def main(
             cuda_graph=cuda_graph,
             output_path=Path(
                 "data",
-                f"kda_cp_scaling_{profile_mode}_{partition.value}_{kda_backend.value}"
+                f"{variant.value}_cp_scaling_{profile_mode}_{partition.value}_{kda_backend.value}"
                 f"_{compute_dtype.value}_w{world_size}_t{tokens}_h{heads}_c{hidden_size}.json",
             ).resolve(),
             config={
@@ -741,6 +760,7 @@ def main(
                 "hidden_size": hidden_size,
                 "heads": heads,
                 "head_dim": 128,
+                "variant": variant.value,
                 "compute_dtype": compute_dtype.value,
                 "short_conv_kernel_size": short_conv_kernel_size,
                 "kda_backend": kda_backend.value,
@@ -764,7 +784,7 @@ def main(
     mode = " with CUDA Graph replay" if cuda_graph else ""
     status = "passed" if validate else "ran"
     print(
-        f"rank {cp_rank}: full packed KDA CP ({partition.value}, {kda_backend.value}) {status}{mode}",
+        f"rank {cp_rank}: full packed {variant.value.upper()} CP ({partition.value}, {kda_backend.value}) {status}{mode}",
         flush=True,
     )
     torch.cuda.synchronize(device)

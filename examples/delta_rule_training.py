@@ -1,7 +1,11 @@
-"""Train a small KDA attention module on one device.
+"""Train a small delta-rule attention module (KDA or GDN) on one device.
 
-This is a small `example` KDA attention module. The goal is to show how one might use the primitives(kernels)
-we have in attn_gym to build a performant KDA implementation. It roughly follows Kimi's architecture.
+This is a small `example` delta-rule attention module. The goal is to show how one might use the
+primitives(kernels) we have in attn_gym to build a performant implementation. The ``kda`` variant
+roughly follows Kimi's architecture; the ``gdn`` variant follows the Gated DeltaNet / Qwen3-Next
+recipe. They share the surrounding module stages and differ in the gate and the core: KDA learns a
+bounded per-channel decay (``bound_gate`` on ``[B, T, H, D]``) and runs ``chunk_kda``; GDN learns one
+softplus decay per head (``[B, T, H]``) and runs ``chunk_gdn``.
 There is a reason though that this is in examples/ and not the core package. We want to encourage people
 to own their own implementation and surrounding ops. Don't wont short convs then dont add em!
 
@@ -11,19 +15,23 @@ Like all good things the only thing this training run proves is that it can over
 
 Run a reference training step with::
 
-    python examples/kda_training.py --backend=reference
+    python examples/delta_rule_training.py --backend=reference
 
 On a Hopper or Blackwell GPU, exercise the fused backend with::
 
-    python examples/kda_training.py --backend=fused
+    python examples/delta_rule_training.py --backend=fused
+
+Train the GDN variant instead of KDA with::
+
+    python examples/delta_rule_training.py --variant=gdn --backend=fused
 
 Run the fused training loop in FP16 with::
 
-    python examples/kda_training.py --backend=fused --compute-dtype=float16
+    python examples/delta_rule_training.py --backend=fused --compute-dtype=float16
 
 Pack Zipf-distributed sequence lengths into one physical batch with::
 
-    python examples/kda_training.py --backend=fused --packed --batch-size=4 --tokens=256
+    python examples/delta_rule_training.py --backend=fused --packed --batch-size=4 --tokens=256
 
 In packed mode, ``batch-size`` is the number of logical sequences and ``tokens``
 is the longest sequence. Add ``--profile`` to export a backend- and shape-named
@@ -31,7 +39,7 @@ Chrome trace. The trace
 contains explicit ``forward`` and ``backward`` record-function ranges. Add
 ``--compile`` to compile the complete module with
 ``torch.compile(fullgraph=True)`` and fuse the PyTorch work around the custom
-KDA operator.
+delta-rule operator.
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ import torch.nn.functional as F
 import typer
 from torch import nn
 
+from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.kda import (
     MAX_GATE_LOWER_BOUND_MAGNITUDE,
     active_token_mask,
@@ -64,6 +73,14 @@ from attn_gym.linear.kda import (
 )
 
 Backend = Literal["reference", "fused"]
+Variant = Literal["kda", "gdn"]
+
+
+class VariantOption(str, Enum):
+    """Delta-rule recipes exposed by the command line."""
+
+    KDA = "kda"
+    GDN = "gdn"
 
 
 class BackendOption(str, Enum):
@@ -115,14 +132,14 @@ def mark_kernels(*args: Any, **kwargs: Any):
 
 
 def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Label one KDA stage during annotation-enabled CUDA Graph capture."""
+    """Label one stage during annotation-enabled CUDA Graph capture."""
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(function)
         def annotated(self: Any, *args: Any, **kwargs: Any) -> Any:
             if not self.enable_graph_annotations:
                 return function(self, *args, **kwargs)
-            with mark_kernels(name.format(backend=self.backend)):
+            with mark_kernels(name.format(variant=self.variant, backend=self.backend)):
                 return function(self, *args, **kwargs)
 
         return annotated
@@ -130,7 +147,7 @@ def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., 
     return decorate
 
 
-class KDAAttentionOutput(NamedTuple):
+class DeltaRuleAttentionOutput(NamedTuple):
     """Hidden states and optional recurrent and convolution states."""
 
     hidden_states: torch.Tensor
@@ -150,8 +167,12 @@ def packed_sequence_metadata(
     return lengths, (0, *accumulate(lengths))
 
 
-class KDAAttention(nn.Module):
-    """Minimal trainable KDA attention with a transformer-style module ABI.
+class DeltaRuleAttention(nn.Module):
+    """Minimal trainable delta-rule attention with a transformer-style module ABI.
+
+    ``variant="kda"`` learns a bounded per-channel log decay through ``f_a_proj``/``f_b_proj``
+    and ``bound_gate``; ``variant="gdn"`` learns one softplus log decay per head through
+    ``a_proj``. ``lower_bound`` and ``fastmath`` apply to the KDA gate and core only.
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
@@ -169,6 +190,7 @@ class KDAAttention(nn.Module):
         num_heads: int,
         head_dim: int,
         *,
+        variant: Variant = "kda",
         short_conv_kernel_size: int = 4,
         lower_bound: float = -5.0,
         backend: Backend = "reference",
@@ -188,18 +210,25 @@ class KDAAttention(nn.Module):
             )
         if backend not in ("reference", "fused"):
             raise ValueError(f"backend must be 'reference' or 'fused', got {backend!r}")
-        if not math.isfinite(lower_bound) or lower_bound > 0.0:
+        if variant not in ("kda", "gdn"):
+            raise ValueError(f"variant must be 'kda' or 'gdn', got {variant!r}")
+        if variant == "kda" and (not math.isfinite(lower_bound) or lower_bound > 0.0):
             raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
-        if backend == "fused" and lower_bound < -MAX_GATE_LOWER_BOUND_MAGNITUDE:
+        if (
+            variant == "kda"
+            and backend == "fused"
+            and lower_bound < -MAX_GATE_LOWER_BOUND_MAGNITUDE
+        ):
             raise ValueError(
                 f"the fused backend requires lower_bound >= "
                 f"{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, got {lower_bound}"
             )
         if backend == "fused" and head_dim != 128:
             raise ValueError("the fused backend requires head_dim=128")
-        if backend == "reference" and fastmath:
-            raise ValueError("fastmath applies only to backend='fused'")
+        if fastmath and (backend == "reference" or variant == "gdn"):
+            raise ValueError("fastmath applies only to variant='kda' with backend='fused'")
 
+        self.variant = variant
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -229,8 +258,13 @@ class KDAAttention(nn.Module):
             **factory_kwargs,
         )
         self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False, **factory_kwargs)
-        self.f_a_proj = nn.Linear(hidden_size, head_dim, bias=False, **factory_kwargs)
-        self.f_b_proj = nn.Linear(head_dim, projection_size, bias=False, **factory_kwargs)
+        if variant == "kda":
+            self.f_a_proj = nn.Linear(hidden_size, head_dim, bias=False, **factory_kwargs)
+            self.f_b_proj = nn.Linear(head_dim, projection_size, bias=False, **factory_kwargs)
+            dt_bias_shape = (num_heads, head_dim)
+        else:
+            self.a_proj = nn.Linear(hidden_size, num_heads, bias=False, **factory_kwargs)
+            dt_bias_shape = (num_heads,)
         self.g_a_proj = nn.Linear(hidden_size, head_dim, bias=False, **factory_kwargs)
         self.g_b_proj = nn.Linear(head_dim, projection_size, bias=False, **factory_kwargs)
         self.output_norm_weight = nn.Parameter(
@@ -238,9 +272,7 @@ class KDAAttention(nn.Module):
         )
         self.out_proj = nn.Linear(projection_size, hidden_size, bias=False, **factory_kwargs)
         self.A_log = nn.Parameter(torch.zeros(num_heads, device=device, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(
-            torch.zeros(num_heads, head_dim, device=device, dtype=torch.float32)
-        )
+        self.dt_bias = nn.Parameter(torch.zeros(dt_bias_shape, device=device, dtype=torch.float32))
 
     def forward(
         self,
@@ -250,8 +282,8 @@ class KDAAttention(nn.Module):
         initial_conv_state: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool = False,
-    ) -> KDAAttentionOutput:
-        """Apply KDA and optionally return recurrent and short-convolution states."""
+    ) -> DeltaRuleAttentionOutput:
+        """Apply the delta rule and optionally return recurrent and short-convolution states."""
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"hidden_states must have shape [B, T, {self.hidden_size}], "
@@ -287,10 +319,10 @@ class KDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         return_final_state: bool,
         **stage_kwargs: Any,
-    ) -> KDAAttentionOutput:
+    ) -> DeltaRuleAttentionOutput:
         """Run the validated stage pipeline shared by every ``forward`` variant.
 
-        ``stage_kwargs`` are forwarded to ``short_convolution`` and ``kda_core`` so a subclass
+        ``stage_kwargs`` are forwarded to ``short_convolution`` and ``delta_rule_core`` so a subclass
         can thread per-call context (for example context-parallel routing) through those two
         stateful stages without storing it on the module or re-spelling the pipeline.
         """
@@ -326,7 +358,7 @@ class KDAAttention(nn.Module):
         raw_gate = mask_inactive_token_gradients(raw_gate, active_mask)
         beta = mask_inactive_token_gradients(beta, active_mask)
         gate = self.gate_activation(raw_gate)
-        output, final_state = self.kda_core(
+        output, final_state = self.delta_rule_core(
             q,
             k,
             v,
@@ -337,26 +369,26 @@ class KDAAttention(nn.Module):
             return_final_state=return_final_state,
             **stage_kwargs,
         )
-        # KDA leaves its output suffix undefined; sanitize it before RMSNorm saves it.
+        # The core leaves its output suffix undefined; sanitize it before RMSNorm saves it.
         output = self.output_normalization(mask_inactive_tokens(output, active_mask))
         output_gate = self.output_gate(hidden_states_compute, output)
         output = self.output_projection(output, output_gate)
         # Keep arbitrary suffix cotangents out of every model parameter reduction.
         output = mask_inactive_token_gradients(output, active_mask)
 
-        return KDAAttentionOutput(
+        return DeltaRuleAttentionOutput(
             output.to(hidden_states.dtype),
             final_state,
             final_conv_state,
         )
 
-    @annotate_kernels("kda/qkv_projection")
+    @annotate_kernels("{variant}/qkv_projection")
     def qkv_projection(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.to(self.compute_dtype)
         qkv = F.linear(hidden_states, self.qkv_proj.weight.to(self.compute_dtype))
         return hidden_states, qkv
 
-    @annotate_kernels("kda/short_convolution")
+    @annotate_kernels("{variant}/short_convolution")
     def short_convolution(
         self,
         qkv: torch.Tensor,
@@ -400,7 +432,7 @@ class KDAAttention(nn.Module):
         final_state = conv_input[:, tokens:].clone() if return_final_state else None
         return qkv, final_state
 
-    @annotate_kernels("kda/qk_normalization")
+    @annotate_kernels("{variant}/qk_normalization")
     def qk_normalization(
         self,
         q: torch.Tensor,
@@ -415,17 +447,23 @@ class KDAAttention(nn.Module):
 
         return l2norm(q, cu_seqlens=cu_seqlens), l2norm(k, cu_seqlens=cu_seqlens)
 
-    @annotate_kernels("kda/gate_projections")
+    @annotate_kernels("{variant}/gate_projections")
     def gate_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, tokens, _ = hidden_states.shape
-        gate_features = F.linear(
-            hidden_states,
-            self.f_a_proj.weight.to(self.compute_dtype),
-        )
-        raw_gate = F.linear(
-            gate_features,
-            self.f_b_proj.weight.to(self.compute_dtype),
-        ).view(batch, tokens, self.num_heads, self.head_dim)
+        if self.variant == "kda":
+            gate_features = F.linear(
+                hidden_states,
+                self.f_a_proj.weight.to(self.compute_dtype),
+            )
+            raw_gate = F.linear(
+                gate_features,
+                self.f_b_proj.weight.to(self.compute_dtype),
+            ).view(batch, tokens, self.num_heads, self.head_dim)
+        else:
+            raw_gate = F.linear(
+                hidden_states,
+                self.a_proj.weight.to(self.compute_dtype),
+            ).view(batch, tokens, self.num_heads)
         beta = (
             F.linear(
                 hidden_states,
@@ -437,20 +475,24 @@ class KDAAttention(nn.Module):
         )
         return raw_gate.contiguous(), beta
 
-    @annotate_kernels("kda/gate_activation")
+    @annotate_kernels("{variant}/gate_activation")
     def gate_activation(self, raw_gate: torch.Tensor) -> torch.Tensor:
         """Map projection outputs to per-token natural-log decay."""
-        return bound_gate(
-            raw_gate,
-            self.A_log,
-            self.dt_bias,
-            lower_bound=self.lower_bound,
-            fastmath=self.fastmath,
-            impl=self.backend,
-        )
+        if self.variant == "kda":
+            return bound_gate(
+                raw_gate,
+                self.A_log,
+                self.dt_bias,
+                lower_bound=self.lower_bound,
+                fastmath=self.fastmath,
+                impl=self.backend,
+            )
+        # Mamba2/GDN convention, matching GateTransform.SOFTPLUS in the fused decode kernel;
+        # the training path has no fused counterpart yet, so both backends run it in eager FP32.
+        return -torch.exp(self.A_log) * F.softplus(raw_gate.float() + self.dt_bias)
 
-    @annotate_kernels("kda/core/{backend}")
-    def kda_core(
+    @annotate_kernels("{variant}/core/{backend}")
+    def delta_rule_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -462,7 +504,20 @@ class KDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return chunk_kda(
+        if self.variant == "kda":
+            return chunk_kda(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial_state,
+                cu_seqlens=cu_seqlens,
+                output_final_state=return_final_state,
+                fastmath=self.fastmath,
+                impl=self.backend,
+            )
+        return chunk_gdn(
             q,
             k,
             v,
@@ -471,11 +526,10 @@ class KDAAttention(nn.Module):
             initial_state,
             cu_seqlens=cu_seqlens,
             output_final_state=return_final_state,
-            fastmath=self.fastmath,
             impl=self.backend,
         )
 
-    @annotate_kernels("kda/output_normalization")
+    @annotate_kernels("{variant}/output_normalization")
     def output_normalization(self, output: torch.Tensor) -> torch.Tensor:
         # TODO: Consider a cu_seqlens-aware RMSNorm for fixed-capacity CUDA Graph
         # replay. Masking makes the inactive suffix numerically inert, but native
@@ -487,7 +541,7 @@ class KDAAttention(nn.Module):
             eps=self.rms_norm_eps,
         )
 
-    @annotate_kernels("kda/output_gate")
+    @annotate_kernels("{variant}/output_gate")
     def output_gate(self, hidden_states: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         gate_features = F.linear(
             hidden_states,
@@ -502,7 +556,7 @@ class KDAAttention(nn.Module):
             .sigmoid()
         )
 
-    @annotate_kernels("kda/output_projection")
+    @annotate_kernels("{variant}/output_projection")
     def output_projection(self, output: torch.Tensor, output_gate: torch.Tensor) -> torch.Tensor:
         return F.linear(
             (output * output_gate).flatten(-2).to(self.compute_dtype),
@@ -511,6 +565,10 @@ class KDAAttention(nn.Module):
 
 
 def main(
+    variant: Annotated[
+        VariantOption,
+        typer.Option(help="Train the KDA (bounded per-channel gate) or GDN (softplus) recipe."),
+    ] = VariantOption.KDA,
     backend: Annotated[
         BackendOption,
         typer.Option(help="Use the reference or the best integrated fused kernels."),
@@ -529,8 +587,8 @@ def main(
         typer.Option(min=1, help="Tokens per sequence, or longest packed sequence."),
     ] = 16384,
     hidden_size: Annotated[int, typer.Option(min=1, help="Transformer hidden size.")] = 2304,
-    num_heads: Annotated[int, typer.Option(min=1, help="Number of KDA heads.")] = 32,
-    head_dim: Annotated[int, typer.Option(min=1, help="Channels per KDA head.")] = 128,
+    num_heads: Annotated[int, typer.Option(min=1, help="Number of attention heads.")] = 32,
+    head_dim: Annotated[int, typer.Option(min=1, help="Channels per head.")] = 128,
     short_conv_kernel_size: Annotated[
         int,
         typer.Option(min=1, help="Causal Q/K/V convolution width."),
@@ -556,14 +614,15 @@ def main(
         typer.Option(help="Pack batch-size Zipf-distributed sequences bounded by tokens."),
     ] = False,
 ) -> None:
-    """Train the single-device KDA example."""
+    """Train the single-device delta-rule example."""
     torch.manual_seed(0)
     if packed and backend != BackendOption.FUSED:
         raise ValueError("--packed requires --backend=fused")
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size,
         num_heads,
         head_dim,
+        variant=variant.value,
         short_conv_kernel_size=short_conv_kernel_size,
         backend=backend.value,
         compute_dtype=(None if compute_dtype is None else getattr(torch, compute_dtype.value)),
@@ -588,7 +647,7 @@ def main(
     execution_name = "_compiled" if compile_model else ""
     dtype_name = "" if compute_dtype is None else f"_{compute_dtype.value}"
     profile_name = (
-        f"kda_training_backend-{backend.value}{dtype_name}{layout_name}{execution_name}"
+        f"{variant.value}_training_backend-{backend.value}{dtype_name}{layout_name}{execution_name}"
         f"_b{batch_size}_t{tokens}_c{hidden_size}_h{num_heads}_d{head_dim}"
     )
 
