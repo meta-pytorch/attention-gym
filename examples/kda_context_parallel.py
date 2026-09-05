@@ -246,6 +246,7 @@ def validate_cuda_graph(
     annotations: bool,
     profile_path: Path | None,
     device: torch.device,
+    warmup_steps: int,
 ) -> None:
     """Capture the full distributed backward and compare a changed-input replay."""
     warmup_stream = torch.cuda.Stream()
@@ -302,6 +303,7 @@ def validate_cuda_graph(
                 profile_path,
                 "cuda_graph_replay",
                 device,
+                warmup_steps=warmup_steps,
             )
             if merged_path is not None:
                 print(f"profile={merged_path}", flush=True)
@@ -316,6 +318,7 @@ def profile_eager_step(
     batch: PackedTrainingBatch,
     profile_path: Path,
     device: torch.device,
+    warmup_steps: int,
 ) -> None:
     """Profile one complete eager context-parallel forward and backward."""
     hidden_states = batch.local_hidden.detach().clone().requires_grad_()
@@ -334,6 +337,7 @@ def profile_eager_step(
         profile_path,
         "iteration",
         device,
+        warmup_steps=warmup_steps,
     )
     step_peak = torch.cuda.max_memory_allocated(device) - resident
     print(
@@ -380,6 +384,14 @@ def main(
         bool,
         typer.Option(help="Export a merged native Perfetto trace with transformer-nuggets."),
     ] = False,
+    warmup_steps: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Steps run before the profiled one and dropped from the trace, so it shows "
+            "steady state (as if deep inside a model) rather than launch skew.",
+        ),
+    ] = 5,
 ) -> None:
     """Run and validate the complete packed context-parallel KDA module."""
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -483,9 +495,10 @@ def main(
             graph_annotations_available,
             profile_path if profile else None,
             device,
+            warmup_steps,
         )
     elif profile:
-        profile_eager_step(model, batch, profile_path, device)
+        profile_eager_step(model, batch, profile_path, device, warmup_steps)
 
     mode = " with CUDA Graph replay" if cuda_graph else ""
     status = "passed" if validate else "ran"
