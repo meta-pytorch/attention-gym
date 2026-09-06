@@ -13,8 +13,10 @@ works without copies. Strides are constexpr as elsewhere in the repo: the kernel
 instruction-bound, and runtime strides measured 8-20% slower; the cost is one JIT per distinct
 stride set (i.e. per new ``T`` for a contiguous gate). The backward is not purely pointwise:
 ``d_dt_bias`` and ``d_A_log`` reduce over rows, so each program writes one FP32 partial per
-channel and the launcher finishes with ``torch.sum``, keeping the reduction deterministic
-without atomics.
+channel into a shared ``[2, row_blocks, C]`` buffer and the launcher finishes with one row
+``sum``, keeping the reduction deterministic without atomics. (Accumulating several row tiles per
+program to shrink the partials was measured: it costs 24 registers, helps only the largest
+shapes, and doubles the small-shape backward.)
 """
 
 from __future__ import annotations
@@ -271,10 +273,12 @@ def _softplus_gate_bwd_cuda(
     elements_per_program, num_warps = BWD_PROGRAM
     block_rows, block_channels = _launch_config(channels, elements_per_program)
     row_blocks = triton.cdiv(rows, block_rows)
-    d_A_log_partial = torch.empty(
-        row_blocks, channels, device=raw_gate.device, dtype=torch.float32
-    )
-    d_dt_bias_partial = torch.empty_like(d_A_log_partial)
+    # Both parameter partials share one buffer so a single row reduction finishes them; the
+    # separate `view(rb, H, D).sum((0, 2))` pattern was a slow strided reduce (2x the time).
+    # d_dt_bias occupies row 0 so the returned view has the compact, zero-offset metadata the
+    # fake implementation describes.
+    partials = torch.empty(2, row_blocks, channels, device=raw_gate.device, dtype=torch.float32)
+    d_dt_bias_partial, d_A_log_partial = partials[0], partials[1]
     softplus_gate_bwd_kernel[(row_blocks, triton.cdiv(channels, block_channels))](
         raw_gate,
         A_log,
@@ -297,5 +301,6 @@ def _softplus_gate_bwd_cuda(
         FASTMATH=fastmath,
         num_warps=num_warps,
     )
-    d_A_log = d_A_log_partial.view(row_blocks, heads, head_dim).sum((0, 2))
-    return d_raw_gate.view(shape), d_A_log, d_dt_bias_partial.sum(0).view(shape[2:])
+    d_dt_bias, d_A_log_channels = partials.sum(1)
+    d_A_log = d_A_log_channels.view(heads, head_dim).sum(1)
+    return d_raw_gate.view(shape), d_A_log, d_dt_bias.view(shape[2:])
