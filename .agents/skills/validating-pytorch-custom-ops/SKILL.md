@@ -56,6 +56,15 @@ Consequences for launch-bound paths (small kernels, high call rate):
 - Give each hot path at most one registered-operator boundary. Nested custom ops double the
   dispatch tax; share the Python launcher between entrypoint ops instead of calling one op from
   another.
+- One contract, one operator pair. When several backends (Triton portable, CuTeDSL fast) or
+  variants (a transform kind, a mode) implement the same public semantics, register a single
+  `fwd`/`bwd` pair, pass the variant as a schema argument (`str kind`, `bool`, `float`), and
+  select the backend inside the CUDA implementation on real tensors. Do not create one op pair
+  per backend or thread a `use_<backend>` flag through `autograd.Function.apply`: selection that
+  runs under Dynamo tracing specializes into the graph, trips the `functools.lru_cache` warning
+  for cached device-property helpers, and multiplies fakes, handles, and Functions. Make every
+  backend return the same output contract (e.g. already-reduced parameter gradients) so one fake
+  describes all of them. `attn_gym::_gate_transform_{fwd,bwd}` is the reference shape.
 - A `define`/`impl` op has no autograd kernel: backprop through a direct call warns and produces
   no gradient, so route all differentiable use through the `autograd.Function` wrapper.
 - `torch.library.opcheck` accepts `torch.ops.attn_gym.op.default`, so the validation workflow
@@ -172,7 +181,11 @@ Schema rules:
 The fake implementation describes output metadata without running the kernel. It must:
 
 - return the same output structure as the real implementation;
-- preserve shape, dtype, device, layout, and relevant strides;
+- preserve shape, dtype, device, layout, and relevant strides. For outputs the kernel allocates
+  fresh, use `x.new_empty(shape)` / `torch.empty(...)`, never `torch.empty_like(x)`:
+  `empty_like` preserves the strides of a dense-but-permuted input while the kernel writes a
+  contiguous result, and Inductor then fails `assert_size_stride`. Include a transposed
+  parameter (`p.t().contiguous().t()`) in the `opcheck` inputs to pin this;
 - avoid reading tensor values, storage, data pointers, or calling `.item()`;
 - use symbolic shape arithmetic rather than data-dependent Python branches.
 
