@@ -134,6 +134,42 @@ elementwise kernels run per decode step.
 
 ::: attn_gym.linear.recurrent_gdn_decode
 
+## Gate Transforms
+
+`gate_transform` turns a raw gate projection into the FP32 natural-log decay consumed by the
+chunked and recurrent operations. The transform kind and the gate shape are independent:
+
+| `kind`       | formula                                              | range              |
+| ------------ | ---------------------------------------------------- | ------------------ |
+| `"bounded"`  | `lower_bound * sigmoid(exp(A_log) * (raw + dt_bias))` | `(lower_bound, 0)` |
+| `"softplus"` | `-exp(A_log) * softplus(raw + dt_bias)`              | `(-inf, 0)`        |
+
+Either kind applies to per-head gates (`raw [B, T, H]`, `dt_bias [H]`, the GDN convention) or
+per-channel gates (`raw [B, T, H, D]`, `dt_bias [H, D]`, the KDA convention). `kind` is
+required: a default could silently select the wrong recurrence convention. `bound_gate` is the
+KDA-specific spelling of `kind="bounded"` for per-channel gates with `lower_bound=-5.0`.
+
+`impl="fused"` has a portable and a fast route. Per-channel `D=128` gates on CUDA capability
+9.0+ use the CuTeDSL kernels for both kinds (near the bf16->fp32 cast roofline with
+`fastmath=True`); every other `"softplus"` configuration uses a portable Triton kernel, and
+per-head `"bounded"` gates are reference-only. Both backwards reduce the `A_log` and `dt_bias`
+gradients in FP32 from per-block partials, so they are deterministic. The
+decode kernels (`recurrent_kda_decode`, `recurrent_gdn_decode`) evaluate the same transforms
+in-kernel from the raw projections and do not call this operation. Unbounded softplus gates
+exceed the finite range some fused chunk-KDA schedules assume; keep per-channel softplus
+gates for backends that document support for it.
+
+```python
+from attn_gym.linear import chunk_gdn, gate_transform
+
+gate = gate_transform(raw_gate, A_log, dt_bias, kind="softplus")
+output, final_state = chunk_gdn(q, k, v, gate, beta, impl="fused")
+```
+
+::: attn_gym.linear.gate_transform
+
+::: attn_gym.linear.GateTransform
+
 ## Stateful Short Convolution
 
 `causal_conv1d` is the differentiable dense or packed operation. It accepts compact

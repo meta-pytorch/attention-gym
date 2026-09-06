@@ -31,8 +31,6 @@ gate stays per value head.
 
 from __future__ import annotations
 
-from enum import Enum
-
 import torch
 import triton
 import triton.language as tl
@@ -42,12 +40,8 @@ from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.recurrent import GateKind
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 
-
-class GateTransform(Enum):
-    """Pointwise transform applied to the raw gate projection in-kernel."""
-
-    BOUNDED = "bounded"  # lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))
-    SOFTPLUS = "softplus"  # -exp(A_log) * softplus(raw_gate + dt_bias)
+# The in-kernel transform shares its definition with the standalone ``gate_transform`` op.
+from attn_gym.linear.types import GateTransform
 
 
 def _decode_launch_config(

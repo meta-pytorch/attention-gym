@@ -9,6 +9,8 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
+from attn_gym.linear._delta_rule.gate import gate_transform
+
 from .kda import cumulative_sequence_offsets
 
 GatePattern = Literal[
@@ -97,7 +99,7 @@ def make_gdn_test_inputs(
             raw_gate = torch.randn(gate_shape, device="cuda", generator=generator)
             a_log = torch.linspace(-0.5, 0.5, value_heads, device="cuda")
             dt_bias = torch.linspace(-0.25, 0.25, value_heads, device="cuda")
-            gate = -a_log.exp().view(1, 1, -1) * F.softplus(raw_gate + dt_bias.view(1, 1, -1))
+            gate = gate_transform(raw_gate, a_log, dt_bias, kind="softplus", impl="reference")
         case _:
             raise ValueError(f"Unsupported gate pattern: {gate_pattern}")
 

@@ -43,4 +43,33 @@ def resolve_impl(impl: Impl | str) -> Impl:
         raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
 
 
-__all__ = ["BackendOptions", "Impl", "KernelOptions", "resolve_impl"]
+class GateTransform(str, Enum):
+    """Pointwise transform from a raw gate projection to a natural-log decay.
+
+    Both kinds apply to per-head (``[B, T, H]``) and per-channel (``[B, T, H, D]``) gates;
+    the kind is independent of the gate shape.
+    """
+
+    BOUNDED = "bounded"  # lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))
+    SOFTPLUS = "softplus"  # -exp(A_log) * softplus(raw_gate + dt_bias)
+
+
+def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
+    """Normalize a gate transform selector and report the valid values."""
+    try:
+        return GateTransform(kind)
+    except ValueError:
+        valid = ", ".join(repr(member.value) for member in GateTransform)
+        raise ValueError(
+            f"unknown gate transform kind {kind!r}; expected one of {valid}"
+        ) from None
+
+
+__all__ = [
+    "BackendOptions",
+    "GateTransform",
+    "Impl",
+    "KernelOptions",
+    "resolve_gate_transform",
+    "resolve_impl",
+]

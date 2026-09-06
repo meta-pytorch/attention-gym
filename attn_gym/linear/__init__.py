@@ -9,6 +9,7 @@
 import importlib
 from typing import TYPE_CHECKING
 
+from attn_gym.linear._delta_rule.gate import gate_transform
 from attn_gym.linear.gdn import chunk_gdn, paged_chunk_gdn, recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear.kda import (
     KernelOptions,
@@ -21,7 +22,7 @@ from attn_gym.linear.kda import (
     recurrent_kda_decode,
 )
 from attn_gym.linear.short_conv import ops as _short_conv_ops
-from attn_gym.linear.types import Impl
+from attn_gym.linear.types import GateTransform, Impl
 
 # Note: Lazy Imports
 # Backend-backed names load on first use, keeping reference imports torch-only.
@@ -51,11 +52,13 @@ GDN_OPS = [
 
 # Model-agnostic building blocks.
 GENERIC_OPS = [
+    "GateTransform",
     "Impl",
     "KernelOptions",
     "active_token_mask",
     "causal_conv1d",
     "causal_conv1d_decode",
+    "gate_transform",
     "l2norm",
     "paged_causal_conv1d",
     "mask_inactive_token_gradients",
