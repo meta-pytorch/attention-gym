@@ -270,7 +270,31 @@ class KDAAttention(nn.Module):
                     f"initial_state must have shape {expected_state}, got {tuple(initial_state.shape)}"
                 )
             initial_state = initial_state.to(device=hidden_states.device, dtype=torch.float32)
+        return self.run_stages(
+            hidden_states,
+            initial_state,
+            initial_conv_state,
+            cu_seqlens=cu_seqlens,
+            return_final_state=return_final_state,
+        )
 
+    def run_stages(
+        self,
+        hidden_states: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        initial_conv_state: torch.Tensor | None,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        return_final_state: bool,
+        **stage_kwargs: Any,
+    ) -> KDAAttentionOutput:
+        """Run the validated stage pipeline shared by every ``forward`` variant.
+
+        ``stage_kwargs`` are forwarded to ``short_convolution`` and ``kda_core`` so a subclass
+        can thread per-call context (for example context-parallel routing) through those two
+        stateful stages without storing it on the module or re-spelling the pipeline.
+        """
+        batch, tokens, _ = hidden_states.shape
         # --8<-- [start:kda-fixed-capacity-masking]
         # Keep the endpoint on-device: a captured graph rebuilds this one mask on
         # replay, then every value mask and gradient barrier below reuses it.
@@ -290,6 +314,7 @@ class KDAAttention(nn.Module):
             initial_conv_state,
             cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
+            **stage_kwargs,
         )
         # Ordinary Q/K normalization reads and saves every physical row.
         qkv = mask_inactive_tokens(qkv, active_mask)
@@ -310,6 +335,7 @@ class KDAAttention(nn.Module):
             initial_state,
             cu_seqlens=cu_seqlens,
             return_final_state=return_final_state,
+            **stage_kwargs,
         )
         # KDA leaves its output suffix undefined; sanitize it before RMSNorm saves it.
         output = self.output_normalization(mask_inactive_tokens(output, active_mask))
