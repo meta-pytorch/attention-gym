@@ -335,7 +335,8 @@ while allowing
 Inductor to fuse the surrounding PyTorch normalization and remaining pointwise work.
 The bounded gate itself uses private CuTeDSL forward and backward operators. It can be
 combined with `--profile`; compilation warmups run before the
-trace starts. Like FLA's default training path, its backward recomputes the W/U,
+trace starts. Profiling requires transformer-nuggets and writes a native Perfetto `.pftrace`
+through the shared `attn_gym.testing.profile_trace` helper. Like FLA's default training path, its backward recomputes the W/U,
 gated Q/K, recurrent-state, and
 corrected-value intermediates instead of retaining them across the forward/backward
 boundary.

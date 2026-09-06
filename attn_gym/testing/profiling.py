@@ -1,14 +1,58 @@
-"""Profiling helpers for distributed example validation."""
+"""Optional profiler ranges, CUDA Graph annotations, and example trace export."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from functools import wraps
 from importlib import import_module
+from inspect import signature
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
+
+
+def record_function(enabled: bool, name: str):
+    """Create a profiler range only when profiling is requested."""
+    return torch.profiler.record_function(name) if enabled else nullcontext()
+
+
+def graph_annotations_available() -> bool:
+    """Check optional CUDA Graph annotation support without making it an import requirement."""
+    try:
+        from torch.cuda.graph_annotations import is_available
+    except ImportError:
+        return False
+    return is_available()
+
+
+def mark_kernels(*args: Any, **kwargs: Any):
+    """Load optional CUDA Graph annotations only when they are requested."""
+    from torch.cuda.graph_annotations import mark_kernels as annotate
+
+    return annotate(*args, **kwargs)
+
+
+def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Label a module method when ``module.enable_graph_annotations`` is true.
+
+    The label may reference attributes through ``{module.attribute}``; disabled annotations
+    bypass both label formatting and the optional CUDA Graph annotation API.
+    """
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(function)
+        def annotated(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if not self.enable_graph_annotations:
+                return function(self, *args, **kwargs)
+            with mark_kernels(name.format(module=self)):
+                return function(self, *args, **kwargs)
+
+        return annotated
+
+    return decorate
 
 
 @contextmanager
@@ -16,8 +60,6 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True) -> Iterato
     """Label eager profiler ranges and optionally annotate captured CUDA Graph kernels."""
     annotation = nullcontext()
     if annotate:
-        from torch.cuda.graph_annotations import mark_kernels
-
         annotation = mark_kernels(name, backward=backward)
     with torch.profiler.record_function(name), annotation:
         yield
@@ -33,6 +75,12 @@ def profile_trace(path: Path, *, warmup: int = 0) -> Iterator[torch.profiler.pro
         raise RuntimeError(
             "profiling requires transformer-nuggets with native Perfetto support"
         ) from error
+
+    if "trace_format" not in signature(profiler).parameters:
+        raise RuntimeError(
+            "installed transformer-nuggets lacks native Perfetto support; "
+            "install it from https://github.com/drisspg/transformer_nuggets"
+        )
 
     with profiler(
         path.with_suffix(".pftrace"),
@@ -103,14 +151,21 @@ def record_distributed_profile(
             if trace is not None and not rank_path.exists():
                 rank_path.write_bytes(trace)
         merged_path = path.with_name(f"{path.stem}_merged.pftrace")
+        # Native traces preserve their clock timestamps; JSON-style re-zeroing is unsupported.
         merge_traces(
             [str(rank_path) for rank_path in rank_paths],
             str(merged_path),
             labels=[f"Rank {index} · GPU {index}" for index in range(world_size)],
-            align_timestamps=True,
         )
     dist.barrier()
     return merged_path
 
 
-__all__ = ["kernel_stage", "profile_trace", "record_distributed_profile"]
+__all__ = [
+    "annotate_kernels",
+    "graph_annotations_available",
+    "kernel_stage",
+    "profile_trace",
+    "record_distributed_profile",
+    "record_function",
+]
