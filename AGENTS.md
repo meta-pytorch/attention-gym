@@ -29,7 +29,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 **Examples** (`examples/`) — end-to-end usage and benchmarks:
 - `benchmark.py` — performance comparison of mask implementations
 - `mla.py` — Multi-Head Latent Attention (DeepSeek-style)
-- `kda_training.py` — trainable single-device KDA showcase with reference or fused backends
+- `delta_rule_training.py` — trainable single-device KDA/GDN showcase with reference or fused backends
 - `flex_attn.ipynb` — interactive notebook walkthrough
 - `debug_score_mod.py` — marimo app for interactive score_mod debugging
 - `flex_determinism.py` — determinism testing for flex_attention
