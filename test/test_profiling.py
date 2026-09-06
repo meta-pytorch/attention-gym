@@ -1,8 +1,9 @@
 """Portable coverage for optional example instrumentation, without CUDA or CuTeDSL."""
 
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -126,6 +127,32 @@ def test_graph_annotation_capability_is_optional(monkeypatch, available):
     module = None if available is None else SimpleNamespace(is_available=lambda: available)
     monkeypatch.setitem(sys.modules, "torch.cuda.graph_annotations", module)
     assert profiling.graph_annotations_available() is bool(available)
+
+
+def test_distributed_native_merge_preserves_timestamps(monkeypatch, tmp_path):
+    path = tmp_path / "trace"
+    path.with_name("trace_rank_0.pftrace").write_bytes(b"rank0")
+    merge = Mock()
+    monkeypatch.setattr(
+        profiling, "import_module", lambda name: SimpleNamespace(merge_traces=merge)
+    )
+    monkeypatch.setattr(profiling, "profile_trace", lambda *args, **kwargs: nullcontext(Mock()))
+    monkeypatch.setattr(profiling.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(profiling.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(profiling.dist, "barrier", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    def gather(value, outputs, dst):
+        assert value == b"rank0" and dst == 0
+        outputs[:] = [b"rank0", b"rank1"]
+
+    monkeypatch.setattr(profiling.dist, "gather_object", gather)
+    merged = profiling.record_distributed_profile(Mock(), path, "step", torch.device("cpu"))
+    assert merged == path.with_name("trace_merged.pftrace")
+    assert path.with_name("trace_rank_1.pftrace").read_bytes() == b"rank1"
+    merge.assert_called_once()
+    # Native merge rejects JSON's re-zeroing option; retain the native clock timestamps.
+    assert merge.call_args.kwargs.get("align_timestamps", False) is False
 
 
 def test_kernel_stage_forwards_annotation_direction(monkeypatch):

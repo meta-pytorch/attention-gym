@@ -151,11 +151,11 @@ def record_distributed_profile(
             if trace is not None and not rank_path.exists():
                 rank_path.write_bytes(trace)
         merged_path = path.with_name(f"{path.stem}_merged.pftrace")
+        # Native traces preserve their clock timestamps; JSON-style re-zeroing is unsupported.
         merge_traces(
             [str(rank_path) for rank_path in rank_paths],
             str(merged_path),
             labels=[f"Rank {index} · GPU {index}" for index in range(world_size)],
-            align_timestamps=True,
         )
     dist.barrier()
     return merged_path
