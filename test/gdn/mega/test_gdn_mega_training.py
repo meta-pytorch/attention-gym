@@ -22,7 +22,6 @@ from attn_gym.linear.gdn.impl.mega_ops import (
     chunk_gdn_mega_packed_fwd_with_initial_state_op,
     chunk_gdn_mega_packed_fwd_with_state_op,
 )
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.testing.kda import assert_matches_low_precision_reference, clone_kda_inputs
 
@@ -231,22 +230,21 @@ def test_gdn_mega_raw_operator_registration() -> None:
     )
     d_output = torch.randn_like(value)
     d_state = torch.randn_like(state)
-    chunk_offsets = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64).chunk_offsets
     scale = 128**-0.5
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(
         chunk_gdn_mega_packed_fwd_op,
-        (q, k, value, gate, beta, cu_seqlens, chunk_offsets, scale),
+        (q, k, value, gate, beta, cu_seqlens, scale),
         test_utils=test_utils,
     )
     torch.library.opcheck(
         chunk_gdn_mega_packed_fwd_with_initial_state_op,
-        (q, k, value, gate, beta, state, cu_seqlens, chunk_offsets, scale),
+        (q, k, value, gate, beta, state, cu_seqlens, scale),
         test_utils=test_utils,
     )
     torch.library.opcheck(
         chunk_gdn_mega_packed_fwd_with_state_op,
-        (q, k, value, gate, beta, state, cu_seqlens, chunk_offsets, scale),
+        (q, k, value, gate, beta, state, cu_seqlens, scale),
         test_utils=test_utils,
     )
     torch.library.opcheck(
@@ -301,7 +299,11 @@ def test_gdn_mega_backward_fake_preserves_leading_strides() -> None:
 
 
 @pytest.mark.parametrize("offsets", ([1, 3], [0, 4, 3], [0, 9]))
-def test_public_gdn_mega_rejects_invalid_packed_offset_values(offsets: list[int]) -> None:
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("mode", ["no_state", "initial_only", "with_state"])
+def test_public_gdn_mega_rejects_invalid_packed_offset_values(
+    offsets: list[int], compiled: bool, mode: str
+) -> None:
     """Device-side boundary validation must fail before invalid TMA descriptors execute."""
     code = f"""
 import torch
@@ -312,17 +314,21 @@ k = torch.randn_like(q)
 v = torch.randn_like(q)
 gate = -torch.rand(shape[:3], device='cuda')
 beta = torch.rand(shape[:3], device='cuda')
-cu = torch.tensor({offsets!r}, dtype=torch.int32, device='cuda')
-chunk_gdn(
-    q,
-    k,
-    v,
-    gate,
-    beta,
+cu = torch.tensor({[0] + [3] * (len(offsets) - 1)!r}, dtype=torch.int32, device='cuda')
+state = torch.zeros(({len(offsets) - 1}, 2, 128, 128), device='cuda')
+call = torch.compile(chunk_gdn, fullgraph=True) if {compiled!r} else chunk_gdn
+kwargs = dict(
+    initial_state=state if {mode!r} != 'no_state' else None,
+    output_final_state={mode!r} == 'with_state',
     cu_seqlens=cu,
     impl='fused',
     kernel_options={{"backend": "mega"}},
 )
+call(q, k, v, gate, beta, **kwargs)
+torch.cuda.synchronize()
+print('valid offsets completed', flush=True)
+cu.copy_(torch.tensor({offsets!r}, dtype=torch.int32, device='cuda'))
+call(q, k, v, gate, beta, **kwargs)
 torch.cuda.synchronize()
 """
     try:
@@ -336,7 +342,9 @@ torch.cuda.synchronize()
         )
     except subprocess.TimeoutExpired:
         pytest.fail("invalid packed offsets hung instead of failing validation")
+    assert "valid offsets completed" in result.stdout, result.stdout + result.stderr
     assert result.returncode != 0, "invalid packed offsets reached the Mega kernel"
+    assert "invalid packed cu_seqlens" in result.stderr, result.stdout + result.stderr
 
 
 def test_public_gdn_mega_casts_low_precision_gate_and_beta_with_gradients() -> None:
