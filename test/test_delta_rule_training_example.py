@@ -1,6 +1,7 @@
-"""Integration tests for the fused KDA training example."""
+"""Integration tests for the fused delta-rule (KDA/GDN) training example."""
 
 from contextlib import contextmanager
+from functools import partial
 from itertools import pairwise
 
 import pytest
@@ -12,66 +13,96 @@ pytest.importorskip("cutlass")
 pytest.importorskip("typer")
 pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
 
+from attn_gym.linear.context_parallel import ContextParallelRouting
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
-from examples import kda_training
-from examples.kda_training import KDAAttention, packed_sequence_metadata
+from attn_gym.testing.kda import assert_relative_rms_within
+from examples import delta_rule_training
+from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
+from examples.delta_rule_training import DeltaRuleAttention, packed_sequence_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="the fused KDA example requires CUDA capability 9.0 or newer",
+    reason="the fused delta-rule example requires CUDA capability 9.0 or newer",
 )
 
 
-def test_kda_example_validates_public_gate_configuration():
+def test_example_validates_public_gate_configuration():
+    make = partial(DeltaRuleAttention, hidden_size=128, num_heads=1, head_dim=128, device="cuda")
+    too_low = -(MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3)
     with pytest.raises(ValueError, match="lower_bound"):
-        KDAAttention(
-            hidden_size=128,
-            num_heads=1,
-            head_dim=128,
-            lower_bound=-(MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3),
-            backend="fused",
-            device="cuda",
-        )
-    KDAAttention(
-        hidden_size=128,
-        num_heads=1,
-        head_dim=128,
-        lower_bound=-(MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3),
-        backend="reference",
-        device="cuda",
-    )
+        make(lower_bound=too_low, backend="fused")
+    make(lower_bound=too_low, backend="reference")
+    # GDN never reads lower_bound, so the KDA-only bound must not constrain it.
+    make(variant="gdn", lower_bound=too_low, backend="fused")
     with pytest.raises(ValueError, match="finite and nonpositive"):
-        KDAAttention(
-            hidden_size=128,
-            num_heads=1,
-            head_dim=128,
-            lower_bound=1.0,
-            backend="reference",
-            device="cuda",
-        )
+        make(lower_bound=1.0, backend="reference")
     with pytest.raises(ValueError, match="fastmath applies only"):
-        KDAAttention(
-            hidden_size=128,
-            num_heads=1,
-            head_dim=128,
-            fastmath=True,
-            backend="reference",
-            device="cuda",
-        )
+        make(fastmath=True, backend="reference")
+    with pytest.raises(ValueError, match="fastmath applies only"):
+        make(variant="gdn", fastmath=True, backend="fused")
+    with pytest.raises(ValueError, match="variant must be"):
+        make(variant="mamba")
+
+
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_fused_backend_matches_reference_module(variant):
+    """Same weights, dense input: the fused bf16 module must track the fp32 reference recipe."""
+    torch.manual_seed(5)
+    options = {"hidden_size": 32, "num_heads": 2, "head_dim": 128, "variant": variant}
+    reference = DeltaRuleAttention(**options, backend="reference", device="cuda")
+    with torch.no_grad():  # zero-initialized gate parameters would make the gate a constant
+        reference.A_log.uniform_(-1.0, 1.0)
+        reference.dt_bias.uniform_(-1.0, 1.0)
+    fused = DeltaRuleAttention(**options, backend="fused", device="cuda")
+    fused.load_state_dict(reference.state_dict())
+    hidden = torch.randn(2, 64, 32, device="cuda")
+    cotangent = torch.randn_like(hidden)
+
+    def run(model):
+        leaf = hidden.clone().requires_grad_()
+        result = model(leaf, return_final_state=True)
+        grads = torch.autograd.grad(result.hidden_states, (leaf, *model.parameters()), cotangent)
+        return [
+            ("output", result.hidden_states),
+            ("final_state", result.final_state),
+            ("input gradient", grads[0]),
+            *zip((name for name, _ in model.named_parameters()), grads[1:], strict=True),
+        ]
+
+    # The reference runs fp32 end to end; the fused module rounds every stage input to bf16,
+    # so pointwise error scales with the tensor's magnitude (observed <= 4% of max, ~1 eps RMS).
+    for (name, actual), (_, expected) in zip(run(fused), run(reference), strict=True):
+        budget = 5e-2 * expected.abs().max().item()
+        torch.testing.assert_close(actual.float(), expected, rtol=0, atol=budget, msg=name)
+        assert_relative_rms_within(actual, expected, name, max_eps=8)
+
+
+def test_context_parallel_module_overrides_only_the_stateful_stages():
+    """CP reuses the base pipeline: only entry validation and the two stateful stages differ."""
+    overridden = {
+        name
+        for name, value in vars(ContextParallelDeltaRuleAttention).items()
+        if callable(value) and name in vars(DeltaRuleAttention)
+    }
+    assert overridden == {"__init__", "forward", "short_convolution", "delta_rule_core"}
+    assert not any(
+        isinstance(value, ContextParallelRouting)
+        for value in vars(ContextParallelDeltaRuleAttention).values()
+    )
 
 
 @pytest.mark.parametrize(
     ("width", "tokens", "with_initial_state"),
     [(5, 2, True), (5, 2, False)],
 )
-def test_kda_example_fused_short_conv_supports_generic_width_and_state(
+def test_example_fused_short_conv_supports_generic_width_and_state(
     width: int,
     tokens: int,
     with_initial_state: bool,
 ):
     """Keep the example on CuTeDSL when adapting optional convolution history."""
     torch.manual_seed(3)
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=128,
         num_heads=1,
         head_dim=128,
@@ -142,7 +173,7 @@ def test_kda_example_fused_short_conv_supports_generic_width_and_state(
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-1)
 
 
-def test_kda_example_builds_packed_sequence_metadata():
+def test_example_builds_packed_sequence_metadata():
     """Keep token-level Zipf samples bounded and cumulative."""
     torch.manual_seed(0)
     lengths, offsets = packed_sequence_metadata(4, 63)
@@ -155,7 +186,8 @@ def test_kda_example_builds_packed_sequence_metadata():
         packed_sequence_metadata(3, 0)
 
 
-def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_marks_cuda_graph_kernel_stages(monkeypatch, variant):
     labels = []
 
     @contextmanager
@@ -164,11 +196,12 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
         labels.append(annotation)
         yield
 
-    monkeypatch.setattr(kda_training, "mark_kernels", record_mark_kernels)
-    model = KDAAttention(
+    monkeypatch.setattr(delta_rule_training, "mark_kernels", record_mark_kernels)
+    model = DeltaRuleAttention(
         hidden_size=32,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         enable_graph_annotations=True,
@@ -179,26 +212,28 @@ def test_kda_example_marks_cuda_graph_kernel_stages(monkeypatch):
     model(hidden, cu_seqlens=offsets)
 
     assert labels == [
-        "kda/qkv_projection",
-        "kda/short_convolution",
-        "kda/qk_normalization",
-        "kda/gate_projections",
-        "kda/gate_activation",
-        "kda/core/fused",
-        "kda/output_normalization",
-        "kda/output_gate",
-        "kda/output_projection",
+        f"{variant}/qkv_projection",
+        f"{variant}/short_convolution",
+        f"{variant}/qk_normalization",
+        f"{variant}/gate_projections",
+        f"{variant}/gate_activation",
+        f"{variant}/core/fused",
+        f"{variant}/output_normalization",
+        f"{variant}/output_gate",
+        f"{variant}/output_projection",
     ]
 
 
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float16])
-def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype):
+def test_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype, variant):
     """Match packed BF16/FP16 training against independent sequence calls."""
     fused_calls = {"short_conv": 0, "l2norm": 0, "gate": 0, "core": 0}
-    short_conv = kda_training.causal_conv1d
-    fused_l2norm = kda_training.l2norm
-    gate = kda_training.bound_gate
-    core = kda_training.chunk_kda
+    core_name = "chunk_kda" if variant == "kda" else "chunk_gdn"
+    short_conv = delta_rule_training.causal_conv1d
+    fused_l2norm = delta_rule_training.l2norm
+    gate = delta_rule_training.bound_gate
+    core = getattr(delta_rule_training, core_name)
 
     def record_short_conv(*args, **kwargs):
         fused_calls["short_conv"] += 1
@@ -216,15 +251,16 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
         fused_calls["core"] += 1
         return core(*args, **kwargs)
 
-    monkeypatch.setattr(kda_training, "causal_conv1d", record_short_conv)
-    monkeypatch.setattr(kda_training, "l2norm", record_l2norm)
-    monkeypatch.setattr(kda_training, "bound_gate", record_gate)
-    monkeypatch.setattr(kda_training, "chunk_kda", record_core)
+    monkeypatch.setattr(delta_rule_training, "causal_conv1d", record_short_conv)
+    monkeypatch.setattr(delta_rule_training, "l2norm", record_l2norm)
+    monkeypatch.setattr(delta_rule_training, "bound_gate", record_gate)
+    monkeypatch.setattr(delta_rule_training, core_name, record_core)
     torch.manual_seed(19)
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=32,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         compute_dtype=compute_dtype,
         device="cuda",
@@ -235,7 +271,9 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
     cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
 
     actual = model(packed_hidden, cu_seqlens=cu_seqlens).hidden_states
-    assert fused_calls == {"short_conv": 1, "l2norm": 2, "gate": 1, "core": 1}
+    # GDN must never route through KDA's bounded gate.
+    fused_gate_calls = 1 if variant == "kda" else 0
+    assert fused_calls == {"short_conv": 1, "l2norm": 2, "gate": fused_gate_calls, "core": 1}
 
     loop_outputs = [
         model(loop_hidden[:, start:end]).hidden_states
@@ -251,29 +289,53 @@ def test_kda_example_packed_matches_sequence_for_loop(monkeypatch, compute_dtype
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-2)
 
 
+def _assert_masked_run_matches(names, actual, expected, active_tokens):
+    """Compare a fixed-capacity run's output, input and parameter gradients against an exact run.
+
+    ``actual`` and ``expected`` are ``(output, input_gradient, *parameter_gradients)``; the
+    actual tensors span the capacity and must be zero past ``active_tokens``.
+    """
+    for label, value, target in zip(("output", "input gradient"), actual[:2], expected[:2]):
+        torch.testing.assert_close(
+            value[:, :active_tokens], target, rtol=3e-2, atol=3e-2, msg=label
+        )
+        assert not value[:, active_tokens:].any(), label
+    for name, value, target in zip(names, actual[2:], expected[2:], strict=True):
+        torch.testing.assert_close(value, target, rtol=3e-2, atol=3e-2, msg=name)
+
+
 @pytest.mark.parametrize(
-    ("captured_offsets", "replayed_offsets"),
+    ("variant", "captured_offsets", "replayed_offsets"),
     [
-        pytest.param([0, 64, 128], [0, 33, 96], id="fewer-tokens"),
-        pytest.param([0, 48, 96, 128], [0, 33, 96, 96], id="fewer-tokens-and-sequences"),
+        pytest.param("kda", [0, 64, 128], [0, 33, 96], id="kda-fewer-tokens"),
         pytest.param(
+            "kda", [0, 48, 96, 128], [0, 33, 96, 96], id="kda-fewer-tokens-and-sequences"
+        ),
+        pytest.param(
+            "kda",
             [0, 64, 128, 128, 128],
             [0, 33, 64, 96, 96],
-            id="more-sequences-within-capacity",
+            id="kda-more-sequences-within-capacity",
+        ),
+        # The masking is variant-agnostic; one GDN case covers its 3-D raw-gate barrier.
+        pytest.param(
+            "gdn", [0, 48, 96, 128], [0, 33, 96, 96], id="gdn-fewer-tokens-and-sequences"
         ),
     ],
 )
-def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
+def test_example_masked_capacity_matches_active_run_under_graph_replay(
+    variant,
     captured_offsets,
     replayed_offsets,
 ):
     """Replay changing L and M over stale capacity and match an exactly sized run."""
     torch.manual_seed(31)
     capacity, hidden_size = captured_offsets[-1], 32
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=hidden_size,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         mask_inactive_capacity=True,
@@ -317,37 +379,24 @@ def test_kda_example_masked_capacity_matches_active_run_under_graph_replay(
             cotangent[:, :active_tokens],
         )
     capture_stream.synchronize()
-    torch.testing.assert_close(
-        captured_output[:, :active_tokens], expected_output, rtol=3e-2, atol=3e-2
-    )
-    assert not captured_output[:, active_tokens:].any()
-    torch.testing.assert_close(
-        captured_gradients[0][:, :active_tokens], expected_gradients[0], rtol=3e-2, atol=3e-2
-    )
-    assert not captured_gradients[0][:, active_tokens:].any()
-    for name, actual_gradient, expected_gradient in zip(
+    _assert_masked_run_matches(
         names,
-        captured_gradients[1:],
-        expected_gradients[1:],
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            actual_gradient,
-            expected_gradient,
-            rtol=3e-2,
-            atol=3e-2,
-            msg=lambda message, parameter=name: f"{parameter}: {message}",
-        )
+        (captured_output, *captured_gradients),
+        (expected_output, *expected_gradients),
+        active_tokens,
+    )
 
 
-def test_kda_example_masked_capacity_supports_strict_fullgraph_autograd():
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+def test_example_masked_capacity_supports_strict_fullgraph_autograd(variant):
     """Compile the reusable gradient barriers through the complete example."""
     torch.manual_seed(32)
     capacity, active_tokens, hidden_size = 128, 96, 32
-    model = KDAAttention(
+    model = DeltaRuleAttention(
         hidden_size=hidden_size,
         num_heads=1,
         head_dim=128,
+        variant=variant,
         backend="fused",
         device="cuda",
         mask_inactive_capacity=True,
@@ -377,27 +426,9 @@ def test_kda_example_masked_capacity_supports_strict_fullgraph_autograd():
             cotangent,
         )
 
-    torch.testing.assert_close(
-        actual_output[:, :active_tokens], expected_output, rtol=3e-2, atol=3e-2
-    )
-    assert not actual_output[:, active_tokens:].any()
-    torch.testing.assert_close(
-        actual_gradients[0][:, :active_tokens],
-        expected_gradients[0],
-        rtol=3e-2,
-        atol=3e-2,
-    )
-    assert not actual_gradients[0][:, active_tokens:].any()
-    for name, actual_gradient, expected_gradient in zip(
+    _assert_masked_run_matches(
         names,
-        actual_gradients[1:],
-        expected_gradients[1:],
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            actual_gradient,
-            expected_gradient,
-            rtol=3e-2,
-            atol=3e-2,
-            msg=lambda message, parameter=name: f"{parameter}: {message}",
-        )
+        (actual_output, *actual_gradients),
+        (expected_output, *expected_gradients),
+        active_tokens,
+    )

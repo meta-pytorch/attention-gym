@@ -89,38 +89,38 @@ Implements a generic single-node ring-attention example launched with `torchrun`
 torchrun --standalone --nproc_per_node=4 examples/ring_attention.py --seq-len 131072
 ```
 
-## KDA Context Parallelism
+## Delta-Rule Context Parallelism
 
-[`examples/kda_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/kda_context_parallel.py)
-— Run the complete transformer-style module from `kda_training.py` over packed context-parallel
+[`examples/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/delta_rule_context_parallel.py)
+— Run the complete transformer-style module from `delta_rule_training.py` over packed context-parallel
 fragments using the reference recipe in `attn_gym.linear.context_parallel` (see
 [Context Parallelism](linear.md#context-parallelism)). This includes projections, Q/K/V short
-convolution, KDA, normalization, gating, and the output projection.
+convolution, the KDA or GDN core (`--variant`), normalization, gating, and the output projection.
 
 Each rank owns fragments (global token ranges) chosen in a dozen lines of plain Python (`fragments`
 in the example): `--partition contiguous` gives each rank one block, while `--partition zigzag`
 gives it two mirrored blocks, matching the layout hybrid models inherit from ring softmax attention.
 The short convolution all-gathers one `W - 1` token tail per fragment (its last subsequence's) and
-routes its initial-state gradient back to the owning ranks. The KDA recurrence computes forward and
+routes its initial-state gradient back to the owning ranks. The delta-rule recurrence computes forward and
 reverse `[bias; transition]` state summaries with portable Triton kernels on Hopper or native
 TMA/UMMA kernels on SM100, all-gathers them, and folds each fragment's predecessors or successors
-onto its first / last subsequence before running the ordinary local KDA kernel. The example
-validates local outputs, convolution and KDA endpoint states, input gradients, and all-reduced
+onto its first / last subsequence before running the ordinary local KDA or GDN kernel. The example
+validates local outputs, convolution and recurrent endpoint states, input gradients, and all-reduced
 parameter gradients against the complete unsharded module. It can also capture the full forward,
 NCCL communication, and backward in one CUDA Graph and validate a changed-input replay. Use
 `--compute-dtype=float16` to exercise the FP16 route. Add `--profile` to use transformer-nuggets to
 export one merged multi-rank trace in native Perfetto `.pftrace` format.
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --partition zigzag
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --partition zigzag
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --compute-dtype=float16
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --compute-dtype=float16
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --cuda-graph
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --cuda-graph
 
-torchrun --standalone --nproc_per_node=2 examples/kda_context_parallel.py --profile
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --profile
 ```
 
 ## Kernel Tuning
