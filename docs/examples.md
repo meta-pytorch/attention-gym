@@ -97,9 +97,21 @@ fragments using the reference recipe in `attn_gym.linear.context_parallel` (see
 [Context Parallelism](linear.md#context-parallelism)). This includes projections, Q/K/V short
 convolution, the KDA or GDN core (`--variant`), normalization, gating, and the output projection.
 
-Each rank owns fragments (global token ranges) chosen in a dozen lines of plain Python (`fragments`
-in the example): `--partition contiguous` gives each rank one block, while `--partition zigzag`
-gives it two mirrored blocks, matching the layout hybrid models inherit from ring softmax attention.
+The input uses the same shared Zipf sampler as the base training example's `--packed` mode:
+`--batch-size` counts logical sequences and `--tokens` bounds their lengths. Use
+`--sequence-lengths` to override sampling with an explicit layout. `--num-heads` and
+`--core-backend` match the base example; `--heads` and `--kda-backend` remain aliases.
+
+Each rank owns fragments (global token ranges) from `partition_fragments` directly in the CP
+example. Edit this function to define your own rank mappings: `--partition contiguous` gives each
+rank one near-equal block, while `--partition zigzag` gives it two mirrored blocks, matching the
+layout hybrid models inherit from ring softmax attention.
+Uneven totals are partitioned without dropping or padding tokens. The model, batch construction,
+loss/backward, and capture recipes are shown in `examples/delta_rule_training.py` and imported
+by the CP example. Numerical assertions, profiling, and benchmark reporting stay in
+`attn_gym.testing.delta_rule` and `attn_gym.testing.profiling`.
+The example keeps the run-mode branches visible: validate first, then benchmark, capture/replay,
+or profile an eager step.
 The short convolution all-gathers one `W - 1` token tail per fragment (its last subsequence's) and
 routes its initial-state gradient back to the owning ranks. The delta-rule recurrence computes forward and
 reverse `[bias; transition]` state summaries with portable Triton kernels on Hopper or native
@@ -109,10 +121,15 @@ validates local outputs, convolution and recurrent endpoint states, input gradie
 parameter gradients against the complete unsharded module. It can also capture the full forward,
 NCCL communication, and backward in one CUDA Graph and validate a changed-input replay. Use
 `--compute-dtype=float16` to exercise the FP16 route. Add `--profile` to use transformer-nuggets to
-export one merged multi-rank trace in native Perfetto `.pftrace` format.
+export one merged multi-rank trace in native Perfetto `.pftrace` format. This requires a
+transformer-nuggets source revision with native Perfetto support; older releases lack the exporter:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py
+uv pip install --python .venv/bin/python 'git+https://github.com/drisspg/transformer_nuggets.git'
+```
+
+```bash
+torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --batch-size 4 --tokens 1024
 
 torchrun --standalone --nproc_per_node=2 examples/delta_rule_context_parallel.py --partition zigzag
 

@@ -36,32 +36,38 @@ Pack Zipf-distributed sequence lengths into one physical batch with::
 
 In packed mode, ``batch-size`` is the number of logical sequences and ``tokens``
 is the longest sequence. Add ``--profile`` to export a backend- and shape-named
-Chrome trace. The trace
+native Perfetto trace (``.pftrace``, requires transformer-nuggets). The trace
 contains explicit ``forward`` and ``backward`` record-function ranges. Add
 ``--compile`` to compile the complete module with
 ``torch.compile(fullgraph=True)`` and fuse the PyTorch work around the custom
 delta-rule operator.
+
+The batch, loss/backward, and capture recipes below are also imported by the context-parallel
+example. Numerical assertions, trace export, and benchmark reporting stay in ``attn_gym.testing``.
 """
 
 from __future__ import annotations
 
+import gc
 import math
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from enum import Enum
-from functools import wraps
-from importlib import import_module
-from importlib.util import find_spec
+from functools import partial
 from itertools import accumulate
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import typer
 from torch import nn
 
 from attn_gym.linear import gate_transform
+from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParallelRouting
 from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.kda import (
     MAX_GATE_LOWER_BOUND_MAGNITUDE,
@@ -73,6 +79,13 @@ from attn_gym.linear.kda import (
     mask_inactive_tokens,
 )
 from attn_gym.linear.types import KernelOptions
+from attn_gym.testing import annotate_kernels, kernel_stage, profile_trace, record_function
+from attn_gym.testing.delta_rule import (
+    assert_context_parallel_matches_reference,
+    measure_training_step,
+    profile_training_step,
+    write_benchmark_report,
+)
 
 Backend = Literal["reference", "fused"]
 Variant = Literal["kda", "gdn"]
@@ -106,64 +119,6 @@ class CoreBackendOption(str, Enum):
     MEGA = "mega"
 
 
-def _record_function(enabled: bool, name: str):
-    """Create a profiler range only when profiling is requested."""
-    return torch.profiler.record_function(name) if enabled else nullcontext()
-
-
-@contextmanager
-def _profile_trace(
-    enabled: bool,
-    path: Path,
-    activities: list[torch.profiler.ProfilerActivity],
-) -> Iterator[torch.profiler.profile | None]:
-    """Export an enhanced trace when transformer-nuggets is installed."""
-    if not enabled:
-        yield None
-        return
-
-    if find_spec("transformer_nuggets") is not None:
-        profiler = import_module("transformer_nuggets.utils.benchmark").profiler
-        with profiler(path, record_shapes=True, trace_format="chrome_json") as active_profiler:
-            yield active_profiler
-        return
-
-    with torch.profiler.profile(activities=activities) as active_profiler:
-        yield active_profiler
-    active_profiler.export_chrome_trace(str(path))
-
-
-def mark_kernels(*args: Any, **kwargs: Any):
-    """Load optional CUDA Graph annotations only when they are requested."""
-    from torch.cuda.graph_annotations import mark_kernels as annotate
-
-    return annotate(*args, **kwargs)
-
-
-def annotate_kernels(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Label one stage during annotation-enabled CUDA Graph capture."""
-
-    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
-        @wraps(function)
-        def annotated(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not self.enable_graph_annotations:
-                return function(self, *args, **kwargs)
-            with mark_kernels(name.format(variant=self.variant, backend=self.backend)):
-                return function(self, *args, **kwargs)
-
-        return annotated
-
-    return decorate
-
-
-class DeltaRuleAttentionOutput(NamedTuple):
-    """Hidden states and optional recurrent and convolution states."""
-
-    hidden_states: torch.Tensor
-    final_state: torch.Tensor | None
-    final_conv_state: torch.Tensor | None
-
-
 def packed_sequence_metadata(
     num_sequences: int,
     max_tokens: int,
@@ -174,6 +129,35 @@ def packed_sequence_metadata(
     weights = torch.arange(1, max_tokens + 1, dtype=torch.float64).reciprocal()
     lengths = tuple(torch.multinomial(weights, num_sequences, replacement=True).add(1).tolist())
     return lengths, (0, *accumulate(lengths))
+
+
+class DeltaRuleAttentionOutput(NamedTuple):
+    """Hidden states and optional recurrent and convolution states."""
+
+    hidden_states: torch.Tensor
+    final_state: torch.Tensor | None
+    final_conv_state: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class PackedTrainingBatch:
+    """Global reference tensors and this rank's span and per-call routing.
+
+    ``token_ids`` maps span positions to global token ids; ``terminal_index`` lists the local
+    subsequences that end their sequence and ``terminal_sequences`` the matching global sequence
+    ids, so endpoint states can be compared with the unsharded run.
+    """
+
+    global_hidden: torch.Tensor | None
+    global_target: torch.Tensor | None
+    global_offsets: torch.Tensor
+    local_hidden: torch.Tensor
+    local_target: torch.Tensor
+    routing: ContextParallelRouting
+    token_ids: torch.Tensor
+    terminal_index: torch.Tensor
+    terminal_sequences: torch.Tensor
+    loss_scale: float
 
 
 class DeltaRuleAttention(nn.Module):
@@ -397,13 +381,13 @@ class DeltaRuleAttention(nn.Module):
             final_conv_state,
         )
 
-    @annotate_kernels("{variant}/qkv_projection")
+    @annotate_kernels("{module.variant}/qkv_projection")
     def qkv_projection(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.to(self.compute_dtype)
         qkv = F.linear(hidden_states, self.qkv_proj.weight.to(self.compute_dtype))
         return hidden_states, qkv
 
-    @annotate_kernels("{variant}/short_convolution")
+    @annotate_kernels("{module.variant}/short_convolution")
     def short_convolution(
         self,
         qkv: torch.Tensor,
@@ -447,7 +431,7 @@ class DeltaRuleAttention(nn.Module):
         final_state = conv_input[:, tokens:].clone() if return_final_state else None
         return qkv, final_state
 
-    @annotate_kernels("{variant}/qk_normalization")
+    @annotate_kernels("{module.variant}/qk_normalization")
     def qk_normalization(
         self,
         q: torch.Tensor,
@@ -462,7 +446,7 @@ class DeltaRuleAttention(nn.Module):
 
         return l2norm(q, cu_seqlens=cu_seqlens), l2norm(k, cu_seqlens=cu_seqlens)
 
-    @annotate_kernels("{variant}/gate_projections")
+    @annotate_kernels("{module.variant}/gate_projections")
     def gate_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, tokens, _ = hidden_states.shape
         if self.variant == "kda":
@@ -490,7 +474,7 @@ class DeltaRuleAttention(nn.Module):
         )
         return raw_gate.contiguous(), beta
 
-    @annotate_kernels("{variant}/gate_activation")
+    @annotate_kernels("{module.variant}/gate_activation")
     def gate_activation(self, raw_gate: torch.Tensor) -> torch.Tensor:
         """Map projection outputs to per-token natural-log decay."""
         if self.variant == "kda":
@@ -507,7 +491,7 @@ class DeltaRuleAttention(nn.Module):
             impl=self.backend,
         )
 
-    @annotate_kernels("{variant}/core/{backend}")
+    @annotate_kernels("{module.variant}/core/{module.backend}")
     def delta_rule_core(
         self,
         q: torch.Tensor,
@@ -548,7 +532,7 @@ class DeltaRuleAttention(nn.Module):
             kernel_options=self.kernel_options,
         )
 
-    @annotate_kernels("{variant}/output_normalization")
+    @annotate_kernels("{module.variant}/output_normalization")
     def output_normalization(self, output: torch.Tensor) -> torch.Tensor:
         # TODO: Consider a cu_seqlens-aware RMSNorm for fixed-capacity CUDA Graph
         # replay. Masking makes the inactive suffix numerically inert, but native
@@ -560,7 +544,7 @@ class DeltaRuleAttention(nn.Module):
             eps=self.rms_norm_eps,
         )
 
-    @annotate_kernels("{variant}/output_gate")
+    @annotate_kernels("{module.variant}/output_gate")
     def output_gate(self, hidden_states: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         gate_features = F.linear(
             hidden_states,
@@ -575,12 +559,324 @@ class DeltaRuleAttention(nn.Module):
             .sigmoid()
         )
 
-    @annotate_kernels("{variant}/output_projection")
+    @annotate_kernels("{module.variant}/output_projection")
     def output_projection(self, output: torch.Tensor, output_gate: torch.Tensor) -> torch.Tensor:
         return F.linear(
             (output * output_gate).flatten(-2).to(self.compute_dtype),
             self.out_proj.weight.to(self.compute_dtype),
         )
+
+
+@contextmanager
+def distributed_device() -> Iterator[torch.device]:
+    """Own the single-node NCCL world group launched by torchrun."""
+    if "LOCAL_RANK" not in os.environ:
+        raise RuntimeError("launch with torchrun --standalone --nproc-per-node=<world_size>")
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    try:
+        yield device
+    finally:
+        torch.cuda.synchronize(device)
+        dist.destroy_process_group()
+
+
+def make_context_parallel_batch(
+    plan: ContextParallelPlan,
+    offsets: tuple[int, ...],
+    hidden_size: int,
+    device: torch.device,
+    *,
+    conv_history: int,
+    validate: bool,
+) -> PackedTrainingBatch:
+    """Build a deterministic global stream, retaining only this rank's shard unless validating.
+
+    All ranks use the same data seeds. Without reference validation, generate on CPU and move
+    only the shard: allocating the whole stream on CUDA can leave large cached segments behind
+    and distort the captured benchmark's memory footprint.
+    """
+    token_ids = plan.global_token_ids(device)
+    stream_device = device if validate else torch.device("cpu")
+    global_hidden = torch.randn(
+        1,
+        offsets[-1],
+        hidden_size,
+        device=stream_device,
+        generator=torch.Generator(stream_device).manual_seed(123),
+    )
+    global_target = torch.randn(
+        1,
+        offsets[-1],
+        hidden_size,
+        device=stream_device,
+        generator=torch.Generator(stream_device).manual_seed(124),
+    )
+    shard_ids = token_ids.to(stream_device)
+    return PackedTrainingBatch(
+        global_hidden=global_hidden if validate else None,
+        global_target=global_target if validate else None,
+        global_offsets=torch.tensor(offsets, dtype=torch.int32, device=device),
+        local_hidden=global_hidden[:, shard_ids].to(device).requires_grad_(),
+        local_target=global_target[:, shard_ids].to(device),
+        routing=plan.routing(device, conv_history=conv_history),
+        token_ids=token_ids,
+        terminal_index=torch.tensor(plan.terminal, dtype=torch.long, device=device),
+        terminal_sequences=torch.tensor(
+            [plan.subsequences[index].sequence for index in plan.terminal],
+            dtype=torch.long,
+            device=device,
+        ),
+        loss_scale=1.0 / global_target.numel(),
+    )
+
+
+def run_training_step(
+    module: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    target: torch.Tensor,
+    routing: ContextParallelRouting,
+    state_index: torch.Tensor,
+    loss_scale: float,
+    *,
+    annotate: bool = False,
+) -> tuple[DeltaRuleAttentionOutput, tuple[torch.Tensor, ...]]:
+    """Run the complete module and differentiate its token and endpoint losses."""
+    module.enable_graph_annotations = annotate
+    result = module(
+        hidden_states,
+        routing=routing,
+        return_final_state=True,
+    )
+    return result, training_gradients(
+        module, result, hidden_states, target, state_index, loss_scale, annotate=annotate
+    )
+
+
+def training_gradients(
+    module: torch.nn.Module,
+    result: DeltaRuleAttentionOutput,
+    hidden_states: torch.Tensor,
+    target: torch.Tensor,
+    state_index: torch.Tensor,
+    loss_scale: float,
+    *,
+    annotate: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Differentiate the same token and true-endpoint losses in CP and unsharded runs."""
+    assert result.final_state is not None
+    assert result.final_conv_state is not None
+    loss = F.mse_loss(result.hidden_states.float(), target, reduction="sum") * loss_scale
+    # Only true sequence ends carry a loss; intermediate subsequence states are handed downstream.
+    loss = loss + 1e-4 * result.final_state[state_index].square().sum()
+    loss = loss + 1e-4 * result.final_conv_state[state_index].float().square().sum()
+    inputs = (hidden_states, *tuple(module.parameters()))
+    with kernel_stage("cp/bwd", annotate, backward=False):
+        return torch.autograd.grad(loss, inputs)
+
+
+def validate_against_reference(
+    model: torch.nn.Module,
+    reference_model: torch.nn.Module,
+    batch: PackedTrainingBatch,
+) -> None:
+    """Compare one sharded full-module backward with the unsharded module."""
+    result, gradients = run_training_step(
+        model,
+        batch.local_hidden,
+        batch.local_target,
+        batch.routing,
+        batch.terminal_index,
+        batch.loss_scale,
+    )
+    assert batch.global_hidden is not None and batch.global_target is not None
+    reference_hidden = batch.global_hidden.detach().clone().requires_grad_()
+    # Unsharded, every sequence in the stream ends here, so every exit state is a true final state.
+    every_sequence = torch.arange(
+        batch.global_offsets.shape[0] - 1, device=reference_hidden.device
+    )
+    reference_result = reference_model(
+        reference_hidden, cu_seqlens=batch.global_offsets, return_final_state=True
+    )
+    reference_gradients = training_gradients(
+        reference_model,
+        reference_result,
+        reference_hidden,
+        batch.global_target,
+        every_sequence,
+        batch.loss_scale,
+    )
+
+    assert_context_parallel_matches_reference(
+        [
+            (result.hidden_states, reference_result.hidden_states[:, batch.token_ids]),
+            (gradients[0], reference_gradients[0][:, batch.token_ids]),
+            (
+                result.final_state[batch.terminal_index],
+                reference_result.final_state[batch.terminal_sequences],
+            ),
+            (
+                result.final_conv_state[batch.terminal_index],
+                reference_result.final_conv_state[batch.terminal_sequences],
+            ),
+        ],
+        zip(gradients[1:], reference_gradients[1:], strict=True),
+        model.compute_dtype,
+    )
+
+
+@contextmanager
+def capture_training_graph(
+    make_model: Callable[[], torch.nn.Module],
+    eager_model: torch.nn.Module,
+    batch: PackedTrainingBatch,
+    *,
+    validate: bool = False,
+    annotations: bool = False,
+) -> Iterator[torch.cuda.CUDAGraph]:
+    """Own a captured training step and its backing model/input until the caller finishes.
+
+    Validation retains an eager oracle and captured outputs to check a changed-input replay.
+    Benchmarking discards step outputs and clears the cache before capture instead, so those
+    allocations do not inflate its graph-pool footprint. Both paths use the same stream lifecycle.
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Parameter AccumulateGrad nodes retain their first stream: use a fresh model and keep
+        # its warmup, eager oracle (if requested), and capture on this stream.
+        model = make_model()
+        model.load_state_dict(eager_model.state_dict())
+        static_hidden = batch.local_hidden.detach().clone().requires_grad_()
+        step = partial(
+            run_training_step,
+            model,
+            target=batch.local_target,
+            routing=batch.routing,
+            state_index=batch.terminal_index,
+            loss_scale=batch.loss_scale,
+        )
+        if validate:
+            # Warm up on the changed input that replay will see, before the graph pool exists.
+            eager_hidden = (static_hidden.detach() * 0.75).requires_grad_()
+            eager_result, eager_gradients = step(eager_hidden)
+            del eager_hidden
+        else:
+            step(static_hidden)
+    stream.synchronize()
+    gc.collect()
+    if not validate:
+        # The warmup activations are dead; do not layer the graph pool over their cached segments.
+        torch.cuda.empty_cache()
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream, enable_annotations=annotations):
+            if validate:
+                graph_result, graph_gradients = step(static_hidden, annotate=annotations)
+            else:
+                step(static_hidden, annotate=annotations)
+        torch.cuda.current_stream().wait_stream(stream)
+        if validate:
+            captured_output = graph_result.hidden_states.clone()
+            torch.cuda.synchronize(static_hidden.device)
+            with torch.no_grad():
+                static_hidden.mul_(0.75)
+            graph.replay()
+            torch.cuda.synchronize(static_hidden.device)
+            if torch.equal(graph_result.hidden_states, captured_output):
+                raise AssertionError("CUDA Graph replay did not observe changed inputs")
+            torch.testing.assert_close(graph_result, eager_result)
+            torch.testing.assert_close(graph_gradients, eager_gradients)
+        yield graph
+    finally:
+        torch.cuda.synchronize(static_hidden.device)
+        graph.reset()
+        gc.collect()
+
+
+def profile_eager_step(
+    model: torch.nn.Module,
+    batch: PackedTrainingBatch,
+    profile_path: Path,
+    device: torch.device,
+    warmup_steps: int,
+) -> None:
+    """Profile a complete eager forward/backward on a fresh input leaf."""
+    hidden_states = batch.local_hidden.detach().clone().requires_grad_()
+    profile_training_step(
+        partial(
+            run_training_step,
+            model,
+            hidden_states,
+            batch.local_target,
+            batch.routing,
+            batch.terminal_index,
+            batch.loss_scale,
+        ),
+        profile_path,
+        device,
+        warmup_steps,
+    )
+
+
+def run_benchmark(
+    make_model: Callable[[], torch.nn.Module],
+    model: torch.nn.Module,
+    batch: PackedTrainingBatch,
+    device: torch.device,
+    *,
+    steps: int,
+    warmup_steps: int,
+    cuda_graph: bool,
+    sequence_lengths: tuple[int, ...],
+    partition: str,
+) -> None:
+    """Time steady-state training steps and record per-rank memory; rank 0 writes JSON.
+
+    Step time is measured per rank with CUDA events; the reported step time is
+    the slowest rank per iteration, which is what gates training. Memory is the
+    peak above what is resident before the timed steps (parameters, inputs, and
+    the graph's static buffers when captured).
+    """
+    hidden_states = batch.local_hidden.detach().clone().requires_grad_()
+    # The capture context owns its model and static input through timing and memory sampling.
+    with (
+        capture_training_graph(make_model, model, batch) if cuda_graph else nullcontext()
+    ) as graph:
+        step: Callable[[], object] = (
+            graph.replay
+            if graph is not None
+            else partial(
+                run_training_step,
+                model,
+                hidden_states,
+                batch.local_target,
+                batch.routing,
+                batch.terminal_index,
+                batch.loss_scale,
+            )
+        )
+        measurement = measure_training_step(
+            step,
+            device,
+            steps=steps,
+            warmup_steps=warmup_steps,
+            local_tokens=int(batch.token_ids.numel()),
+        )
+    # Release the graph pool before rank-report collectives allocate staging buffers.
+    write_benchmark_report(
+        measurement,
+        model,
+        device,
+        steps=steps,
+        warmup_steps=warmup_steps,
+        cuda_graph=cuda_graph,
+        sequence_lengths=sequence_lengths,
+        partition=partition,
+    )
 
 
 def main(
@@ -626,8 +922,8 @@ def main(
         bool,
         typer.Option(
             help=(
-                "Export a named Chrome trace with forward/backward ranges and optional "
-                "transformer-nuggets postprocessing."
+                "Export a native Perfetto .pftrace with forward/backward ranges "
+                "(requires transformer-nuggets)."
             )
         ),
     ] = False,
@@ -683,13 +979,13 @@ def main(
 
     def train_step() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
-        with _record_function(profile, f"{profile_name}/forward"):
+        with record_function(profile, f"{profile_name}/forward"):
             output = model(hidden_states, cu_seqlens=cu_seqlens).hidden_states
-        with _record_function(profile, f"{profile_name}/loss"):
+        with record_function(profile, f"{profile_name}/loss"):
             loss = F.mse_loss(output.float(), target)
-        with _record_function(profile, f"{profile_name}/backward"):
+        with record_function(profile, f"{profile_name}/backward"):
             grad_scaler.scale(loss).backward()
-        with _record_function(profile, f"{profile_name}/optimizer"):
+        with record_function(profile, f"{profile_name}/optimizer"):
             grad_scaler.step(optimizer)
             grad_scaler.update()
         return loss
@@ -700,11 +996,8 @@ def main(
         if hidden_states.is_cuda:
             torch.cuda.synchronize(hidden_states.device)
 
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if hidden_states.is_cuda:
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-    profile_path = Path(f"{profile_name}.json")
-    with _profile_trace(profile, profile_path, activities) as active_profiler:
+    profile_path = Path(f"{profile_name}.pftrace")
+    with profile_trace(profile_path) if profile else nullcontext() as active_profiler:
         for step in range(steps):
             loss = train_step()
             if active_profiler is not None:

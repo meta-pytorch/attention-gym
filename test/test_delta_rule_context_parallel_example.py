@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import fields
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -18,7 +21,12 @@ pytest.importorskip("typer")
 from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParallelRouting
 from attn_gym.testing.kda import assert_relative_rms_within
 from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
-from examples.delta_rule_training import DeltaRuleAttention, DeltaRuleAttentionOutput
+from examples.delta_rule_training import (
+    DeltaRuleAttention,
+    DeltaRuleAttentionOutput,
+    PackedTrainingBatch,
+    capture_training_graph,
+)
 
 pytestmark = [
     pytest.mark.skipif(
@@ -202,6 +210,45 @@ def _rank_main(
                 torch.testing.assert_close(output_only.hidden_states, actual[0].hidden_states)
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize(device)
+        if capture:
+            # Exercise the example's shared lifecycle, not only the hand-captured ABI above.
+            batch = PackedTrainingBatch(
+                global_hidden=global_hidden,
+                global_target=global_target,
+                global_offsets=torch.tensor(offsets, device=device, dtype=torch.int32),
+                local_hidden=hidden,
+                local_target=target,
+                routing=new_routing,
+                token_ids=ids,
+                terminal_index=torch.tensor(plan.terminal, device=device, dtype=torch.long),
+                terminal_sequences=torch.tensor(
+                    [plan.subsequences[index].sequence for index in plan.terminal],
+                    device=device,
+                    dtype=torch.long,
+                ),
+                loss_scale=1.0 / global_target.numel(),
+            )
+            make_model = partial(
+                ContextParallelDeltaRuleAttention, **options, group=dist.group.WORLD
+            )
+            for validate in (True, False):
+                # Both normal exit and a caller failure must release the captured graph.
+                error = (
+                    nullcontext()
+                    if validate
+                    else pytest.raises(RuntimeError, match="caller failed")
+                )
+                with (
+                    error,
+                    capture_training_graph(make_model, model, batch, validate=validate) as replay,
+                ):
+                    reset = Mock(wraps=replay.reset)
+                    replay.reset = reset
+                    replay.replay()
+                    torch.cuda.synchronize(device)
+                    if not validate:
+                        raise RuntimeError("caller failed")
+                reset.assert_called_once_with()
     finally:
         if graph is not None:
             graph.reset()

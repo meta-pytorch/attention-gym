@@ -15,6 +15,7 @@ pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires
 
 from attn_gym.linear.context_parallel import ContextParallelRouting
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
+from attn_gym.testing import profiling
 from attn_gym.testing.kda import assert_relative_rms_within
 from examples import delta_rule_training
 from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
@@ -273,7 +274,7 @@ def test_example_marks_cuda_graph_kernel_stages(monkeypatch, variant):
         labels.append(annotation)
         yield
 
-    monkeypatch.setattr(delta_rule_training, "mark_kernels", record_mark_kernels)
+    monkeypatch.setattr(profiling, "mark_kernels", record_mark_kernels)
     model = DeltaRuleAttention(
         hidden_size=32,
         num_heads=1,
