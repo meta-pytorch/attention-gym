@@ -198,18 +198,28 @@ def test_fused_softplus_matches_reference(shape: str, dtype: torch.dtype, fastma
 
 @pytest.mark.parametrize("shape", [SCALAR, VECTOR128])
 @pytest.mark.parametrize("fastmath", [False, True])
-def test_fused_softplus_extreme_logits(shape: str, fastmath: bool):
-    """Huge logits stay finite and tiny negative-logit gradients survive on both backends.
+@pytest.mark.parametrize(
+    ("logits", "a_log"),
+    [
+        pytest.param((3e38, -20.0, 80.0), 0.0, id="huge-logits"),
+        pytest.param((-20.0, -12.0, -8.0), 20.0, id="large-amplitude-small-tail"),
+    ],
+)
+def test_fused_softplus_extreme_logits(
+    shape: str, fastmath: bool, logits: tuple[float, ...], a_log: float
+):
+    """Extreme logits match the reference, with gradients, on both backends.
 
-    Regression: ``(z + |z|) / 2`` overflows for ``z > FLT_MAX / 2`` and ``1 - 1/(1+e)`` cancels
-    the ``sigmoid(z)`` factor to zero for ``z <= -17``.
+    Regressions: ``(z + |z|) / 2`` overflows for ``z > FLT_MAX / 2``; ``1 - 1/(1+e)`` cancels the
+    ``sigmoid(z)`` factor to zero for ``z <= -17``; fastmath ``log2(1 + e)`` rounds the softplus
+    tail to zero, which ``exp(A_log)`` amplifies (``raw=-20, A_log=20`` is a gate of -1, not 0).
     """
     raw_gate, A_log, dt_bias = make_gate_inputs(shape, dtype=torch.float32, requires_grad=True)
     with torch.no_grad():
-        raw_gate[:, 0::3] = 3e38
-        raw_gate[:, 1::3] = -20.0
-        raw_gate[:, 2::3] = 80.0
-        A_log.zero_()
+        for offset, logit in enumerate(logits):
+            raw_gate[:, offset::3] = logit
+        dt_bias.zero_()
+        A_log.fill_(a_log)
     actual = gate_transform(raw_gate, A_log, dt_bias, kind="softplus", fastmath=fastmath)
     expected = gate_transform(raw_gate, A_log, dt_bias, kind="softplus", impl="reference")
     assert torch.isfinite(actual).all()
@@ -217,8 +227,7 @@ def test_fused_softplus_extreme_logits(shape: str, fastmath: bool):
     cotangent = torch.ones_like(expected)
     expected_gradients = torch.autograd.grad(expected, (raw_gate, A_log, dt_bias), cotangent)
     actual_gradients = torch.autograd.grad(actual, (raw_gate, A_log, dt_bias), cotangent)
-    negative_rows = raw_gate[:, 1::3]
-    assert (expected_gradients[0][:, 1::3] != 0).all() and negative_rows.numel() > 0
+    assert (expected_gradients[0][:, 1::3] != 0).all()
     for actual_gradient, expected_gradient in zip(
         actual_gradients, expected_gradients, strict=True
     ):
@@ -368,7 +377,7 @@ def test_fused_softplus_fullgraph_dynamic_tokens(shape: str):
 def test_bound_gate_is_bounded_gate_transform():
     """``bound_gate`` keeps its per-channel contract and equals ``kind="bounded"``."""
     inputs = make_gate_inputs(VECTOR128)
-    for impl in ("reference", "fused"):
+    for impl in ("reference", "fused") if CUTE_CAPABLE else ("reference",):
         expected = gate_transform(*inputs, kind="bounded", lower_bound=-3.25, impl=impl)
         actual = bound_gate(*inputs, lower_bound=-3.25, impl=impl)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

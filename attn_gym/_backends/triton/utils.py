@@ -11,6 +11,7 @@ import triton.language as tl
 # Kernels fold natural-log inputs into the faster exp2 with ``exp(x) == exp2(x * LOG2_E)``.
 # Wrapped as a constexpr so ``@triton.jit`` functions can reference it as a module global.
 LOG2_E = tl.constexpr(math.log2(math.e))
+LN_2 = tl.constexpr(math.log(2.0))
 
 SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
 autotune_cache_kwargs = {"cache_results": True} if SUPPORTS_AUTOTUNE_CACHE else {}

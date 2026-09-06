@@ -19,22 +19,21 @@ without atomics.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from attn_gym._backends.triton.utils import LOG2_E, ptr_offset
+from attn_gym._backends.triton.utils import LN_2, LOG2_E, ptr_offset
 
-LN_2 = tl.constexpr(math.log(2.0))
 # Matches ``torch.nn.functional.softplus``: above this input the identity is exact in FP32.
 SOFTPLUS_THRESHOLD = tl.constexpr(20.0)
-# Elements per program with the channel block capped so narrow per-head gates (H=32) and wide
-# per-channel gates (H*128) both fill four warps; a sweep of 512-16K elements and 1-8 warps on
-# GB200 found no better point.
-ELEMENTS_PER_PROGRAM = 2048
+# (elements per program, warps): 16 elements per thread in both kernels, but the forward wants
+# many one-warp CTAs while the backward's per-program partial reductions want four warps. Swept
+# 256-16K elements x 1-8 warps on GB200 over per-head (H=32, 64) and per-channel (H*128) gates;
+# the channel block is capped so narrow gates still get several rows per program.
+FWD_PROGRAM = (512, 1)
+BWD_PROGRAM = (2048, 4)
 MAX_BLOCK_CHANNELS = 256
 
 # NOTE [Fastmath Softplus]
@@ -42,16 +41,21 @@ MAX_BLOCK_CHANNELS = 256
 # rounding) issues ~60 instructions per element and caps this kernel at about half of HBM
 # bandwidth. The fastmath path uses the MUFU ``ex2.approx``/``lg2.approx`` intrinsics through the
 # overflow-free form ``max(s, 0) + log(1 + exp(-|s|))``, which needs no threshold branch and
-# reaches the memory roofline. Its absolute error matches FP32 eager (~6e-7 on N(0, 4) inputs);
-# relative error is large only where softplus underflows toward zero, which the downstream
-# ``exp(gate)`` cannot see. ``tl.log2`` is not a shortcut here: Triton lowers it to a
-# polynomial, not ``lg2.approx``.
+# reaches the memory roofline. ``log2(1 + e)`` loses the tail once ``1 + e`` rounds to 1, and
+# ``exp(A_log)`` can be large enough to make that tail matter (``raw=-20, A_log=20`` gives a gate
+# of -1, not 0), so below ``SMALL_TAIL`` the tail uses its series ``e - e^2/2`` (relative error
+# ``e^2/3 < 1e-5``). With that branch the absolute error matches FP32 eager (~6e-7 on N(0, 4)
+# inputs). ``tl.log2`` is not a shortcut here: Triton lowers it to a polynomial, not
+# ``lg2.approx``.
+SMALL_TAIL = tl.constexpr(2.0**-8)
 
 
 @triton.jit
 def _softplus(s, FASTMATH: tl.constexpr):
     if FASTMATH:  # See NOTE [Fastmath Softplus]
-        return tl.maximum(s, 0.0) + libdevice.fast_log2f(1.0 + tl.exp2(-tl.abs(s) * LOG2_E)) * LN_2
+        e = tl.exp2(-tl.abs(s) * LOG2_E)
+        tail = tl.where(e < SMALL_TAIL, e - 0.5 * e * e, libdevice.fast_log2f(1.0 + e) * LN_2)
+        return tl.maximum(s, 0.0) + tail
     return tl.where(s > SOFTPLUS_THRESHOLD, s, libdevice.log1p(libdevice.exp(s)))
 
 
@@ -206,10 +210,10 @@ def softplus_gate_bwd_kernel(
     tl.store(d_A_log_partial + i_row_block * C + o_c, tl.sum(d_amplitude_log, 0), mask=m_c)
 
 
-def _launch_config(channels: int) -> tuple[int, int]:
-    """Pick ``(BLOCK_ROWS, BLOCK_C)`` so one program covers ``ELEMENTS_PER_PROGRAM`` elements."""
+def _launch_config(channels: int, elements_per_program: int) -> tuple[int, int]:
+    """Pick ``(BLOCK_ROWS, BLOCK_C)`` so one program covers ``elements_per_program`` elements."""
     block_channels = min(triton.next_power_of_2(channels), MAX_BLOCK_CHANNELS)
-    return max(1, ELEMENTS_PER_PROGRAM // block_channels), block_channels
+    return max(1, elements_per_program // block_channels), block_channels
 
 
 def _softplus_gate_fwd_cuda(
@@ -225,7 +229,8 @@ def _softplus_gate_fwd_cuda(
     batch, tokens, heads, head_dim = raw_gate.shape
     rows, channels = batch * tokens, heads * head_dim
     gate = torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
-    block_rows, block_channels = _launch_config(channels)
+    elements_per_program, num_warps = FWD_PROGRAM
+    block_rows, block_channels = _launch_config(channels, elements_per_program)
     softplus_gate_fwd_kernel[
         (triton.cdiv(rows, block_rows), triton.cdiv(channels, block_channels))
     ](
@@ -244,7 +249,7 @@ def _softplus_gate_fwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return gate.view(shape)
 
@@ -263,7 +268,8 @@ def _softplus_gate_bwd_cuda(
     batch, tokens, heads, head_dim = raw_gate.shape
     rows, channels = batch * tokens, heads * head_dim
     d_raw_gate = torch.empty_like(raw_gate, memory_format=torch.contiguous_format)
-    block_rows, block_channels = _launch_config(channels)
+    elements_per_program, num_warps = BWD_PROGRAM
+    block_rows, block_channels = _launch_config(channels, elements_per_program)
     row_blocks = triton.cdiv(rows, block_rows)
     d_A_log_partial = torch.empty(
         row_blocks, channels, device=raw_gate.device, dtype=torch.float32
@@ -289,7 +295,7 @@ def _softplus_gate_bwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
-        num_warps=4,
+        num_warps=num_warps,
     )
     d_A_log = d_A_log_partial.view(row_blocks, heads, head_dim).sum((0, 2))
     return d_raw_gate.view(shape), d_A_log, d_dt_bias_partial.sum(0).view(shape[2:])

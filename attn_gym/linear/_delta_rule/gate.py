@@ -274,7 +274,7 @@ def gate_transform(
         raise TypeError(f"fastmath must be bool, got {type(fastmath).__name__}")
     if raw_gate.dtype not in _SUPPORTED_FUSED_DTYPES or not raw_gate.is_cuda:
         raise ValueError("gate_transform(impl='fused') requires CUDA FP16, BF16, or FP32 raw_gate")
-    if not torch.compiler.is_compiling() and min(raw_gate.shape) < 1:
+    if min(raw_gate.shape) < 1:
         raise ValueError("gate_transform(impl='fused') requires nonzero raw_gate dimensions")
     if kind is GateTransform.BOUNDED and (raw_gate.ndim != 4 or raw_gate.shape[3] != 128):
         raise ValueError(

@@ -55,6 +55,9 @@ _THREADS = 128
 _VALUES_PER_THREAD = 8
 _ALIGNMENT = 16
 _LN_2 = math.log(2.0)
+# Below this ``exp(-|z|)`` the fastmath ``log2(1 + e)`` has lost the tail; see NOTE [Fastmath
+# Softplus] in attn_gym/linear/_delta_rule/triton/softplus_gate.py.
+_SMALL_TAIL = 2.0**-8
 
 
 @dataclass(frozen=True)
@@ -81,14 +84,22 @@ def softplus_terms(z, fastmath: cutlass.Constexpr[bool]):
     fastmath trades the accurate ``log1p`` for the MUFU ``ex2``/``lg2`` intrinsics.
     """
     magnitude = cute.math.abs(z)
+    is_vector = isinstance(z, cute.TensorSSA)
     if cutlass.const_expr(fastmath):
         e = cute.math.exp2(-magnitude * Float32(LOG2_E), fastmath=True)
-        tail = cute.math.log2(Float32(1.0) + e, fastmath=True) * Float32(_LN_2)
+        approx_tail = cute.math.log2(Float32(1.0) + e, fastmath=True) * Float32(_LN_2)
+        series_tail = e - Float32(0.5) * e * e
+        if cutlass.const_expr(is_vector):
+            tail = cute.where(e < Float32(_SMALL_TAIL), series_tail, approx_tail)
+        else:
+            tail = approx_tail
+            if e < Float32(_SMALL_TAIL):
+                tail = series_tail
     else:
         e = cute.math.exp(-magnitude)
         tail = cute.math.log1p(e)
     # cute.math.max needs operands of one kind: a TensorSSA zero for vectors, a scalar otherwise.
-    if cutlass.const_expr(isinstance(z, cute.TensorSSA)):
+    if cutlass.const_expr(is_vector):
         positive = cute.math.max(z, cute.zeros_like(z))
     else:
         positive = cute.math.max(z, Float32(0.0))
