@@ -16,23 +16,23 @@ Like all good things the only thing this training run proves is that it can over
 
 Run a reference training step with::
 
-    python examples/delta_rule_training.py --backend=reference
+    python examples/linear/delta_rule_training.py --backend=reference
 
 On a Hopper or Blackwell GPU, exercise the fused backend with::
 
-    python examples/delta_rule_training.py --backend=fused
+    python examples/linear/delta_rule_training.py --backend=fused
 
 Train the GDN variant instead of KDA with::
 
-    python examples/delta_rule_training.py --variant=gdn --backend=fused
+    python examples/linear/delta_rule_training.py --variant=gdn --backend=fused
 
 Run the fused training loop in FP16 with::
 
-    python examples/delta_rule_training.py --backend=fused --compute-dtype=float16
+    python examples/linear/delta_rule_training.py --backend=fused --compute-dtype=float16
 
 Pack Zipf-distributed sequence lengths into one physical batch with::
 
-    python examples/delta_rule_training.py --backend=fused --packed --batch-size=4 --tokens=256
+    python examples/linear/delta_rule_training.py --backend=fused --packed --batch-size=4 --tokens=256
 
 In packed mode, ``batch-size`` is the number of logical sequences and ``tokens``
 is the longest sequence. Add ``--profile`` to export a backend- and shape-named

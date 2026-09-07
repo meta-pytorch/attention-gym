@@ -37,6 +37,8 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor, tensor_supports_tma
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
+from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import CHUNK_SIZE, prepare_span, zero_state
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
@@ -44,7 +46,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     _finish_chunk_kda_bwd,
     _prepare_chunk_kda_bwd,
 )
-from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     ChunkKDAFactors,
     _finish_chunk_kda_fwd,
@@ -57,7 +58,6 @@ from attn_gym.linear.kda.impl.mega_ops import (
     chunk_mega_packed_fwd_with_state_op,
     validate_mega_available,
 )
-from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
 from attn_gym.linear.types import KernelOptions
 

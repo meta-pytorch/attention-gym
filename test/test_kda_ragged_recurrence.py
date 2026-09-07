@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda import chunk_scheduler
+from attn_gym.linear._delta_rule.triton import chunk_scheduler
 from attn_gym.linear.kda.chunk_scheduler import (
     RaggedChunkMetadata,
     ScheduleRequest,

@@ -6,11 +6,8 @@
 
 """Shared mathematical and structural constants for KDA implementations."""
 
-import math
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE, LN2, LOG2_E
 
-LN2 = math.log(2.0)
-LOG2_E = math.log2(math.e)
-DEFAULT_CHUNK_SIZE = 64
 SM100_KDA_CAPABILITIES = frozenset(((10, 0), (10, 3)))
 
 

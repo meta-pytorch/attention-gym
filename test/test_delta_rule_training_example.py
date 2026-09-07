@@ -17,9 +17,9 @@ from attn_gym.linear.context_parallel import ContextParallelRouting
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.testing import profiling
 from attn_gym.testing.kda import assert_relative_rms_within
-from examples import delta_rule_training
-from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
-from examples.delta_rule_training import DeltaRuleAttention, packed_sequence_metadata
+from examples.linear import delta_rule_training
+from examples.linear.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
+from examples.linear.delta_rule_training import DeltaRuleAttention, packed_sequence_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),

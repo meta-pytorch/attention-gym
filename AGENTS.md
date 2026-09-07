@@ -22,17 +22,16 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 - `graphormer` — Graphormer spatial + edge encodings (learnable shortest-path biases)
 - `latent_attention` — latent/compressed attention
 
-**Paged attention example** (`examples/paged_attention/`) — `PagedAttention` example for efficient inference with variable-length KV caches using fixed-size page blocks.
+**Paged attention example** (`examples/flex_attention/paged_attention.py`) — `PagedAttention` example for efficient inference with variable-length KV caches using fixed-size page blocks.
 
 **Utilities** (`attn_gym/utils.py`) — helpers for visualizing and debugging `score_mod`/`mask_mod` functions.
 
-**Examples** (`examples/`) — end-to-end usage and benchmarks:
-- `benchmark.py` — performance comparison of mask implementations
-- `mla.py` — Multi-Head Latent Attention (DeepSeek-style)
-- `delta_rule_training.py` — trainable single-device KDA/GDN showcase with reference or fused backends
-- `flex_attn.ipynb` — interactive notebook walkthrough
-- `debug_score_mod.py` — marimo app for interactive score_mod debugging
-- `flex_determinism.py` — determinism testing for flex_attention
+**Examples** (`examples/`) — end-to-end usage and benchmarks, at most one directory level deep:
+- `flex_attention/` — masks/score mods, notebooks, MLA, paged/ring attention, and runtime integration
+- `linear/` — KDA/GDN training, context parallelism, and decoding
+- `sparse/` — compressed sparse attention, VSA, and FastWan integration
+
+Keep variant-specific names in filenames rather than adding nested example directories.
 
 ## Quick Start
 

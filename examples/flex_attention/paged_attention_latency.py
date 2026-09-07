@@ -2,7 +2,7 @@
 Benchmarking the latency of a paged attention layer against a non-paged attention layer.
 
 Command:
-    python3 latency.py --setting change_max_seq_len
+    python examples/flex_attention/paged_attention_latency.py --setting change_max_seq_len
 """
 
 import torch
@@ -11,7 +11,12 @@ from torch.nn.attention.flex_attention import (
     create_block_mask,
     noop_mask,
 )
-from utils import gen_offset, generate_score_mod, random_init_paged_attention
+
+from examples.flex_attention.paged_attention_utils import (
+    gen_offset,
+    generate_score_mod,
+    random_init_paged_attention,
+)
 
 dtype = torch.bfloat16
 
@@ -30,7 +35,10 @@ def benchmark_layer(
     converted_score_mod,
     dtype=torch.bfloat16,
 ):
-    from model import NonPagedAttentionLayer, PagedAttentionLayer
+    from examples.flex_attention.paged_attention_model import (
+        NonPagedAttentionLayer,
+        PagedAttentionLayer,
+    )
 
     # compile model
     non_paged_foo = torch.compile(

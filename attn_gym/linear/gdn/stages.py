@@ -21,6 +21,8 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
+from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import prepare_span, zero_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
@@ -39,8 +41,6 @@ from attn_gym.linear.gdn.impl.chunk import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
-from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
-from attn_gym.linear.kda.ops import _plain_gate_scan_op
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:

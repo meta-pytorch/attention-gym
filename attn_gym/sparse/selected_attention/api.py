@@ -35,11 +35,12 @@ def _validate_inputs(
     local_kv: Tensor,
     sparse_kv: Tensor,
     kv_indices: Tensor,
-    attention_sink: Tensor,
-    doc_ids: Tensor,
-    sliding_window_size: Tensor,
+    attention_sink: Tensor | None,
+    doc_ids: Tensor | None,
+    sliding_window_size: int,
     share_kv: bool,
 ) -> None:
+    """Validate tensor metadata without reading values or skipping compiled callers."""
     if type(sliding_window_size) is not int:
         raise TypeError(
             f"sliding_window_size must be a Python int, got {type(sliding_window_size).__name__}."
@@ -51,6 +52,11 @@ def _validate_inputs(
         "sparse_kv": sparse_kv,
         "kv_indices": kv_indices,
     }
+
+    if attention_sink is not None:
+        tensors["attention_sink"] = attention_sink
+    if doc_ids is not None:
+        tensors["doc_ids"] = doc_ids
 
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
@@ -91,29 +97,27 @@ def _validate_inputs(
 
     expected_kv_heads = 1 if share_kv else heads
     if (
+        sparse_kv.ndim != 4
+        or sparse_kv.shape[0] != batch
+        or sparse_kv.shape[1] != expected_kv_heads
+        or sparse_kv.shape[3] != head_dim
+    ):
+        expected_h = "1" if share_kv else "heads"
+        raise ValueError(
+            f"sparse_kv must have shape [batch, {expected_h}, sparse_sequence_length, head_dim], "
+            f"got {list(sparse_kv.shape)}."
+        )
+    if (
         local_kv.ndim != 4
         or local_kv.shape[0] != batch
         or local_kv.shape[1] != expected_kv_heads
         or local_kv.shape[2] != sequence_length
         or local_kv.shape[3] != head_dim
     ):
-        expected_h = "1 or heads" if share_kv else "heads"
+        expected_h = "1" if share_kv else "heads"
         raise ValueError(
             f"local_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
             f"got {list(local_kv.shape)}."
-        )
-    sparse_seq_len = sparse_kv.shape[2]
-
-    if (
-        sparse_kv.ndim != 4
-        or sparse_kv.shape[0] != batch
-        or sparse_kv.shape[1] != expected_kv_heads
-        or sparse_kv.shape[3] != head_dim
-    ):
-        expected_h = "1 or heads" if share_kv else "heads"
-        raise ValueError(
-            f"sparse_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
-            f"got {list(sparse_kv.shape)}."
         )
 
     if (
@@ -131,6 +135,7 @@ def _validate_inputs(
         )
     if kv_indices.device != query.device:
         raise ValueError(f"kv_indices must be on {query.device}, got {kv_indices.device}.")
+    sparse_seq_len = sparse_kv.shape[2]
     num_topk = kv_indices.shape[2]
     if num_topk > sparse_seq_len:
         raise ValueError(
@@ -139,8 +144,6 @@ def _validate_inputs(
         )
 
     if attention_sink is not None:
-        if not isinstance(attention_sink, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
         if attention_sink.dtype not in (query.dtype, torch.float32):
             raise ValueError(
                 "attention_sink must have the same dtype as query or use torch.float32, "
@@ -156,15 +159,12 @@ def _validate_inputs(
             )
 
     # --- doc_ids (optional) ---
-    if doc_ids is not None:
-        if not isinstance(doc_ids, torch.Tensor):
-            raise TypeError(
-                f"doc_ids must be a torch.Tensor or None, got {type(doc_ids).__name__}."
-            )
-        if doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length:
-            raise ValueError(
-                f"doc_ids must have shape [batch, sequence_length], got {list(doc_ids.shape)}."
-            )
+    if doc_ids is not None and (
+        doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length
+    ):
+        raise ValueError(
+            f"doc_ids must have shape [batch, sequence_length], got {list(doc_ids.shape)}."
+        )
 
 
 @overload
@@ -267,18 +267,20 @@ def selected_attention(
             output has shape (batch_size, num_heads, sequence_length, head_dim) and
             aux.lse has shape (batch_size, num_heads, sequence_length) when requested.
     """
-    share_kv = sparse_kv.shape[1] == 1
-    if not torch.compiler.is_compiling():
-        _validate_inputs(
-            query,
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            attention_sink,
-            doc_ids,
-            sliding_window_size,
-            share_kv,
-        )
+    if mode not in ("auto", "chunked"):
+        raise ValueError(f"mode must be 'auto' or 'chunked', got {mode!r}.")
+
+    share_kv = isinstance(sparse_kv, Tensor) and sparse_kv.ndim == 4 and sparse_kv.shape[1] == 1
+    _validate_inputs(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
+        share_kv,
+    )
 
     match backend:
         case "eager":

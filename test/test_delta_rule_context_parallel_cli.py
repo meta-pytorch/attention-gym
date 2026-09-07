@@ -10,8 +10,8 @@ pytest.importorskip("cutlass")
 typer = pytest.importorskip("typer")
 from typer.testing import CliRunner
 
-from examples import delta_rule_context_parallel as cp
-from examples.delta_rule_training import packed_sequence_metadata
+from examples.linear import delta_rule_context_parallel as cp
+from examples.linear.delta_rule_training import packed_sequence_metadata
 
 
 @pytest.mark.parametrize("explicit_lengths", [False, True])

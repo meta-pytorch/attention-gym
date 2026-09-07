@@ -2,7 +2,7 @@
 
 Run-to-run determinism is important for workloads such as long reinforcement-learning rollouts and Mixture-of-Experts models. This guide explains how to make FlexAttention produce bitwise-identical results across repeated runs on the same hardware and software stack.
 
-The accompanying [`examples/flex_determinism.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_determinism.py) script tests the behavior described below across standard attention, decoding, grouped-query attention, and long-context shapes.
+The accompanying [`examples/flex_attention/flex_determinism.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_attention/flex_determinism.py) script tests the behavior described below across standard attention, decoding, grouped-query attention, and long-context shapes.
 
 !!! note
     This guide covers repeatability between runs with the same environment. It does not guarantee bitwise equivalence across different PyTorch or compiler versions, GPU architectures, or kernel configurations.
@@ -102,7 +102,7 @@ Pinning `kernel_options` prevents FlexAttention's main kernels from changing con
 Run the repository's determinism example on a CUDA system:
 
 ```bash
-python examples/flex_determinism.py
+python examples/flex_attention/flex_determinism.py
 ```
 
 The script resets compiler state and uses fresh Inductor caches between runs so that it tests repeatability across independent compilations rather than repeatedly executing one cached kernel.
@@ -139,7 +139,7 @@ The reference implementations compute in FP32 even inside an autocast region.
 ## References
 
 - [FlexAttention API reference](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)
-- [FlexAttention determinism test script](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_determinism.py)
+- [FlexAttention determinism test script](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_attention/flex_determinism.py)
 - [Inductor deterministic configuration](https://github.com/pytorch/pytorch/blob/901bbcba122825c817cac9e0b88221096fcd74ae/torch/_inductor/config.py#L712)
 - [Inductor benchmark-distortion test configuration](https://github.com/pytorch/pytorch/blob/901bbcba122825c817cac9e0b88221096fcd74ae/torch/_inductor/config.py#L2102)
 - [Inductor reduction-filter test configuration](https://github.com/pytorch/pytorch/blob/901bbcba122825c817cac9e0b88221096fcd74ae/torch/_inductor/config.py#L2094)

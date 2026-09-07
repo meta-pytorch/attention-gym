@@ -8,8 +8,8 @@ import torch
 pytest.importorskip("cutlass", reason="the example modules import their optional fused kernels")
 pytest.importorskip("typer")
 
-from examples.delta_rule_context_parallel import partition_fragments
-from examples.delta_rule_training import packed_sequence_metadata
+from examples.linear.delta_rule_context_parallel import partition_fragments
+from examples.linear.delta_rule_training import packed_sequence_metadata
 
 
 @pytest.mark.parametrize("seed", [0, 7, 123])

@@ -196,7 +196,7 @@ The KDA references use token-major tensors: query, key, and per-channel gate are
 PyTorch autograd and an optional recurrent state shaped `[N, H, V, K]`. Paged prefill and decode
 use the same axis order with the leading dimension interpreted as cache slots.
 
-`examples/delta_rule_training.py` builds these operations into a small trainable
+`examples/linear/delta_rule_training.py` builds these operations into a small trainable
 `[B, T, hidden_size] -> [B, T, hidden_size]` attention module (`--variant=kda`; the same module
 runs the GDN recipe with `--variant=gdn`, swapping only the gate and the core). To mirror the
 main Kimi block structure, projected Q/K/V pass through a causal depthwise SiLU
@@ -319,7 +319,7 @@ the selected implementation owns its sequence-local scan and scheduling. Set
 `cu_seqlens[-1]`; dense and exact-packed
 callers leave it disabled and pay no masking cost. The optimized boundaries are
 first-order and do not support higher-order autograd. Run
-`python examples/delta_rule_training.py --backend=fused --packed --batch-size=4 --tokens=256`
+`python examples/linear/delta_rule_training.py --backend=fused --packed --batch-size=4 --tokens=256`
 to sample token-level lengths from a truncated Zipf distribution, pack them exactly
 into one physical batch, print their `cu_seqlens`, and pass those offsets through the
 complete training step. The complete composed core forward and backward use private custom
@@ -353,7 +353,7 @@ The module can sit behind a transformer layer's attention slot while state is
 threaded explicitly:
 
 ```python
-from examples.delta_rule_training import DeltaRuleAttention
+from examples.linear.delta_rule_training import DeltaRuleAttention
 
 attention = DeltaRuleAttention(hidden_size=512, num_heads=4, head_dim=128).cuda()
 first = attention(hidden_states[:, :128], return_final_state=True)
@@ -533,7 +533,7 @@ fixed-shape device tensors; `summary_slots` / `grad_summary_slots` fill a rank's
 buffer from a prepared handle and a routing, and `compose_entry_states` /
 `compose_exit_cotangents` fold the gathered `[world, slots, ...]` buffers into each subsequence's
 entry state or exit cotangent; the collective in between is the caller's.
-[`examples/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/delta_rule_context_parallel.py)
+[`examples/linear/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/delta_rule_context_parallel.py)
 builds contiguous and zig-zag fragment lists in a dozen lines.
 
 ### Communication: the all-gather recipe

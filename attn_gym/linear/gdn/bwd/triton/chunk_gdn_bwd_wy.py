@@ -18,7 +18,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,

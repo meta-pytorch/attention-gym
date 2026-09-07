@@ -1,7 +1,7 @@
 """Verify that composing CSA from selected_attention matches the standalone reference.
 
 The composition path (CSA built from selected_attention) is imported directly
-from examples/compressed_sparse_attention.py. The standalone reference CSA is
+from examples/sparse/compressed_sparse_attention.py. The standalone reference CSA is
 defined inline here for comparison.
 """
 
@@ -35,7 +35,10 @@ pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
 
 def _load_csa_example():
     example_path = (
-        Path(__file__).resolve().parents[1] / "examples" / "compressed_sparse_attention.py"
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "sparse"
+        / "compressed_sparse_attention.py"
     )
     spec = spec_from_file_location("_compressed_sparse_attention_example", example_path)
     if spec is None or spec.loader is None:

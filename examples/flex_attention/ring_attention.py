@@ -1,7 +1,7 @@
 """Run a Ring Attention example by directly invoking FlexAttention primitives.
 
 Launch with:
-    torchrun --standalone --nproc_per_node=<world_size> examples/ring_attention.py --seq-len <global_seq_len>
+    torchrun --standalone --nproc_per_node=<world_size> examples/flex_attention/ring_attention.py --seq-len <global_seq_len>
 """
 
 import argparse
@@ -214,7 +214,7 @@ def init_distributed(seq_len: int) -> tuple[torch.device, RingShard]:
     if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         raise RuntimeError(
             "Launch with `torchrun --standalone --nproc_per_node=<world_size> "
-            "examples/ring_attention.py --seq-len <global_seq_len>`."
+            "examples/flex_attention/ring_attention.py --seq-len <global_seq_len>`."
         )
     local_rank = int(os.environ["LOCAL_RANK"])
     declared_world_size = int(os.environ["WORLD_SIZE"])

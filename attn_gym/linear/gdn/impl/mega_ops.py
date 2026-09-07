@@ -85,7 +85,7 @@ def _validate_packed_boundaries(cu_seqlens: Tensor, q: Tensor) -> None:
         or cu_seqlens.device != q.device
     ):
         raise TypeError("cu_seqlens must be a contiguous int32 vector on q.device")
-    from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import _prepare_ragged_chunk_offsets
 
     _prepare_ragged_chunk_offsets(cu_seqlens, q.shape[1], 64)
 

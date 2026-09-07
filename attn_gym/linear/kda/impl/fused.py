@@ -5,9 +5,9 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
+from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.ops import (
-    _plain_gate_scan_op,
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
     chunk_fwd_op,
