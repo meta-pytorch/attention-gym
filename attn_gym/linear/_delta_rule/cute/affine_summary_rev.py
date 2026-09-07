@@ -55,6 +55,7 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     MAX_RANGES,
     decode_work_row,
     plan_work_budget,
+    zero_tail_tokens,
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
@@ -503,50 +504,6 @@ class BlackwellDeltaAffineSummaryRev:
         return column_tile, head, work, start, length, chunk_begin, chunk_end
 
     @cute.jit
-    def _neutralize_do_tail(self, smem, stage, valid_rows, tid):
-        """Zero ``dO`` token rows ``>= valid_rows`` of one B-operand stage before UMMA reads it."""
-        column_atom = cute.size(smem, mode=[0, 0])
-        token_atom = cute.size(smem, mode=[0, 1])
-        assert column_atom * cute.size(smem, mode=[1]) == self.BN, "column modes must tile BN"
-        assert token_atom * cute.size(smem, mode=[2]) == self.BT, "token modes must tile BT"
-        for token in cutlass.range(valid_rows, self.BT, unroll=1):
-            for column_block in cutlass.range_constexpr(
-                (self.BN + self.WARP_SIZE - 1) // self.WARP_SIZE
-            ):
-                column = tid + column_block * self.WARP_SIZE
-                if column < self.BN:
-                    coordinate = (
-                        (column % column_atom, token % token_atom),
-                        column // column_atom,
-                        token // token_atom,
-                        stage,
-                    )
-                    smem[coordinate] = self.io_type(0.0)
-        cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
-
-    @cute.jit
-    def _neutralize_w_tail(self, smem, stage, valid_rows, tid):
-        """Zero ``w^T`` token columns ``>= valid_rows`` of one A-operand stage before UMMA reads it."""
-        row_atom = cute.size(smem, mode=[0, 0, 0])
-        token_atom = cute.size(smem, mode=[0, 1])
-        assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
-        assert row_atom * cute.size(smem, mode=[0, 0, 1]) == self.BK
-        assert token_atom * cute.size(smem, mode=[2]) == self.BT
-        for token in cutlass.range(valid_rows, self.BT, unroll=1):
-            for row_block in cutlass.range_constexpr(self.BK // self.WARP_SIZE):
-                row = tid + row_block * self.WARP_SIZE
-                coordinate = (
-                    ((row % row_atom, row // row_atom), token % token_atom),
-                    0,
-                    token // token_atom,
-                    stage,
-                )
-                smem[coordinate] = self.io_type(0.0)
-        cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
-
-    @cute.jit
     def _tail_valid_rows(self, length):
         """Valid token rows of a range's last chunk, or zero when that chunk is full."""
         rows = length - ((length + self.BT - 1) // self.BT - 1) * self.BT
@@ -791,10 +748,8 @@ class BlackwellDeltaAffineSummaryRev:
             )
             has_source = column_tile < VAL_DIM // self.BN
 
-            # The range starts at token ``start``: offset every descriptor along its token mode
-            # so chunk ``ct`` reads tokens ``start + ct * BT`` onward. A partial last chunk
-            # over-reads the following tokens; the MMA warp neutralizes them through ``do`` and
-            # ``w`` and the gate row is clamped to the range's final token.
+            # A partial last chunk clamps the gate row here; the MMA warp zeroes every
+            # token-indexed operand stage past the range boundary.
             k_desc = cute.domain_offset((start, 0, (0, 0)), desc_k)
             w_desc = cute.domain_offset((0, start, (0, 0)), desc_w)
             gate_desc = cute.domain_offset((0, start, (0, 0)), desc_gate)
@@ -950,7 +905,10 @@ class BlackwellDeltaAffineSummaryRev:
         t_wdv_acc,
         t_w,
         t_dv,
+        s_k,
+        s_q,
         s_do,
+        s_aqk,
         s_w,
         state_consumer,
         k_consumer,
@@ -965,10 +923,10 @@ class BlackwellDeltaAffineSummaryRev:
     ):
         """Issue the four UMMA operations for each reverse chunk.
 
-        MMA1 (``kg @ X``) and MMA4 (``w^T @ dv``) each run two accumulate passes
-        over the hi/lo halves of their fp32-valued B operand. On a range's partial last
-        chunk the ``dO`` and ``w`` stages are zeroed past the valid rows before UMMA reads
-        them, so over-read tokens contribute nothing.
+        MMA1 (``kg @ X``) and MMA4 (``w^T @ dv``) each run two accumulate passes over the
+        hi/lo halves of their fp32-valued B operand. On a partial last chunk, ``kg``, ``qg^T``,
+        ``dO``, ``Aqk^T``, and ``w^T`` are zeroed past the range boundary before UMMA reads them.
+        Multiplying by a zero mask would retain NaN/Inf from uninitialized capacity slack.
         """
         cute.arch.setmaxregister_decrease(self.aux_regs)
         tid, _, _ = cute.arch.thread_idx()
@@ -998,8 +956,15 @@ class BlackwellDeltaAffineSummaryRev:
                     do_handle = do_consumer.wait_and_advance()
                     aqk_handle = aqk_consumer.wait_and_advance()
                     if is_tail:
-                        # Tokens past the range feed both Aqk^T dO and qg^T dO through dO.
-                        self._neutralize_do_tail(s_do, do_handle.index, tail_valid_rows, mma_tid)
+                        zero_tail_tokens(
+                            s_do, do_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
+                        )
+                        zero_tail_tokens(
+                            s_q, q_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
+                        )
+                        zero_tail_tokens(
+                            s_aqk, aqk_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
+                        )
                     for k_block in cutlass.range(cute.size(t_aqk, mode=[2]), unroll_full=True):
                         mma_aqdo.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(k_block != 0))
                         cute.gemm(
@@ -1026,6 +991,10 @@ class BlackwellDeltaAffineSummaryRev:
                     do_handle.release()
 
                 k_handle = k_consumer.wait_and_advance()
+                if is_tail:
+                    zero_tail_tokens(
+                        s_k, k_handle.index, tail_valid_rows, mma_tid, self.io_type, 0
+                    )
                 for split in cutlass.range_constexpr(2):
                     # Each hi/lo half is one pipeline stage, published separately.
                     state_handle = state_consumer.wait_and_advance()
@@ -1048,8 +1017,9 @@ class BlackwellDeltaAffineSummaryRev:
 
                 w_handle = w_consumer.wait_and_advance()
                 if is_tail:
-                    # dv rows past the range hold k @ X of foreign tokens; w^T drops them.
-                    self._neutralize_w_tail(s_w, w_handle.index, tail_valid_rows, mma_tid)
+                    zero_tail_tokens(
+                        s_w, w_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
+                    )
                 wdv_handle = wdv_producer.acquire_and_advance()
                 for split in cutlass.range_constexpr(2):
                     dv_operand_handle = dv_operand_consumer.wait_and_advance()
@@ -1349,7 +1319,10 @@ class BlackwellDeltaAffineSummaryRev:
                 t_wdv_acc,
                 t_w,
                 t_dv,
+                s_k,
+                s_q,
                 s_do,
+                s_aqk,
                 s_w,
                 state_consumer,
                 k_consumer,

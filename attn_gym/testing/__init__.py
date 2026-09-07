@@ -3,6 +3,7 @@
 from .gdn import make_gdn_test_inputs
 from .kda import cumulative_sequence_offsets, strided_state_pool
 from .profiling import (
+    TraceFormat,
     annotate_kernels,
     kernel_stage,
     profile_trace,
@@ -11,6 +12,7 @@ from .profiling import (
 )
 
 __all__ = [
+    "TraceFormat",
     "annotate_kernels",
     "cumulative_sequence_offsets",
     "kernel_stage",

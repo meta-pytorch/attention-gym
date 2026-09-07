@@ -563,9 +563,11 @@ def chunk_gdn_fwd_intra_packed(
         BC=16,
     )
 
-    w = k.new_zeros(batch, tokens, value_heads, key_dim)
-    u = torch.zeros(v.shape, dtype=v.dtype, device=v.device)
-    restored_k = torch.zeros_like(w)
+    # Only active token rows are written; the inactive suffix is unspecified like every ragged
+    # primitive output (docs/linear.md).
+    w = k.new_empty(batch, tokens, value_heads, key_dim)
+    u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    restored_k = torch.empty_like(w)
     scalar_recompute_w_u_kg_kernel[(metadata.capacity, value_heads)](
         q=None,
         k=k,
@@ -623,11 +625,10 @@ def chunk_gdn_recompute_w_u_qg_kg(
     elif tokens % 64:
         raise ValueError("dense fused chunk GDN recompute requires complete BT64 chunks")
 
-    factory = torch.zeros if metadata is not None else torch.empty
-    w = factory((batch, tokens, value_heads, key_dim), dtype=k.dtype, device=k.device)
-    u = factory(v.shape, dtype=v.dtype, device=v.device)
-    restored_k = factory(w.shape, dtype=w.dtype, device=w.device)
-    qg = factory(w.shape, dtype=w.dtype, device=w.device)
+    w = torch.empty(batch, tokens, value_heads, key_dim, dtype=k.dtype, device=k.device)
+    u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    restored_k = torch.empty_like(w)
+    qg = torch.empty_like(w)
     chunks = tokens // 64 if metadata is None else metadata.capacity
     cu_seqlens = None if metadata is None else metadata.cu_seqlens
     chunk_offsets = None if metadata is None else metadata.chunk_offsets

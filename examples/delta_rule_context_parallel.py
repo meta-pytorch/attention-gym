@@ -40,7 +40,7 @@ from attn_gym.linear.context_parallel import (
 )
 from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
 from attn_gym.linear.kda.context_parallel import context_parallel_kda
-from attn_gym.testing import kernel_stage, record_distributed_profile
+from attn_gym.testing import TraceFormat, kernel_stage, record_distributed_profile
 from attn_gym.testing.profiling import graph_annotations_available
 from examples.delta_rule_training import (
     ComputeDTypeOption,
@@ -64,6 +64,18 @@ class PartitionOption(str, Enum):
 
     CONTIGUOUS = "contiguous"
     ZIGZAG = "zigzag"
+
+
+class TraceFormatOption(str, Enum):
+    """Per-rank trace format for ``--profile``."""
+
+    PERFETTO = "perfetto"
+    KINETO = "kineto"
+
+    @property
+    def trace_format(self) -> TraceFormat:
+        """Return the transformer-nuggets trace format."""
+        return "track_event" if self is TraceFormatOption.PERFETTO else "chrome_json"
 
 
 def partition_fragments(
@@ -241,8 +253,12 @@ def main(
         bool, typer.Option(help="Compare against the unsharded module on the whole stream.")
     ] = True,
     profile: Annotated[
-        bool, typer.Option(help="Export a merged native Perfetto trace with transformer-nuggets.")
+        bool, typer.Option(help="Export a merged trace of one steady-state step.")
     ] = False,
+    trace_format: Annotated[
+        TraceFormatOption,
+        typer.Option(help="Per-rank format; kineto writes gzipped JSON for annotate-roofline."),
+    ] = TraceFormatOption.PERFETTO,
     warmup_steps: Annotated[
         int, typer.Option(min=0, help="Warmup steps before profiling or timing.")
     ] = 5,
@@ -351,11 +367,14 @@ def main(
                         "cuda_graph_replay",
                         device,
                         warmup_steps=warmup_steps,
+                        trace_format=trace_format.trace_format,
                     )
                     if merged_path is not None:
                         print(f"profile={merged_path}", flush=True)
         elif profile:
-            profile_eager_step(model, batch, profile_path, device, warmup_steps)
+            profile_eager_step(
+                model, batch, profile_path, device, warmup_steps, trace_format.trace_format
+            )
 
         status = "passed" if validate else "ran"
         print(

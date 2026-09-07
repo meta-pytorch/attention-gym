@@ -79,7 +79,13 @@ from attn_gym.linear.kda import (
     mask_inactive_tokens,
 )
 from attn_gym.linear.types import KernelOptions
-from attn_gym.testing import annotate_kernels, kernel_stage, profile_trace, record_function
+from attn_gym.testing import (
+    TraceFormat,
+    annotate_kernels,
+    kernel_stage,
+    profile_trace,
+    record_function,
+)
 from attn_gym.testing.delta_rule import (
     assert_context_parallel_matches_reference,
     measure_training_step,
@@ -803,6 +809,7 @@ def profile_eager_step(
     profile_path: Path,
     device: torch.device,
     warmup_steps: int,
+    trace_format: TraceFormat = "track_event",
 ) -> None:
     """Profile a complete eager forward/backward on a fresh input leaf."""
     hidden_states = batch.local_hidden.detach().clone().requires_grad_()
@@ -819,6 +826,7 @@ def profile_eager_step(
         profile_path,
         device,
         warmup_steps,
+        trace_format=trace_format,
     )
 
 

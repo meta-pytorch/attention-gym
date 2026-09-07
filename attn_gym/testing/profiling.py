@@ -8,10 +8,17 @@ from functools import wraps
 from importlib import import_module
 from inspect import signature
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
+
+TraceFormat = Literal["track_event", "chrome_json"]
+
+
+def trace_suffix(trace_format: TraceFormat) -> str:
+    """File suffix transformer-nuggets writes for ``trace_format``."""
+    return ".pftrace" if trace_format == "track_event" else ".json.gz"
 
 
 def record_function(enabled: bool, name: str):
@@ -66,8 +73,14 @@ def kernel_stage(name: str, annotate: bool, *, backward: bool = True) -> Iterato
 
 
 @contextmanager
-def profile_trace(path: Path, *, warmup: int = 0) -> Iterator[torch.profiler.profile]:
-    """Record one native Perfetto trace per rank, discarding ``warmup`` scheduled steps."""
+def profile_trace(
+    path: Path, *, warmup: int = 0, trace_format: TraceFormat = "track_event"
+) -> Iterator[torch.profiler.profile]:
+    """Record one trace per rank, discarding ``warmup`` scheduled steps.
+
+    ``track_event`` writes native Perfetto; ``chrome_json`` writes gzipped Kineto JSON, which
+    keeps the shape metadata ``annotate-roofline`` needs (a later Perfetto merge drops it).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         profiler = import_module("transformer_nuggets.utils.benchmark").profiler
@@ -83,9 +96,10 @@ def profile_trace(path: Path, *, warmup: int = 0) -> Iterator[torch.profiler.pro
         )
 
     with profiler(
-        path.with_suffix(".pftrace"),
+        path.with_name(path.stem + trace_suffix(trace_format)),
         record_shapes=True,
-        trace_format="track_event",
+        trace_format=trace_format,
+        gzip_trace=trace_format == "chrome_json",
         warmup=warmup,
     ) as active_profiler:
         yield active_profiler
@@ -98,8 +112,9 @@ def record_distributed_profile(
     device: torch.device,
     *,
     warmup_steps: int = 0,
+    trace_format: TraceFormat = "track_event",
 ) -> Path | None:
-    """Profile one synchronized world-group step and merge its native rank traces.
+    """Profile one synchronized world-group step and merge its rank traces.
 
     ``warmup_steps`` extra steps run first with the profiler attached but are
     dropped from the trace, so the recorded step is steady state: kernels,
@@ -117,7 +132,7 @@ def record_distributed_profile(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     dist.barrier()
-    with profile_trace(path, warmup=warmup_steps) as active_profiler:
+    with profile_trace(path, warmup=warmup_steps, trace_format=trace_format) as active_profiler:
         for index in range(warmup_steps):
             step()
             if index == warmup_steps - 1:
@@ -138,8 +153,9 @@ def record_distributed_profile(
 
     # Ranks on other nodes may not share a filesystem with rank 0: ship the trace
     # bytes over the process group so the merge only needs rank 0's local disk.
+    suffix = trace_suffix(trace_format)
     rank_paths = [
-        path.with_name(f"{path.stem}_rank_{index}.pftrace") for index in range(world_size)
+        path.with_name(f"{path.stem}_rank_{index}{suffix}") for index in range(world_size)
     ]
     gathered: list[bytes | None] | None = [None] * world_size if rank == 0 else None
     dist.gather_object(rank_paths[rank].read_bytes(), gathered, dst=0)
@@ -162,6 +178,7 @@ def record_distributed_profile(
 
 
 __all__ = [
+    "TraceFormat",
     "annotate_kernels",
     "graph_annotations_available",
     "kernel_stage",

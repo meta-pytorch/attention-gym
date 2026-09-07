@@ -242,6 +242,76 @@ def test_state_summary_matches_zero_and_identity_probes(op):
         assert_summary_parts_match(summaries[index], fused, oracle, index)
 
 
+@pytest.fixture
+def nan_filled_empty(monkeypatch):
+    """Fill every fresh floating-point tensor with NaN, the worst case ``torch.empty`` allows.
+
+    The caching allocator mostly recycles blocks, so a test cannot rely on real garbage: filling
+    at the allocation entry points the kernels use makes every unwritten element a NaN.
+    """
+
+    def nan_filled(allocate):
+        def allocate_nan_filled(*args, **kwargs):
+            tensor = allocate(*args, **kwargs)
+            return tensor.fill_(torch.nan) if tensor.is_floating_point() else tensor
+
+        return allocate_nan_filled
+
+    for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
+        monkeypatch.setattr(owner, name, nan_filled(getattr(owner, name)))
+
+
+@requires_kda_target
+@pytest.mark.usefixtures("nan_filled_empty")
+@pytest.mark.parametrize(
+    "op",
+    [
+        pytest.param(KDA, id="kda"),
+        pytest.param(GDN, id="gdn"),
+        pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
+    ],
+)
+def test_fixed_capacity_intermediates_may_be_uninitialized(op):
+    """Intermediates are ``torch.empty``: their inactive suffix may hold NaN and must not leak.
+
+    The last document ends mid-chunk at the active endpoint, so every kernel that TMA-loads whole
+    64-token tiles over-reads into the capacity slack of the factors (w, u, kg, qg, aqk, ...) it
+    produced itself. The forward, the CP summaries, and the staged backward must agree bitwise
+    with the same computation on a buffer with no slack, where TMA zero-fills instead.
+    """
+    tokens, active = 256, 191
+    inputs = op.make_inputs(tokens, seed=11)
+    cu_seqlens = torch.tensor([0, 65, active], dtype=torch.int32, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(12)
+    d_output = torch.randn(
+        1, tokens, op.value_heads, HEAD_DIM, device="cuda", generator=generator
+    ).to(inputs[2].dtype)
+    d_final_state = torch.randn(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
+    ranges = bounds_of((0, 65), (65, active))
+
+    def run(inputs, d_output):
+        prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens)
+        summaries = prepared.state_summaries(ranges)
+        output, final_state = prepared.run(None, output_final_state=True)
+        grads = op.prepare_backward(prepared.saved, d_output, None, scale=prepared.scale)
+        grad_summaries = grads.state_grad_summaries(ranges)
+        dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
+        return (summaries, final_state, grad_summaries), (output, dq, dk, dv, dgate, dbeta)
+
+    expected_states, expected_rows = run(
+        tuple(t[:, :active].clone() for t in inputs), d_output[:, :active].clone()
+    )
+    states, rows = run(inputs, d_output)
+    active_rows = tuple(t[:, :active] for t in rows)
+    for got, want in zip(states + active_rows, expected_states + expected_rows, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+    # Unlike the other token gradients, the gate cotangent must be zero past the active tokens:
+    # parameterized gate producers such as ``gate_transform`` reduce it over physical tokens
+    # (docs/linear.md, "the internal reverse scan returns zero cotangents for inactive gate rows").
+    dgate = rows[4]
+    assert not dgate[:, active:].any()
+
+
 def bounds_of(*ranges: tuple[int, int]) -> torch.Tensor:
     """``int32 [R, 2]`` device tensor of span ranges for ``state_summaries``."""
     return torch.tensor(ranges, dtype=torch.int32, device="cuda")

@@ -70,9 +70,8 @@ halves of the I/O dtype and accumulated in two UMMA passes. The A operands
 (``w``, ``kg``) and ``u`` retain their original bf16/fp16 storage.
 
 Limitations:
-  - B=1, fixed K=V=128, BT=64; any ``T``. Token ranges come from a device ``bounds`` tensor and
-    a partial last chunk is neutralized in-kernel (gate row clamped, over-read ``kg`` columns
-    zeroed), which assumes the over-read tokens are finite: ``0 * inf`` is NaN.
+  - B=1, fixed K=V=128, BT=64; any ``T``. Token ranges come from a device ``bounds`` tensor;
+    partial last chunks clamp the gate row and zero every over-read UMMA operand in SMEM.
   - Contiguous inputs; SM100 (tcgen05) only.
 """
 
@@ -107,6 +106,45 @@ DATA_ALIGN_BYTES = 16
 
 _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
+
+
+def operand_view_layout(shape, token_mode: int):
+    """Map ``(rows, tokens)`` onto a staged UMMA operand's nested atom/rest modes.
+
+    Regrouping a CuTe identity layout preserves the stage's native coordinate space, including
+    its swizzle, without reconstructing compact strides.
+    """
+    identity = cute.make_identity_layout(shape)
+    (atom_0, atom_1), rest_0, rest_1 = identity.shape
+    (stride_a0, stride_a1), stride_r0, stride_r1 = identity.stride
+    modes = ((atom_0, rest_0), (atom_1, rest_1))
+    strides = ((stride_a0, stride_r0), (stride_a1, stride_r1))
+    row_mode = 1 - token_mode
+    return cute.make_layout(
+        (modes[row_mode], modes[token_mode]), stride=(strides[row_mode], strides[token_mode])
+    )
+
+
+@cute.jit
+def zero_tail_tokens(smem, stage, valid_rows, tid, io_type, token_mode: cutlass.Constexpr):
+    """Zero token rows ``>= valid_rows`` of one staged UMMA operand before the MMA reads it.
+
+    Selecting the over-read rows away in SMEM, rather than cancelling them with a ``0 *``
+    factor, keeps NaN/Inf garbage from uninitialized capacity slack out of the result.
+    ``token_mode`` names which atom/rest pair of the staged layout spans the tokens; one warp
+    (``tid`` in ``[0, 32)``) performs the stores.
+    """
+    stage_view = smem[None, None, None, stage]
+    view = cute.composition(stage_view, operand_view_layout(stage_view.shape, token_mode))
+    rows = cute.size(view, mode=[0])
+    warp_size = cute.arch.WARP_SIZE
+    assert cute.size(view, mode=[1]) == BT, "token modes must tile BT"
+    assert rows % warp_size == 0, "operand rows must be a multiple of the warp size"
+    for token in cutlass.range(valid_rows, BT, unroll=1):
+        for row_block in cutlass.range_constexpr(rows // warp_size):
+            view[tid + row_block * warp_size, token] = io_type(0.0)
+    cute.arch.fence_view_async_shared()
+    cute.arch.sync_warp()
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -494,9 +532,8 @@ class _AffineSummaryFwdOp:
         """Own the per-chunk TMA G2S loads for w, kg^T, u, and the gate row.
 
         The range starts at token ``start`` of the stream, so every descriptor is offset along
-        its token mode and chunk ``ct`` reads tokens ``start + ct * BT`` onward; a partial last
-        chunk over-reads into the next range's tokens (or TMA zero fill past ``T``), which the
-        MMA warp neutralizes through ``kg`` and the gate row clamp below.
+        its token mode and chunk ``ct`` reads tokens ``start + ct * BT`` onward. A partial last
+        chunk clamps the gate row here; the MMA warp zeroes each over-read operand stage.
         """
         batch = Int32(0)
         desc_w = cute.domain_offset((start, 0, (0, 0)), tma.w.desc)
@@ -549,7 +586,9 @@ class _AffineSummaryFwdOp:
         num_chunks,
         tail_chunk,
         tail_valid_rows,
+        sW,
         sKg,
+        sU,
         mma_wx,
         mma_kt,
         mma_ktu,
@@ -576,20 +615,23 @@ class _AffineSummaryFwdOp:
         passes over ``Kg^T @ (-wx)``; MMA1 likewise runs two passes over the
         hi/lo state snapshot, recovering ~fp32 operand precision.
 
-        Chunk ``tail_chunk`` (local index) holds only ``tail_valid_rows`` range tokens; its
-        remaining ``kg`` columns are zeroed before use so the over-read tokens contribute nothing
-        to either ``Kg^T @ U`` or ``Kg^T @ (-wx)``.
+        Chunk ``tail_chunk`` holds only ``tail_valid_rows`` range tokens. Its ``w``, ``kg^T``,
+        and ``u`` stages are zeroed past that boundary before UMMA reads them. Multiplying by a
+        zero mask would retain NaN/Inf from uninitialized capacity slack.
         """
         tid, _, _ = cute.arch.thread_idx()
         mma_tid = tid - WarpRole.MMA * self.WARP_SZ
         for ct in cutlass.range(0, num_chunks, unroll=0):
+            is_tail = ct == tail_chunk and tail_valid_rows != 0
             # --- MMA2a: kg^T(SMEM A) × U(SMEM B) → kt(TMEM), value tiles only ---
             kgh = pkg_C.wait_and_advance()
-            if ct == tail_chunk and tail_valid_rows != 0:
-                self._neutralize_kg_tail(sKg, kgh.index, tail_valid_rows, mma_tid)
+            if is_tail:
+                zero_tail_tokens(sKg, kgh.index, tail_valid_rows, mma_tid, self.io_type, 1)
             ktd = pkt_P.acquire_and_advance()
             if is_value:
                 uh = pu_C.wait_and_advance()
+                if is_tail:
+                    zero_tail_tokens(sU, uh.index, tail_valid_rows, mma_tid, self.io_type, 1)
                 for kp in cutlass.range_constexpr(cute.size(t_kg_au, mode=[2])):
                     mma_ktu.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                     cute.gemm(
@@ -603,6 +645,8 @@ class _AffineSummaryFwdOp:
 
             # --- MMA1: w(SMEM A) × X snapshot(SMEM B) → wx(TMEM) ---
             wh = pw_C.wait_and_advance()
+            if is_tail:
+                zero_tail_tokens(sW, wh.index, tail_valid_rows, mma_tid, self.io_type, 0)
             wxd = pwx_P.acquire_and_advance()
             for split in cutlass.range_constexpr(2):
                 # Each hi/lo half is one pipeline stage, published separately.
@@ -637,27 +681,6 @@ class _AffineSummaryFwdOp:
                 tmpbh.release()
             ktd.commit()
             kgh.release()
-
-    @cute.jit
-    def _neutralize_kg_tail(self, smem, stage, valid_rows, tid):
-        """Zero ``kg^T`` token columns ``>= valid_rows`` of one stage before UMMA reads it."""
-        row_atom = cute.size(smem, mode=[0, 0, 0])
-        token_atom = cute.size(smem, mode=[0, 1])
-        assert cute.size(smem, mode=[1]) == 1, "expected a single rest-M mode"
-        assert row_atom * cute.size(smem, mode=[0, 0, 1]) == KEY_DIM
-        assert token_atom * cute.size(smem, mode=[2]) == BT
-        for token in cutlass.range(valid_rows, BT, unroll=1):
-            for row_block in cutlass.range_constexpr(KEY_DIM // self.WARP_SZ):
-                row = tid + row_block * self.WARP_SZ
-                coordinate = (
-                    ((row % row_atom, row // row_atom), token % token_atom),
-                    0,
-                    token // token_atom,
-                    stage,
-                )
-                smem[coordinate] = self.io_type(0.0)
-        cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
 
     @cute.jit
     def run_state(
@@ -1035,7 +1058,9 @@ class _AffineSummaryFwdOp:
                 num_chunks=chunk_end - chunk_begin,
                 tail_chunk=tail_chunk,
                 tail_valid_rows=tail_valid_rows,
+                sW=sW,
                 sKg=sKg,
+                sU=sU,
                 mma_wx=mma_wx,
                 mma_kt=mma_kt,
                 mma_ktu=mma_ktu,

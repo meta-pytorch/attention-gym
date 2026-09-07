@@ -1,4 +1,8 @@
-"""Dense scalar-gate specialization of the KDA inter-chunk state recurrence."""
+"""Scalar-gate inter-chunk state recurrence.
+
+The dense path keeps its own BT64 kernel; the packed path reuses the KDA recurrence kernel,
+which already specializes on a per-head scalar gate.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,8 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_sequence_work
+from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear.kda.fwd.triton.chunk_delta_h import _delta_h_launch
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -103,73 +108,6 @@ def chunk_gdn_fwd_recurrence_dense(
     return h, v_new, final_state
 
 
-@triton.jit
-def chunk_gdn_fwd_recurrence_packed_kernel(
-    restored_k,
-    w,
-    u,
-    cumulative_gate,
-    initial_state,
-    h,
-    v_new,
-    final_state,
-    cu_seqlens,
-    chunk_offsets,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-):
-    """Traverse one packed sequence/head/value tile with a resident FP32 state."""
-    sequence_head = tl.program_id(0)
-    value_tile = tl.program_id(1)
-    sequence = sequence_head // H
-    head = sequence_head % H
-
-    bos, eos, chunk_begin = load_ragged_sequence_work(cu_seqlens, chunk_offsets, sequence)
-    bos, eos, chunk_begin = bos.to(tl.int64), eos.to(tl.int64), chunk_begin.to(tl.int64)
-    chunks = (eos - bos + BT - 1) // BT
-    key = tl.arange(0, K)
-    value = value_tile * BV + tl.arange(0, BV)
-    state_offset = ptr_offset(
-        (sequence, head, value[None, :], key[:, None]), (H * V * K, V * K, K, 1)
-    )
-    state = tl.load(initial_state + state_offset).to(tl.float32)
-    row = tl.arange(0, BT)
-
-    for local_chunk in tl.range(0, chunks):
-        global_chunk = chunk_begin + local_chunk
-        token_start = bos + local_chunk * BT
-        token = token_start + row
-        token_mask = token < eos
-        h_offset = ptr_offset(
-            (global_chunk, head, key[:, None], value[None, :]), (H * K * V, K * V, V, 1)
-        )
-        tl.store(h + h_offset, state.to(h.dtype.element_ty))
-
-        w_offset = ptr_offset((token[:, None], head, key[None, :]), (H * K, K, 1))
-        u_offset = ptr_offset((token[:, None], head, value[None, :]), (H * V, V, 1))
-        w_tile = tl.load(w + w_offset, mask=token_mask[:, None], other=0.0)
-        u_tile = tl.load(u + u_offset, mask=token_mask[:, None], other=0.0)
-        corrected = u_tile.to(tl.float32) - tl.dot(w_tile, state.to(w_tile.dtype))
-        tl.store(
-            v_new + u_offset,
-            corrected.to(v_new.dtype.element_ty),
-            mask=token_mask[:, None],
-        )
-
-        final_token = tl.minimum(token_start + BT, eos) - 1
-        final_gate = tl.load(cumulative_gate + ptr_offset((final_token, head), (H, 1))).to(
-            tl.float32
-        )
-        state *= tl.exp2(final_gate)
-        restored = tl.load(restored_k + w_offset, mask=token_mask[:, None], other=0.0)
-        state = tl.dot(tl.trans(restored), corrected.to(restored.dtype), acc=state)
-
-    tl.store(final_state + state_offset, state)
-
-
 def chunk_gdn_fwd_recurrence_packed(
     restored_k: torch.Tensor,
     w: torch.Tensor,
@@ -189,28 +127,22 @@ def chunk_gdn_fwd_recurrence_packed(
     if initial_state.shape != expected_state:
         raise ValueError(f"initial_state must have shape {expected_state}")
 
-    h = restored_k.new_empty(1, metadata.capacity, heads, key_dim, value_dim)
-    v_new = torch.empty_like(u)
+    # The KDA recurrence kernel owns the scalar-gate specialization: on SM100 its warp-specialized
+    # TMA schedule steps a chunk in about half the time of a plain Triton loop, and it falls back
+    # to ordinary pipelining for FP32 inputs and other architectures.
     final_state = torch.empty_like(initial_state)
-    block_value = 64
-    chunk_gdn_fwd_recurrence_packed_kernel[(num_sequences * heads, value_dim // block_value)](
+    h, v_new = _delta_h_launch(
         restored_k,
         w,
         u,
         cumulative_gate,
         initial_state,
-        h,
-        v_new,
-        final_state,
+        None,
+        None,
         metadata.cu_seqlens,
         metadata.chunk_offsets,
-        H=heads,
-        K=key_dim,
-        V=value_dim,
-        BT=64,
-        BV=block_value,
-        num_warps=4,
-        num_stages=2,
+        metadata.capacity,
+        final_state,
     )
     return h, v_new, final_state
 
