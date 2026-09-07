@@ -41,7 +41,7 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
     ScheduleKind,

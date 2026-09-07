@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,

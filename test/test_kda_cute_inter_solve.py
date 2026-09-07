@@ -33,7 +33,7 @@ def test_ragged_fake_tensors_reject_legacy_boolean_schedule():
     pytest.importorskip("cutlass")
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
+    from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
     from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
         chunk_kda_fwd_k3b_ragged_cute,
         chunk_kda_fwd_k4b_ragged_cute,

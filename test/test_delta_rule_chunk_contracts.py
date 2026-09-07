@@ -1,4 +1,4 @@
-"""Shared chunk ownership, compatibility, and torch-only operator metadata contracts."""
+"""Shared chunk ownership and torch-only operator metadata contracts."""
 
 import ast
 from pathlib import Path
@@ -8,33 +8,10 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from attn_gym.linear._delta_rule import chunk_ops, chunk_schedule
-from attn_gym.linear.kda import chunk_schedule as legacy_schedule
-from attn_gym.linear.kda import ops as kda_ops
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "RaggedChunkMetadata",
-        "ResolvedSchedule",
-        "ScheduleKind",
-        "ScheduleRequest",
-        "chunk_capacity",
-        "prepare_ragged_chunk_metadata",
-        "validate_schedule_request",
-    ],
-)
-def test_kda_schedule_exports_share_one_owner(name: str) -> None:
-    """Legacy imports preserve enum, metadata type, and callable identity."""
-    shared = getattr(chunk_schedule, name)
-    assert getattr(legacy_schedule, name) is shared
-    assert shared.__module__ == chunk_schedule.__name__
 
 
 def test_chunk_ops_preserve_registered_graph_targets() -> None:
     """Moving contracts must not create alternate schemas or operator boundaries."""
-    assert kda_ops.prepare_chunk_offsets_op is chunk_ops.prepare_chunk_offsets_op
-    assert kda_ops._plain_gate_scan_op is chunk_ops._plain_gate_scan_op
     assert (
         chunk_ops.prepare_chunk_offsets_op is torch.ops.attn_gym.kda_prepare_chunk_offsets.default
     )

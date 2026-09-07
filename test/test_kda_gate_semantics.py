@@ -11,12 +11,12 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda import bound_gate, chunk_kda
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
-from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA gate ops require CUDA")

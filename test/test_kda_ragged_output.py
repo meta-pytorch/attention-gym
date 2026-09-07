@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o as output_module
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     ScheduleKind,
     ScheduleRequest,
     prepare_ragged_chunk_metadata,
@@ -284,7 +284,7 @@ def test_ragged_output_zero_capacity_skips_launch():
 )
 def test_persistent_ragged_output_strides_multiple_tasks_per_worker(monkeypatch):
     """Force fewer workers than tasks so the stride loop iterates repeatedly."""
-    from attn_gym.linear.kda import chunk_scheduler
+    from attn_gym.linear._delta_rule.triton import chunk_scheduler
 
     monkeypatch.setattr(chunk_scheduler.GridScheduler, "num_workers", lambda self, s, d: 3)
     torch.manual_seed(7)

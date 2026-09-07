@@ -33,9 +33,16 @@ from torch.nn.attention.flex_attention import (
     create_block_mask,
 )
 
-from examples.flex_attention.paged_attention import PagedAttention
-from examples.flex_attention.paged_attention_model import PagedAttentionLayer
-from examples.flex_attention.paged_attention_utils import gen_offset, slice_block_mask
+# Sibling imports work both as ``examples.flex_attention.*`` and as a directly executed
+# script, where only this directory is on ``sys.path``.
+if __package__:
+    from .paged_attention import PagedAttention
+    from .paged_attention_model import PagedAttentionLayer
+    from .paged_attention_utils import gen_offset, slice_block_mask
+else:
+    from paged_attention import PagedAttention
+    from paged_attention_model import PagedAttentionLayer
+    from paged_attention_utils import gen_offset, slice_block_mask
 
 create_block_mask = torch.compile(create_block_mask)
 

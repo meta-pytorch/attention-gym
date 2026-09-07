@@ -20,7 +20,10 @@ import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, load_ragged_sequence_work
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
+    RaggedChunkMetadata,
+    load_ragged_sequence_work,
+)
 
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128

@@ -17,6 +17,8 @@ from attn_gym.linear import (
     paged_chunk_gdn,
     recurrent_gdn,
 )
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
+from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.gdn import ops as gdn_ops
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
@@ -30,8 +32,6 @@ from attn_gym.linear.gdn.ops import (
     chunk_fwd_packed_with_state_op,
     chunk_fwd_with_state_op,
 )
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.ops import _plain_gate_scan_op
 from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,

@@ -12,11 +12,14 @@ from torch.nn.attention.flex_attention import (
     noop_mask,
 )
 
-from examples.flex_attention.paged_attention_utils import (
-    gen_offset,
-    generate_score_mod,
-    random_init_paged_attention,
-)
+# Sibling imports work both as ``examples.flex_attention.*`` and as a directly executed
+# script, where only this directory is on ``sys.path``.
+if __package__:
+    from .paged_attention_model import NonPagedAttentionLayer, PagedAttentionLayer
+    from .paged_attention_utils import gen_offset, generate_score_mod, random_init_paged_attention
+else:
+    from paged_attention_model import NonPagedAttentionLayer, PagedAttentionLayer
+    from paged_attention_utils import gen_offset, generate_score_mod, random_init_paged_attention
 
 dtype = torch.bfloat16
 
@@ -35,11 +38,6 @@ def benchmark_layer(
     converted_score_mod,
     dtype=torch.bfloat16,
 ):
-    from examples.flex_attention.paged_attention_model import (
-        NonPagedAttentionLayer,
-        PagedAttentionLayer,
-    )
-
     # compile model
     non_paged_foo = torch.compile(
         NonPagedAttentionLayer(bsz, n_heads, max_seq_len, head_dim, dtype), fullgraph=True

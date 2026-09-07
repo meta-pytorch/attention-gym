@@ -7,13 +7,16 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
+    RaggedChunkMetadata,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_module
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
     _blackwell_delta_h_bwd_dhu_dv_fused_packed,
     blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
     should_bound_sequence_extent,
 )
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata, prepare_ragged_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(

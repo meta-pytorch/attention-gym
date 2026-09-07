@@ -5,8 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
+    ScheduleRequest,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
-from attn_gym.linear.kda.chunk_scheduler import ScheduleRequest, prepare_ragged_chunk_metadata
 from attn_gym.testing import cumulative_sequence_offsets
 from attn_gym.testing.kda import bwd_daqk_reference
 

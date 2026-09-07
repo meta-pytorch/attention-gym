@@ -7,7 +7,7 @@ from itertools import pairwise
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     ScheduleRequest,
     prepare_ragged_chunk_metadata,
@@ -139,7 +139,7 @@ def test_recompute_fake_tensors_reach_no_launch():
 
 def test_recompute_triton_matches_cute_on_ragged_partial_chunks():
     """Pin the default path against the CuTe kernel on tails and empty sequences."""
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 
     torch.manual_seed(6)
@@ -171,7 +171,7 @@ def test_recompute_triton_matches_cute_on_ragged_partial_chunks():
 
 def test_recompute_precision_modes_match_cute_and_tighten_error():
     """tf32/tf32x3 run real higher-precision dots, not silently-degraded bf16."""
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
         _recompute_w_u_fwd_cute,
         recompute_w_u_fwd,
@@ -219,7 +219,7 @@ def test_recompute_precision_modes_match_cute_and_tighten_error():
 
 def test_recompute_supports_grouped_value_heads():
     """H_V > H_K maps each value head onto its key-head group for k/gk."""
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import (
         _recompute_w_u_fwd_cute,
         recompute_w_u_fwd,

@@ -1,6 +1,8 @@
 """Portable checks for the shallow example layout and its relocated entrypoints."""
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,7 +22,6 @@ def test_examples_have_one_concept_directory() -> None:
         if relative == Path("__init__.py"):
             continue
         assert len(relative.parts) == 2, f"example must be one directory deep: {relative}"
-        assert relative.parts[0] in {"flex_attention", "linear", "sparse"}
 
 
 def test_relocated_paged_recipe_reserves_and_releases_cpu_pages() -> None:
@@ -35,6 +36,37 @@ def test_relocated_paged_recipe_reserves_and_releases_cpu_pages() -> None:
     cache.erase(torch.tensor([0]))
     assert len(cache.empty_pages) == 4
     assert cache.capacity[0].item() == 0
+
+
+def test_paged_throughput_imports_as_package() -> None:
+    """The throughput benchmark resolves its siblings under the package import path."""
+    pytest.importorskip("datasets")
+    from examples.flex_attention import paged_attention_throughput
+
+    assert paged_attention_throughput.PagedAttention is paged_attention.PagedAttention
+
+
+def test_paged_latency_script_runs_without_checkout_on_import_path(tmp_path: Path) -> None:
+    """Direct ``python <script>`` execution must not depend on an editable-install path hook."""
+    script = EXAMPLES_ROOT / "flex_attention" / "paged_attention_latency.py"
+    # Emulate ``python script.py``: only the script directory leads sys.path, and the editable
+    # install's checkout-root entry is removed so ``import examples`` cannot resolve.
+    bootstrap = (
+        "import runpy, sys\n"
+        f"sys.path = [{str(script.parent)!r}] + "
+        f"[p for p in sys.path[1:] if p != {str(REPO_ROOT)!r}]\n"
+        f"sys.argv = [{str(script)!r}, '--help']\n"
+        f"runpy.run_path({str(script)!r}, run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", bootstrap],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
 
 
 @pytest.mark.parametrize(

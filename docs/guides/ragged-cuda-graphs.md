@@ -81,7 +81,7 @@ Its a graph. Duh, but really - the common PyTorch usage and definition is to `re
 Lets setup a small test program, since this is attn_gym we will focus on a simple proxy attention module. However, the learnings will apply to both varlen attention and the new linear-attention variants we are adding to the gym. I will start with varlen for now in the examples.
 
 ```python
---8<-- "examples/flex_attention/cuda_graphs.py:hello-world"
+--8 < --"examples/flex_attention/cuda_graphs.py:hello-world"
 ```
 
 1. simple wrapper around the standard pytorch profiler
@@ -107,14 +107,14 @@ This is somewhat a contrived example since we are using small model dim and toke
 PyTorch's api pretty closely mirror the lower level gpu apis for CG (CUDA Graphs, im done writing those two words).
 
 ```python
---8<-- "examples/flex_attention/cuda_graphs.py:capture-graph"
+--8 < --"examples/flex_attention/cuda_graphs.py:capture-graph"
 ```
 
 1. We use a side stream to isolate the exact work we want to record.
 2. We warmup to initialize any lazy CUDA state such as library handles and then wait on it before the real capture.
 
 ```python
---8<-- "examples/flex_attention/cuda_graphs.py:hello-world-graph"
+--8 < --"examples/flex_attention/cuda_graphs.py:hello-world-graph"
 ```
 
 1. its replay time!
@@ -188,13 +188,13 @@ The graph therefore keeps the physical [{{ capacity_symbol("T") }}, D] and [{{ c
 <summary>Packed batch loader</summary>
 
 ```python
---8<-- "examples/flex_attention/cuda_graphs.py:training-batches"
+--8 < --"examples/flex_attention/cuda_graphs.py:training-batches"
 ```
 
 </details>
 
 ```python
---8<-- "examples/flex_attention/cuda_graphs.py:realistic-training-loop"
+--8 < --"examples/flex_attention/cuda_graphs.py:realistic-training-loop"
 ```
 
 1. `token_capacity` is a policy typically chosen by the data pipeline and whatever your global batchsize you found acceptable for your model arch. Every replay must satisfy {{ capacity_symbol("L") }} &lt;= {{ capacity_symbol("T") }}.
@@ -501,7 +501,7 @@ Another sidequest but this one is important because I have seen many an issue th
 The training example therefore uses two different masks:
 
 ```python
---8<-- "examples/linear/delta_rule_training.py:kda-fixed-capacity-masking"
+--8 < --"examples/linear/delta_rule_training.py:kda-fixed-capacity-masking"
 ```
 
 1. Build one reusable device mask from `cu_seqlens[-1]`. Because this happens inside capture, replay rebuilds it from the current device endpoint without a host read.
@@ -600,9 +600,7 @@ New Api alert!: [`claim`](https://github.com/pytorch/pytorch/pull/178215) is `_r
 ```python
 # capture
 A, n = save(grad)
-opt_g = capture(
-    optimizer
-)
+opt_g = capture(optimizer)
 release(grad)
 
 # replay

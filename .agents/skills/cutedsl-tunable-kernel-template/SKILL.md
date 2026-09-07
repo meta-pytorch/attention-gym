@@ -174,10 +174,10 @@ def my_op(
 This gives three intentional modes:
 
 ```python
-my_op(q, k)                                      # conservative default
-my_op(q, k, config=MyConfig(64, 128))            # force one specialization
-my_op(q, k, tune=True)                           # input-aware candidate method
-my_op(q, k, tune=True, configs=(cfg_a, cfg_b))   # explicit candidate override
+my_op(q, k)  # conservative default
+my_op(q, k, config=MyConfig(64, 128))  # force one specialization
+my_op(q, k, tune=True)  # input-aware candidate method
+my_op(q, k, tune=True, configs=(cfg_a, cfg_b))  # explicit candidate override
 ```
 
 Reject `config=` with tuning and reject `configs=` without tuning rather than silently ignoring either argument.

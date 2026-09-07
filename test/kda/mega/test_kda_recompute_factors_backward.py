@@ -18,7 +18,7 @@ D = 128
 
 def inputs(lengths: list[int], heads: int = 2):
     """Create dense or packed KDA core inputs and optional routing metadata."""
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 
     total = sum(lengths)
     q, k, v, increments, beta = make_kda_test_inputs(
@@ -69,7 +69,7 @@ def test_recomputed_factors_backward_matches_saved_factors(lengths):
 
 
 def test_ragged_backward_ignores_akk_capacity_slack():
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
     from attn_gym.linear.kda.ops import chunk_bwd_op
 

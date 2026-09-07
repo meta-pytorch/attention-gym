@@ -11,11 +11,6 @@ import importlib
 
 import torch
 
-from attn_gym.linear._delta_rule.chunk_ops import (
-    _plain_gate_scan_op,  # noqa: F401 -- compatibility re-export
-    prepare_chunk_offsets_op,
-)
-
 _CHUNK_SIZE = 64
 
 
@@ -748,7 +743,6 @@ __all__ = [
     "delta_h_op",
     "delta_h_paged_op",
     "delta_h_with_state_op",
-    "prepare_chunk_offsets_op",
     "recurrent_decode_forward",
     "recurrent_decode_op",
     "recurrent_forward",

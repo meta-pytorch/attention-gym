@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from attn_gym.linear._delta_rule.triton import chunk_scheduler
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     ScheduleRequest,
     prepare_ragged_chunk_metadata,

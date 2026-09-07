@@ -7,8 +7,9 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
+from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
+from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.linear.kda.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.impl.mega_ops import (
     chunk_mega_dense_training_fwd_op,
     chunk_mega_packed_fwd_op,
@@ -21,7 +22,6 @@ from attn_gym.linear.kda.impl.mega_ops import (
     validate_mega_available,
 )
 from attn_gym.linear.kda.ops import (
-    _plain_gate_scan_op,
     chunk_bwd_recompute_factors_op,
     chunk_bwd_recompute_factors_with_state_grad_op,
 )

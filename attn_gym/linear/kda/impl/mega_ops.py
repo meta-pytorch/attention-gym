@@ -95,7 +95,7 @@ def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, *, backe
 
 
 def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
-    from attn_gym.linear.kda.fwd.triton.plain_gate import _plain_gate_scan_cuda
+    from attn_gym.linear._delta_rule.triton.plain_gate import _plain_gate_scan_cuda
 
     backend = _backend(q)
     # Prioritize the persistent one-CTA-per-SM Mega grid; the scan can fill its drain tail.
@@ -119,7 +119,7 @@ def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
 
 
 def _packed_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, chunk_offsets, split, scale):
-    from attn_gym.linear.kda.fwd.triton.plain_gate import _plain_gate_scan_cuda
+    from attn_gym.linear._delta_rule.triton.plain_gate import _plain_gate_scan_cuda
 
     backend = _backend(q)
     output, cumulative_gate = fork_join_streams(

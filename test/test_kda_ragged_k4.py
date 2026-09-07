@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
     ScheduleKind,
@@ -272,7 +272,7 @@ def test_persistent_ragged_k4_matches_static_over_capacity():
 
 def test_persistent_ragged_k4_strides_multiple_chunks_per_worker(monkeypatch):
     """Force fewer workers than active chunks so CTAs reuse SMEM across iterations."""
-    from attn_gym.linear.kda import chunk_scheduler
+    from attn_gym.linear._delta_rule.triton import chunk_scheduler
 
     monkeypatch.setattr(chunk_scheduler.GridScheduler, "num_chunk_workers", lambda self, device: 2)
     lengths = [65, 63, 130, 70]

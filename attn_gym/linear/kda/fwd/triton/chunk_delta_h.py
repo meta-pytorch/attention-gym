@@ -28,8 +28,7 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
-from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
     ScheduleKind,
@@ -37,6 +36,7 @@ from attn_gym.linear.kda.chunk_scheduler import (
     load_ragged_sequence_extent,
     load_ragged_sequence_work,
 )
+from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
