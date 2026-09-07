@@ -134,7 +134,7 @@ def chunk_gdn_recompute_aqk_packed(
     batch, tokens, heads, key_dim = q.shape
     if batch != 1 or key_dim != 128 or k.shape != q.shape:
         raise ValueError("packed fused chunk GDN Aqk recompute requires B=1 and K=128")
-    aqk = torch.zeros(batch, tokens, heads, 64, dtype=q.dtype, device=q.device)
+    aqk = torch.empty(batch, tokens, heads, 64, dtype=q.dtype, device=q.device)
     chunk_gdn_recompute_aqk_kernel[(metadata.capacity, heads)](
         q,
         k,

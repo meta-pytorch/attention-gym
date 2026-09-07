@@ -201,9 +201,11 @@ def chunk_gdn_bwd_intra_packed(
     if d_gate_raw.shape != q.shape:
         raise ValueError("d_gate_raw must match expanded q")
 
-    d_q = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
-    d_k = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
-    d_beta = torch.zeros_like(beta, dtype=torch.float32)
+    d_q = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    d_k = torch.empty(k.shape, dtype=torch.float32, device=k.device)
+    d_beta = torch.empty_like(beta, dtype=torch.float32)
+    # Returned as the gate cotangent without a reverse scan behind it, so inactive rows
+    # must be zero (docs/linear.md); the other outputs leave their suffix unspecified.
     d_gate = torch.zeros_like(cumulative_gate, dtype=torch.float32)
     chunk_gdn_bwd_intra_kernel[(metadata.capacity, heads)](
         q,

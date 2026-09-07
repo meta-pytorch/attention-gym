@@ -89,23 +89,30 @@ def test_native_trace_reports_missing_dependency(monkeypatch, tmp_path):
         pytest.fail("missing profiler must not silently fall back to another format")
 
 
-def test_native_trace_uses_pftrace_and_forwards_warmup(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("trace_format", "suffix", "gzip_trace"),
+    [("track_event", ".pftrace", False), ("chrome_json", ".json.gz", True)],
+    ids=["perfetto", "kineto"],
+)
+def test_profile_trace_forwards_format_and_warmup(
+    monkeypatch, tmp_path, trace_format, suffix, gzip_trace
+):
     calls = []
     token = object()
 
     @contextmanager
-    def profiler(path, *, record_shapes, trace_format, warmup):
-        calls.append((path, record_shapes, trace_format, warmup))
+    def profiler(path, *, record_shapes, trace_format, gzip_trace, warmup):
+        calls.append((path, record_shapes, trace_format, gzip_trace, warmup))
         yield token
 
     monkeypatch.setattr(
         profiling, "import_module", lambda name: SimpleNamespace(profiler=profiler)
     )
     trace = tmp_path / "profiles" / "training"
-    with profile_trace(trace, warmup=2) as active:
+    with profile_trace(trace, warmup=2, trace_format=trace_format) as active:
         assert active is token
     assert trace.parent.is_dir()
-    assert calls == [(trace.with_suffix(".pftrace"), True, "track_event", 2)]
+    assert calls == [(trace.with_name("training" + suffix), True, trace_format, gzip_trace, 2)]
 
 
 def test_native_trace_rejects_outdated_profiler(monkeypatch, tmp_path):

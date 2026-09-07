@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from attn_gym.testing.profiling import record_distributed_profile
+from attn_gym.testing.profiling import TraceFormat, record_distributed_profile
 
 
 def assert_context_parallel_matches_reference(
@@ -43,6 +43,7 @@ def profile_training_step(
     profile_path: Path,
     device: torch.device,
     warmup_steps: int,
+    trace_format: TraceFormat = "track_event",
 ) -> None:
     """Profile one eager step and report memory without owning its model or inputs."""
     torch.cuda.synchronize(device)
@@ -54,6 +55,7 @@ def profile_training_step(
         "iteration",
         device,
         warmup_steps=warmup_steps,
+        trace_format=trace_format,
     )
     step_peak = torch.cuda.max_memory_allocated(device) - resident
     print(

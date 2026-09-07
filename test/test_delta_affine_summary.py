@@ -730,19 +730,31 @@ def test_range_summaries_match_per_range_launches(dtype):
             )
 
 
+def scale_up(neighbours: torch.Tensor) -> None:
+    neighbours *= 64
+
+
+def poison(neighbours: torch.Tensor) -> None:
+    neighbours[:, ::2] = torch.nan
+    neighbours[:, 1::2] = torch.inf
+
+
 @pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_range_tails_ignore_the_tokens_that_follow(dtype):
-    """A partial last chunk over-reads the next tokens; scaled-up neighbours must not leak in.
+@pytest.mark.parametrize("corrupt", [scale_up, poison], ids=["scaled", "non-finite"])
+def test_range_tails_ignore_the_tokens_that_follow(dtype, corrupt):
+    """A partial last chunk over-reads the next tokens; they must not leak in, whatever they hold.
 
     The single-range launch sees TMA zero fill past its slice instead of those tokens, so the two
-    must agree bitwise; the neighbours are finite, which the kernels require (``0 * inf`` is NaN).
+    must agree bitwise. Producers allocate token-shaped intermediates with ``torch.empty`` and
+    write only the active prefix, so the over-read tokens may be NaN/Inf: the kernels must drop
+    them by selection, not by scaling (``0 * NaN`` is NaN).
     """
     tensors = make_summary_inputs(41, dtype, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
     for tensor in (qg, kg, w, u, dout, aqk):
-        tensor[:, 300:364] *= 64  # never inside a range below
-    bounds = torch.tensor([[0, 300], [172, 300]], dtype=torch.int32, device="cuda")
+        corrupt(tensor[:, 300:364])  # never inside a range below
+    bounds = torch.tensor([[0, 300], [172, 300], [364, 640]], dtype=torch.int32, device="cuda")
     scale = 128**-0.5
 
     forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
