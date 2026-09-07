@@ -24,14 +24,14 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda.chunk_schedule import (
+from attn_gym.linear._delta_rule.chunk_schedule import (
     RaggedChunkMetadata,
     ResolvedSchedule,
     ScheduleKind,
     ScheduleRequest,
     validate_schedule_request,
 )
-from attn_gym.linear.kda.chunk_scheduler import GridScheduler
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import GridScheduler
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE, is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,

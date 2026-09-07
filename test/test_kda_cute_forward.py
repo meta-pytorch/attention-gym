@@ -17,6 +17,7 @@ from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 pytest.importorskip("cutlass")
 
 from attn_gym.linear import chunk_kda, paged_chunk_kda
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd as _chunk_kda_bwd_module
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     ChunkKdaBwdIntraConfig,
@@ -26,7 +27,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     ChunkKdaBwdWyDqkgConfig,
     chunk_kda_bwd_wy_dqkg,
 )
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_op,
     _chunk_kda_bwd_with_state_grad_op,

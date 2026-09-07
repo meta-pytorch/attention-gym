@@ -16,7 +16,7 @@ All modes use the checkpoint's learned per-token compress gate
 transformer, so it is re-attached from the safetensors file here.
 
 Example:
-    python examples/fastwan_vsa.py --mode flex --output_dir outputs/
+    python examples/sparse/fastwan_vsa.py --mode flex --output_dir outputs/
 """
 
 import math
@@ -137,9 +137,9 @@ def exact_tile_metadata(grid: tuple[int, int, int], tile: tuple[int, int, int], 
 
 
 def import_upstream_vsa():
-    """Import the installed `vsa` package, dodging the examples/vsa.py shadow.
+    """Import the installed `vsa` package, dodging the examples/sparse/vsa.py shadow.
 
-    Running ``python examples/fastwan_vsa.py`` puts ``examples/`` at
+    Running ``python examples/sparse/fastwan_vsa.py`` puts ``examples/sparse/`` at
     ``sys.path[0]``, where ``vsa.py`` (the FlexAttention example) shadows the
     upstream FastVideo ``vsa`` package.
     """

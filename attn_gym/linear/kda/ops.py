@@ -81,10 +81,6 @@ torch.library.define(
     + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
-torch.library.define(
-    "attn_gym::_kda_plain_gate_scan",
-    "(Tensor values, Tensor? cu_seqlens, Tensor? chunk_offsets, bool reverse) -> Tensor",
-)
 _RECURRENT_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
     " Tensor? initial_state, Tensor? cu_seqlens, float scale, bool autotune)"
@@ -103,10 +99,6 @@ torch.library.define(
     "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
     " Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, Tensor(b!) out,"
     " float lower_bound, bool use_lower_bound, float scale) -> ()",
-)
-torch.library.define(
-    "attn_gym::kda_prepare_chunk_offsets",
-    "(Tensor cu_seqlens, SymInt tokens, int chunk_size) -> Tensor",
 )
 
 _DELTA_H_ARGS = (
@@ -138,13 +130,6 @@ def _chunk_backend():
             "chunk_kda(impl='fused') requires the optional CuTeDSL backend: "
             "pip install attn-gym[linear]"
         ) from error
-
-
-def _plain_gate_backend():
-    try:
-        return importlib.import_module("attn_gym.linear.kda.fwd.triton.plain_gate")
-    except ImportError as error:
-        raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
 
 
 def _recurrent_backend():
@@ -199,10 +184,6 @@ def _chunk_bwd_recompute_factors_with_state_grad_cuda(*args):
     return _chunk_backend()._chunk_kda_bwd_recompute_factors_with_state_grad_cuda(*args)
 
 
-def _plain_gate_scan_cuda(*args):
-    return _plain_gate_backend()._plain_gate_scan_cuda(*args)
-
-
 def _recurrent_fwd_cuda(*args):
     return _recurrent_backend()._kda_recurrent_fwd_cuda(*args)
 
@@ -229,12 +210,6 @@ def _recurrent_decode_cuda(*args):
 
 def _delta_h_paged_cuda(*args):
     return _delta_h_backend()._delta_h_paged_cuda(*args)
-
-
-def _prepare_chunk_offsets_cuda(*args):
-    from attn_gym.linear.kda.chunk_scheduler import _prepare_ragged_chunk_offsets
-
-    return _prepare_ragged_chunk_offsets(*args)
 
 
 torch.library.impl("attn_gym::kda_chunk_fwd", "CUDA", _chunk_fwd_cuda)
@@ -266,7 +241,6 @@ torch.library.impl(
     "CUDA",
     _chunk_bwd_recompute_factors_with_state_grad_cuda,
 )
-torch.library.impl("attn_gym::_kda_plain_gate_scan", "CUDA", _plain_gate_scan_cuda)
 torch.library.impl("attn_gym::kda_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
 torch.library.impl(
     "attn_gym::kda_recurrent_fwd_no_state",
@@ -282,11 +256,6 @@ torch.library.impl(
     "attn_gym::kda_recurrent_decode",
     "CUDA",
     _recurrent_decode_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_prepare_chunk_offsets",
-    "CUDA",
-    _prepare_chunk_offsets_cuda,
 )
 torch.library.impl("attn_gym::kda_delta_h", "CUDA", _delta_h_cuda)
 torch.library.impl("attn_gym::kda_delta_h_with_state", "CUDA", _delta_h_with_state_cuda)
@@ -502,18 +471,6 @@ def _chunk_bwd_recompute_factors_with_state_grad_fake(
     )
 
 
-@torch.library.register_fake("attn_gym::_kda_plain_gate_scan")
-def _plain_gate_scan_fake(
-    values: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    chunk_offsets: torch.Tensor | None,
-    reverse: bool,
-) -> torch.Tensor:
-    """Describe the compact internal gate scan output."""
-    del cu_seqlens, chunk_offsets, reverse
-    return torch.empty_like(values, memory_format=torch.contiguous_format)
-
-
 @torch.library.register_fake("attn_gym::kda_recurrent_fwd")
 def _recurrent_fwd_fake(
     q: torch.Tensor,
@@ -599,16 +556,6 @@ def _recurrent_decode_fake(
     )
 
 
-@torch.library.register_fake("attn_gym::kda_prepare_chunk_offsets")
-def _prepare_chunk_offsets_fake(
-    cu_seqlens: torch.Tensor,
-    tokens: int,
-    chunk_size: int,
-) -> torch.Tensor:
-    del tokens, chunk_size
-    return torch.empty_like(cu_seqlens)
-
-
 def _delta_h_fake_common(
     k: torch.Tensor, u: torch.Tensor, capacity: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -679,12 +626,10 @@ chunk_bwd_recompute_factors_op = torch.ops.attn_gym.kda_chunk_bwd_recompute_fact
 chunk_bwd_recompute_factors_with_state_grad_op = (
     torch.ops.attn_gym.kda_chunk_bwd_recompute_factors_with_state_grad.default
 )
-_plain_gate_scan_op = torch.ops.attn_gym._kda_plain_gate_scan.default
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
 recurrent_decode_op = torch.ops.attn_gym.kda_recurrent_decode.default
-prepare_chunk_offsets_op = torch.ops.attn_gym.kda_prepare_chunk_offsets.default
 delta_h_op = torch.ops.attn_gym.kda_delta_h.default
 delta_h_with_state_op = torch.ops.attn_gym.kda_delta_h_with_state.default
 delta_h_paged_op = torch.ops.attn_gym.kda_delta_h_paged.default
@@ -798,7 +743,6 @@ __all__ = [
     "delta_h_op",
     "delta_h_paged_op",
     "delta_h_with_state_op",
-    "prepare_chunk_offsets_op",
     "recurrent_decode_forward",
     "recurrent_decode_op",
     "recurrent_forward",

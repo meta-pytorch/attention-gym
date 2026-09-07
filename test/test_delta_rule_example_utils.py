@@ -15,7 +15,7 @@ def training():
     """Load example recipes only when their optional fused dependencies are installed."""
     pytest.importorskip("cutlass")
     pytest.importorskip("typer")
-    from examples import delta_rule_training
+    from examples.linear import delta_rule_training
 
     return delta_rule_training
 

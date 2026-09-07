@@ -10,7 +10,7 @@ Like that example's ``--packed`` mode, ``--batch-size`` is the number of logical
 TorchTitan's K3 attention dimensions: hidden size 7168 and 96 heads of dimension 128, not a full
 K3 model. Launch with:
 
-    torchrun --standalone --nproc-per-node=2 examples/delta_rule_context_parallel.py --batch-size 4 --tokens 1024
+    torchrun --standalone --nproc-per-node=2 examples/linear/delta_rule_context_parallel.py --batch-size 4 --tokens 1024
 
 Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to vary the recipe.
 ``--core-backend mega`` selects the KDA Mega backend (SM100/SM103). ``--cuda-graph`` checks a
@@ -42,7 +42,7 @@ from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
 from attn_gym.linear.kda.context_parallel import context_parallel_kda
 from attn_gym.testing import TraceFormat, kernel_stage, record_distributed_profile
 from attn_gym.testing.profiling import graph_annotations_available
-from examples.delta_rule_training import (
+from examples.linear.delta_rule_training import (
     ComputeDTypeOption,
     CoreBackendOption,
     DeltaRuleAttention,

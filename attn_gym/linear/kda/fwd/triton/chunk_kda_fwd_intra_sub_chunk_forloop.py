@@ -18,7 +18,7 @@ import triton.language as tl
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,

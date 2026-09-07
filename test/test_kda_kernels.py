@@ -15,9 +15,9 @@ triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
 from attn_gym._backends.triton.utils import can_use_tma
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
     chunk_gla_fwd_kernel_o,

@@ -1,9 +1,15 @@
 import torch
-from paged_attention import PagedAttention
 from torch.nn.attention.flex_attention import (
     BlockMask,
     _identity,
 )
+
+# Sibling imports work both as ``examples.flex_attention.*`` and as a directly executed
+# script, where only this directory is on ``sys.path``.
+if __package__:
+    from .paged_attention import PagedAttention
+else:
+    from paged_attention import PagedAttention
 
 
 def batch_reserve(paged_attention: PagedAttention, target_seq_len: torch.Tensor):

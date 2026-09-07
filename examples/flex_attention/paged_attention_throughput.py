@@ -27,14 +27,22 @@ from collections import deque
 
 import torch
 from datasets import load_dataset
-from model import PagedAttentionLayer
-from paged_attention import PagedAttention
 from torch.nn.attention.flex_attention import (
     BlockMask,
     _identity,
     create_block_mask,
 )
-from utils import gen_offset, slice_block_mask
+
+# Sibling imports work both as ``examples.flex_attention.*`` and as a directly executed
+# script, where only this directory is on ``sys.path``.
+if __package__:
+    from .paged_attention import PagedAttention
+    from .paged_attention_model import PagedAttentionLayer
+    from .paged_attention_utils import gen_offset, slice_block_mask
+else:
+    from paged_attention import PagedAttention
+    from paged_attention_model import PagedAttentionLayer
+    from paged_attention_utils import gen_offset, slice_block_mask
 
 create_block_mask = torch.compile(create_block_mask)
 

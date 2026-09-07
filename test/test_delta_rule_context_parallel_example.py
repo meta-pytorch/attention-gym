@@ -20,8 +20,8 @@ pytest.importorskip("typer")
 
 from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParallelRouting
 from attn_gym.testing.kda import assert_relative_rms_within
-from examples.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
-from examples.delta_rule_training import (
+from examples.linear.delta_rule_context_parallel import ContextParallelDeltaRuleAttention
+from examples.linear.delta_rule_training import (
     DeltaRuleAttention,
     DeltaRuleAttentionOutput,
     PackedTrainingBatch,

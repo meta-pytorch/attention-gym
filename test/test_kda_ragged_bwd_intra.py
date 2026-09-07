@@ -11,11 +11,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     ChunkKdaBwdIntraConfig,
     chunk_kda_bwd_intra,
 )
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     bwd_intra_reference,

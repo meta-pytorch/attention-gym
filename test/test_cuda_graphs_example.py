@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
 
-from examples import cuda_graph_trace_comparison
+from examples.flex_attention import cuda_graph_trace_comparison
 
 
 def test_training_loop_trace_comparison_uses_raw_and_postprocessed_captures(

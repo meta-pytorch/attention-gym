@@ -217,11 +217,11 @@ def test_delta_h_dv_fusion_runtime_flags(use_gate: bool, state_mode: str):
 def test_packed_delta_h_dv_fusion_matches_reference(
     bv: int, force_int64: bool, heads: int, monkeypatch
 ):
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
         _blackwell_delta_h_bwd_dhu_dv_fused_packed,
     )
     from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.testing.kda import cumulative_sequence_offsets
 
     torch.manual_seed(23)
@@ -317,10 +317,10 @@ def test_packed_delta_h_dv_fusion_matches_reference(
 
 
 def test_packed_delta_h_dv_fusion_cuda_graph_replays_smaller_endpoint():
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
         _blackwell_delta_h_bwd_dhu_dv_fused_packed,
     )
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.testing.kda import cumulative_sequence_offsets
 
     torch.manual_seed(41)
@@ -380,10 +380,10 @@ def test_packed_delta_h_dv_fusion_cuda_graph_replays_smaller_endpoint():
 
 
 def test_packed_delta_h_dv_fusion_preserves_empty_state_slots():
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
         _blackwell_delta_h_bwd_dhu_dv_fused_packed,
     )
-    from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
     from attn_gym.testing.kda import cumulative_sequence_offsets
 
     heads = 1

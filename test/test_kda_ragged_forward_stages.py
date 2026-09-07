@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 
 pytestmark = pytest.mark.skipif(

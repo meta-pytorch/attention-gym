@@ -15,7 +15,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(

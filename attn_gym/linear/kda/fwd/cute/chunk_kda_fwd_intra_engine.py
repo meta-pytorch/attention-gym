@@ -40,8 +40,8 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work as _tl_load_ragged_chunk_work,
 )
 from attn_gym.linear.kda.constants import is_sm100_kda_capability

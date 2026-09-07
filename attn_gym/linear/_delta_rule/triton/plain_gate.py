@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Internal natural-log to cumulative-log2 KDA gate scan.
+"""Internal natural-log to cumulative-log2 gate scan shared by delta-rule variants.
 
 Dense and packed routing use separate kernels because a shared constexpr branch changes
 the FP32 scan lowering enough to break route-independent rounding. One registered op
@@ -18,12 +18,12 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE, LOG2_E
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     chunk_capacity,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
-from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE, LOG2_E
 
 
 @triton.jit(do_not_specialize=["T"])

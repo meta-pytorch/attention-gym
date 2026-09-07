@@ -14,7 +14,7 @@ from contextlib import nullcontext
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,

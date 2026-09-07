@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym.linear.kda.chunk_scheduler import (
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     PERSISTENT_AUTO_WAVES,
     PERSISTENT_CTAS_PER_SM,
     GridScheduler,
@@ -192,7 +192,7 @@ def test_ragged_chunk_scheduler_rejects_invalid_boundaries(boundaries, tokens):
     source = f"""
 import os
 import torch
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 
 try:
     offsets = torch.tensor({boundaries!r}, device="cuda", dtype=torch.int32)

@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 @pytest.mark.parametrize("invalid", ["rank", "empty", "short", "dtype", "cpu"])
 def test_raw_forward_rejects_metadata_before_device_reads(op, invalid: str, monkeypatch):
     """Raw callers must not reach the offset kernel with a malformed metadata tensor."""
-    from attn_gym.linear.kda import chunk_scheduler
+    from attn_gym.linear._delta_rule.triton import chunk_scheduler
 
     scheduler = Mock(side_effect=AssertionError("malformed metadata reached the scheduler"))
     backend = Mock(side_effect=AssertionError("malformed metadata reached the Mega backend"))

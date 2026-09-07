@@ -13,8 +13,11 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_rows
+from attn_gym.linear._delta_rule.chunk_schedule import (
+    RaggedChunkMetadata,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata, prepare_ragged_chunk_metadata
 
 CHUNK_SIZE = 64
 

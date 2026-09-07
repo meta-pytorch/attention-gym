@@ -1,4 +1,4 @@
-"""Graph-safe chunk scheduling for packed variable-length KDA inputs.
+"""Graph-safe chunk scheduling shared by packed delta-rule implementations.
 
 Coordinate system
 -----------------
@@ -94,7 +94,7 @@ import triton.language as tl
 
 # The op-wrapped metadata builder is re-exported so every caller routes the offsets
 # launch through the registered scheduler op instead of tracing it directly.
-from attn_gym.linear.kda.chunk_schedule import (
+from attn_gym.linear._delta_rule.chunk_schedule import (
     RaggedChunkMetadata,
     ResolvedSchedule,
     ScheduleKind,

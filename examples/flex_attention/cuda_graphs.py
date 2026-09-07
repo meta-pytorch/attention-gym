@@ -15,7 +15,7 @@ from torch.nn.attention.varlen import varlen_attn
 Tensor = torch.Tensor
 GraphOutput = TypeVar("GraphOutput")
 TraceFormat = Literal["chrome_json", "track_event"]
-TRACE_PATH = Path(__file__).resolve().parents[1]
+TRACE_PATH = Path(__file__).resolve().parents[2]
 
 
 class VarLenAttention(nn.Module):

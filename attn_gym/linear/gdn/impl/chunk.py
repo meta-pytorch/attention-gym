@@ -13,6 +13,7 @@ from attn_gym._backends.cute import (
 )
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.span import zero_state
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
@@ -44,7 +45,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
 

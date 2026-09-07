@@ -621,8 +621,8 @@ def test_dense_tail_batch_gradients_match_explicit_packed_lowering():
 
 def test_public_auto_persistent_matches_static_composition(monkeypatch):
     """Route the complete public forward/backward through AUTO persistent plans."""
-    from attn_gym.linear.kda import chunk_scheduler
-    from attn_gym.linear.kda.chunk_schedule import ScheduleKind
+    from attn_gym.linear._delta_rule.chunk_schedule import ScheduleKind
+    from attn_gym.linear._delta_rule.triton import chunk_scheduler
 
     capacity = 4096
     active_lengths = [321, 0, 63, 128, 488]

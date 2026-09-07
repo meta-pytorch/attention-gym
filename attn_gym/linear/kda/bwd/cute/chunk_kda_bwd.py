@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
     blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
 )
@@ -19,7 +20,6 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd_wy_triton
-from attn_gym.linear.kda.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
 from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h

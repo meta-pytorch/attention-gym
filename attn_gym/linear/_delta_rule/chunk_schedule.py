@@ -1,4 +1,4 @@
-"""Torch-only packed chunk metadata used by the public fused wrapper."""
+"""Torch-only chunk metadata and scheduling policies shared by delta-rule variants."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym.linear.kda.ops import prepare_chunk_offsets_op
+from attn_gym.linear._delta_rule.chunk_ops import prepare_chunk_offsets_op
 
 
 class ScheduleRequest(Enum):

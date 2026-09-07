@@ -5,9 +5,9 @@ from pathlib import Path
 
 import torch
 
-from examples.cuda_graphs import hello_world_training_loop
+from examples.flex_attention.cuda_graphs import hello_world_training_loop
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 WORK_DIR = ROOT / "agent_space/cuda_graph_training_loop_comparison"
 OUTPUT = ROOT / "docs/assets/traces/hello_world_training_loop_comparison.pftrace"
 

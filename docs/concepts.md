@@ -127,12 +127,12 @@ For a full interactive walkthrough of this debugging workflow, run the marimo no
 
 ```bash
 pip install -e ".[viz]"
-marimo run examples/debug_score_mod.py
+marimo run examples/flex_attention/debug_score_mod.py
 ```
 
 ## Interactive Notebook
 
-The `examples/flex_attn.ipynb` Jupyter notebook provides a comprehensive interactive walkthrough covering:
+The `examples/flex_attention/flex_attn.ipynb` Jupyter notebook provides a comprehensive interactive walkthrough covering:
 
 - Basic usage and score modification vs masking
 - Causal, sliding window, prefix LM, document masking
@@ -143,7 +143,7 @@ The `examples/flex_attn.ipynb` Jupyter notebook provides a comprehensive interac
 - Flamingo cross-attention
 
 ```bash
-jupyter notebook examples/flex_attn.ipynb
+jupyter notebook examples/flex_attention/flex_attn.ipynb
 ```
 
 ## Further Reading

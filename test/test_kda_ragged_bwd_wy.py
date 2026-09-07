@@ -9,10 +9,10 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
 )
-from attn_gym.linear.kda.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     bwd_wy_dqkg_reference,

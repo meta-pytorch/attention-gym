@@ -5,8 +5,8 @@ from functools import partial
 import pytest
 import torch
 
-from attn_gym.linear.kda import chunk_schedule
-from attn_gym.linear.kda.chunk_schedule import RaggedChunkMetadata
+from attn_gym.linear._delta_rule import chunk_schedule
+from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
