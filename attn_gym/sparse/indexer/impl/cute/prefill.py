@@ -5,9 +5,9 @@ queries for each 64-head tile, and overlaps the tensor-core producer with two
 independent CUDA-warpgroup Top-K consumers.  Both final Top-K lists remain
 entirely in shared memory.  There are no global partial lists and no merge
 kernel.  The public operation is a direct CuTeDSL launch guarded by an
-in-process compile cache keyed on the static shape/dtype contract (dtype,
-batch, queries, heads, head_dim, topk, causal); it has no dispatcher
-registration or fallback implementation.
+in-process and persistent TVM-FFI compile cache keyed on the static shape/dtype
+contract (dtype, batch, queries, heads, head_dim, topk, causal) and compile
+target; it has no dispatcher registration or fallback implementation.
 """
 
 import math
@@ -19,8 +19,10 @@ import torch
 from cutlass import Float32, Int32, Int64, cute, pipeline, utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.target import detect_compile_target, set_compile_target
 
 _TILE_CANDIDATES = 128
 _TILE_HEADS = 64
@@ -50,6 +52,15 @@ _MAX_SEQUENCE = 1 << 20
 _INVALID_KEY = -(1 << 63)
 _INVALID_ORDINAL = -(1 << 31)
 _WARP_SIZE = 32
+
+_CUTE_IO_TYPES = {
+    "bf16": cutlass.BFloat16,
+    "fp16": cutlass.Float16,
+}
+_TORCH_IO_TYPE_NAMES = {
+    torch.bfloat16: "bf16",
+    torch.float16: "fp16",
+}
 
 
 @cute.struct
@@ -1390,7 +1401,42 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         raise RuntimeError("this tcgen05 kernel requires an SM100 GPU")
 
 
-_compile_cache: dict[tuple, object] = {}
+@jit_cache
+def _compile_indexer(
+    dtype_name: str,
+    batch: int,
+    queries: int,
+    heads: int,
+    head_dim: int,
+    topk: int,
+    causal: bool,
+):
+    io_dtype = _CUTE_IO_TYPES[dtype_name]
+
+    def tensor(dtype, shape):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=_ALIGNMENT,
+        )
+
+    sort_span = _selection_sort_span(topk)
+    return compile_tvm_ffi(
+        _launch,
+        tensor(io_dtype, (batch, queries, heads, head_dim)),
+        tensor(io_dtype, (batch, queries, head_dim)),
+        tensor(io_dtype, (batch, queries, heads)),
+        tensor(cutlass.Int32, (batch, queries, topk)),
+        Float32(1.0),
+        topk,
+        sort_span,
+        causal,
+        name=(
+            f"indexer_prefill_{dtype_name}_b{batch}_t{queries}_h{heads}_d{head_dim}_"
+            f"k{topk}_c{int(causal)}"
+        ),
+    )
 
 
 def index(
@@ -1407,14 +1453,10 @@ def index(
     [B,T,topk].  Invalid contracts, compilation errors, shared-memory
     exhaustion, and launch errors propagate; there is no fallback.
 
-    A compiled kernel is cached per (dtype, batch, queries, heads, head_dim,
-    topk, causal, device compute capability); the same shape/dtype/topk/
-    causal/capability combination reuses the already-compiled kernel instead
-    of retracing on every call. A new sequence length recompiles, and so
-    does a device whose compute capability differs from a cached entry's
-    (e.g. a heterogeneous multi-GPU host) -- the generated PTX/SASS bakes in
-    the compiling device's architecture, so a capability mismatch across
-    devices in the same process must never share a cache entry.
+    The shared CuTeDSL cache keys exact shape, dtype, topk, causal mode, and
+    compile target. Process-local hits reuse the loaded TVM-FFI callable, while
+    warm processes can load its persisted object without retracing. A new
+    sequence length or compile target selects a different specialization.
     """
     _validate(q, k, weights, topk)
     if topk == 0:
@@ -1422,32 +1464,19 @@ def index(
 
     output = torch.empty((*q.shape[:2], topk), dtype=torch.int32, device=q.device)
     batch, queries, heads, head_dim = q.shape
-    capability = torch.cuda.get_device_capability(q.device)
-    compile_key = (q.dtype, batch, queries, heads, head_dim, topk, causal, capability)
     score_scale = 1.0 / math.sqrt(heads * head_dim)
-    q_c = from_dlpack(q, assumed_align=_ALIGNMENT)
-    k_c = from_dlpack(k, assumed_align=_ALIGNMENT)
-    weights_c = from_dlpack(weights, assumed_align=_ALIGNMENT)
-    output_c = from_dlpack(output, assumed_align=_ALIGNMENT)
-    compiled = _compile_cache.get(compile_key)
-    if compiled is None:
-        compiled = cute.compile(
-            _launch,
-            q_c,
-            k_c,
-            weights_c,
-            output_c,
-            score_scale,
-            topk,
-            _selection_sort_span(topk),
-            causal,
-            cute.runtime.make_fake_stream(),
-        )
-        _compile_cache[compile_key] = compiled
-    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    compiled(q_c, k_c, weights_c, output_c, score_scale, stream)
+    set_compile_target(detect_compile_target(q.device.index))
+    compiled = _compile_indexer(
+        _TORCH_IO_TYPE_NAMES[q.dtype],
+        batch,
+        queries,
+        heads,
+        head_dim,
+        topk,
+        causal,
+    )
+    compiled(q.detach(), k.detach(), weights.detach(), output, Float32(score_scale))
     return output
 
 
 __all__ = ["index"]
-

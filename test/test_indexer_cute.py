@@ -173,6 +173,8 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         (2, 128, 64, 128, 127),
         (2, 256, 64, 128, 129),
         (2, 512, 64, 128, 512),
+        (2, 1024, 64, 128, 512),
+        (2, 4096, 64, 128, 128)
     ],
     ids=[
         "base",
@@ -191,6 +193,8 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         "topk_127",
         "topk_129",
         "topk_512",
+        "topk_1024",
+        "topk_4096"
     ],
 )
 def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal, dtype):
