@@ -14,7 +14,7 @@ from contextlib import nullcontext
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_inter_solve_cute,
@@ -115,6 +115,7 @@ def chunk_kda_fwd_intra(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -142,6 +143,7 @@ def chunk_kda_fwd_intra(
     ):
         w, u, _qg, kg = recompute_w_u_fwd(
             autotune=autotune,
+            schedule=schedule,
             k=k,
             v=v,
             beta=beta,

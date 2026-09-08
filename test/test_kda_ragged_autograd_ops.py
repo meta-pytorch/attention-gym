@@ -41,6 +41,7 @@ def test_ragged_custom_op_registrations():
         metadata.chunk_offsets,
         _DEFAULT_SCALE,
         True,
+        "auto",
     )
     torch.library.opcheck(
         _chunk_kda_fwd_ragged_with_state_op,
@@ -74,6 +75,7 @@ def test_ragged_custom_op_registrations():
             _DEFAULT_SCALE,
             False,
             True,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -87,6 +89,7 @@ def test_ragged_custom_op_registrations():
         metadata.chunk_offsets,
         _DEFAULT_SCALE,
         True,
+        "auto",
     )
     with torch.no_grad():
         output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args)
@@ -104,6 +107,7 @@ def test_ragged_custom_op_registrations():
             _DEFAULT_SCALE,
             False,
             True,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,

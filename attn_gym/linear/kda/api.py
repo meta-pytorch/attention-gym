@@ -166,6 +166,7 @@ def chunk_kda(
             output_final_state=output_final_state,
             fastmath=fastmath,
             autotune=autotune,
+            schedule=options.schedule,
         )
     return reference_kda(
         partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE),
@@ -219,7 +220,8 @@ def paged_chunk_kda(
             configurations when true; Mega uses its fixed schedule.
         kernel_options: Backend-specific options. ``{"backend": "mega"}`` selects
             the optional CuTeDSL 4.7 Mega backend. ``split_backward`` and
-            ``split_forward`` are not supported by this paged operation.
+            ``split_forward`` are not supported by this paged operation; ``schedule``
+            applies to the fused backend as in ``chunk_kda``.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -270,6 +272,7 @@ def paged_chunk_kda(
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
         autotune=autotune,
+        schedule=options.schedule,
     )
 
 

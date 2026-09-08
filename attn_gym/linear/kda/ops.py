@@ -17,7 +17,7 @@ _CHUNK_SIZE = 64
 # Fixed-arity schema pairs avoid optional outputs on hot paths.
 _CHUNK_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor? initial_state,"
-    " float scale, bool autotune)"
+    " float scale, bool autotune, str schedule)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd",
@@ -31,7 +31,7 @@ torch.library.define(
 _CHUNK_RAGGED_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, float scale, "
-    "bool autotune)"
+    "bool autotune, str schedule)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd_ragged",
@@ -46,13 +46,14 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
     "Tensor cu_seqlens, "
-    "Tensor chunk_offsets, bool autotune) -> Tensor",
+    "Tensor chunk_offsets, bool autotune, str schedule) -> Tensor",
 )
 
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
     "Tensor Akk, Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
-    "Tensor? d_final_state, {initial_state}, float scale, bool fastmath, bool autotune)"
+    "Tensor? d_final_state, {initial_state}, float scale, bool fastmath, bool autotune, "
+    "str schedule)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_bwd",
@@ -68,7 +69,8 @@ torch.library.define(
 _CHUNK_BWD_RECOMPUTE_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
-    "Tensor? d_final_state, {initial_state}, float scale, bool fastmath, bool autotune)"
+    "Tensor? d_final_state, {initial_state}, float scale, bool fastmath, bool autotune, "
+    "str schedule)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_bwd_recompute_factors",
@@ -277,8 +279,9 @@ def _chunk_fwd_fake(
     initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
-    del k, cumulative_gate, beta, initial_state, scale, autotune
+    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule
     return _chunk_fwd_fake_common(q, v)
 
 
@@ -292,8 +295,9 @@ def _chunk_fwd_with_state_fake(
     initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
-    del k, cumulative_gate, beta, initial_state, scale, autotune
+    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (q.shape[0], q.shape[2], v.shape[-1], q.shape[3]),
@@ -314,8 +318,19 @@ def _chunk_fwd_ragged_fake(
     chunk_offsets: torch.Tensor,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
-    del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, scale, autotune
+    del (
+        k,
+        cumulative_gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        chunk_offsets,
+        scale,
+        autotune,
+        schedule,
+    )
     return _chunk_fwd_fake_common(q, v)
 
 
@@ -331,8 +346,9 @@ def _chunk_fwd_ragged_with_state_fake(
     chunk_offsets: torch.Tensor,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
-    del k, cumulative_gate, beta, initial_state, chunk_offsets, scale, autotune
+    del k, cumulative_gate, beta, initial_state, chunk_offsets, scale, autotune, schedule
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (cu_seqlens.shape[0] - 1, q.shape[2], v.shape[-1], q.shape[3]),
@@ -354,6 +370,7 @@ def _chunk_fwd_ragged_paged_fake(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    schedule: str,
 ) -> torch.Tensor:
     del (
         k,
@@ -365,6 +382,7 @@ def _chunk_fwd_ragged_paged_fake(
         cu_seqlens,
         chunk_offsets,
         autotune,
+        schedule,
     )
     return v.new_empty(v.shape, dtype=q.dtype)
 
@@ -396,9 +414,10 @@ def _chunk_bwd_fake(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
     del aqk, akk, cu_seqlens, chunk_offsets, d_output, d_final_state, initial_state
-    del scale, fastmath, autotune
+    del scale, fastmath, autotune, schedule
     return _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta)
 
 
@@ -419,8 +438,20 @@ def _chunk_bwd_with_state_grad_fake(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
-    del aqk, akk, cu_seqlens, chunk_offsets, d_output, d_final_state, scale, fastmath, autotune
+    del (
+        aqk,
+        akk,
+        cu_seqlens,
+        chunk_offsets,
+        d_output,
+        d_final_state,
+        scale,
+        fastmath,
+        autotune,
+        schedule,
+    )
     return (
         *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
         torch.empty_like(initial_state),
@@ -442,9 +473,10 @@ def _chunk_bwd_recompute_factors_fake(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
     del cu_seqlens, chunk_offsets, d_output, d_final_state, initial_state
-    del scale, fastmath, autotune
+    del scale, fastmath, autotune, schedule
     return _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta)
 
 
@@ -463,8 +495,9 @@ def _chunk_bwd_recompute_factors_with_state_grad_fake(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
-    del cu_seqlens, chunk_offsets, d_output, d_final_state, scale, fastmath, autotune
+    del cu_seqlens, chunk_offsets, d_output, d_final_state, scale, fastmath, autotune, schedule
     return (
         *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
         torch.empty_like(initial_state),

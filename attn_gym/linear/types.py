@@ -26,6 +26,13 @@ class KernelOptions(BackendOptions, total=False):
     split_forward: bool
     """Allow KDA Mega to use its approximate forgetting-horizon split forward schedule."""
 
+    schedule: Literal["auto", "static", "persistent"]
+    """Set ``"persistent"`` for CUDA graphs whose replays can carry far fewer tokens than the
+    captured capacity: the default static grid pays one CTA per capacity chunk even when empty,
+    while the persistent grid strides over active work only and wins below ~1/4 of capacity
+    active. Outputs are bitwise identical. Fused backend only; Hopper or newer for packed
+    inputs."""
+
 
 class Impl(str, Enum):
     """Select a fused or reference implementation without automatic fallback."""

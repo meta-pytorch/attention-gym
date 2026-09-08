@@ -518,8 +518,9 @@ def chunk_gla_fwd_o_gk(
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms.
 
     Args:
-        schedule: Internal scheduling request for tests. Automatic selection is
-            the default and dense inputs keep their exact launch grid.
+        schedule: Ragged launch geometry, as ``chunk_kda``'s ``kernel_options['schedule']``.
+            AUTO keeps the static grid; dense inputs always use
+            their exact launch grid.
 
     Raises:
         ValueError: If persistent scheduling is forced for a packed input outside

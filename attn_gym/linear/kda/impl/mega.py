@@ -116,6 +116,7 @@ class ChunkKdaMegaDense(torch.autograd.Function):
             ctx.scale,
             False,
             False,
+            "auto",
         )
         d_gate = plain_gate_bwd_dense_cute_op(d_cumulative.contiguous())
         return dq, dk, dv, d_gate, d_beta, None, None, None, None
@@ -254,6 +255,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                     ctx.scale,
                     False,
                     False,
+                    "auto",
                 )
             )
         else:
@@ -272,6 +274,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                 ctx.scale,
                 False,
                 False,
+                "auto",
             )
             d_initial_state = None
         d_gate = _plain_gate_scan_op(d_cumulative.contiguous(), cu_seqlens, chunk_offsets, True)

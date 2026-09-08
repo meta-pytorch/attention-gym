@@ -6,7 +6,10 @@ import torch
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
-from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.chunk_schedule import (
+    ScheduleRequest,
+    prepare_ragged_chunk_metadata,
+)
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -49,6 +52,7 @@ class _ChunkKDA(torch.autograd.Function):
         output_final_state,
         fastmath,
         autotune,
+        schedule,
     ):
         cumulative_gate = _plain_gate_scan_op(
             gate,
@@ -60,11 +64,11 @@ class _ChunkKDA(torch.autograd.Function):
             assert chunk_offsets is None
             if output_final_state:
                 output, state, aqk, akk = chunk_fwd_with_state_op(
-                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune, schedule
                 )
             else:
                 output, aqk, akk = chunk_fwd_op(
-                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune
+                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune, schedule
                 )
         elif output_final_state:
             assert chunk_offsets is not None
@@ -79,6 +83,7 @@ class _ChunkKDA(torch.autograd.Function):
                 chunk_offsets,
                 scale,
                 autotune,
+                schedule,
             )
         else:
             assert chunk_offsets is not None
@@ -93,6 +98,7 @@ class _ChunkKDA(torch.autograd.Function):
                 chunk_offsets,
                 scale,
                 autotune,
+                schedule,
             )
         ctx.save_for_backward(
             q,
@@ -109,6 +115,7 @@ class _ChunkKDA(torch.autograd.Function):
         ctx.scale = scale
         ctx.fastmath = fastmath
         ctx.autotune = autotune
+        ctx.schedule = schedule
         ctx.set_materialize_grads(False)
         if output_final_state:
             return output, state
@@ -145,6 +152,7 @@ class _ChunkKDA(torch.autograd.Function):
             ctx.scale,
             ctx.fastmath,
             ctx.autotune,
+            ctx.schedule,
         )
         if initial_state is not None:
             dq, dk, dv, d_cumulative, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
@@ -157,7 +165,7 @@ class _ChunkKDA(torch.autograd.Function):
             chunk_offsets,
             True,
         )
-        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None, None
 
 
 def chunk_forward(
@@ -173,6 +181,7 @@ def chunk_forward(
     output_final_state: bool = False,
     fastmath: bool = False,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize per-token natural-log gates and invoke the fused chunk operators."""
     _validate_fused_constraints(q, v)
@@ -216,6 +225,7 @@ def chunk_forward(
             True,
             fastmath,
             autotune,
+            schedule.value,
         )
     else:
         output = _ChunkKDA.apply(
@@ -231,6 +241,7 @@ def chunk_forward(
             False,
             fastmath,
             autotune,
+            schedule.value,
         )
         state = None
     return output.reshape(output_shape).to(output_dtype), state
@@ -248,6 +259,7 @@ def paged_chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> torch.Tensor:
     """Normalize inputs and invoke the registered paged chunk operator."""
     _validate_fused_constraints(q, v)
@@ -289,6 +301,7 @@ def paged_chunk_forward(
         metadata.cu_seqlens,
         metadata.chunk_offsets,
         autotune,
+        schedule.value,
     )
     return output.reshape(output_shape).to(output_dtype)
 

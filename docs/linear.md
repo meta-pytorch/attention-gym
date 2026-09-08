@@ -430,6 +430,14 @@ currently require a no-state call, so context parallelism never uses them. `page
 same exact unsplit forward while updating selected cache slots directly; paged execution never uses
 forgetting-horizon splitting. Install the `mega` extra to use this backend.
 
+`kernel_options={"schedule": "persistent"}` is for CUDA graphs whose replays can carry far fewer
+tokens than the capacity they were captured for. The default static grid launches one CTA per
+capacity chunk, so a replay at 1/16 of capacity still pays for the empty CTAs; the persistent grid
+strides over only the active work. Below roughly a quarter of capacity active, persistent wins
+(measured 0.1-0.7x the static time on GB200); at full capacity it loses (1.1-2.4x). Outputs are
+bitwise identical. Requires the fused backend and, for packed inputs, the TMA output path (Hopper or
+newer).
+
 ::: attn_gym.linear.chunk_kda
 
 ::: attn_gym.linear.paged_chunk_kda
@@ -502,7 +510,9 @@ summaries = prepared.state_summaries(bounds)  # [bias; transition] per range
 # ...exchange summaries and compose each subsequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
-grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
+grads = chunk_kda_prepare_backward(
+    prepared.saved, d_output, initial_state, scale=prepared.scale, schedule=prepared.schedule
+)
 grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; transition]
 # ...exchange and compose each subsequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)

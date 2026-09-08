@@ -439,8 +439,9 @@ def recompute_w_u_fwd_triton(
     """Launch the register-operand recompute for packed B=1 inputs.
 
     Args:
-        schedule: Internal scheduling request for tests; automatic selection is
-            the default and dense inputs keep their exact launch grid.
+        schedule: Ragged launch geometry, as ``chunk_kda``'s ``kernel_options['schedule']``.
+            AUTO keeps the static grid; dense inputs always use
+            their exact launch grid.
     """
     batch, tokens, key_heads, key_dim = k.shape
     value_heads, value_dim = v.shape[2], v.shape[3]
