@@ -29,17 +29,18 @@ Notes:
 - uv hard-links wheels from its cache, so after the first nightly download this
   takes seconds and costs almost no extra disk per worktree.
 - Activate `.venv` before installing so an already-active foreign environment is not modified.
-- `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`, but it also lets
-  the open `[linear]` bound resolve to `nvidia-cutlass-dsl` dev releases (4.8.0.dev0 breaks
-  `tcgen05_mma_ws(..., mma_kind=)` in the fused CuTeDSL backward). Pin it afterwards:
-  `uv pip install "nvidia-cutlass-dsl[cu13]==4.7.1"`.
+- `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`.
+  `[tests]` omits FlashAttention on aarch64, so its transitive CuTeDSL pin does not apply
+  there or to linear-only installs. When updating CuTeDSL, run
+  `pytest -n 6 test/test_kda_bwd_wy_compile.py` to catch NVVM binding changes without a
+  Blackwell GPU, then validate forward/backward numerics on supported hardware.
 - A `.venv` symlink into another worktree is not isolation: its editable `.pth` still
   points at that worktree, so pytest imports the other checkout's `attn_gym`. Replace it
   with a real per-worktree env.
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
-- `[tests]` currently brings FlashAttention's CuTeDSL 4.6 pin and cannot be combined with the
+- On x86_64 Linux, `[tests]` brings FlashAttention's CuTeDSL 4.6 pin and conflicts with the
   CuTeDSL 4.7+ `[mega]` extra. For Mega worktrees, install `-e '.[mega,dev]' pytest pytest-xdist`
   instead; Mega tests import-skip optional FlashAttention coverage.
 

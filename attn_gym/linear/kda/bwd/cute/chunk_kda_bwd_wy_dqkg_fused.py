@@ -104,11 +104,12 @@ def tcgen05mma_ws_ss_f16(
             loc=loc,
             ip=ip,
         )
+        # CUTLASS 4.8 renamed these four parameters but preserved their positional order.
         _nvvm.tcgen05_mma_ws(
-            mma_kind=_nvvm.Tcgen05MMAKind.F16,
-            d=destination,
-            a=_ir(a_value, loc, ip),
-            b=_ir(b_value, loc, ip),
+            _nvvm.Tcgen05MMAKind.F16,
+            destination,
+            _ir(a_value, loc, ip),
+            _ir(b_value, loc, ip),
             idesc=_ir(idesc_value, loc, ip),
             enable_input_d=enable_d,
             collector_b_buffer=None,
