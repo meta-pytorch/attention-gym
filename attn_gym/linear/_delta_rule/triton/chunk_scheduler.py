@@ -150,15 +150,23 @@ class GridScheduler:
         capacity_tasks: int,
         workers: int,
         requirement: str,
+        auto_persistent: bool = True,
     ) -> ResolvedSchedule:
-        """Translate caller policy into one concrete schedule."""
+        """Translate caller policy into one concrete schedule.
+
+        ``eligible`` says whether a persistent kernel exists for the input, so an explicit
+        PERSISTENT request fails without it. ``auto_persistent`` only steers AUTO; explicit
+        requests ignore it.
+        """
         validate_schedule_request(request)
         if request is ScheduleRequest.PERSISTENT and not eligible:
             raise ValueError(f"persistent scheduling requires {requirement}")
         if capacity_tasks == 0:
             return ResolvedSchedule(ScheduleKind.STATIC, workers, capacity_tasks)
         if request is ScheduleRequest.AUTO:
-            persistent = eligible and capacity_tasks > PERSISTENT_AUTO_WAVES * workers
+            persistent = (
+                eligible and auto_persistent and capacity_tasks > PERSISTENT_AUTO_WAVES * workers
+            )
         else:
             persistent = request is ScheduleRequest.PERSISTENT
         return ResolvedSchedule(
@@ -196,8 +204,28 @@ class GridScheduler:
         *,
         eligible: bool = True,
         requirement: str = "a persistent kernel for this input layout",
+        auto_persistent: bool = True,
     ) -> ResolvedSchedule:
-        """Resolve scheduling for a flattened ``(chunk, subtask)`` work list."""
+        """Resolve scheduling for a flattened ``(chunk, subtask)`` work list.
+
+        Args:
+            eligible: Whether a persistent kernel exists for this input; an explicit
+                PERSISTENT request fails without one.
+            auto_persistent: Whether AUTO may choose PERSISTENT past ``PERSISTENT_AUTO_WAVES``.
+                Heavy kernels pass ``False``: the persistent stride loop pays off for small
+                latency-bound kernels, but the 128x128 KDA output-composition and
+                W/U-recompute kernels lose with it because their persistent variants hold
+                more registers, so fewer CTAs stay resident per SM and realized DRAM
+                bandwidth roughly halves, while the static grid only pays launch time per
+                padding CTA. On SM100 a sweep from 1 to 325 bounded-worker waves over
+                single/uniform-8/Zipf-8/Zipf-16 layouts at H=32/96 with the buffer full found
+                persistent output 1.1-2.4x and persistent recompute 1.03-1.31x slower, with no
+                crossover; the output kernel had already measured slower on Hopper. PERSISTENT
+                wins again only when a captured graph replays with under ~1/4 (output) or
+                ~1/8 (recompute) of its capacity active. The scheduler sees only capacity, so
+                AUTO bets on mostly-full buffers, which is how packed training batches are
+                built; callers with sparse replays request PERSISTENT explicitly.
+        """
         workers = self.num_workers(subtasks_per_chunk, device)
         return self._resolve(
             request,
@@ -205,6 +233,7 @@ class GridScheduler:
             self.metadata.capacity * subtasks_per_chunk,
             workers,
             requirement,
+            auto_persistent,
         )
 
     def resolve_sequences(
