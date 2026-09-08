@@ -88,3 +88,22 @@ def selected_attention_single_config(
         for tuner in tuners:
             tuner.cache.clear()
             tuner.cache.update(original_caches[id(tuner)])
+
+
+@pytest.fixture
+def nan_filled_empty(monkeypatch):
+    """Fill every fresh floating-point tensor with NaN, the worst case ``torch.empty`` allows.
+
+    The caching allocator mostly recycles blocks, so a test cannot rely on real garbage: filling
+    at the allocation entry points the kernels use makes every unwritten element a NaN.
+    """
+
+    def nan_filled(allocate):
+        def allocate_nan_filled(*args, **kwargs):
+            tensor = allocate(*args, **kwargs)
+            return tensor.fill_(torch.nan) if tensor.is_floating_point() else tensor
+
+        return allocate_nan_filled
+
+    for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
+        monkeypatch.setattr(owner, name, nan_filled(getattr(owner, name)))

@@ -3664,13 +3664,9 @@ def chunk_kda_bwd_wy_dqkg(
         dq=torch.empty_like(g, memory_format=torch.contiguous_format),
         dk=torch.empty_like(g, memory_format=torch.contiguous_format),
         dv2=torch.empty_like(v, memory_format=torch.contiguous_format),
-        # Dense BT64 writes every dg element. Ragged execution preserves the
-        # zero initialization required by predicated tails and sanitizer runs.
-        dg=(
-            torch.empty_like(g, memory_format=torch.contiguous_format)
-            if metadata is None
-            else torch.zeros_like(g, memory_format=torch.contiguous_format)
-        ),
+        # Every active dg row is written (tail chunks store row-predicated); the inactive capacity
+        # is never loaded (intra stages predicate rows) and the reverse gate scan zeroes it.
+        dg=torch.empty_like(g, memory_format=torch.contiguous_format),
         db=torch.empty_like(beta, memory_format=torch.contiguous_format),
         dA=torch.empty_like(A, dtype=torch.float32, memory_format=torch.contiguous_format),
         cu_seqlens=cu_seqlens,
