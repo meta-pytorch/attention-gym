@@ -243,25 +243,6 @@ def test_state_summary_matches_zero_and_identity_probes(op):
         assert_summary_parts_match(summaries[index], fused, oracle, index)
 
 
-@pytest.fixture
-def nan_filled_empty(monkeypatch):
-    """Fill every fresh floating-point tensor with NaN, the worst case ``torch.empty`` allows.
-
-    The caching allocator mostly recycles blocks, so a test cannot rely on real garbage: filling
-    at the allocation entry points the kernels use makes every unwritten element a NaN.
-    """
-
-    def nan_filled(allocate):
-        def allocate_nan_filled(*args, **kwargs):
-            tensor = allocate(*args, **kwargs)
-            return tensor.fill_(torch.nan) if tensor.is_floating_point() else tensor
-
-        return allocate_nan_filled
-
-    for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
-        monkeypatch.setattr(owner, name, nan_filled(getattr(owner, name)))
-
-
 @requires_kda_target
 @pytest.mark.usefixtures("nan_filled_empty")
 @pytest.mark.parametrize(

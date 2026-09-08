@@ -303,11 +303,25 @@ def test_plain_gate_scan_accepts_strided_dense_input():
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=2e-5, atol=2e-5)
 
 
-def test_plain_gate_scan_resets_packed_boundaries_and_zeros_inactive_gradient():
-    """Reset packed scans and keep inactive-capacity gradients out of reductions."""
-    lengths = [65, 0, 63]
+@pytest.mark.parametrize(
+    ("lengths", "capacity"),
+    [
+        pytest.param([65, 0, 63], 145, id="empty-sequence-and-slack"),
+        # Two active chunks fill the whole chunk capacity of 128 tokens, so only the launcher's
+        # one extra program is left to zero the 63-token inactive tail.
+        pytest.param([65], 128, id="full-capacity"),
+        # Every token is inactive: the tail spans the whole buffer.
+        pytest.param([0, 0], 200, id="all-inactive"),
+    ],
+)
+@pytest.mark.usefixtures("nan_filled_empty")
+def test_plain_gate_scan_resets_packed_boundaries_and_zeros_inactive_gradient(lengths, capacity):
+    """Reset packed scans and keep inactive-capacity gradients out of reductions.
+
+    The scan output is ``torch.empty``; with NaN-filled allocations the inactive tail is zero
+    only if the reverse kernel wrote it.
+    """
     active_tokens = sum(lengths)
-    capacity = active_tokens + 17
     offsets = cumulative_sequence_offsets(lengths)
     metadata = prepare_ragged_chunk_metadata(offsets, capacity, 64)
     torch.manual_seed(7)
