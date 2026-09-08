@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -300,14 +301,20 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     return chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
 
 
-class ChunkGDNBwdPrepared(NamedTuple):
-    """Recomputed local tensors shared across the context-parallel backward boundary."""
+@dataclass
+class ChunkGDNBwdPrepared:
+    """Recomputed local tensors shared across the context-parallel backward boundary.
 
-    w: torch.Tensor
-    qg: torch.Tensor
-    kg: torch.Tensor
-    h: torch.Tensor
-    v_new: torch.Tensor
+    Mutable so ``_finish_chunk_gdn_bwd`` can release each field at its last use; the callers'
+    frames keep the container alive, so a ``None`` field is the only way to free the storage
+    before the later stages allocate. Fields are ``None`` after the backward finishes.
+    """
+
+    w: torch.Tensor | None
+    qg: torch.Tensor | None
+    kg: torch.Tensor | None
+    h: torch.Tensor | None
+    v_new: torch.Tensor | None
 
 
 def _prepare_chunk_gdn_bwd(
@@ -406,8 +413,16 @@ def _finish_chunk_gdn_bwd(
 
     ``aqk`` is the expanded-head intra-chunk Q/K factor when the caller already holds it (the
     staged reverse summary computes it first); the Blackwell path recomputes it otherwise.
+
+    The Blackwell path releases every recomputed tensor at its last use (``prepared`` fields
+    and the ``del`` statements) because the step's peak memory sits inside this function:
+    the wy/dqkg and intra stages each allocate several ``[T, H, K]`` FP32 buffers, and holding
+    the dead ``h``/``dh``/``w``/``qg``/``kg``/``vector_gate`` alongside them costs ~1 GiB per
+    16k tokens at 32 heads.
     """
-    w, qg, kg, h, v_new = prepared
+    w, qg, kg, h, v_new = prepared.w, prepared.qg, prepared.kg, prepared.h, prepared.v_new
+    assert w is not None and qg is not None and kg is not None
+    assert h is not None and v_new is not None
     if not use_blackwell_backward(q):
         dh, d_initial_state, dv = chunk_gdn_bwd_delta_h(
             q,
@@ -474,6 +489,8 @@ def _finish_chunk_gdn_bwd(
         chunk_size=64,
         metadata=metadata,
     )
+    prepared.w = prepared.qg = prepared.kg = None
+    del w, qg, kg, aqk
     dq, dk, dv, dg_raw, db, d_raw_akk = chunk_kda_bwd_wy_dqkg(
         expanded_q,
         expanded_k,
@@ -492,6 +509,8 @@ def _finish_chunk_gdn_bwd(
         fastmath=False,
         autotune=False,
     )
+    prepared.h = prepared.v_new = None
+    del h, v_new, dh, vector_gate
     intra = (
         chunk_gdn_bwd_intra_dense(
             expanded_q,
@@ -515,8 +534,13 @@ def _finish_chunk_gdn_bwd(
         )
     )
     intra_dq, intra_dk, intra_db, d_gate = intra
-    dq = dq.float() + intra_dq
-    dk = dk.float() + intra_dk
+    del d_aqk, d_raw_akk, dg_raw
+    # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk`` (allocated like the FP32 vector
+    # gate), so accumulating in place is the same FP32 add without a third full-size buffer.
+    assert dq.dtype == torch.float32 and dk.dtype == torch.float32
+    dq.add_(intra_dq)
+    dk.add_(intra_dk)
+    del intra_dq, intra_dk
     if groups > 1:
         dq = dq.view(*q.shape[:2], q.shape[2], groups, q.shape[3]).sum(3)
         dk = dk.view(*k.shape[:2], k.shape[2], groups, k.shape[3]).sum(3)
