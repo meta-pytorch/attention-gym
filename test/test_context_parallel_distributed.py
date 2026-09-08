@@ -53,9 +53,11 @@ OPS = {"kda": (chunk_kda, context_parallel_kda), "gdn": (chunk_gdn, context_para
 # Fragment tables over two cp ranks. Zig-zag is the training layout; "uneven" is one 384-token
 # sequence where cp rank 0 owns three fragments and cp rank 1 two, so its chain alternates ranks
 # through all five slots and cp rank 1 gathers a padding slot; "empty-document" adds a
-# zero-length sequence to the stream.
+# zero-length sequence to the stream; "one-document" gives each rank one whole subsequence of
+# complete chunks, the layout that dispatches the dense kernels.
 TABLES = {
     "zigzag": (CU_SEQLENS, [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
+    "one-document": ((0, 384), [[(0, 192)], [(192, 384)]]),
     "uneven": ((0, 384), [[(0, 64), (128, 192), (256, 384)], [(64, 128), (192, 256)]]),
     "empty-document": ((0, 40, 40, 100, 384), [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
 }
