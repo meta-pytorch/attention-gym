@@ -61,6 +61,7 @@ def test_recomputed_factors_backward_matches_saved_factors(lengths):
         D**-0.5,
         False,
         False,
+        "auto",
     )
     expected = chunk_bwd_op(*common[:5], Aqk, Akk, *common[5:])
     actual = chunk_bwd_recompute_factors_op(*common)
@@ -109,6 +110,7 @@ def test_ragged_backward_ignores_akk_capacity_slack():
         D**-0.5,
         False,
         False,
+        "auto",
     )
     expected = chunk_bwd_op(*common[:6], clean_akk, *common[6:])
     actual = chunk_bwd_op(*common[:6], poisoned_akk, *common[6:])
@@ -142,6 +144,7 @@ def test_recomputed_factors_backward_with_state_matches_saved_factors():
         D**-0.5,
         False,
         False,
+        "auto",
     )
     expected = chunk_bwd_with_state_grad_op(*common[:5], aqk, akk, *common[5:])
     actual = chunk_bwd_recompute_factors_with_state_grad_op(*common)
@@ -159,7 +162,7 @@ def test_recomputed_factors_backward_op_registration():
     d_output = torch.randn_like(v)
     torch.library.opcheck(
         chunk_bwd_recompute_factors_op,
-        (q, k, v, gate, beta, None, None, d_output, None, None, D**-0.5, False, False),
+        (q, k, v, gate, beta, None, None, d_output, None, None, D**-0.5, False, False, "auto"),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
         atol=2e-3,
@@ -181,6 +184,7 @@ def test_recomputed_factors_backward_op_registration():
             D**-0.5,
             False,
             False,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,

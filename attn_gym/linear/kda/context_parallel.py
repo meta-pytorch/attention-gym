@@ -19,6 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
+from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
 
 
@@ -46,7 +47,12 @@ def context_parallel_kda(
     """
     stages = StagedOp(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
-        partial(chunk_kda_prepare_backward, autotune=autotune, fastmath=fastmath),
+        partial(
+            chunk_kda_prepare_backward,
+            autotune=autotune,
+            fastmath=fastmath,
+            schedule=resolve_kernel_options(kernel_options).schedule,
+        ),
     )
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 

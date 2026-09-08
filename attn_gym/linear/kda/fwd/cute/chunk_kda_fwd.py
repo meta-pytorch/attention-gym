@@ -13,7 +13,7 @@ from attn_gym._backends.cute import (
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
-from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
@@ -145,6 +145,7 @@ def _prepare_chunk_kda_fwd(
     *,
     scale: float,
     autotune: bool,
+    schedule: ScheduleRequest,
 ) -> ChunkKDAFactors:
     """Compute the local factors needed by both CP summaries and ordinary output."""
     with profiler_range("kda/fused/chunk_kda_fwd_intra"):
@@ -160,6 +161,7 @@ def _prepare_chunk_kda_fwd(
                 chunk_size=_CHUNK_SIZE,
                 profile_ranges=torch.autograd.profiler._is_profiler_enabled,
                 autotune=autotune,
+                schedule=schedule,
             )
         )
 
@@ -176,6 +178,7 @@ def _finish_chunk_kda_fwd(
     scale: float,
     output_final_state: bool,
     autotune: bool,
+    schedule: ScheduleRequest,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply an initial state and compose token outputs from prepared local factors."""
     with profiler_range("kda/triton/inter_chunk_state"):
@@ -203,6 +206,7 @@ def _finish_chunk_kda_fwd(
             chunk_size=_CHUNK_SIZE,
             metadata=metadata,
             autotune=autotune,
+            schedule=schedule,
         )
     return output, final_state
 
@@ -221,6 +225,7 @@ def _chunk_kda_fwd(
     scale: float,
     output_final_state: bool,
     autotune: bool,
+    schedule: ScheduleRequest,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
     factors = _prepare_chunk_kda_fwd(
@@ -232,6 +237,7 @@ def _chunk_kda_fwd(
         metadata,
         scale=scale,
         autotune=autotune,
+        schedule=schedule,
     )
     output, final_state = _finish_chunk_kda_fwd(
         q,
@@ -244,6 +250,7 @@ def _chunk_kda_fwd(
         scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
+        schedule=schedule,
     )
     return output, final_state, factors.aqk, factors.akk
 
@@ -257,6 +264,7 @@ def _chunk_kda_fwd_shared(
     initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    schedule: str,
     output_final_state: bool,
 ):
     """Keep the complete composed forward behind one compiler-opaque boundary."""
@@ -275,6 +283,7 @@ def _chunk_kda_fwd_shared(
         scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
+        schedule=ScheduleRequest(schedule),
     )
 
 
@@ -287,6 +296,7 @@ def _chunk_kda_fwd_cuda(
     initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    schedule: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, _final_state, Aqk, Akk = _chunk_kda_fwd_shared(
         q,
@@ -297,6 +307,7 @@ def _chunk_kda_fwd_cuda(
         initial_state,
         scale,
         autotune,
+        schedule,
         False,
     )
     return output, Aqk, Akk
@@ -311,6 +322,7 @@ def _chunk_kda_fwd_with_state_cuda(
     initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    schedule: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _chunk_kda_fwd_shared(
         q,
@@ -321,6 +333,7 @@ def _chunk_kda_fwd_with_state_cuda(
         initial_state,
         scale,
         autotune,
+        schedule,
         True,
     )
 
@@ -336,6 +349,7 @@ def _chunk_kda_fwd_ragged_shared(
     chunk_offsets: torch.Tensor,
     scale: float,
     autotune: bool,
+    schedule: str,
     output_final_state: bool,
 ):
     """Run ragged forward with caller-prepared routing and fixed-schema factors."""
@@ -355,6 +369,7 @@ def _chunk_kda_fwd_ragged_shared(
         scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
+        schedule=ScheduleRequest(schedule),
     )
 
 
@@ -369,6 +384,7 @@ def _chunk_kda_fwd_ragged_cuda(
     chunk_offsets: torch.Tensor,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
     output, _state, Aqk, Akk = _chunk_kda_fwd_ragged_shared(
         q,
@@ -381,6 +397,7 @@ def _chunk_kda_fwd_ragged_cuda(
         chunk_offsets,
         scale,
         autotune,
+        schedule,
         False,
     )
     return output, Aqk, Akk
@@ -397,6 +414,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
     chunk_offsets: torch.Tensor,
     scale: float,
     autotune: bool,
+    schedule: str,
 ):
     return _chunk_kda_fwd_ragged_shared(
         q,
@@ -409,6 +427,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
         chunk_offsets,
         scale,
         autotune,
+        schedule,
         True,
     )
 
@@ -425,6 +444,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
     autotune: bool,
+    schedule: str,
 ) -> torch.Tensor:
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
@@ -452,6 +472,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         scale=_HEAD_DIM**-0.5,
         output_final_state=False,
         autotune=autotune,
+        schedule=ScheduleRequest(schedule),
     )
     return output
 
@@ -512,6 +533,7 @@ def _chunk_kda_bwd_shared(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
     """Run the opaque composed backward with saved or recomputed factors."""
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
@@ -544,6 +566,7 @@ def _chunk_kda_bwd_shared(
         scale=scale,
         fastmath=fastmath,
         autotune=autotune,
+        schedule=ScheduleRequest(schedule),
     )
 
 
@@ -561,6 +584,7 @@ def _chunk_kda_bwd_recompute_factors_shared(
     scale: float,
     fastmath: bool,
     autotune: bool,
+    schedule: str,
 ):
     """Keep the recomputed-factor backward opaque to AOTAutograd."""
     return _chunk_kda_bwd_shared(
@@ -579,6 +603,7 @@ def _chunk_kda_bwd_recompute_factors_shared(
         scale,
         fastmath,
         autotune,
+        schedule,
     )
 
 

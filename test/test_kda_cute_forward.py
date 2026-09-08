@@ -153,7 +153,7 @@ def test_private_chunk_kda_forward_matches_reference(dtype: torch.dtype):
     q, k, v, gate, beta = _inputs(tokens=64, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     actual, aqk, akk = _chunk_kda_fwd_op(
-        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
     )
     golden, _ = naive_chunk_kda(
         q.double(),
@@ -177,7 +177,7 @@ def test_private_fp16_forward_factors_are_finite_at_gate_limit():
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
 
     output, aqk, akk = _chunk_kda_fwd_op(
-        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
     )
 
     for tensor in (output, aqk, akk):
@@ -596,12 +596,14 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
     module = importlib.import_module("attn_gym.linear.kda.impl.fused")
     routes = []
 
-    def dense_forward(q, _k, v, _gate, _beta, _state, _scale, _tune):
+    def dense_forward(q, _k, v, _gate, _beta, _state, _scale, _tune, _schedule):
         routes.append("dense")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
 
-    def ragged_forward(q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _scale, _tune):
+    def ragged_forward(
+        q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _scale, _tune, _schedule
+    ):
         routes.append("ragged")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
@@ -890,6 +892,7 @@ def test_chunk_kda_op_registration(dtype):
         initial_state.detach(),
         _DEFAULT_SCALE,
         True,
+        "auto",
     )
     torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
     torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
@@ -919,6 +922,7 @@ def test_chunk_kda_paged_op_registration():
             cu_seqlens,
             metadata.chunk_offsets,
             True,
+            "auto",
         ),
         rtol=2e-2,
         atol=2e-3,
@@ -941,6 +945,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             initial_state,
             _DEFAULT_SCALE,
             True,
+            "auto",
         )
     torch.library.opcheck(
         _chunk_kda_bwd_op,
@@ -960,6 +965,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             _DEFAULT_SCALE,
             False,
             True,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -983,6 +989,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             _DEFAULT_SCALE,
             False,
             True,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,

@@ -17,17 +17,19 @@ from typing import Literal, NamedTuple
 
 import torch
 
+from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_kda`` backend selection and its Mega scheduling switches."""
+    """Validated ``chunk_kda`` backend selection, Mega switches, and ragged launch schedule."""
 
     backend: Literal["fused", "mega"]
     split_backward: bool
     split_forward: bool
+    schedule: ScheduleRequest = ScheduleRequest.AUTO
 
 
 def resolve_kernel_options(
@@ -51,7 +53,14 @@ def resolve_kernel_options(
         if value and backend != "mega":
             raise ValueError(f"{name} requires kernel_options['backend']='mega'")
         splits[name] = value
-    return ResolvedKernelOptions(backend, splits["split_backward"], splits["split_forward"])
+    schedule = kernel_options.get("schedule", "auto")
+    if schedule not in ("auto", "static", "persistent"):
+        raise ValueError("kernel_options['schedule'] must be 'auto', 'static', or 'persistent'")
+    if schedule != "auto" and backend != "fused":
+        raise ValueError("schedule requires kernel_options['backend']='fused'")
+    return ResolvedKernelOptions(
+        backend, splits["split_backward"], splits["split_forward"], ScheduleRequest(schedule)
+    )
 
 
 def validate_kda_inputs(

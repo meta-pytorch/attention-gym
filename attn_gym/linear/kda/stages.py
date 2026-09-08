@@ -38,7 +38,7 @@ import torch
 
 from attn_gym._backends.cute import normalize_compact_tensor, tensor_supports_tma
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
-from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import CHUNK_SIZE, prepare_span, zero_state
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
@@ -122,6 +122,7 @@ class ChunkKDAPrepared:
     metadata: RaggedChunkMetadata | None
     scale: float
     autotune: bool
+    schedule: ScheduleRequest
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -153,6 +154,7 @@ class ChunkKDAPrepared:
             scale=self.scale,
             output_final_state=output_final_state,
             autotune=self.autotune,
+            schedule=self.schedule,
         )
 
 
@@ -170,6 +172,8 @@ class ChunkKDAMegaPrepared:
     metadata: RaggedChunkMetadata
     scale: float
     autotune: bool
+    # Mega rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
+    schedule: ScheduleRequest = ScheduleRequest.AUTO
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -188,6 +192,7 @@ class ChunkKDAMegaPrepared:
             self.metadata,
             scale=self.scale,
             autotune=self.autotune,
+            schedule=self.schedule,
         )
         return build_state_summaries(
             factors.kg, factors.w, factors.u, saved.cumulative_gate, bounds
@@ -245,7 +250,7 @@ def chunk_kda_prepare(
     ``kernel_options={"backend": "mega"}`` runs the local pass with Mega and computes fused factors
     only for the summaries; the split schedules are not available with entry states.
     """
-    backend, split_backward, split_forward = resolve_kernel_options(kernel_options)
+    backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
     if split_backward or split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare")
     validate_kda_inputs(
@@ -276,12 +281,12 @@ def chunk_kda_prepare(
         )
         return ChunkKDAMegaPrepared(saved, gate, metadata, scale, autotune)
     factors = _prepare_chunk_kda_fwd(
-        q, k, v, cumulative_gate, beta, metadata, scale=scale, autotune=autotune
+        q, k, v, cumulative_gate, beta, metadata, scale=scale, autotune=autotune, schedule=schedule
     )
     saved = ChunkKDASaved(
         q, k, v, cumulative_gate, beta, factors.aqk, factors.akk, cu_seqlens, chunk_offsets
     )
-    return ChunkKDAPrepared(saved, factors, metadata, scale, autotune)
+    return ChunkKDAPrepared(saved, factors, metadata, scale, autotune, schedule)
 
 
 @dataclass
@@ -366,6 +371,7 @@ def chunk_kda_prepare_backward(
     scale: float,
     autotune: bool = True,
     fastmath: bool = False,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> ChunkKDABackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
@@ -373,7 +379,8 @@ def chunk_kda_prepare_backward(
     forward handle's resolved ``prepared.scale``; there is no default because a silently
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
     caller's autograd function owns them. ``fastmath`` applies to the gradient kernels as in
-    ``chunk_kda``.
+    ``chunk_kda``; pass the forward handle's ``prepared.schedule`` so the backward's factor
+    recompute uses the same launch geometry.
     """
     metadata = None
     if saved.cu_seqlens is not None:
@@ -401,6 +408,7 @@ def chunk_kda_prepare_backward(
         scale=scale,
         chunk_size=CHUNK_SIZE,
         autotune=autotune,
+        schedule=schedule,
     )
     return ChunkKDABackward(
         saved, d_output, initial_state, metadata, prepared, scale, autotune, fastmath

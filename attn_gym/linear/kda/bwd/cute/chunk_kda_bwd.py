@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from attn_gym._backends.profiler import profiler_range
-from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
     blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
 )
@@ -55,6 +55,7 @@ def _prepare_chunk_kda_bwd(
     scale: float,
     chunk_size: int,
     autotune: bool,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> ChunkKDABwdPrepared:
     """Resolve intra factors and recompute local state before CP communication."""
     if Aqk is None:
@@ -71,6 +72,7 @@ def _prepare_chunk_kda_bwd(
             metadata=metadata,
             chunk_size=chunk_size,
             autotune=autotune,
+            schedule=schedule,
         )
     assert qg is not None and kg is not None
     with profiler_range("kda/triton/backward_recompute_state"):
@@ -233,6 +235,7 @@ def chunk_kda_bwd(
     chunk_size: int = 64,
     fastmath: bool = False,
     autotune: bool = True,
+    schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -267,6 +270,7 @@ def chunk_kda_bwd(
         scale=scale,
         chunk_size=chunk_size,
         autotune=autotune,
+        schedule=schedule,
     )
     return _finish_chunk_kda_bwd(
         q,
