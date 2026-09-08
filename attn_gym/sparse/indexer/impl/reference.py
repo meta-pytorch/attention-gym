@@ -36,6 +36,15 @@ def index(
         return torch.empty((batch, queries, 0), dtype=torch.int32, device=q.device)
     scale = 1.0 / math.sqrt(heads * head_dim)
 
+    # Accumulate scoring in FP32 to match the CuTe backend's accumulation
+    # contract, regardless of the input storage dtype (e.g. FP16/BF16 can
+    # overflow the dot product or produce NaNs from mixed-sign weights before
+    # scaling). FP64 inputs are left at FP64 rather than downcast.
+    accum_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+    q = q.to(accum_dtype)
+    k = k.to(accum_dtype)
+    weights = weights.to(accum_dtype)
+
     # dots: [B, T, H, S]
     dots = torch.einsum("bthd,bsd->bths", q, k)
     # score: [B, T, S]

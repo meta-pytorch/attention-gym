@@ -121,8 +121,8 @@ def index(
         [B, T, topk] INT32 tensor of selected candidate indices. 
         Not guaranteed to be sorted
     """
-    if not torch.compiler.is_compiling():
-        _validate_inputs(q, k, weights, topk, causal)
+    
+    _validate_inputs(q, k, weights, topk, causal)
 
     match mode:
         case "auto":

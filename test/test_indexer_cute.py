@@ -259,6 +259,13 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     )
     assert not torch.any(dup), "duplicate valid index"
 
+    # causality check
+    if causal:
+        row = torch.arange(queries, device=device).view(1, queries, 1)
+        assert not torch.any(valid & (cute_indices_i64 > row)), "causal violation"
+
+    assert not torch.any((~valid) & (cute_indices_i64 != -1)), "invalid slot is not -1"
+
     # FP64 scores at the kernel-selected positions
     kernel_scores_64 = scores_64.gather(-1, safe_indices)  # [B, T, topk]
 
