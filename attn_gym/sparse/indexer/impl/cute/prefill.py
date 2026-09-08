@@ -797,6 +797,7 @@ def _run_query_selector_mailbox(
     mailbox_consumer,
     selection_keys,
     buffer_counts,
+    drain_flags,
     tidx,
     warp_idx,
     lane,
@@ -914,8 +915,27 @@ def _run_query_selector_mailbox(
                 selection_keys[query_base + Int32(run_size) + warp_base + lane_rank] = candidate_key
 
             selection_barrier.arrive_and_wait()
-            occupied = Int32(buffer_counts[query_slot])
-            if occupied > Int32(0) and occupied >= Int32(drain_threshold):
+            # A fast sibling thread can already be past this point and into
+            # the next tile's atomic_add on this same buffer_counts cell
+            # before a slower sibling reads it here for *this* tile (the
+            # accumulator is a relaxed, unordered atomic). Different threads
+            # in the group could then independently read different values
+            # and disagree on whether to drain. Elect a single reader,
+            # broadcast its decision through shared memory, and force every
+            # thread through a second barrier before any of them acts on it,
+            # so the whole 128-thread group takes the drain/no-drain branch
+            # together and no thread starts next-tile work until every
+            # thread has observed the same decision.
+            if tidx == Int32(0):
+                occupied = Int32(buffer_counts[query_slot])
+                drain_flags[query_slot] = (
+                    Int32(1)
+                    if occupied > Int32(0) and occupied >= Int32(drain_threshold)
+                    else Int32(0)
+                )
+            selection_barrier.arrive_and_wait()
+            should_drain = drain_flags[query_slot] != Int32(0)
+            if should_drain:
                 _drain_long_term_buffer(
                     selection_keys,
                     buffer_counts,
@@ -1002,6 +1022,11 @@ def _prefill_index_kernel(
         byte_alignment=128,
     )
     buffer_counts = smem.allocate_tensor(
+        Int32,
+        cute.make_layout((_QUERIES_PER_CTA,)),
+        byte_alignment=16,
+    )
+    drain_flags = smem.allocate_tensor(
         Int32,
         cute.make_layout((_QUERIES_PER_CTA,)),
         byte_alignment=16,
@@ -1162,6 +1187,7 @@ def _prefill_index_kernel(
             mailbox0_consumer,
             selection_keys,
             buffer_counts,
+            drain_flags,
             tidx - Int32(_SELECTOR_WARP_BASE * _WARP_SIZE),
             warp_idx - Int32(_SELECTOR_WARP_BASE),
             lane,
@@ -1177,6 +1203,7 @@ def _prefill_index_kernel(
             mailbox1_consumer,
             selection_keys,
             buffer_counts,
+            drain_flags,
             tidx - Int32((_SELECTOR_WARP_BASE + _SELECTION_WARPS) * _WARP_SIZE),
             warp_idx - Int32(_SELECTOR_WARP_BASE + _SELECTION_WARPS),
             lane,

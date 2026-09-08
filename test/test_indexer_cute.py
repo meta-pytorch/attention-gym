@@ -285,6 +285,49 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     )
 
 
+def _partial_acceptance_inputs(
+    device: torch.device,
+    dtype: torch.dtype,
+    batch: int,
+    queries: int,
+    heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    candidates = 512
+    idx = torch.arange(candidates, device=device)
+    tile = idx // 128
+    local = idx % 128
+
+    value = (tile + 1).to(torch.float32) * 100.0 + local.to(torch.float32)
+    reject = (tile == 2) & (local >= 96)
+    value = torch.where(reject, -(local.to(torch.float32) - 95.0), value)
+
+    k_row = (value / head_dim).to(dtype)
+    k = k_row.view(1, candidates, 1).expand(batch, candidates, head_dim).contiguous()
+    q = torch.ones(batch, queries, heads, head_dim, device=device, dtype=dtype)
+    w = torch.ones(batch, queries, heads, device=device, dtype=dtype)
+    return q, k, w
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_cute_partial_acceptance_across_tiles(dtype):
+    _skip_no_sm100()
+
+    device = torch.device("cuda")
+    batch, queries, heads, head_dim, topk = 64, 512, 2, 128, 128
+
+    q, k, w = _partial_acceptance_inputs(device, dtype, batch, queries, heads, head_dim)
+    expected = index(q, k, w, topk, causal=False, backend="eager")
+    actual = index(q, k, w, topk, causal=False, backend="cute")
+
+    torch.testing.assert_close(
+        actual.sort(dim=-1).values,
+        expected.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
 def test_cute_backend_under_torch_compile(causal):
     """torch.compile over the cute backend runs and matches uncompiled output.
