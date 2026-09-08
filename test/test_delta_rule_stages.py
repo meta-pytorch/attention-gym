@@ -12,6 +12,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear._delta_rule.span import CHUNK_SIZE
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
     compose_entry_states,
@@ -595,7 +596,11 @@ class RankResult(NamedTuple):
 def simulate_context_parallel(
     op: Op, cu_seqlens_global, fragments, inputs, d_output, d_final_state
 ) -> list[RankResult]:
-    """Run every rank's forward and backward in one process; a stack stands in for all-gather."""
+    """Run every rank's forward and backward in one process; a stack stands in for all-gather.
+
+    Spans that are one whole subsequence take the dense kernels, as ``context_parallel_chunk``
+    does; the handle's ``metadata`` confirms which path ran.
+    """
     device = inputs[0].device
     ranks = range(len(fragments))
     plans = [
@@ -606,10 +611,15 @@ def simulate_context_parallel(
     routings = [plan.routing(device) for plan in plans]
     prepared = [
         op.prepare(
-            *(tensor[:, token_ids[r]] for tensor in inputs), cu_seqlens=routings[r].cu_seqlens
+            *(tensor[:, token_ids[r]] for tensor in inputs),
+            cu_seqlens=None if routings[r].cu_seqlens.shape[0] == 2 else routings[r].cu_seqlens,
         )
         for r in ranks
     ]
+    if op is not KDA_MEGA:  # Mega runs packed-only; the fused stages are dense iff chunk-aligned.
+        for handle, routing in zip(prepared, routings, strict=True):
+            dense = routing.cu_seqlens.shape[0] == 2 and routing.tokens % CHUNK_SIZE == 0
+            assert (handle.metadata is None) is dense
 
     gathered = torch.stack([summary_slots(prepared[r], routings[r]) for r in ranks])
     initial_states = [compose_entry_states(gathered, routings[r]) for r in ranks]
@@ -649,21 +659,28 @@ def simulate_context_parallel(
 # Sequences [0, 40), [40, 232), [232, 384); each entry lists one rank's fragments.
 CU_SEQLENS = (0, 40, 232, 384)
 LAYOUTS = [
-    pytest.param([[(0, 192)], [(192, 384)]], id="contiguous-2"),
-    pytest.param([[(0, 96), (288, 384)], [(96, 192), (192, 288)]], id="zigzag-2"),
+    pytest.param(CU_SEQLENS, [[(0, 192)], [(192, 384)]], id="contiguous-2"),
+    pytest.param(CU_SEQLENS, [[(0, 96), (288, 384)], [(96, 192), (192, 288)]], id="zigzag-2"),
     pytest.param(
-        [[(0, 64), (320, 384)], [(64, 128), (256, 320)], [(128, 192), (192, 256)]], id="zigzag-3"
+        CU_SEQLENS,
+        [[(0, 64), (320, 384)], [(64, 128), (256, 320)], [(128, 192), (192, 256)]],
+        id="zigzag-3",
     ),
     # Uneven ownership: rank 0 holds one short piece, rank 1 the rest in reversed order.
-    pytest.param([[(96, 160)], [(160, 384), (0, 96)]], id="uneven-reordered"),
+    pytest.param(CU_SEQLENS, [[(96, 160)], [(160, 384), (0, 96)]], id="uneven-reordered"),
+    # One document over two ranks: each span is one whole subsequence of complete chunks, so
+    # both ranks run the dense kernels and exchange summaries over the dense factor layout.
+    pytest.param((0, 384), [[(0, 192)], [(192, 384)]], id="one-document-dense"),
+    # Same, cut mid-chunk: whole subsequences that fall back to a packed schedule.
+    pytest.param((0, 384), [[(0, 200)], [(200, 384)]], id="one-document-partial-chunk"),
 ]
 
 
 @requires_kda_target
 @op_param
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_simulated_context_parallel_matches_unsharded_op(op, layout, dtype, request):
+@pytest.mark.parametrize(("cu_seqlens", "layout"), LAYOUTS)
+def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout, dtype, request):
     if op is KDA_MEGA and dtype is torch.float16:
         # The unsharded Mega op itself returns non-finite FP16 outputs for model-range gates:
         # exp(-cumulative gate) over a 16-token chunk exceeds the FP16 range once gates fall below
@@ -671,9 +688,9 @@ def test_simulated_context_parallel_matches_unsharded_op(op, layout, dtype, requ
         request.applymarker(
             pytest.mark.xfail(strict=True, raises=AssertionError, reason="Mega FP16 gate overflow")
         )
-    q, k, v, gate, beta = op.make_inputs(CU_SEQLENS[-1], seed=4, dtype=dtype)
+    q, k, v, gate, beta = op.make_inputs(cu_seqlens[-1], seed=4, dtype=dtype)
     inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in (q, k, v, gate, beta))
-    offsets = torch.tensor(CU_SEQLENS, dtype=torch.int32, device="cuda")
+    offsets = torch.tensor(cu_seqlens, dtype=torch.int32, device="cuda")
 
     output, final_state = op.chunk(*inputs, cu_seqlens=offsets, output_final_state=True)
     generator = torch.Generator(device="cuda").manual_seed(5)
@@ -691,7 +708,7 @@ def test_simulated_context_parallel_matches_unsharded_op(op, layout, dtype, requ
     )
 
     results = simulate_context_parallel(
-        op, CU_SEQLENS, layout, (q, k, v, gate, beta), d_output, d_final_state
+        op, cu_seqlens, layout, (q, k, v, gate, beta), d_output, d_final_state
     )
     for result in results:
         ids = result.token_ids

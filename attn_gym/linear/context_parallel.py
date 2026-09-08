@@ -89,6 +89,8 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
     # context_parallel_chunk does.
     routing = plan.routing(device)
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
+    #   a span that is one whole subsequence (cu_seqlens has one segment) passes None instead
+    #   and runs the dense kernels
     slots = summary_slots(prepared, routing)                  # state_summaries(forward_bounds)
     #   one entry per local fragment, in span order; routing.forward_bounds is
     #   slot 0 (frag C): [0, 96)      C∩s1 is C's last subsequence, continued by D∩s1
@@ -125,6 +127,10 @@ What the table does not constrain:
   that start from zero. So a rank computes at most one summary per fragment it owns, the gather
   is one slot per fragment, and no fragment has more predecessors or successors than there are
   other fragments in the table.
+- A span that is one whole subsequence needs no packed schedule. When the routing was built with
+  ``max_subsequences=1``, its ``cu_seqlens`` has one segment and the recipe prepares the span as an
+  unpacked ``chunk_*`` call would, on the dense kernels. That is a shape, not a value, so it is the
+  same for every layout a captured graph replays.
 
 CUDA Graph replay follows from that bound. ``plan.routing(device)`` turns a layout into device
 tensors: the span's ``cu_seqlens``, one ``[start, stop)`` per fragment for the summary launches
@@ -676,6 +682,9 @@ class StagedOp(NamedTuple):
     """A delta-rule variant's staged entry points with the op-specific options already bound.
 
     ``prepare(q, k, v, gate, beta, *, cu_seqlens)`` returns a :class:`PreparedForward`;
+    ``cu_seqlens`` is ``None`` when the routing has a single segment, so the op treats the span
+    exactly as an unpacked ``chunk_*`` call would (dense kernels for chunk-aligned spans) and the
+    backward handle inherits that choice through ``saved``.
     ``prepare_backward(saved, d_output, initial_state, *, scale)`` returns a
     :class:`PreparedBackward`, where ``saved`` is the forward handle's ``saved`` NamedTuple
     rebuilt from ``ctx.saved_tensors`` and ``scale`` is the forward handle's resolved value.
@@ -722,7 +731,10 @@ class _ContextParallelChunk(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, gate, beta, routing, group, stages):
-        prepared = stages.prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
+        # A one-segment routing (max_subsequences=1) is one whole subsequence: run the dense
+        # kernels. The shape is host metadata of the cap, so a captured graph keeps the choice.
+        cu_seqlens = None if routing.cu_seqlens.shape[0] == 2 else routing.cu_seqlens
+        prepared = stages.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
         gathered = _all_gather_slots(summary_slots(prepared, routing), group)
         initial_state = compose_entry_states(gathered, routing)
         with profiler_range("cp/run"):

@@ -558,7 +558,11 @@ point-to-point pipeline, a recursive-doubling scan over `compose_summaries`, DTe
 communication overlap, compose the staged primitives and the routing helpers (`summary_slots`,
 `compose_entry_states`, ...) around your own collective; the primitives and plans are unchanged.
 Sharding does not cost accuracy: against an FP32 reference, sharded gradients match the unsharded
-fused op's error to within noise for both ops.
+fused op's error to within noise for both ops. When a rank's span is one whole subsequence (a
+routing built with `max_subsequences=1`, the usual case for one long document over contiguous
+shards), the recipe passes `cu_seqlens=None` to the stages, so a chunk-aligned span runs the same
+dense kernels as an unpacked `chunk_kda` call; the choice follows the routing's shape, so it is
+fixed per captured graph.
 
 ```python
 from attn_gym.linear.context_parallel import ContextParallelPlan
