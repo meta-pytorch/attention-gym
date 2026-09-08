@@ -544,7 +544,12 @@ def recompute_w_u_fwd_triton(
     if metadata is None:
         kernel[(chunks, value_heads)](**kernel_kwargs)
         return w, u, qg, kg
-    resolved = GridScheduler(metadata).resolve_flat(schedule, value_heads, k.device)
+    resolved = GridScheduler(metadata).resolve_flat(
+        schedule,
+        value_heads,
+        k.device,
+        auto_persistent=False,  # heavy kernel; see GridScheduler.resolve_flat
+    )
     if resolved.kind is ScheduleKind.PERSISTENT:
         persistent_kernel = (
             recompute_w_u_fwd_kernel_persistent if autotune else _PINNED_W_U_PERSISTENT
