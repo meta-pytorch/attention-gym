@@ -197,11 +197,11 @@ class ChunkKDAPrepared:
 
 @dataclass
 class ChunkKDAMegaPrepared:
-    """Mega forward handle: on-chip factors for ``run``, fused factors only for summaries.
+    """Mega forward handle with native whole-sequence summaries for canonical CP.
 
-    Mega never materializes the WY factors, so ``run`` executes the Mega with-state kernel over the
-    whole local stream and ``state_summaries`` computes the fused factors once for the whole stream
-    (its ranges are device values). The backward handle is :class:`ChunkKDAMegaBackward`.
+    ``deterministic_work=True`` uses native BT16 state probes, without materializing WY factors.
+    Arbitrary chunk-aligned ranges retain the fused summary path. The backward handle is
+    :class:`ChunkKDAMegaBackward`.
     """
 
     saved: ChunkKDAMegaSaved
@@ -214,13 +214,24 @@ class ChunkKDAMegaPrepared:
     def state_summaries(
         self, bounds: torch.Tensor, *, deterministic_work: bool = False
     ) -> torch.Tensor:
-        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
+        """Return FP32 ``[B; A]`` maps, using native probes for canonical whole sequences.
 
-        Mega keeps no WY factors, so this factors the whole local stream once (the fused
-        forward's factor half) and summarizes every range from it; see
-        ``ChunkKDAPrepared.state_summaries`` for the contract.
+        With ``deterministic_work=True``, bounds must be exactly the consecutive pairs of
+        ``saved.cu_seqlens``, in order. Values are a caller contract (no device-to-host sync).
+        Native BT16 rounding defines a new canonical baseline, not unsharded Mega bit parity.
+        Otherwise arbitrary chunk-aligned bounds use the fused summary contract described by
+        ``ChunkKDAPrepared.state_summaries``.
         """
         saved = self.saved
+        if deterministic_work:
+            # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
+            from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_summaries
+
+            if bounds.shape != (saved.cu_seqlens.shape[0] - 1, 2):
+                raise ValueError("native Mega summaries require one bound per whole subsequence")
+            return build_mega_state_summaries(
+                saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens
+            )
         factors = _prepare_chunk_kda_fwd(
             saved.q,
             saved.k,
@@ -286,8 +297,9 @@ def chunk_kda_prepare(
     float16 or bfloat16 dtype (no silent cast, because the caller owns autograd), and the batch
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
-    ``kernel_options={"backend": "mega"}`` runs the local pass with Mega and computes fused factors
-    only for the summaries; the split schedules are not available with entry states.
+    ``kernel_options={"backend": "mega"}`` runs the local pass with Mega; canonical whole-sequence
+    summaries (``deterministic_work=True``) also use Mega, while arbitrary-range summaries retain
+    fused factors. Split schedules are not available with entry states.
     """
     backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
     if split_backward or split_forward:
