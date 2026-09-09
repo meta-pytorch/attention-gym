@@ -19,6 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.context_parallel_deterministic import (
+    CanonicalRouting,
     CanonicalTiling,
     context_parallel_chunk_deterministic,
 )
@@ -62,6 +63,7 @@ def context_parallel_kda_deterministic(
     *,
     tiling: CanonicalTiling,
     group: dist.ProcessGroup,
+    routing: CanonicalRouting | None = None,
     scale: float | None = None,
     fastmath: bool = False,
     kernel_options: KernelOptions | None = None,
@@ -74,7 +76,7 @@ def context_parallel_kda_deterministic(
     """
     stages = _kda_stages(scale, False, fastmath, kernel_options)
     return context_parallel_chunk_deterministic(
-        stages, q, k, v, gate, beta, tiling=tiling, group=group
+        stages, q, k, v, gate, beta, tiling=tiling, group=group, routing=routing
     )
 
 

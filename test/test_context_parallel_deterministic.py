@@ -22,11 +22,10 @@ import torch.multiprocessing as mp
 pytest.importorskip("cutlass")
 
 import attn_gym.linear.context_parallel_deterministic as det
+from attn_gym.linear._delta_rule.triton.canonical_scan import canonical_scan_entries
 from attn_gym.linear.context_parallel_deterministic import (
     CanonicalTiling,
-    Tile,
-    boundary_states,
-    canonical_scan,
+    canonical_entries,
     tile_stream,
 )
 from attn_gym.linear.kda.context_parallel import _kda_stages, context_parallel_kda_deterministic
@@ -71,6 +70,12 @@ def test_fragments_must_fall_on_tile_boundaries():
         CanonicalTiling.from_fragments(cu, [[(17, 0)], [(17, 981)]], 0, tile_size=64)
     with pytest.raises(ValueError, match="outside"):
         CanonicalTiling.from_fragments(cu, [[(0, 981)], []], 2, tile_size=64)
+    # Document 4 (tokens 468..981) has tiles at 468, 532, ...; a 2-tile block boundary is 596.
+    CanonicalTiling.from_fragments(cu, [[(0, 596)], [(596, 981)]], 0, tile_size=64, scan_block=2)
+    with pytest.raises(ValueError, match="one scan block"):
+        CanonicalTiling.from_fragments(
+            cu, [[(0, 532)], [(532, 981)]], 0, tile_size=64, scan_block=2
+        )
 
 
 def test_non_contiguous_ownership_keeps_span_order_consistent():
@@ -90,7 +95,9 @@ def _serial_entries(leaves: torch.Tensor, documents: list[int]) -> torch.Tensor:
     from attn_gym.linear.context_parallel import compose_summaries
 
     value_dim = leaves.shape[2] - leaves.shape[3]
-    entries = torch.zeros(leaves.shape[0], leaves.shape[1], value_dim, leaves.shape[3])
+    entries = torch.zeros(
+        leaves.shape[0], leaves.shape[1], value_dim, leaves.shape[3], device=leaves.device
+    )
     prefix = None
     for i, doc in enumerate(documents):
         if i == 0 or doc != documents[i - 1]:
@@ -103,51 +110,81 @@ def _serial_entries(leaves: torch.Tensor, documents: list[int]) -> torch.Tensor:
 
 def _leaves(n: int, seed: int) -> torch.Tensor:
     torch.manual_seed(seed)
-    leaves = torch.randn(n, 2, 8, 4)
-    leaves[:, :, 4:, :] = torch.eye(4) + 0.01 * torch.randn(n, 2, 4, 4)
+    leaves = torch.randn(n, 2, 256, 128, device="cuda")
+    leaves[:, :, 128:, :] = torch.eye(128, device="cuda") + 0.01 * torch.randn(
+        n, 2, 128, 128, device="cuda"
+    )
     return leaves
 
 
-@pytest.mark.parametrize("documents", [[0] * 9, [0, 0, 0, 1, 2, 2, 2], [0, 1, 2, 3], [0] * 1])
-def test_scan_matches_serial_composition_per_document(documents):
-    """The Blelloch scan restarts at documents and equals serial composition (fp32 rounding)."""
-    leaves = _leaves(len(documents), 0)
-    tiles = [Tile(d, 0, 0) for d in documents]
-    torch.testing.assert_close(
-        boundary_states(leaves, tiles, reverse=False), _serial_entries(leaves, documents)
+def _doc_offsets(documents: list[int]) -> torch.Tensor:
+    offsets = [0] + [i for i in range(1, len(documents)) if documents[i] != documents[i - 1]]
+    return torch.tensor([*offsets, len(documents)], dtype=torch.int32, device="cuda")
+
+
+def _single_rank_tiling(documents: list[int], scan_block: int) -> CanonicalTiling:
+    """One rank owning every tile of documents with the given tile counts (64-token tiles)."""
+    lengths = []
+    for doc in dict.fromkeys(documents):
+        lengths.append(64 * documents.count(doc))
+    cu = (0, *accumulate(lengths))
+    return CanonicalTiling.from_fragments(
+        cu, [[(0, cu[-1])]], 0, tile_size=64, scan_block=scan_block
     )
-    reversed_docs = documents[::-1]
-    expected = _serial_entries(leaves.flip(0), reversed_docs).flip(0)
-    torch.testing.assert_close(boundary_states(leaves, tiles, reverse=True), expected)
 
 
-def test_scan_of_a_document_is_independent_of_its_neighbours():
+@pytest.mark.parametrize("documents", [[0] * 9, [0, 0, 0, 1, 2, 2, 2], [0, 1, 2, 3], [0] * 1])
+def test_fused_scan_matches_serial_composition_per_document(documents):
+    """The fused scan restarts at documents and equals serial composition to fp32 accuracy."""
+    leaves = _leaves(len(documents), 0)
+    offsets = _doc_offsets(documents)
+    torch.testing.assert_close(
+        canonical_scan_entries(leaves, offsets),
+        _serial_entries(leaves, documents),
+        atol=1e-4,
+        rtol=1e-5,
+    )
+    expected = _serial_entries(leaves.flip(0), documents[::-1]).flip(0)
+    torch.testing.assert_close(
+        canonical_scan_entries(leaves, offsets, reverse=True), expected, atol=1e-4, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("scan_block", [1, 2, 4])
+def test_blocked_entries_match_serial_composition(scan_block):
+    """The three-level block tree equals serial composition to fp32 accuracy, both directions."""
+    documents = [0] * 7 + [1] * 3 + [2] * 5
+    leaves = _leaves(len(documents), 5)
+    tiling = _single_rank_tiling(documents, scan_block)
+    like = leaves[:1]
+    for reverse in (False, True):
+        got = canonical_entries(
+            leaves, tiling, tiling.routing("cuda"), like, None, reverse=reverse
+        )
+        if reverse:
+            expected = _serial_entries(leaves.flip(0), documents[::-1]).flip(0)
+        else:
+            expected = _serial_entries(leaves, documents)
+        torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize("scan_block", [1, 4])
+def test_entries_of_a_document_are_independent_of_its_neighbours(scan_block):
     """A document's entry states are bitwise the same wherever it sits in the packed stream."""
     document = _leaves(5, 1)
-    reference = None
+    reference: dict[bool, torch.Tensor] = {}
     for before, after in ((0, 0), (1, 0), (3, 2), (7, 5)):
         others = _leaves(before + after, 2 + before)
         leaves = torch.cat((others[:before], document, others[before:]))
-        tiles = [Tile(0, 0, 0)] * before + [Tile(1, 0, 0)] * 5 + [Tile(2, 0, 0)] * after
+        documents = [0] * before + [1] * 5 + [2] * after
+        tiling = _single_rank_tiling(documents, scan_block)
         for reverse in (False, True):
-            entries = boundary_states(leaves, tiles, reverse=reverse)[before : before + 5]
-            key = (reverse,)
-            if reference is None:
-                reference = {}
-            if key not in reference:
-                reference[key] = entries
-            assert torch.equal(entries, reference[key]), (before, after, reverse)
-
-
-def test_scan_prefix_ignores_right_padding():
-    """Blelloch reads only positions <= j, so padding a row on the right never changes bits."""
-    row = _leaves(6, 3)
-    identity = torch.zeros(1, 2, 8, 4)
-    identity[:, :, 4:, :] = torch.eye(4)
-    base = canonical_scan(row[None])[0]
-    for pad in (1, 2, 5, 10):
-        padded = torch.cat((row, identity.expand(pad, -1, -1, -1)))
-        assert torch.equal(canonical_scan(padded[None])[0, :6], base)
+            entries = canonical_entries(
+                leaves, tiling, tiling.routing("cuda"), leaves[:1], None, reverse=reverse
+            )
+            entries = entries[before : before + 5]
+            reference.setdefault(reverse, entries)
+            assert torch.equal(entries, reference[reverse]), (before, after, reverse)
 
 
 # ---------------------------------------------------------------- transports
@@ -206,14 +243,17 @@ def _inputs(lengths, gate: str, seed: int, device):
 
 
 @torch.no_grad()
-def _canonical_cp1(inputs, grad, lengths, tile_size: int, kernel_options):
+def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kernel_options):
     """Single-process canonical run over the same tiles: the contract every ownership reproduces.
 
     Every tile is prepared by its own staged call (the strictest form of the leaf contract); the
-    batched production path must match this bitwise.
+    batched production path must match this bitwise. The scan tree is the production one.
     """
     cu = (0, *accumulate(lengths))
     tiles = tile_stream(cu, tile_size)
+    tiling = CanonicalTiling.from_fragments(
+        cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
+    )
     stages = _kda_stages(None, False, False, kernel_options)
     device = inputs[0].device
 
@@ -229,7 +269,8 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, kernel_options):
             for p, t in zip(prepared, tiles, strict=True)
         ]
     )
-    entries = boundary_states(maps, tiles, reverse=False)
+    routing = tiling.routing(device)
+    entries = canonical_entries(maps, tiling, routing, maps[:1], None, reverse=False)
     outputs, backwards = [], []
     for i, (p, t) in enumerate(zip(prepared, tiles, strict=True)):
         outputs.append(p.run(entries[i : i + 1], output_final_state=False)[0])
@@ -244,7 +285,7 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, kernel_options):
             for b, t in zip(backwards, tiles, strict=True)
         ]
     )
-    exits = boundary_states(rmaps, tiles, reverse=True)
+    exits = canonical_entries(rmaps, tiling, routing, maps[:1], None, reverse=True)
     grads = [b.run(exits[i : i + 1])[:5] for i, b in enumerate(backwards)]
     return (
         torch.cat(outputs, dim=1),
@@ -267,21 +308,32 @@ OWNERSHIPS = {
 }
 
 
-def _rank_main(cp_rank, world, port, lengths, tile_size, ownership, gate, backend):
+def _rank_main(cp_rank, world, port, lengths, tile_size, scan_block, ownership, gate, backend):
     device = _init(cp_rank, world, port)
     try:
         kernel_options = {"backend": backend} if backend != "fused" else None
         inputs, grad = _inputs(lengths, gate, 97, device)
         cu = (0, *accumulate(lengths))
-        expected = _canonical_cp1(inputs, grad, lengths, tile_size, kernel_options)
+        expected = _canonical_cp1(inputs, grad, lengths, tile_size, scan_block, kernel_options)
         if ownership == "cyclic":
+            # Alternate whole blocks between the ranks (tiles when scan_block == 1).
+            blocks = CanonicalTiling.from_fragments(
+                cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
+            ).blocks
             tiles = tile_stream(cu, tile_size)
             fragments = [
-                [(t.start, t.stop) for i, t in enumerate(tiles) if i % 2 == r] for r in range(2)
+                [
+                    (tiles[block[0]].start, tiles[block[-1]].stop)
+                    for b, block in enumerate(blocks)
+                    if b % 2 == r
+                ]
+                for r in range(2)
             ]
         else:
             fragments = OWNERSHIPS[ownership](cu, len(lengths))
-        tiling = CanonicalTiling.from_fragments(cu, fragments, cp_rank, tile_size=tile_size)
+        tiling = CanonicalTiling.from_fragments(
+            cu, fragments, cp_rank, tile_size=tile_size, scan_block=scan_block
+        )
         ids = tiling.global_token_ids(device)
         local = tuple(v[:, ids].contiguous().requires_grad_() for v in inputs)
         output = context_parallel_kda_deterministic(
@@ -301,23 +353,34 @@ def _rank_main(cp_rank, world, port, lengths, tile_size, ownership, gate, backen
 @pytest.mark.parametrize("backend", ["fused", "mega"])
 @pytest.mark.parametrize("gate", ["strong", "mild", "zero"])
 @pytest.mark.parametrize(
-    "lengths,tile_size,ownership",
+    "lengths,tile_size,scan_block,ownership",
     [
-        (RAGGED, 64, "contiguous"),
-        (RAGGED, 64, "cyclic"),
-        (RAGGED, 128, "empty_rank"),
-        (ELEPHANT, 64, "cyclic"),
+        (RAGGED, 64, 1, "contiguous"),
+        (RAGGED, 64, 1, "cyclic"),
+        (RAGGED, 128, 1, "empty_rank"),
+        (ELEPHANT, 64, 1, "cyclic"),
+        (RAGGED, 64, 4, "cyclic"),
+        (ELEPHANT, 64, 4, "contiguous"),
     ],
-    ids=["ragged-contig", "ragged-cyclic", "ragged-empty", "elephant-cyclic"],
+    ids=[
+        "ragged-contig",
+        "ragged-cyclic",
+        "ragged-empty",
+        "elephant-cyclic",
+        "ragged-cyclic-block4",
+        "elephant-contig-block4",
+    ],
 )
-def test_two_ranks_match_canonical_cp1_bitwise(lengths, tile_size, ownership, gate, backend):
+def test_two_ranks_match_canonical_cp1_bitwise(
+    lengths, tile_size, scan_block, ownership, gate, backend
+):
     if backend == "mega":
         pytest.importorskip("cutlass.experimental")
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Mega needs SM100/103")
     mp.spawn(
         _rank_main,
-        args=(2, _free_port(), lengths, tile_size, ownership, gate, backend),
+        args=(2, _free_port(), lengths, tile_size, scan_block, ownership, gate, backend),
         nprocs=2,
         join=True,
     )
@@ -332,7 +395,7 @@ def test_canonical_cp1_matches_fp64_reference_within_bf16_budget():
     inputs, grad = _inputs(lengths, "mild", 41, torch.device("cuda"))
     inputs = tuple(v[:, :, :1].contiguous() for v in inputs)
     grad = grad[:, :, :1].contiguous()
-    actual = _canonical_cp1(inputs, grad, lengths, 64, None)
+    actual = _canonical_cp1(inputs, grad, lengths, 64, 2, None)
     cu = torch.tensor((0, *accumulate(lengths)), dtype=torch.int32, device="cuda")
     high = tuple(v.detach().cpu().double().requires_grad_() for v in inputs)
     out_high, _ = kda_reference(*high, cu_seqlens=cu.cpu(), output_final_state=False)

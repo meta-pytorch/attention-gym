@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import os
 import statistics
+from collections.abc import Callable
 from functools import partial
-from itertools import accumulate
+from itertools import accumulate, pairwise
 from pathlib import Path
 from typing import Annotated
 
@@ -41,9 +42,11 @@ ZIPF_FRACTIONS = (0.5, 0.25, 0.125, 0.0625)
 def document_lengths(tokens: int, grid: int) -> tuple[int, ...]:
     """Zipf-like documents on a ``grid`` so every recipe can share fragment boundaries.
 
-    Fractions are floored to the grid, so the last document absorbs the rounding; ``tokens``
-    must leave it at least one grid step (e.g. tokens >= 16 * grid).
+    Fractions are floored to the grid and the last document absorbs rounding. For small
+    workloads, shrink the document grid (not the canonical tiles) to keep all five nonempty.
+    Document boundaries are always valid tile boundaries, even for documents shorter than a tile.
     """
+    grid = min(grid, max(64, tokens // 16 // 64 * 64))
     lengths = [int(tokens * f) // grid * grid for f in ZIPF_FRACTIONS]
     remainder = tokens - sum(lengths)
     if min(lengths) < grid or remainder < grid:
@@ -64,37 +67,98 @@ def balanced_cut(cu: tuple[int, ...], tile: int, world: int) -> list[list[tuple[
     return fragments
 
 
-def timed(fn, *, iters: int, device) -> list[float]:
-    """Per-iteration milliseconds from CUDA events, synchronized across ranks each iteration."""
-    samples = []
+class PhaseClock:
+    """CUDA-event intervals named by their closing mark; read only after synchronization."""
+
+    def __init__(self) -> None:
+        self.marks: list[tuple[str, torch.cuda.Event]] = []
+
+    def mark(self, name: str) -> None:
+        """Record a phase boundary on the current stream."""
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self.marks.append((name, event))
+
+    def elapsed(self) -> dict[str, float]:
+        """Return local phase durations in milliseconds."""
+        return {
+            name: prev.elapsed_time(event) for (_, prev), (name, event) in pairwise(self.marks)
+        }
+
+
+def timed(
+    step: Callable[[PhaseClock], object],
+    *,
+    iters: int,
+    device: torch.device,
+    distributed: bool = True,
+) -> tuple[list[dict[str, float]], list[float], list[float]]:
+    """Local phase samples and slowest-rank fwd/bwd ms, with a barrier before each step.
+
+    Unlike single-device graph timing, these eager measurements include launch gaps and
+    collective waits. ``distributed=False`` measures the single-GPU split benchmark.
+    """
+    phases, fwd, bwd = [], [], []
     for _ in range(iters):
-        dist.barrier()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
+        if distributed:
+            dist.barrier()
+        clock = PhaseClock()
+        step(clock)
         torch.cuda.synchronize(device)
-        local = torch.tensor([start.elapsed_time(end)], device=device)
-        dist.all_reduce(local, op=dist.ReduceOp.MAX)
-        samples.append(local.item())
-    return samples
+        local = clock.elapsed()
+        phases.append(local)
+        totals = torch.tensor(
+            [
+                sum(v for k, v in local.items() if k.startswith(prefix))
+                for prefix in ("fwd", "bwd")
+            ],
+            device=device,
+        )
+        if distributed:
+            dist.all_reduce(totals, op=dist.ReduceOp.MAX)
+        f, b = totals.tolist()
+        fwd.append(f)
+        bwd.append(b)
+    return phases, fwd, bwd
+
+
+def clocked(fn: Callable[[], object], clock: PhaseClock, *, phase: str) -> None:
+    """Time a public operation as a single phase."""
+    clock.mark("start")
+    fn()
+    clock.mark(phase)
+
+
+def forward(
+    op: Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]],
+    inputs: tuple[torch.Tensor, ...],
+    grad: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], torch.Tensor]:
+    """Run a KDA public API with fresh autograd leaves; ignore optional final states."""
+    leaves = tuple(v.detach().requires_grad_() for v in inputs)
+    result = op(*leaves)
+    return (result[0] if isinstance(result, tuple) else result), leaves, grad
 
 
 def main(
     tokens: Annotated[int, typer.Option(help="Total packed tokens.")] = 8192,
     heads: Annotated[int, typer.Option()] = 64,
-    backend: Annotated[str, typer.Option(help="fused or mega (forward core).")] = "fused",
+    backend: Annotated[str, typer.Option(help="fused or mega staged backend.")] = "fused",
     tiles: Annotated[str, typer.Option(help="Comma-separated canonical tile sizes.")] = "64,256",
+    scan_block: Annotated[
+        int, typer.Option(help="Tiles per exchanged scan block; fragments must be block-aligned.")
+    ] = 1,
     rounds: Annotated[int, typer.Option()] = 5,
     iters: Annotated[int, typer.Option(help="Timed iterations per round per variant.")] = 10,
     out_path: Annotated[Path | None, typer.Option("--out")] = None,
 ) -> None:
+    """Compare unsharded, standard CP, and canonical CP forward/backward costs."""
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
     tile_sizes = [int(t) for t in tiles.split(",")]
-    grid = max(tile_sizes)
+    grid = max(tile_sizes) * scan_block
     lengths = document_lengths(tokens, grid)
     cu = (0, *accumulate(lengths))
     options = {"backend": backend} if backend != "fused" else None
@@ -112,14 +176,14 @@ def main(
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
     fragments = balanced_cut(cu, grid, world)
 
-    variants: dict[str, tuple] = {}
-
-    def unsharded_fwd():
-        leaves = tuple(v.detach().requires_grad_() for v in inputs)
-        out, _ = chunk_kda(*leaves, cu_seqlens=cu_dev, kernel_options=options, autotune=False)
-        return out, leaves, grad
-
-    variants["unsharded"] = unsharded_fwd
+    variants = {
+        "unsharded": partial(
+            forward,
+            partial(chunk_kda, cu_seqlens=cu_dev, kernel_options=options, autotune=False),
+            inputs,
+            grad,
+        )
+    }
 
     plan = ContextParallelPlan.from_fragments(cu, fragments, rank)
     routing = plan.routing(device)
@@ -127,33 +191,41 @@ def main(
     cp_local = tuple(v[:, cp_ids].contiguous() for v in inputs)
     cp_grad = grad[:, cp_ids].contiguous()
 
-    def cp_fwd():
-        leaves = tuple(v.detach().requires_grad_() for v in cp_local)
-        out, _ = context_parallel_kda(
-            *leaves,
+    variants["cp"] = partial(
+        forward,
+        partial(
+            context_parallel_kda,
             routing=routing,
             group=dist.group.WORLD,
             kernel_options=options,
             autotune=False,
-        )
-        return out, leaves, cp_grad
-
-    variants["cp"] = cp_fwd
+        ),
+        cp_local,
+        cp_grad,
+    )
 
     for tile in tile_sizes:
-        tiling = CanonicalTiling.from_fragments(cu, fragments, rank, tile_size=tile)
+        tiling = CanonicalTiling.from_fragments(
+            cu, fragments, rank, tile_size=tile, scan_block=scan_block
+        )
+        det_routing = tiling.routing(device)
         ids = tiling.global_token_ids(device)
         local = tuple(v[:, ids].contiguous() for v in inputs)
         local_grad = grad[:, ids].contiguous()
 
-        def det_fwd(tiling=tiling, local=local, local_grad=local_grad):
-            leaves = tuple(v.detach().requires_grad_() for v in local)
-            out = context_parallel_kda_deterministic(
-                *leaves, tiling=tiling, group=dist.group.WORLD, kernel_options=options
-            )
-            return out, leaves, local_grad
-
-        variants[f"det-{tile}"] = det_fwd
+        name = f"det-{tile}" + (f"-b{scan_block}" if scan_block > 1 else "")
+        variants[name] = partial(
+            forward,
+            partial(
+                context_parallel_kda_deterministic,
+                tiling=tiling,
+                routing=det_routing,
+                group=dist.group.WORLD,
+                kernel_options=options,
+            ),
+            local,
+            local_grad,
+        )
 
     # Warm up (compiles) and keep one retained graph per variant for backward timing.
     retained = {}
@@ -170,13 +242,21 @@ def main(
     for r in range(rounds):
         order = names if r % 2 == 0 else names[::-1]
         for name in order:
-            fwd_ms[name] += timed(variants[name], iters=iters, device=device)
+            _, f, _ = timed(
+                partial(clocked, variants[name], phase="fwd/run"), iters=iters, device=device
+            )
+            fwd_ms[name] += f
             out, leaves, g = retained[name]
-            bwd_ms[name] += timed(
-                partial(torch.autograd.grad, out, leaves, g, retain_graph=True),
+            _, _, b = timed(
+                partial(
+                    clocked,
+                    partial(torch.autograd.grad, out, leaves, g, retain_graph=True),
+                    phase="bwd/run",
+                ),
                 iters=iters,
                 device=device,
             )
+            bwd_ms[name] += b
 
     if rank == 0:
         rows = []
@@ -214,6 +294,7 @@ def main(
                         "world": world,
                         "lengths": lengths,
                         "fragments": fragments,
+                        "scan_block": scan_block,
                         "rounds": rounds,
                         "iters": iters,
                         "device": torch.cuda.get_device_name(device),
