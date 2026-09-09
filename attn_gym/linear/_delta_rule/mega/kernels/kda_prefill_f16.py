@@ -410,7 +410,6 @@ def tmaldg_warp(
                 sQ_tma[raw_index.idx],
                 q_slice,
                 bars.mb_q_ready[raw_bar_index.idx].smem_ptr,
-                acquire=False,
             )
 
             # ---- K load ----------------------------------------------------------
@@ -424,7 +423,6 @@ def tmaldg_warp(
                 sK_tma[raw_index.idx],
                 k_slice,
                 bars.mb_k_ready[raw_bar_index.idx].smem_ptr,
-                acquire=False,
             )
 
             # ---- Gate load -------------------------------------------------------
@@ -438,7 +436,6 @@ def tmaldg_warp(
                 sGate_tma[raw_index.idx],
                 gate_slice,
                 bars.mb_gate_ready[raw_bar_index.idx].smem_ptr,
-                acquire=False,
             )
 
             # ---- V load ----------------------------------------------------------
@@ -452,7 +449,6 @@ def tmaldg_warp(
                 sV_tma[raw_index.idx],
                 v_slice,
                 bars.mb_v_ready[raw_bar_index.idx].smem_ptr,
-                acquire=False,
             )
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
@@ -1034,7 +1030,7 @@ def epilogue_warp(
                 bars.mb_o_tmastg_ready[o_stage].wait(((cum_chunk - cutlass.Int32(1)) // cfg.smem_o_stages) % 2)
                 o_slice = tma_slice_runtime_desc(desc_o_slot, cutlass.Int32(0), head_o, output_chunk_start)
                 if output_chunk >= wstart:
-                    tma_store_tile(sO_tma[o_stage], o_slice, acquire=False)
+                    tma_store_tile(sO_tma[o_stage], o_slice)
                     tma_store_commit()
                 tma_store_wait(0)
                 bars.mb_o_tmastg_done[o_stage].arrive()
@@ -1047,7 +1043,7 @@ def epilogue_warp(
             o_stage = last_cum_chunk % cfg.smem_o_stages
             bars.mb_o_tmastg_ready[o_stage].wait((last_cum_chunk // cfg.smem_o_stages) % 2)
             o_slice = tma_slice_runtime_desc(desc_o_slot, cutlass.Int32(0), head_o, output_chunk_start)
-            tma_store_tile(sO_tma[o_stage], o_slice, acquire=False)
+            tma_store_tile(sO_tma[o_stage], o_slice)
             tma_store_commit()
             tma_store_wait(0)
             bars.mb_o_tmastg_done[o_stage].arrive()

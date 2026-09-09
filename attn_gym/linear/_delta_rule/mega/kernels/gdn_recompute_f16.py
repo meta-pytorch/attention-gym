@@ -733,7 +733,7 @@ def tmastg_warp(
                                 head_o,
                             )
                             tma_store_tile(
-                                sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False
+                                sCheckpoint_tma[checkpoint_stage], checkpoint_slice
                             )
                             tma_store_commit()
                             checkpoint_coord += 1
@@ -1366,7 +1366,7 @@ def tmaldg_warp(
                 desc_k_slot, cutlass.Int32(0), head_k, input_tok_coord
             )
             kq_tile = sKQ_lo_tma[kq_idx]
-            tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
+            tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
             for chunk_idx in cutlass.range(cstart + 1, wend):
                 tok_coord = chunk_idx * cutlass.Int32(cfg.b_t)
                 input_tok_coord = batch_start + tok_coord if use_packed_coords else tok_coord
@@ -1384,14 +1384,13 @@ def tmaldg_warp(
                 kq_tile = sKQ_lo_tma[kq_idx]
                 if member == 0:
                     tma_load_tile(
-                        kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False
+                        kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr
                     )
                 else:
                     tma_load_tile(
                         kq_tile.shifted(kq_box_elems),
                         k_slice,
                         bars.mb_kq_ready[kq_idx].smem_ptr,
-                        acquire=False,
                     )
 
                 # ---- V load ------------------------------------------------------
@@ -1406,7 +1405,7 @@ def tmaldg_warp(
                     desc_v_slot, cutlass.Int32(0), head_v, input_v_tok
                 )
                 tma_load_tile(
-                    sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False
+                    sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr
                 )
 
             v_idx = v_index.idx
@@ -1417,7 +1416,7 @@ def tmaldg_warp(
             v_tok = (wend - cutlass.Int32(1)) * cutlass.Int32(cfg.b_t)
             input_v_tok = batch_start + v_tok if use_packed_coords else v_tok
             v_slice = tma_slice_runtime_desc(desc_v_slot, cutlass.Int32(0), head_v, input_v_tok)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
 
         tile_idx, sched_state = sched_publish_next(
             cfg, bars, sSched, mSched, sched_state, tile_idx, num_ctas

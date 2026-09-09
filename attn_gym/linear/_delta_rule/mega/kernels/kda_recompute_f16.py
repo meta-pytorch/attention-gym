@@ -382,7 +382,7 @@ def tmaldg_warp(
             k_slice = tma_slice_runtime_desc(
                 desc_k_slot, cutlass.Int32(0), head_k, input_chunk_start
             )
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, bars.mb_k_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, bars.mb_k_ready[raw_index.idx].smem_ptr)
 
             # ---- Gate load -------------------------------------------------------
             bars.mb_gate_done[raw_index.idx].wait(raw_index.phase)
@@ -391,7 +391,7 @@ def tmaldg_warp(
             gate_slice = tma_slice_runtime_desc(
                 desc_gate_slot, cutlass.Int32(0), head_o, input_chunk_start
             )
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr)
 
             # ---- V load ----------------------------------------------------------
             bars.mb_v_done[raw_index.idx].wait(raw_index.phase)
@@ -400,7 +400,7 @@ def tmaldg_warp(
             v_slice = tma_slice_runtime_desc(
                 desc_v_slot, cutlass.Int32(0), head_v, input_chunk_start
             )
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr)
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx, sched_state = sched_publish_next(cfg, bars, sSched, mSched, sched_state, tile_idx, num_ctas)
@@ -860,7 +860,7 @@ def epilogue_warp(
                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
                 checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                 checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), head_o)
-                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                 tma_store_commit()
                 tma_store_wait(0)
                 bars.mb_checkpoint_tmastg_done[checkpoint_stage].arrive()
@@ -876,7 +876,7 @@ def epilogue_warp(
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                         checkpoint_entry = checkpoint_quot
                         checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), checkpoint_entry, head_o)
-                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                         tma_store_commit()
                         tma_store_wait(0)
                         bars.mb_checkpoint_tmastg_done[checkpoint_stage].arrive()
