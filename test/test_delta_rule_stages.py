@@ -55,11 +55,61 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
+    # Mega stages reproduce its native backward bitwise, not the public op's fused recompute.
+    # Other variants use public_gradients directly.
+    backward: Callable[..., tuple[torch.Tensor, ...]] | None = None
 
     def make_inputs(self, tokens: int, seed: int, dtype: torch.dtype = torch.bfloat16) -> Inputs:
         return self.factory(
             tokens, key_heads=self.key_heads, value_heads=self.value_heads, seed=seed, dtype=dtype
         )
+
+    def public_gradients(
+        self,
+        inputs: Inputs,
+        initial_state: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        d_output: torch.Tensor | None,
+        d_final_state: torch.Tensor | None,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Public-op gradients; a None cotangent drops that loss term."""
+        leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+        if initial_state is not None:
+            leaves += (initial_state.detach().clone().requires_grad_(),)
+        output, final_state = self.chunk(
+            *leaves, cu_seqlens=cu_seqlens, output_final_state=True, scale=scale
+        )
+        terms = [(output, d_output), (final_state, d_final_state)]
+        outputs, cotangents = zip(*(term for term in terms if term[1] is not None), strict=True)
+        return torch.autograd.grad(outputs, leaves, cotangents)
+
+
+def mega_native_gradients(
+    inputs: Inputs,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    *,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """The native stateful Mega backward, which the Mega staged handle runs."""
+    from attn_gym.linear.kda.impl import mega_ops
+
+    q, k, v, gate, beta = inputs
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
+    operands = (q, k, v, gate, beta, torch.zeros_like(v) if d_output is None else d_output)
+    scale = HEAD_DIM**-0.5 if scale is None else scale
+    if initial_state is None:
+        return mega_ops.chunk_mega_packed_bwd_with_exit_cotangent_op(
+            *operands, cu_seqlens, d_final_state, scale
+        )
+    return mega_ops.chunk_mega_packed_bwd_with_state_op(
+        *operands, cu_seqlens, initial_state.contiguous(), d_final_state, scale
+    )
 
 
 def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
@@ -123,6 +173,7 @@ requires_mega = pytest.mark.skipif(
 KDA_MEGA = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=MEGA),
     prepare=partial(chunk_kda_prepare, kernel_options=MEGA),
+    backward=mega_native_gradients,
 )
 op_param = pytest.mark.parametrize(
     "op",
@@ -317,11 +368,10 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
 @pytest.mark.parametrize("state", ["contiguous", "strided-key", "none"])
 @pytest.mark.parametrize("packing", ["packed", "dense"])
 def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state, packing):
-    """The staged backward is the op's own kernel sequence, so all six gradients are bitwise.
+    """All six staged gradients match the selected backward bitwise, including optional losses.
 
-    Covers the cotangents the staged API makes optional (``d_output=None``, no final-state loss),
-    the entry-state layouts ``run`` accepts (none, contiguous, a key-strided view), and both chunk
-    schedules: packed ``cu_seqlens`` and a dense span of complete chunks (``metadata is None``).
+    Mega uses its native stateful backward and also checks BF16 agreement with the public op.
+    The matrix covers entry-state layouts, packed/dense schedules, and default/custom scales.
     """
     inputs = op.make_inputs(320, seed=7)
     if packing == "packed":
@@ -343,21 +393,18 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
         sequences, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda", generator=generator
     )
 
-    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs) + (
-        () if initial_state is None else (initial_state.detach().clone().requires_grad_(),)
+    d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
+    gradients = partial(
+        op.backward or op.public_gradients, inputs, initial_state, cu_seqlens, scale=scale
     )
-    output, final_state = op.chunk(
-        *leaves, cu_seqlens=cu_seqlens, output_final_state=True, scale=scale
-    )
-    d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
     if loss == "output-only":
-        expected = torch.autograd.grad(output, leaves, d_output)
+        expected = gradients(d_output, None)
         d_final_state = torch.zeros_like(d_final_state)
     elif loss == "final-state-only":
-        expected = torch.autograd.grad(final_state, leaves, d_final_state)
+        expected = gradients(None, d_final_state)
         d_output = None
     else:
-        expected = torch.autograd.grad((output, final_state), leaves, (d_output, d_final_state))
+        expected = gradients(d_output, d_final_state)
 
     prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens, scale=scale)
     prepared.run(initial_state, output_final_state=True)
@@ -376,6 +423,16 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
         torch.testing.assert_close(
             got, want, atol=0, rtol=0, msg=lambda m, name=name: f"{name}: {m}"
         )
+    if op.backward is not None:
+        # The native kernel is not the public op's backward; it must still agree with it to
+        # within the two kernels' BF16 rounding (both are FP32-accumulated over the same graph).
+        public = op.public_gradients(
+            inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
+        )
+        for name, got, want in zip(names, actual, public, strict=True):
+            assert_relative_rms_within(
+                got.float(), want.float(), f"{name} vs public op", max_eps=4.0
+            )
 
 
 @requires_kda_target
@@ -677,8 +734,8 @@ def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout,
     generator = torch.Generator(device="cuda").manual_seed(5)
     d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
     d_final_state = torch.randn(final_state.shape, device="cuda", generator=generator)
-    expected_grads = torch.autograd.grad(
-        (output, final_state), inputs, grad_outputs=(d_output, d_final_state)
+    expected_grads = (op.backward or op.public_gradients)(
+        (q, k, v, gate, beta), None, offsets, d_output, d_final_state
     )
 
     # Sharding must not cost accuracy: measure both paths against the FP32 eager oracle.

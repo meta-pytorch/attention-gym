@@ -610,10 +610,12 @@ local pass with Mega from the composed entry state. Because Mega keeps WY factor
 `state_summaries` computes the fused factors once over the whole local stream and summarizes
 every range from them; that factor pass is paid even when every fragment ends its document and
 the summaries are identities, since which ranges are empty is a device value under replay. A
-layout that never continues a document across ranks does not need this recipe. Backward
-recomputes the local fused factors and uses Mega's existing with-state route through the fused
-staged backward. The staged handles and this recipe are eager-only; `torch.compile` is not
-supported through them.
+layout that never continues a document across ranks does not need this recipe. The backward
+handle's `run` is Mega's own stateful backward (`attn_gym::kda_chunk_mega_packed_bwd_with_state`:
+checkpoint recompute from the saved entry state, then the BT16 backward folding in the exit
+cotangent), so a document cut at 16-token boundaries reproduces the unsharded Mega gradients bit
+for bit; only `state_grad_summaries` still recomputes the fused factors over the local stream. The
+staged handles and this recipe are eager-only; `torch.compile` is not supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
