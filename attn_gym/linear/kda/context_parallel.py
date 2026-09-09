@@ -41,11 +41,20 @@ def context_parallel_kda(
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale``, ``autotune``, and ``kernel_options`` follow ``chunk_kda``. With
-    ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and the fused factors are
-    computed once over the span for the summaries. Its backward is Mega's native stateful kernel,
-    so ``fastmath`` applies only to the fused backend's backward.
+    ``kernel_options={"backend": "mega"}`` the local pass and forward summaries run on Mega
+    (native BT16 probes define a new standard-CP numerical baseline); only reverse summaries
+    still use fused factors. Its backward is Mega's native stateful kernel, so ``fastmath``
+    applies only to the fused backend's backward.
     """
-    stages = StagedOp(
+    stages = _kda_stages(scale, autotune, fastmath, kernel_options)
+    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
+
+
+def _kda_stages(
+    scale: float | None, autotune: bool, fastmath: bool, kernel_options: KernelOptions | None
+) -> StagedOp:
+    """Bind ``chunk_kda``'s options to its staged entry points."""
+    return StagedOp(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
         partial(
             chunk_kda_prepare_backward,
@@ -54,7 +63,6 @@ def context_parallel_kda(
             schedule=resolve_kernel_options(kernel_options).schedule,
         ),
     )
-    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
 __all__ = ["context_parallel_kda"]

@@ -110,9 +110,8 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
 
 The key contract: the routing hands ``state_summaries`` / ``state_grad_summaries`` exactly one
 whole subsequence per active fragment slot, as consecutive entries of the span's own
-``cu_seqlens`` (LOCAL). Direct callers must obey NOTE [Summary ranges are whole chunks of one
-subsequence] in ``kda.stages`` themselves; the bounds' shape and dtype are checked, their values
-are not.
+``cu_seqlens`` (LOCAL). Direct callers must obey NOTE [Summary ranges are subsequences] in
+``kda.stages`` themselves; the bounds' shape and dtype are checked, their values are not.
 
 What the table does not constrain:
 
@@ -653,7 +652,11 @@ class PreparedForward(Protocol):
         ...
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
-        """One ``[HV, V + K, K]`` affine summary per ``[start, stop)`` row of ``bounds``."""
+        """One ``[HV, V + K, K]`` affine summary per ``[start, stop)`` row of ``bounds``.
+
+        Every nonempty row is one subsequence of the span (NOTE [Summary ranges are subsequences]
+        in ``attn_gym.linear.kda.stages``); ``start == stop`` is the identity.
+        """
         ...
 
     def run(

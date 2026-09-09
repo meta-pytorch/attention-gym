@@ -101,21 +101,17 @@ class ChunkKDAMegaSaved(NamedTuple):
     chunk_offsets: torch.Tensor
 
 
-# NOTE [Summary ranges are whole chunks of one subsequence]
+# NOTE [Summary ranges are subsequences]
 # ``state_summaries(bounds)`` and ``state_grad_summaries(bounds)`` take an ``int32 [R, 2]``
 # device tensor of LOCAL span offsets (see NOTE [Terminology] in ``attn_gym.linear.context_parallel``).
-# The factor kernels lay 64-token chunks from each subsequence's first token, and every chunk's
-# factors are scaled toward that chunk's last token, so a row is exact only over whole chunks of
-# one subsequence:
-#
-#     start = sub_start + CHUNK_SIZE * i
-#     stop  = sub_start + CHUNK_SIZE * j   or   stop = sub_end   (the partial tail chunk is fine)
-#     [start, stop) must not cross a ``cu_seqlens`` boundary;  start == stop is the identity
-#
-# The context-parallel routing always passes whole subsequences, ``(cu_seqlens[i],
-# cu_seqlens[i + 1])``, which satisfies this trivially. A row that starts or stops mid-chunk, or
-# spans two subsequences, returns a plausible but wrong map. The values are not checked: they live
-# on the device so the launch replays under CUDA Graph capture, and reading them back would sync.
+# Every nonempty row must be one subsequence, ``(cu_seqlens[i], cu_seqlens[i + 1])``, in any
+# order and selection; ``start == stop`` is the identity map. That is what the context-parallel
+# routing produces: a rank summarizes its whole piece of a document, never part of it. The fused
+# kernels would also sum an interior run of 64-token chunks of one subsequence, but that is not
+# part of the contract and Mega's kernels cannot do it. The values are not checked: they live on
+# the device so the launch replays under CUDA Graph capture, and reading them back would sync; a
+# row that matches no subsequence is filled with NaN on Mega and returns a plausible but wrong map
+# on the fused kernels.
 
 
 def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
@@ -163,12 +159,16 @@ class ChunkKDAPrepared:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         ``bounds`` is an ``int32 [R, 2]`` device tensor of ``[start, stop)`` span offsets, each
-        obeying NOTE [Summary ranges are whole chunks of one subsequence]; ``start == stop``
-        yields the identity. The ranges are read on the device, so a CUDA Graph captured around
-        this call replays for any layout of the same shape.
+        obeying NOTE [Summary ranges are subsequences]; ``start == stop`` yields the identity. The
+        ranges are read on the device, so a CUDA Graph captured around this call replays for any
+        layout of the same shape.
         """
         return build_state_summaries(
-            self.factors.kg, self.factors.w, self.factors.u, self.saved.cumulative_gate, bounds
+            self.factors.kg,
+            self.factors.w,
+            self.factors.u,
+            self.saved.cumulative_gate,
+            bounds,
         )
 
     def run(
@@ -195,11 +195,11 @@ class ChunkKDAPrepared:
 
 @dataclass
 class ChunkKDAMegaPrepared:
-    """Mega forward handle: on-chip factors for ``run``, fused factors only for summaries.
+    """Mega forward handle: ``run`` is Mega's with-state kernel and summaries are Mega's too.
 
-    Mega never materializes the WY factors, so ``run`` executes the Mega with-state kernel over the
-    whole local stream and ``state_summaries`` computes the fused factors once for the whole stream
-    (its ranges are device values). The backward handle is :class:`ChunkKDAMegaBackward`.
+    Mega keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two runs
+    of Mega's state-only pass over it (from a zero entry state for ``B``, from the identity with
+    the value term disabled for ``A``). The backward handle is :class:`ChunkKDAMegaBackward`.
     """
 
     saved: ChunkKDAMegaSaved
@@ -212,24 +212,15 @@ class ChunkKDAMegaPrepared:
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
-        Mega keeps no WY factors, so this factors the whole local stream once (the fused
-        forward's factor half) and summarizes every range from it; see
-        ``ChunkKDAPrepared.state_summaries`` for the contract.
+        Rows follow NOTE [Summary ranges are subsequences]. The maps carry Mega's 16-token-chunk
+        rounding, which differs from the fused maps and from an unsharded Mega pass.
         """
+        # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
+        from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_summaries
+
         saved = self.saved
-        factors = _prepare_chunk_kda_fwd(
-            saved.q,
-            saved.k,
-            saved.v,
-            saved.cumulative_gate,
-            saved.beta,
-            self.metadata,
-            scale=self.scale,
-            autotune=self.autotune,
-            schedule=self.schedule,
-        )
-        return build_state_summaries(
-            factors.kg, factors.w, factors.u, saved.cumulative_gate, bounds
+        return build_mega_state_summaries(
+            saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
         )
 
     def run(
@@ -277,8 +268,8 @@ def chunk_kda_prepare(
     float16 or bfloat16 dtype (no silent cast, because the caller owns autograd), and the batch
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
-    ``kernel_options={"backend": "mega"}`` runs the local pass with Mega and computes fused factors
-    only for the summaries; the split schedules are not available with entry states.
+    ``kernel_options={"backend": "mega"}`` runs the local pass and the forward summaries with
+    Mega's kernels. Split schedules are not available with entry states.
     """
     backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
     if split_backward or split_forward:
@@ -393,10 +384,9 @@ class ChunkKDABackward:
 
 @dataclass
 class ChunkKDAMegaBackward:
-    """Mega backward handle: ``run`` is Mega's stateful backward, summaries use fused factors.
+    """Mega backward handle: ``run`` is Mega's stateful backward.
 
-    ``state_grad_summaries`` recomputes the fused factors on demand over the whole local stream,
-    as the forward handle's ``state_summaries`` does. Nothing is consumed, so ``run`` and
+    Summaries recompute the fused factors on demand. Nothing is consumed, so ``run`` and
     ``state_grad_summaries`` may be called in either order.
     """
 
@@ -410,7 +400,7 @@ class ChunkKDAMegaBackward:
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
-        Same contract as ``ChunkKDABackward.state_grad_summaries``.
+        Rows follow ``ChunkKDABackward.state_grad_summaries``.
         """
         saved = self.saved
         # The fused backward over the equivalent tape (no materialized factors) owns the recompute.

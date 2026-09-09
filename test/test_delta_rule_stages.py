@@ -20,7 +20,6 @@ from attn_gym.linear.context_parallel import (
     compose_summaries,
     grad_summary_slots,
     merge_state,
-    neutral_summary,
     summary_slots,
 )
 from attn_gym.linear.gdn import chunk_gdn
@@ -506,81 +505,6 @@ def test_state_grad_summary_matches_zero_and_identity_probes(op):
     assert summaries.shape == (2, op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
     for index in range(2):
         assert_summary_parts_match(summaries[index], fused, oracle, index)
-
-
-@requires_kda_target
-@op_param
-def test_summaries_are_exact_over_whole_chunks_of_one_subsequence(op):
-    """NOTE [Summary ranges are whole chunks of one subsequence]: interior chunk runs compose."""
-    q, k, v, gate, beta = op.make_inputs(520, seed=11)
-    gate = gate / 50
-    # Subsequences [0, 72) and [72, 520); the second has chunk boundaries at 72 + 64 * i.
-    cu_seqlens = torch.tensor([0, 72, 520], dtype=torch.int32, device="cuda")
-    d_output = torch.randn(
-        v.shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(12)
-    )
-    zero = torch.zeros(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
-    prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
-    prepared.run(zero, output_final_state=True)
-    grads = op.prepare_backward(prepared.saved, d_output.to(v.dtype), zero, scale=prepared.scale)
-
-    one = torch.zeros(1, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
-    identity = torch.eye(HEAD_DIM, device="cuda").expand_as(one).contiguous()
-
-    def oracle(start, stop):
-        """Run the FP32 reference on the token range as a sequence of its own and probe it."""
-        sliced = [tensor[:, start:stop] for tensor in (q, k, v, gate, beta)]
-        inputs = [tensor.float() for tensor in sliced[:3]] + sliced[3:]
-
-        def d_entry_state(d_exit_state):
-            entry = one.clone().requires_grad_()
-            output, final_state = op.reference(*inputs, entry, output_final_state=True)
-            (grad,) = torch.autograd.grad(
-                (output, final_state), entry, (d_output[:, start:stop], d_exit_state)
-            )
-            return grad
-
-        _, bias = op.reference(*inputs, one, output_final_state=True)
-        _, shifted = op.reference(*inputs, identity, output_final_state=True)
-        reverse_bias = d_entry_state(one)
-        forward = torch.cat((bias, shifted - bias), dim=-2)[0]
-        reverse = torch.cat((reverse_bias, d_entry_state(identity) - reverse_bias), dim=-2)[0]
-        return forward, reverse
-
-    def standalone(start, stop):
-        """The staged summaries of the token range run as a stream of its own."""
-        sliced = [tensor[:, start:stop] for tensor in (q, k, v, gate, beta)]
-        own = op.prepare(*sliced)
-        own.run(one, output_final_state=True)
-        own_grads = op.prepare_backward(
-            own.saved, d_output[:, start:stop].to(v.dtype), one, scale=own.scale
-        )
-        whole = bounds_of((0, stop - start))
-        return own.state_summaries(whole)[0], own_grads.state_grad_summaries(whole)[0]
-
-    # Rows on the second subsequence's chunk grid: interior runs, a single chunk, a run ending at
-    # the subsequence end, the first chunk alone, and an empty range. One launch summarizes them
-    # all; each interior summary must match the same range summarized on its own, pointwise
-    # within that run's own error against the FP32 oracle and in aggregate.
-    ranges = ((136, 264), (200, 456), (136, 200), (392, 520), (72, 136), (300, 300))
-    forward = prepared.state_summaries(bounds_of(*ranges))
-    reverse = grads.state_grad_summaries(bounds_of(*ranges))
-    assert forward.shape == reverse.shape == (len(ranges), op.value_heads, 2 * HEAD_DIM, HEAD_DIM)
-    empty = neutral_summary(op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
-    torch.testing.assert_close(forward[-1], empty, atol=0, rtol=0)
-    torch.testing.assert_close(reverse[-1], empty, atol=0, rtol=0)
-    for index, (start, stop) in enumerate(ranges[:-1]):
-        oracles = oracle(start, stop)
-        for name, actual, expected, low in zip(
-            ("forward", "reverse"),
-            (forward[index], reverse[index]),
-            oracles,
-            standalone(start, stop),
-            strict=True,
-        ):
-            label = f"{name} [{start}, {stop})"
-            assert_matches_low_precision_reference(actual, expected, low, label)
-            assert_relative_rms_within(actual, expected, label, max_eps=1.0)
 
 
 @requires_kda_target

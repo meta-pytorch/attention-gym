@@ -605,17 +605,31 @@ between complete forward/backward steps, not while backward still needs the prev
 
 ### Mega local execution
 
-`kernel_options={"backend": "mega"}` makes `chunk_kda_prepare` and `context_parallel_kda` run each
-local pass with Mega from the composed entry state. Because Mega keeps WY factors on chip,
-`state_summaries` computes the fused factors once over the whole local stream and summarizes
-every range from them; that factor pass is paid even when every fragment ends its document and
-the summaries are identities, since which ranges are empty is a device value under replay. A
-layout that never continues a document across ranks does not need this recipe. The backward
-handle's `run` is Mega's own stateful backward (`attn_gym::kda_chunk_mega_packed_bwd_with_state`:
-checkpoint recompute from the saved entry state, then the BT16 backward folding in the exit
-cotangent), so a document cut at 16-token boundaries reproduces the unsharded Mega gradients bit
-for bit; only `state_grad_summaries` still recomputes the fused factors over the local stream. The
-staged handles and this recipe are eager-only; `torch.compile` is not supported through them.
+`kernel_options={"backend": "mega"}` runs each rank's local passes with Mega's kernels. The
+recipe is the same as for the fused backend: summarize every local range as an affine map of its
+entry state, exchange and compose the maps, then run the local pass from the composed state.
+
+*Forward.* `prepare` stores only the inputs; Mega keeps its WY factors on chip and never writes
+them out. `state_summaries` produces each range's `[B; A]` map (`S_exit = S_entry @ A + B`) by
+running Mega's state-only pass over the range twice: from a zero entry state, whose final state
+is `B`, and from an identity entry state with the value term disabled, whose final state is `A`.
+Which ranges are probed and how their rows are ordered is decided on the device, so the call is
+CUDA Graph replayable and an empty range yields the identity map. This requires every range to be
+a subsequence (one rank's piece of a document, one segment of the local `cu_seqlens`),
+which the CP recipe guarantees; a caller passing arbitrary 64-aligned ranges gets maps computed
+from the fused factors instead. `run` is Mega's forward from the composed entry state.
+
+*Backward.* `run` is Mega's own stateful backward (`kda_chunk_mega_packed_bwd_with_state`):
+the state pass from the saved entry state writes checkpoints, then the BT16 backward consumes
+them together with the exit cotangent, returning the token gradients and the entry-state
+cotangent. `state_grad_summaries` still computes the reverse maps from the fused factors, so the
+Mega backward under CP pays one fused factor pass over the local span in addition to its own.
+
+*Numerics.* A document cut on 16-token boundaries whose fragments exchange Mega's own state and
+cotangent reproduces the unsharded Mega gradients bit for bit. The composed entry states do not:
+the maps carry Mega's 16-token-chunk rounding, so Mega under CP is its own numerical baseline,
+neither the fused CP baseline nor unsharded Mega. The staged handles and this recipe are
+eager-only; `torch.compile` is not supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 

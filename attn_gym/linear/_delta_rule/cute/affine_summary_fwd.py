@@ -30,8 +30,9 @@ Terms (see also NOTE [Terminology] in ``attn_gym.linear.context_parallel``):
     chunk         64 tokens (``BT``). The factor kernels lay chunks from each subsequence's
                   first token, so every subsequence has its own chunk grid.
     range         one row of ``bounds``: ``[start, stop)`` of whole chunks inside one
-                  subsequence of the span (NOTE [Summary ranges are whole chunks of one
-                  subsequence] in ``attn_gym.linear.kda.stages``), which gets its own
+                  subsequence of the span (the staged contract only promises whole
+                  subsequences, NOTE [Summary ranges are subsequences] in
+                  ``attn_gym.linear.kda.stages``), which gets its own
                   ``[bias; transition]`` summary. ``R`` = number of rows. A range never spans
                   two documents; a row with ``start == stop`` scans nothing and yields the
                   identity.
