@@ -54,6 +54,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
 from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
 from attn_gym.linear.kda.impl.mega import validate_mega_constraints
 from attn_gym.linear.kda.impl.mega_ops import (
+    chunk_mega_packed_bwd_with_state_op,
     chunk_mega_packed_fwd_with_initial_state_op,
     chunk_mega_packed_fwd_with_state_op,
     validate_mega_available,
@@ -67,7 +68,7 @@ class ChunkKDASaved(NamedTuple):
 
     Every field is a tensor or ``None`` so the tuple can be splatted into
     ``ctx.save_for_backward`` and rebuilt from ``ctx.saved_tensors``. ``aqk``/``akk`` are
-    ``None`` when the forward did not materialize them (Mega); backward recomputes them.
+    ``None`` when the forward did not materialize them; backward recomputes them.
     """
 
     q: torch.Tensor
@@ -79,6 +80,24 @@ class ChunkKDASaved(NamedTuple):
     akk: torch.Tensor | None
     cu_seqlens: torch.Tensor | None
     chunk_offsets: torch.Tensor | None
+
+
+class ChunkKDAMegaSaved(NamedTuple):
+    """Forward tensors a Mega ``chunk_kda_prepare`` stores for ``chunk_kda_prepare_backward``.
+
+    The type routes ``chunk_kda_prepare_backward`` to the native Mega backward, which reads the
+    raw ``gate`` and keeps its factors on chip; ``cumulative_gate`` feeds only the fused factor
+    pass behind the reverse summaries. Mega always runs packed, so the offsets are never ``None``.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    gate: torch.Tensor
+    cumulative_gate: torch.Tensor
+    beta: torch.Tensor
+    cu_seqlens: torch.Tensor
+    chunk_offsets: torch.Tensor
 
 
 # NOTE [Summary ranges are whole chunks of one subsequence]
@@ -110,6 +129,15 @@ def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
     return state if state.stride(-1) == 1 else state.contiguous()
 
 
+def _normalize_mega_state(state: torch.Tensor) -> torch.Tensor:
+    """FP32 state as Mega's launchers read it through TMA.
+
+    Unit-stride keys and 16-byte-aligned outer strides suffice, so only other layouts are copied.
+    """
+    state = state.float()
+    return state if tensor_supports_tma(state) else state.contiguous()
+
+
 @dataclass
 class ChunkKDAPrepared:
     """Local forward factors shared by ``state_summaries`` and ``run``.
@@ -124,16 +152,25 @@ class ChunkKDAPrepared:
     autotune: bool
     schedule: ScheduleRequest
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         ``bounds`` is an ``int32 [R, 2]`` device tensor of ``[start, stop)`` span offsets, each
         obeying NOTE [Summary ranges are whole chunks of one subsequence]; ``start == stop``
         yields the identity. The ranges are read on the device, so a CUDA Graph captured around
-        this call replays for any layout of the same shape.
+        this call replays for any layout of the same shape. ``deterministic_work=True`` pins
+        each range's recurrence partition for canonical tile batching; factor preparation
+        must also use ``autotune=False``.
         """
         return build_state_summaries(
-            self.factors.kg, self.factors.w, self.factors.u, self.saved.cumulative_gate, bounds
+            self.factors.kg,
+            self.factors.w,
+            self.factors.u,
+            self.saved.cumulative_gate,
+            bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -164,18 +201,19 @@ class ChunkKDAMegaPrepared:
 
     Mega never materializes the WY factors, so ``run`` executes the Mega with-state kernel over the
     whole local stream and ``state_summaries`` computes the fused factors once for the whole stream
-    (its ranges are device values). Backward recomputes the intra factors, as Mega does today.
+    (its ranges are device values). The backward handle is :class:`ChunkKDAMegaBackward`.
     """
 
-    saved: ChunkKDASaved  # aqk/akk are None: Mega keeps them on chip
-    gate: torch.Tensor
+    saved: ChunkKDAMegaSaved
     metadata: RaggedChunkMetadata
     scale: float
     autotune: bool
     # Mega rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
     schedule: ScheduleRequest = ScheduleRequest.AUTO
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         Mega keeps no WY factors, so this factors the whole local stream once (the fused
@@ -195,7 +233,12 @@ class ChunkKDAMegaPrepared:
             schedule=self.schedule,
         )
         return build_state_summaries(
-            factors.kg, factors.w, factors.u, saved.cumulative_gate, bounds
+            factors.kg,
+            factors.w,
+            factors.u,
+            saved.cumulative_gate,
+            bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -209,19 +252,15 @@ class ChunkKDAMegaPrepared:
         if initial_state is None:
             initial_state = zero_state(saved.q, saved.v, self.metadata)
         else:
-            # Mega's launcher reads the state through TMA: unit-stride keys and 16-byte-aligned
-            # outer strides suffice, so only other layouts are copied.
-            initial_state = initial_state.float()
-            if not tensor_supports_tma(initial_state):
-                initial_state = initial_state.contiguous()
+            initial_state = _normalize_mega_state(initial_state)
         args = (
             saved.q,
             saved.k,
             saved.v,
-            self.gate,
+            saved.gate,
             saved.beta,
             initial_state,
-            self.metadata.cu_seqlens,
+            saved.cu_seqlens,
             self.scale,
         )
         if output_final_state:
@@ -276,10 +315,9 @@ def chunk_kda_prepare(
         assert metadata is not None
         gate = normalize_compact_tensor(gate)
         validate_mega_constraints(q, k, v, gate, beta, None, metadata.cu_seqlens)
-        saved = ChunkKDASaved(
-            q, k, v, cumulative_gate, beta, None, None, cu_seqlens, chunk_offsets
-        )
-        return ChunkKDAMegaPrepared(saved, gate, metadata, scale, autotune)
+        assert cu_seqlens is not None and chunk_offsets is not None
+        saved = ChunkKDAMegaSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
+        return ChunkKDAMegaPrepared(saved, metadata, scale, autotune)
     factors = _prepare_chunk_kda_fwd(
         q, k, v, cumulative_gate, beta, metadata, scale=scale, autotune=autotune, schedule=schedule
     )
@@ -305,7 +343,9 @@ class ChunkKDABackward:
     autotune: bool
     fastmath: bool
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         Packed as ``[C; R]`` with ``d_entry_state = d_exit_state @ R + C``, where ``C`` is the
@@ -323,6 +363,7 @@ class ChunkKDABackward:
             self.saved.cumulative_gate,
             self.scale,
             bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -363,8 +404,101 @@ class ChunkKDABackward:
         return dq, dk, dv, dgate, dbeta, d_initial_state
 
 
+@dataclass
+class ChunkKDAMegaBackward:
+    """Mega backward handle: native stateful kernels for ``run``, fused factors for summaries.
+
+    ``run`` is the native Mega backward (checkpoint recompute + BT16 backward) from the saved
+    entry state and the exit cotangent: given the states Mega itself hands over, fragments cut at
+    16-token document offsets reproduce the unsharded Mega gradients bit for bit (the summaries'
+    FP32 maps round the handed-over values differently). ``state_grad_summaries``
+    still recomputes the fused factors over the whole local stream, as the forward handle's
+    ``state_summaries`` does; Mega emits no per-range reverse maps yet, and this pass includes the
+    fused state recompute the summaries do not read. Unlike :class:`ChunkKDABackward`, nothing is
+    consumed, so ``run`` and ``state_grad_summaries`` may be called in either order.
+    """
+
+    saved: ChunkKDAMegaSaved
+    d_output: torch.Tensor
+    initial_state: torch.Tensor | None
+    metadata: RaggedChunkMetadata
+    scale: float
+    autotune: bool
+    schedule: ScheduleRequest
+
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
+
+        Same contract as ``ChunkKDABackward.state_grad_summaries``.
+        """
+        saved = self.saved
+        prepared = _prepare_chunk_kda_bwd(
+            saved.q,
+            saved.k,
+            saved.v,
+            saved.cumulative_gate,
+            saved.beta,
+            None,
+            None,
+            self.d_output,
+            self.initial_state,
+            self.metadata,
+            scale=self.scale,
+            chunk_size=CHUNK_SIZE,
+            autotune=self.autotune,
+            schedule=self.schedule,
+        )
+        assert prepared.qg is not None and prepared.kg is not None
+        assert prepared.w is not None and prepared.aqk is not None
+        return build_state_grad_summaries(
+            prepared.qg,
+            prepared.kg,
+            prepared.w,
+            self.d_output,
+            prepared.aqk,
+            saved.cumulative_gate,
+            self.scale,
+            bounds,
+            deterministic_work=deterministic_work,
+        )
+
+    def run(
+        self, d_final_state: torch.Tensor | None = None
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Run Mega's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
+
+        Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)``; the last is ``None`` when the
+        forward ran without an entry state. An absent ``d_final_state`` skips the cotangent load
+        and gives the token gradients of an explicit zero.
+        """
+        saved = self.saved
+        if d_final_state is not None:
+            d_final_state = _normalize_mega_state(d_final_state)
+        return chunk_mega_packed_bwd_with_state_op(
+            saved.q,
+            saved.k,
+            saved.v,
+            saved.gate,
+            saved.beta,
+            self.d_output,
+            saved.cu_seqlens,
+            self.initial_state,
+            d_final_state,
+            self.scale,
+        )
+
+
 def chunk_kda_prepare_backward(
-    saved: ChunkKDASaved,
+    saved: ChunkKDASaved | ChunkKDAMegaSaved,
     d_output: torch.Tensor | None,
     initial_state: torch.Tensor | None,
     *,
@@ -372,7 +506,7 @@ def chunk_kda_prepare_backward(
     autotune: bool = True,
     fastmath: bool = False,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-) -> ChunkKDABackward:
+) -> ChunkKDABackward | ChunkKDAMegaBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the
@@ -380,20 +514,31 @@ def chunk_kda_prepare_backward(
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
     caller's autograd function owns them. ``fastmath`` applies to the gradient kernels as in
     ``chunk_kda``; pass the forward handle's ``prepared.schedule`` so the backward's factor
-    recompute uses the same launch geometry.
+    recompute uses the same launch geometry. A Mega tape (:class:`ChunkKDAMegaSaved`) returns
+    :class:`ChunkKDAMegaBackward`, whose native ``run`` ignores ``fastmath`` and defers the fused
+    factor recompute to ``state_grad_summaries``.
     """
+    if d_output is None:
+        d_output = torch.zeros_like(saved.v)
+    else:
+        d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
+    scale = float(scale)
+    if isinstance(saved, ChunkKDAMegaSaved):
+        metadata = RaggedChunkMetadata.from_offsets(
+            saved.cu_seqlens, saved.chunk_offsets, saved.q.shape[1], CHUNK_SIZE
+        )
+        if initial_state is not None:
+            initial_state = _normalize_mega_state(initial_state)
+        return ChunkKDAMegaBackward(
+            saved, d_output, initial_state, metadata, scale, autotune, schedule
+        )
     metadata = None
     if saved.cu_seqlens is not None:
         assert saved.chunk_offsets is not None
         metadata = RaggedChunkMetadata.from_offsets(
             saved.cu_seqlens, saved.chunk_offsets, saved.q.shape[1], CHUNK_SIZE
         )
-    if d_output is None:
-        d_output = torch.zeros_like(saved.v)
-    else:
-        d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     initial_state = _normalize_state(initial_state)  # The backward recomputes the chain from it.
-    scale = float(scale)
     prepared = _prepare_chunk_kda_bwd(
         saved.q,
         saved.k,
@@ -417,7 +562,9 @@ def chunk_kda_prepare_backward(
 
 __all__ = [
     "ChunkKDABackward",
+    "ChunkKDAMegaBackward",
     "ChunkKDAMegaPrepared",
+    "ChunkKDAMegaSaved",
     "ChunkKDAPrepared",
     "ChunkKDASaved",
     "chunk_kda_prepare",

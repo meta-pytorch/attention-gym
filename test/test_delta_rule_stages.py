@@ -55,11 +55,73 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
+    # The unsharded kernels the staged backward reproduces bitwise; ``None`` is autograd through
+    # ``chunk``. Mega's staged backward is the native stateful kernel, while the public op's
+    # stateful backward is the fused recompute, so Mega names the native op here.
+    backward: Callable[..., tuple[torch.Tensor, ...]] | None = None
 
     def make_inputs(self, tokens: int, seed: int, dtype: torch.dtype = torch.bfloat16) -> Inputs:
         return self.factory(
             tokens, key_heads=self.key_heads, value_heads=self.value_heads, seed=seed, dtype=dtype
         )
+
+    def gradients(
+        self,
+        inputs: Inputs,
+        initial_state: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        d_output: torch.Tensor | None,
+        d_final_state: torch.Tensor | None,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """``(dq, dk, dv, dgate, dbeta[, d_initial_state])`` of the unsharded op.
+
+        A ``None`` cotangent drops that term of the loss.
+        """
+        if self.backward is not None:
+            return self.backward(
+                inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
+            )
+        leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+        if initial_state is not None:
+            leaves += (initial_state.detach().clone().requires_grad_(),)
+        output, final_state = self.chunk(
+            *leaves, cu_seqlens=cu_seqlens, output_final_state=True, scale=scale
+        )
+        terms = [(output, d_output), (final_state, d_final_state)]
+        outputs, cotangents = zip(*(term for term in terms if term[1] is not None), strict=True)
+        return torch.autograd.grad(outputs, leaves, cotangents)
+
+
+def mega_native_gradients(
+    inputs: Inputs,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    d_output: torch.Tensor | None,
+    d_final_state: torch.Tensor | None,
+    *,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """The native stateful Mega backward, which the Mega staged handle runs."""
+    from attn_gym.linear.kda.impl.mega_ops import chunk_mega_packed_bwd_with_state_op
+
+    q, k, v, gate, beta = inputs
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
+    grads = chunk_mega_packed_bwd_with_state_op(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        torch.zeros_like(v) if d_output is None else d_output,
+        cu_seqlens,
+        None if initial_state is None else initial_state.contiguous(),
+        d_final_state,
+        HEAD_DIM**-0.5 if scale is None else scale,
+    )
+    return grads if initial_state is not None else grads[:5]
 
 
 def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
@@ -123,6 +185,7 @@ requires_mega = pytest.mark.skipif(
 KDA_MEGA = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=MEGA),
     prepare=partial(chunk_kda_prepare, kernel_options=MEGA),
+    backward=mega_native_gradients,
 )
 op_param = pytest.mark.parametrize(
     "op",
@@ -319,7 +382,7 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
 def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state, packing):
     """The staged backward is the op's own kernel sequence, so all six gradients are bitwise.
 
-    Covers the cotangents the staged API makes optional (``d_output=None``, no final-state loss),
+    For Mega the sequence is the native stateful backward (``Op.backward``). Covers the cotangents the staged API makes optional (``d_output=None``, no final-state loss),
     the entry-state layouts ``run`` accepts (none, contiguous, a key-strided view), and both chunk
     schedules: packed ``cu_seqlens`` and a dense span of complete chunks (``metadata is None``).
     """
@@ -343,21 +406,16 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
         sequences, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda", generator=generator
     )
 
-    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs) + (
-        () if initial_state is None else (initial_state.detach().clone().requires_grad_(),)
-    )
-    output, final_state = op.chunk(
-        *leaves, cu_seqlens=cu_seqlens, output_final_state=True, scale=scale
-    )
-    d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
+    d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
+    gradients = partial(op.gradients, inputs, initial_state, cu_seqlens, scale=scale)
     if loss == "output-only":
-        expected = torch.autograd.grad(output, leaves, d_output)
+        expected = gradients(d_output, None)
         d_final_state = torch.zeros_like(d_final_state)
     elif loss == "final-state-only":
-        expected = torch.autograd.grad(final_state, leaves, d_final_state)
+        expected = gradients(None, d_final_state)
         d_output = None
     else:
-        expected = torch.autograd.grad((output, final_state), leaves, (d_output, d_final_state))
+        expected = gradients(d_output, d_final_state)
 
     prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens, scale=scale)
     prepared.run(initial_state, output_final_state=True)
@@ -677,9 +735,7 @@ def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout,
     generator = torch.Generator(device="cuda").manual_seed(5)
     d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
     d_final_state = torch.randn(final_state.shape, device="cuda", generator=generator)
-    expected_grads = torch.autograd.grad(
-        (output, final_state), inputs, grad_outputs=(d_output, d_final_state)
-    )
+    expected_grads = op.gradients((q, k, v, gate, beta), None, offsets, d_output, d_final_state)
 
     # Sharding must not cost accuracy: measure both paths against the FP32 eager oracle.
     f32 = tuple(tensor.detach().float().requires_grad_() for tensor in (q, k, v, gate, beta))

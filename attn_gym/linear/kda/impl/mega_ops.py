@@ -48,6 +48,12 @@ torch.library.define(
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
+    "attn_gym::kda_chunk_mega_packed_bwd_with_state",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
+    "Tensor cu_seqlens, Tensor? initial_state, Tensor? d_final_state, float scale) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?)",
+)
+torch.library.define(
     "attn_gym::kda_plain_gate_bwd_dense_cute",
     "(Tensor d_cumulative) -> Tensor",
 )
@@ -220,6 +226,25 @@ def _packed_local_bwd_cuda(q, k, value, gate, beta, d_output, cu_seqlens, split,
         cu_seqlens,
         scale=scale,
         split=split,
+    )[:5]
+
+
+def _packed_bwd_with_state_cuda(
+    q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale
+):
+    from attn_gym.linear._delta_rule.mega.backward import chunk_delta_rule_bwd_mega_packed
+
+    return chunk_delta_rule_bwd_mega_packed(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        d_output,
+        cu_seqlens,
+        scale=scale,
+        initial_state=initial_state,
+        d_final_state=d_final_state,
     )
 
 
@@ -246,6 +271,9 @@ torch.library.impl(
 )
 torch.library.impl("attn_gym::kda_chunk_mega_packed_fwd_paged", "CUDA", _packed_fwd_paged_cuda)
 torch.library.impl("attn_gym::kda_chunk_mega_packed_local_bwd", "CUDA", _packed_local_bwd_cuda)
+torch.library.impl(
+    "attn_gym::kda_chunk_mega_packed_bwd_with_state", "CUDA", _packed_bwd_with_state_cuda
+)
 torch.library.impl("attn_gym::kda_plain_gate_bwd_dense_cute", "CUDA", _plain_gate_bwd_cuda)
 
 
@@ -301,6 +329,21 @@ def _packed_local_bwd_fake(q, k, value, gate, beta, d_output, cu_seqlens, split,
     return tuple(torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta))
 
 
+@torch.library.register_fake("attn_gym::kda_chunk_mega_packed_bwd_with_state")
+def _packed_bwd_with_state_fake(
+    q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale
+):
+    del d_output, cu_seqlens, d_final_state, scale
+    gradients = tuple(
+        torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta)
+    )
+    # The launcher allocates a compact FP32 cotangent whatever the entry state's outer strides.
+    d_initial_state = (
+        None if initial_state is None else initial_state.new_empty(initial_state.shape)
+    )
+    return (*gradients, d_initial_state)
+
+
 @torch.library.register_fake("attn_gym::kda_plain_gate_bwd_dense_cute")
 def _plain_gate_bwd_fake(d_cumulative):
     return torch.empty_like(d_cumulative)
@@ -317,11 +360,15 @@ chunk_mega_packed_fwd_with_state_op = (
     torch.ops.attn_gym.kda_chunk_mega_packed_fwd_with_state.default
 )
 chunk_mega_packed_local_bwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_local_bwd.default
+chunk_mega_packed_bwd_with_state_op = (
+    torch.ops.attn_gym.kda_chunk_mega_packed_bwd_with_state.default
+)
 plain_gate_bwd_dense_cute_op = torch.ops.attn_gym.kda_plain_gate_bwd_dense_cute.default
 
 
 __all__ = [
     "chunk_mega_dense_training_fwd_op",
+    "chunk_mega_packed_bwd_with_state_op",
     "chunk_mega_packed_fwd_op",
     "chunk_mega_packed_fwd_paged_op",
     "chunk_mega_packed_fwd_with_initial_state_op",

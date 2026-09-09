@@ -1466,6 +1466,8 @@ def build_state_grad_summaries(
     cumulative_gate: torch.Tensor,
     scale: float,
     bounds: torch.Tensor,
+    *,
+    deterministic_work: bool = False,
 ) -> torch.Tensor:
     """Compute one packed reverse affine summary per token range of a stream.
 
@@ -1479,6 +1481,10 @@ def build_state_grad_summaries(
         scale: Query scaling factor used by the local backward recurrence.
         bounds: ``int32 [R, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
             same contract as ``build_state_summaries``.
+        deterministic_work: Scan each range in one work item, so the recurrence partition does
+            not depend on span length, range count, or SM count (the SM100 column tile is
+            already fixed). The upstream factor kernels are not pinned; disable their autotuning
+            separately.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as local bias then reverse
@@ -1566,9 +1572,12 @@ def build_state_grad_summaries(
         )
         state_bn = BlackwellDeltaAffineSummaryRev.BN
     # As in the forward: a static budget from the span's chunk count, ranges cut on the device.
-    budget = plan_work_budget(
-        cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
-    )
+    if deterministic_work:
+        budget = 1
+    else:
+        budget = plan_work_budget(
+            cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
+        )
     work, range_ids = work_table(bounds, budget)
     partials = torch.empty(
         (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the CuTeDSL 4.7 Mega no-state long-context backward."""
+"""Torch launcher for the CuTeDSL 4.7 Mega long-context backward, with or without state."""
 
 from __future__ import annotations
 
@@ -32,11 +32,29 @@ def chunk_delta_rule_bwd_mega_packed(
     *,
     scale: float | None = None,
     split: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run checkpoint recompute followed by exact or forgetting-horizon backward."""
+    initial_state: torch.Tensor | None = None,
+    d_final_state: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Run checkpoint recompute followed by exact or forgetting-horizon backward.
+
+    ``initial_state`` and ``d_final_state`` are optional FP32 ``[N, H, V, K]`` entry states
+    and exit cotangents per packed sequence. ``None`` skips state loads, with token gradients
+    bitwise equal to an explicit zero tensor. Returns ``(dq, dk, dv, dgate, dbeta,
+    d_initial_state)``; the last is ``None`` unless ``initial_state`` was given.
+    The approximate forgetting-horizon ``split`` schedule requires a no-state call.
+    """
     scale = resolve_scale(scale, q.shape[-1])
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
+    if split and (initial_state is not None or d_final_state is not None):
+        raise ValueError("the split backward schedule requires a no-state call")
     with initialized_cuda_device(q):
         if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
             raise ValueError("q must have shape [1, T, H, 128]")
@@ -69,6 +87,16 @@ def chunk_delta_rule_bwd_mega_packed(
         ):
             raise TypeError("cu_seqlens must be aligned contiguous int32 on q.device")
         num_sequences = cu_seqlens.shape[0] - 1
+        state_shape = (num_sequences, heads, value.shape[-1], dim)
+        for name, state in (("initial_state", initial_state), ("d_final_state", d_final_state)):
+            if state is None:
+                continue
+            if state.shape != state_shape or state.dtype != torch.float32:
+                raise TypeError(f"{name} must be float32 with shape {state_shape}")
+            if state.device != q.device:
+                raise ValueError(f"{name} must be on q.device")
+            if not tensor_supports_tma(state):
+                raise TypeError(f"{name} requires a TMA-compatible inner mode")
         stream = torch.cuda.current_stream(q.device).cuda_stream
         schedule = prepare_mega_schedule(
             gate,
@@ -102,11 +130,12 @@ def chunk_delta_rule_bwd_mega_packed(
             dtype=torch.int64,
             device=q.device,
         )
-        dq = torch.empty_like(q[0])
-        dk = torch.empty_like(k[0])
-        dv = torch.empty_like(value[0])
-        dgate = torch.empty_like(gate[0])
-        dbeta = torch.empty_like(beta[0])
+        gradients = tuple(torch.empty_like(t[0]) for t in (q, k, value, gate, beta))
+        d_initial_state = (
+            None
+            if initial_state is None
+            else torch.empty(state_shape, dtype=torch.float32, device=q.device)
+        )
 
         kda_recompute_f16.chunk_kda_recompute_sm100(
             k[0],
@@ -114,7 +143,7 @@ def chunk_delta_rule_bwd_mega_packed(
             gate[0],
             beta[0],
             cu_seqlens,
-            None,
+            initial_state,
             None,
             checkpoint_every_n_tokens=16,
             output_state_checkpoints=checkpoints,
@@ -137,29 +166,19 @@ def chunk_delta_rule_bwd_mega_packed(
             beta[0],
             d_output[0],
             checkpoints,
-            dq,
-            dk,
-            dv,
-            dgate,
-            dbeta,
+            *gradients,
             cu_seqlens,
             scale,
-            use_initial_state=False,
-            d_initial_state=None,
-            d_final_state=None,
+            use_initial_state=initial_state is not None,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
             work_items=schedule.work_items,
             work_count=schedule.work_count,
             sched_ctr=bwd_scheduler,
             order_in_prologue=False,
             tensormap_workspace=backward_workspace,
         )
-        return (
-            dq.unsqueeze(0),
-            dk.unsqueeze(0),
-            dv.unsqueeze(0),
-            dgate.unsqueeze(0),
-            dbeta.unsqueeze(0),
-        )
+        return (*(grad.unsqueeze(0) for grad in gradients), d_initial_state)
 
 
 __all__ = ["chunk_delta_rule_bwd_mega_packed"]
