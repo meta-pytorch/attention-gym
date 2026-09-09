@@ -42,8 +42,8 @@ def context_parallel_kda(
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale``, ``autotune``, and ``kernel_options`` follow ``chunk_kda``. With
     ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and the fused factors are
-    computed once over the span for the summaries; ``fastmath`` applies to the staged backward,
-    which is the fused one for either backend.
+    computed once over the span for the summaries. Its backward is Mega's native stateful kernel,
+    so ``fastmath`` applies only to the fused backend's backward.
     """
     stages = StagedOp(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
