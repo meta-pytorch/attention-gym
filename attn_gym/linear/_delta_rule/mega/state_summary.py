@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Native BT16 affine probes for Mega context-parallel subsequences.
+"""Native BT16 affine probes for whole packed sequences.
 
-B is the no-state final state; A is the identity-seeded, zero-value final state. Native
-state/operand rounding makes this an approximate affine map, not bitwise reconstruction of
-an ordinary unsharded Mega run. C is the native zero-exit entry cotangent. The cheaper reverse
-transition A.T is opt-in: it is not the identity-seeded native backward's rounding.
+Forward maps pack [B; A] for ``exit = entry @ A + B``; reverse maps pack [C; R] for
+``d_entry = d_exit @ R + C``. Native state/operand rounding makes these approximate affine
+maps, not bitwise reconstruction of an ordinary unsharded Mega run. Every probe is unsplit,
+so its arithmetic is independent of sequence ownership and packed token count.
 """
 
 from __future__ import annotations
+
+from types import ModuleType
 
 import torch
 import triton
@@ -20,7 +22,7 @@ from attn_gym.utils import ceildiv
 from .forward import validate_available
 from .kernels import kda_bprop_f16, kda_recompute_f16
 from .kernels.common.host import tensormap_workspace_bytes
-from .schedule import prepare_mega_schedule
+from .schedule import MegaSchedule, prepare_mega_schedule
 
 
 @triton.jit
@@ -35,6 +37,7 @@ def _select_summary_work(cu, bounds, work, count, HEADS: tl.constexpr, ROWS: tl.
     selected = tl.sum(((lo == start) & (hi == stop) & (lo < hi)).to(tl.int32), 0) > 0
     stop = tl.where(selected, stop, start)
     chunks = tl.cdiv(stop - start, 16)
+    # Native row: [seq, head, wstart, wend, cstart, cend, token_start, token_stop].
     fields = tl.arange(0, 8)
     row = tl.where(fields == 0, seq, tl.where(fields == 1, head, 0))
     row = tl.where((fields == 3) | (fields == 5), chunks, row)
@@ -56,10 +59,11 @@ def _gather_summary_rows(
     hi = tl.load(cu + seqs + 1, seqs < SEQUENCES, other=-1)
     seq = tl.max(tl.where((lo == start) & (hi == stop), seqs, 0), 0)
     offsets = block * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(maps + (seq * HEADS + head) * 32768 + offsets)
-    identity = (offsets // 128 - 128 == offsets % 128).to(tl.float32)
+    value = tl.load(maps + (seq * HEADS + head) * (256 * 128) + offsets)
+    # [0; I]: diagonal ones live only in the lower 128 rows.
+    identity = (offsets // 128 == 128 + offsets % 128).to(tl.float32)
     value = tl.where(start == stop, identity, value)
-    tl.store(output + (row * HEADS + head) * 32768 + offsets, value)
+    tl.store(output + (row * HEADS + head) * (256 * 128) + offsets, value)
 
 
 def build_mega_state_summaries(
@@ -73,12 +77,62 @@ def build_mega_state_summaries(
 ) -> torch.Tensor:
     """Return FP32 ``[N, H, 256, 128]`` maps packed as ``[B; A]`` for whole sequences.
 
-    Inputs use the staged ``[1, T, H, 128]`` layout, with FP32 gate/beta and already
-    normalized keys. Both passes are unsplit, independent of packed token count or ownership.
-    Optional bounds select/reorder whole consecutive cu_seqlens pairs (a caller contract);
-    empty bounds return ``[0; I]``. Selection stays on device for CUDA Graph replay.
+    B is the no-state final state; A is the identity-seeded, zero-value final state.
+    Inputs use staged ``[1, T, H, 128]`` layout, FP32 gate/beta, and normalized keys.
+    Optional contiguous int32 ``bounds[R, 2]`` on k.device select, reorder, or duplicate
+    consecutive cu_seqlens pairs. Empty intervals yield ``[0; I]``; zero rows yield no maps.
+    Bounds values stay on device and may change during CUDA Graph replay.
     """
-    return _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds, bias=True)
+    maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds, bias=True)
+    return _summary_rows(maps, cu_seqlens, bounds)
+
+
+def _summary_rows(
+    maps: torch.Tensor, cu_seqlens: torch.Tensor, bounds: torch.Tensor | None
+) -> torch.Tensor:
+    """Gather selected probes only after native kernels finish writing by sequence index."""
+    if bounds is None:
+        return maps
+    sequences, heads = maps.shape[:2]
+    selected = torch.empty(bounds.shape[0], heads, 256, 128, device=maps.device, dtype=maps.dtype)
+    if bounds.shape[0]:
+        with initialized_cuda_device(maps):
+            _gather_summary_rows[(bounds.shape[0], heads, 32)](
+                maps, cu_seqlens, bounds, selected, heads, sequences, 1024
+            )
+    return selected
+
+
+def _prepare_summary_launch(
+    gate: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    bounds: torch.Tensor | None,
+    kernel: ModuleType,
+) -> tuple[MegaSchedule, torch.Tensor]:
+    """Allocate native launch buffers and select whole-sequence work without a host sync.
+
+    With bounds, the caller must reset counters before each probe and disable prologue
+    ordering; otherwise the prologue generates all work and resets counters itself.
+    """
+    sequences, heads = cu_seqlens.shape[0] - 1, gate.shape[2]
+    schedule = prepare_mega_schedule(
+        gate,
+        cu_seqlens,
+        tile_tokens=16,
+        counter_count=2,
+        split=False,
+        stream=torch.cuda.current_stream(gate.device).cuda_stream,
+    )
+    if bounds is not None:
+        _select_summary_work[(sequences, heads)](
+            cu_seqlens, bounds, schedule.work_items, schedule.work_count, heads, bounds.shape[0]
+        )
+    workspace = torch.empty(
+        ceildiv(tensormap_workspace_bytes(kernel, sequences), 8),
+        dtype=torch.int64,
+        device=gate.device,
+    )
+    return schedule, workspace
 
 
 def _build_mega_state_probes(
@@ -91,7 +145,7 @@ def _build_mega_state_probes(
     *,
     bias: bool,
 ) -> torch.Tensor:
-    """Run the native transition probe and, when requested, the zero-state bias probe."""
+    """Probe selected sequences into full-size storage indexed by the native sequence IDs."""
     validate_available(k)
     if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] != 128:
         raise ValueError("k must have shape [1, T, H, 128]")
@@ -119,27 +173,8 @@ def _build_mega_state_probes(
         )
         summaries[:, :, 128:, :].diagonal(dim1=-2, dim2=-1).fill_(1)
         if k.shape[1] != 0 and (bounds is None or bounds.shape[0] != 0):
-            schedule = prepare_mega_schedule(
-                gate,
-                cu_seqlens,
-                tile_tokens=16,
-                counter_count=2,
-                split=False,
-                stream=torch.cuda.current_stream(k.device).cuda_stream,
-            )
-            if bounds is not None:
-                _select_summary_work[(num_sequences, heads)](
-                    cu_seqlens,
-                    bounds,
-                    schedule.work_items,
-                    schedule.work_count,
-                    heads,
-                    bounds.shape[0],
-                )
-            workspace = torch.empty(
-                ceildiv(tensormap_workspace_bytes(kda_recompute_f16, num_sequences), 8),
-                dtype=torch.int64,
-                device=k.device,
+            schedule, workspace = _prepare_summary_launch(
+                gate, cu_seqlens, bounds, kda_recompute_f16
             )
             for transition_only in (False, True) if bias else (True,):
                 if bounds is not None:
@@ -162,16 +197,7 @@ def _build_mega_state_probes(
                     tensormap_workspace=workspace,
                     transition_only=transition_only,
                 )
-        if bounds is None:
-            return summaries
-        selected = torch.empty(
-            bounds.shape[0], heads, 256, 128, device=k.device, dtype=torch.float32
-        )
-        if bounds.shape[0]:
-            _gather_summary_rows[(bounds.shape[0], heads, 32)](
-                summaries, cu_seqlens, bounds, selected, heads, num_sequences, 1024
-            )
-        return selected
+        return summaries
 
 
 def build_mega_state_grad_summaries(
@@ -187,51 +213,35 @@ def build_mega_state_grad_summaries(
     transpose_forward_transition: bool = False,
     bounds: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return whole-sequence FP32 ``[C; R]`` probes for ``d_entry = d_exit @ R + C``.
+    """Return whole-sequence FP32 ``[N, H, 256, 128]`` maps packed as ``[C; R]``.
 
-    Optional ``bounds`` (``int32 [R, 2]`` device tensor of whole consecutive cu_seqlens pairs)
-    select and order the returned rows on device; every sequence is still probed.
-
-    C uses native bprop with zero exit cotangent. Its dH recurrence does not read V or the
-    checkpoints, so broadcast zero checkpoints avoid a forward state recompute and its large
-    checkpoint allocation. The unchanged kernel still computes/discards token gradients.
-
-    By default R is one native backward pass with all 128 identity rows seeded together and
-    zero d_output. ``transpose_forward_transition=True`` instead uses the cheaper forward
-    A.T probe: algebraically the adjoint, but NOT native backward rounding. Canonical Mega CP
-    explicitly selects this approximate numerical baseline; it remains ownership-invariant.
+    C is the native entry cotangent with zero exit cotangent. R uses an identity exit
+    cotangent and zero d_output. ``transpose_forward_transition=True`` instead uses A.T
+    from the forward probe: algebraically the adjoint, but not native backward rounding.
+    Inputs and bounds follow :func:`build_mega_state_summaries`; selection applies to both
+    probes and empty intervals yield ``[0; I]``.
     """
     validate_available(q)
     with initialized_cuda_device(q):
         sequences, heads = cu_seqlens.numel() - 1, q.shape[2]
         if transpose_forward_transition:
-            maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, None, bias=False)
+            maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds, bias=False)
             maps[:, :, 128:].copy_(maps[:, :, 128:].transpose(-1, -2).contiguous())
         else:
             maps = torch.zeros(sequences, heads, 256, 128, device=q.device)
             maps[:, :, 128:].diagonal(dim1=-2, dim2=-1).fill_(1)
-        if q.shape[1] == 0:
-            return maps
-        schedule = prepare_mega_schedule(
-            gate,
-            cu_seqlens,
-            tile_tokens=16,
-            counter_count=2,
-            split=False,
-            stream=torch.cuda.current_stream(q.device).cuda_stream,
-        )
-        workspace = torch.empty(
-            ceildiv(tensormap_workspace_bytes(kda_bprop_f16, sequences), 8),
-            dtype=torch.int64,
-            device=q.device,
-        )
-        # Zero-stride checkpoint rows are legal in the native TMA ABI. All sequence-local
-        # checkpoint descriptors address this single tile, regardless of packed token count.
+        if q.shape[1] == 0 or (bounds is not None and bounds.shape[0] == 0):
+            return _summary_rows(maps, cu_seqlens, bounds)
+        schedule, workspace = _prepare_summary_launch(gate, cu_seqlens, bounds, kda_bprop_f16)
+        # The dH recurrence ignores V/checkpoints; token gradients are computed but discarded.
+        # Zero-stride TMA checkpoint rows all address one tile, avoiding a state recompute.
         checkpoints = torch.zeros(1, heads, 128, 128, device=q.device, dtype=q.dtype).expand(
             q.shape[1] // 16 + sequences, -1, -1, -1
         )
         scratch = [torch.empty_like(t[0]) for t in (q, k, value, gate, beta)]
         for transition in (False,) if transpose_forward_transition else (False, True):
+            if bounds is not None:
+                schedule.counters.zero_()
             exit_state = None
             do = d_output
             if transition:
@@ -255,16 +265,7 @@ def build_mega_state_grad_summaries(
                 work_count=schedule.work_count,
                 sched_ctr=schedule.counters if sequences * heads <= schedule.num_sms else None,
                 sched_all=schedule.counters,
-                order_in_prologue=True,
+                order_in_prologue=bounds is None,
                 tensormap_workspace=workspace,
             )
-        if bounds is None:
-            return maps
-        selected = torch.empty(
-            bounds.shape[0], heads, 256, 128, device=q.device, dtype=torch.float32
-        )
-        if bounds.shape[0]:
-            _gather_summary_rows[(bounds.shape[0], heads, 32)](
-                maps, cu_seqlens, bounds, selected, heads, sequences, 1024
-            )
-        return selected
+        return _summary_rows(maps, cu_seqlens, bounds)
