@@ -43,8 +43,12 @@ def configure_local_image(
         )
     else:
         configured = configured.add_local_python_source("attn_gym")
-    return configured.add_local_dir(ROOT_PATH / "test", remote_path="/root/test").add_local_dir(
-        ROOT_PATH / "examples", remote_path="/root/examples"
+    # test_examples_layout checks README.md and docs/ against examples/, so ship them too.
+    return (
+        configured.add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
+        .add_local_dir(ROOT_PATH / "examples", remote_path="/root/examples")
+        .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
+        .add_local_file(ROOT_PATH / "README.md", remote_path="/root/README.md")
     )
 
 
