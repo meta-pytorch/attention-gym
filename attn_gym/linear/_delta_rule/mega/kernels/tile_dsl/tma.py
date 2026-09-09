@@ -3,7 +3,8 @@
 #
 # Modified by Attention Gym in 2026: multicast, bulk-copy, cp.async tile loads, and static
 # descriptor paths unused by the vendored kernels were removed. Tiles always address a runtime
-# descriptor that the caller acquires once with :func:`tma_tensormap_acquire`.
+# descriptor that the caller acquires once with :func:`tma_tensormap_acquire`. Store group
+# commit/wait use the cute.arch wrappers; the tensor copies stay on the raw-descriptor primitives.
 
 
 import cutlass
@@ -47,12 +48,12 @@ def tma_store_tile(smem_tile, gmem_slice):
 
 @cute.jit
 def tma_store_commit():
-    nvvm.cp_async_bulk_commit_group()
+    cute.arch.cp_async_bulk_commit_group()
 
 
 @cute.jit
 def tma_store_wait(num_remaining: int = 0):
-    nvvm.cp_async_bulk_wait_group(num_remaining, read=True)
+    cute.arch.cp_async_bulk_wait_group(num_remaining, read=True)
 
 
 @cute.jit
