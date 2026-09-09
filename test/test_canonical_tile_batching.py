@@ -1,8 +1,7 @@
 """Bitwise ownership invariance of the fused canonical-tile staged primitives.
 
-The reference uses independent per-tile calls, including the dense dispatch for complete
-single tiles and the production summary defaults used by the prototype. The candidate
-packs those same tiles as separate subsequences in one call with pinned summary work.
+Independent per-tile calls use dense dispatch for complete tiles and default summary work.
+The candidate packs the same tiles as subsequences in one call with pinned summary work.
 Random nonzero entry states and exit cotangents exercise both affine boundary terms.
 """
 
@@ -16,6 +15,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym.linear.context_parallel_deterministic import tile_stream
 from attn_gym.linear.kda.stages import (
     ChunkKDAPrepared,
     chunk_kda_prepare,
@@ -104,11 +104,7 @@ def test_canonical_tile_batching(tile_size: int, heads: int, gate: str) -> None:
     """Packing rank-owned ragged tiles must preserve every forward/backward stage bit."""
     torch.manual_seed(41)
     doc_offsets = [0, *accumulate([17, 65, 129, 257, 513])]
-    tiles = [
-        (start, min(start + tile_size, end))
-        for begin, end in pairwise(doc_offsets)
-        for start in range(begin, end, tile_size)
-    ]
+    tiles = tile_stream(doc_offsets, tile_size)
     inputs = make_kda_test_inputs(
         doc_offsets[-1],
         heads=heads,
@@ -123,14 +119,14 @@ def test_canonical_tile_batching(tile_size: int, heads: int, gate: str) -> None:
     exit_grad = torch.randn_like(entry) * 0.1
     reference = [
         run_tiles(
-            tuple(value[:, start:stop].clone() for value in inputs),
-            d_output[:, start:stop].clone(),
-            [stop - start],
+            tuple(value[:, tile.start : tile.stop].clone() for value in inputs),
+            d_output[:, tile.start : tile.stop].clone(),
+            [tile.length],
             entry[i : i + 1],
             exit_grad[i : i + 1],
             packed=False,
         )
-        for i, (start, stop) in enumerate(tiles)
+        for i, tile in enumerate(tiles)
     ]
     # Three independent copies cross the summary-budget and short-sequence recurrence
     # thresholds. Rotation makes the default budget split inside a two-chunk tile.
@@ -139,17 +135,17 @@ def test_canonical_tile_batching(tile_size: int, heads: int, gate: str) -> None:
         list(range(0, len(tiles), 2)),
         list(range(1, len(tiles), 2))[::-1],
         (list(range(4, len(tiles))) + list(range(4))) * 3,
+        [next(i for i, tile in enumerate(tiles) if tile.length == tile_size)],
     ]
-    owners.append([next(i for i, (start, stop) in enumerate(tiles) if stop - start == tile_size)])
     state_names = {"summary", "grad_summary", "final_state", "d_entry"}
     for owned in owners:
         batched = run_tiles(
             tuple(
-                torch.cat([value[:, tiles[i][0] : tiles[i][1]] for i in owned], dim=1)
+                torch.cat([value[:, tiles[i].start : tiles[i].stop] for i in owned], dim=1)
                 for value in inputs
             ),
-            torch.cat([d_output[:, tiles[i][0] : tiles[i][1]] for i in owned], dim=1),
-            [tiles[i][1] - tiles[i][0] for i in owned],
+            torch.cat([d_output[:, tiles[i].start : tiles[i].stop] for i in owned], dim=1),
+            [tiles[i].length for i in owned],
             entry[owned],
             exit_grad[owned],
             packed=True,

@@ -613,13 +613,57 @@ the summaries are identities, since which ranges are empty is a device value und
 layout that never continues a document across ranks does not need this recipe. The backward
 handle's `run` is Mega's own stateful backward (`attn_gym::kda_chunk_mega_packed_bwd_with_state`:
 checkpoint recompute from the saved entry state, then the BT16 backward folding in the exit
-cotangent), so a document cut at 16-token boundaries reproduces the unsharded Mega gradients bit
-for bit; only `state_grad_summaries` still recomputes the fused factors over the local stream. The
-staged handles and this recipe are eager-only; `torch.compile` is not supported through them.
+cotangent). Given Mega's own entry state and exit cotangent, two fragments of a document cut on a
+16-token boundary reproduce the unsharded Mega gradients bit for bit; under this recipe the entry
+states are composed from the fused summaries, whose FP32 rounding differs from Mega's, so the
+sharded result is close to but not bitwise the unsharded one. `state_grad_summaries` still
+recomputes the fused factors over the local stream. The staged handles and this recipe are
+eager-only; `torch.compile` is not supported through them.
+
+### Deterministic mode: results independent of the CP degree
+
+`attn_gym.linear.kda.context_parallel_kda_deterministic` fixes the whole arithmetic graph before
+ranks are assigned, so output and every input gradient are **bitwise identical for any CP degree
+and any ownership of whole tiles**, including CP=1. It is a different numerical contract from the
+unsharded `chunk_kda` call (the same recurrence, composed through fixed FP32 affine maps; the
+error against an FP64 reference stays within the BF16 budget the tests use), and from the
+standard recipe above, whose summaries depend on the fragment table.
+
+- **Tiles.** Every document is cut from its first token into `tile_size` tiles (a multiple of
+  64; the last tile of a document may be short). `CanonicalTiling.from_fragments(cu_seqlens,
+  fragments, rank, tile_size=...)` assigns whole tiles to ranks and rejects a fragment boundary
+  that does not fall on a tile boundary. Ranks may own different numbers of tiles or none.
+- **Leaves.** A rank prepares its tiles in one staged call, each tile a packed subsequence, and
+  builds one `[bias; transition]` map per tile with `deterministic_work=True`, which pins the
+  summary kernels' work partition so it cannot depend on how many tiles the rank owns.
+- **Scan.** All maps are all-gathered and composed per document with a work-efficient scan
+  whose tree depends only on the tile count; the backward mirrors it over the reverse maps.
+
+```python
+from attn_gym.linear.context_parallel_deterministic import CanonicalTiling
+from attn_gym.linear.kda import context_parallel_kda_deterministic
+
+tiling = CanonicalTiling.from_fragments(cu_seqlens_global, fragments, rank, tile_size=1024)
+ids = tiling.global_token_ids(device)  # this rank's tiles, in span order
+output = context_parallel_kda_deterministic(
+    q[:, ids], k[:, ids], v[:, ids], gate[:, ids], beta[:, ids], tiling=tiling, group=group
+)
+```
+
+Every rank calls the forward and its backward the same number of times, including ranks that own
+no tiles. Autotuning is disabled in this mode. The tile size is the performance knob: maps are
+`H x 256 x 128` FP32 (128 KiB per tile per head), so the scan's bandwidth grows with the tile
+count; 1024-token tiles cost about 2-3x the standard recipe on GB200 at 32k tokens, 64-token
+tiles far more (`benchmarks/kda_cp_deterministic.py`). Works with the fused and the Mega
+forward; the backward is the staged one of the chosen backend.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
 ::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.kda.context_parallel.context_parallel_kda_deterministic
+
+::: attn_gym.linear.context_parallel_deterministic.CanonicalTiling
 
 ::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
 

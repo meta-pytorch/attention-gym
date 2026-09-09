@@ -83,6 +83,21 @@ class Op(NamedTuple):
             return self.backward(
                 inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
             )
+        return self.public_gradients(
+            inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
+        )
+
+    def public_gradients(
+        self,
+        inputs: Inputs,
+        initial_state: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        d_output: torch.Tensor | None,
+        d_final_state: torch.Tensor | None,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Gradients by autograd through the public ``chunk`` op, whatever backward it selects."""
         leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
         if initial_state is not None:
             leaves += (initial_state.detach().clone().requires_grad_(),)
@@ -434,6 +449,16 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state,
         torch.testing.assert_close(
             got, want, atol=0, rtol=0, msg=lambda m, name=name: f"{name}: {m}"
         )
+    if op.backward is not None:
+        # The native kernel is not the public op's backward; it must still agree with it to
+        # within the two kernels' BF16 rounding (both are FP32-accumulated over the same graph).
+        public = op.public_gradients(
+            inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
+        )
+        for name, got, want in zip(names, actual, public, strict=True):
+            assert_relative_rms_within(
+                got.float(), want.float(), f"{name} vs public op", max_eps=4.0
+            )
 
 
 @requires_kda_target

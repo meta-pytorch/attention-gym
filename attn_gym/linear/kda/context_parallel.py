@@ -18,6 +18,10 @@ from attn_gym.linear.context_parallel import (
     StagedOp,
     context_parallel_chunk,
 )
+from attn_gym.linear.context_parallel_deterministic import (
+    CanonicalTiling,
+    context_parallel_chunk_deterministic,
+)
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
@@ -42,10 +46,40 @@ def context_parallel_kda(
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale``, ``autotune``, and ``kernel_options`` follow ``chunk_kda``. With
     ``kernel_options={"backend": "mega"}`` the local pass runs on Mega and the fused factors are
-    computed once over the span for the summaries; ``fastmath`` applies to the staged backward,
-    which is the fused one for either backend.
+    computed once over the span for the summaries; its backward is Mega's native stateful kernel,
+    so ``fastmath`` applies only to the fused backend's backward.
     """
-    stages = StagedOp(
+    stages = _kda_stages(scale, autotune, fastmath, kernel_options)
+    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
+
+
+def context_parallel_kda_deterministic(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    tiling: CanonicalTiling,
+    group: dist.ProcessGroup,
+    scale: float | None = None,
+    fastmath: bool = False,
+    kernel_options: KernelOptions | None = None,
+) -> torch.Tensor:
+    """Run KDA over this rank's canonical tiles; results do not depend on the CP degree.
+
+    See NOTE [Canonical Tiles] in ``attn_gym.linear.context_parallel_deterministic``. Autotuning
+    is disabled because a tuned configuration is part of the arithmetic and would have to be
+    identical on every rank; ``fastmath`` and ``kernel_options`` follow ``chunk_kda``.
+    """
+    stages = _kda_stages(scale, False, fastmath, kernel_options)
+    return context_parallel_chunk_deterministic(
+        stages, q, k, v, gate, beta, tiling=tiling, group=group
+    )
+
+
+def _kda_stages(scale, autotune, fastmath, kernel_options) -> StagedOp:
+    return StagedOp(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
         partial(
             chunk_kda_prepare_backward,
@@ -54,7 +88,6 @@ def context_parallel_kda(
             schedule=resolve_kernel_options(kernel_options).schedule,
         ),
     )
-    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
-__all__ = ["context_parallel_kda"]
+__all__ = ["context_parallel_kda", "context_parallel_kda_deterministic"]
