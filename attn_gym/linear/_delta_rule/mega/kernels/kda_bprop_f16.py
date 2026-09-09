@@ -607,25 +607,25 @@ def epilogue_warp(
                 if pend_writes:
                     desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
                     dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDq_tma[dq_index.idx], dq_slice, acquire=False)
+                    tma_store_tile(sDq_tma[dq_index.idx], dq_slice)
                     tma_store_commit()
                 bars.mb_dk_tmastg_ready[dk_index.idx].wait(dk_index.phase)
                 if pend_writes:
                     desc_dk_slot = (desc_dk_base + slot).tospace(cutlass.AddressSpace.generic)
                     dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDk_tma[dk_index.idx], dk_slice, acquire=False)
+                    tma_store_tile(sDk_tma[dk_index.idx], dk_slice)
                     tma_store_commit()
                 bars.mb_dgate_tmastg_ready[dgate_index.idx].wait(dgate_index.phase)
                 if pend_writes:
                     desc_dgate_slot = (desc_dgate_base + slot).tospace(cutlass.AddressSpace.generic)
                     dgate_slice = tma_slice_runtime_desc(desc_dgate_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice, acquire=False)
+                    tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice)
                     tma_store_commit()
                 bars.mb_dv_tmastg_ready[dv_index.idx].wait(dv_index.phase)
                 if pend_writes:
                     desc_dv_slot = (desc_dv_base + slot).tospace(cutlass.AddressSpace.generic)
                     dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDv_tma[dv_index.idx], dv_slice, acquire=False)
+                    tma_store_tile(sDv_tma[dv_index.idx], dv_slice)
                     tma_store_commit()
                 tma_store_wait(3)
                 bars.mb_dq_tmastg_done[dq_index.idx].arrive()
@@ -648,25 +648,25 @@ def epilogue_warp(
             if pend_writes:
                 desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
                 dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_o, pend_start)
-                tma_store_tile(sDq_tma[dq_index.idx], dq_slice, acquire=False)
+                tma_store_tile(sDq_tma[dq_index.idx], dq_slice)
                 tma_store_commit()
             bars.mb_dk_tmastg_ready[dk_index.idx].wait(dk_index.phase)
             if pend_writes:
                 desc_dk_slot = (desc_dk_base + slot).tospace(cutlass.AddressSpace.generic)
                 dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, pend_start)
-                tma_store_tile(sDk_tma[dk_index.idx], dk_slice, acquire=False)
+                tma_store_tile(sDk_tma[dk_index.idx], dk_slice)
                 tma_store_commit()
             bars.mb_dgate_tmastg_ready[dgate_index.idx].wait(dgate_index.phase)
             if pend_writes:
                 desc_dgate_slot = (desc_dgate_base + slot).tospace(cutlass.AddressSpace.generic)
                 dgate_slice = tma_slice_runtime_desc(desc_dgate_slot, cutlass.Int32(0), head_o, pend_start)
-                tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice, acquire=False)
+                tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice)
                 tma_store_commit()
             bars.mb_dv_tmastg_ready[dv_index.idx].wait(dv_index.phase)
             if pend_writes:
                 desc_dv_slot = (desc_dv_base + slot).tospace(cutlass.AddressSpace.generic)
                 dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, pend_start)
-                tma_store_tile(sDv_tma[dv_index.idx], dv_slice, acquire=False)
+                tma_store_tile(sDv_tma[dv_index.idx], dv_slice)
                 tma_store_commit()
             tma_store_wait(3)
             bars.mb_dq_tmastg_done[dq_index.idx].arrive()
@@ -1718,7 +1718,7 @@ def tmaldg_warp(
             q_slice = tma_slice_runtime_desc(
                 desc_q_slot, cutlass.Int32(0), head_q, input_chunk_start
             )
-            tma_load_tile(sQ_tma[raw_index.idx], q_slice, bars.mb_q_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sQ_tma[raw_index.idx], q_slice, bars.mb_q_ready[raw_index.idx].smem_ptr)
 
             # ---- K load ----------------------------------------------------------
             bars.mb_k_done[raw_index.idx].wait(raw_index.phase)
@@ -1727,7 +1727,7 @@ def tmaldg_warp(
             k_slice = tma_slice_runtime_desc(
                 desc_k_slot, cutlass.Int32(0), head_k, input_chunk_start
             )
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, bars.mb_k_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, bars.mb_k_ready[raw_index.idx].smem_ptr)
 
             # ---- Gate load -------------------------------------------------------
             bars.mb_gate_done[raw_index.idx].wait(raw_index.phase)
@@ -1736,7 +1736,7 @@ def tmaldg_warp(
             gate_slice = tma_slice_runtime_desc(
                 desc_gate_slot, cutlass.Int32(0), head_o, input_chunk_start
             )
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr)
 
             # ---- dO load ---------------------------------------------------------
             bars.mb_do_done[raw_index.idx].wait(raw_index.phase)
@@ -1745,7 +1745,7 @@ def tmaldg_warp(
             do_slice = tma_slice_runtime_desc(
                 desc_do_slot, cutlass.Int32(0), head_o, input_chunk_start
             )
-            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr)
 
             # ---- V load ----------------------------------------------------------
             bars.mb_v_done[raw_index.idx].wait(raw_index.phase)
@@ -1754,7 +1754,7 @@ def tmaldg_warp(
             v_slice = tma_slice_runtime_desc(
                 desc_v_slot, cutlass.Int32(0), head_v, input_chunk_start
             )
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr)
 
             # ---- entering state ----
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -1765,7 +1765,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
                 state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
-                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
+                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx = next_tile
 
