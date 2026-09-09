@@ -9,25 +9,25 @@
 # This operator is memory-bound at chunk_size=64 (~11 FLOP/byte vs the ~350
 # FLOP/byte B200 balance point), so tensor-core operand ceremony is pure
 # overhead: `tl.dot` consumes register operands directly and converts the FP32
-# gates in flight, avoiding the staging -> convert -> swizzled-SMEM round trip
-# the tcgen05/UMMA kernel pays (~40% of its runtime at BT=64).
+# gates in flight. A tcgen05/UMMA version (removed in favour of this kernel)
+# spent ~40% of its runtime on the staging -> convert -> swizzled-SMEM round
+# trip at BT=64; its register accumulators are what make it necessary again if
+# chunk_size ever grows past 64 (measured ~70x cliff at BT=256, PR #311).
 #
-# Computes per chunk (matching the CuTe kernel's contract, including its
-# inclusive-tril masking of A and its grouped-value-head mapping
-# ``key_head = value_head // (H_V // H_K)`` for k/gk):
+# Computes per chunk, reading only the inclusive lower triangle of A and
+# mapping grouped value heads onto ``key_head = value_head // (H_V // H_K)``
+# for k/gk:
 #   w  = A @ (k * beta * exp2(gk))
 #   u  = A @ (v * beta)
 #   qg = q * exp2(gk)              (only when q and gk are provided)
 #   kg = k * exp2(gk_last - gk)    (only when gk is provided)
 #
-# dot_precision selects the tensor-core operand precision, mirroring the CuTe
-# kernel's knob: "bf16" rounds the fp32 operand products to bf16 before the
-# dot; "tf32"/"tf32x3" keep them in fp32 registers and pass
-# ``input_precision`` through to `tl.dot` (only meaningful for fp32 operands).
-# W stays single-pass tf32 in tf32x3 mode, and tf32x3 requires fp32 A, both
-# matching the CuTe contract. Note fp32->tf32 operand conversion truncates
-# rather than rounds inside the MMA, a <=1-ulp-of-tf32 difference from the
-# CuTe kernel's rounded conversion; both sit inside the mode's accuracy class.
+# dot_precision selects the tensor-core operand precision: "bf16" rounds the
+# fp32 operand products to bf16 before the dot; "tf32"/"tf32x3" keep them in
+# fp32 registers and pass ``input_precision`` through to `tl.dot` (only
+# meaningful for fp32 operands). W stays single-pass tf32 in tf32x3 mode, and
+# tf32x3 requires fp32 A. fp32->tf32 operand conversion truncates rather than
+# rounds inside the MMA, within the mode's accuracy class.
 
 from __future__ import annotations
 
@@ -163,7 +163,7 @@ def _recompute_w_u_task(
 
     o_A = tl.arange(0, BT)
     valid = T_local - i_t * BT
-    # Inclusive tril + row/col validity, matching the CuTe kernel's A masking.
+    # Inclusive tril + row/col validity: only the active lower triangle of A is read.
     m_A = m_t[:, None] & (o_A[None, :] <= o_A[:, None]) & (o_A[None, :] < valid)
     b_A_raw = tl.load(
         A + ptr_offset((token[:, None], i_hv, o_A[None, :]), (HV * BT, BT, 1)),
@@ -236,7 +236,7 @@ def _recompute_w_u_task(
                 b_kg.to(kg.dtype.element_ty),
                 mask=m_tk,
             )
-        # W stays single-pass tf32 even in tf32x3 mode, matching the CuTe contract.
+        # W stays single-pass tf32 even in tf32x3 mode; only U gets the 3-pass split.
         if PRECISION == 0:
             b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
         else:
