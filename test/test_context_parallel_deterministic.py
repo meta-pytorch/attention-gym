@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import socket
+import time
 from itertools import accumulate, pairwise
 from unittest.mock import patch
 
@@ -70,6 +71,12 @@ def test_fragments_must_fall_on_tile_boundaries():
         CanonicalTiling.from_fragments(cu, [[(17, 0)], [(17, 981)]], 0, tile_size=64)
     with pytest.raises(ValueError, match="outside"):
         CanonicalTiling.from_fragments(cu, [[(0, 981)], []], 2, tile_size=64)
+    tiling = CanonicalTiling.from_fragments(cu, [[(0, 981)]], 0, tile_size=64, scan_block=2)
+    # The 17-token document fits one tile and is not summarized; blocks never span documents.
+    single = {i for i, t in enumerate(tiling.tiles) if t.document == 0}
+    assert set(tiling.summarized) == set(range(len(tiling.tiles))) - single
+    assert all(len({tiling.tiles[i].document for i in block}) == 1 for block in tiling.blocks)
+    assert [i for block in tiling.blocks for i in block] == list(tiling.summarized)
     # Document 4 (tokens 468..981) has tiles at 468, 532, ...; a 2-tile block boundary is 596.
     CanonicalTiling.from_fragments(cu, [[(0, 596)], [(596, 981)]], 0, tile_size=64, scan_block=2)
     with pytest.raises(ValueError, match="one scan block"):
@@ -178,9 +185,15 @@ def test_entries_of_a_document_are_independent_of_its_neighbours(scan_block):
         leaves = torch.cat((others[:before], document, others[before:]))
         documents = [0] * before + [1] * 5 + [2] * after
         tiling = _single_rank_tiling(documents, scan_block)
+        summarized = torch.tensor(tiling.summarized, device="cuda")
         for reverse in (False, True):
             entries = canonical_entries(
-                leaves, tiling, tiling.routing("cuda"), leaves[:1], None, reverse=reverse
+                leaves[summarized],
+                tiling,
+                tiling.routing("cuda"),
+                leaves[:1],
+                None,
+                reverse=reverse,
             )
             entries = entries[before : before + 5]
             reference.setdefault(reverse, entries)
@@ -263,10 +276,12 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kerne
     prepared = [
         stages.prepare(*(v[:, t.start : t.stop] for v in inputs), cu_seqlens=None) for t in tiles
     ]
+    # Single-tile documents are not summarized (NOTE [Single-Tile Documents]).
+    summarized = tiling.summarized
     maps = torch.cat(
         [
-            p.state_summaries(bounds(t), deterministic_work=True)
-            for p, t in zip(prepared, tiles, strict=True)
+            prepared[i].state_summaries(bounds(tiles[i]), deterministic_work=True)
+            for i in summarized
         ]
     )
     routing = tiling.routing(device)
@@ -281,8 +296,8 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kerne
         )
     rmaps = torch.cat(
         [
-            b.state_grad_summaries(bounds(t), deterministic_work=True)
-            for b, t in zip(backwards, tiles, strict=True)
+            backwards[i].state_grad_summaries(bounds(tiles[i]), deterministic_work=True)
+            for i in summarized
         ]
     )
     exits = canonical_entries(rmaps, tiling, routing, maps[:1], None, reverse=True)
@@ -316,16 +331,23 @@ def _rank_main(cp_rank, world, port, lengths, tile_size, scan_block, ownership, 
         cu = (0, *accumulate(lengths))
         expected = _canonical_cp1(inputs, grad, lengths, tile_size, scan_block, kernel_options)
         if ownership == "cyclic":
-            # Alternate whole blocks between the ranks (tiles when scan_block == 1).
-            blocks = CanonicalTiling.from_fragments(
+            # Alternate whole blocks between the ranks (tiles when scan_block == 1); tiles of
+            # single-tile documents form no block and alternate on their own.
+            tiling = CanonicalTiling.from_fragments(
                 cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
-            ).blocks
-            tiles = tile_stream(cu, tile_size)
+            )
+            units = sorted(
+                [
+                    *tiling.blocks,
+                    *((i,) for i in range(len(tiling.tiles)) if i not in tiling.summarized),
+                ]
+            )
+            tiles = tiling.tiles
             fragments = [
                 [
-                    (tiles[block[0]].start, tiles[block[-1]].stop)
-                    for b, block in enumerate(blocks)
-                    if b % 2 == r
+                    (tiles[unit[0]].start, tiles[unit[-1]].stop)
+                    for u, unit in enumerate(units)
+                    if u % 2 == r
                 ]
                 for r in range(2)
             ]
@@ -378,12 +400,23 @@ def test_two_ranks_match_canonical_cp1_bitwise(
         pytest.importorskip("cutlass.experimental")
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Mega needs SM100/103")
-    mp.spawn(
+    # A rank that raises leaves its peer blocked in a collective; poll the context so the
+    # failure surfaces instead of the case hanging until the outer timeout.
+    context = mp.spawn(
         _rank_main,
         args=(2, _free_port(), lengths, tile_size, scan_block, ownership, gate, backend),
         nprocs=2,
-        join=True,
+        join=False,
     )
+    deadline = time.monotonic() + 300
+    try:
+        # join(timeout) returns after each process exits (raising if it failed); loop until all did.
+        while not context.join(timeout=max(0.0, deadline - time.monotonic())):
+            assert time.monotonic() < deadline, "two-rank case did not finish within 300 s"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
 
 
 # ---------------------------------------------------------------- accuracy vs FP64

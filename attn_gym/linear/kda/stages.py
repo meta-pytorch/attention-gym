@@ -226,27 +226,20 @@ class ChunkKDAMegaPrepared:
     ) -> torch.Tensor:
         """Return FP32 ``[B; A]`` maps, using native probes for canonical whole sequences.
 
-        With ``deterministic_work=True``, bounds must be exactly the consecutive pairs of
-        ``saved.cu_seqlens``, in order. Values are a caller contract (no device-to-host sync).
-        ``whole_sequences=True`` accepts any selection/reordering of those pairs, plus empty
-        rows. Native BT16 rounding defines new standard and canonical Mega-CP baselines,
-        not unsharded Mega bit parity. Otherwise arbitrary chunk-aligned bounds use the fused
-        summary contract described by ``ChunkKDAPrepared.state_summaries``.
+        With ``deterministic_work=True`` or ``whole_sequences=True``, bounds must be whole
+        ``saved.cu_seqlens`` pairs in any selection or order, plus empty rows; the values are a
+        caller contract (no device-to-host sync). Native BT16 rounding defines new standard and
+        canonical Mega-CP baselines, not unsharded Mega bit parity. Otherwise arbitrary
+        chunk-aligned bounds use the fused summary contract described by
+        ``ChunkKDAPrepared.state_summaries``.
         """
         saved = self.saved
         if deterministic_work or whole_sequences:
             # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
             from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_summaries
 
-            if deterministic_work and bounds.shape != (saved.cu_seqlens.shape[0] - 1, 2):
-                raise ValueError("native Mega summaries require one bound per whole subsequence")
             return build_mega_state_summaries(
-                saved.k,
-                saved.v,
-                saved.gate,
-                saved.beta,
-                saved.cu_seqlens,
-                bounds=None if deterministic_work else bounds,
+                saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
             )
         factors = _prepare_chunk_kda_fwd(
             saved.q,
@@ -456,8 +449,8 @@ class ChunkKDAMegaBackward:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         Same range contract as ``ChunkKDABackward.state_grad_summaries``. With
-        ``deterministic_work=True``, bounds must equal the consecutive cu_seqlens pairs
-        in order, and native C plus forward A.T replace the fused numerical baseline.
+        ``deterministic_work=True``, bounds must be whole cu_seqlens pairs (any selection or
+        order), and native C plus forward A.T replace the fused numerical baseline.
         """
         saved = self.saved
         if deterministic_work:
@@ -465,8 +458,6 @@ class ChunkKDAMegaBackward:
                 build_mega_state_grad_summaries,
             )
 
-            if bounds.shape != (saved.cu_seqlens.shape[0] - 1, 2):
-                raise ValueError("native Mega summaries require one bound per whole subsequence")
             return build_mega_state_grad_summaries(
                 saved.q,
                 saved.k,
@@ -477,6 +468,7 @@ class ChunkKDAMegaBackward:
                 saved.cu_seqlens,
                 self.scale,
                 transpose_forward_transition=True,
+                bounds=bounds,
             )
         prepared = _prepare_chunk_kda_bwd(
             saved.q,

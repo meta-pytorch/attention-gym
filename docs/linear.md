@@ -605,39 +605,27 @@ between complete forward/backward steps, not while backward still needs the prev
 
 ### Mega local execution
 
-`kernel_options={"backend": "mega"}` makes `chunk_kda_prepare` and `context_parallel_kda` run each
-local pass with Mega from the composed entry state. Because Mega keeps WY factors on chip,
-`state_summaries` computes the fused factors once over the whole local stream and summarizes
-every range from them; that factor pass is paid even when every fragment ends its document and
-the summaries are identities, since which ranges are empty is a device value under replay. A
-layout that never continues a document across ranks does not need this recipe. The backward
-handle's `run` is Mega's own stateful backward (`attn_gym::kda_chunk_mega_packed_bwd_with_state`:
-checkpoint recompute from the saved entry state, then the BT16 backward folding in the exit
-cotangent). Given Mega's own entry state and exit cotangent, two fragments of a document cut on a
-16-token boundary reproduce the unsharded Mega gradients bit for bit; under this recipe the entry
-states are composed from the fused summaries, whose FP32 rounding differs from Mega's, so the
-sharded result is close to but not bitwise the unsharded one. `state_grad_summaries` still
-recomputes the fused factors over the local stream. The staged handles and this recipe are
-eager-only; `torch.compile` is not supported through them.
+`kernel_options={"backend": "mega"}` selects Mega's local forward and native stateful backward.
+Standard CP forward summaries use native BT16 probes for whole subsequences; arbitrary-range
+forward summaries and standard CP reverse summaries still recompute fused BT64 factors. Native
+summaries define a new Mega-CP numerical baseline, not bitwise parity with fused summaries or
+unsharded Mega. Two 16-token-aligned fragments exchanging Mega's *own* state and cotangent do
+reproduce one native backward bitwise, but composed summaries have different FP32 rounding.
+The staged handles and CP recipes are eager-only; `torch.compile` is not supported.
 
 ### Deterministic mode: results independent of the CP degree
 
-`attn_gym.linear.kda.context_parallel_kda_deterministic` fixes the whole arithmetic graph before
-ranks are assigned, so output and every input gradient are **bitwise identical for any CP degree
-and any ownership of whole tiles**, including CP=1. It is a different numerical contract from the
-unsharded `chunk_kda` call (the same recurrence, composed through fixed FP32 affine maps; the
-error against an FP64 reference stays within the BF16 budget the tests use), and from the
-standard recipe above, whose summaries depend on the fragment table.
+`context_parallel_kda_deterministic` gives **bitwise-identical output and all input gradients
+across CP degrees**, including CP=1, for fixed backend/settings, `tile_size`, and `scan_block`.
+Whole-tile ownership and neighboring packed documents do not change a document's result. This is
+a distinct numerical baseline from standard CP and unsharded `chunk_kda`; FP64 reference tests
+bound its error with the repository's BF16 budget.
 
-- **Tiles.** Every document is cut from its first token into `tile_size` tiles (a multiple of
-  64; the last tile of a document may be short). `CanonicalTiling.from_fragments(cu_seqlens,
-  fragments, rank, tile_size=...)` assigns whole tiles to ranks and rejects a fragment boundary
-  that does not fall on a tile boundary. Ranks may own different numbers of tiles or none.
-- **Leaves.** A rank prepares its tiles in one staged call, each tile a packed subsequence, and
-  builds one `[bias; transition]` map per tile with `deterministic_work=True`, which pins the
-  summary kernels' work partition so it cannot depend on how many tiles the rank owns.
-- **Scan.** All maps are all-gathered and composed per document with a work-efficient scan
-  whose tree depends only on the tile count; the backward mirrors it over the reverse maps.
+Each document is tiled from its first token with `tile_size` a positive multiple of 64; its last
+tile may be short. Fragment boundaries must coincide with tile boundaries. Each rank prepares
+its tiles as packed subsequences, using `deterministic_work=True` to pin summary arithmetic.
+The all-gathered maps are folded in document order with three-pass TF32; backward mirrors the
+fold over reverse maps. Single-tile documents need no summaries, exchange payload, or scan.
 
 ```python
 from attn_gym.linear.context_parallel_deterministic import CanonicalTiling
@@ -645,17 +633,43 @@ from attn_gym.linear.kda import context_parallel_kda_deterministic
 
 tiling = CanonicalTiling.from_fragments(cu_seqlens_global, fragments, rank, tile_size=1024)
 ids = tiling.global_token_ids(device)  # this rank's tiles, in span order
+routing = tiling.routing(device)  # index tensors; reuse while the layout is fixed
 output = context_parallel_kda_deterministic(
-    q[:, ids], k[:, ids], v[:, ids], gate[:, ids], beta[:, ids], tiling=tiling, group=group
+    q[:, ids],
+    k[:, ids],
+    v[:, ids],
+    gate[:, ids],
+    beta[:, ids],
+    tiling=tiling,
+    routing=routing,
+    group=group,
 )
 ```
 
-Every rank calls the forward and its backward the same number of times, including ranks that own
-no tiles. Autotuning is disabled in this mode. The tile size is the performance knob: maps are
-`H x 256 x 128` FP32 (128 KiB per tile per head), so the scan's bandwidth grows with the tile
-count; 1024-token tiles cost about 2-3x the standard recipe on GB200 at 32k tokens, 64-token
-tiles far more (`benchmarks/kda_cp_deterministic.py`). Works with the fused and the Mega
-forward; the backward is the staged one of the chosen backend.
+Every rank must call forward and backward equally often, including empty ranks. The API returns
+only local output, not final states. Autotuning is disabled. Fused and Mega use their own staged
+backwards; Mega's canonical reverse maps use native zero-exit cotangents plus the transposed
+forward transition, not fused-map or native backward-probe rounding. Mega's `split_forward` and
+`split_backward` are rejected: approximate horizon cuts would change the FP32 summary leaves.
+
+**Cost and fragment plans.** With `K = V = 128`, every summarized tile contributes an
+`H x 256 x 128` FP32 map (128 KiB per head). Every rank holds the gathered maps, including
+collective padding, plus entry states for its own tiles. Larger tiles reduce map overhead but
+can reduce leaf parallelism. Balance both tokens and tiles of multi-tile documents across ranks;
+cutting long documents on tile boundaries adds no summaries. Contiguous rank-order ownership
+with equal exchanged block counts avoids the gathered-map placement copy.
+
+Recorded runs on two GB200s at 32k tokens / 64 heads / five documents measured tile 1024 at
+1.22x / 0.85x standard CP forward/backward time for Mega, and 1.52x / 1.20x for fused (lower is
+better). With many short documents, tile 2048 can beat standard CP in both directions. These
+are eager KDA-operation timings, not end-to-end model measurements. Reproduce for your packing with
+`benchmarks/kda_cp_deterministic.py` or `benchmarks/kda_cp_fragment_study.py`.
+
+**`scan_block`** groups consecutive document-relative tiles, exchanging one map per block;
+ranks must own whole blocks. Keep the default `1` on two NVLink GPUs: extra folds offset the
+exchange savings there. Benefits at larger CP degrees or slower interconnects remain unmeasured.
+Changing either `scan_block` or `tile_size` changes the numerical contract; keep both fixed when
+comparing CP degrees.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 

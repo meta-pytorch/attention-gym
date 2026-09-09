@@ -24,6 +24,13 @@ the whole arithmetic graph before ranks are assigned:
     entry     ``merge_state(0, prefix[i - 1])`` for tile ``i``; the first tile of a document enters
               with zero. Exits are the reverse analogue.
 
+NOTE [Single-Tile Documents]
+A document that fits in one tile has no state to carry: its tile enters with the zero state and
+nothing reads its map. Such tiles are excluded from the summaries, the exchange, and the scan
+(``CanonicalTiling.summarized``). The exclusion is a function of the tiling only, so the
+contract is unchanged, and on packings with many short documents it removes most of the
+recipe's overhead (``agent_space/friendly_fragments/REPORT.md``).
+
 NOTE [Scan Blocks]
 Exchanging every tile's map costs 128 KiB per tile per head per rank. Consecutive tiles of a
 document are therefore grouped into blocks of ``scan_block`` tiles (document-relative, the last
@@ -50,6 +57,7 @@ preparing every tile alone (``test/test_canonical_tile_batching.py``).
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
@@ -154,18 +162,25 @@ class CanonicalTiling:
         return tiling
 
     @property
+    def summarized(self) -> tuple[int, ...]:
+        """Tile ids whose maps take part in the scan: those of multi-tile documents."""
+        counts = Counter(tile.document for tile in self.tiles)
+        return tuple(i for i, tile in enumerate(self.tiles) if counts[tile.document] > 1)
+
+    @property
     def blocks(self) -> tuple[tuple[int, ...], ...]:
         """Tile ids of every scan block, in tile order (NOTE [Scan Blocks])."""
         blocks: list[tuple[int, ...]] = []
-        start = 0
-        for index in range(1, len(self.tiles) + 1):
-            if (
-                index == len(self.tiles)
-                or self.tiles[index].document != self.tiles[start].document
+        run: list[int] = []
+        for index in (*self.summarized, None):
+            if run and (
+                index is None or self.tiles[index].document != self.tiles[run[0]].document
             ):
-                for begin in range(start, index, self.scan_block):
-                    blocks.append(tuple(range(begin, min(begin + self.scan_block, index))))
-                start = index
+                for begin in range(0, len(run), self.scan_block):
+                    blocks.append(tuple(run[begin : begin + self.scan_block]))
+                run = []
+            if index is not None:
+                run.append(index)
         return tuple(blocks)
 
     @property
@@ -199,22 +214,55 @@ class CanonicalTiling:
         """Materialize the index tensors the recipe reads, once per layout and device."""
         offsets = self.span_offsets()
         blocks = self.blocks
+        my_blocks = self.my_blocks
+        summarized = set(self.summarized)
+        positions = [p for p, index in enumerate(self.mine) if index in summarized]
+        first_tile = {block[0]: b for b, block in enumerate(blocks)}
+        per_rank = [[first_tile[i] for i in ids if i in first_tile] for ids in self.owned]
+        order = [b for ranks_blocks in per_rank for b in ranks_blocks]
+        width = self.slots
+        if order == list(range(len(blocks))) and len(order) == width * len(self.owned):
+            gather_place = None
+        else:
+            rows = [
+                rank * width + row
+                for rank, ranks_blocks in enumerate(per_rank)
+                for row in range(len(ranks_blocks))
+            ]
+            gather_place = (
+                torch.tensor(order, dtype=torch.int64, device=device),
+                torch.tensor(rows, dtype=torch.int64, device=device),
+            )
+        bounds = list(pairwise(offsets))
         return CanonicalRouting(
             cu_seqlens=torch.tensor(offsets, dtype=torch.int32, device=device),
-            bounds=torch.tensor(list(pairwise(offsets)), dtype=torch.int32, device=device),
-            mine=_selection(self.mine, device),
-            tile_document_offsets=_document_offsets(
-                [tile.document for tile in self.tiles], device
+            bounds=torch.tensor(bounds, dtype=torch.int32, device=device),
+            summary_bounds=torch.tensor(
+                [bounds[p] for p in positions], dtype=torch.int32, device=device
+            ).reshape(-1, 2),
+            summarized_positions=(
+                None
+                if len(positions) == len(self.mine)
+                else torch.tensor(positions, dtype=torch.int64, device=device)
             ),
             block_document_offsets=_document_offsets(
                 [self.tiles[block[0]].document for block in blocks], device
             ),
             my_block_offsets=torch.tensor(
-                [0, *accumulate(len(blocks[b]) for b in self.my_blocks)],
+                [0, *accumulate(len(blocks[b]) for b in my_blocks)],
                 dtype=torch.int32,
                 device=device,
             ),
-            my_blocks=_selection(self.my_blocks, device),
+            my_blocks=_selection(my_blocks, device),
+            my_block_tiles=_selection(
+                [
+                    sum(len(blocks[b]) for b in range(block)) + offset
+                    for block in my_blocks
+                    for offset in range(len(blocks[block]))
+                ],
+                device,
+            ),
+            gather_place=gather_place,
         )
 
 
@@ -230,18 +278,22 @@ class CanonicalRouting(NamedTuple):
     """Device tensors of a :class:`CanonicalTiling` for one rank, built once per layout.
 
     ``cu_seqlens``/``bounds`` describe the rank's span with one segment per owned tile;
-    ``mine`` (and ``my_blocks``) select the rank's tiles (blocks) in a tile-order (block-order)
-    buffer, as a slice when they are consecutive so no gather copy is made; the document
-    offsets give the per-document scans their restart points.
+    ``summary_bounds`` are the rows of ``bounds`` whose tiles take part in the scan and
+    ``summarized_positions`` their positions among the owned tiles (``None`` when all do).
+    ``my_blocks`` / ``my_block_tiles`` select this rank's blocks / block tiles in the block-order
+    exchange buffer, as a slice when consecutive so no gather copy is made; ``gather_place``
+    reorders the all-gather packets into block order (``None`` when they already are).
     """
 
     cu_seqlens: torch.Tensor
     bounds: torch.Tensor
-    mine: torch.Tensor | slice
-    tile_document_offsets: torch.Tensor
+    summary_bounds: torch.Tensor
+    summarized_positions: torch.Tensor | None
     block_document_offsets: torch.Tensor
     my_block_offsets: torch.Tensor
     my_blocks: torch.Tensor | slice
+    my_block_tiles: torch.Tensor | slice
+    gather_place: tuple[torch.Tensor, torch.Tensor] | None
 
 
 def _selection(ids: Sequence[int], device: torch.device | str) -> torch.Tensor | slice:
@@ -265,6 +317,7 @@ def tile_stream(cu_seqlens_global: Sequence[int], tile_size: int) -> list[Tile]:
 def all_gather_block_maps(
     local: torch.Tensor | None,
     tiling: CanonicalTiling,
+    routing: CanonicalRouting,
     like: torch.Tensor,
     group: dist.ProcessGroup | None,
 ) -> torch.Tensor:
@@ -291,25 +344,16 @@ def all_gather_block_maps(
     gathered = like.new_empty((world * width, *like.shape[1:]))
     with profiler_range("cp/all_gather_blocks"):
         dist.all_gather_into_tensor(gathered, packet, group=group)
-    per_rank = [
-        [b for b, block in enumerate(tiling.blocks) if block[0] in set(ids)]
-        for ids in tiling.owned
-    ]
-    order = [b for blocks in per_rank for b in blocks]
-    if order == list(range(len(order))) and len(order) == world * width:
+    if routing.gather_place is None:
         return gathered
-    rows = [
-        rank * width + row for rank, blocks in enumerate(per_rank) for row in range(len(blocks))
-    ]
+    order, rows = routing.gather_place
     placed = torch.empty_like(gathered[: len(tiling.blocks)])
-    placed[torch.tensor(order, device=like.device)] = gathered[
-        torch.tensor(rows, device=like.device)
-    ]
+    placed[order] = gathered[rows]
     return placed
 
 
 def canonical_entries(
-    tile_maps: torch.Tensor | None,
+    summary_maps: torch.Tensor | None,
     tiling: CanonicalTiling,
     routing: CanonicalRouting,
     like: torch.Tensor,
@@ -319,34 +363,47 @@ def canonical_entries(
 ) -> torch.Tensor | None:
     """Entry (or exit when ``reverse``) FP32 states of this rank's tiles, in ``tiling.mine`` order.
 
-    With ``scan_block == 1`` every tile map is gathered and scanned per document. Otherwise the
-    fixed three-level tree of NOTE [Scan Blocks]: fold each owned block's tile maps into one block
-    map; all-gather block maps; scan them per document for the block entry states; fold each
-    owned block's tiles again from its entry state for the tile states. Every fold is the
-    left-to-right (right-to-left when ``reverse``) serial fold in three-pass TF32, so the result
-    is a function of the tiles' maps and indices only.
+    ``summary_maps`` are the maps of the rank's summarized tiles (NOTE [Single-Tile Documents])
+    in span order, or ``None`` for an empty rank (which still joins the collective). Tiles of
+    single-tile documents get the zero state.
+
+    With ``scan_block == 1`` every summarized tile map is gathered and scanned per document.
+    Otherwise the fixed three-level tree of NOTE [Scan Blocks]: fold each owned block's tile maps
+    into one block map; all-gather block maps; scan them per document for the block entry states;
+    fold each owned block's tiles again from its entry state for the tile states. Every fold is
+    the left-to-right (right-to-left when ``reverse``) serial fold in three-pass TF32, so the
+    result is a function of the tiles' maps and indices only.
     """
+    if summary_maps is None or summary_maps.shape[0] == 0:
+        # An empty rank, or one owning only single-tile documents, still joins the collective.
+        all_gather_block_maps(None, tiling, routing, like, group)
+        if summary_maps is None:
+            return None
+        return like.new_zeros(
+            (len(tiling.mine), like.shape[1], like.shape[2] - like.shape[3], like.shape[3])
+        )
     if tiling.scan_block == 1:
-        gathered = all_gather_block_maps(tile_maps, tiling, like, group)
-        entries = canonical_scan_entries(gathered, routing.tile_document_offsets, reverse=reverse)
-        return entries[routing.mine] if tile_maps is not None else None
-    block_maps = (
-        fold_ranges(tile_maps, routing.my_block_offsets, reverse=reverse)
-        if tile_maps is not None
-        else None
-    )
-    gathered = all_gather_block_maps(block_maps, tiling, like, group)
-    block_entries = canonical_scan_entries(
-        gathered, routing.block_document_offsets, reverse=reverse
-    )
-    if tile_maps is None:
-        return None
-    return canonical_scan_entries(
-        tile_maps,
-        routing.my_block_offsets,
-        reverse=reverse,
-        initial=block_entries[routing.my_blocks],
-    )
+        gathered = all_gather_block_maps(summary_maps, tiling, routing, like, group)
+        entries = canonical_scan_entries(
+            gathered, routing.block_document_offsets, reverse=reverse
+        )[routing.my_block_tiles]
+    else:
+        block_maps = fold_ranges(summary_maps, routing.my_block_offsets, reverse=reverse)
+        gathered = all_gather_block_maps(block_maps, tiling, routing, like, group)
+        block_entries = canonical_scan_entries(
+            gathered, routing.block_document_offsets, reverse=reverse
+        )
+        entries = canonical_scan_entries(
+            summary_maps,
+            routing.my_block_offsets,
+            reverse=reverse,
+            initial=block_entries[routing.my_blocks],
+        )
+    if routing.summarized_positions is None:
+        return entries
+    full = entries.new_zeros((len(tiling.mine), *entries.shape[1:]))
+    full[routing.summarized_positions] = entries
+    return full
 
 
 class _CanonicalContextParallel(torch.autograd.Function):
@@ -367,7 +424,11 @@ class _CanonicalContextParallel(torch.autograd.Function):
         n = len(tiling.mine)
         if n:
             prepared = stages.prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
-            maps = prepared.state_summaries(routing.bounds, deterministic_work=True)
+            maps = (
+                prepared.state_summaries(routing.summary_bounds, deterministic_work=True)
+                if routing.summary_bounds.shape[0]
+                else like[:0]
+            )
         else:
             prepared = None
             maps = None
@@ -408,7 +469,11 @@ class _CanonicalContextParallel(torch.autograd.Function):
             backward = ctx.stages.prepare_backward(
                 ctx.saved_type._make(saved), d_output, entry, scale=ctx.scale
             )
-            maps = backward.state_grad_summaries(routing.bounds, deterministic_work=True)
+            maps = (
+                backward.state_grad_summaries(routing.summary_bounds, deterministic_work=True)
+                if routing.summary_bounds.shape[0]
+                else like[:0]
+            )
         else:
             backward = None
             maps = None

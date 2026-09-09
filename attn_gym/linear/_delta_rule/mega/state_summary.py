@@ -185,8 +185,12 @@ def build_mega_state_grad_summaries(
     scale: float,
     *,
     transpose_forward_transition: bool = False,
+    bounds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return whole-sequence FP32 ``[C; R]`` probes for ``d_entry = d_exit @ R + C``.
+
+    Optional ``bounds`` (``int32 [R, 2]`` device tensor of whole consecutive cu_seqlens pairs)
+    select and order the returned rows on device; every sequence is still probed.
 
     C uses native bprop with zero exit cotangent. Its dH recurrence does not read V or the
     checkpoints, so broadcast zero checkpoints avoid a forward state recompute and its large
@@ -254,4 +258,13 @@ def build_mega_state_grad_summaries(
                 order_in_prologue=True,
                 tensormap_workspace=workspace,
             )
-        return maps
+        if bounds is None:
+            return maps
+        selected = torch.empty(
+            bounds.shape[0], heads, 256, 128, device=q.device, dtype=torch.float32
+        )
+        if bounds.shape[0]:
+            _gather_summary_rows[(bounds.shape[0], heads, 32)](
+                maps, cu_seqlens, bounds, selected, heads, sequences, 1024
+            )
+        return selected
