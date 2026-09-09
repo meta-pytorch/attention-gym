@@ -47,11 +47,18 @@ torch.library.define(
     "Tensor cu_seqlens, bool split, float scale) "
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
+# Fixed-arity pair over one launcher: only the with-state backward returns the entry cotangent.
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_bwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor cu_seqlens, Tensor? initial_state, Tensor? d_final_state, float scale) "
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?)",
+    "Tensor cu_seqlens, Tensor initial_state, Tensor? d_final_state, float scale) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_mega_packed_bwd_with_exit_cotangent",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
+    "Tensor cu_seqlens, Tensor? d_final_state, float scale) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_plain_gate_bwd_dense_cute",
@@ -248,6 +255,14 @@ def _packed_bwd_with_state_cuda(
     )
 
 
+def _packed_bwd_with_exit_cotangent_cuda(
+    q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, scale
+):
+    return _packed_bwd_with_state_cuda(
+        q, k, value, gate, beta, d_output, cu_seqlens, None, d_final_state, scale
+    )[:5]
+
+
 def _plain_gate_bwd_cuda(d_cumulative):
     from attn_gym.linear._delta_rule.mega.kernels.kda_plain_gate_bwd import (
         plain_gate_cumsum_dense_bwd_cute,
@@ -273,6 +288,11 @@ torch.library.impl("attn_gym::kda_chunk_mega_packed_fwd_paged", "CUDA", _packed_
 torch.library.impl("attn_gym::kda_chunk_mega_packed_local_bwd", "CUDA", _packed_local_bwd_cuda)
 torch.library.impl(
     "attn_gym::kda_chunk_mega_packed_bwd_with_state", "CUDA", _packed_bwd_with_state_cuda
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_mega_packed_bwd_with_exit_cotangent",
+    "CUDA",
+    _packed_bwd_with_exit_cotangent_cuda,
 )
 torch.library.impl("attn_gym::kda_plain_gate_bwd_dense_cute", "CUDA", _plain_gate_bwd_cuda)
 
@@ -323,25 +343,32 @@ def _packed_fwd_paged_fake(
     return torch.empty_like(value)
 
 
+def _token_gradients_fake(q, k, value, gate, beta):
+    """One compact gradient per token operand, as the backward launchers allocate them."""
+    return tuple(torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta))
+
+
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_local_bwd")
 def _packed_local_bwd_fake(q, k, value, gate, beta, d_output, cu_seqlens, split, scale):
-    del d_output, cu_seqlens, split, scale
-    return tuple(torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta))
+    return _token_gradients_fake(q, k, value, gate, beta)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_bwd_with_state")
 def _packed_bwd_with_state_fake(
     q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale
 ):
-    del d_output, cu_seqlens, d_final_state, scale
-    gradients = tuple(
-        torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta)
-    )
     # The launcher allocates a compact FP32 cotangent whatever the entry state's outer strides.
-    d_initial_state = (
-        None if initial_state is None else initial_state.new_empty(initial_state.shape)
+    return (
+        *_token_gradients_fake(q, k, value, gate, beta),
+        initial_state.new_empty(initial_state.shape),
     )
-    return (*gradients, d_initial_state)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_mega_packed_bwd_with_exit_cotangent")
+def _packed_bwd_with_exit_cotangent_fake(
+    q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, scale
+):
+    return _token_gradients_fake(q, k, value, gate, beta)
 
 
 @torch.library.register_fake("attn_gym::kda_plain_gate_bwd_dense_cute")
@@ -363,11 +390,15 @@ chunk_mega_packed_local_bwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_local_
 chunk_mega_packed_bwd_with_state_op = (
     torch.ops.attn_gym.kda_chunk_mega_packed_bwd_with_state.default
 )
+chunk_mega_packed_bwd_with_exit_cotangent_op = (
+    torch.ops.attn_gym.kda_chunk_mega_packed_bwd_with_exit_cotangent.default
+)
 plain_gate_bwd_dense_cute_op = torch.ops.attn_gym.kda_plain_gate_bwd_dense_cute.default
 
 
 __all__ = [
     "chunk_mega_dense_training_fwd_op",
+    "chunk_mega_packed_bwd_with_exit_cotangent_op",
     "chunk_mega_packed_bwd_with_state_op",
     "chunk_mega_packed_fwd_op",
     "chunk_mega_packed_fwd_paged_op",

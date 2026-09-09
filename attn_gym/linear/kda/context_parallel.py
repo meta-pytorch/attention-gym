@@ -73,15 +73,26 @@ def context_parallel_kda_deterministic(
 
     See NOTE [Canonical Tiles] in ``attn_gym.linear.context_parallel_deterministic``. Autotuning
     is disabled because a tuned configuration is part of the arithmetic and would have to be
-    identical on every rank; ``fastmath`` and ``kernel_options`` follow ``chunk_kda``.
+    identical on every rank; ``fastmath`` and ``kernel_options`` follow ``chunk_kda``, except
+    that Mega's forgetting-horizon split (``split_forward``/``split_backward``) is rejected: the
+    canonical tiles already bound every leaf, and a split leaf would change the FP32 summaries.
     """
+    options = resolve_kernel_options(kernel_options)
+    if options.split_forward or options.split_backward:
+        raise ValueError(
+            "context_parallel_kda_deterministic does not support split_forward/split_backward: "
+            "canonical tiles fix every leaf, and a horizon split would change the summaries"
+        )
     stages = _kda_stages(scale, False, fastmath, kernel_options)
     return context_parallel_chunk_deterministic(
         stages, q, k, v, gate, beta, tiling=tiling, group=group, routing=routing
     )
 
 
-def _kda_stages(scale, autotune, fastmath, kernel_options) -> StagedOp:
+def _kda_stages(
+    scale: float | None, autotune: bool, fastmath: bool, kernel_options: KernelOptions | None
+) -> StagedOp:
+    """Bind ``chunk_kda``'s options to its staged entry points."""
     return StagedOp(
         partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
         partial(

@@ -12,6 +12,8 @@ import math
 import os
 import socket
 import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from itertools import accumulate, pairwise
 from unittest.mock import patch
 
@@ -24,12 +26,14 @@ pytest.importorskip("cutlass")
 
 import attn_gym.linear.context_parallel_deterministic as det
 from attn_gym.linear._delta_rule.triton.canonical_scan import canonical_scan_entries
+from attn_gym.linear.context_parallel import compose_summaries
 from attn_gym.linear.context_parallel_deterministic import (
     CanonicalTiling,
     canonical_entries,
     tile_stream,
 )
 from attn_gym.linear.kda.context_parallel import _kda_stages, context_parallel_kda_deterministic
+from attn_gym.linear.types import KernelOptions
 from attn_gym.testing.kda import kda_reference, make_kda_test_inputs
 
 pytestmark = [
@@ -37,7 +41,7 @@ pytestmark = [
     pytest.mark.xdist_group("two-gpu"),
 ]
 
-HEADS, DIM = 4, 128
+HEADS = 4
 RAGGED = (17, 65, 129, 257, 513)
 ELEPHANT = (800, 31, 33, 31, 33, 31, 33)
 NAMES = ("output", "dq", "dk", "dv", "dgate", "dbeta")
@@ -97,25 +101,25 @@ def test_non_contiguous_ownership_keeps_span_order_consistent():
     assert [tiling.tiles[i].length for i in tiling.mine] == [b - a for a, b in pairwise(offsets)]
 
 
-def _serial_entries(leaves: torch.Tensor, documents: list[int]) -> torch.Tensor:
-    """Exclusive prefix bias per tile by serial composition, restarting at each document."""
-    from attn_gym.linear.context_parallel import compose_summaries
-
+def _serial_entries(
+    leaves: torch.Tensor, offsets: Sequence[int], *, reverse: bool
+) -> torch.Tensor:
+    """Exclusive serial prefix bias, restarting at each document in either direction."""
     value_dim = leaves.shape[2] - leaves.shape[3]
     entries = torch.zeros(
         leaves.shape[0], leaves.shape[1], value_dim, leaves.shape[3], device=leaves.device
     )
-    prefix = None
-    for i, doc in enumerate(documents):
-        if i == 0 or doc != documents[i - 1]:
-            prefix = leaves[i]
-        else:
+    for start, stop in pairwise(offsets):
+        indices = range(stop - 1, start - 1, -1) if reverse else range(start, stop)
+        prefix = leaves[indices[0]]
+        for i in indices[1:]:
             entries[i] = prefix[:, :value_dim, :]
             prefix = compose_summaries(prefix, leaves[i])
     return entries
 
 
 def _leaves(n: int, seed: int) -> torch.Tensor:
+    """Random affine maps with near-identity transitions to keep long prefixes nontrivial."""
     torch.manual_seed(seed)
     leaves = torch.randn(n, 2, 256, 128, device="cuda")
     leaves[:, :, 128:, :] = torch.eye(128, device="cuda") + 0.01 * torch.randn(
@@ -124,54 +128,42 @@ def _leaves(n: int, seed: int) -> torch.Tensor:
     return leaves
 
 
-def _doc_offsets(documents: list[int]) -> torch.Tensor:
-    offsets = [0] + [i for i in range(1, len(documents)) if documents[i] != documents[i - 1]]
-    return torch.tensor([*offsets, len(documents)], dtype=torch.int32, device="cuda")
-
-
-def _single_rank_tiling(documents: list[int], scan_block: int) -> CanonicalTiling:
-    """One rank owning every tile of documents with the given tile counts (64-token tiles)."""
-    lengths = []
-    for doc in dict.fromkeys(documents):
-        lengths.append(64 * documents.count(doc))
+def _single_rank_tiling(
+    lengths: Sequence[int], tile_size: int = 64, scan_block: int = 1
+) -> CanonicalTiling:
+    """Tile packed document lengths with every token owned by one rank."""
     cu = (0, *accumulate(lengths))
     return CanonicalTiling.from_fragments(
-        cu, [[(0, cu[-1])]], 0, tile_size=64, scan_block=scan_block
+        cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
     )
 
 
-@pytest.mark.parametrize("documents", [[0] * 9, [0, 0, 0, 1, 2, 2, 2], [0, 1, 2, 3], [0] * 1])
-def test_fused_scan_matches_serial_composition_per_document(documents):
+@pytest.mark.parametrize("tile_counts", [(9,), (3, 1, 3), (1, 1, 1, 1), (1,)])
+def test_fused_scan_matches_serial_composition_per_document(tile_counts):
     """The fused scan restarts at documents and equals serial composition to fp32 accuracy."""
-    leaves = _leaves(len(documents), 0)
-    offsets = _doc_offsets(documents)
-    torch.testing.assert_close(
-        canonical_scan_entries(leaves, offsets),
-        _serial_entries(leaves, documents),
-        atol=1e-4,
-        rtol=1e-5,
-    )
-    expected = _serial_entries(leaves.flip(0), documents[::-1]).flip(0)
-    torch.testing.assert_close(
-        canonical_scan_entries(leaves, offsets, reverse=True), expected, atol=1e-4, rtol=1e-5
-    )
+    leaves = _leaves(sum(tile_counts), 0)
+    offsets = [0, *accumulate(tile_counts)]
+    device_offsets = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    for reverse in (False, True):
+        torch.testing.assert_close(
+            canonical_scan_entries(leaves, device_offsets, reverse=reverse),
+            _serial_entries(leaves, offsets, reverse=reverse),
+            atol=1e-4,
+            rtol=1e-5,
+        )
 
 
 @pytest.mark.parametrize("scan_block", [1, 2, 4])
 def test_blocked_entries_match_serial_composition(scan_block):
     """The three-level block tree equals serial composition to fp32 accuracy, both directions."""
-    documents = [0] * 7 + [1] * 3 + [2] * 5
-    leaves = _leaves(len(documents), 5)
-    tiling = _single_rank_tiling(documents, scan_block)
-    like = leaves[:1]
+    tile_counts = (7, 3, 5)
+    leaves = _leaves(sum(tile_counts), 5)
+    tiling = _single_rank_tiling([64 * count for count in tile_counts], scan_block=scan_block)
     for reverse in (False, True):
         got = canonical_entries(
-            leaves, tiling, tiling.routing("cuda"), like, None, reverse=reverse
+            leaves, tiling, tiling.routing("cuda"), leaves[:1], None, reverse=reverse
         )
-        if reverse:
-            expected = _serial_entries(leaves.flip(0), documents[::-1]).flip(0)
-        else:
-            expected = _serial_entries(leaves, documents)
+        expected = _serial_entries(leaves, [0, *accumulate(tile_counts)], reverse=reverse)
         torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-5)
 
 
@@ -183,8 +175,9 @@ def test_entries_of_a_document_are_independent_of_its_neighbours(scan_block):
     for before, after in ((0, 0), (1, 0), (3, 2), (7, 5)):
         others = _leaves(before + after, 2 + before)
         leaves = torch.cat((others[:before], document, others[before:]))
-        documents = [0] * before + [1] * 5 + [2] * after
-        tiling = _single_rank_tiling(documents, scan_block)
+        tiling = _single_rank_tiling(
+            [64 * count for count in (before, 5, after) if count], scan_block=scan_block
+        )
         summarized = torch.tensor(tiling.summarized, device="cuda")
         for reverse in (False, True):
             entries = canonical_entries(
@@ -203,24 +196,19 @@ def test_entries_of_a_document_are_independent_of_its_neighbours(scan_block):
 # ---------------------------------------------------------------- transports
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-_REAL_ALL_GATHER = dist.all_gather_into_tensor
-
-
-def _cpu_all_gather_into_tensor(gathered, packet, group=None):
+def _cpu_all_gather_into_tensor(
+    gathered: torch.Tensor, packet: torch.Tensor, group: dist.ProcessGroup | None = None
+) -> None:
     """Gloo path: gather CPU copies, then place them into the CUDA output buffer."""
     staging = torch.empty(gathered.shape, dtype=gathered.dtype)
-    _REAL_ALL_GATHER(staging, packet.cpu(), group=group)
+    dist.all_gather_into_tensor(staging, packet.cpu(), group=group)
     gathered.copy_(staging)
 
 
-def _init(cp_rank: int, world: int, port: int) -> torch.device:
-    shared = torch.cuda.device_count() == 1
+@contextmanager
+def _process_group(cp_rank: int, world: int, port: int) -> Iterator[torch.device]:
+    """NCCL on one GPU per rank, or Gloo with the module's collective staged through the CPU."""
+    shared = torch.cuda.device_count() < world
     device = torch.device("cuda", 0 if shared else cp_rank)
     torch.cuda.set_device(device)
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
@@ -230,16 +218,23 @@ def _init(cp_rank: int, world: int, port: int) -> torch.device:
         world_size=world,
         device_id=None if shared else device,
     )
-    if shared:
-        patcher = patch.object(det.dist, "all_gather_into_tensor", _cpu_all_gather_into_tensor)
-        patcher.start()
-    return device
+    try:
+        if shared:
+            with patch.object(det, "_all_gather_into_tensor", _cpu_all_gather_into_tensor):
+                yield device
+        else:
+            yield device
+    finally:
+        dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------- canonical CP1 reference
 
 
-def _inputs(lengths, gate: str, seed: int, device):
+def _inputs(
+    lengths: Sequence[int], gate: str, seed: int
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Seeded KDA inputs and output cotangent on the current rank device."""
     torch.manual_seed(seed)
     values = make_kda_test_inputs(
         sum(lengths),
@@ -251,27 +246,25 @@ def _inputs(lengths, gate: str, seed: int, device):
         log_uniform_gate=gate == "strong",
         gate_value=0.0 if gate == "zero" else None,
     )
-    values = tuple(v.to(device) for v in values)
     return values, torch.randn_like(values[2])
 
 
 @torch.no_grad()
-def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kernel_options):
-    """Single-process canonical run over the same tiles: the contract every ownership reproduces.
-
-    Every tile is prepared by its own staged call (the strictest form of the leaf contract); the
-    batched production path must match this bitwise. The scan tree is the production one.
-    """
-    cu = (0, *accumulate(lengths))
-    tiles = tile_stream(cu, tile_size)
-    tiling = CanonicalTiling.from_fragments(
-        cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
-    )
+def _canonical_cp1(
+    inputs: tuple[torch.Tensor, ...],
+    grad: torch.Tensor,
+    lengths: Sequence[int],
+    tile_size: int,
+    scan_block: int,
+    kernel_options: KernelOptions | None,
+) -> tuple[torch.Tensor, ...]:
+    """Independent per-tile staged calls with the production scan: the bitwise CP contract."""
+    tiling = _single_rank_tiling(lengths, tile_size, scan_block)
+    tiles = tiling.tiles
     stages = _kda_stages(None, False, False, kernel_options)
     device = inputs[0].device
 
-    def bounds(t):
-        return torch.tensor([[0, t.length]], dtype=torch.int32, device=device)
+    bounds = [torch.tensor([[0, t.length]], dtype=torch.int32, device=device) for t in tiles]
 
     prepared = [
         stages.prepare(*(v[:, t.start : t.stop] for v in inputs), cu_seqlens=None) for t in tiles
@@ -279,10 +272,7 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kerne
     # Single-tile documents are not summarized (NOTE [Single-Tile Documents]).
     summarized = tiling.summarized
     maps = torch.cat(
-        [
-            prepared[i].state_summaries(bounds(tiles[i]), deterministic_work=True)
-            for i in summarized
-        ]
+        [prepared[i].state_summaries(bounds[i], deterministic_work=True) for i in summarized]
     )
     routing = tiling.routing(device)
     entries = canonical_entries(maps, tiling, routing, maps[:1], None, reverse=False)
@@ -295,10 +285,7 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kerne
             )
         )
     rmaps = torch.cat(
-        [
-            backwards[i].state_grad_summaries(bounds(tiles[i]), deterministic_work=True)
-            for i in summarized
-        ]
+        [backwards[i].state_grad_summaries(bounds[i], deterministic_work=True) for i in summarized]
     )
     exits = canonical_entries(rmaps, tiling, routing, maps[:1], None, reverse=True)
     grads = [b.run(exits[i : i + 1])[:5] for i, b in enumerate(backwards)]
@@ -308,7 +295,8 @@ def _canonical_cp1(inputs, grad, lengths, tile_size: int, scan_block: int, kerne
     )
 
 
-def _bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> int:
+def _bit_mismatches(actual: torch.Tensor, expected: torch.Tensor) -> int:
+    """Count unequal storage elements, including signed zeros; reject non-finite values."""
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
     assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
     view = torch.int16 if actual.dtype == torch.bfloat16 else torch.int32
@@ -317,42 +305,34 @@ def _bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> int:
 
 # ---------------------------------------------------------------- two-rank cases
 
-OWNERSHIPS = {
-    "contiguous": lambda cu, n: [[(0, cu[len(cu) // 2])], [(cu[len(cu) // 2], cu[-1])]],
-    "empty_rank": lambda cu, n: [[], [(0, cu[-1])]],
-}
 
-
-def _rank_main(cp_rank, world, port, lengths, tile_size, scan_block, ownership, gate, backend):
-    device = _init(cp_rank, world, port)
-    try:
+def _rank_main(
+    cp_rank: int,
+    world: int,
+    port: int,
+    lengths: Sequence[int],
+    tile_size: int,
+    scan_block: int,
+    ownership: str,
+    gate: str,
+    backend: str,
+) -> None:
+    """Compare each rank's output and five gradients to independent per-tile CP=1 calls."""
+    with _process_group(cp_rank, world, port) as device:
         kernel_options = {"backend": backend} if backend != "fused" else None
-        inputs, grad = _inputs(lengths, gate, 97, device)
+        inputs, grad = _inputs(lengths, gate, 97)
         cu = (0, *accumulate(lengths))
         expected = _canonical_cp1(inputs, grad, lengths, tile_size, scan_block, kernel_options)
         if ownership == "cyclic":
-            # Alternate whole blocks between the ranks (tiles when scan_block == 1); tiles of
-            # single-tile documents form no block and alternate on their own.
-            tiling = CanonicalTiling.from_fragments(
-                cu, [[(0, cu[-1])]], 0, tile_size=tile_size, scan_block=scan_block
-            )
-            units = sorted(
-                [
-                    *tiling.blocks,
-                    *((i,) for i in range(len(tiling.tiles)) if i not in tiling.summarized),
-                ]
-            )
-            tiles = tiling.tiles
-            fragments = [
-                [
-                    (tiles[unit[0]].start, tiles[unit[-1]].stop)
-                    for u, unit in enumerate(units)
-                    if u % 2 == r
-                ]
-                for r in range(2)
-            ]
+            # Whole document-relative scan blocks alternate, including single-tile documents.
+            units = tile_stream(cu, tile_size * scan_block)
+            fragments = [[(t.start, t.stop) for t in units[r::world]] for r in range(world)]
         else:
-            fragments = OWNERSHIPS[ownership](cu, len(lengths))
+            fragments = {
+                "contiguous": [[(0, cu[len(cu) // 2])], [(cu[len(cu) // 2], cu[-1])]],
+                "empty_rank": [[], [(0, cu[-1])]],
+                "single": [[(0, cu[-1])]],
+            }[ownership]
         tiling = CanonicalTiling.from_fragments(
             cu, fragments, cp_rank, tile_size=tile_size, scan_block=scan_block
         )
@@ -364,59 +344,74 @@ def _rank_main(cp_rank, world, port, lengths, tile_size, scan_block, ownership, 
         # Every rank runs the backward: its all-gather is a collective even for an empty rank.
         grads = torch.autograd.grad(output, local, grad[:, ids])
         mismatches = {
-            name: _bits_equal(a, e[:, ids])
+            name: _bit_mismatches(a, e[:, ids])
             for name, a, e in zip(NAMES, (output, *grads), expected, strict=True)
         }
         assert all(v == 0 for v in mismatches.values()), mismatches
-    finally:
-        dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("backend", ["fused", "mega"])
+@pytest.fixture(params=["fused", "mega"])
+def backend(request: pytest.FixtureRequest) -> str:
+    """Skip Mega before spawning when its DSL or GPU architecture is unavailable."""
+    if request.param == "mega":
+        pytest.importorskip("cutlass.experimental")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            pytest.skip("Mega needs SM100/103")
+    return request.param
+
+
 @pytest.mark.parametrize("gate", ["strong", "mild", "zero"])
 @pytest.mark.parametrize(
     "lengths,tile_size,scan_block,ownership",
     [
-        (RAGGED, 64, 1, "contiguous"),
-        (RAGGED, 64, 1, "cyclic"),
-        (RAGGED, 128, 1, "empty_rank"),
-        (ELEPHANT, 64, 1, "cyclic"),
-        (RAGGED, 64, 4, "cyclic"),
-        (ELEPHANT, 64, 4, "contiguous"),
-    ],
-    ids=[
-        "ragged-contig",
-        "ragged-cyclic",
-        "ragged-empty",
-        "elephant-cyclic",
-        "ragged-cyclic-block4",
-        "elephant-contig-block4",
+        pytest.param(RAGGED, 64, 1, "contiguous", id="ragged-contig"),
+        pytest.param(RAGGED, 64, 1, "cyclic", id="ragged-cyclic"),
+        pytest.param(RAGGED, 128, 1, "empty_rank", id="ragged-empty"),
+        pytest.param(ELEPHANT, 64, 1, "cyclic", id="elephant-cyclic"),
+        pytest.param(RAGGED, 64, 4, "cyclic", id="ragged-cyclic-block4"),
+        pytest.param(ELEPHANT, 64, 4, "contiguous", id="elephant-contig-block4"),
     ],
 )
 def test_two_ranks_match_canonical_cp1_bitwise(
     lengths, tile_size, scan_block, ownership, gate, backend
 ):
-    if backend == "mega":
-        pytest.importorskip("cutlass.experimental")
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            pytest.skip("Mega needs SM100/103")
-    # A rank that raises leaves its peer blocked in a collective; poll the context so the
-    # failure surfaces instead of the case hanging until the outer timeout.
-    context = mp.spawn(
-        _rank_main,
-        args=(2, _free_port(), lengths, tile_size, scan_block, ownership, gate, backend),
-        nprocs=2,
-        join=False,
-    )
+    _spawn(2, (lengths, tile_size, scan_block, ownership, gate, backend))
+
+
+def _spawn(nprocs: int, args: tuple) -> None:
+    """Surface failed ranks promptly and bound each case to 300 seconds, including compilation."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    context = mp.spawn(_rank_main, args=(nprocs, port, *args), nprocs=nprocs, join=False)
     deadline = time.monotonic() + 300
     try:
-        # join(timeout) returns after each process exits (raising if it failed); loop until all did.
+        # join() reports failed ranks immediately, but may reap only one successful rank at a time.
         while not context.join(timeout=max(0.0, deadline - time.monotonic())):
-            assert time.monotonic() < deadline, "two-rank case did not finish within 300 s"
+            assert time.monotonic() < deadline, "spawned case did not finish within 300 s"
     finally:
         for process in context.processes:
             if process.is_alive():
                 process.kill()
+
+
+@pytest.mark.parametrize("option", ["split_forward", "split_backward"])
+def test_split_schedules_are_rejected_before_any_collective(option):
+    """Reject Mega splits before collecting: they would change the canonical FP32 summaries."""
+    tiling = _single_rank_tiling(RAGGED)
+    inputs, _ = _inputs(RAGGED, "mild", 3)
+    with pytest.raises(ValueError, match="split_forward/split_backward"):
+        context_parallel_kda_deterministic(
+            *inputs,
+            tiling=tiling,
+            group=None,
+            kernel_options={"backend": "mega", option: True},
+        )
+
+
+def test_single_rank_public_api_matches_canonical_cp1_bitwise(backend):
+    """CP=1 through the public entry point is the same contract the two-rank cases reproduce."""
+    _spawn(1, (RAGGED, 64, 1, "single", "strong", backend))
 
 
 # ---------------------------------------------------------------- accuracy vs FP64
@@ -425,7 +420,7 @@ def test_two_ranks_match_canonical_cp1_bitwise(
 def test_canonical_cp1_matches_fp64_reference_within_bf16_budget():
     """The new contract is checked against an independent FP64 recurrence, not only self-consistency."""
     lengths = (17, 65, 129)
-    inputs, grad = _inputs(lengths, "mild", 41, torch.device("cuda"))
+    inputs, grad = _inputs(lengths, "mild", 41)
     inputs = tuple(v[:, :, :1].contiguous() for v in inputs)
     grad = grad[:, :, :1].contiguous()
     actual = _canonical_cp1(inputs, grad, lengths, 64, 2, None)
