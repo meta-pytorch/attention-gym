@@ -1,6 +1,8 @@
 import torch
 from torch import Tensor
 
+from .ops import _indexer_cute_op
+
 
 def _validate_inputs(
     q: Tensor,
@@ -39,9 +41,7 @@ def _validate_inputs(
 
     # --- shape agreement ---
     if k.shape[0] != batch or k.shape[2] != head_dim:
-        raise ValueError(
-            f"k must have shape [B={batch}, S, D={head_dim}], got {list(k.shape)}."
-        )
+        raise ValueError(f"k must have shape [B={batch}, S, D={head_dim}], got {list(k.shape)}.")
     if tuple(weights.shape) != (batch, queries, heads):
         raise ValueError(
             f"weights must have shape {[batch, queries, heads]}, got {list(weights.shape)}."
@@ -51,9 +51,7 @@ def _validate_inputs(
     if not q.is_floating_point():
         raise TypeError(f"q must have a floating-point dtype, got {q.dtype}.")
     if k.dtype != q.dtype:
-        raise ValueError(
-            f"k must have the same dtype as q, but got {k.dtype} and {q.dtype}."
-        )
+        raise ValueError(f"k must have the same dtype as q, but got {k.dtype} and {q.dtype}.")
     if weights.dtype != q.dtype:
         raise ValueError(
             f"weights must have the same dtype as q, but got {weights.dtype} and {q.dtype}."
@@ -61,13 +59,10 @@ def _validate_inputs(
 
     # --- device ---
     if k.device != q.device:
-        raise ValueError(
-            f"k must be on the same device as q, but got {k.device} and {q.device}."
-        )
+        raise ValueError(f"k must be on the same device as q, but got {k.device} and {q.device}.")
     if weights.device != q.device:
         raise ValueError(
-            f"weights must be on the same device as q, "
-            f"but got {weights.device} and {q.device}."
+            f"weights must be on the same device as q, but got {weights.device} and {q.device}."
         )
 
     # --- topk range ---
@@ -118,10 +113,10 @@ def index(
         mode: Currently only prefill is supported; auto defaults to prefill.
 
     Returns:
-        [B, T, topk] INT32 tensor of selected candidate indices. 
+        [B, T, topk] INT32 tensor of selected candidate indices.
         Not guaranteed to be sorted
     """
-    
+
     _validate_inputs(q, k, weights, topk, causal)
 
     match mode:
@@ -140,8 +135,6 @@ def index(
         case "triton":
             raise NotImplementedError("Triton backend is not implemented yet.")
         case "cute":
-            from .impl import cute as cute_backend
-
-            return cute_backend.index(q, k, weights, topk, causal)
+            return _indexer_cute_op(q, k, weights, topk, causal)
         case _:
             raise NotImplementedError(f"Backend {backend!r} is not supported.")

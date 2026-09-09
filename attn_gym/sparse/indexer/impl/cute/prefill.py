@@ -4,10 +4,11 @@ Each CTA owns two adjacent query rows, reuses every staged key tile across both
 queries for each 64-head tile, and overlaps the tensor-core producer with two
 independent CUDA-warpgroup Top-K consumers.  Both final Top-K lists remain
 entirely in shared memory.  There are no global partial lists and no merge
-kernel.  The public operation is a direct CuTeDSL launch guarded by an
+kernel.  The launcher is guarded by an
 in-process and persistent TVM-FFI compile cache keyed on the static shape/dtype
 contract (dtype, batch, queries, heads, head_dim, topk, causal) and compile
-target; it has no dispatcher registration or fallback implementation.
+target. The public API invokes it through the private operator in
+``attn_gym.sparse.indexer.ops``; there is no fallback implementation.
 
 The launch schedule (stage counts, query/candidate tiling, warp-role
 assignment) is owned by ``IndexerConfig`` and ``IndexerWarpRole`` and threaded

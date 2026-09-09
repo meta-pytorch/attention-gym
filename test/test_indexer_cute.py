@@ -7,11 +7,15 @@ backend runs and matches eager output under torch.compile.
 """
 
 import math
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
 
 from attn_gym.sparse.indexer import index
+from attn_gym.sparse.indexer.ops import _indexer_cute_op
 
 
 def _skip_no_sm100():
@@ -21,11 +25,9 @@ def _skip_no_sm100():
         pytest.skip("SM100 (compute capability 10.0) required for CuTe backend")
 
 
-def _reference_scores(
-    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
-) -> torch.Tensor:
+def _reference_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Compute the indexer score matrix in the input dtype."""
-    batch, queries, heads, head_dim = q.shape
+    _, _, heads, head_dim = q.shape
     scale = 1.0 / math.sqrt(heads * head_dim)
     dots = torch.einsum("bthd,bsd->bths", q, k)
     return (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
@@ -57,20 +59,14 @@ def _validate_indices(
     # Valid count check
     if causal:
         row = torch.arange(queries, device=device).view(1, queries, 1)
-        expected_valid = torch.minimum(
-            row + 1, torch.full_like(row, topk)
-        ).expand(batch, -1, -1)
+        expected_valid = torch.minimum(row + 1, torch.full_like(row, topk)).expand(batch, -1, -1)
     else:
-        expected_valid = torch.full(
-            (batch, queries, 1), topk, device=device
-        )
+        expected_valid = torch.full((batch, queries, 1), topk, device=device)
     assert torch.equal(valid.sum(-1, keepdim=True), expected_valid), "wrong valid count"
 
     # No duplicate valid indices
     sorted_actual = actual_i64.sort(-1).values
-    dup = (sorted_actual[..., 1:] == sorted_actual[..., :-1]) & (
-        sorted_actual[..., 1:] >= 0
-    )
+    dup = (sorted_actual[..., 1:] == sorted_actual[..., :-1]) & (sorted_actual[..., 1:] >= 0)
     assert not torch.any(dup), "duplicate valid index"
 
     # Compute reference topk from scores
@@ -174,7 +170,7 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         (2, 256, 64, 128, 129),
         (2, 512, 64, 128, 512),
         (2, 1024, 64, 128, 512),
-        (2, 4096, 64, 128, 128)
+        (2, 4096, 64, 128, 128),
     ],
     ids=[
         "base",
@@ -194,7 +190,7 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         "topk_129",
         "topk_512",
         "topk_1024",
-        "topk_4096"
+        "topk_4096",
     ],
 )
 def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal, dtype):
@@ -223,9 +219,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
 
     # Apply causal mask
     if causal:
-        causal_mask = torch.ones(
-            queries, queries, device=device, dtype=torch.bool
-        ).triu_(1)
+        causal_mask = torch.ones(queries, queries, device=device, dtype=torch.bool).triu_(1)
         scores_64.masked_fill_(causal_mask, float("-inf"))
 
     # FP64 Top-K boundary: the Kth-largest score per row
@@ -254,9 +248,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     # No duplicate valid indices within a row
     cute_indices_i64 = cute_indices.to(torch.int64)
     sorted_indices = cute_indices_i64.sort(-1).values
-    dup = (sorted_indices[..., 1:] == sorted_indices[..., :-1]) & (
-        sorted_indices[..., 1:] >= 0
-    )
+    dup = (sorted_indices[..., 1:] == sorted_indices[..., :-1]) & (sorted_indices[..., 1:] >= 0)
     assert not torch.any(dup), "duplicate valid index"
 
     # causality check
@@ -270,9 +262,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     kernel_scores_64 = scores_64.gather(-1, safe_indices)  # [B, T, topk]
 
     # Tolerance from the reduction chain: dot(D) then sum(H)
-    accumulation_eps = (
-        (math.sqrt(head_dim) + math.sqrt(heads)) * torch.finfo(torch.float32).eps
-    )
+    accumulation_eps = (math.sqrt(head_dim) + math.sqrt(heads)) * torch.finfo(torch.float32).eps
     scale = torch.maximum(boundary.abs(), torch.ones_like(boundary))
     tolerance = accumulation_eps * scale  # [B, T]
 
@@ -329,19 +319,15 @@ def test_cute_partial_acceptance_across_tiles(dtype):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
-def test_cute_backend_under_torch_compile(causal):
-    """torch.compile over the cute backend runs and matches uncompiled output.
-
-    fullgraph=True is not supported: `_validate`'s alignment check
-    (`tensor.data_ptr() % _ALIGNMENT`) is not traceable, so this compiles with
-    the default graph-break-tolerant mode instead.
-    """
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("topk", [0, 32])
+def test_cute_backend_under_torch_compile(causal, dtype, topk):
+    """Capture the public API as one graph and match uncompiled CuTe output."""
     _skip_no_sm100()
 
     torch.manual_seed(2026)
     device = torch.device("cuda")
-    dtype = torch.bfloat16
-    batch, queries, heads, head_dim, topk = 2, 128, 64, 128, 32
+    batch, queries, heads, head_dim = 2, 128, 64, 128
 
     q = torch.randn(batch, queries, heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(batch, queries, head_dim, device=device, dtype=dtype)
@@ -354,9 +340,39 @@ def test_cute_backend_under_torch_compile(causal):
     assert eager_out.shape == (batch, queries, topk)
     assert eager_out.dtype == torch.int32
 
-    compiled_run = torch.compile(run)
+    compiled_run = torch.compile(run, fullgraph=True)
     compiled_out = compiled_run(q, k, w)
     assert compiled_out.shape == (batch, queries, topk)
     assert compiled_out.dtype == torch.int32
 
     torch.testing.assert_close(compiled_out, eager_out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("topk", [0, 16])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_cute_op_registration(causal, dtype, topk, requires_grad):
+    """Check registration, including partial tiles and nondifferentiable indices."""
+    _skip_no_sm100()
+    q = torch.randn(2, 65, 64, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
+    k = torch.randn(2, 65, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
+    w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
+    torch.library.opcheck(_indexer_cute_op, (q, k, w, topk, causal))
+    result = index(q, k, w, topk, causal=causal, backend="cute")
+    assert not result.requires_grad
+    assert result.grad_fn is None
+
+
+def test_cute_dynamic_fullgraph():
+    """Reuse a public graph while the launcher specializes for each sequence length."""
+    _skip_no_sm100()
+    compiled = torch.compile(index, fullgraph=True, dynamic=True)
+    for tokens in (65, 129):
+        q = torch.randn(2, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(2, tokens, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2, tokens, 64, device="cuda", dtype=torch.bfloat16)
+        actual = compiled(q, k, w, 16, causal=True, backend="cute")
+        expected = index(q, k, w, 16, causal=True, backend="cute")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
