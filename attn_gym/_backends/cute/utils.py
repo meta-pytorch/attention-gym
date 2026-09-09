@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any
 
@@ -26,9 +28,20 @@ def _contains_torch_tensor(value: Any) -> bool:
 
 
 @lru_cache(maxsize=8)
-def get_device_properties(device: torch.device) -> Any:
-    """Return cached CUDA properties for a device."""
+def get_device_properties(device: torch.device | int) -> Any:
+    """Return cached CUDA properties for a device or device ordinal."""
     return torch.cuda.get_device_properties(device)
+
+
+@contextmanager
+def initialized_cuda_device(tensor: torch.Tensor) -> Iterator[None]:
+    """Make ``tensor``'s device current for a TVM-FFI launch and restore the caller's device."""
+    previous_device = torch.cuda.current_device()
+    torch.cuda.set_device(tensor.device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
@@ -122,6 +135,24 @@ def make_fake_strided_tensor(
     )
 
 
+def validate_tma_tensor(
+    name: str, tensor: torch.Tensor, *, alignment: int = TMA_ALIGNMENT_BYTES
+) -> None:
+    """Reject layouts that cannot satisfy the aligned TMA tensor contract."""
+    if tensor.data_ptr() % alignment:
+        raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
+    if tensor.stride(-1) != 1:
+        raise ValueError(f"{name} innermost stride must be one")
+    element_bytes = tensor.element_size()
+    for stride in tensor.stride()[:-1]:
+        if stride < 0:
+            raise ValueError(f"{name} outer strides must be nonnegative")
+        if stride * element_bytes % TMA_ALIGNMENT_BYTES:
+            raise ValueError(
+                f"{name} outer byte strides must be multiples of {TMA_ALIGNMENT_BYTES}"
+            )
+
+
 def tensor_supports_tma(tensor: torch.Tensor) -> bool:
     """Return whether a CUDA tensor has a TMA-compatible aligned row layout."""
     return tensor.is_cuda and tensor_supports_contiguous_dim(
@@ -204,10 +235,12 @@ __all__ = [
     "TMA_ALIGNMENT_BYTES",
     "compile_tvm_ffi",
     "get_device_properties",
+    "initialized_cuda_device",
     "make_fake_strided_tensor",
     "normalize_compact_tensor",
     "normalize_tma_rows",
     "tensor_supports_contiguous_dim",
     "tensor_supports_tma",
     "tensor_supports_tma_rows",
+    "validate_tma_tensor",
 ]

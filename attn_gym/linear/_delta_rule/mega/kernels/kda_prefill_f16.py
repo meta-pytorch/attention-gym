@@ -91,23 +91,18 @@ from functools import lru_cache, partial
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
+import torch
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
 from attn_gym._backends.cute import compile_tvm_ffi
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from .common.host import get_dtype
 from .common.paged_state import resolve_paged_state
-from .compat import (
-    current_device,
-    get_device_properties,
-    tensor_device_index,
-    validate_tma_tensor,
-)
 from .common.thd import (
     TENSOR_MAP_QWORDS,
     emit_seq_descs,
@@ -3089,8 +3084,8 @@ def chunk_kda_sm100(
         has_initial_state,
     )
 
-    device_index = tensor_device_index(q)
-    if current_device() != device_index:
+    device_index = q.get_device()
+    if torch.cuda.current_device() != device_index:
         raise ValueError("the active CUDA device must match q.device")
     device_properties = get_device_properties(device_index)
     num_sm = device_properties.multi_processor_count

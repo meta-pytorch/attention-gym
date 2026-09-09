@@ -8,6 +8,8 @@ from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.cute.utils import get_device_properties
+
 from .kernels.common.split_k import (
     WORK_ITEM_FIELDS,
     build_split_table,
@@ -15,7 +17,6 @@ from .kernels.common.split_k import (
     compute_ideal_chunks,
     max_work_items,
 )
-from .kernels.compat import multiprocessor_count, tensor_device_index
 
 
 class MegaSchedule(NamedTuple):
@@ -43,7 +44,7 @@ def prepare_mega_schedule(
         raise ValueError("counter_count must be positive")
     tokens, heads = gate.shape[1:3]
     num_sequences = cu_seqlens.shape[0] - 1
-    num_sms = multiprocessor_count(tensor_device_index(gate))
+    num_sms = get_device_properties(gate.device).multi_processor_count
     work_count = torch.empty(1, dtype=torch.int32, device=gate.device)
     counters = torch.empty(counter_count, dtype=torch.int32, device=gate.device)
 

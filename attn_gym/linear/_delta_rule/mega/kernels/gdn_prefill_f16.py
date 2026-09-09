@@ -87,6 +87,7 @@ from functools import lru_cache, partial
 from typing import NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda_driver
+import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
@@ -94,10 +95,10 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cutlass_dsl import min
 
 from attn_gym._backends.cute import compile_tvm_ffi
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.elementwise import softplus
-from .common.host import get_dtype
+from .common.host import checkpoint_capacity_bound, get_dtype
 from .common.paged_state import resolve_paged_state
 from .common.split_k import (
     ORDER_CAPACITY,
@@ -122,13 +123,7 @@ from .common.tvm_ffi import (
     make_workspace_signature,
     validate_cu_seqlens,
 )
-from .compat import (
-    checkpoint_capacity_bound,
-    current_device,
-    get_device_properties,
-    tensor_device_index,
-    validate_tma_tensor,
-)
+
 from .gdn_prefill_config import CFG
 from .tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from .tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
@@ -4085,8 +4080,8 @@ def chunk_gdn_sm100(
         state_indices,
         has_initial_state,
     )
-    device_index = tensor_device_index(q)
-    if current_device() != device_index:
+    device_index = q.get_device()
+    if torch.cuda.current_device() != device_index:
         raise ValueError("the active CUDA device must match q.device")
     device_properties = get_device_properties(device_index)
     num_sm = device_properties.multi_processor_count

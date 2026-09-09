@@ -39,7 +39,8 @@ runs.
 
 The Frost-derived kernels and required `common/` and `tile_dsl/` helpers are adapted from NVIDIA
 `cudnn-frontend` commit `085d50b33691f06e2309f8e6724741a021985649`. Runtime imports were moved
-into the Attention Gym namespace, `compat.py` replaces cuDNN host utilities, and `tile_dsl/` is
+into the Attention Gym namespace, cuDNN host utilities became plain Torch calls plus
+`attn_gym._backends.cute.utils` helpers, and `tile_dsl/` is
 trimmed to the single-CTA, non-block-scaled paths these kernels use. Helpers with a `cute.arch`
 equivalent use it; the mbarrier try-wait spin, TMA tensor copies over runtime descriptors, and
 tcgen05 descriptor stepping stay on `cutlass.experimental.primitives` (see the comments in
