@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # Modified by Attention Gym in 2026: cluster, grid-dependency, and predicated arrive paths unused
-# by the vendored single-CTA kernels were removed.
+# by the vendored single-CTA kernels were removed; barrier ops use the cute.arch wrappers.
 
 
 import enum
@@ -11,9 +11,8 @@ from typing import NamedTuple
 
 import cutlass
 from cutlass import cute
+from cutlass.cute.nvgpu import tcgen05
 from cutlass.experimental import primitives as nvvm
-
-WAIT_TIMEOUT = 1
 
 
 class PipelineState(NamedTuple):
@@ -36,6 +35,14 @@ def advance(state, stages):
     return PipelineState(idx=new_idx, phase=new_phase)
 
 
+# Suspend-time hint for the try_wait spin: 1 ns keeps the poll loop as SYNCS.PHASECHK +
+# NANOSLEEP. ``cute.arch.mbarrier_wait`` (10 ms hint, compiler-expanded retry loop) made the GDN
+# kernels duplicate their TMA issue paths and spill (+16% instructions, STACK 0 -> 88), and
+# ``cute.arch.mbarrier_try_wait`` (no hint) drops the NANOSLEEP backoff, so the spin stays on the
+# primitive with an explicit hint.
+WAIT_TIMEOUT = 1
+
+
 @cute.jit
 def wait(mb, phase):
     while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=WAIT_TIMEOUT):
@@ -44,17 +51,17 @@ def wait(mb, phase):
 
 @cute.jit
 def arrive(mb):
-    nvvm.mbarrier_arrive(mb)
+    cute.arch.mbarrier_arrive(mb.data_ptr())
 
 
 @cute.jit
 def arrive_expect_tx(mb, n_bytes):
-    nvvm.mbarrier_arrive_expect_tx(mb, n_bytes)
+    cute.arch.mbarrier_arrive_and_expect_tx(mb.data_ptr(), n_bytes)
 
 
 @cute.jit
 def commit_mma(mb):
-    nvvm.tcgen05_commit(mb, group=nvvm.CTAGroup.CTA_1)
+    tcgen05.commit(mb.data_ptr())
 
 
 class Producer(enum.IntEnum):
@@ -92,7 +99,7 @@ class MBarrier:
             count = int(self.init_count[self.stage_idx])
         else:
             count = int(self.init_count)
-        nvvm.mbarrier_init(self.smem_ptr, count)
+        cute.arch.mbarrier_init(self.smem_ptr.data_ptr(), count)
 
     def wait(self, phase):
         wait(self.smem_ptr, phase)
