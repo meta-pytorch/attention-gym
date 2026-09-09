@@ -361,7 +361,8 @@ def tmaldg_warp(
         desc_gate_slot = (desc_gate_base + slot).tospace(cutlass.AddressSpace.generic)
         if elect_one:
             tma_tensormap_acquire(desc_k_slot)
-            tma_tensormap_acquire(desc_v_slot)
+            if cutlass.const_expr(not cfg.transition_only):
+                tma_tensormap_acquire(desc_v_slot)
             tma_tensormap_acquire(desc_gate_slot)
         use_packed_coords = batch_end == packed_tokens
         for chunk_idx in cutlass.range(cstart, wend, 1, unroll=1):
@@ -389,13 +390,14 @@ def tmaldg_warp(
             tma_load_tile(sGate_tma[raw_index.idx], gate_slice, bars.mb_gate_ready[raw_index.idx].smem_ptr)
 
             # ---- V load ----------------------------------------------------------
-            bars.mb_v_done[raw_index.idx].wait(raw_index.phase)
-            if elect_one:
-                bars.mb_v_ready[raw_index.idx].arrive(n_bytes=cfg.tma_v_bytes)
-            v_slice = tma_slice_runtime_desc(
-                desc_v_slot, cutlass.Int32(0), head_v, input_chunk_start
-            )
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr)
+            if cutlass.const_expr(not cfg.transition_only):
+                bars.mb_v_done[raw_index.idx].wait(raw_index.phase)
+                if elect_one:
+                    bars.mb_v_ready[raw_index.idx].arrive(n_bytes=cfg.tma_v_bytes)
+                v_slice = tma_slice_runtime_desc(
+                    desc_v_slot, cutlass.Int32(0), head_v, input_chunk_start
+                )
+                tma_load_tile(sV_tma[raw_index.idx], v_slice, bars.mb_v_ready[raw_index.idx].smem_ptr)
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx, sched_state = sched_publish_next(cfg, bars, sSched, mSched, sched_state, tile_idx, num_ctas)
@@ -715,7 +717,7 @@ def tcgen05_mma_warp(
         num_chunks_tile = wend - cstart
         for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
             cum_chunk = cum_chunk_base + local_chunk_idx
-            have_state = cutlass.Boolean(True) if cutlass.const_expr(cfg.use_initial_state) else local_chunk_idx > 0
+            have_state = cutlass.Boolean(True) if cutlass.const_expr(cfg.use_initial_state or cfg.transition_only) else local_chunk_idx > 0
             decay_stage = k_decay_ready.idx
             state_scale_diag_stage = qk_scale_index.idx
             intermediate_stage = t_inv_ready.idx
@@ -1306,6 +1308,16 @@ def compute1_warp_group(
         if num_chunks_tile > 0:
             # ---- first chunk: seed state TMEM from mState_init ----------
             seed_from_initial_state = cstart == 0
+            if cutlass.const_expr(cfg.transition_only):
+                for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
+                    identity_block = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    for col in cutlass.range_constexpr(32):
+                        identity_block[col] = (value_dim == key_block_start + col).to(cutlass.Float32)
+                    nvvm.tcgen05_st(
+                        "32x32b",
+                        nvvm.make_tmem_ptr((row_id << 16) + (tmem_col + cfg.tmem_state_acc_offset + key_block_start), cutlass.Float32),
+                        identity_block.load(),
+                    )
             if cutlass.const_expr(mState_init is not None):
                 if seed_from_initial_state:
                     seed_vw = 16 // (mState_init.element_type.width // 8)
@@ -1333,13 +1345,13 @@ def compute1_warp_group(
                             nvvm.make_tmem_ptr((row_id << 16) + (tmem_col + cfg.tmem_state_acc_offset + key_block_start), cutlass.Float32),
                             state_block.load(),
                         )
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                 nvvm.tcgen05_wait("store")
             sV_ptr = smem_data_ptr(sV_raw) + raw_index.idx * (cfg.d_v * cfg.b_t)
             sBeta_ptr = smem_data_ptr(sBeta_raw) + raw_index.idx * cfg.b_t
 
             # ---- state repack: acc TMEM -> packed b16 TMEM ----------------------
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                 state_vecs = []
                 for sub in cutlass.range_constexpr(cfg.d_k // 16):
                     state_vecs.append(nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_addr + state_col_id + sub * 16, cutlass.Float32), num=16))
@@ -1400,19 +1412,23 @@ def compute1_warp_group(
                     bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
 
             # ---- Y staging: Y = Beta * (V - State*K) -----------------------------
-            bars.mb_v_ready[raw_index.idx].wait(raw_index.phase)
-            raw_v_frag0 = nvvm.ldmatrix(
-                sV_ptr + v_swz_off0,
-                4,
-                nvvm.MMALayout.COL,
-            )
-            raw_v_frag1 = nvvm.ldmatrix(
-                sV_ptr + v_swz_off,
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(cfg.transition_only):
+                raw_v_frag0 = tuple(cutlass.Int32(0) for _ in range(4))
+                raw_v_frag1 = tuple(cutlass.Int32(0) for _ in range(4))
+            else:
+                bars.mb_v_ready[raw_index.idx].wait(raw_index.phase)
+                raw_v_frag0 = nvvm.ldmatrix(
+                    sV_ptr + v_swz_off0,
+                    4,
+                    nvvm.MMALayout.COL,
+                )
+                raw_v_frag1 = nvvm.ldmatrix(
+                    sV_ptr + v_swz_off,
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             bars.mb_beta_ready[raw_index.idx].wait(raw_index.phase)
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                 bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
 
                 state_k_vec0 = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_addr + statek_col_id, cutlass.Float32), num=2)
@@ -1427,7 +1443,7 @@ def compute1_warp_group(
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
-                if cutlass.const_expr(mState_init is not None):
+                if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                     y_inp_pack0[reg_idx], _, _ = beta_residual_f16x2(
                         raw_v_frag0[raw_matrix],
                         beta_regs[2 * reg_idx],
@@ -1448,7 +1464,7 @@ def compute1_warp_group(
             for reg_idx in cutlass.range_constexpr(4):
                 raw_matrix = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
                 frag_pair = (reg_idx ^ 2) * 2
-                if cutlass.const_expr(mState_init is not None):
+                if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                     y_inp_pack1[reg_idx], _, _ = beta_residual_f16x2(
                         raw_v_frag1[raw_matrix],
                         beta_regs[2 * reg_idx],
@@ -1468,9 +1484,10 @@ def compute1_warp_group(
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row_addr + y_inp_col_id, cutlass.Int8), y_inp_pack0.load())
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row16_addr + y_inp_col_id, cutlass.Int8), y_inp_pack1.load())
             nvvm.tcgen05_wait("store")
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(mState_init is not None or cfg.transition_only):
                 state_k_acc_index = advance(state_k_acc_index, 1)
-            bars.mb_v_done[raw_index.idx].arrive()
+            if cutlass.const_expr(not cfg.transition_only):
+                bars.mb_v_done[raw_index.idx].arrive()
             bars.mb_beta_done[raw_index.idx].arrive()
             bars.mb_y_inp_ready.arrive()
 
@@ -1563,17 +1580,21 @@ def compute1_warp_group(
                     bars.mb_state_acc_read_done.arrive()
 
             # ---- Y staging: Y = Beta * (V - State*K) -----------------------------
-            bars.mb_v_ready[raw_index.idx].wait(raw_index.phase)
-            raw_v_frag0 = nvvm.ldmatrix(
-                sV_ptr + v_swz_off0,
-                4,
-                nvvm.MMALayout.COL,
-            )
-            raw_v_frag1 = nvvm.ldmatrix(
-                sV_ptr + v_swz_off,
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(cfg.transition_only):
+                raw_v_frag0 = tuple(cutlass.Int32(0) for _ in range(4))
+                raw_v_frag1 = tuple(cutlass.Int32(0) for _ in range(4))
+            else:
+                bars.mb_v_ready[raw_index.idx].wait(raw_index.phase)
+                raw_v_frag0 = nvvm.ldmatrix(
+                    sV_ptr + v_swz_off0,
+                    4,
+                    nvvm.MMALayout.COL,
+                )
+                raw_v_frag1 = nvvm.ldmatrix(
+                    sV_ptr + v_swz_off,
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             bars.mb_beta_ready[raw_index.idx].wait(raw_index.phase)
 
             # ---- read back State*K acc -------------------------------------------
@@ -1616,7 +1637,8 @@ def compute1_warp_group(
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(st_row16_addr + y_inp_col_id, cutlass.Int8), y_inp_pack1.load())
             nvvm.tcgen05_wait("store")
             state_k_acc_index = advance(state_k_acc_index, 1)
-            bars.mb_v_done[raw_index.idx].arrive()
+            if cutlass.const_expr(not cfg.transition_only):
+                bars.mb_v_done[raw_index.idx].arrive()
             bars.mb_beta_done[raw_index.idx].arrive()
             bars.mb_y_inp_ready.arrive()
 
@@ -1681,7 +1703,9 @@ def compute1_warp_group(
                 for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                     for col in cutlass.range_constexpr(32):
                         key_dim = key_block_start + col
-                        if cutlass.const_expr(mState_init is not None):
+                        if cutlass.const_expr(cfg.transition_only):
+                            mState_out[batch_idx, head_o, value_dim, key_dim] = (value_dim == key_dim).to(mState_out.element_type)
+                        elif cutlass.const_expr(mState_init is not None):
                             mState_out[batch_idx, head_o, value_dim, key_dim] = mState_init[batch_idx, head_o, value_dim, key_dim]
                         else:
                             mState_out[batch_idx, head_o, value_dim, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
@@ -1715,6 +1739,7 @@ class KdaRecomputeOp:
             f"c{int(cfg.enable_checkpoints)}l{int(cfg.l2norm)}"
             f"g{int(cfg.safe_gate)}b{int(cfg.beta_sigmoid)}d{int(cfg.dyn_sched)}"
             f"_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}{gate_scale}"
+            + ("_transition" if cfg.transition_only else "")
         )
 
     @cute.jit
@@ -1870,7 +1895,10 @@ def kernel(
         cute.make_layout((cfg.intermediate_cosize,))
     )
     sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
-    sV_raw = storage.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
+    sV_raw = (
+        sK_raw if cutlass.const_expr(cfg.transition_only)
+        else storage.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
+    )
     sGate_raw = storage.gate.get_tensor(cute.make_layout((cfg.gate_cosize,)))
     sState_scale_diag_raw = storage.state_scale_diag.get_tensor(
         cute.make_layout((cfg.state_scale_diag_cosize,))
@@ -2105,6 +2133,7 @@ class KdaRecomputeCfg:
     n_heads_out: int
     max_active_clusters: int
     dyn_sched: bool = False
+    transition_only: bool = False
     sched_stages: int = CFG.SMEM_SCHED_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
@@ -2179,6 +2208,7 @@ def build_cfg(
     n_heads_out: int,
     max_active_clusters: int,
     dyn_sched: bool = False,
+    transition_only: bool = False,
 ) -> KdaRecomputeCfg:
     """Build the per-compile ``KdaRecomputeCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
@@ -2199,6 +2229,7 @@ def build_cfg(
         n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         dyn_sched=dyn_sched,
+        transition_only=transition_only,
     )
     if enable_checkpoints:
         cfg.smem_raw_stages = 6
@@ -2252,7 +2283,7 @@ def build_cfg(
     assert (cfg.tmem_u_inp_offset + (cfg.b_t // 2)) <= 512
 
     cfg.k_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
-    cfg.v_cosize = cfg.smem_raw_stages * cfg.d_v * cfg.b_t
+    cfg.v_cosize = 0 if transition_only else cfg.smem_raw_stages * cfg.d_v * cfg.b_t
     cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
     cfg.beta_cosize = cfg.smem_raw_stages * cfg.b_t
     cfg.k_inv_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
@@ -2516,6 +2547,7 @@ def get_compiled_cache(
     device_major: int,
     device_minor: int,
     num_sm: int,
+    transition_only: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2539,6 +2571,7 @@ def compile(
     *,
     num_sm: int,
     checkpoint_every_n_tokens: int,
+    transition_only: bool = False,
 ):
     """JIT-compile one fake-tensor TVM-FFI recompute signature."""
     cfg = build_cfg(
@@ -2556,6 +2589,7 @@ def compile(
         n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         dyn_sched=dyn_sched,
+        transition_only=transition_only,
     )
     op = KdaRecomputeOp(cfg, use_int64_offsets)
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
@@ -2623,6 +2657,7 @@ def chunk_kda_recompute_sm100(
     order_in_prologue: bool = False,
     *,
     tensormap_workspace,
+    transition_only: bool = False,
 ) -> None:
     """Execute the Blackwell BT=16 chunked KDA recompute (state/checkpoints-only)
     kernel.
@@ -2633,7 +2668,7 @@ def chunk_kda_recompute_sm100(
 
     Args:
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
-        v: ``(total_tokens, HV, DV)`` float16/bfloat16
+        v: ``(total_tokens, HV, DV)`` float16/bfloat16; ignored for transition_only
         gate: ``(total_tokens, HO, DK)`` float32.  Natural-log decay unless
               ``safe_gate``, which applies the safe-gate transform
               ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``.
@@ -2650,6 +2685,9 @@ def chunk_kda_recompute_sm100(
         output_state_checkpoints: ``(total_checkpoints, HO, DV, DK)`` io-dtype (VK, K
             contiguous); per-sequence entry offsets are derived on device from
             ``cu_seqlens``, so there is no separate checkpoint-offset tensor.
+        transition_only: seed identity on chip and use zero V, defining the native approximate
+            right transition in ``state_next = state @ A + B``. Requires unsplit work items,
+            no initial state/checkpoints and a final-state output.
         use_qk_l2norm_in_kernel: L2-normalize k rows inside the kernel
         safe_gate: interpret ``gate`` through the safe-gate transform
         a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
@@ -2665,6 +2703,11 @@ def chunk_kda_recompute_sm100(
             every launch (``build_split_table`` does this when it is passed as
             ``sched_ctr``).  None keeps the static CTA stride.
     """
+    if transition_only:
+        if initial_state is not None or checkpoint_every_n_tokens or output_state is None:
+            raise ValueError("transition_only requires final state, no initial state or checkpoints")
+        # Keep the tensor ABI, but never read V or allocate its SMEM ring.
+        v = k
     for name, tensor in (("k", k), ("v", v), ("gate", gate)):
         validate_tma_tensor(name, tensor)
     for name, tensor in (
@@ -2782,6 +2825,7 @@ def chunk_kda_recompute_sm100(
         device_properties.major,
         device_properties.minor,
         num_sm,
+        transition_only,
     )
 
     io_dtype = get_dtype(k.dtype)
@@ -2803,6 +2847,7 @@ def chunk_kda_recompute_sm100(
             use_int64_offsets,
             num_sm=num_sm,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            transition_only=transition_only,
         )
 
     if "prologue" not in cache:
