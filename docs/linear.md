@@ -631,9 +631,46 @@ the maps carry Mega's 16-token-chunk rounding, so Mega under CP is its own numer
 neither the fused CP baseline nor unsharded Mega. The staged handles and this recipe are
 eager-only; `torch.compile` is not supported through them.
 
+### Document-parallel mode: never split a document
+
+If every fragment boundary is a document boundary, no rank needs another rank's state: each
+document runs from the zero state to its end on one rank, exactly as an unsharded call runs it.
+`document_parallel_kda` is that case with everything else removed: no summaries, no collectives,
+no compose. Its output and gradients are bitwise identical for any CP degree and any
+document-aligned fragment table, including CP=1, and with the fused backend they are bitwise the
+public `chunk_kda(autotune=False)`; with Mega the output is, and the gradients are Mega's own
+backward. It is also cheaper than the standard recipe, which computes and gathers summaries even
+for fragments that end their documents.
+
+```python
+from attn_gym.linear.context_parallel import ContextParallelPlan
+from attn_gym.linear.document_parallel import check_document_aligned
+from attn_gym.linear.kda import document_parallel_kda
+
+check_document_aligned(cu_seqlens_global, fragments)  # every cut is a document boundary
+plan = ContextParallelPlan.from_fragments(cu_seqlens_global, fragments, rank)
+ids = plan.global_token_ids(device)
+output = document_parallel_kda(
+    q[:, ids],
+    k[:, ids],
+    v[:, ids],
+    gate[:, ids],
+    beta[:, ids],
+    cu_seqlens=plan.routing(device).cu_seqlens,
+)
+```
+
+What it pins is the kernels: autotuning is off and Mega's forgetting-horizon split is rejected,
+because both let a document's bits depend on the span it is packed into. What it costs is
+balance: the loader can only cut at document boundaries, so a rank can be a document's worth of
+tokens off, and a document longer than a rank can hold has no document-aligned cut at all. That
+case needs the sequence to be split across ranks, which is what the standard recipe above does.
+
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
 ::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.kda.context_parallel.document_parallel_kda
 
 ::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
 

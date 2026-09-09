@@ -18,6 +18,7 @@ from attn_gym.linear.context_parallel import (
     StagedOp,
     context_parallel_chunk,
 )
+from attn_gym.linear.document_parallel import document_parallel_chunk
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
@@ -50,6 +51,35 @@ def context_parallel_kda(
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
+def document_parallel_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    scale: float | None = None,
+    fastmath: bool = False,
+    kernel_options: KernelOptions | None = None,
+) -> torch.Tensor:
+    """Run KDA over this rank's whole documents; bits do not depend on the CP degree or packing.
+
+    See NOTE [Document-aligned fragments] in ``attn_gym.linear.document_parallel``. Autotuning is
+    off and Mega's split schedules are rejected, since both would let a document's bits depend on
+    the span it is packed into; ``fastmath`` and the remaining ``kernel_options`` follow
+    ``chunk_kda``.
+    """
+    options = resolve_kernel_options(kernel_options)
+    if options.split_backward or options.split_forward:
+        raise ValueError(
+            "document_parallel_kda does not support split_forward/split_backward: the horizon"
+            " split depends on the span length, so a document's bits would depend on its packing"
+        )
+    stages = _kda_stages(scale, False, fastmath, kernel_options)
+    return document_parallel_chunk(stages, q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+
+
 def _kda_stages(
     scale: float | None, autotune: bool, fastmath: bool, kernel_options: KernelOptions | None
 ) -> StagedOp:
@@ -65,4 +95,4 @@ def _kda_stages(
     )
 
 
-__all__ = ["context_parallel_kda"]
+__all__ = ["context_parallel_kda", "document_parallel_kda"]
