@@ -5,7 +5,6 @@
 # unused by the vendored kernels were removed.
 
 
-
 import cutlass
 from cutlass import cute
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx

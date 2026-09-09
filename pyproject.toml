@@ -138,7 +138,6 @@ exclude = [
     "attn_gym/linear/_delta_rule/mega/kernels/kda_prefill_f16.py",
     "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_config.py",
     "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/tile_dsl",
 ]
 
 [tool.ruff.lint]

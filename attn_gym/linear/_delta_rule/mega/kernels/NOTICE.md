@@ -44,6 +44,11 @@ Changes made for Attention Gym:
   call the cached launch paths directly;
 - FP8 conversion and MMA helpers used only by upstream SDPA kernels were omitted from this
   linear-attention subset;
+- `tile_dsl/` helpers the vendored kernels never reach (cluster and multicast barriers, predicated
+  arrives, block-scaled MMAs, ldmatrix B-fragment loaders, cp.async tile loads, TMEM reduction
+  loads, `RegTile`, generic swizzles) were removed, and the remaining barrier, packed fp32, and
+  bulk-group helpers call the `cute.arch` wrappers instead of the raw primitives where the SASS
+  is unchanged;
 - split backward scheduling omits empty-sequence work items, preventing invalid persistent-kernel
   TMEM lifecycle transitions;
 - package-marker descriptions identify the vendored subset;
