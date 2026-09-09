@@ -37,7 +37,8 @@ NOTE [Single-Tile Documents]
 A document that fits in one tile has no state to carry: its tile enters with zero and nothing
 reads its map, so it is excluded from the summaries, the exchange, and the scan
 (``CanonicalTiling.summarized``). The exclusion depends on the tiling only, so the contract is
-unchanged, and on packings with many short documents it removes most of the recipe's overhead.
+unchanged, and on packings with many short documents it removes most of the recipe's overhead
+(measured by ``benchmarks/kda_cp_fragment_study.py``).
 """
 
 from __future__ import annotations

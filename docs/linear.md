@@ -690,7 +690,7 @@ Recorded runs on two GB200s at 32k tokens / 64 heads / five documents measured t
 1.22x / 0.85x standard CP forward/backward time for Mega, and 1.52x / 1.20x for fused (lower is
 better). With many short documents, tile 2048 can beat standard CP in both directions. These
 are eager KDA-operation timings, not end-to-end model measurements. Reproduce for your packing with
-`benchmarks/kda_cp_deterministic.py`.
+`benchmarks/kda_cp_deterministic.py` or `benchmarks/kda_cp_fragment_study.py`.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
