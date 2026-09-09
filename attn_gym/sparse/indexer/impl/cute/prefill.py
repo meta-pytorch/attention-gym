@@ -112,18 +112,6 @@ class IndexerWarpRole(IntEnum):
     SELECTOR_Q1 = 3
     MMA = 4
     LOAD = 5
-    END = 6
-
-
-@cute.struct
-class _SharedStorage:
-    k_barriers: cute.struct.MemRange[Int64, 2 * 2]
-    q_barriers: cute.struct.MemRange[Int64, 4 * 2]
-    acc0_barriers: cute.struct.MemRange[Int64, 4 * 2]
-    acc1_barriers: cute.struct.MemRange[Int64, 4 * 2]
-    mailbox0_barriers: cute.struct.MemRange[Int64, 4 * 2]
-    mailbox1_barriers: cute.struct.MemRange[Int64, 4 * 2]
-    tmem_holding: Int32
 
 
 def _make_shared_storage_type(config: IndexerConfig):
