@@ -21,8 +21,8 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd_wy_triton
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
-from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
@@ -61,8 +61,8 @@ def _prepare_chunk_kda_bwd(
     if Aqk is None:
         Aqk, Akk = chunk_kda_fwd_factors(q, k, g, beta, scale, metadata, chunk_size=chunk_size)
     assert Akk is not None
-    with profiler_range("kda/cute/backward_recompute_w_u"):
-        w, u, qg, kg = recompute_w_u_fwd(
+    with profiler_range("kda/triton/backward_recompute_w_u"):
+        w, u, qg, kg = recompute_w_u_fwd_triton(
             q=q,
             k=k,
             v=v,

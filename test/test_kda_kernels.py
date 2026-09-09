@@ -33,6 +33,7 @@ from attn_gym.linear.kda.fwd.triton.l2norm_fwd import (
     l2norm,
     l2norm_fwd_kernel,
 )
+from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 from attn_gym.linear.kda.naive import l2norm_bwd_ref, l2norm_fwd_ref
 from attn_gym.linear.kda.utils import IS_GATHER_SUPPORTED
 from attn_gym.testing.kda import (
@@ -64,7 +65,6 @@ try:
     from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import (
         chunk_kda_fwd_intra as chunk_kda_fwd_intra_cute,
     )
-    from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 
     HAS_CUTE = True
     CUTE_IMPORT_ERR = ""
@@ -911,7 +911,8 @@ def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
 
 
 def _recompute_wu_ref(k, v, beta, A, gk, q, chunk_size=64):
-    """Reference for ``recompute_w_u_fwd`` (per-chunk 64-token block, ``gk`` in log2 units)::
+    """Reference for ``recompute_w_u_fwd_triton`` (per-chunk 64-token block, ``gk`` in log2
+    units)::
 
     w  = A @ (k * beta * 2^gk)
     u  = A @ (v * beta)
@@ -938,8 +939,7 @@ def _recompute_wu_ref(k, v, beta, A, gk, q, chunk_size=64):
     return W, U, QG, KG
 
 
-@requires_cute
-def test_recompute_w_u_fwd_cute():
+def test_recompute_w_u_fwd_triton():
     num_chunks, H = 4, 4
     torch.manual_seed(20)
     B, K, V = 1, 128, 128
@@ -957,7 +957,7 @@ def test_recompute_w_u_fwd_cute():
     gk = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.5
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
 
-    w, u, qg, kg = recompute_w_u_fwd(
+    w, u, qg, kg = recompute_w_u_fwd_triton(
         k=k,
         v=v,
         beta=beta,

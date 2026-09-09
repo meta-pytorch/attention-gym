@@ -23,7 +23,6 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
     chunk_kda_fwd_k4b_ragged_cute,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
-from attn_gym.linear.kda.fwd.cute.recompute_w_u_fwd import recompute_w_u_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
@@ -33,6 +32,7 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k3_triton import (
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k4_triton import (
     chunk_kda_fwd_k4b_triton,
 )
+from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
 from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
@@ -137,11 +137,11 @@ def chunk_kda_fwd_intra(
         profile_ranges=profile_ranges,
     )
     with (
-        torch.profiler.record_function("kda/cute/recompute_w_u")
+        torch.profiler.record_function("kda/triton/recompute_w_u")
         if profile_ranges
         else nullcontext()
     ):
-        w, u, _qg, kg = recompute_w_u_fwd(
+        w, u, _qg, kg = recompute_w_u_fwd_triton(
             autotune=autotune,
             schedule=schedule,
             k=k,
