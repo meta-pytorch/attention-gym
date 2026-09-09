@@ -620,16 +620,18 @@ them out. `state_summaries` produces each range's `[B; A]` map (`S_exit = S_entr
 running Mega's state-only pass over the range twice: from a zero entry state, whose final state
 is `B`, and from an identity entry state with the value term disabled, whose final state is `A`.
 Which ranges are probed and how their rows are ordered is decided on the device, so the call is
-CUDA Graph replayable and an empty range yields the identity map. This requires every range to be
-a subsequence (one rank's piece of a document, one segment of the local `cu_seqlens`),
-which the CP recipe guarantees; a caller passing arbitrary 64-aligned ranges gets maps computed
-from the fused factors instead. `run` is Mega's forward from the composed entry state.
+CUDA Graph replayable and an empty range yields the identity map. Every range must be a
+subsequence (one rank's piece of a document, one segment of the local `cu_seqlens`), which is
+all the CP recipes ever request; a nonempty range that is not one is filled with NaN. `run` is
+Mega's forward from the composed entry state.
 
 *Backward.* `run` is Mega's own stateful backward (`kda_chunk_mega_packed_bwd_with_state`):
 the state pass from the saved entry state writes checkpoints, then the BT16 backward consumes
 them together with the exit cotangent, returning the token gradients and the entry-state
-cotangent. `state_grad_summaries` still computes the reverse maps from the fused factors, so the
-Mega backward under CP pays one fused factor pass over the local span in addition to its own.
+cotangent. `state_grad_summaries` produces each subsequence's `[C; R]` map with the same
+kernels: `C` is the entry-state cotangent of Mega's backward run with a zero exit cotangent, and
+`R` is the forward transition transposed. No fused factors are computed anywhere on the Mega
+path.
 
 *Numerics.* A document cut on 16-token boundaries whose fragments exchange Mega's own state and
 cotangent reproduces the unsharded Mega gradients bit for bit. The composed entry states do not:

@@ -252,18 +252,9 @@ def test_staged_mega_backward_is_the_native_op() -> None:
         chunk_mega_packed_bwd_with_state_op(*operands, initial_state, d_final_state, SCALE),
     )
 
-    # Arbitrary-range reverse summaries still come from the fused factors.
-    fused = chunk_kda_prepare(q, k, value, gate, beta, cu_seqlens=offsets)
-    fused_grads = chunk_kda_prepare_backward(
-        fused.saved, d_output, initial_state, scale=fused.scale
-    )
+    # Reverse maps are Mega's own probes (test_kda_mega_native_summary covers their contents).
     bounds = torch.tensor([[0, 100], [100, 256]], dtype=torch.int32, device="cuda")
-    torch.testing.assert_close(
-        grads.state_grad_summaries(bounds),
-        fused_grads.state_grad_summaries(bounds),
-        atol=0,
-        rtol=0,
-    )
+    assert grads.state_grad_summaries(bounds).shape == (2, 2, 256, 128)
     # Without an entry state the tape's backward keeps Mega's no-state arithmetic.
     no_state = chunk_kda_prepare_backward(prepared.saved, d_output, None, scale=prepared.scale)
     *no_state_grads, d_initial_state = no_state.run(None)

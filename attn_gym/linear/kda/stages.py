@@ -268,8 +268,8 @@ def chunk_kda_prepare(
     float16 or bfloat16 dtype (no silent cast, because the caller owns autograd), and the batch
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
-    ``kernel_options={"backend": "mega"}`` runs the local pass and the forward summaries with
-    Mega's kernels. Split schedules are not available with entry states.
+    ``kernel_options={"backend": "mega"}`` runs the local pass and both summaries with Mega's
+    kernels. Split schedules are not available with entry states.
     """
     backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
     if split_backward or split_forward:
@@ -384,9 +384,11 @@ class ChunkKDABackward:
 
 @dataclass
 class ChunkKDAMegaBackward:
-    """Mega backward handle: ``run`` is Mega's stateful backward.
+    """Mega backward handle: ``run`` is Mega's stateful backward and the reverse maps are Mega's.
 
-    Summaries recompute the fused factors on demand. Nothing is consumed, so ``run`` and
+    Each subsequence's ``[C; R]`` map is the entry cotangent of Mega's backward run with a zero
+    exit cotangent (``C``) and the forward transition transposed (``R``, the exact adjoint; a
+    natively probed adjoint would round differently). Nothing is consumed, so ``run`` and
     ``state_grad_summaries`` may be called in either order.
     """
 
@@ -400,29 +402,23 @@ class ChunkKDAMegaBackward:
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
-        Rows follow ``ChunkKDABackward.state_grad_summaries``.
+        Rows follow NOTE [Summary ranges are subsequences].
         """
+        from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_grad_summaries
+
         saved = self.saved
-        # The fused backward over the equivalent tape (no materialized factors) owns the recompute.
-        fused_saved = ChunkKDASaved(
+        return build_mega_state_grad_summaries(
             saved.q,
             saved.k,
             saved.v,
-            saved.cumulative_gate,
+            saved.gate,
             saved.beta,
-            None,
-            None,
-            saved.cu_seqlens,
-            saved.chunk_offsets,
-        )
-        return chunk_kda_prepare_backward(
-            fused_saved,
             self.d_output,
-            self.initial_state,
-            scale=self.scale,
-            autotune=self.autotune,
-            schedule=self.schedule,
-        ).state_grad_summaries(bounds)
+            saved.cu_seqlens,
+            self.scale,
+            transpose_forward_transition=True,
+            bounds=bounds,
+        )
 
     def run(
         self, d_final_state: torch.Tensor | None = None
