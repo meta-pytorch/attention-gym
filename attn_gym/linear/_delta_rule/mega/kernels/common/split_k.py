@@ -78,6 +78,7 @@ import math
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
+import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -87,7 +88,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import make_fake_strided_tensor
 
-from ..compat import current_device, data_ptr, get_device_properties, tensor_device_index
+from attn_gym._backends.cute.utils import get_device_properties
 
 from .elementwise import softplus
 from .host import get_dtype
@@ -955,7 +956,7 @@ def build_split_table(
     if gate_channels and gate.stride(2) != 1:
         raise ValueError("per-channel gate channels must be contiguous")
     if gate_channels and gate_channels % 128 == 0 and (
-        data_ptr(gate) % 16 != 0 or gate.stride(0) % 4 != 0 or gate.stride(1) % 4 != 0
+        gate.data_ptr() % 16 != 0 or gate.stride(0) % 4 != 0 or gate.stride(1) % 4 != 0
     ):
         raise ValueError(
             "per-channel gate rows and head slices must be 16-byte aligned "
@@ -990,8 +991,8 @@ def build_split_table(
         or not work_count.is_contiguous()
     ):
         raise ValueError("work_count must be contiguous int32 with shape (1,)")
-    device_index = tensor_device_index(cu_seqlens)
-    if current_device() != device_index:
+    device_index = cu_seqlens.get_device()
+    if torch.cuda.current_device() != device_index:
         raise ValueError("the active CUDA device must match cu_seqlens.device")
     device_properties = get_device_properties(device_index)
     if split:

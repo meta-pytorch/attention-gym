@@ -7,13 +7,13 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
 
 from .kernels import kda_prefill_f16 as kernel
 from .kernels.common.host import tensormap_workspace_bytes
-from .kernels.compat import get_device_properties, tensor_device_index
 from .schedule import prepare_mega_schedule
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
@@ -24,7 +24,7 @@ def validate_available(q: torch.Tensor) -> None:
     """Validate the device contract without launching asynchronous work."""
     if not q.is_cuda:
         raise ValueError("the Mega KDA backend requires CUDA tensors")
-    properties = get_device_properties(tensor_device_index(q))
+    properties = get_device_properties(q.device)
     if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
         raise ValueError("the CuTeDSL 4.7 KDA backend requires SM100 or SM103")
 

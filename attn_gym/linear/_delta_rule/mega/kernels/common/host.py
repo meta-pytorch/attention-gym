@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Attention Gym in 2026: dtype validation now uses exact supported names.
+# Modified by Attention Gym in 2026: dtype validation now uses exact supported names and the
+# checkpoint capacity bound moved here from the removed Torch compat shim.
 
 """Host-side helpers shared by the FROST LA kernel modules (engine-invoked)."""
 
@@ -32,3 +33,9 @@ def tensormap_workspace_bytes(mod, B: int) -> int:
     """Runtime TMA-descriptor block for a kernel module: per-batch arrays +
     static slots + 128 alignment slack."""
     return TENSOR_MAP_QWORDS * 8 * (mod.TENSORMAP_DESC_ARRAYS * B + mod.TENSORMAP_STATIC_SLOTS) + 128
+
+
+def checkpoint_capacity_bound(tokens: int, num_sequences: int, interval: int) -> int:
+    """Return the graph-safe checkpoint-row bound for packed sequences."""
+    nonempty = min(tokens, num_sequences)
+    return 0 if nonempty == 0 else nonempty + (tokens - nonempty) // interval

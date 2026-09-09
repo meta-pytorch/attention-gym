@@ -1088,8 +1088,7 @@ def test_mega_multistream_fullgraph_cuda_graph_replay(candidate) -> None:
 
 
 def test_mega_tma_validation_routes_oversized_singleton_stride_to_int64() -> None:
-    from attn_gym._backends.cute.utils import requires_int64_abi
-    from attn_gym.linear._delta_rule.mega.kernels.compat import validate_tma_tensor
+    from attn_gym._backends.cute.utils import requires_int64_abi, validate_tma_tensor
 
     tensor = torch.empty_strided(
         (1, 1, D),

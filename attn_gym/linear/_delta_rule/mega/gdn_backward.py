@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import torch
 
-from attn_gym.linear._delta_rule.mega.kernels.common.host import tensormap_workspace_bytes
-from attn_gym.linear._delta_rule.mega.kernels.compat import (
+from attn_gym._backends.cute.utils import initialized_cuda_device
+from attn_gym.linear._delta_rule.mega.kernels.common.host import (
     checkpoint_capacity_bound,
-    initialized_cuda_device,
+    tensormap_workspace_bytes,
 )
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv

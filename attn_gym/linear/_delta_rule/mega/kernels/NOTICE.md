@@ -37,7 +37,8 @@ Source mapping:
 Changes made for Attention Gym:
 
 - imports were moved from `cudnn.frost.*` into this package;
-- cuDNN host/device utilities were replaced by the Torch shim in `compat.py`;
+- cuDNN host/device utilities were replaced by Torch calls and `attn_gym._backends.cute.utils`
+  helpers (`get_device_properties`, `validate_tma_tensor`, `initialized_cuda_device`);
 - host dtype validation, device-aware compilation caching, role invariants, and stale documentation
   were tightened for the Attention Gym integration;
 - unused upstream forward, recompute, and bprop replay wrappers were removed; the public adapters
