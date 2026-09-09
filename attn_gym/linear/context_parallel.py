@@ -653,13 +653,18 @@ class PreparedForward(Protocol):
         ...
 
     def state_summaries(
-        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+        whole_sequences: bool = False,
     ) -> torch.Tensor:
         """One ``[HV, V + K, K]`` affine summary per ``[start, stop)`` row of ``bounds``.
 
-        ``deterministic_work=True`` pins the summary kernels' work partition so the result does
-        not depend on the span length, the range count, or the device (the deterministic CP
-        recipe requires it); the default keeps the throughput-oriented planner.
+        ``deterministic_work`` pins the summary kernels' work partition so the maps do not
+        depend on span length, range count, or SM count (the deterministic recipe needs this).
+        ``whole_sequences`` promises every nonempty row is a complete subsequence, letting an op
+        substitute a whole-sequence kernel.
         """
         ...
 
@@ -712,7 +717,7 @@ def summary_slots(prepared: PreparedForward, routing: ContextParallelRouting) ->
     Fragments whose last subsequence ends its sequence have an empty range and send the identity.
     """
     with profiler_range("cp/state_summaries"):
-        return prepared.state_summaries(routing.forward_bounds)
+        return prepared.state_summaries(routing.forward_bounds, whole_sequences=True)
 
 
 def grad_summary_slots(

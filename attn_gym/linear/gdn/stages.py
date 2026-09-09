@@ -76,7 +76,11 @@ class ChunkGDNPrepared:
     scale: float
 
     def state_summaries(
-        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+        whole_sequences: bool = False,
     ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
