@@ -13,11 +13,9 @@ def test_basic_correctness():
       k[0,1,:] = [0, 1]  -> dot = 0 -> relu = 0
     score = w * relu(dot) / sqrt(H*D) -> candidate 0 wins.
     """
-    q = torch.tensor([[[[1.0, 0.0]],
-                        [[0.0, 1.0]]]])      # [1,2,1,2]
-    k = torch.tensor([[[1.0, 0.0],
-                        [0.0, 1.0]]])         # [1,2,2]
-    w = torch.tensor([[[1.0], [1.0]]])        # [1,2,1]
+    q = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])  # [1,2,1,2]
+    k = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])  # [1,2,2]
+    w = torch.tensor([[[1.0], [1.0]]])  # [1,2,1]
 
     actual = index(q, k, w, topk=1)
 

@@ -18,8 +18,8 @@ def index(
     Computes:
         Attention matrix between q and k, reduces across heads (sum of scaled relu),
         then takes topk q_i* k_j attention score positions for each q_i
-        
-        
+
+
     Args:
         q: [B, T, H, D]
         k: [B, S, D]

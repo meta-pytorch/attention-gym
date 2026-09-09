@@ -82,9 +82,7 @@ def main() -> None:
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 
     print(f"device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
-    print(
-        f"shape: B={args.batch} H={args.heads} S={args.sequence_length} D={args.head_dim}"
-    )
+    print(f"shape: B={args.batch} H={args.heads} S={args.sequence_length} D={args.head_dim}")
     print(f"sparsity: topk={args.topk} causal={args.causal} dtype={args.dtype}")
 
     fwd_flops = useful_flops(args)

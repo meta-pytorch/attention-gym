@@ -7,9 +7,6 @@ backend runs and matches eager output under torch.compile.
 """
 
 import math
-import subprocess
-import sys
-import textwrap
 
 import pytest
 import torch
@@ -375,4 +372,3 @@ def test_cute_dynamic_fullgraph():
         actual = compiled(q, k, w, 16, causal=True, backend="cute")
         expected = index(q, k, w, 16, causal=True, backend="cute")
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
