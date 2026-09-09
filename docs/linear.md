@@ -606,8 +606,8 @@ fragment table, including CP=1**; for KDA they are also bitwise the public `chun
 else is required: no flag, no tiling, no change to the kernels. `document_aligned_fragments` in
 `examples/linear/delta_rule_context_parallel.py` (`--partition documents`) assigns whole documents
 to ranks, longest first onto the least-loaded rank, so ranks stay within one document's length of
-each other. What it cannot do is split a document that does not fit on one rank; that is what
-the summaries above are for.
+each other. What it cannot do is split a document that does not fit on one rank; that case is
+the deterministic mode below.
 
 ### Mega local execution
 
@@ -639,9 +639,66 @@ the maps carry Mega's 16-token-chunk rounding, so Mega under CP is its own numer
 neither the fused CP baseline nor unsharded Mega. The staged handles and this recipe are
 eager-only; `torch.compile` is not supported through them.
 
+### Deterministic mode: results independent of the CP degree
+
+`context_parallel_kda_deterministic` gives **bitwise-identical output and all input gradients
+across CP degrees**: pick a `tile_size`, cut fragments on its grid, call this entry point at
+every CP degree including 1 with the same backend and settings, and the bits are identical.
+Whole-tile ownership and neighboring packed documents do not change a document's result. This is
+a distinct numerical baseline from standard CP and unsharded `chunk_kda`; FP64 reference tests
+bound its error with the repository's BF16 budget.
+
+Each document is tiled from its first token with `tile_size` a positive multiple of 64; its last
+tile may be short. Fragment boundaries must coincide with tile boundaries. Each rank prepares
+its tiles as packed subsequences, using `deterministic_work=True` to pin summary arithmetic.
+The all-gathered maps are folded in document order with three-pass TF32; backward mirrors the
+fold over reverse maps. Single-tile documents need no summaries, exchange payload, or scan.
+
+```python
+from attn_gym.linear.context_parallel_deterministic import CanonicalTiling
+from attn_gym.linear.kda import context_parallel_kda_deterministic
+
+tiling = CanonicalTiling.from_fragments(cu_seqlens_global, fragments, rank, tile_size=1024)
+ids = tiling.global_token_ids(device)  # this rank's tiles, in span order
+routing = tiling.routing(device)  # index tensors; reuse while the layout is fixed
+output = context_parallel_kda_deterministic(
+    q[:, ids],
+    k[:, ids],
+    v[:, ids],
+    gate[:, ids],
+    beta[:, ids],
+    tiling=tiling,
+    routing=routing,
+    group=group,
+)
+```
+
+Every rank must call forward and backward equally often, including empty ranks. The API returns
+only local output, not final states. Autotuning is disabled. Fused and Mega use their own staged
+backwards; Mega's canonical reverse maps use native zero-exit cotangents plus the transposed
+forward transition, not fused-map or native backward-probe rounding. Mega's `split_forward` and
+`split_backward` are rejected: approximate horizon cuts would change the FP32 summary leaves.
+
+**Cost and fragment plans.** With `K = V = 128`, every summarized tile contributes an
+`H x 256 x 128` FP32 map (128 KiB per head). Every rank holds the gathered maps, including
+collective padding, plus entry states for its own tiles. Larger tiles reduce map overhead but
+can reduce leaf parallelism. Balance both tokens and tiles of multi-tile documents across ranks;
+cutting long documents on tile boundaries adds no summaries. Contiguous rank-order ownership
+with equal summarized-tile counts avoids the gathered-map placement copy.
+
+Recorded runs on two GB200s at 32k tokens / 64 heads / five documents measured tile 1024 at
+1.22x / 0.85x standard CP forward/backward time for Mega, and 1.52x / 1.20x for fused (lower is
+better). With many short documents, tile 2048 can beat standard CP in both directions. These
+are eager KDA-operation timings, not end-to-end model measurements. Reproduce for your packing with
+`benchmarks/kda_cp_deterministic.py`.
+
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 
 ::: attn_gym.linear.kda.context_parallel.context_parallel_kda
+
+::: attn_gym.linear.kda.context_parallel.context_parallel_kda_deterministic
+
+::: attn_gym.linear.context_parallel_deterministic.CanonicalTiling
 
 ::: attn_gym.linear.gdn.context_parallel.context_parallel_gdn
 

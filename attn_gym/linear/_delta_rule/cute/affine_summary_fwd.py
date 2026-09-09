@@ -1196,6 +1196,8 @@ def build_state_summaries(
     u: torch.Tensor,
     cumulative_gate: torch.Tensor,
     bounds: torch.Tensor,
+    *,
+    deterministic_work: bool = False,
 ) -> torch.Tensor:
     """Compute one packed affine state summary per token range of a stream's WY chunk factors.
 
@@ -1210,6 +1212,10 @@ def build_state_summaries(
             64-token chunk grid, ``stop`` on the grid or at the sequence's end (a partial last
             chunk is neutralized in-kernel). The values are not checked (that would sync);
             other ranges return a plausible but wrong map.
+        deterministic_work: Scan each range in one work item with a fixed SM100 column tile,
+            so the recurrence partition does not depend on span length, range count, or SM
+            count. The upstream factor kernels are not pinned; disable their autotuning
+            separately.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as state bias then state
@@ -1284,11 +1290,15 @@ def build_state_summaries(
         kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
         # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
         # BN=64 only when the extra column tiles would spill past one CTA wave and
-        # serialize whole recurrence chains.
-        state_bn = 32 if ranges * heads * (SUMMARY_DIM // 32) <= sm_count else 64
+        # serialize whole recurrence chains. Deterministic work pins BN=32.
+        one_wave = ranges * heads * (SUMMARY_DIM // 32) <= sm_count
+        state_bn = 32 if deterministic_work or one_wave else 64
     # The bounds live on the device, so the budget comes from the span's chunk count (a static
     # upper bound) and the device cuts the ranges' actual chunks into that many items.
-    budget = plan_work_budget(cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), sm_count)
+    if deterministic_work:
+        budget = 1
+    else:
+        budget = plan_work_budget(cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), sm_count)
     work, range_ids = work_table(bounds, budget)
     partials = torch.empty(
         (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device

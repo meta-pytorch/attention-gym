@@ -18,6 +18,11 @@ from attn_gym.linear.context_parallel import (
     StagedOp,
     context_parallel_chunk,
 )
+from attn_gym.linear.context_parallel_deterministic import (
+    CanonicalRouting,
+    CanonicalTiling,
+    context_parallel_chunk_deterministic,
+)
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
@@ -50,6 +55,40 @@ def context_parallel_kda(
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
+def context_parallel_kda_deterministic(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    tiling: CanonicalTiling,
+    group: dist.ProcessGroup,
+    routing: CanonicalRouting | None = None,
+    scale: float | None = None,
+    fastmath: bool = False,
+    kernel_options: KernelOptions | None = None,
+) -> torch.Tensor:
+    """Run KDA over this rank's canonical tiles; results do not depend on the CP degree.
+
+    See NOTE [Canonical Tiles] in ``attn_gym.linear.context_parallel_deterministic``. Autotuning
+    is disabled because a tuned configuration is part of the arithmetic and would have to be
+    identical on every rank; ``fastmath`` and ``kernel_options`` follow ``chunk_kda``, except
+    that Mega's forgetting-horizon split (``split_forward``/``split_backward``) is rejected: the
+    canonical tiles already bound every leaf, and a split leaf would change the FP32 summaries.
+    """
+    options = resolve_kernel_options(kernel_options)
+    if options.split_forward or options.split_backward:
+        raise ValueError(
+            "context_parallel_kda_deterministic does not support split_forward/split_backward: "
+            "canonical tiles fix every leaf, and a horizon split would change the summaries"
+        )
+    stages = _kda_stages(scale, False, fastmath, kernel_options)
+    return context_parallel_chunk_deterministic(
+        stages, q, k, v, gate, beta, tiling=tiling, group=group, routing=routing
+    )
+
+
 def _kda_stages(
     scale: float | None, autotune: bool, fastmath: bool, kernel_options: KernelOptions | None
 ) -> StagedOp:
@@ -65,4 +104,4 @@ def _kda_stages(
     )
 
 
-__all__ = ["context_parallel_kda"]
+__all__ = ["context_parallel_kda", "context_parallel_kda_deterministic"]

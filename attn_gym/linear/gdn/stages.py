@@ -75,7 +75,12 @@ class ChunkGDNPrepared:
     metadata: RaggedChunkMetadata | None
     scale: float
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         See ``attn_gym.linear.kda.stages.ChunkKDAPrepared.state_summaries`` for the contract.
@@ -87,6 +92,7 @@ class ChunkGDNPrepared:
             self.factors.u,
             _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
             bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -174,7 +180,9 @@ class ChunkGDNBackward:
             q, k, saved.cumulative_gate, self.scale, self.metadata
         )
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         See ``attn_gym.linear.kda.stages.ChunkKDABackward.state_grad_summaries``.
@@ -189,6 +197,7 @@ class ChunkGDNBackward:
             _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
             self.scale,
             bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
