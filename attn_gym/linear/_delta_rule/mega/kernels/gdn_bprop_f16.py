@@ -105,8 +105,9 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : epilogue warp   - store dQ, dK, dV to global memory
 """
 
-from dataclasses import dataclass
-from functools import cache, partial
+from dataclasses import dataclass, replace
+from functools import partial
+from pathlib import Path
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
@@ -116,7 +117,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 from cutlass.experimental import cuda
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.elementwise import softplus
@@ -5235,7 +5236,7 @@ def kernel(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnBwdCfg:
     """Static BT=64 scalar-GDN backward-kernel configuration."""
 
@@ -5369,66 +5370,53 @@ def build_cfg(
         if len(group) != 4 or group != tuple(range(group[0], group[-1] + 1)):
             raise ValueError("the fixed schedule requires contiguous four-warp compute groups")
 
-    cfg.threads_per_cta = len(role_ids) * cfg.threads_per_warp
-    cfg.tmem_alloc_barrier_threads = (
-        1 + len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids)
-    ) * cfg.threads_per_warp
-    cfg.inverse_barrier_threads = len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp
-    cfg.inverse_inner_barrier_threads = 2 * cfg.threads_per_warp
-    cfg.init_state_store_barrier_threads = len(cfg.compute_group_1_warp_ids) * cfg.threads_per_warp
-    cfg.cg1_barrier_threads = len(cfg.compute_group_1_warp_ids) * cfg.threads_per_warp
-
-    cfg.tmem_dstate_acc_offset = 0
-    cfg.tmem_dvdk_acc_offset = cfg.tmem_dstate_acc_offset + cfg.tmem_dstate_acc_stages * 128
-    cfg.tmem_dstate_inp_offset = cfg.tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * 64
-    cfg.tmem_shared_acc_offset = cfg.tmem_dstate_inp_offset + cfg.tmem_dstate_inp_stages * 64
-    cfg.tmem_shared_inp_offset = cfg.tmem_shared_acc_offset + cfg.tmem_shared_acc_stages * 64
-    cfg.tmem_y_offset = cfg.tmem_shared_inp_offset + cfg.tmem_shared_inp_stages * (cfg.b_t // 2)
-    if cfg.tmem_y_offset + cfg.b_t // 2 > 512:
+    tmem_dstate_acc_offset = 0
+    tmem_dvdk_acc_offset = tmem_dstate_acc_offset + cfg.tmem_dstate_acc_stages * 128
+    tmem_dstate_inp_offset = tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * 64
+    tmem_shared_acc_offset = tmem_dstate_inp_offset + cfg.tmem_dstate_inp_stages * 64
+    tmem_shared_inp_offset = tmem_shared_acc_offset + cfg.tmem_shared_acc_stages * 64
+    tmem_y_offset = tmem_shared_inp_offset + cfg.tmem_shared_inp_stages * (cfg.b_t // 2)
+    if tmem_y_offset + cfg.b_t // 2 > 512:
         raise ValueError("BT=64 GDN TMEM layout exceeds 512 columns")
 
-    cfg.q_cosize = cfg.smem_q_stages * cfg.b_t * cfg.d_k
-    cfg.k_cosize = cfg.smem_k_stages * cfg.b_t * cfg.d_k
-    cfg.v_cosize = cfg.smem_v_stages * cfg.b_t * cfg.d_v
-    cfg.do_cosize = cfg.smem_do_stages * cfg.b_t * cfg.d_v
-    cfg.state_cosize = cfg.smem_state_stages * cfg.d_k * cfg.d_v
-    cfg.t_inv_cosize = cfg.smem_t_inv_stages * cfg.b_t * cfg.b_t
-    cfg.a_cosize = cfg.smem_a_stages * cfg.b_t * cfg.b_t
-    cfg.dq_cosize = cfg.smem_dq_stages * cfg.b_t * cfg.d_k
-    cfg.dk_cosize = cfg.smem_dk_stages * cfg.b_t * cfg.d_k
-    cfg.dv_cosize = cfg.smem_dv_stages * cfg.b_t * cfg.d_v
     element_bytes = io_dtype.width // 8
-    cfg.tma_q_bytes = cfg.b_t * cfg.d_k * element_bytes
-    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * element_bytes
-    cfg.tma_v_bytes = cfg.b_t * cfg.d_v * element_bytes
-    cfg.tma_do_bytes = cfg.b_t * cfg.d_v * element_bytes
-    cfg.tma_state_bytes = cfg.d_k * cfg.d_v * element_bytes
-    return cfg
+    return replace(
+        cfg,
+        threads_per_cta=len(role_ids) * cfg.threads_per_warp,
+        tmem_alloc_barrier_threads=(
+            1 + len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids)
+        )
+        * cfg.threads_per_warp,
+        inverse_barrier_threads=len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp,
+        inverse_inner_barrier_threads=2 * cfg.threads_per_warp,
+        init_state_store_barrier_threads=len(cfg.compute_group_1_warp_ids) * cfg.threads_per_warp,
+        cg1_barrier_threads=len(cfg.compute_group_1_warp_ids) * cfg.threads_per_warp,
+        tmem_dstate_acc_offset=tmem_dstate_acc_offset,
+        tmem_dvdk_acc_offset=tmem_dvdk_acc_offset,
+        tmem_dstate_inp_offset=tmem_dstate_inp_offset,
+        tmem_shared_acc_offset=tmem_shared_acc_offset,
+        tmem_shared_inp_offset=tmem_shared_inp_offset,
+        tmem_y_offset=tmem_y_offset,
+        q_cosize=cfg.smem_q_stages * cfg.b_t * cfg.d_k,
+        k_cosize=cfg.smem_k_stages * cfg.b_t * cfg.d_k,
+        v_cosize=cfg.smem_v_stages * cfg.b_t * cfg.d_v,
+        do_cosize=cfg.smem_do_stages * cfg.b_t * cfg.d_v,
+        state_cosize=cfg.smem_state_stages * cfg.d_k * cfg.d_v,
+        t_inv_cosize=cfg.smem_t_inv_stages * cfg.b_t * cfg.b_t,
+        a_cosize=cfg.smem_a_stages * cfg.b_t * cfg.b_t,
+        dq_cosize=cfg.smem_dq_stages * cfg.b_t * cfg.d_k,
+        dk_cosize=cfg.smem_dk_stages * cfg.b_t * cfg.d_k,
+        dv_cosize=cfg.smem_dv_stages * cfg.b_t * cfg.d_v,
+        tma_q_bytes=cfg.b_t * cfg.d_k * element_bytes,
+        tma_k_bytes=cfg.b_t * cfg.d_k * element_bytes,
+        tma_v_bytes=cfg.b_t * cfg.d_v * element_bytes,
+        tma_do_bytes=cfg.b_t * cfg.d_v * element_bytes,
+        tma_state_bytes=cfg.d_k * cfg.d_v * element_bytes,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 8
 TENSORMAP_STATIC_SLOTS = 0
-
-
-@cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    h_q: int,
-    h_k: int,
-    h_v: int,
-    use_dstate_in: bool,
-    use_dstate0: bool,
-    use_initial_state: bool,
-    dyn_sched: bool,
-    run_order: bool,
-    order_gen: bool,
-    use_int64_offsets: bool,
-    device_index: int,
-    device_major: int,
-    device_minor: int,
-    num_sm: int,
-):
-    return {}
 
 
 def _validate_scalar_fp32(name, tensor, expected_shape) -> None:
@@ -5442,6 +5430,135 @@ def _validate_scalar_fp32(name, tensor, expected_shape) -> None:
         raise ValueError(f"{name} innermost stride must be one")
     if any(stride < 0 for stride in tensor.stride()[:-1]):
         raise ValueError(f"{name} outer strides must be nonnegative")
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_gdn_bprop(
+    io_dtype: type[cutlass.Numeric],
+    h_q: int,
+    h_k: int,
+    h_v: int,
+    h_out: int,
+    use_initial_state: bool,
+    use_dstate_in: bool,
+    use_dstate0: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+    num_sm: int,
+    scale: float,
+):
+    """JIT-compile one fake-tensor TVM-FFI backward signature."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    cfg = build_cfg(
+        io_dtype,
+        use_initial_state=use_initial_state,
+        use_dstate_in=use_dstate_in,
+        use_dstate0=use_dstate0,
+        q_ratio=h_out // h_q,
+        k_ratio=h_out // h_k,
+        v_ratio=h_out // h_v,
+        n_heads_out=h_out,
+        max_active_clusters=num_sm,
+        dyn_sched=dyn_sched,
+    )
+    op = GdnBpropOp(cfg, use_int64_offsets)
+    tokens_sym, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
+    scalar_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=4,
+        use_int64_offsets=use_int64_offsets,
+    )
+    return compile_tvm_ffi(
+        op,
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        None,
+        None,
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        make_cu_seqlens_signature(sequence_entries),
+        make_strided_signature_tensor(
+            cutlass.Float32,
+            (sequences, h_out, CFG.D_V, CFG.D_K),
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+        )
+        if use_dstate0
+        else None,
+        make_strided_signature_tensor(
+            cutlass.Float32,
+            (sequences, h_out, CFG.D_V, CFG.D_K),
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+        )
+        if use_dstate_in
+        else None,
+        make_work_items_signature(work_rows),
+        make_counter_signature(),
+        make_counter_signature(sched_entries) if dyn_sched else None,
+        make_workspace_signature(workspace_words),
+        cutlass.Float32(scale),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_gdn_bprop_prologue(
+    io_dtype: type[cutlass.Numeric],
+    h_q: int,
+    h_k: int,
+    h_v: int,
+    h_out: int,
+    run_order: bool,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    (
+        tokens_sym,
+        checkpoint_rows,
+        sequence_entries,
+        work_rows,
+        sched_entries,
+        workspace_words,
+    ) = (sym_int() for _ in range(6))
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
+        tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_V)),
+        tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
+        tma_tensor(io_dtype, (checkpoint_rows, h_out, CFG.D_V, CFG.D_K)),
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if run_order and not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        name=(
+            f"gdn_mega_bprop_prologue_{io_dtype.__name__.lower()}"
+            f"_hq{h_q}_hk{h_k}_hv{h_v}_ho{h_out}_r{int(run_order)}"
+            f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+        ),
+    )
 
 
 def chunk_gdn_bwd_sm100(
@@ -5609,124 +5726,35 @@ def chunk_gdn_bwd_sm100(
         raise ValueError("the active CUDA device must match q.device")
     device_properties = get_device_properties(device_index)
     num_sm = device_properties.multi_processor_count
-    cache = get_compiled_cache(
-        str(q.dtype),
+    io_dtype = get_dtype(q.dtype)
+    compiled = _compile_gdn_bprop(
+        io_dtype,
         h_q,
         h_k,
         h_v,
+        h_out,
+        use_initial_state,
         use_dstate_in,
         use_dstate0,
-        use_initial_state,
         dyn_sched,
-        run_order,
-        order_gen,
         use_int64_offsets,
-        device_index,
-        device_properties.major,
-        device_properties.minor,
         num_sm,
+        scale,
     )
 
-    io_dtype = get_dtype(q.dtype)
-    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-    if "compiled" not in cache:
-        cfg = build_cfg(
-            io_dtype,
-            use_initial_state=use_initial_state,
-            use_dstate_in=use_dstate_in,
-            use_dstate0=use_dstate0,
-            q_ratio=h_out // h_q,
-            k_ratio=h_out // h_k,
-            v_ratio=h_out // h_v,
-            n_heads_out=h_out,
-            max_active_clusters=num_sm,
-            dyn_sched=dyn_sched,
-        )
-        op = GdnBpropOp(cfg, use_int64_offsets)
-        tokens_sym, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(6)
-        )
-        scalar_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=4,
-            use_int64_offsets=use_int64_offsets,
-        )
-        cache["compiled"] = compile_tvm_ffi(
-            op,
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            None,
-            None,
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            make_cu_seqlens_signature(sequence_entries),
-            make_strided_signature_tensor(
-                cutlass.Float32,
-                (sequences, h_out, CFG.D_V, CFG.D_K),
-                assumed_align=16,
-                use_int64_offsets=use_int64_offsets,
-            )
-            if use_dstate0
-            else None,
-            make_strided_signature_tensor(
-                cutlass.Float32,
-                (sequences, h_out, CFG.D_V, CFG.D_K),
-                assumed_align=16,
-                use_int64_offsets=use_int64_offsets,
-            )
-            if use_dstate_in
-            else None,
-            make_work_items_signature(work_rows),
-            make_counter_signature(),
-            make_counter_signature(sched_entries) if dyn_sched else None,
-            make_workspace_signature(workspace_words),
-            cutlass.Float32(scale),
-        )
-
-    if "prologue" not in cache:
-        (
-            tokens_sym,
-            checkpoint_rows,
-            sequence_entries,
-            work_rows,
-            sched_entries,
-            workspace_words,
-        ) = (sym_int() for _ in range(6))
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            run_order,
-            order_gen,
-            has_sched,
-            tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
-            tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_V)),
-            tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
-            tma_tensor(io_dtype, (checkpoint_rows, h_out, CFG.D_V, CFG.D_K)),
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if run_order and not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            name=(
-                f"gdn_mega_bprop_prologue_{io_dtype.__name__.lower()}"
-                f"_hq{h_q}_hk{h_k}_hv{h_v}_ho{h_out}_r{int(run_order)}"
-                f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
-            ),
-        )
-
-    cache["prologue"](
+    compiled_prologue = _compile_gdn_bprop_prologue(
+        io_dtype,
+        h_q,
+        h_k,
+        h_v,
+        h_out,
+        run_order,
+        order_gen,
+        has_sched,
+        dyn_sched,
+        use_int64_offsets,
+    )
+    compiled_prologue(
         q,
         k,
         v,
@@ -5742,7 +5770,7 @@ def chunk_gdn_bwd_sm100(
         sched_all if run_order else None,
         tensormap_workspace,
     )
-    cache["compiled"](
+    compiled(
         gate,
         None,
         None,

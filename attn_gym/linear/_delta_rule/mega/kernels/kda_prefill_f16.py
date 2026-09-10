@@ -86,8 +86,9 @@ GEMM schedule (tcgen05-MMA warp, in issue order per chunk):
 Requires the public CuTeDSL 4.7 API, including `cutlass.experimental.*`.
 """
 
-from dataclasses import dataclass
-from functools import lru_cache, partial
+from dataclasses import dataclass, replace
+from functools import partial
+from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -97,7 +98,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
@@ -2367,7 +2368,7 @@ def kernel(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class KdaCfg:
     """Kernel cfg (fixed BT=16 schedule constants; derived TMEM column offsets
     and SMEM buffer cosizes are stamped by ``build_cfg``; per-stage sizes are
@@ -2477,7 +2478,9 @@ def build_cfg(
     """Build the per-compile ``KdaCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
     if io_dtype not in (cutlass.Float16, cutlass.BFloat16):
-        raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
+        raise ValueError(
+            f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported"
+        )
     if paged_state and not (use_initial_state and store_final_state):
         raise ValueError("paged_state requires an aliased input/output state pool")
     cfg = KdaCfg(
@@ -2498,7 +2501,7 @@ def build_cfg(
         max_active_clusters=max_active_clusters,
         dyn_sched=dyn_sched,
     )
-    cfg.smem_raw_bar_stages = cfg.smem_raw_stages + (cfg.smem_raw_stages % 2)
+    smem_raw_bar_stages = cfg.smem_raw_stages + (cfg.smem_raw_stages % 2)
     role_ids = (
         *cfg.compute_group_0_warp_ids,
         *cfg.compute_group_1_warp_ids,
@@ -2512,57 +2515,66 @@ def build_cfg(
     for group in (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids):
         if not group or group != tuple(range(group[0], group[-1] + 1)):
             raise ValueError("compute warp groups must be nonempty and use contiguous IDs")
-    cfg.threads_per_cta = len(role_ids) * cfg.threads_per_warp
     if cfg.cg0_warps_per_group != 4:
         raise ValueError("the fixed schedule requires four warps per compute group 0 subgroup")
     if len(cfg.compute_group_0_warp_ids) % cfg.cg0_warps_per_group:
         raise ValueError("compute group 0 must divide evenly into ping-pong warp groups")
-    cfg.cg0_group_count = len(cfg.compute_group_0_warp_ids) // cfg.cg0_warps_per_group
-    if cfg.cg0_group_count != 2:
+    cg0_group_count = len(cfg.compute_group_0_warp_ids) // cfg.cg0_warps_per_group
+    if cg0_group_count != 2:
         raise ValueError("the fixed schedule requires two compute group 0 ping-pong subgroups")
-    cfg.cg0_threads_per_group = cfg.cg0_warps_per_group * cfg.threads_per_warp
-    cfg.tmem_user_threads = (1 + len(cfg.compute_group_1_warp_ids)) * cfg.threads_per_warp
     named_barrier_ids = (
         *range(
             cfg.cg0_group_sync_barrier_base_id,
-            cfg.cg0_group_sync_barrier_base_id + cfg.cg0_group_count,
+            cfg.cg0_group_sync_barrier_base_id + cg0_group_count,
         ),
         cfg.tmem_lifecycle_barrier_id,
         cfg.cg0_tile_entry_barrier_id,
     )
-    if (
-        any(not 1 <= barrier_id <= 15 for barrier_id in named_barrier_ids)
-        or len(set(named_barrier_ids)) != len(named_barrier_ids)
-    ):
+    if any(not 1 <= barrier_id <= 15 for barrier_id in named_barrier_ids) or len(
+        set(named_barrier_ids)
+    ) != len(named_barrier_ids):
         raise ValueError("named barrier IDs must be disjoint values in [1, 15]")
     if cfg.smem_state_scale_diag_stages != cfg.qk_scale_ready_stages:
         raise ValueError("diag and qk-scale ready rings must share their rolling stage")
 
-    cfg.tmem_state_inp_offset = cfg.tmem_state_acc_offset + cfg.d_k
-    cfg.tmem_q_state_acc_offset = cfg.tmem_state_inp_offset + (cfg.d_k // 2)
-    cfg.tmem_state_k_acc_offset = cfg.tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
-    cfg.tmem_u_acc_offset = cfg.tmem_state_k_acc_offset + cfg.b_t
-    cfg.tmem_y_inp_offset = cfg.tmem_u_acc_offset + cfg.b_t
-    cfg.tmem_u_inp_offset = cfg.tmem_y_inp_offset + (cfg.b_t // 2)
-    assert (cfg.tmem_u_inp_offset + (cfg.b_t // 2)) <= 512
+    tmem_state_inp_offset = cfg.tmem_state_acc_offset + cfg.d_k
+    tmem_q_state_acc_offset = tmem_state_inp_offset + (cfg.d_k // 2)
+    tmem_state_k_acc_offset = tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
+    tmem_u_acc_offset = tmem_state_k_acc_offset + cfg.b_t
+    tmem_y_inp_offset = tmem_u_acc_offset + cfg.b_t
+    tmem_u_inp_offset = tmem_y_inp_offset + (cfg.b_t // 2)
+    assert (tmem_u_inp_offset + (cfg.b_t // 2)) <= 512
 
-    cfg.q_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
-    cfg.k_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
-    cfg.v_cosize = cfg.smem_raw_stages * cfg.d_v * cfg.b_t
-    cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
-    cfg.beta_cosize = cfg.smem_raw_bar_stages * cfg.b_t
-    cfg.k_inv_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
-    cfg.k_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.q_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.k_restore_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.state_scale_diag_cosize = cfg.smem_state_scale_diag_stages * (cfg.d_k // 16) * 256
-    cfg.o_cosize = cfg.smem_o_stages * cfg.b_t * cfg.d_v
-    cfg.intermediate_cosize = cfg.smem_intermediate_stages * 2 * cfg.b_t * cfg.b_t
-    cfg.tma_q_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_k_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_v_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * 4
-    return cfg
+    return replace(
+        cfg,
+        smem_raw_bar_stages=smem_raw_bar_stages,
+        threads_per_cta=len(role_ids) * cfg.threads_per_warp,
+        cg0_group_count=cg0_group_count,
+        cg0_threads_per_group=cfg.cg0_warps_per_group * cfg.threads_per_warp,
+        tmem_user_threads=(1 + len(cfg.compute_group_1_warp_ids)) * cfg.threads_per_warp,
+        tmem_state_inp_offset=tmem_state_inp_offset,
+        tmem_q_state_acc_offset=tmem_q_state_acc_offset,
+        tmem_state_k_acc_offset=tmem_state_k_acc_offset,
+        tmem_u_acc_offset=tmem_u_acc_offset,
+        tmem_y_inp_offset=tmem_y_inp_offset,
+        tmem_u_inp_offset=tmem_u_inp_offset,
+        q_cosize=cfg.smem_raw_stages * cfg.d_k * cfg.b_t,
+        k_cosize=cfg.smem_raw_stages * cfg.d_k * cfg.b_t,
+        v_cosize=cfg.smem_raw_stages * cfg.d_v * cfg.b_t,
+        gate_cosize=cfg.smem_raw_stages * cfg.d_k * cfg.b_t,
+        beta_cosize=smem_raw_bar_stages * cfg.b_t,
+        k_inv_cosize=cfg.smem_decay_stages * cfg.b_t * cfg.d_k,
+        k_decay_cosize=cfg.smem_decay_stages * cfg.d_k * cfg.b_t,
+        q_decay_cosize=cfg.smem_decay_stages * cfg.d_k * cfg.b_t,
+        k_restore_cosize=cfg.smem_decay_stages * cfg.d_k * cfg.b_t,
+        state_scale_diag_cosize=cfg.smem_state_scale_diag_stages * (cfg.d_k // 16) * 256,
+        o_cosize=cfg.smem_o_stages * cfg.b_t * cfg.d_v,
+        intermediate_cosize=cfg.smem_intermediate_stages * 2 * cfg.b_t * cfg.b_t,
+        tma_q_bytes=cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8),
+        tma_k_bytes=cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8),
+        tma_v_bytes=cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8),
+        tma_gate_bytes=cfg.d_k * cfg.b_t * 4,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 5  # per-batch runtime TMA descriptors: Q, K, V, Gate, O
@@ -2809,34 +2821,8 @@ def prologue(
 # ---- Torch adapter / host-side compilation ---------------------------------------
 
 
-@lru_cache(maxsize=None)
-def get_compiled_cache(
-    io_dtype_str: str,
-    state_dtype_str: str,
-    HQ: int,
-    HK: int,
-    HV: int,
-    use_initial_state: bool,
-    store_final_state: bool,
-    l2norm: bool,
-    safe_gate: bool,
-    gate_lower_bound: float,
-    beta_sigmoid: bool,
-    dyn_sched: bool,
-    order_gen: bool,
-    use_int64_offsets: bool,
-    paged_state: bool,
-    has_initial_state_mask: bool,
-    device_index: int,
-    device_major: int,
-    device_minor: int,
-    num_sm: int,
-):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
-
-
-def compile(
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_kda_prefill(
     io_dtype,
     state_dtype,
     use_initial_state: bool,
@@ -2938,6 +2924,55 @@ def compile(
         make_counter_signature(sched_entries) if dyn_sched else None,
         make_workspace_signature(workspace_words),
         cutlass.Float32(scale),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_kda_prefill_prologue(
+    io_dtype: type[cutlass.Numeric],
+    HQ: int,
+    HK: int,
+    HV: int,
+    HO: int,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, sequence_entries, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(5)
+    )
+
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens, HQ, 128)),
+        tma_tensor(io_dtype, (tokens, HK, 128)),
+        tma_tensor(io_dtype, (tokens, HV, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (tokens, HO, 128)),
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        name=(
+            f"kda_mega_prefill_prologue_{io_dtype.__name__.lower()}"
+            f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}"
+            f"_o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+        ),
     )
 
 
@@ -3089,88 +3124,40 @@ def chunk_kda_sm100(
         raise ValueError("the active CUDA device must match q.device")
     device_properties = get_device_properties(device_index)
     num_sm = device_properties.multi_processor_count
-    cache = get_compiled_cache(
-        str(q.dtype),
-        str(state_dtype_src),
-        HQ,
-        HK,
-        HV,
+    io_dtype = get_dtype(q.dtype)
+    compiled = _compile_kda_prefill(
+        io_dtype,
+        get_dtype(state_dtype_src),
         use_initial_state,
         store_final_state,
         use_qk_l2norm_in_kernel,
         safe_gate,
-        gate_lower_bound,
+        gate_scale_log2,
         use_beta_sigmoid_in_kernel,
+        q_ratio,
+        k_ratio,
+        v_ratio,
+        HO,
         dyn_sched,
-        order_gen,
         use_int64_offsets,
-        paged_state,
-        has_initial_state_mask,
-        device_index,
-        device_properties.major,
-        device_properties.minor,
-        num_sm,
+        num_sm=num_sm,
+        scale=scale,
+        paged_state=paged_state,
+        has_initial_state_mask=has_initial_state_mask,
     )
 
-    io_dtype = get_dtype(q.dtype)
-    if "compiled" not in cache:
-        cache["compiled"] = compile(
-            io_dtype,
-            get_dtype(state_dtype_src),
-            use_initial_state,
-            store_final_state,
-            use_qk_l2norm_in_kernel,
-            safe_gate,
-            gate_scale_log2,
-            use_beta_sigmoid_in_kernel,
-            q_ratio,
-            k_ratio,
-            v_ratio,
-            HO,
-            dyn_sched,
-            use_int64_offsets,
-            num_sm=num_sm,
-            scale=scale,
-            paged_state=paged_state,
-            has_initial_state_mask=has_initial_state_mask,
-        )
-
-    if "prologue" not in cache:
-        sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-        tokens, sequence_entries, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(5)
-        )
-
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            order_gen,
-            has_sched,
-            tma_tensor(io_dtype, (tokens, HQ, 128)),
-            tma_tensor(io_dtype, (tokens, HK, 128)),
-            tma_tensor(io_dtype, (tokens, HV, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (tokens, HO, 128)),
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            name=(
-                f"kda_mega_prefill_prologue_{io_dtype.__name__.lower()}"
-                f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}"
-                f"_o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
-            ),
-        )
-    cache["prologue"](
+    compiled_prologue = _compile_kda_prefill_prologue(
+        io_dtype,
+        HQ,
+        HK,
+        HV,
+        HO,
+        order_gen,
+        has_sched,
+        dyn_sched,
+        use_int64_offsets,
+    )
+    compiled_prologue(
         q,
         k,
         v,
@@ -3183,7 +3170,7 @@ def chunk_kda_sm100(
         sched_ctr,
         tensormap_workspace,
     )
-    cache["compiled"](
+    compiled(
         q,
         k,
         v,
