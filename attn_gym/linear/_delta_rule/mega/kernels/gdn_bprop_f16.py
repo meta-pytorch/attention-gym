@@ -107,6 +107,7 @@ Warp assignments (12 warps = 384 threads):
 
 from dataclasses import dataclass
 from functools import cache, partial
+from pathlib import Path
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
@@ -116,7 +117,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 from cutlass.experimental import cuda
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.elementwise import softplus
@@ -5444,6 +5445,135 @@ def _validate_scalar_fp32(name, tensor, expected_shape) -> None:
         raise ValueError(f"{name} outer strides must be nonnegative")
 
 
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile(
+    io_dtype: type[cutlass.Numeric],
+    h_q: int,
+    h_k: int,
+    h_v: int,
+    h_out: int,
+    use_initial_state: bool,
+    use_dstate_in: bool,
+    use_dstate0: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+    num_sm: int,
+    scale: float,
+):
+    """JIT-compile one fake-tensor TVM-FFI backward signature."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    cfg = build_cfg(
+        io_dtype,
+        use_initial_state=use_initial_state,
+        use_dstate_in=use_dstate_in,
+        use_dstate0=use_dstate0,
+        q_ratio=h_out // h_q,
+        k_ratio=h_out // h_k,
+        v_ratio=h_out // h_v,
+        n_heads_out=h_out,
+        max_active_clusters=num_sm,
+        dyn_sched=dyn_sched,
+    )
+    op = GdnBpropOp(cfg, use_int64_offsets)
+    tokens_sym, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
+    scalar_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=4,
+        use_int64_offsets=use_int64_offsets,
+    )
+    return compile_tvm_ffi(
+        op,
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        None,
+        None,
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
+        make_cu_seqlens_signature(sequence_entries),
+        make_strided_signature_tensor(
+            cutlass.Float32,
+            (sequences, h_out, CFG.D_V, CFG.D_K),
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+        )
+        if use_dstate0
+        else None,
+        make_strided_signature_tensor(
+            cutlass.Float32,
+            (sequences, h_out, CFG.D_V, CFG.D_K),
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+        )
+        if use_dstate_in
+        else None,
+        make_work_items_signature(work_rows),
+        make_counter_signature(),
+        make_counter_signature(sched_entries) if dyn_sched else None,
+        make_workspace_signature(workspace_words),
+        cutlass.Float32(scale),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile_prologue(
+    io_dtype: type[cutlass.Numeric],
+    h_q: int,
+    h_k: int,
+    h_v: int,
+    h_out: int,
+    run_order: bool,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    (
+        tokens_sym,
+        checkpoint_rows,
+        sequence_entries,
+        work_rows,
+        sched_entries,
+        workspace_words,
+    ) = (sym_int() for _ in range(6))
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
+        tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_V)),
+        tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
+        tma_tensor(io_dtype, (checkpoint_rows, h_out, CFG.D_V, CFG.D_K)),
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if run_order and not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        name=(
+            f"gdn_mega_bprop_prologue_{io_dtype.__name__.lower()}"
+            f"_hq{h_q}_hk{h_k}_hv{h_v}_ho{h_out}_r{int(run_order)}"
+            f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+        ),
+    )
+
+
 def chunk_gdn_bwd_sm100(
     q,
     k,
@@ -5628,104 +5758,35 @@ def chunk_gdn_bwd_sm100(
     )
 
     io_dtype = get_dtype(q.dtype)
-    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     if "compiled" not in cache:
-        cfg = build_cfg(
+        cache["compiled"] = compile(
             io_dtype,
-            use_initial_state=use_initial_state,
-            use_dstate_in=use_dstate_in,
-            use_dstate0=use_dstate0,
-            q_ratio=h_out // h_q,
-            k_ratio=h_out // h_k,
-            v_ratio=h_out // h_v,
-            n_heads_out=h_out,
-            max_active_clusters=num_sm,
-            dyn_sched=dyn_sched,
-        )
-        op = GdnBpropOp(cfg, use_int64_offsets)
-        tokens_sym, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(6)
-        )
-        scalar_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=4,
-            use_int64_offsets=use_int64_offsets,
-        )
-        cache["compiled"] = compile_tvm_ffi(
-            op,
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            None,
-            None,
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            scalar_tensor(cutlass.Float32, (tokens_sym, h_out)),
-            make_cu_seqlens_signature(sequence_entries),
-            make_strided_signature_tensor(
-                cutlass.Float32,
-                (sequences, h_out, CFG.D_V, CFG.D_K),
-                assumed_align=16,
-                use_int64_offsets=use_int64_offsets,
-            )
-            if use_dstate0
-            else None,
-            make_strided_signature_tensor(
-                cutlass.Float32,
-                (sequences, h_out, CFG.D_V, CFG.D_K),
-                assumed_align=16,
-                use_int64_offsets=use_int64_offsets,
-            )
-            if use_dstate_in
-            else None,
-            make_work_items_signature(work_rows),
-            make_counter_signature(),
-            make_counter_signature(sched_entries) if dyn_sched else None,
-            make_workspace_signature(workspace_words),
-            cutlass.Float32(scale),
+            h_q,
+            h_k,
+            h_v,
+            h_out,
+            use_initial_state,
+            use_dstate_in,
+            use_dstate0,
+            dyn_sched,
+            use_int64_offsets,
+            num_sm,
+            scale,
         )
 
     if "prologue" not in cache:
-        (
-            tokens_sym,
-            checkpoint_rows,
-            sequence_entries,
-            work_rows,
-            sched_entries,
-            workspace_words,
-        ) = (sym_int() for _ in range(6))
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
+        cache["prologue"] = compile_prologue(
             io_dtype,
-            CFG.B_T,
+            h_q,
+            h_k,
+            h_v,
+            h_out,
             run_order,
             order_gen,
             has_sched,
-            tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
-            tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_V)),
-            tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
-            tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
-            tma_tensor(io_dtype, (checkpoint_rows, h_out, CFG.D_V, CFG.D_K)),
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if run_order and not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            name=(
-                f"gdn_mega_bprop_prologue_{io_dtype.__name__.lower()}"
-                f"_hq{h_q}_hk{h_k}_hv{h_v}_ho{h_out}_r{int(run_order)}"
-                f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
-            ),
+            dyn_sched,
+            use_int64_offsets,
         )
-
     cache["prologue"](
         q,
         k,

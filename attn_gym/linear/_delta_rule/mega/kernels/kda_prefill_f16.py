@@ -88,6 +88,7 @@ Requires the public CuTeDSL 4.7 API, including `cutlass.experimental.*`.
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -97,7 +98,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
@@ -2836,6 +2837,7 @@ def get_compiled_cache(
     return {}
 
 
+@jit_cache(extra_sources=(Path(__file__).parent,))
 def compile(
     io_dtype,
     state_dtype,
@@ -2938,6 +2940,55 @@ def compile(
         make_counter_signature(sched_entries) if dyn_sched else None,
         make_workspace_signature(workspace_words),
         cutlass.Float32(scale),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile_prologue(
+    io_dtype: type[cutlass.Numeric],
+    HQ: int,
+    HK: int,
+    HV: int,
+    HO: int,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, sequence_entries, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(5)
+    )
+
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens, HQ, 128)),
+        tma_tensor(io_dtype, (tokens, HK, 128)),
+        tma_tensor(io_dtype, (tokens, HV, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (tokens, HO, 128)),
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        name=(
+            f"kda_mega_prefill_prologue_{io_dtype.__name__.lower()}"
+            f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}"
+            f"_o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+        ),
     )
 
 
@@ -3136,39 +3187,16 @@ def chunk_kda_sm100(
         )
 
     if "prologue" not in cache:
-        sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-        tokens, sequence_entries, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(5)
-        )
-
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
+        cache["prologue"] = compile_prologue(
             io_dtype,
-            CFG.B_T,
+            HQ,
+            HK,
+            HV,
+            HO,
             order_gen,
             has_sched,
-            tma_tensor(io_dtype, (tokens, HQ, 128)),
-            tma_tensor(io_dtype, (tokens, HK, 128)),
-            tma_tensor(io_dtype, (tokens, HV, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (tokens, HO, 128)),
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            name=(
-                f"kda_mega_prefill_prologue_{io_dtype.__name__.lower()}"
-                f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}"
-                f"_o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
-            ),
+            dyn_sched,
+            use_int64_offsets,
         )
     cache["prologue"](
         q,

@@ -73,6 +73,7 @@ Warp assignments (16 warps = 512 threads):
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -82,7 +83,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 from attn_gym.linear._delta_rule.mega.kernels.common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from attn_gym.linear._delta_rule.mega.kernels.common.host import checkpoint_capacity_bound, get_dtype
@@ -4145,6 +4146,151 @@ def get_compiled_cache(
     return {}
 
 
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile(
+    io_dtype: type[cutlass.Numeric],
+    HQ: int,
+    HK: int,
+    HV: int,
+    HO: int,
+    use_dstate_in: bool,
+    use_dstate0: bool,
+    use_qk_l2norm_in_kernel: bool,
+    safe_gate: bool,
+    gate_scale_log2: float,
+    use_beta_sigmoid: bool,
+    use_initial_state: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+    num_sm: int,
+    scale: float,
+):
+    """JIT-compile one fake-tensor TVM-FFI backward signature."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    cfg = build_cfg(
+        io_dtype,
+        use_dstate_in=use_dstate_in,
+        use_dstate0=use_dstate0,
+        l2norm=use_qk_l2norm_in_kernel,
+        safe_gate=safe_gate,
+        gate_scale_log2=gate_scale_log2,
+        beta_sigmoid=use_beta_sigmoid,
+        use_initial_state=use_initial_state,
+        q_ratio=HO // HQ,
+        k_ratio=HO // HK,
+        v_ratio=HO // HV,
+        n_heads_out=HO,
+        max_active_clusters=num_sm,
+        dyn_sched=dyn_sched,
+    )
+    op = KdaBpropOp(cfg, use_int64_offsets)
+    (
+        tokens,
+        checkpoint_rows,
+        sequence_entries,
+        sequences,
+        work_rows,
+        sched_entries,
+        workspace_words,
+    ) = (sym_int() for _ in range(7))
+
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    beta_dtype = io_dtype if use_beta_sigmoid else cutlass.Float32
+    return compile_tvm_ffi(
+        op,
+        make_compact_signature_tensor(
+            cutlass.Float32,
+            (HO,),
+            assumed_align=4,
+        )
+        if safe_gate
+        else None,
+        tma_tensor(cutlass.Float32, (HO, 128)) if safe_gate else None,
+        make_strided_signature_tensor(
+            beta_dtype,
+            (tokens, HO),
+            assumed_align=beta_dtype.width // 8,
+            use_int64_offsets=use_int64_offsets,
+        ),
+        tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        make_strided_signature_tensor(
+            beta_dtype,
+            (tokens, HO),
+            assumed_align=beta_dtype.width // 8,
+            use_int64_offsets=use_int64_offsets,
+        ),
+        make_cu_seqlens_signature(sequence_entries),
+        tma_tensor(cutlass.Float32, (sequences, HO, 128, 128)) if use_dstate0 else None,
+        tma_tensor(cutlass.Float32, (sequences, HO, 128, 128)) if use_dstate_in else None,
+        make_work_items_signature(work_rows),
+        make_counter_signature(),
+        make_counter_signature(sched_entries) if dyn_sched else None,
+        make_workspace_signature(workspace_words),
+        cutlass.Float32(scale),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile_prologue(
+    io_dtype: type[cutlass.Numeric],
+    HQ: int,
+    HK: int,
+    HV: int,
+    HO: int,
+    run_order: bool,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, checkpoint_rows, sequence_entries, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
+
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens, HQ, 128)),
+        tma_tensor(io_dtype, (tokens, HK, 128)),
+        tma_tensor(io_dtype, (tokens, HV, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (tokens, HQ, 128)),
+        tma_tensor(io_dtype, (tokens, HK, 128)),
+        tma_tensor(io_dtype, (tokens, HV, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128)),
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if run_order and not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        name=(
+            f"kda_mega_bprop_prologue_{io_dtype.__name__.lower()}"
+            f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}_r{int(run_order)}"
+            f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+        ),
+    )
+
+
 def chunk_kda_bwd_sm100(
     q,
     k,
@@ -4347,114 +4493,38 @@ def chunk_kda_bwd_sm100(
     )
 
     io_dtype = get_dtype(q.dtype)
-    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     if "compiled" not in cache:
-        cfg = build_cfg(
+        cache["compiled"] = compile(
             io_dtype,
-            use_dstate_in=use_dstate_in,
-            use_dstate0=use_dstate0,
-            l2norm=use_qk_l2norm_in_kernel,
-            safe_gate=safe_gate,
-            gate_scale_log2=gate_scale_log2,
-            beta_sigmoid=use_beta_sigmoid,
-            use_initial_state=use_initial_state,
-            q_ratio=HO // HQ,
-            k_ratio=HO // HK,
-            v_ratio=HO // HV,
-            n_heads_out=HO,
-            max_active_clusters=num_sm,
-            dyn_sched=dyn_sched,
-        )
-        op = KdaBpropOp(cfg, use_int64_offsets)
-        (
-            tokens,
-            checkpoint_rows,
-            sequence_entries,
-            sequences,
-            work_rows,
-            sched_entries,
-            workspace_words,
-        ) = (sym_int() for _ in range(7))
-
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        beta_dtype = io_dtype if use_beta_sigmoid else cutlass.Float32
-        cache["compiled"] = compile_tvm_ffi(
-            op,
-            make_compact_signature_tensor(
-                cutlass.Float32,
-                (HO,),
-                assumed_align=4,
-            )
-            if safe_gate
-            else None,
-            tma_tensor(cutlass.Float32, (HO, 128)) if safe_gate else None,
-            make_strided_signature_tensor(
-                beta_dtype,
-                (tokens, HO),
-                assumed_align=beta_dtype.width // 8,
-                use_int64_offsets=use_int64_offsets,
-            ),
-            tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            make_strided_signature_tensor(
-                beta_dtype,
-                (tokens, HO),
-                assumed_align=beta_dtype.width // 8,
-                use_int64_offsets=use_int64_offsets,
-            ),
-            make_cu_seqlens_signature(sequence_entries),
-            tma_tensor(cutlass.Float32, (sequences, HO, 128, 128)) if use_dstate0 else None,
-            tma_tensor(cutlass.Float32, (sequences, HO, 128, 128)) if use_dstate_in else None,
-            make_work_items_signature(work_rows),
-            make_counter_signature(),
-            make_counter_signature(sched_entries) if dyn_sched else None,
-            make_workspace_signature(workspace_words),
-            cutlass.Float32(scale),
+            HQ,
+            HK,
+            HV,
+            HO,
+            use_dstate_in,
+            use_dstate0,
+            use_qk_l2norm_in_kernel,
+            safe_gate,
+            gate_scale_log2,
+            use_beta_sigmoid,
+            use_initial_state,
+            dyn_sched,
+            use_int64_offsets,
+            num_sm,
+            scale,
         )
 
     if "prologue" not in cache:
-        tokens, checkpoint_rows, sequence_entries, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(6)
-        )
-
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
+        cache["prologue"] = compile_prologue(
             io_dtype,
-            CFG.B_T,
+            HQ,
+            HK,
+            HV,
+            HO,
             run_order,
             order_gen,
             has_sched,
-            tma_tensor(io_dtype, (tokens, HQ, 128)),
-            tma_tensor(io_dtype, (tokens, HK, 128)),
-            tma_tensor(io_dtype, (tokens, HV, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (tokens, HQ, 128)),
-            tma_tensor(io_dtype, (tokens, HK, 128)),
-            tma_tensor(io_dtype, (tokens, HV, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128)),
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if run_order and not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            name=(
-                f"kda_mega_bprop_prologue_{io_dtype.__name__.lower()}"
-                f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}_r{int(run_order)}"
-                f"o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
-            ),
+            dyn_sched,
+            use_int64_offsets,
         )
     cache["prologue"](
         q,

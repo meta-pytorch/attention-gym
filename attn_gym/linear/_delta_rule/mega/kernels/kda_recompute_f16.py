@@ -85,6 +85,7 @@ Requires the public CuTeDSL 4.7 API, including `cutlass.experimental.*`.
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -94,7 +95,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 from attn_gym.linear._delta_rule.mega.kernels.common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from attn_gym.linear._delta_rule.mega.kernels.common.host import checkpoint_capacity_bound, get_dtype
@@ -2553,6 +2554,7 @@ def get_compiled_cache(
     return {}
 
 
+@jit_cache(extra_sources=(Path(__file__).parent,))
 def compile(
     io_dtype,
     state_dtype,
@@ -2630,6 +2632,61 @@ def compile(
         make_counter_signature(sched_entries) if dyn_sched else None,
         make_workspace_signature(workspace_words),
         cutlass.Int32(checkpoint_every_n_tokens),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def compile_prologue(
+    io_dtype: type[cutlass.Numeric],
+    HK: int,
+    HV: int,
+    HO: int,
+    enable_checkpoints: bool,
+    run_order: bool,
+    order_gen: bool,
+    has_sched: bool,
+    dyn_sched: bool,
+    checkpoint_every_n_tokens: int,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, sequence_entries, checkpoint_rows, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
+
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        has_sched,
+        tma_tensor(io_dtype, (tokens, HK, 128)),
+        tma_tensor(io_dtype, (tokens, HV, 128)),
+        tma_tensor(cutlass.Float32, (tokens, HO, 128)),
+        tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128))
+        if enable_checkpoints
+        else None,
+        make_cu_seqlens_signature(sequence_entries),
+        work_items_signature if run_order and not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if has_sched else None,
+        make_workspace_signature(workspace_words),
+        cutlass.Int32(checkpoint_every_n_tokens),
+        name=(
+            f"kda_mega_recompute_prologue_{io_dtype.__name__.lower()}"
+            f"_hk{HK}_hv{HV}_ho{HO}_c{int(enable_checkpoints)}"
+            f"_r{int(run_order)}o{int(order_gen)}d{int(dyn_sched)}"
+            f"_i64{int(use_int64_offsets)}"
+        ),
     )
 
 
@@ -2851,43 +2908,18 @@ def chunk_kda_recompute_sm100(
         )
 
     if "prologue" not in cache:
-        sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-        tokens, sequence_entries, checkpoint_rows, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(6)
-        )
-
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
+        cache["prologue"] = compile_prologue(
             io_dtype,
-            CFG.B_T,
+            HK,
+            HV,
+            HO,
+            enable_checkpoints,
             run_order,
             order_gen,
             has_sched,
-            tma_tensor(io_dtype, (tokens, HK, 128)),
-            tma_tensor(io_dtype, (tokens, HV, 128)),
-            tma_tensor(cutlass.Float32, (tokens, HO, 128)),
-            tma_tensor(io_dtype, (checkpoint_rows, HO, 128, 128))
-            if state_checkpoints_for_descs is not None
-            else None,
-            make_cu_seqlens_signature(sequence_entries),
-            work_items_signature if run_order and not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if has_sched else None,
-            make_workspace_signature(workspace_words),
-            cutlass.Int32(checkpoint_every_n_tokens),
-            name=(
-                f"kda_mega_recompute_prologue_{io_dtype.__name__.lower()}"
-                f"_hk{HK}_hv{HV}_ho{HO}_c{int(enable_checkpoints)}"
-                f"_r{int(run_order)}o{int(order_gen)}d{int(dyn_sched)}"
-                f"_i64{int(use_int64_offsets)}"
-            ),
+            dyn_sched,
+            checkpoint_every_n_tokens,
+            use_int64_offsets,
         )
     cache["prologue"](
         k,
