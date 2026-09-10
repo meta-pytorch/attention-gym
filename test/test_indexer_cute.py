@@ -363,11 +363,11 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
 
 def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
     _skip_no_sm100()
-    from attn_gym.sparse.indexer.impl.cute import prefill
+    from attn_gym.sparse.indexer.impl.cute import impl
 
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
-    prefill._compile_indexer.cache_clear()
+    impl._compile_indexer.cache_clear()
     torch.manual_seed(2026)
     try:
         for batch, tokens in ((2, 65), (3, 65), (3, 129), (1, 257)):
@@ -379,21 +379,21 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             assert actual.shape == (batch, tokens, 16)
             assert actual.dtype == torch.int32
             _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
-            cache_info = prefill._compile_indexer.cache_info()
+            cache_info = impl._compile_indexer.cache_info()
             assert cache_info.misses == 1
             assert cache_info.currsize == 1
-        assert prefill._compile_indexer.cache_info().hits == 3
-        assert prefill._compile_indexer.is_cached("bf16", 64, 128, 16, True)
-        prefill._compile_indexer.cache_clear()
+        assert impl._compile_indexer.cache_info().hits == 3
+        assert impl._compile_indexer.is_cached("bf16", 64, 128, 16, True)
+        impl._compile_indexer.cache_clear()
         actual = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
         torch.cuda.synchronize()
         _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
-        cache_info = prefill._compile_indexer.cache_info()
+        cache_info = impl._compile_indexer.cache_info()
         assert cache_info.hits == 1
         assert cache_info.misses == 0
         assert cache_info.currsize == 1
     finally:
-        prefill._compile_indexer.cache_clear()
+        impl._compile_indexer.cache_clear()
 
 
 def test_cute_dynamic_fullgraph():

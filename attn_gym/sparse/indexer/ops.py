@@ -14,7 +14,7 @@ torch.library.define(
 
 
 def _indexer_cute_cuda(q: Tensor, k: Tensor, weights: Tensor, topk: int, causal: bool) -> Tensor:
-    from .impl.cute.prefill import index as launch
+    from .impl.cute.impl import index as launch
 
     return launch(q, k, weights, topk, causal)
 
