@@ -1,4 +1,4 @@
-"""Native Mega affine probes define a standard Mega CP baseline."""
+"""Native Mega affine probes define an ownership-invariant canonical CP baseline."""
 
 from __future__ import annotations
 
@@ -157,20 +157,31 @@ def test_native_two_tile_handoff_matches_fp64(dtype: torch.dtype, monkeypatch) -
     prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu, autotune=False, kernel_options=MEGA)
     _forbid_fused_factors(monkeypatch)
     bounds = torch.stack((cu[:-1], cu[1:]), dim=1)
-    maps = prepared.state_summaries(bounds)
+    maps = prepared.state_summaries(bounds, deterministic_work=True)
     entry0 = torch.zeros_like(maps[0, :, :128])
     entries = torch.stack((entry0, merge_state(entry0, maps[0])))
     output, final = prepared.run(entries, output_final_state=True)
     assert final is not None
     composed_final = merge_state(entries[1], maps[1])
+    do = torch.randn_like(output)
+    exit1 = torch.randn_like(entry0) * 0.1
+    backward = chunk_kda_prepare_backward(
+        prepared.saved, do, entries, scale=prepared.scale, autotune=False
+    )
+    reverse = backward.state_grad_summaries(bounds, deterministic_work=True)
+    exits = torch.stack((merge_state(exit1, reverse[1]), exit1))
+    gradients = backward.run(exits)[:5]
     references = []
     for precision in (torch.float64, torch.float32):
         leaves = tuple(t.requires_grad_() for t in clone_kda_inputs(inputs, dtype=precision))
         ref_output, ref_final = kda_reference(*leaves, scale=prepared.scale)
-        references.append((ref_output, ref_final, ref_final))
+        ref_gradients = torch.autograd.grad(
+            (ref_output, ref_final), leaves, (do.to(precision), exit1[None].to(precision))
+        )
+        references.append((ref_output, ref_final, ref_final, *ref_gradients))
     for name, actual, high, low in zip(
-        ("output", "native final", "composed final"),
-        (output, final[-1:], composed_final[None]),
+        ("output", "native final", "composed final", "dq", "dk", "dv", "dgate", "dbeta"),
+        (output, final[-1:], composed_final[None], *gradients),
         *references,
         strict=True,
     ):
@@ -281,6 +292,7 @@ def test_native_reverse_bias_and_ownership(
     if transpose_forward_transition:
         bounds = torch.stack((cu[:-1], cu[1:]), dim=1)
         assert torch.equal(backward.state_grad_summaries(bounds), maps)
+        assert torch.equal(backward.state_grad_summaries(bounds, deterministic_work=True), maps)
     else:
         zero_backward = chunk_kda_prepare_backward(
             prepared.saved,

@@ -647,9 +647,16 @@ class PreparedForward(Protocol):
         """The resolved query scale; the backward must reuse it."""
         ...
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+    ) -> torch.Tensor:
         """One ``[HV, V + K, K]`` affine summary per ``[start, stop)`` row of ``bounds``.
 
+        ``deterministic_work`` pins the summary kernels' work partition so the maps do not
+        depend on span length, range count, or SM count (the deterministic recipe needs this).
         Every nonempty row is one subsequence of the span (NOTE [Summary ranges are subsequences]
         in ``attn_gym.linear.kda.stages``); ``start == stop`` is the identity.
         """
@@ -665,8 +672,13 @@ class PreparedForward(Protocol):
 class PreparedBackward(Protocol):
     """Backward handle of a staged delta-rule op (``chunk_*_prepare_backward``)."""
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
-        """One ``[C; R]`` reverse map per row of ``bounds``: ``d_entry = d_exit @ R + C``."""
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
+        """One ``[C; R]`` reverse map per row of ``bounds``: ``d_entry = d_exit @ R + C``.
+
+        ``deterministic_work`` as in :meth:`PreparedForward.state_summaries`.
+        """
         ...
 
     def run(self, d_final_state: torch.Tensor | None) -> tuple[torch.Tensor, ...]:

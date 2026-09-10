@@ -155,13 +155,20 @@ class ChunkKDAPrepared:
     autotune: bool
     schedule: ScheduleRequest
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         ``bounds`` is an ``int32 [R, 2]`` device tensor of ``[start, stop)`` span offsets, each
         obeying NOTE [Summary ranges are subsequences]; ``start == stop`` yields the identity. The
         ranges are read on the device, so a CUDA Graph captured around this call replays for any
-        layout of the same shape.
+        layout of the same shape. ``deterministic_work=True`` pins each range's recurrence
+        partition for canonical tile batching; factor preparation must also use
+        ``autotune=False``.
         """
         return build_state_summaries(
             self.factors.kg,
@@ -169,6 +176,7 @@ class ChunkKDAPrepared:
             self.factors.u,
             self.saved.cumulative_gate,
             bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -209,11 +217,18 @@ class ChunkKDAMegaPrepared:
     # Mega rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
     schedule: ScheduleRequest = ScheduleRequest.AUTO
 
-    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_summaries(
+        self,
+        bounds: torch.Tensor,
+        *,
+        deterministic_work: bool = False,
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
         Rows follow NOTE [Summary ranges are subsequences]. The maps carry Mega's 16-token-chunk
         rounding, which differs from the fused maps and from an unsharded Mega pass.
+        ``deterministic_work`` is accepted for the protocol and has nothing to pin: each map is
+        one subsequence's own pass, independent of the rest of the span.
         """
         # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
         from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_summaries
@@ -324,7 +339,9 @@ class ChunkKDABackward:
     autotune: bool
     fastmath: bool
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         Packed as ``[C; R]`` with ``d_entry_state = d_exit_state @ R + C``, where ``C`` is the
@@ -342,6 +359,7 @@ class ChunkKDABackward:
             self.saved.cumulative_gate,
             self.scale,
             bounds,
+            deterministic_work=deterministic_work,
         )
 
     def run(
@@ -399,10 +417,13 @@ class ChunkKDAMegaBackward:
     autotune: bool
     schedule: ScheduleRequest
 
-    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+    def state_grad_summaries(
+        self, bounds: torch.Tensor, *, deterministic_work: bool = False
+    ) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
-        Rows follow NOTE [Summary ranges are subsequences].
+        Rows follow NOTE [Summary ranges are subsequences]. ``deterministic_work`` is accepted for
+        the protocol and has nothing to pin: each map is one subsequence's own pass.
         """
         from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_grad_summaries
 

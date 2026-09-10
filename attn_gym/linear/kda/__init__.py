@@ -38,6 +38,7 @@ _BACKEND_EXPORTS = {
     "chunk_kda_prepare": "attn_gym.linear.kda.stages",
     "chunk_kda_prepare_backward": "attn_gym.linear.kda.stages",
     "context_parallel_kda": "attn_gym.linear.kda.context_parallel",
+    "context_parallel_kda_deterministic": "attn_gym.linear.kda.context_parallel",
 }
 # Backward compat: these moved to attn_gym.linear.short_conv, whose own lazy resolution supplies
 # the error message; import them from attn_gym.linear instead.
