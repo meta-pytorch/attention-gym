@@ -10,10 +10,9 @@ contract (dtype, batch, queries, heads, head_dim, topk, causal) and compile
 target. The public API invokes it through the private operator in
 ``attn_gym.sparse.indexer.ops``; there is no fallback implementation.
 
-The launch schedule (stage counts, query/candidate tiling, warp-role
-assignment) is owned by ``IndexerConfig`` and ``IndexerWarpRole`` and threaded
-through ``IndexerPrefillKernel`` instance state, rather than being implicit
-module-global policy shared by free functions.
+The kernel owns its fixed tile geometry and two-query schedule. ``IndexerConfig``
+contains the tunable D tile and pipeline/launch settings, while ``IndexerWarpRole``
+records the fixed warp boundaries.
 """
 
 import math
@@ -58,19 +57,9 @@ _INDEXER_DTYPES_BY_NAME = {dtype.name: dtype for dtype in INDEXER_DTYPES.values(
 
 @dataclass(frozen=True)
 class IndexerConfig:
-    """Compile-time launch and pipeline-stage schedule for the prefill kernel.
+    """Tunable D tiling and pipeline/launch settings for the prefill kernel."""
 
-    Every stage count, tile size, and warp count the kernel and its helpers
-    agree on lives here; nothing about the schedule is a module-global
-    constant. ``IndexerPrefillKernel`` owns one instance and every helper
-    that needs schedule state reads it from ``self.config``.
-    """
-
-    tile_candidates: int = 128
-    tile_heads: int = 64
     tile_d: int = 64
-    queries_per_cta: int = 2
-    selection_warps: int = 4
     k_stages: int = 2
     q_stages: int = 4
     mailbox_stages: int = 4
@@ -79,40 +68,17 @@ class IndexerConfig:
     # TMEM allocation.  Reducer and selector warps are permanently disjoint.
     acc_stages: int = 4
     min_blocks_per_mp: int = 1
-    mma_instruction: tuple[int, int, int] = (128, 64, 16)
-
-    @property
-    def selection_threads(self) -> int:
-        return self.selection_warps * _WARP_SIZE
-
-    @property
-    def consumer_warps(self) -> int:
-        """Reducer (or selector) warps owned by one query slot, times two queries."""
-        return self.queries_per_cta * self.selection_warps
-
-    @property
-    def acc_tmem_stages(self) -> int:
-        return self.queries_per_cta * self.acc_stages
-
-    @property
-    def mma_tile(self) -> tuple[int, int, int]:
-        return (self.tile_candidates, self.tile_heads, self.tile_d)
 
 
 class IndexerWarpRole(IntEnum):
-    """Warp-role boundaries in the prefill kernel.
-
-    Each named role spans a range of warps rather than a single warp index;
-    ``IndexerPrefillKernel.warp_range`` returns that range for a given role.
-    ``MMA`` and ``LOAD`` are single-warp roles.
-    """
+    """Fixed starting warp indices; reducer and selector roles span four warps."""
 
     REDUCER_Q0 = 0
-    REDUCER_Q1 = 1
-    SELECTOR_Q0 = 2
-    SELECTOR_Q1 = 3
-    MMA = 4
-    LOAD = 5
+    REDUCER_Q1 = 4
+    SELECTOR_Q0 = 8
+    SELECTOR_Q1 = 12
+    MMA = 16
+    LOAD = 17
 
 
 def _make_shared_storage_type(config: IndexerConfig):
@@ -173,15 +139,22 @@ def _bitonic_lane_value(
 
 
 class IndexerPrefillKernel:
-    """Own the static problem shape, schedule, and warp-role dispatch for the
-    prefill Top-K indexer.
+    """Own the prefill kernel's fixed geometry, problem shape, and tuning config."""
 
-    Stage counts, tiling, and warp-role assignment come from ``config``
-    (``IndexerConfig``) and ``IndexerWarpRole`` rather than module-global
-    constants: every helper below that needs schedule state is a method
-    reading ``self``/``self.config``, so the kernel and its helpers agree on
-    the schedule by construction, not by convention.
-    """
+    tile_candidates = 128
+    tile_heads = 64
+    queries_per_cta = 2
+    selection_warps = 4
+    selection_threads = selection_warps * _WARP_SIZE
+    mma_instruction = (128, 64, 16)
+
+    @property
+    def acc_tmem_stages(self) -> int:
+        return self.queries_per_cta * self.config.acc_stages
+
+    @property
+    def mma_tile(self) -> tuple[int, int, int]:
+        return (self.tile_candidates, self.tile_heads, self.config.tile_d)
 
     def __init__(
         self,
@@ -219,7 +192,7 @@ class IndexerPrefillKernel:
                 f"indexer, got {self.topk}."
             )
         padded = 1 << (max(self.topk, 1) - 1).bit_length()
-        return max(self.config.tile_candidates, padded)
+        return max(self.tile_candidates, padded)
 
     @property
     def sort_span(self) -> int:
@@ -234,46 +207,15 @@ class IndexerPrefillKernel:
 
     @property
     def threads(self) -> int:
-        """Total CTA thread count: every warp role, sized by ``config.selection_warps``.
-
-        ``IndexerWarpRole`` values are ordinal role markers, not literal warp
-        indices -- ``warp_range`` is the source of truth for actual warp
-        indices, since those scale with ``config.selection_warps``.
-        """
-        return self.warp_range(IndexerWarpRole.LOAD).stop * _WARP_SIZE
-
-    def warp_range(self, role: "IndexerWarpRole") -> range:
-        """Return the warp-index range owned by one role.
-
-        ``REDUCER_Q0``/``REDUCER_Q1``/``SELECTOR_Q0``/``SELECTOR_Q1`` each own
-        ``config.selection_warps`` warps; ``MMA`` and ``LOAD`` own exactly one.
-        """
-        selection_warps = self.config.selection_warps
-        starts = {
-            IndexerWarpRole.REDUCER_Q0: 0,
-            IndexerWarpRole.REDUCER_Q1: selection_warps,
-            IndexerWarpRole.SELECTOR_Q0: 2 * selection_warps,
-            IndexerWarpRole.SELECTOR_Q1: 3 * selection_warps,
-            IndexerWarpRole.MMA: 4 * selection_warps,
-            IndexerWarpRole.LOAD: 4 * selection_warps + 1,
-        }
-        widths = {
-            IndexerWarpRole.REDUCER_Q0: selection_warps,
-            IndexerWarpRole.REDUCER_Q1: selection_warps,
-            IndexerWarpRole.SELECTOR_Q0: selection_warps,
-            IndexerWarpRole.SELECTOR_Q1: selection_warps,
-            IndexerWarpRole.MMA: 1,
-            IndexerWarpRole.LOAD: 1,
-        }
-        start = starts[role]
-        return range(start, start + widths[role])
+        """Total CTA thread count for the fixed warp-role schedule."""
+        return (int(IndexerWarpRole.LOAD) + 1) * _WARP_SIZE
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name, including the schedule."""
         return (
             f"indexer_prefill_{self.dtype.name}_b{self.batch}_t{self.queries}_"
             f"h{self.heads}_d{self.head_dim}_k{self.topk}_c{int(self.causal)}_"
-            f"sw{self.config.selection_warps}_ks{self.config.k_stages}_"
+            f"sw{self.selection_warps}_ks{self.config.k_stages}_"
             f"qs{self.config.q_stages}_ms{self.config.mailbox_stages}_"
             f"as{self.config.acc_stages}"
         )
@@ -362,7 +304,7 @@ class IndexerPrefillKernel:
         rank: Int32,
     ) -> Int64:
         """Return one rank of a stable descending merge of two ``tile_candidates``-key runs."""
-        tile_candidates = self.config.tile_candidates
+        tile_candidates = self.tile_candidates
         diagonal = rank + Int32(1)
         lower = Int32(0)
         upper = diagonal
@@ -410,8 +352,8 @@ class IndexerPrefillKernel:
         sort_span: cutlass.Constexpr,
     ):
         """Retain Top-128 from 512 keys with warp-local runs and two merge levels."""
-        tile_candidates = self.config.tile_candidates
-        selection_threads = self.config.selection_threads
+        tile_candidates = self.tile_candidates
+        selection_threads = self.selection_threads
         warp = logical_tid >> Int32(5)
         lane = logical_tid & Int32(_WARP_SIZE - 1)
         run_base = query_base + warp * Int32(tile_candidates)
@@ -424,7 +366,7 @@ class IndexerPrefillKernel:
         pair_tid = logical_tid & Int32(63)
         pair_a_base = query_base + pair * Int32(2 * tile_candidates)
         pair_b_base = pair_a_base + Int32(tile_candidates)
-        scratch_base = Int32(self.config.queries_per_cta * sort_span) + Int32(
+        scratch_base = Int32(self.queries_per_cta * sort_span) + Int32(
             query_slot * 2 * tile_candidates
         )
         pair_output_base = scratch_base + pair * Int32(tile_candidates)
@@ -471,14 +413,14 @@ class IndexerPrefillKernel:
         """Sort the long-term-buffer/buffer2 union and retain its first run_size keys.
 
         ``run_size`` is the padded persistent-run size (a power of two, >= the
-        configured ``tile_candidates``; equal to the caller's requested topk
+        fixed ``tile_candidates``; equal to the caller's requested topk
         only when topk is itself such a power of two). Global indices are
         striped across the selector warp-group's threads. Distances below a
         warp use shuffles, distances of 32/64 exchange through shared memory,
         and distances of at least one warp-group width compare register pairs
         owned by the same thread.
         """
-        selection_threads = self.config.selection_threads
+        selection_threads = self.selection_threads
         if cutlass.const_expr(run_size == 128 and sort_span == 512):
             self._drain_hierarchical_512_128(
                 keys,
@@ -573,7 +515,7 @@ class IndexerPrefillKernel:
         q_producer,
     ):
         """TMA warp: reuse each staged K tile across two head tiles."""
-        mma_tile = self.config.mma_tile
+        mma_tile = self.mma_tile
         mma_zero = tiled_mma.get_slice(0)
         head_pairs = head_tiles // Int32(2)
         for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
@@ -874,11 +816,11 @@ class IndexerPrefillKernel:
         causal: cutlass.Constexpr,
     ):
         """Reduce every score tile and publish one ordinal per reducer thread."""
-        tile_candidates = self.config.tile_candidates
-        tile_heads = self.config.tile_heads
+        tile_candidates = self.tile_candidates
+        tile_heads = self.tile_heads
         acc_stages = self.config.acc_stages
         mailbox_stages = self.config.mailbox_stages
-        mma_tile = self.config.mma_tile
+        mma_tile = self.mma_tile
         accumulator_flat = accumulator[((None, None), 0, 0, None)]
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.Ld16x256bOp(tcgen05.Repetition.x8, tcgen05.Pack.NONE),
@@ -998,9 +940,9 @@ class IndexerPrefillKernel:
         reads back the *entire* persistent run (topk == run_size); otherwise
         the output truncation would read an arbitrary, unsorted subset.
         """
-        tile_candidates = self.config.tile_candidates
-        selection_warps = self.config.selection_warps
-        selection_threads = self.config.selection_threads
+        tile_candidates = self.tile_candidates
+        selection_warps = self.selection_warps
+        selection_threads = self.selection_threads
         mailbox_stages = self.config.mailbox_stages
         selection_barrier_id = 3
         if cutlass.const_expr(query_slot == 1):
@@ -1083,7 +1025,7 @@ class IndexerPrefillKernel:
                     other = Int64(cute.arch.shuffle_sync_bfly(seed_min, 1 << shuffle_stage))
                     seed_min = other if other < seed_min else seed_min  # noqa: FURB136
                 seed_scratch_base = Int32(
-                    self.config.queries_per_cta * sort_span + query_slot * 2 * tile_candidates
+                    self.queries_per_cta * sort_span + query_slot * 2 * tile_candidates
                 )
                 if lane == Int32(0):
                     selection_keys[seed_scratch_base + warp_idx] = seed_min
@@ -1186,20 +1128,20 @@ class IndexerPrefillKernel:
     ):
         """Dispatch the reducer, selector, MMA, and load warp roles."""
         config = self.config
-        tile_candidates = config.tile_candidates
-        tile_heads = config.tile_heads
+        tile_candidates = self.tile_candidates
+        tile_heads = self.tile_heads
         tile_d = config.tile_d
-        queries_per_cta = config.queries_per_cta
-        selection_warps = config.selection_warps
-        selection_threads = config.selection_threads
-        mma_tile = config.mma_tile
+        queries_per_cta = self.queries_per_cta
+        selection_warps = self.selection_warps
+        selection_threads = self.selection_threads
+        mma_tile = self.mma_tile
         threads = self.threads
 
-        reducer_q1_start = self.warp_range(IndexerWarpRole.REDUCER_Q1).start
-        selector_q0_start = self.warp_range(IndexerWarpRole.SELECTOR_Q0).start
-        selector_q1_start = self.warp_range(IndexerWarpRole.SELECTOR_Q1).start
-        mma_warp = self.warp_range(IndexerWarpRole.MMA).start
-        load_warp = self.warp_range(IndexerWarpRole.LOAD).start
+        reducer_q1_start = int(IndexerWarpRole.REDUCER_Q1)
+        selector_q0_start = int(IndexerWarpRole.SELECTOR_Q0)
+        selector_q1_start = int(IndexerWarpRole.SELECTOR_Q1)
+        mma_warp = int(IndexerWarpRole.MMA)
+        load_warp = int(IndexerWarpRole.LOAD)
 
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1334,7 +1276,7 @@ class IndexerPrefillKernel:
         fragment_q = tiled_mma.make_fragment_B(sQ)
         accumulator_shape = tiled_mma.partition_shape_C(mma_tile[:2])
         accumulator_template = tiled_mma.make_fragment_C(
-            cute.append(accumulator_shape, config.acc_tmem_stages)
+            cute.append(accumulator_shape, self.acc_tmem_stages)
         )
 
         tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads)
@@ -1496,7 +1438,7 @@ class IndexerPrefillKernel:
         topk = self.topk
         sort_span = self.sort_span
         causal = self.causal
-        mma_tile = config.mma_tile
+        mma_tile = self.mma_tile
 
         q_hdtb = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 3, 1, 0]))
         k_sdb = cute.make_tensor(k.iterator, cute.select(k.layout, mode=[1, 2, 0]))
@@ -1504,7 +1446,7 @@ class IndexerPrefillKernel:
         mma_op = tcgen05.MmaF16BF16Op(
             q.element_type,
             Float32,
-            config.mma_instruction,
+            self.mma_instruction,
             tcgen05.CtaGroup.ONE,
             tcgen05.OperandSource.SMEM,
             cute.nvgpu.OperandMajorMode.K,
@@ -1558,7 +1500,7 @@ class IndexerPrefillKernel:
             sort_span,
             causal,
         ).launch(
-            grid=(cute.ceil_div(q.shape[1], config.queries_per_cta), q.shape[0], 1),
+            grid=(cute.ceil_div(q.shape[1], self.queries_per_cta), q.shape[0], 1),
             block=(self.threads, 1, 1),
             min_blocks_per_mp=config.min_blocks_per_mp,
             stream=stream,
