@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import socket
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import partial
@@ -164,95 +165,124 @@ def _assert_matches_unsharded(
         assert_relative_rms_within(exit_states[index], expected, "final state", max_eps=2.0)
 
 
-def _rank_main(
-    cp_rank: int, world: int, port: int, op_name: str, final_state_loss: bool, table: str
+# NOTE [Collectives Before Assertions]
+# Both ranks run every case of a spawn in one process group, in the same order, so a case that
+# fails on one rank must not desync the other: each case issues all of its collectives (the cp
+# forward/backward, the single-rank ``new_group`` calls, the halo all-gather) before its first
+# assertion, and ``_rank_main`` records the failure and moves on to the next case.
+
+
+def _check_case(
+    cp_rank: int, device: torch.device, op_name: str, final_state_loss: bool, table: str
 ) -> None:
+    """One (loss structure, fragment table) case; raises ``AssertionError`` on any mismatch."""
     chunk, cp = OPS[op_name]
     cu_seqlens, fragments = TABLES[table]
-    with _process_group(cp_rank, world, port) as device:
-        generator = torch.Generator(device=device).manual_seed(0)
-        operands, d_output, d_final = _sample(
-            op_name, cu_seqlens[-1], len(cu_seqlens) - 1, generator
-        )
+    generator = torch.Generator(device=device).manual_seed(0)
+    operands, d_output, d_final = _sample(op_name, cu_seqlens[-1], len(cu_seqlens) - 1, generator)
 
-        # Unsharded oracle with the same loss structure.
-        inputs = tuple(t.clone().requires_grad_() for t in operands)
-        offsets = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-        output, final = chunk(*inputs, cu_seqlens=offsets, output_final_state=True)
-        outputs = (output, final) if final_state_loss else (output,)
-        cotangents = (d_output, d_final) if final_state_loss else (d_output,)
-        expected_grads = torch.autograd.grad(outputs, inputs, grad_outputs=cotangents)
+    # Unsharded oracle with the same loss structure.
+    inputs = tuple(t.clone().requires_grad_() for t in operands)
+    offsets = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    output, final = chunk(*inputs, cu_seqlens=offsets, output_final_state=True)
+    outputs = (output, final) if final_state_loss else (output,)
+    cotangents = (d_output, d_final) if final_state_loss else (d_output,)
+    expected_grads = torch.autograd.grad(outputs, inputs, grad_outputs=cotangents)
 
-        plan = ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
-        ids = plan.global_token_ids(device)
-        local = tuple(t[:, ids].clone().requires_grad_() for t in operands)
-        local_output, exit_states = cp(
-            *local, routing=plan.routing(device), group=dist.group.WORLD
+    plan = ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
+    ids = plan.global_token_ids(device)
+    local = tuple(t[:, ids].clone().requires_grad_() for t in operands)
+    local_output, exit_states = cp(*local, routing=plan.routing(device), group=dist.group.WORLD)
+    local_outputs = (local_output,)
+    local_cotangents = [d_output[:, ids]]
+    if final_state_loss:
+        local_outputs = (local_output, exit_states)
+        local_cotangents.append(_exit_cotangent(plan, d_final, exit_states.shape[0]))
+    grads = torch.autograd.grad(local_outputs, local, grad_outputs=local_cotangents)
+
+    # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
+    qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)
+    d_histories = torch.randn(
+        2, MAX_SUBSEQUENCES, CONV_HISTORY, CHANNELS, device=device, generator=generator
+    )
+    local_qkv = qkv[:, ids].clone().requires_grad_()
+    routing = plan.routing(device, max_subsequences=MAX_SUBSEQUENCES, conv_history=CONV_HISTORY)
+    history = context_parallel_conv_history(local_qkv, routing, dist.group.WORLD)
+    (d_qkv,) = torch.autograd.grad(history, local_qkv, grad_outputs=d_histories[cp_rank])
+
+    if table == "documents":
+        # No document crosses ranks, so every document runs from the zero state on the rank
+        # that owns it: the recipe at CP=2 is bitwise the recipe at CP=1 (a one-rank group
+        # over the whole stream) and the unsharded op, whose kernels the staged path shares.
+        alone = ContextParallelPlan.from_fragments(cu_seqlens, [[(0, cu_seqlens[-1])]], 0)
+        solo = tuple(t.clone().requires_grad_() for t in operands)
+        solo_output, solo_exit = cp(
+            *solo, routing=alone.routing(device), group=dist.new_group([cp_rank])
         )
-        local_outputs = (local_output,)
-        local_cotangents = [d_output[:, ids]]
-        if final_state_loss:
-            local_outputs = (local_output, exit_states)
-            local_cotangents.append(_exit_cotangent(plan, d_final, exit_states.shape[0]))
-        grads = torch.autograd.grad(local_outputs, local, grad_outputs=local_cotangents)
-        _assert_matches_unsharded(
-            plan, ids, (local_output, grads, exit_states), (output, expected_grads, final)
+        solo_grads = torch.autograd.grad(
+            (solo_output, solo_exit),
+            solo,
+            grad_outputs=(d_output, _exit_cotangent(alone, d_final, solo_exit.shape[0])),
         )
-        if table == "documents":
-            # No document crosses ranks, so every document runs from the zero state on the rank
-            # that owns it: the recipe at CP=2 is bitwise the recipe at CP=1 (a one-rank group
-            # over the whole stream) and the unsharded op, whose kernels the staged path shares.
-            alone = ContextParallelPlan.from_fragments(cu_seqlens, [[(0, cu_seqlens[-1])]], 0)
-            solo = tuple(t.clone().requires_grad_() for t in operands)
-            solo_output, solo_exit = cp(
-                *solo, routing=alone.routing(device), group=dist.new_group([cp_rank])
-            )
+        if not final_state_loss:
             solo_grads = torch.autograd.grad(
-                (solo_output, solo_exit),
+                cp(*solo, routing=alone.routing(device), group=dist.new_group([cp_rank]))[0],
                 solo,
-                grad_outputs=(d_output, _exit_cotangent(alone, d_final, solo_exit.shape[0])),
+                grad_outputs=(d_output,),
             )
-            if not final_state_loss:
-                solo_grads = torch.autograd.grad(
-                    cp(*solo, routing=alone.routing(device), group=dist.new_group([cp_rank]))[0],
-                    solo,
-                    grad_outputs=(d_output,),
-                )
-            for ref_output, ref_grads in ((solo_output, solo_grads), (output, expected_grads)):
-                for actual, expected in zip(
-                    (local_output, *grads), (ref_output, *ref_grads), strict=True
-                ):
-                    assert torch.equal(actual, expected[:, ids])
-            for index in plan.terminal:
-                sequence = plan.subsequences[index].sequence
-                assert torch.equal(exit_states[index], solo_exit[sequence])
-                assert torch.equal(exit_states[index], final[sequence])
 
-        # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
-        qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)
-        d_histories = torch.randn(
-            2, MAX_SUBSEQUENCES, CONV_HISTORY, CHANNELS, device=device, generator=generator
-        )
-        local_qkv = qkv[:, ids].clone().requires_grad_()
-        routing = plan.routing(
-            device, max_subsequences=MAX_SUBSEQUENCES, conv_history=CONV_HISTORY
-        )
-        history = context_parallel_conv_history(local_qkv, routing, dist.group.WORLD)
-        (d_qkv,) = torch.autograd.grad(history, local_qkv, grad_outputs=d_histories[cp_rank])
-        expected_history, expected_d_qkv = _conv_history_oracle(
-            cu_seqlens, fragments, cp_rank, qkv, d_histories
-        )
-        torch.testing.assert_close(history, expected_history)
-        torch.testing.assert_close(d_qkv, expected_d_qkv[:, ids])
+    # See NOTE [Collectives Before Assertions]: no collective below this line.
+    _assert_matches_unsharded(
+        plan, ids, (local_output, grads, exit_states), (output, expected_grads, final)
+    )
+    if table == "documents":
+        for ref_output, ref_grads in ((solo_output, solo_grads), (output, expected_grads)):
+            for actual, expected in zip(
+                (local_output, *grads), (ref_output, *ref_grads), strict=True
+            ):
+                assert torch.equal(actual, expected[:, ids])
+        for index in plan.terminal:
+            sequence = plan.subsequences[index].sequence
+            assert torch.equal(exit_states[index], solo_exit[sequence])
+            assert torch.equal(exit_states[index], final[sequence])
+    expected_history, expected_d_qkv = _conv_history_oracle(
+        cu_seqlens, fragments, cp_rank, qkv, d_histories
+    )
+    torch.testing.assert_close(history, expected_history)
+    torch.testing.assert_close(d_qkv, expected_d_qkv[:, ids])
+
+
+def _rank_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
+    """Run every case in one process group (both ranks in the same order); report all failures."""
+    with _process_group(cp_rank, world, port) as device:
+        failures = {}
+        for final_state_loss, loss_id in ((True, "with-final"), (False, "output-only")):
+            for table in TABLES:
+                try:
+                    _check_case(cp_rank, device, op_name, final_state_loss, table)
+                except AssertionError as error:
+                    failures[f"{loss_id}-{table}"] = str(error)
+        assert not failures, "\n".join(f"{case}: {message}" for case, message in failures.items())
+
+
+def _spawn(target, args: tuple) -> None:
+    """Spawn two ranks, surface a failed rank promptly, and bound the run to 600 s."""
+    context = mp.spawn(target, args=(2, _free_port(), *args), nprocs=2, join=False)
+    deadline = time.monotonic() + 600
+    try:
+        # join() reports failed ranks immediately, but may reap only one successful rank at a time.
+        while not context.join(timeout=max(0.0, deadline - time.monotonic())):
+            assert time.monotonic() < deadline, "spawned ranks did not finish within 600 s"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
 
 
 @pytest.mark.parametrize("op_name", list(OPS))
-@pytest.mark.parametrize("final_state_loss", [True, False], ids=["with-final", "output-only"])
-@pytest.mark.parametrize("table", list(TABLES))
-def test_context_parallel_matches_unsharded_op_on_two_ranks(op_name, final_state_loss, table):
-    mp.spawn(
-        _rank_main, args=(2, _free_port(), op_name, final_state_loss, table), nprocs=2, join=True
-    )
+def test_context_parallel_matches_unsharded_op_on_two_ranks(op_name):
+    """One spawn per op covers every loss structure and table; a failure names each failing case."""
+    _spawn(_rank_main, (op_name,))
 
 
 # One 384-token stream under three document layouts and three fragment tables (zig-zag, contiguous,
@@ -393,4 +423,4 @@ def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="NCCL graph replay needs two GPUs")
 @pytest.mark.parametrize("op_name", list(OPS))
 def test_one_captured_graph_replays_across_document_layouts(op_name):
-    mp.spawn(_replay_main, args=(2, _free_port(), op_name), nprocs=2, join=True)
+    _spawn(_replay_main, (op_name,))
