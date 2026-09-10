@@ -11,7 +11,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.indexer import index
+from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_cute_op
 
 
@@ -137,7 +137,7 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
     k = torch.randn(batch, queries, head_dim, device=device, dtype=dtype)
     w = torch.randn(batch, queries, heads, device=device, dtype=dtype)
 
-    actual = index(q, k, w, topk, causal=causal, backend="cute")
+    actual = lightning_indexer(q, k, w, topk, causal=causal, backend="cute")
     scores = _reference_scores(q.float(), k.float(), w.float())
 
     assert actual.dtype == torch.int32
@@ -208,7 +208,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     w_lp = torch.randn(batch, queries, heads, device=device, dtype=dtype)
 
     if topk == 0:
-        cute_indices = index(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
+        cute_indices = lightning_indexer(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
         assert cute_indices.shape == (batch, queries, 0)
         return
 
@@ -226,7 +226,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     boundary = ref_topk_values[..., -1]
 
     # Get cute-selected indices
-    cute_indices = index(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
+    cute_indices = lightning_indexer(q_lp, k_lp, w_lp, topk, causal=causal, backend="cute")
     valid = cute_indices >= 0
     safe_indices = cute_indices.to(torch.int64).clamp_min(0)
 
@@ -304,8 +304,8 @@ def test_cute_partial_acceptance_across_tiles(dtype):
     batch, queries, heads, head_dim, topk = 64, 512, 2, 128, 128
 
     q, k, w = _partial_acceptance_inputs(device, dtype, batch, queries, heads, head_dim)
-    expected = index(q, k, w, topk, causal=False, backend="eager")
-    actual = index(q, k, w, topk, causal=False, backend="cute")
+    expected = lightning_indexer(q, k, w, topk, causal=False, backend="eager")
+    actual = lightning_indexer(q, k, w, topk, causal=False, backend="cute")
 
     torch.testing.assert_close(
         actual.sort(dim=-1).values,
@@ -331,7 +331,7 @@ def test_cute_backend_under_torch_compile(causal, dtype, topk):
     w = torch.randn(batch, queries, heads, device=device, dtype=dtype)
 
     def run(q, k, w):
-        return index(q, k, w, topk, causal=causal, backend="cute")
+        return lightning_indexer(q, k, w, topk, causal=causal, backend="cute")
 
     eager_out = run(q, k, w)
     assert eager_out.shape == (batch, queries, topk)
@@ -356,7 +356,7 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
     k = torch.randn(2, 65, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
     torch.library.opcheck(_indexer_cute_op, (q, k, w, topk, causal))
-    result = index(q, k, w, topk, causal=causal, backend="cute")
+    result = lightning_indexer(q, k, w, topk, causal=causal, backend="cute")
     assert not result.requires_grad
     assert result.grad_fn is None
 
@@ -374,7 +374,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             q = torch.randn(batch, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
             k = torch.randn(batch, tokens, 128, device="cuda", dtype=torch.bfloat16)
             w = torch.randn(batch, tokens, 64, device="cuda", dtype=torch.bfloat16)
-            actual = index(q, k, w, 16, causal=True, backend="cute")
+            actual = lightning_indexer(q, k, w, 16, causal=True, backend="cute")
             torch.cuda.synchronize()
             assert actual.shape == (batch, tokens, 16)
             assert actual.dtype == torch.int32
@@ -385,7 +385,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
         assert prefill._compile_indexer.cache_info().hits == 3
         assert prefill._compile_indexer.is_cached("bf16", 64, 128, 16, True)
         prefill._compile_indexer.cache_clear()
-        actual = index(q, k, w, 16, causal=True, backend="cute")
+        actual = lightning_indexer(q, k, w, 16, causal=True, backend="cute")
         torch.cuda.synchronize()
         _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
         cache_info = prefill._compile_indexer.cache_info()
@@ -399,11 +399,11 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
 def test_cute_dynamic_fullgraph():
     """Reuse a public graph while the launcher specializes for each sequence length."""
     _skip_no_sm100()
-    compiled = torch.compile(index, fullgraph=True, dynamic=True)
+    compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True)
     for tokens in (65, 129):
         q = torch.randn(2, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(2, tokens, 128, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(2, tokens, 64, device="cuda", dtype=torch.bfloat16)
         actual = compiled(q, k, w, 16, causal=True, backend="cute")
-        expected = index(q, k, w, 16, causal=True, backend="cute")
+        expected = lightning_indexer(q, k, w, 16, causal=True, backend="cute")
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

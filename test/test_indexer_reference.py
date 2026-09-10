@@ -2,7 +2,7 @@
 
 import torch
 
-from attn_gym.sparse.indexer import index
+from attn_gym.sparse.indexer import lightning_indexer
 
 
 def test_basic_correctness():
@@ -17,7 +17,7 @@ def test_basic_correctness():
     k = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])  # [1,2,2]
     w = torch.tensor([[[1.0], [1.0]]])  # [1,2,1]
 
-    actual = index(q, k, w, topk=1)
+    actual = lightning_indexer(q, k, w, topk=1)
 
     assert actual.shape == (1, 2, 1)
     # t=0: dot with k0=1, k1=0 -> winner is 0
@@ -38,7 +38,7 @@ def test_causal_masking():
     k = torch.randn(B, T, D)
     w = torch.ones(B, T, H)
 
-    actual = index(q, k, w, topk, causal=True)
+    actual = lightning_indexer(q, k, w, topk, causal=True)
 
     for t in range(T):
         row = actual[0, t, :]  # [topk]
@@ -67,7 +67,7 @@ def test_output_dtype_and_shape():
     k = torch.randn(B, T, D)
     w = torch.randn(B, T, H)
 
-    out = index(q, k, w, K)
+    out = lightning_indexer(q, k, w, K)
 
     assert out.dtype == torch.int32
     assert out.shape == (B, T, K)

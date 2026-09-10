@@ -76,7 +76,7 @@ def _validate_inputs(
         )
 
 
-def index(
+def lightning_indexer(
     q: Tensor,
     k: Tensor,
     weights: Tensor,

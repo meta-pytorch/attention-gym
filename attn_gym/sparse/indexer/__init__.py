@@ -1,5 +1,5 @@
 """Multi-head weighted ReLU Top-K indexer."""
 
-from .api import index
+from .api import lightning_indexer
 
-__all__ = ["index"]
+__all__ = ["lightning_indexer"]

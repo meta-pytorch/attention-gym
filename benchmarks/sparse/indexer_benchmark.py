@@ -11,7 +11,7 @@ import argparse
 import torch
 import triton
 
-from attn_gym.sparse.indexer import index
+from attn_gym.sparse.indexer import lightning_indexer
 
 DTYPES = {
     "float32": torch.float32,
@@ -91,7 +91,9 @@ def main() -> None:
         q, k, weights = make_inputs(args)
 
         def fwd(_q=q, _k=k, _weights=weights, _backend=backend):
-            return index(_q, _k, _weights, args.topk, causal=args.causal, backend=_backend)
+            return lightning_indexer(
+                _q, _k, _weights, args.topk, causal=args.causal, backend=_backend
+            )
 
         fwd()
         fwd_ms = triton.testing.do_bench(
