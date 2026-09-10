@@ -122,7 +122,7 @@ class CoreBackendOption(str, Enum):
     """Chunk-core kernel families selectable through ``kernel_options``."""
 
     FUSED = "fused"
-    MEGA = "mega"
+    CUDNN = "cudnn"
 
 
 def packed_sequence_metadata(
@@ -173,7 +173,7 @@ class DeltaRuleAttention(nn.Module):
     and the bounded ``gate_transform``; ``variant="gdn"`` learns one softplus log decay per head
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
     both fused gates and to the KDA core. ``kernel_options`` are passed through to the chunk
-    core (``{"backend": "mega"}`` selects the SM100 Mega kernels for either variant).
+    core (``{"backend": "cudnn"}`` selects the SM100 cuDNN kernels for either variant).
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
@@ -902,7 +902,7 @@ def main(
     ] = None,
     core_backend: Annotated[
         CoreBackendOption,
-        typer.Option(help="Chunk kernels for the fused backend: repo-local or Mega (SM100)."),
+        typer.Option(help="Chunk kernels for the fused backend: repo-local or cuDNN (SM100)."),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
         bool, typer.Option(help="Use approximate exponentials in the fused gate and KDA core.")
@@ -957,7 +957,7 @@ def main(
         backend=backend.value,
         fastmath=fastmath,
         kernel_options=(
-            {"backend": core_backend.value} if core_backend is CoreBackendOption.MEGA else None
+            {"backend": core_backend.value} if core_backend is CoreBackendOption.CUDNN else None
         ),
         compute_dtype=(None if compute_dtype is None else getattr(torch, compute_dtype.value)),
         device=device,

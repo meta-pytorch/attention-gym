@@ -54,7 +54,7 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
-    # Mega stages reproduce its native stateful backward bitwise (public_gradients would route
+    # cuDNN stages reproduce its native stateful backward bitwise (public_gradients would route
     # the no-state case through the no-state op).
     # Other variants use public_gradients directly.
     backward: Callable[..., tuple[torch.Tensor, ...]] | None = None
@@ -86,7 +86,7 @@ class Op(NamedTuple):
         return torch.autograd.grad(outputs, leaves, cotangents)
 
 
-def mega_native_gradients(
+def cudnn_native_gradients(
     inputs: Inputs,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
@@ -95,8 +95,8 @@ def mega_native_gradients(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """The native stateful Mega backward, which the Mega staged handle runs."""
-    from attn_gym.linear.kda.impl import mega_ops
+    """The native stateful cuDNN backward, which the cuDNN staged handle runs."""
+    from attn_gym.linear.kda.impl import cudnn_ops
 
     q, k, v, gate, beta = inputs
     if cu_seqlens is None:
@@ -104,10 +104,10 @@ def mega_native_gradients(
     operands = (q, k, v, gate, beta, torch.zeros_like(v) if d_output is None else d_output)
     scale = HEAD_DIM**-0.5 if scale is None else scale
     if initial_state is None:
-        return mega_ops.chunk_mega_packed_bwd_with_exit_cotangent_op(
+        return cudnn_ops.chunk_cudnn_packed_bwd_with_exit_cotangent_op(
             *operands, cu_seqlens, d_final_state, scale
         )
-    return mega_ops.chunk_mega_packed_bwd_with_state_op(
+    return cudnn_ops.chunk_cudnn_packed_bwd_with_state_op(
         *operands, cu_seqlens, initial_state.contiguous(), d_final_state, scale
     )
 
@@ -163,23 +163,23 @@ GDN = Op(
     key_heads=2,
     value_heads=2,
 )
-MEGA = {"backend": "mega"}
-requires_mega = pytest.mark.skipif(
+CUDNN = {"backend": "cudnn"}
+requires_cudnn = pytest.mark.skipif(
     importlib.util.find_spec("cutlass.experimental") is None
     or not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="Mega requires CuTeDSL>=4.7 on SM100/SM103",
+    reason="cuDNN requires CuTeDSL>=4.7 on SM100/SM103",
 )
-KDA_MEGA = KDA._replace(
-    chunk=partial(chunk_kda, kernel_options=MEGA),
-    prepare=partial(chunk_kda_prepare, kernel_options=MEGA),
-    backward=mega_native_gradients,
+KDA_CUDNN = KDA._replace(
+    chunk=partial(chunk_kda, kernel_options=CUDNN),
+    prepare=partial(chunk_kda_prepare, kernel_options=CUDNN),
+    backward=cudnn_native_gradients,
 )
 op_param = pytest.mark.parametrize(
     "op",
     [
         pytest.param(KDA, id="kda"),
-        pytest.param(KDA_MEGA, id="kda-mega", marks=requires_mega),
+        pytest.param(KDA_CUDNN, id="kda-cudnn", marks=requires_cudnn),
         pytest.param(GDN, id="gdn"),
         pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
     ],
@@ -260,7 +260,7 @@ def test_prepare_run_matches_chunk_op_unpacked_with_strided_qkv(op, tokens):
     assert q.stride(-1) == 2
 
     # The fused ops accept either layout and the stages normalize strided inputs themselves; the
-    # public Mega op rejects strides, so every reference gets compact copies.
+    # public cuDNN op rejects strides, so every reference gets compact copies.
     expected, _ = op.chunk(q.contiguous(), k.contiguous(), v.contiguous(), gate, beta)
     output, final_state = op.prepare(q, k, v, gate, beta).run()
 
@@ -370,7 +370,7 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
 def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state, packing):
     """All six staged gradients match the selected backward bitwise, including optional losses.
 
-    Mega uses its native stateful backward and also checks BF16 agreement with the public op.
+    cuDNN uses its native stateful backward and also checks BF16 agreement with the public op.
     The matrix covers entry-state layouts, packed/dense schedules, and default/custom scales.
     """
     inputs = op.make_inputs(320, seed=7)
@@ -458,7 +458,7 @@ def test_backward_from_a_tape_without_factors_matches_saved_factors(packing, dty
     )
 
     prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu_seqlens, scale=0.25, autotune=False)
-    # A Mega forward saves no factors; its backward must match one that did, bit for bit.
+    # A cuDNN forward saves no factors; its backward must match one that did, bit for bit.
     tapes = (prepared.saved, prepared.saved._replace(aqk=None, akk=None))
     results = []
     for saved in tapes:
@@ -509,13 +509,13 @@ def test_state_grad_summary_matches_zero_and_identity_probes(op):
 
 
 @requires_kda_target
-@requires_mega
+@requires_cudnn
 @pytest.mark.parametrize("bounds", [(0, 72), (72, 200)], ids=["partial-tail", "aligned-offset"])
-def test_mega_state_summaries_replay_under_cuda_graph(bounds):
+def test_cudnn_state_summaries_replay_under_cuda_graph(bounds):
     """The lazily factored span reads its ranges on the device, so capture never syncs."""
     q, k, v, gate, beta = KDA.make_inputs(200, seed=7)
     cu_seqlens = torch.tensor([0, 72, 200], dtype=torch.int32, device="cuda")
-    prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens, kernel_options=MEGA)
+    prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens, kernel_options=CUDNN)
     bounds = bounds_of(bounds)
     expected = prepared.state_summaries(bounds)
 
@@ -540,12 +540,12 @@ def test_mega_state_summaries_replay_under_cuda_graph(bounds):
 
 
 @requires_kda_target
-def test_mega_prepare_rejects_split_schedules():
-    """The option check precedes the availability check, so this needs no Mega install."""
+def test_cudnn_prepare_rejects_split_schedules():
+    """The option check precedes the availability check, so this needs no cuDNN install."""
     q, k, v, gate, beta = KDA.make_inputs(128, seed=8)
     for option in ("split_backward", "split_forward"):
         with pytest.raises(ValueError, match="split schedules"):
-            chunk_kda_prepare(q, k, v, gate, beta, kernel_options={**MEGA, option: True})
+            chunk_kda_prepare(q, k, v, gate, beta, kernel_options={**CUDNN, option: True})
 
 
 class RankResult(NamedTuple):
@@ -579,7 +579,9 @@ def simulate_context_parallel(
         )
         for r in ranks
     ]
-    if op is not KDA_MEGA:  # Mega runs packed-only; the fused stages are dense iff chunk-aligned.
+    if (
+        op is not KDA_CUDNN
+    ):  # cuDNN runs packed-only; the fused stages are dense iff chunk-aligned.
         for handle, routing in zip(prepared, routings, strict=True):
             dense = routing.cu_seqlens.shape[0] == 2 and routing.tokens % CHUNK_SIZE == 0
             assert (handle.metadata is None) is dense
@@ -644,12 +646,14 @@ LAYOUTS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(("cu_seqlens", "layout"), LAYOUTS)
 def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout, dtype, request):
-    if op is KDA_MEGA and dtype is torch.float16:
-        # The unsharded Mega op itself returns non-finite FP16 outputs for model-range gates:
+    if op is KDA_CUDNN and dtype is torch.float16:
+        # The unsharded cuDNN op itself returns non-finite FP16 outputs for model-range gates:
         # exp(-cumulative gate) over a 16-token chunk exceeds the FP16 range once gates fall below
         # -ln 2. Sharding neither causes nor hides that, so pin it here until the kernel is fixed.
         request.applymarker(
-            pytest.mark.xfail(strict=True, raises=AssertionError, reason="Mega FP16 gate overflow")
+            pytest.mark.xfail(
+                strict=True, raises=AssertionError, reason="cuDNN FP16 gate overflow"
+            )
         )
     q, k, v, gate, beta = op.make_inputs(cu_seqlens[-1], seed=4, dtype=dtype)
     inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in (q, k, v, gate, beta))

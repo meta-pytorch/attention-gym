@@ -20,7 +20,7 @@ base_image = (
     .pip_install("torch", pre=True, index_url=PYTORCH_NIGHTLY_INDEX)
 )
 image = base_image
-mega_image = base_image
+cudnn_image = base_image
 
 
 def configure_local_image(
@@ -54,7 +54,7 @@ def configure_local_image(
 
 if modal.is_local():
     image = configure_local_image(image, ["tests"])
-    mega_image = configure_local_image(mega_image.pip_install("pytest-xdist"), ["mega", "dev"])
+    cudnn_image = configure_local_image(cudnn_image.pip_install("pytest-xdist"), ["cudnn", "dev"])
 
 app = modal.App("attention-gym-modal-tests", image=image)
 
@@ -149,20 +149,20 @@ def run_pytest() -> tuple[int, str]:
     return execute_pytest(["test"], "pytest-report", "B200 pytest summary")
 
 
-@app.function(image=mega_image, gpu="B200", timeout=30 * 60)
-def run_mega_pytest() -> tuple[int, str]:
-    """Run the CuTeDSL 4.7+ GDN/KDA Mega suites in their compatible environment."""
+@app.function(image=cudnn_image, gpu="B200", timeout=30 * 60)
+def run_cudnn_pytest() -> tuple[int, str]:
+    """Run the CuTeDSL 4.7+ GDN/KDA cuDNN suites in their compatible environment."""
     return execute_pytest(
-        ["test/gdn/mega", "test/kda/mega"],
-        "mega-pytest-report",
-        "B200 Mega pytest summary",
+        ["test/gdn/cudnn", "test/kda/cudnn"],
+        "cudnn-pytest-report",
+        "B200 cuDNN pytest summary",
     )
 
 
 @app.local_entrypoint()
 def main() -> None:
     """Run both B200 suites and publish their summaries to GitHub Actions."""
-    results = (run_pytest.remote(), run_mega_pytest.remote())
+    results = (run_pytest.remote(), run_cudnn_pytest.remote())
     combined_summary = "\n".join(summary for _return_code, summary in results)
     print(f"\n{combined_summary}")
     if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):

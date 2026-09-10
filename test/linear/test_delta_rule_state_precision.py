@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _mega_available() -> bool:
+def _cudnn_available() -> bool:
     try:
         import cutlass.experimental  # noqa: F401
     except ImportError:
@@ -35,9 +35,9 @@ def _mega_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-_MEGA_SKIP = pytest.mark.skipif(
-    not _mega_available(),
-    reason="the Mega backend requires nvidia-cutlass-dsl>=4.7 on SM100/SM103",
+_CUDNN_SKIP = pytest.mark.skipif(
+    not _cudnn_available(),
+    reason="the cuDNN backend requires nvidia-cutlass-dsl>=4.7 on SM100/SM103",
 )
 # Documented limitations: only the contract assertions may fail, and they must keep failing.
 _FP16_STATE_RANGE = pytest.mark.xfail(
@@ -50,10 +50,10 @@ _FP16_COTANGENT_RANGE = pytest.mark.xfail(
     raises=AssertionError,
     reason="FP16 execution stages state cotangents as FP16 tapes; 2^-25 flushes to zero",
 )
-_MEGA_KDA_CARRY = pytest.mark.xfail(
+_CUDNN_KDA_CARRY = pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="Mega KDA decays the carried state through a Q/K/V-dtype diagonal MMA, not in FP32",
+    reason="cuDNN KDA decays the carried state through a Q/K/V-dtype diagonal MMA, not in FP32",
 )
 # The FP32 carry may differ from the eager reference only by log2-domain gate conversions.
 _FP32_CARRY_RTOL = 1e-5
@@ -62,7 +62,7 @@ _FAMILIES = ("gdn", "kda")
 _DTYPES = (pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float16, id="fp16"))
 _BACKENDS = (
     pytest.param(None, id="fused"),
-    pytest.param({"backend": "mega"}, id="mega", marks=_MEGA_SKIP),
+    pytest.param({"backend": "cudnn"}, id="cudnn", marks=_CUDNN_SKIP),
 )
 
 
@@ -123,7 +123,7 @@ def test_large_state_decays_in_fp32(
     if dtype is torch.float16:
         request.applymarker(_FP16_STATE_RANGE)
     elif family == "kda" and kernel_options is not None:
-        request.applymarker(_MEGA_KDA_CARRY)
+        request.applymarker(_CUDNN_KDA_CARRY)
     inputs = _zero_inputs(family, dtype, tokens=1, gate_value=-4.0)
     initial_state = torch.zeros(1, 1, 128, 128, device="cuda")
     initial_state[0, 0, 0, 0] = 65536.0

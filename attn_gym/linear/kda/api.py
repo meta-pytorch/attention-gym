@@ -27,10 +27,10 @@ from attn_gym.linear._delta_rule.validation import (
     validate_paged_state,
 )
 from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.kda.impl.cudnn import chunk_forward as _cudnn_chunk_forward
+from attn_gym.linear.kda.impl.cudnn import paged_chunk_forward as _cudnn_paged_chunk_forward
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
-from attn_gym.linear.kda.impl.mega import chunk_forward as _mega_chunk_forward
-from attn_gym.linear.kda.impl.mega import paged_chunk_forward as _mega_paged_chunk_forward
 from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
@@ -83,11 +83,11 @@ def chunk_kda(
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
             are internal. The repo-local fused implementation requires approximately
-            ``[-5.914, 0]``. Mega BF16 instead requires every aligned 16-token
+            ``[-5.914, 0]``. cuDNN BF16 instead requires every aligned 16-token
             per-channel sum to exceed ``-126 * ln(2)``; a uniform
             ``lower_bound >= -5.45`` is safe, including
-            the common ``-5`` bound. Mega stages these MMA operands in the Q/K dtype rather
-            than TF32, so Mega FP16 does not support usual model-range gates. These limits
+            the common ``-5`` bound. cuDNN stages these MMA operands in the Q/K dtype rather
+            than TF32, so cuDNN FP16 does not support usual model-range gates. These limits
             are not checked at runtime and do not apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
@@ -102,9 +102,9 @@ def chunk_kda(
         scale: Query scale, applied inside the kernels in FP32. Defaults to
             ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        fastmath: Allow less precise fused math for speed; rejected by the Mega
+        fastmath: Allow less precise fused math for speed; rejected by the cuDNN
             backend and ``"reference"``.
-        autotune: Benchmark candidate fused-kernel configurations when true. Mega
+        autotune: Benchmark candidate fused-kernel configurations when true. cuDNN
             accepts this argument for API compatibility but uses its fixed schedule.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
             differentiable eager PyTorch in FP32. There is no automatic fallback.
@@ -138,8 +138,8 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options.backend == "mega":
-            return _mega_chunk_forward(
+        if options.backend == "cudnn":
+            return _cudnn_chunk_forward(
                 q,
                 k,
                 v,
@@ -217,9 +217,9 @@ def paged_chunk_kda(
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
         autotune: For the repo-local fused backend, benchmark candidate kernel
-            configurations when true; Mega uses its fixed schedule.
-        kernel_options: Backend-specific options. ``{"backend": "mega"}`` selects
-            the optional CuTeDSL 4.7 Mega backend. ``split_backward`` and
+            configurations when true; cuDNN uses its fixed schedule.
+        kernel_options: Backend-specific options. ``{"backend": "cudnn"}`` selects
+            the optional CuTeDSL 4.7 cuDNN backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies to the fused backend as in ``chunk_kda``.
 
@@ -248,8 +248,8 @@ def paged_chunk_kda(
     options = resolve_kernel_options(kernel_options)
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
-    if options.backend == "mega":
-        return _mega_paged_chunk_forward(
+    if options.backend == "cudnn":
+        return _cudnn_paged_chunk_forward(
             q,
             k,
             v,

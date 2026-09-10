@@ -14,7 +14,7 @@ _KERNEL_OPTION_NAMES = frozenset({"backend"})
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
-) -> Literal["fused", "mega"]:
+) -> Literal["fused", "cudnn"]:
     """Validate chunk backend options while keeping the repo-local path as default."""
     if kernel_options is None:
         return "fused"
@@ -23,8 +23,8 @@ def resolve_kernel_options(
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported chunk_gdn kernel options: {names}")
     backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "mega"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    if backend not in ("fused", "cudnn"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
     return backend
 
 

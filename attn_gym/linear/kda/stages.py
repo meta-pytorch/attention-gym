@@ -51,15 +51,15 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _finish_chunk_kda_fwd,
     _prepare_chunk_kda_fwd,
 )
-from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
-from attn_gym.linear.kda.impl.mega import validate_mega_constraints
-from attn_gym.linear.kda.impl.mega_ops import (
-    chunk_mega_packed_bwd_with_exit_cotangent_op,
-    chunk_mega_packed_bwd_with_state_op,
-    chunk_mega_packed_fwd_with_initial_state_op,
-    chunk_mega_packed_fwd_with_state_op,
-    validate_mega_available,
+from attn_gym.linear.kda.impl.cudnn import validate_cudnn_constraints
+from attn_gym.linear.kda.impl.cudnn_ops import (
+    chunk_cudnn_packed_bwd_with_exit_cotangent_op,
+    chunk_cudnn_packed_bwd_with_state_op,
+    chunk_cudnn_packed_fwd_with_initial_state_op,
+    chunk_cudnn_packed_fwd_with_state_op,
+    validate_cudnn_available,
 )
+from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
 from attn_gym.linear.types import KernelOptions
 
@@ -83,12 +83,12 @@ class ChunkKDASaved(NamedTuple):
     chunk_offsets: torch.Tensor | None
 
 
-class ChunkKDAMegaSaved(NamedTuple):
-    """Forward tensors a Mega ``chunk_kda_prepare`` stores for ``chunk_kda_prepare_backward``.
+class ChunkKDACudnnSaved(NamedTuple):
+    """Forward tensors a cuDNN ``chunk_kda_prepare`` stores for ``chunk_kda_prepare_backward``.
 
-    Mega's backward reads the raw ``gate`` and keeps its factors on chip, so the tape carries the
+    cuDNN's backward reads the raw ``gate`` and keeps its factors on chip, so the tape carries the
     gate instead of WY factors; ``cumulative_gate`` only feeds the fused factor pass behind
-    arbitrary-range summaries. Mega always runs packed, so the offsets are never ``None``.
+    arbitrary-range summaries. cuDNN always runs packed, so the offsets are never ``None``.
     """
 
     q: torch.Tensor
@@ -108,9 +108,9 @@ class ChunkKDAMegaSaved(NamedTuple):
 # order and selection; ``start == stop`` is the identity map. That is what the context-parallel
 # routing produces: a rank summarizes its whole piece of a document, never part of it. The fused
 # kernels would also sum an interior run of 64-token chunks of one subsequence, but that is not
-# part of the contract and Mega's kernels cannot do it. The values are not checked: they live on
+# part of the contract and cuDNN's kernels cannot do it. The values are not checked: they live on
 # the device so the launch replays under CUDA Graph capture, and reading them back would sync; a
-# row that matches no subsequence is filled with NaN on Mega and returns a plausible but wrong map
+# row that matches no subsequence is filled with NaN on cuDNN and returns a plausible but wrong map
 # on the fused kernels.
 
 
@@ -126,8 +126,8 @@ def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
     return state if state.stride(-1) == 1 else state.contiguous()
 
 
-def _normalize_mega_state(state: torch.Tensor | None) -> torch.Tensor | None:
-    """FP32 state as Mega's launchers read it through TMA.
+def _normalize_cudnn_state(state: torch.Tensor | None) -> torch.Tensor | None:
+    """FP32 state as cuDNN's launchers read it through TMA.
 
     Unit-stride keys and 16-byte-aligned outer strides suffice, so only other layouts are copied.
     The copy is a ``clone``: ``.contiguous()`` returns a contiguous view unchanged even when its
@@ -194,32 +194,32 @@ class ChunkKDAPrepared:
 
 
 @dataclass
-class ChunkKDAMegaPrepared:
-    """Mega forward handle: ``run`` is Mega's with-state kernel and summaries are Mega's too.
+class ChunkKDACudnnPrepared:
+    """cuDNN forward handle: ``run`` is cuDNN's with-state kernel and summaries are cuDNN's too.
 
-    Mega keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two runs
-    of Mega's state-only pass over it (from a zero entry state for ``B``, from the identity with
-    the value term disabled for ``A``). The backward handle is :class:`ChunkKDAMegaBackward`.
+    cuDNN keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two runs
+    of cuDNN's state-only pass over it (from a zero entry state for ``B``, from the identity with
+    the value term disabled for ``A``). The backward handle is :class:`ChunkKDACudnnBackward`.
     """
 
-    saved: ChunkKDAMegaSaved
+    saved: ChunkKDACudnnSaved
     metadata: RaggedChunkMetadata
     scale: float
     autotune: bool
-    # Mega rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
+    # cuDNN rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
     schedule: ScheduleRequest = ScheduleRequest.AUTO
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
-        Rows follow NOTE [Summary ranges are subsequences]. The maps carry Mega's 16-token-chunk
-        rounding, which differs from the fused maps and from an unsharded Mega pass.
+        Rows follow NOTE [Summary ranges are subsequences]. The maps carry cuDNN's 16-token-chunk
+        rounding, which differs from the fused maps and from an unsharded cuDNN pass.
         """
         # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
-        from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_summaries
+        from attn_gym.linear._delta_rule.cudnn.state_summary import build_cudnn_state_summaries
 
         saved = self.saved
-        return build_mega_state_summaries(
+        return build_cudnn_state_summaries(
             saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
         )
 
@@ -229,12 +229,12 @@ class ChunkKDAMegaPrepared:
         *,
         output_final_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run Mega's with-state kernel from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
+        """Run cuDNN's with-state kernel from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
         saved = self.saved
         if initial_state is None:
             initial_state = zero_state(saved.q, saved.v, self.metadata)
         else:
-            initial_state = _normalize_mega_state(initial_state)
+            initial_state = _normalize_cudnn_state(initial_state)
         args = (
             saved.q,
             saved.k,
@@ -246,8 +246,8 @@ class ChunkKDAMegaPrepared:
             self.scale,
         )
         if output_final_state:
-            return chunk_mega_packed_fwd_with_state_op(*args)
-        return chunk_mega_packed_fwd_with_initial_state_op(*args), None
+            return chunk_cudnn_packed_fwd_with_state_op(*args)
+        return chunk_cudnn_packed_fwd_with_initial_state_op(*args), None
 
 
 def chunk_kda_prepare(
@@ -261,14 +261,14 @@ def chunk_kda_prepare(
     scale: float | None = None,
     autotune: bool = True,
     kernel_options: KernelOptions | None = None,
-) -> ChunkKDAPrepared | ChunkKDAMegaPrepared:
+) -> ChunkKDAPrepared | ChunkKDACudnnPrepared:
     """Run the factor half of ``chunk_kda`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_kda`` with two restrictions: ``q``/``k``/``v`` must already share a
     float16 or bfloat16 dtype (no silent cast, because the caller owns autograd), and the batch
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
-    ``kernel_options={"backend": "mega"}`` runs the local pass and both summaries with Mega's
+    ``kernel_options={"backend": "cudnn"}`` runs the local pass and both summaries with cuDNN's
     kernels. Split schedules are not available with entry states.
     """
     backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
@@ -282,10 +282,10 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
-    if backend == "mega":
-        validate_mega_available(q)
+    if backend == "cudnn":
+        validate_cudnn_available(q)
         if cu_seqlens is None:
-            # Mega's with-state kernels are packed-only, so it always gets explicit boundaries;
+            # cuDNN's with-state kernels are packed-only, so it always gets explicit boundaries;
             # arange keeps the launch capture-safe.
             cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
@@ -293,12 +293,12 @@ def chunk_kda_prepare(
     )
     gate = gate.float()
     cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
-    if backend == "mega":
+    if backend == "cudnn":
         assert metadata is not None and cu_seqlens is not None and chunk_offsets is not None
         gate = normalize_compact_tensor(gate)
-        validate_mega_constraints(q, k, v, gate, beta, None, cu_seqlens)
-        saved = ChunkKDAMegaSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
-        return ChunkKDAMegaPrepared(saved, metadata, scale, autotune)
+        validate_cudnn_constraints(q, k, v, gate, beta, None, cu_seqlens)
+        saved = ChunkKDACudnnSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
+        return ChunkKDACudnnPrepared(saved, metadata, scale, autotune)
     factors = _prepare_chunk_kda_fwd(
         q, k, v, cumulative_gate, beta, metadata, scale=scale, autotune=autotune, schedule=schedule
     )
@@ -383,16 +383,16 @@ class ChunkKDABackward:
 
 
 @dataclass
-class ChunkKDAMegaBackward:
-    """Mega backward handle: ``run`` is Mega's stateful backward and the reverse maps are Mega's.
+class ChunkKDACudnnBackward:
+    """cuDNN backward handle: ``run`` is cuDNN's stateful backward and the reverse maps are cuDNN's.
 
-    Each subsequence's ``[C; R]`` map is the entry cotangent of Mega's backward run with a zero
+    Each subsequence's ``[C; R]`` map is the entry cotangent of cuDNN's backward run with a zero
     exit cotangent (``C``) and the forward transition transposed (``R``, the exact adjoint; a
     natively probed adjoint would round differently). Nothing is consumed, so ``run`` and
     ``state_grad_summaries`` may be called in either order.
     """
 
-    saved: ChunkKDAMegaSaved
+    saved: ChunkKDACudnnSaved
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
@@ -404,10 +404,12 @@ class ChunkKDAMegaBackward:
 
         Rows follow NOTE [Summary ranges are subsequences].
         """
-        from attn_gym.linear._delta_rule.mega.state_summary import build_mega_state_grad_summaries
+        from attn_gym.linear._delta_rule.cudnn.state_summary import (
+            build_cudnn_state_grad_summaries,
+        )
 
         saved = self.saved
-        return build_mega_state_grad_summaries(
+        return build_cudnn_state_grad_summaries(
             saved.q,
             saved.k,
             saved.v,
@@ -430,27 +432,27 @@ class ChunkKDAMegaBackward:
         torch.Tensor,
         torch.Tensor | None,
     ]:
-        """Run Mega's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
+        """Run cuDNN's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
 
         Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)``; the last is ``None`` when the
         forward ran without an entry state. An absent ``d_final_state`` skips the cotangent load
         and gives the token gradients of an explicit zero.
         """
         saved = self.saved
-        d_final_state = _normalize_mega_state(d_final_state)
+        d_final_state = _normalize_cudnn_state(d_final_state)
         operands = (saved.q, saved.k, saved.v, saved.gate, saved.beta, self.d_output)
         if self.initial_state is None:
-            grads = chunk_mega_packed_bwd_with_exit_cotangent_op(
+            grads = chunk_cudnn_packed_bwd_with_exit_cotangent_op(
                 *operands, saved.cu_seqlens, d_final_state, self.scale
             )
             return (*grads, None)
-        return chunk_mega_packed_bwd_with_state_op(
+        return chunk_cudnn_packed_bwd_with_state_op(
             *operands, saved.cu_seqlens, self.initial_state, d_final_state, self.scale
         )
 
 
 def chunk_kda_prepare_backward(
-    saved: ChunkKDASaved | ChunkKDAMegaSaved,
+    saved: ChunkKDASaved | ChunkKDACudnnSaved,
     d_output: torch.Tensor | None,
     initial_state: torch.Tensor | None,
     *,
@@ -458,7 +460,7 @@ def chunk_kda_prepare_backward(
     autotune: bool = True,
     fastmath: bool = False,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-) -> ChunkKDABackward | ChunkKDAMegaBackward:
+) -> ChunkKDABackward | ChunkKDACudnnBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the
@@ -466,8 +468,8 @@ def chunk_kda_prepare_backward(
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
     caller's autograd function owns them. ``fastmath`` applies to the gradient kernels as in
     ``chunk_kda``; pass the forward handle's ``prepared.schedule`` so the backward's factor
-    recompute uses the same launch geometry. A Mega tape (:class:`ChunkKDAMegaSaved`) returns
-    :class:`ChunkKDAMegaBackward`, whose native ``run`` ignores ``fastmath``; it recomputes fused
+    recompute uses the same launch geometry. A cuDNN tape (:class:`ChunkKDACudnnSaved`) returns
+    :class:`ChunkKDACudnnBackward`, whose native ``run`` ignores ``fastmath``; it recomputes fused
     factors only if ``state_grad_summaries`` needs them.
     """
     if d_output is None:
@@ -475,9 +477,9 @@ def chunk_kda_prepare_backward(
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
-    if isinstance(saved, ChunkKDAMegaSaved):
-        return ChunkKDAMegaBackward(
-            saved, d_output, _normalize_mega_state(initial_state), scale, autotune, schedule
+    if isinstance(saved, ChunkKDACudnnSaved):
+        return ChunkKDACudnnBackward(
+            saved, d_output, _normalize_cudnn_state(initial_state), scale, autotune, schedule
         )
     metadata = None
     if saved.cu_seqlens is not None:
@@ -509,9 +511,9 @@ def chunk_kda_prepare_backward(
 
 __all__ = [
     "ChunkKDABackward",
-    "ChunkKDAMegaBackward",
-    "ChunkKDAMegaPrepared",
-    "ChunkKDAMegaSaved",
+    "ChunkKDACudnnBackward",
+    "ChunkKDACudnnPrepared",
+    "ChunkKDACudnnSaved",
     "ChunkKDAPrepared",
     "ChunkKDASaved",
     "chunk_kda_prepare",

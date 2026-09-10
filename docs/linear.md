@@ -31,8 +31,8 @@ slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and pre
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. Like
 `chunk_kda`, `chunk_gdn` defaults to the repo-local fused chunk pipeline (`impl="fused"`);
-`impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "mega"}` to select the
-optional Mega CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only
+`impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "cudnn"}` to select the
+optional cuDNN CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only
 Triton scan.
 
 ```python
@@ -52,7 +52,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
   support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
-- An opt-in Mega fused chunk implementation with the same public training/state contract and
+- An opt-in cuDNN fused chunk implementation with the same public training/state contract and
   direct paged-cache prefill on SM100/SM103.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
@@ -65,7 +65,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
 
 !!! note "What the fused paths keep in FP32"
 
-    Every optimized GDN and KDA path (repo-local fused and Mega) carries the recurrent state
+    Every optimized GDN and KDA path (repo-local fused and cuDNN) carries the recurrent state
     from `initial_state` to `final_state`, and the state cotangent from `d_final_state` to
     `d_initial_state`, in FP32 accumulators with FP32 decay. The chunk-entry state that each
     chunk reads, the per-chunk state checkpoints, and the per-chunk state-cotangent tape are
@@ -77,20 +77,20 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     cotangents within the FP16 normal range, for example through loss scaling, or use BF16 when
     state magnitudes can leave it. Use L2-normalized Q/K with FP16, as the training example does:
     unnormalized Q/K or unusually large V can likewise push attention, solve, and value
-    intermediates outside the FP16 range between FP32-accumulating GEMMs. The Mega KDA backend
+    intermediates outside the FP16 range between FP32-accumulating GEMMs. The cuDNN KDA backend
     additionally applies the per-chunk decay to the carried state, and to the state cotangent of
     its no-state local backward, through a diagonal MMA in the Q/K/V dtype rather than in FP32.
 
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and
-`K = V = 128`, but has no Mega runtime dependency. Its scalar natural-log gate is not lower-bounded:
+`K = V = 128`, but has no cuDNN runtime dependency. Its scalar natural-log gate is not lower-bounded:
 kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
 wide-address path. Backward uses the tuned CuTe kernels on SM100/SM103 and portable Triton
 kernels on Ampere, Hopper, and other supported architectures.
 
-The Mega chunk backend requires the optional `mega` dependencies and SM100/SM103,
+The cuDNN chunk backend requires the optional `cudnn` dependencies and SM100/SM103,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
 gate without a lower bound and uses exact execution without an approximate forgetting-horizon
 split.
@@ -370,9 +370,9 @@ conversion and its sequence-local BT64 cumulative sum; `recurrent_kda` performs 
 conversion because recurrence consumes one token decay at a time. This keeps chunking out
 of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The repo-local fused
-backend requires approximately `[-5.914, 0]`. Mega BF16 instead requires every aligned 16-token
+backend requires approximately `[-5.914, 0]`. cuDNN BF16 instead requires every aligned 16-token
 per-channel sum to exceed `-126 * ln(2)`; a uniform `lower_bound >= -5.45` is safe, including the
-common `-5` bound. Mega stages these MMA operands in the Q/K dtype rather than TF32, so Mega FP16 does
+common `-5` bound. cuDNN stages these MMA operands in the Q/K dtype rather than TF32, so cuDNN FP16 does
 not support usual model-range gates. These limits are not checked at runtime. The training example
 uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
@@ -394,7 +394,7 @@ gate activation, beta sigmoid, recurrence, output, and state-cache update run in
 Triton kernel. Callers may provide a stable output buffer for allocation-free CUDA
 Graph replay.
 
-`chunk_kda(..., kernel_options={"backend": "mega"})` selects an opt-in SM100/SM103
+`chunk_kda(..., kernel_options={"backend": "cudnn"})` selects an opt-in SM100/SM103
 FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
 public CuTeDSL 4.7 primitives and has no cuDNN Frontend runtime dependency. Like the other
@@ -406,22 +406,22 @@ TMA-compatible innermost modes with aligned dynamic outer strides; beta requires
 contiguous inner mode. By default the forward is exact and
 unsplit: one persistent work item per sequence and head, which leaves the GPU underused for a few
 long sequences at low head counts. FP16 and BF16 use exact backward execution by default; eligible
-packed no-state long contexts may use the Mega backward with one unsplit work item per sequence and
+packed no-state long contexts may use the cuDNN backward with one unsplit work item per sequence and
 head. Callers that guarantee normalized keys, post-sigmoid beta, and nonpositive decay increments may
-set `split_backward` and/or `split_forward` to `True` in a Mega `kernel_options` mapping to opt into
+set `split_backward` and/or `split_forward` to `True` in a cuDNN `kernel_options` mapping to opt into
 approximate forgetting-horizon splitting: a sequence is cut only where its cumulative decay has
 crossed the kernel's threshold, and each cut item rebuilds its entry state from zero over a short
 warmup window. Gates that never forget produce no cuts and reproduce the unsplit result exactly; when
 cuts are accepted the result stays within the low-precision error budget while exposing several
 times the parallel work. The threshold is a margin of bits past the output dtype's half-ulp, not an
 underflow; see `NOTE [Forgetting Horizon]` in
-`attn_gym/linear/_delta_rule/mega/kernels/common/split_k.py`. `split_forward` affects only the
+`attn_gym/linear/_delta_rule/cudnn/kernels/common/split_k.py`. `split_forward` affects only the
 forward recurrence: unless `split_backward` is also enabled, backward computes the exact unsplit
 recurrence's gradient rather than the derivative of the split forward. The implementation chooses
 the split count from the input geometry; no public split-size knob is exposed. Split schedules
-currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "mega"})` uses the
+currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "cudnn"})` uses the
 same exact unsplit forward while updating selected cache slots directly; paged execution never uses
-forgetting-horizon splitting. Install the `mega` extra to use this backend.
+forgetting-horizon splitting. Install the `cudnn` extra to use this backend.
 
 `kernel_options={"schedule": "persistent"}` is for CUDA graphs whose replays can carry far fewer
 tokens than the capacity they were captured for. The default static grid launches one CTA per
@@ -609,34 +609,34 @@ to ranks, longest first onto the least-loaded rank, so ranks stay within one doc
 each other. What it cannot do is split a document that does not fit on one rank; that is what
 the summaries above are for.
 
-### Mega local execution
+### cuDNN local execution
 
-`kernel_options={"backend": "mega"}` runs each rank's local passes with Mega's kernels. The
+`kernel_options={"backend": "cudnn"}` runs each rank's local passes with cuDNN's kernels. The
 recipe is the same as for the fused backend: summarize every local range as an affine map of its
 entry state, exchange and compose the maps, then run the local pass from the composed state.
 
-*Forward.* `prepare` stores only the inputs; Mega keeps its WY factors on chip and never writes
+*Forward.* `prepare` stores only the inputs; cuDNN keeps its WY factors on chip and never writes
 them out. `state_summaries` produces each range's `[B; A]` map (`S_exit = S_entry @ A + B`) by
-running Mega's state-only pass over the range twice: from a zero entry state, whose final state
+running cuDNN's state-only pass over the range twice: from a zero entry state, whose final state
 is `B`, and from an identity entry state with the value term disabled, whose final state is `A`.
 Which ranges are probed and how their rows are ordered is decided on the device, so the call is
 CUDA Graph replayable and an empty range yields the identity map. Every range must be a
 subsequence (one rank's piece of a document, one segment of the local `cu_seqlens`), which is
 all the CP recipes ever request; a nonempty range that is not one is filled with NaN. `run` is
-Mega's forward from the composed entry state.
+cuDNN's forward from the composed entry state.
 
-*Backward.* `run` is Mega's own stateful backward (`kda_chunk_mega_packed_bwd_with_state`):
+*Backward.* `run` is cuDNN's own stateful backward (`kda_chunk_cudnn_packed_bwd_with_state`):
 the state pass from the saved entry state writes checkpoints, then the BT16 backward consumes
 them together with the exit cotangent, returning the token gradients and the entry-state
 cotangent. `state_grad_summaries` produces each subsequence's `[C; R]` map with the same
-kernels: `C` is the entry-state cotangent of Mega's backward run with a zero exit cotangent, and
-`R` is the forward transition transposed. No fused factors are computed anywhere on the Mega
+kernels: `C` is the entry-state cotangent of cuDNN's backward run with a zero exit cotangent, and
+`R` is the forward transition transposed. No fused factors are computed anywhere on the cuDNN
 path.
 
-*Numerics.* A document cut on 16-token boundaries whose fragments exchange Mega's own state and
-cotangent reproduces the unsharded Mega gradients bit for bit. The composed entry states do not:
-the maps carry Mega's 16-token-chunk rounding, so Mega under CP is its own numerical baseline,
-neither the fused CP baseline nor unsharded Mega. The staged handles and this recipe are
+*Numerics.* A document cut on 16-token boundaries whose fragments exchange cuDNN's own state and
+cotangent reproduces the unsharded cuDNN gradients bit for bit. The composed entry states do not:
+the maps carry cuDNN's 16-token-chunk rounding, so cuDNN under CP is its own numerical baseline,
+neither the fused CP baseline nor unsharded cuDNN. The staged handles and this recipe are
 eager-only; `torch.compile` is not supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk

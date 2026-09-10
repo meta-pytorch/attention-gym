@@ -237,7 +237,7 @@ def test_chunk_kernel_options_plumbing():
             gate,
             beta,
             impl="reference",
-            kernel_options={"backend": "mega"},
+            kernel_options={"backend": "cudnn"},
         )
 
 
