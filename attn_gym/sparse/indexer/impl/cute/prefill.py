@@ -81,20 +81,6 @@ class IndexerWarpRole(IntEnum):
     LOAD = 17
 
 
-def _make_shared_storage_type(config: IndexerConfig):
-    @cute.struct
-    class SharedStorage:
-        k_barriers: cute.struct.MemRange[Int64, config.k_stages * 2]
-        q_barriers: cute.struct.MemRange[Int64, config.q_stages * 2]
-        acc0_barriers: cute.struct.MemRange[Int64, config.acc_stages * 2]
-        acc1_barriers: cute.struct.MemRange[Int64, config.acc_stages * 2]
-        mailbox0_barriers: cute.struct.MemRange[Int64, config.mailbox_stages * 2]
-        mailbox1_barriers: cute.struct.MemRange[Int64, config.mailbox_stages * 2]
-        tmem_holding: Int32
-
-    return SharedStorage
-
-
 @dsl_user_op
 def _bitcast_f32_to_i32(value, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.bitcast(T.i32(), Float32(value).ir_value()))
@@ -162,6 +148,18 @@ class IndexerPrefillKernel:
         self.causal = causal
         self.dtype = dtype
         self.config = config if config is not None else IndexerConfig()
+
+        @cute.struct
+        class SharedStorage:
+            k_barriers: cute.struct.MemRange[Int64, self.config.k_stages * 2]
+            q_barriers: cute.struct.MemRange[Int64, self.config.q_stages * 2]
+            acc0_barriers: cute.struct.MemRange[Int64, self.config.acc_stages * 2]
+            acc1_barriers: cute.struct.MemRange[Int64, self.config.acc_stages * 2]
+            mailbox0_barriers: cute.struct.MemRange[Int64, self.config.mailbox_stages * 2]
+            mailbox1_barriers: cute.struct.MemRange[Int64, self.config.mailbox_stages * 2]
+            tmem_holding: Int32
+
+        self.SharedStorage = SharedStorage
 
     @property
     def run_size(self) -> int:
@@ -1134,7 +1132,7 @@ class IndexerPrefillKernel:
         mQ1_hd = mQ_hdtb[None, None, query1_load, batch]
 
         smem = utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage_type)
+        storage = smem.allocate(self.SharedStorage)
         sK = smem.allocate_tensor(
             element_type=io_dtype,
             layout=k_smem_layout.outer,
@@ -1444,7 +1442,6 @@ class IndexerPrefillKernel:
             tiled_mma,
         )
 
-        self.shared_storage_type = _make_shared_storage_type(config)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tiled_mma,
