@@ -2,8 +2,8 @@
 
 """Native BT16 affine probes for whole packed sequences.
 
-Forward maps pack [B; A] for ``exit = entry @ A + B``.
-Native state/operand rounding makes these approximate affine
+Forward maps pack [B; A] for ``exit = entry @ A + B``; reverse maps pack [C; R] for
+``d_entry = d_exit @ R + C``. Native state/operand rounding makes these approximate affine
 maps, not bitwise reconstruction of an ordinary unsharded Mega run. Every probe is unsplit,
 so its arithmetic is independent of sequence ownership and packed token count.
 """
@@ -20,7 +20,7 @@ from attn_gym._backends.cute.utils import initialized_cuda_device
 from attn_gym.utils import ceildiv
 
 from .forward import validate_available
-from .kernels import kda_recompute_f16
+from .kernels import kda_bprop_f16, kda_recompute_f16
 from .kernels.common.host import tensormap_workspace_bytes
 from .schedule import MegaSchedule, prepare_mega_schedule
 
@@ -91,7 +91,7 @@ def build_mega_state_summaries(
     consecutive cu_seqlens pairs. Empty intervals yield ``[0; I]``; zero rows yield no maps.
     Bounds values stay on device and may change during CUDA Graph replay.
     """
-    maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds)
+    maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds, bias=True)
     return _summary_rows(maps, cu_seqlens, bounds)
 
 
@@ -150,8 +150,13 @@ def _build_mega_state_probes(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
     bounds: torch.Tensor | None,
+    *,
+    bias: bool,
 ) -> torch.Tensor:
-    """Probe selected sequences into full-size storage indexed by the native sequence IDs."""
+    """Probe selected sequences into full-size storage indexed by the native sequence IDs.
+
+    ``bias=False`` skips the zero-state probe and returns only the transition ``A``.
+    """
     validate_available(k)
     if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] != 128:
         raise ValueError("k must have shape [1, T, H, 128]")
@@ -182,7 +187,7 @@ def _build_mega_state_probes(
             schedule, workspace = _prepare_summary_launch(
                 gate, cu_seqlens, bounds, kda_recompute_f16
             )
-            for transition_only in (False, True):
+            for transition_only in (False, True) if bias else (True,):
                 if bounds is not None:
                     schedule.counters.zero_()
                 kda_recompute_f16.chunk_kda_recompute_sm100(
@@ -204,3 +209,74 @@ def _build_mega_state_probes(
                     transition_only=transition_only,
                 )
         return summaries
+
+
+def build_mega_state_grad_summaries(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    d_output: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    *,
+    transpose_forward_transition: bool = False,
+    bounds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return subsequence FP32 ``[N, H, 256, 128]`` maps packed as ``[C; R]``.
+
+    C is the native entry cotangent with zero exit cotangent. R uses an identity exit
+    cotangent and zero d_output. ``transpose_forward_transition=True`` instead uses A.T
+    from the forward probe: algebraically the adjoint, but not native backward rounding.
+    Inputs and bounds follow :func:`build_mega_state_summaries`; selection applies to both
+    probes and empty intervals yield ``[0; I]``.
+    """
+    validate_available(q)
+    with initialized_cuda_device(q):
+        sequences, heads = cu_seqlens.numel() - 1, q.shape[2]
+        if transpose_forward_transition:
+            maps = _build_mega_state_probes(k, value, gate, beta, cu_seqlens, bounds, bias=False)
+            maps[:, :, 128:].copy_(maps[:, :, 128:].transpose(-1, -2).contiguous())
+        else:
+            maps = torch.zeros(sequences, heads, 256, 128, device=q.device)
+            maps[:, :, 128:].diagonal(dim1=-2, dim2=-1).fill_(1)
+        if q.shape[1] == 0 or (bounds is not None and bounds.shape[0] == 0):
+            return _summary_rows(maps, cu_seqlens, bounds)
+        schedule, workspace = _prepare_summary_launch(gate, cu_seqlens, bounds, kda_bprop_f16)
+        # The dH recurrence ignores V/checkpoints; token gradients are computed but discarded.
+        # Zero-stride TMA checkpoint rows all address one tile, avoiding a state recompute.
+        checkpoints = torch.zeros(1, heads, 128, 128, device=q.device, dtype=q.dtype).expand(
+            q.shape[1] // 16 + sequences, -1, -1, -1
+        )
+        scratch = [torch.empty_like(t[0]) for t in (q, k, value, gate, beta)]
+        for transition in (False,) if transpose_forward_transition else (False, True):
+            if bounds is not None:
+                schedule.counters.zero_()
+            exit_state = None
+            do = d_output
+            if transition:
+                exit_state = torch.eye(128, device=q.device).expand(sequences, heads, 128, 128)
+                do = torch.zeros_like(d_output[:, :1]).expand_as(d_output)
+            kda_bprop_f16.chunk_kda_bwd_sm100(
+                q[0],
+                k[0],
+                value[0],
+                gate[0],
+                beta[0],
+                do[0],
+                checkpoints,
+                *scratch,
+                cu_seqlens,
+                scale,
+                use_initial_state=True,
+                d_initial_state=maps[:, :, 128:] if transition else maps[:, :, :128],
+                d_final_state=exit_state,
+                work_items=schedule.work_items,
+                work_count=schedule.work_count,
+                sched_ctr=schedule.counters if sequences * heads <= schedule.num_sms else None,
+                sched_all=schedule.counters,
+                order_in_prologue=bounds is None,
+                tensormap_workspace=workspace,
+            )
+        return _summary_rows(maps, cu_seqlens, bounds)
