@@ -554,21 +554,17 @@ def _all_gather_slots(local_slots: torch.Tensor, group: dist.ProcessGroup) -> to
 
 
 def fold_slots(gathered: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
-    """Apply gathered summaries to the zero state, one row of slots at a time.
+    """Apply gathered summaries to the zero state along each row's chain of slots.
 
     ``gathered`` is ``[world, slots, HV, V + K, K]`` and ``sources`` is ``int64 [rows, L]`` of
     flat ``cp_rank * slots + fragment`` indices in application order, padded with
-    ``world * slots``, which addresses the identity appended here. Every row costs ``L`` merges
-    regardless of how many real slots it names, so the launch sequence is fixed and CUDA Graph
-    capturable.
+    ``world * slots`` (the identity, never applied). The whole table folds in one launch whose
+    grid is fixed by ``rows`` and ``L``, so it is CUDA Graph capturable and replays across
+    layouts.
     """
-    heads, packed, key_dim = gathered.shape[-3:]
-    neutral = neutral_summary(heads, packed - key_dim, key_dim, device=gathered.device)
-    flat = torch.cat((gathered.flatten(0, 1), neutral.unsqueeze(0)))
-    state = gathered.new_zeros(sources.shape[0], heads, packed - key_dim, key_dim)
-    for step in range(sources.shape[1]):
-        state = merge_state(state, flat[sources[:, step]])
-    return state
+    from attn_gym.linear._delta_rule.triton.fold_slots import fold_slots_fused
+
+    return fold_slots_fused(gathered.flatten(0, 1), sources)
 
 
 def _scatter_folds(folded: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
