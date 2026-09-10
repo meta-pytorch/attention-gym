@@ -2,7 +2,7 @@
 
 Usage:
     python benchmarks/sparse/indexer_benchmark.py
-    python benchmarks/sparse/indexer_benchmark.py --backend eager cute
+    python benchmarks/sparse/indexer_benchmark.py --impl reference fused
     python benchmarks/sparse/indexer_benchmark.py --batch 4 --sequence-length 2048
 """
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument(
-        "--backend", nargs="+", default=["eager"], choices=["eager", "cute"]
+        "--impl", nargs="+", default=["fused"], choices=["reference", "fused"]
     )
     parser.add_argument("--warmup", type=int, default=200, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=1000, help="Measurement duration in ms")
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if "cute" in args.backend:
+    if "fused" in args.impl:
         assert args.heads % 2 == 0, "cute backend requires an even number of heads"
         assert args.head_dim % 16 == 0, "cute backend requires head_dim divisible by 16"
         assert args.dtype in ("float16", "bfloat16"), "cute backend requires fp16 or bf16"
@@ -87,12 +87,12 @@ def main() -> None:
 
     fwd_flops = useful_flops(args)
 
-    for backend in args.backend:
+    for impl in args.impl:
         q, k, weights = make_inputs(args)
 
-        def fwd(_q=q, _k=k, _weights=weights, _backend=backend):
+        def fwd(_q=q, _k=k, _weights=weights, _impl=impl):
             return lightning_indexer(
-                _q, _k, _weights, args.topk, causal=args.causal, backend=_backend
+                _q, _k, _weights, args.topk, causal=args.causal, impl=_impl
             )
 
         fwd()
@@ -101,7 +101,7 @@ def main() -> None:
         )
         fwd_tflops = fwd_flops / (fwd_ms * 1e9)
 
-        print(f"[{backend}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} TFLOP/s)")
+        print(f"[{impl}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} TFLOP/s)")
 
 
 if __name__ == "__main__":

@@ -83,7 +83,8 @@ def lightning_indexer(
     topk: int,
     *,
     causal: bool = False,
-    backend: str = "eager",
+    impl: str = "fused",
+    kernel_options: dict[str, str] | None = None,
 ) -> Tensor:
     """Return the Top-K candidate indices for every (batch, query) row.
 
@@ -108,7 +109,9 @@ def lightning_indexer(
         causal: If True, query at position t can only attend to candidates
             at positions <= t.  Requires S == T.
 
-        backend: One of "eager" or "cute".
+        impl: One of "reference" or "fused". Defaults to "fused".
+
+        kernel_options: Fused kernel options; the supported backend is "cute".
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -117,12 +120,16 @@ def lightning_indexer(
 
     _validate_inputs(q, k, weights, topk, causal)
 
-    match backend:
-        case "eager":
+    match impl:
+        case "reference":
+            if kernel_options:
+                raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
             return reference.index(q, k, weights, topk, causal)
-        case "cute":
+        case "fused":
+            if kernel_options not in (None, {}, {"backend": "cute"}):
+                raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
             return _indexer_cute_op(q, k, weights, topk, causal)
         case _:
-            raise NotImplementedError(f"Backend {backend!r} is not supported.")
+            raise ValueError(f"unknown impl {impl!r}; expected 'reference' or 'fused'")
