@@ -206,6 +206,310 @@ class IndexerPrefillKernel:
             f"as{self.config.acc_stages}"
         )
 
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_k: cute.CopyAtom,
+        mK_sdb: cute.Tensor,
+        tma_atom_q: cute.CopyAtom,
+        mQ_hdtb: cute.Tensor,
+        mW_bth: cute.Tensor,
+        mOut_btk: cute.Tensor,
+        k_smem_layout: cute.ComposedLayout,
+        q_smem_layout: cute.ComposedLayout,
+        score_scale: Float32,
+    ):
+        """Dispatch the reducer, selector, MMA, and load warp roles."""
+        config = self.config
+        causal = self.causal
+        io_dtype = self.dtype.cute_type
+        tile_candidates = self.tile_candidates
+        tile_heads = self.tile_heads
+        tile_d = config.tile_d
+        queries_per_cta = self.queries_per_cta
+        selection_warps = self.selection_warps
+        selection_threads = self.selection_threads
+        mma_tile = self.mma_tile
+        threads = self.threads
+
+        reducer_q1_start = int(IndexerWarpRole.REDUCER_Q1)
+        selector_q0_start = int(IndexerWarpRole.SELECTOR_Q0)
+        selector_q1_start = int(IndexerWarpRole.SELECTOR_Q1)
+        mma_warp = int(IndexerWarpRole.MMA)
+        load_warp = int(IndexerWarpRole.LOAD)
+
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx & Int32(_WARP_SIZE - 1)
+        query_pair, batch, _ = cute.arch.block_idx()
+
+        num_candidates = cute.size(mK_sdb.shape[0])
+        num_heads = cute.size(mQ_hdtb.shape[0])
+        num_queries = cute.size(mQ_hdtb.shape[2])
+        query0 = query_pair * Int32(queries_per_cta)
+        query1 = query0 + Int32(1)
+        query1_active = query1 < num_queries
+        query1_load = query1 if query1_active else query0
+        mK_sd = mK_sdb[None, None, batch]
+        mQ0_hd = mQ_hdtb[None, None, query0, batch]
+        mQ1_hd = mQ_hdtb[None, None, query1_load, batch]
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(self.SharedStorage)
+        sK = smem.allocate_tensor(
+            element_type=io_dtype,
+            layout=k_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=k_smem_layout.inner,
+        )
+        sQ = smem.allocate_tensor(
+            element_type=io_dtype,
+            layout=q_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=q_smem_layout.inner,
+        )
+        selection_keys = smem.allocate_tensor(
+            Int64,
+            cute.make_layout(
+                (queries_per_cta * self.sort_span + queries_per_cta * 2 * tile_candidates,)
+            ),
+            byte_alignment=128,
+        )
+        buffer_counts = smem.allocate_tensor(
+            Int32,
+            cute.make_layout((queries_per_cta,)),
+            byte_alignment=16,
+        )
+        drain_flags = smem.allocate_tensor(
+            Int32,
+            cute.make_layout((queries_per_cta,)),
+            byte_alignment=16,
+        )
+        mailbox_ordinals = smem.allocate_tensor(
+            Int32,
+            cute.make_layout((queries_per_cta * config.mailbox_stages * tile_candidates,)),
+            byte_alignment=128,
+        )
+
+        if warp_idx == Int32(load_warp):
+            cpasync.prefetch_descriptor(tma_atom_k)
+            cpasync.prefetch_descriptor(tma_atom_q)
+
+        k_bytes_per_stage = cute.size_in_bytes(
+            io_dtype,
+            cute.select(k_smem_layout, mode=[0, 1, 2]),
+        )
+        q_bytes_per_stage = cute.size_in_bytes(
+            io_dtype,
+            cute.select(q_smem_layout, mode=[0, 1, 2]),
+        )
+        k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=config.k_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=k_bytes_per_stage,
+            barrier_storage=storage.k_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=config.q_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=q_bytes_per_stage,
+            barrier_storage=storage.q_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        acc0_producer, acc0_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=config.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, selection_threads),
+            barrier_storage=storage.acc0_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        acc1_producer, acc1_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=config.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, selection_threads),
+            barrier_storage=storage.acc1_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        mailbox0_producer, mailbox0_consumer = pipeline.PipelineAsync.create(
+            num_stages=config.mailbox_stages,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                selection_threads,
+            ),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                selection_threads,
+            ),
+            barrier_storage=storage.mailbox0_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        mailbox1_producer, mailbox1_consumer = pipeline.PipelineAsync.create(
+            num_stages=config.mailbox_stages,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                selection_threads,
+            ),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                selection_threads,
+            ),
+            barrier_storage=storage.mailbox1_barriers.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+
+        # All pipeline barriers are now initialized.  One fence and CTA
+        # rendezvous replaces the otherwise redundant synchronization
+        # performed by every individual pipeline constructor.
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+
+        fragment_k = tiled_mma.make_fragment_A(sK)
+        fragment_q = tiled_mma.make_fragment_B(sQ)
+        accumulator_shape = tiled_mma.partition_shape_C(mma_tile[:2])
+        accumulator_template = tiled_mma.make_fragment_C(
+            cute.append(accumulator_shape, self.acc_tmem_stages)
+        )
+
+        tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads)
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding.ptr,
+            barrier_for_retrieve=tmem_barrier,
+            allocator_warp_id=mma_warp,
+        )
+        tmem.allocate(utils.get_num_tmem_alloc_cols(accumulator_template))
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(Float32)
+        accumulator = cute.make_tensor(tmem_ptr, accumulator_template.layout)
+
+        candidate_tiles = (
+            cute.ceil_div(query1_load + Int32(1), tile_candidates)
+            if causal
+            else cute.ceil_div(num_candidates, tile_candidates)
+        )
+        head_tiles = cute.ceil_div(num_heads, tile_heads)
+
+        if warp_idx < Int32(reducer_q1_start):
+            self._run_query_reducer_mailbox(
+                accumulator,
+                acc0_consumer,
+                mailbox_ordinals,
+                mailbox0_producer,
+                mW_bth,
+                tidx,
+                warp_idx,
+                lane,
+                batch,
+                query0,
+                query0 < num_queries,
+                0,
+                num_candidates,
+                num_heads,
+                candidate_tiles,
+                head_tiles,
+                score_scale,
+            )
+        elif warp_idx < Int32(selector_q0_start):
+            self._run_query_reducer_mailbox(
+                accumulator,
+                acc1_consumer,
+                mailbox_ordinals,
+                mailbox1_producer,
+                mW_bth,
+                tidx - Int32(selection_threads),
+                warp_idx - Int32(reducer_q1_start),
+                lane,
+                batch,
+                query1_load,
+                query1_active,
+                1,
+                num_candidates,
+                num_heads,
+                candidate_tiles,
+                head_tiles,
+                score_scale,
+            )
+        elif warp_idx < Int32(selector_q1_start):
+            self._run_query_selector_mailbox(
+                mailbox_ordinals,
+                mailbox0_consumer,
+                selection_keys,
+                buffer_counts,
+                drain_flags,
+                tidx - Int32(selector_q0_start * _WARP_SIZE),
+                warp_idx - Int32(selector_q0_start),
+                lane,
+                0,
+                candidate_tiles,
+            )
+        elif warp_idx < Int32(mma_warp):
+            self._run_query_selector_mailbox(
+                mailbox_ordinals,
+                mailbox1_consumer,
+                selection_keys,
+                buffer_counts,
+                drain_flags,
+                tidx - Int32(selector_q1_start * _WARP_SIZE),
+                warp_idx - Int32(selector_q1_start),
+                lane,
+                1,
+                candidate_tiles,
+            )
+
+        if warp_idx == Int32(load_warp):
+            self._run_paired_load(
+                tiled_mma,
+                tma_atom_k,
+                tma_atom_q,
+                mK_sd,
+                mQ0_hd,
+                mQ1_hd,
+                sK,
+                sQ,
+                candidate_tiles,
+                head_tiles,
+                k_producer,
+                q_producer,
+            )
+        elif warp_idx == Int32(mma_warp):
+            self._run_paired_mma(
+                tiled_mma,
+                accumulator,
+                fragment_k,
+                fragment_q,
+                candidate_tiles,
+                head_tiles,
+                cute.ceil_div(cute.size(mK_sd, mode=[1]), tile_d),
+                k_consumer,
+                q_consumer,
+                acc0_producer,
+                acc1_producer,
+            )
+        # Every selection group has already performed its mandatory final
+        # drain, so it may write its disjoint output rows without waiting
+        # for other roles.
+        selection_query = (warp_idx - Int32(selector_q0_start)) // Int32(selection_warps)
+        selection_tid = (tidx - Int32(selector_q0_start * _WARP_SIZE)) & Int32(
+            selection_threads - 1
+        )
+        selection_base = selection_query * Int32(self.sort_span)
+        query_index = query0 if selection_query == Int32(0) else query1
+        query_active = selection_query == Int32(0) or query1_active
+        is_selection_warp = warp_idx >= Int32(selector_q0_start) and warp_idx < Int32(mma_warp)
+        if is_selection_warp:
+            for write_round in cutlass.range_constexpr(cute.ceil_div(self.topk, selection_threads)):
+                slot = selection_tid + Int32(write_round * selection_threads)
+                if query_active and slot < Int32(self.topk):
+                    key = Int64(selection_keys[selection_base + slot])
+                    mOut_btk[batch, query_index, slot] = ~Int32(key & Int64(0xFFFFFFFF))
+        tmem.relinquish_alloc_permit()
+        tmem_free_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=threads)
+        tmem_free_barrier.arrive_and_wait()
+        tmem.free(tmem_ptr)
+
     @cute.jit
     def _gemm_query_tile(
         self,
@@ -1082,310 +1386,6 @@ class IndexerPrefillKernel:
                 query_slot,
                 selection_barrier,
             )
-
-    @cute.kernel
-    def kernel(
-        self,
-        tiled_mma: cute.TiledMma,
-        tma_atom_k: cute.CopyAtom,
-        mK_sdb: cute.Tensor,
-        tma_atom_q: cute.CopyAtom,
-        mQ_hdtb: cute.Tensor,
-        mW_bth: cute.Tensor,
-        mOut_btk: cute.Tensor,
-        k_smem_layout: cute.ComposedLayout,
-        q_smem_layout: cute.ComposedLayout,
-        score_scale: Float32,
-    ):
-        """Dispatch the reducer, selector, MMA, and load warp roles."""
-        config = self.config
-        causal = self.causal
-        io_dtype = self.dtype.cute_type
-        tile_candidates = self.tile_candidates
-        tile_heads = self.tile_heads
-        tile_d = config.tile_d
-        queries_per_cta = self.queries_per_cta
-        selection_warps = self.selection_warps
-        selection_threads = self.selection_threads
-        mma_tile = self.mma_tile
-        threads = self.threads
-
-        reducer_q1_start = int(IndexerWarpRole.REDUCER_Q1)
-        selector_q0_start = int(IndexerWarpRole.SELECTOR_Q0)
-        selector_q1_start = int(IndexerWarpRole.SELECTOR_Q1)
-        mma_warp = int(IndexerWarpRole.MMA)
-        load_warp = int(IndexerWarpRole.LOAD)
-
-        tidx, _, _ = cute.arch.thread_idx()
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        lane = tidx & Int32(_WARP_SIZE - 1)
-        query_pair, batch, _ = cute.arch.block_idx()
-
-        num_candidates = cute.size(mK_sdb.shape[0])
-        num_heads = cute.size(mQ_hdtb.shape[0])
-        num_queries = cute.size(mQ_hdtb.shape[2])
-        query0 = query_pair * Int32(queries_per_cta)
-        query1 = query0 + Int32(1)
-        query1_active = query1 < num_queries
-        query1_load = query1 if query1_active else query0
-        mK_sd = mK_sdb[None, None, batch]
-        mQ0_hd = mQ_hdtb[None, None, query0, batch]
-        mQ1_hd = mQ_hdtb[None, None, query1_load, batch]
-
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(self.SharedStorage)
-        sK = smem.allocate_tensor(
-            element_type=io_dtype,
-            layout=k_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=k_smem_layout.inner,
-        )
-        sQ = smem.allocate_tensor(
-            element_type=io_dtype,
-            layout=q_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=q_smem_layout.inner,
-        )
-        selection_keys = smem.allocate_tensor(
-            Int64,
-            cute.make_layout(
-                (queries_per_cta * self.sort_span + queries_per_cta * 2 * tile_candidates,)
-            ),
-            byte_alignment=128,
-        )
-        buffer_counts = smem.allocate_tensor(
-            Int32,
-            cute.make_layout((queries_per_cta,)),
-            byte_alignment=16,
-        )
-        drain_flags = smem.allocate_tensor(
-            Int32,
-            cute.make_layout((queries_per_cta,)),
-            byte_alignment=16,
-        )
-        mailbox_ordinals = smem.allocate_tensor(
-            Int32,
-            cute.make_layout((queries_per_cta * config.mailbox_stages * tile_candidates,)),
-            byte_alignment=128,
-        )
-
-        if warp_idx == Int32(load_warp):
-            cpasync.prefetch_descriptor(tma_atom_k)
-            cpasync.prefetch_descriptor(tma_atom_q)
-
-        k_bytes_per_stage = cute.size_in_bytes(
-            io_dtype,
-            cute.select(k_smem_layout, mode=[0, 1, 2]),
-        )
-        q_bytes_per_stage = cute.size_in_bytes(
-            io_dtype,
-            cute.select(q_smem_layout, mode=[0, 1, 2]),
-        )
-        k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=config.k_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=k_bytes_per_stage,
-            barrier_storage=storage.k_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=config.q_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=q_bytes_per_stage,
-            barrier_storage=storage.q_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        acc0_producer, acc0_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=config.acc_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, selection_threads),
-            barrier_storage=storage.acc0_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        acc1_producer, acc1_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=config.acc_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, selection_threads),
-            barrier_storage=storage.acc1_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        mailbox0_producer, mailbox0_consumer = pipeline.PipelineAsync.create(
-            num_stages=config.mailbox_stages,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                selection_threads,
-            ),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                selection_threads,
-            ),
-            barrier_storage=storage.mailbox0_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        mailbox1_producer, mailbox1_consumer = pipeline.PipelineAsync.create(
-            num_stages=config.mailbox_stages,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                selection_threads,
-            ),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                selection_threads,
-            ),
-            barrier_storage=storage.mailbox1_barriers.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-
-        # All pipeline barriers are now initialized.  One fence and CTA
-        # rendezvous replaces the otherwise redundant synchronization
-        # performed by every individual pipeline constructor.
-        cute.arch.mbarrier_init_fence()
-        cute.arch.barrier()
-
-        fragment_k = tiled_mma.make_fragment_A(sK)
-        fragment_q = tiled_mma.make_fragment_B(sQ)
-        accumulator_shape = tiled_mma.partition_shape_C(mma_tile[:2])
-        accumulator_template = tiled_mma.make_fragment_C(
-            cute.append(accumulator_shape, self.acc_tmem_stages)
-        )
-
-        tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads)
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding.ptr,
-            barrier_for_retrieve=tmem_barrier,
-            allocator_warp_id=mma_warp,
-        )
-        tmem.allocate(utils.get_num_tmem_alloc_cols(accumulator_template))
-        tmem.wait_for_alloc()
-        tmem_ptr = tmem.retrieve_ptr(Float32)
-        accumulator = cute.make_tensor(tmem_ptr, accumulator_template.layout)
-
-        candidate_tiles = (
-            cute.ceil_div(query1_load + Int32(1), tile_candidates)
-            if causal
-            else cute.ceil_div(num_candidates, tile_candidates)
-        )
-        head_tiles = cute.ceil_div(num_heads, tile_heads)
-
-        if warp_idx < Int32(reducer_q1_start):
-            self._run_query_reducer_mailbox(
-                accumulator,
-                acc0_consumer,
-                mailbox_ordinals,
-                mailbox0_producer,
-                mW_bth,
-                tidx,
-                warp_idx,
-                lane,
-                batch,
-                query0,
-                query0 < num_queries,
-                0,
-                num_candidates,
-                num_heads,
-                candidate_tiles,
-                head_tiles,
-                score_scale,
-            )
-        elif warp_idx < Int32(selector_q0_start):
-            self._run_query_reducer_mailbox(
-                accumulator,
-                acc1_consumer,
-                mailbox_ordinals,
-                mailbox1_producer,
-                mW_bth,
-                tidx - Int32(selection_threads),
-                warp_idx - Int32(reducer_q1_start),
-                lane,
-                batch,
-                query1_load,
-                query1_active,
-                1,
-                num_candidates,
-                num_heads,
-                candidate_tiles,
-                head_tiles,
-                score_scale,
-            )
-        elif warp_idx < Int32(selector_q1_start):
-            self._run_query_selector_mailbox(
-                mailbox_ordinals,
-                mailbox0_consumer,
-                selection_keys,
-                buffer_counts,
-                drain_flags,
-                tidx - Int32(selector_q0_start * _WARP_SIZE),
-                warp_idx - Int32(selector_q0_start),
-                lane,
-                0,
-                candidate_tiles,
-            )
-        elif warp_idx < Int32(mma_warp):
-            self._run_query_selector_mailbox(
-                mailbox_ordinals,
-                mailbox1_consumer,
-                selection_keys,
-                buffer_counts,
-                drain_flags,
-                tidx - Int32(selector_q1_start * _WARP_SIZE),
-                warp_idx - Int32(selector_q1_start),
-                lane,
-                1,
-                candidate_tiles,
-            )
-
-        if warp_idx == Int32(load_warp):
-            self._run_paired_load(
-                tiled_mma,
-                tma_atom_k,
-                tma_atom_q,
-                mK_sd,
-                mQ0_hd,
-                mQ1_hd,
-                sK,
-                sQ,
-                candidate_tiles,
-                head_tiles,
-                k_producer,
-                q_producer,
-            )
-        elif warp_idx == Int32(mma_warp):
-            self._run_paired_mma(
-                tiled_mma,
-                accumulator,
-                fragment_k,
-                fragment_q,
-                candidate_tiles,
-                head_tiles,
-                cute.ceil_div(cute.size(mK_sd, mode=[1]), tile_d),
-                k_consumer,
-                q_consumer,
-                acc0_producer,
-                acc1_producer,
-            )
-        # Every selection group has already performed its mandatory final
-        # drain, so it may write its disjoint output rows without waiting
-        # for other roles.
-        selection_query = (warp_idx - Int32(selector_q0_start)) // Int32(selection_warps)
-        selection_tid = (tidx - Int32(selector_q0_start * _WARP_SIZE)) & Int32(
-            selection_threads - 1
-        )
-        selection_base = selection_query * Int32(self.sort_span)
-        query_index = query0 if selection_query == Int32(0) else query1
-        query_active = selection_query == Int32(0) or query1_active
-        is_selection_warp = warp_idx >= Int32(selector_q0_start) and warp_idx < Int32(mma_warp)
-        if is_selection_warp:
-            for write_round in cutlass.range_constexpr(cute.ceil_div(self.topk, selection_threads)):
-                slot = selection_tid + Int32(write_round * selection_threads)
-                if query_active and slot < Int32(self.topk):
-                    key = Int64(selection_keys[selection_base + slot])
-                    mOut_btk[batch, query_index, slot] = ~Int32(key & Int64(0xFFFFFFFF))
-        tmem.relinquish_alloc_permit()
-        tmem_free_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=threads)
-        tmem_free_barrier.arrive_and_wait()
-        tmem.free(tmem_ptr)
 
     @cute.jit
     def __call__(
