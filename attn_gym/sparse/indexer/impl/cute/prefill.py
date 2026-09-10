@@ -79,6 +79,7 @@ class IndexerWarpRole(IntEnum):
     SELECTOR_Q1 = 12
     MMA = 16
     LOAD = 17
+    END = 18
 
 
 @dsl_user_op
@@ -193,7 +194,7 @@ class IndexerPrefillKernel:
     @property
     def threads(self) -> int:
         """Total CTA thread count for the fixed warp-role schedule."""
-        return (int(IndexerWarpRole.LOAD) + 1) * _WARP_SIZE
+        return int(IndexerWarpRole.END) * _WARP_SIZE
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name, including the schedule."""
