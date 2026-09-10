@@ -9,10 +9,6 @@ in-process and persistent TVM-FFI compile cache keyed on the static shape/dtype
 contract (dtype, heads, head_dim, topk, causal) and compile target. Batch and
 sequence dimensions are symbolic. The public API invokes it through the private operator in
 ``attn_gym.sparse.indexer.ops``; there is no fallback implementation.
-
-The kernel owns its fixed tile geometry and two-query schedule. ``IndexerConfig``
-contains the tunable D tile and pipeline/launch settings, while ``IndexerWarpRole``
-records the fixed warp boundaries.
 """
 
 import math
@@ -82,13 +78,6 @@ class IndexerWarpRole(IntEnum):
 
 
 def _make_shared_storage_type(config: IndexerConfig):
-    """Build the ``@cute.struct`` shared-memory layout for one config.
-
-    Stage counts are baked in as compile-time array extents, so a config with
-    different stage counts gets its own struct type rather than reusing a
-    module-global one.
-    """
-
     @cute.struct
     class SharedStorage:
         k_barriers: cute.struct.MemRange[Int64, config.k_stages * 2]
@@ -139,8 +128,6 @@ def _bitonic_lane_value(
 
 
 class IndexerPrefillKernel:
-    """Own the prefill kernel's fixed geometry, problem shape, and tuning config."""
-
     tile_candidates = 128
     tile_heads = 64
     queries_per_cta = 2
