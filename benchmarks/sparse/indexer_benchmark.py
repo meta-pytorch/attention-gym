@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument(
-        "--backend", nargs="+", default=["eager"], choices=["eager", "triton", "cute"]
+        "--backend", nargs="+", default=["eager"], choices=["eager", "cute"]
     )
     parser.add_argument("--warmup", type=int, default=200, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=1000, help="Measurement duration in ms")

@@ -81,9 +81,9 @@ def index(
     k: Tensor,
     weights: Tensor,
     topk: int,
+    *,
     causal: bool = False,
     backend: str = "eager",
-    mode: str = "auto",
 ) -> Tensor:
     """Return the Top-K candidate indices for every (batch, query) row.
 
@@ -108,9 +108,7 @@ def index(
         causal: If True, query at position t can only attend to candidates
             at positions <= t.  Requires S == T.
 
-        backend: One of "eager", "triton", or "cute".
-
-        mode: Currently only prefill is supported; auto defaults to prefill.
+        backend: One of "eager" or "cute".
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -119,21 +117,11 @@ def index(
 
     _validate_inputs(q, k, weights, topk, causal)
 
-    match mode:
-        case "auto":
-            pass  # auto currently dispatches to prefill
-        case "prefill":
-            pass
-        case _:
-            raise NotImplementedError(f"Mode {mode!r} is not supported.")
-
     match backend:
         case "eager":
             from .impl import reference
 
             return reference.index(q, k, weights, topk, causal)
-        case "triton":
-            raise NotImplementedError("Triton backend is not implemented yet.")
         case "cute":
             return _indexer_cute_op(q, k, weights, topk, causal)
         case _:
