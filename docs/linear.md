@@ -29,23 +29,16 @@ output = scale * state @ query
 Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace `N` with the
 slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
-tokens in order for decoding, inference prefill, and state-carrying correctness checks. `chunk_gdn`
-defaults to eager PyTorch (`impl="reference"`); `chunk_gdn(..., impl="fused")` selects the
-repo-local scalar chunk pipeline. Pass `kernel_options={"backend": "mega"}` to select the optional
-Mega CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
+tokens in order for decoding, inference prefill, and state-carrying correctness checks. Like
+`chunk_kda`, `chunk_gdn` defaults to the repo-local fused chunk pipeline (`impl="fused"`);
+`impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "mega"}` to select the
+optional Mega CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only
+Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
 
-output, final_state = chunk_gdn(
-    query,
-    key,
-    value,
-    gate,
-    beta,
-    impl="fused",
-    output_final_state=True,
-)
+output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_state=True)
 ```
 
 ### Supported capabilities
@@ -163,7 +156,7 @@ gates for backends that document support for it.
 from attn_gym.linear import chunk_gdn, gate_transform
 
 gate = gate_transform(raw_gate, A_log, dt_bias, kind="softplus")
-output, final_state = chunk_gdn(q, k, v, gate, beta, impl="fused")
+output, final_state = chunk_gdn(q, k, v, gate, beta)
 ```
 
 ::: attn_gym.linear.gate_transform

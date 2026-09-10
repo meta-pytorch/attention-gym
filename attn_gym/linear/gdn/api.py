@@ -33,7 +33,7 @@ def chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply chunk-parallel gated delta rule attention for training and prefill.
@@ -58,8 +58,9 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        impl: ``"reference"`` uses eager PyTorch. ``"fused"`` uses the repo-local scalar chunk
-            pipeline on CUDA capability 8.0+ with FP16/BF16 QKV and ``K = V = 128``.
+        impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
+            capability 8.0+ with FP16/BF16 QKV and ``K = V = 128``, as ``chunk_kda`` does;
+            ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
             default; ``{"backend": "mega"}`` selects the optional CuTeDSL 4.7 Mega backend.
 
