@@ -63,9 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=128)
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
-    parser.add_argument(
-        "--impl", nargs="+", default=["fused"], choices=["reference", "fused"]
-    )
+    parser.add_argument("--impl", nargs="+", default=["fused"], choices=["reference", "fused"])
     parser.add_argument("--warmup", type=int, default=200, help="Warmup duration in ms")
     parser.add_argument("--rep", type=int, default=1000, help="Measurement duration in ms")
     parser.add_argument("--seed", type=int, default=123)
@@ -91,9 +89,7 @@ def main() -> None:
         q, k, weights = make_inputs(args)
 
         def fwd(_q=q, _k=k, _weights=weights, _impl=impl):
-            return lightning_indexer(
-                _q, _k, _weights, args.topk, causal=args.causal, impl=_impl
-            )
+            return lightning_indexer(_q, _k, _weights, args.topk, causal=args.causal, impl=_impl)
 
         fwd()
         fwd_ms = triton.testing.do_bench(

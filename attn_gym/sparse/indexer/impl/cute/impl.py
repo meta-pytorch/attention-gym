@@ -500,7 +500,9 @@ class IndexerPrefillKernel:
         query_active = selection_query == Int32(0) or query1_active
         is_selection_warp = warp_idx >= Int32(selector_q0_start) and warp_idx < Int32(mma_warp)
         if is_selection_warp:
-            for write_round in cutlass.range_constexpr(cute.ceil_div(self.topk, selection_threads)):
+            for write_round in cutlass.range_constexpr(
+                cute.ceil_div(self.topk, selection_threads)
+            ):
                 slot = selection_tid + Int32(write_round * selection_threads)
                 if query_active and slot < Int32(self.topk):
                     key = Int64(selection_keys[selection_base + slot])
