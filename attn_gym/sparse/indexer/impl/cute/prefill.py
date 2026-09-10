@@ -6,8 +6,8 @@ independent CUDA-warpgroup Top-K consumers.  Both final Top-K lists remain
 entirely in shared memory.  There are no global partial lists and no merge
 kernel.  The launcher is guarded by an
 in-process and persistent TVM-FFI compile cache keyed on the static shape/dtype
-contract (dtype, batch, queries, heads, head_dim, topk, causal) and compile
-target. The public API invokes it through the private operator in
+contract (dtype, heads, head_dim, topk, causal) and compile target. Batch and
+sequence dimensions are symbolic. The public API invokes it through the private operator in
 ``attn_gym.sparse.indexer.ops``; there is no fallback implementation.
 
 The kernel owns its fixed tile geometry and two-query schedule. ``IndexerConfig``
@@ -158,8 +158,6 @@ class IndexerPrefillKernel:
 
     def __init__(
         self,
-        batch: int,
-        queries: int,
         heads: int,
         head_dim: int,
         topk: int,
@@ -167,8 +165,6 @@ class IndexerPrefillKernel:
         dtype: IndexerDType,
         config: IndexerConfig | None = None,
     ):
-        self.batch = batch
-        self.queries = queries
         self.heads = heads
         self.head_dim = head_dim
         self.topk = topk
@@ -213,7 +209,7 @@ class IndexerPrefillKernel:
     def get_name(self) -> str:
         """Return the stable compiled-artifact name, including the schedule."""
         return (
-            f"indexer_prefill_{self.dtype.name}_b{self.batch}_t{self.queries}_"
+            f"indexer_prefill_{self.dtype.name}_"
             f"h{self.heads}_d{self.head_dim}_k{self.topk}_c{int(self.causal)}_"
             f"sw{self.selection_warps}_ks{self.config.k_stages}_"
             f"qs{self.config.q_stages}_ms{self.config.mailbox_stages}_"
@@ -1538,15 +1534,15 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
 @jit_cache
 def _compile_indexer(
     dtype_name: str,
-    batch: int,
-    queries: int,
     heads: int,
     head_dim: int,
     topk: int,
     causal: bool,
 ):
     dtype = _INDEXER_DTYPES_BY_NAME[dtype_name]
-    operation = IndexerPrefillKernel(batch, queries, heads, head_dim, topk, causal, dtype)
+    operation = IndexerPrefillKernel(heads, head_dim, topk, causal, dtype)
+    batch = cute.sym_int()
+    queries = cute.sym_int()
 
     def tensor(cute_type, shape):
         return cute.runtime.make_fake_compact_tensor(
@@ -1580,23 +1576,21 @@ def index(
     [B,T,topk].  Invalid contracts, compilation errors, shared-memory
     exhaustion, and launch errors propagate; there is no fallback.
 
-    The shared CuTeDSL cache keys exact shape, dtype, topk, causal mode, and
-    compile target. Process-local hits reuse the loaded TVM-FFI callable, while
-    warm processes can load its persisted object without retracing. A new
-    sequence length or compile target selects a different specialization.
+    The shared CuTeDSL cache keys dtype, heads, head_dim, topk, causal mode,
+    and compile target. Batch and sequence dimensions are symbolic, so changes
+    to either reuse the same specialization. Process-local hits reuse the loaded
+    TVM-FFI callable; warm processes can load its persisted object without retracing.
     """
     _validate(q, k, weights, topk)
     if topk == 0:
         return torch.empty((*q.shape[:2], 0), dtype=torch.int32, device=q.device)
 
     output = torch.empty((*q.shape[:2], topk), dtype=torch.int32, device=q.device)
-    batch, queries, heads, head_dim = q.shape
+    heads, head_dim = q.shape[2:]
     score_scale = 1.0 / math.sqrt(heads * head_dim)
     set_compile_target(detect_compile_target(q.device.index))
     compiled = _compile_indexer(
         INDEXER_DTYPES[q.dtype].name,
-        batch,
-        queries,
         heads,
         head_dim,
         topk,

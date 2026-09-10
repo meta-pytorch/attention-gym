@@ -361,6 +361,41 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
     assert result.grad_fn is None
 
 
+def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
+    _skip_no_sm100()
+    from attn_gym.sparse.indexer.impl.cute import prefill
+
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
+    prefill._compile_indexer.cache_clear()
+    torch.manual_seed(2026)
+    try:
+        for batch, tokens in ((2, 65), (3, 65), (3, 129), (1, 257)):
+            q = torch.randn(batch, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
+            k = torch.randn(batch, tokens, 128, device="cuda", dtype=torch.bfloat16)
+            w = torch.randn(batch, tokens, 64, device="cuda", dtype=torch.bfloat16)
+            actual = index(q, k, w, 16, causal=True, backend="cute")
+            torch.cuda.synchronize()
+            assert actual.shape == (batch, tokens, 16)
+            assert actual.dtype == torch.int32
+            _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
+            cache_info = prefill._compile_indexer.cache_info()
+            assert cache_info.misses == 1
+            assert cache_info.currsize == 1
+        assert prefill._compile_indexer.cache_info().hits == 3
+        assert prefill._compile_indexer.is_cached("bf16", 64, 128, 16, True)
+        prefill._compile_indexer.cache_clear()
+        actual = index(q, k, w, 16, causal=True, backend="cute")
+        torch.cuda.synchronize()
+        _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
+        cache_info = prefill._compile_indexer.cache_info()
+        assert cache_info.hits == 1
+        assert cache_info.misses == 0
+        assert cache_info.currsize == 1
+    finally:
+        prefill._compile_indexer.cache_clear()
+
+
 def test_cute_dynamic_fullgraph():
     """Reuse a public graph while the launcher specializes for each sequence length."""
     _skip_no_sm100()
