@@ -72,8 +72,9 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : epilogue warp  - checkpoint TMA stores
 """
 
-from dataclasses import dataclass
-from functools import lru_cache, partial
+from dataclasses import dataclass, replace
+from functools import partial
+from pathlib import Path
 from typing import NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -84,7 +85,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 from cutlass.cutlass_dsl import min
 
-from attn_gym._backends.cute import compile_tvm_ffi
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
 from .common.elementwise import softplus
@@ -2532,184 +2533,192 @@ def prologue(
     ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
 
 
-@cute.jit
-def host(
-    cfg: cutlass.Constexpr,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    gate: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    beta: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    state_in: Optional[cute.Tensor],
-    state_out: Optional[cute.Tensor],
-    work_items: Optional[cute.Tensor],
-    work_count: Optional[cute.Tensor],
-    sched_ctr: Optional[cute.Tensor],
-    checkpoint_every_n_tokens: cutlass.Int32,
-    tensormap_workspace: cute.Tensor,
-    stream: cuda_driver.CUstream,
-):
-    h_k = k.shape[1]
-    h_v = v.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
-    heads_out = gate.shape[1]
+class GdnRecomputeOp:
+    """Compile and launch one static mega GDN recompute configuration."""
 
-    # ---- GQA reshapes: fold the head group into a --------------------------------
-    if cutlass.const_expr(cfg.is_GQA):
-        h_ratio = heads_out // h_v
-        h_native = h_v
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_ratio, h_v)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_ratio, h_v)),
-                stride=(v.stride[2], v.stride[0], (0, v.stride[1])),
-            ),
-        )
-    else:
-        h_ratio = h_v // h_k
-        h_native = h_k
-        k = cute.make_tensor(
-            k.iterator,
-            cute.make_layout(
-                (k.shape[0], k.shape[2], (h_ratio, h_k)),
-                stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
-            ),
-        )
-        v = cute.make_tensor(
-            v.iterator,
-            cute.make_layout(
-                (v.shape[2], v.shape[0], (h_ratio, h_k)),
-                stride=(v.stride[2], v.stride[0], (v.stride[1], h_ratio * v.stride[1])),
-            ),
+    def __init__(self, cfg: "GdnRecomputeCfg", use_int64_offsets: bool = False):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        return (
+            f"gdn_mega_recompute_{cfg.io_dtype.__name__.lower()}_{cfg.state_dtype.__name__.lower()}"
+            f"_hk{cfg.n_heads_out // cfg.k_ratio}_hv{cfg.n_heads_out // cfg.v_ratio}"
+            f"_ho{cfg.n_heads_out}"
+            f"_g{int(cfg.is_GQA)}_i{int(cfg.use_initial_state)}f{int(cfg.store_final_state)}"
+            f"c{int(cfg.enable_checkpoints)}_l{int(cfg.log_gate)}s{int(cfg.safe_gate)}"
+            f"b{int(cfg.beta_sigmoid)}_d{int(cfg.dyn_sched)}_i64{int(self.use_int64_offsets)}"
         )
 
-    gate = cute.make_tensor(
-        gate.iterator,
-        cute.make_layout(
-            (gate.shape[0], (h_ratio, h_native)),
-            stride=(gate.stride[0], (gate.stride[1], h_ratio * gate.stride[1])),
-        ),
-    )
-    beta = cute.make_tensor(
-        beta.iterator,
-        cute.make_layout(
-            (beta.shape[0], (h_ratio, h_native)),
-            stride=(beta.stride[0], (beta.stride[1], h_ratio * beta.stride[1])),
-        ),
-    )
-    if cutlass.const_expr(state_in is not None):
-        state_in = cute.make_tensor(
-            state_in.iterator,
-            cute.make_layout(
-                (state_in.shape[2], state_in.shape[3], (h_ratio, h_native), state_in.shape[0]),
-                stride=(
-                    state_in.stride[2],
-                    state_in.stride[3],
-                    (state_in.stride[1], h_ratio * state_in.stride[1]),
-                    state_in.stride[0],
+    @cute.jit
+    def __call__(
+        self,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        gate: cute.Tensor,
+        a_log: Optional[cute.Tensor],
+        dt_bias: Optional[cute.Tensor],
+        beta: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        state_in: Optional[cute.Tensor],
+        state_out: Optional[cute.Tensor],
+        work_items: Optional[cute.Tensor],
+        work_count: Optional[cute.Tensor],
+        sched_ctr: Optional[cute.Tensor],
+        checkpoint_every_n_tokens: cutlass.Int32,
+        tensormap_workspace: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        cfg = self.cfg
+        h_k = k.shape[1]
+        h_v = v.shape[1]
+        batch_size = cu_seqlens.shape[0] - 1
+        heads_out = gate.shape[1]
+
+        # ---- GQA reshapes: fold the head group into a --------------------------------
+        if cutlass.const_expr(cfg.is_GQA):
+            h_ratio = heads_out // h_v
+            h_native = h_v
+            k = cute.make_tensor(
+                k.iterator,
+                cute.make_layout(
+                    (k.shape[0], k.shape[2], (h_ratio, h_v)),
+                    stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
                 ),
-            ),
-        )
-    if cutlass.const_expr(state_out is not None):
-        state_out = cute.make_tensor(
-            state_out.iterator,
-            cute.make_layout(
-                (state_out.shape[2], state_out.shape[3], (h_ratio, h_native), state_out.shape[0]),
-                stride=(
-                    state_out.stride[2],
-                    state_out.stride[3],
-                    (state_out.stride[1], h_ratio * state_out.stride[1]),
-                    state_out.stride[0],
+            )
+            v = cute.make_tensor(
+                v.iterator,
+                cute.make_layout(
+                    (v.shape[2], v.shape[0], (h_ratio, h_v)),
+                    stride=(v.stride[2], v.stride[0], (0, v.stride[1])),
                 ),
+            )
+        else:
+            h_ratio = h_v // h_k
+            h_native = h_k
+            k = cute.make_tensor(
+                k.iterator,
+                cute.make_layout(
+                    (k.shape[0], k.shape[2], (h_ratio, h_k)),
+                    stride=(k.stride[0], k.stride[2], (0, k.stride[1])),
+                ),
+            )
+            v = cute.make_tensor(
+                v.iterator,
+                cute.make_layout(
+                    (v.shape[2], v.shape[0], (h_ratio, h_k)),
+                    stride=(v.stride[2], v.stride[0], (v.stride[1], h_ratio * v.stride[1])),
+                ),
+            )
+
+        gate = cute.make_tensor(
+            gate.iterator,
+            cute.make_layout(
+                (gate.shape[0], (h_ratio, h_native)),
+                stride=(gate.stride[0], (gate.stride[1], h_ratio * gate.stride[1])),
             ),
         )
+        beta = cute.make_tensor(
+            beta.iterator,
+            cute.make_layout(
+                (beta.shape[0], (h_ratio, h_native)),
+                stride=(beta.stride[0], (beta.stride[1], h_ratio * beta.stride[1])),
+            ),
+        )
+        if cutlass.const_expr(state_in is not None):
+            state_in = cute.make_tensor(
+                state_in.iterator,
+                cute.make_layout(
+                    (state_in.shape[2], state_in.shape[3], (h_ratio, h_native), state_in.shape[0]),
+                    stride=(
+                        state_in.stride[2],
+                        state_in.stride[3],
+                        (state_in.stride[1], h_ratio * state_in.stride[1]),
+                        state_in.stride[0],
+                    ),
+                ),
+            )
+        if cutlass.const_expr(state_out is not None):
+            state_out = cute.make_tensor(
+                state_out.iterator,
+                cute.make_layout(
+                    (
+                        state_out.shape[2],
+                        state_out.shape[3],
+                        (h_ratio, h_native),
+                        state_out.shape[0],
+                    ),
+                    stride=(
+                        state_out.stride[2],
+                        state_out.stride[3],
+                        (state_out.stride[1], h_ratio * state_out.stride[1]),
+                        state_out.stride[0],
+                    ),
+                ),
+            )
 
-    # ---- SMEM sizing: per-buffer element cosizes ---------------------------------
-    bpe = cfg.io_dtype.width // 8
-    kq_tile_elems = 2 * cfg.b_t * cfg.d_k
-    v_tile_elems = cfg.d_v * cfg.b_t
-    tinv_tile_elems = cfg.b_t * cfg.b_t
-    cfg.kq_cosize = kq_tile_elems * cfg.smem_kq_stages
-    cfg.v_cosize = v_tile_elems * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elems * cfg.smem_t_inv_stages
-    cfg.checkpoint_cosize = (
-        cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages if cfg.enable_checkpoints else 1
-    )
+        cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
+        beta_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_beta_stages))
 
-    cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
-    beta_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_beta_stages))
+        num_descs = batch_size
 
-    cfg.tma_kq_bytes = (kq_tile_elems // 2) * bpe
-    cfg.tma_v_bytes = v_tile_elems * bpe
+        # ---- launch ------------------------------------------------------------------
+        grid_shape = (cfg.max_active_clusters, 1, 1)
 
-    cfg.n_heads_out = heads_out
-    cfg.k_ratio = heads_out // h_k
-    cfg.v_ratio = heads_out // h_v
-    num_descs = batch_size
+        @cute.struct
+        class SharedStorage:
+            checkpoint: cute.struct.Align[
+                cute.struct.MemRange[cfg.io_dtype, cfg.checkpoint_cosize], cfg.buffer_align_bytes
+            ]
+            kq: cute.struct.Align[
+                cute.struct.MemRange[cfg.io_dtype, cfg.kq_cosize], cfg.buffer_align_bytes
+            ]
+            cumsumlog: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged)],
+                128,
+            ]
+            cumprod: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged)],
+                128,
+            ]
+            beta: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(beta_smem_layout_staged)], 128
+            ]
+            t_inv: cute.struct.Align[
+                cute.struct.MemRange[cfg.io_dtype, cfg.t_inv_cosize], cfg.buffer_align_bytes
+            ]
+            v: cute.struct.Align[
+                cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes
+            ]
 
-    # ---- launch ------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
-
-    @cute.struct
-    class SharedStorage:
-        checkpoint: cute.struct.Align[
-            cute.struct.MemRange[cfg.io_dtype, cfg.checkpoint_cosize], cfg.buffer_align_bytes
-        ]
-        kq: cute.struct.Align[
-            cute.struct.MemRange[cfg.io_dtype, cfg.kq_cosize], cfg.buffer_align_bytes
-        ]
-        cumsumlog: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged)], 128
-        ]
-        cumprod: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged)], 128
-        ]
-        beta: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, cute.cosize(beta_smem_layout_staged)], 128
-        ]
-        t_inv: cute.struct.Align[
-            cute.struct.MemRange[cfg.io_dtype, cfg.t_inv_cosize], cfg.buffer_align_bytes
-        ]
-        v: cute.struct.Align[
-            cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes
-        ]
-
-    kernel(
-        cfg,
-        SharedStorage,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        state_in,
-        state_out,
-        work_items,
-        work_count,
-        sched_ctr,
-        checkpoint_every_n_tokens,
-        cumsumlog_smem_layout_staged,
-        beta_smem_layout_staged,
-        k,
-        v,
-        tensormap_workspace,
-        cutlass.Int32(num_descs),
-    ).launch(
-        grid=grid_shape,
-        block=(cfg.threads_per_cta, 1, 1),
-        cluster=cfg.cluster_shape_mnk,
-        stream=stream,
-        min_blocks_per_mp=1,
-    )
+        kernel(
+            cfg,
+            SharedStorage,
+            gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_seqlens,
+            state_in,
+            state_out,
+            work_items,
+            work_count,
+            sched_ctr,
+            checkpoint_every_n_tokens,
+            cumsumlog_smem_layout_staged,
+            beta_smem_layout_staged,
+            k,
+            v,
+            tensormap_workspace,
+            cutlass.Int32(num_descs),
+        ).launch(
+            grid=grid_shape,
+            block=(cfg.threads_per_cta, 1, 1),
+            cluster=cfg.cluster_shape_mnk,
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
 
 @cute.kernel
@@ -3004,15 +3013,14 @@ def kernel(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnRecomputeCfg:
     """Per-compile GDN kernel knob, built by ``build_cfg``.
 
     The per-compile parameters (dtypes, GQA, state flags) are the
     ``cute.compile`` cache keys; the rest is derived from the module-global
-    ``CFG`` constants.  ``host`` stamps the shape-derived fields at trace
-    time.  Passed ``cfg``-first (a ``cutlass.Constexpr``) into ``host`` /
-    ``kernel`` and every warp body.
+    ``CFG`` constants. ``build_cfg`` computes all derived fields before tracing.
+    Owned by ``GdnRecomputeOp`` and passed into ``kernel`` and every warp body.
     """
 
     io_dtype: Type[cutlass.Numeric]
@@ -3072,7 +3080,7 @@ class GdnRecomputeCfg:
     tmem_y_decay_u_inp_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time (shape-derived) --------------------------
+    # ---- shape-derived sizes and head ratios set by build_cfg -------------------
     kq_cosize: int = 0
     v_cosize: int = 0
     t_inv_cosize: int = 0
@@ -3097,6 +3105,9 @@ def build_cfg(
     safe_gate: bool = False,
     beta_sigmoid: bool = False,
     dyn_sched: bool = False,
+    n_heads_out: int = 0,
+    k_ratio: int = 1,
+    v_ratio: int = 1,
 ) -> GdnRecomputeCfg:
     """Build the per-compile ``GdnRecomputeCfg`` (io_dtype ∈ {Float16, BFloat16};
     acc is always Float32)."""
@@ -3117,25 +3128,48 @@ def build_cfg(
         safe_gate=safe_gate,
         beta_sigmoid=beta_sigmoid,
         dyn_sched=dyn_sched,
+        n_heads_out=n_heads_out,
+        k_ratio=k_ratio,
+        v_ratio=v_ratio,
     )
-    cfg.smem_checkpoint_stages = 1
+    smem_checkpoint_stages = 1
     if enable_checkpoints:
-        cfg.smem_kq_stages = 3
+        cfg = replace(cfg, smem_kq_stages=3)
     if not use_initial_state:
-        cfg.num_regs_compute_group_1 = 232
-        cfg.num_regs_other = 48
+        cfg = replace(cfg, num_regs_compute_group_1=232, num_regs_other=48)
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
-    cfg.tmem_alloc_barrier_threads = cfg.threads_per_warp * (1 + n_cg0 + n_cg1)
-    cfg.inverse_barrier_threads = cfg.threads_per_warp * n_cg0
-    cfg.init_state_store_barrier_threads = cfg.threads_per_warp * n_cg1
-    cfg.tmem_state_acc_offset = 0
-    cfg.tmem_state_inp_offset = cfg.tmem_state_acc_offset + cfg.tmem_state_acc_stages * 128
-    cfg.tmem_cg0_acc_offset = cfg.tmem_state_inp_offset + cfg.tmem_state_inp_stages * 64
-    cfg.tmem_cg1_acc_offset = cfg.tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * 64
-    cfg.tmem_y_decay_u_inp_offset = cfg.tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * 64
-    return cfg
+    tmem_state_acc_offset = 0
+    tmem_state_inp_offset = tmem_state_acc_offset + cfg.tmem_state_acc_stages * 128
+    tmem_cg0_acc_offset = tmem_state_inp_offset + cfg.tmem_state_inp_stages * 64
+    tmem_cg1_acc_offset = tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * 64
+    # ---- SMEM sizing: per-buffer element cosizes ---------------------------------
+    bpe = cfg.io_dtype.width // 8
+    kq_tile_elems = 2 * cfg.b_t * cfg.d_k
+    v_tile_elems = cfg.d_v * cfg.b_t
+    tinv_tile_elems = cfg.b_t * cfg.b_t
+
+    return replace(
+        cfg,
+        smem_checkpoint_stages=smem_checkpoint_stages,
+        threads_per_cta=cfg.threads_per_warp * (4 + n_cg0 + n_cg1),
+        tmem_alloc_barrier_threads=cfg.threads_per_warp * (1 + n_cg0 + n_cg1),
+        inverse_barrier_threads=cfg.threads_per_warp * n_cg0,
+        init_state_store_barrier_threads=cfg.threads_per_warp * n_cg1,
+        tmem_state_acc_offset=tmem_state_acc_offset,
+        tmem_state_inp_offset=tmem_state_inp_offset,
+        tmem_cg0_acc_offset=tmem_cg0_acc_offset,
+        tmem_cg1_acc_offset=tmem_cg1_acc_offset,
+        tmem_y_decay_u_inp_offset=tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * 64,
+        kq_cosize=kq_tile_elems * cfg.smem_kq_stages,
+        v_cosize=v_tile_elems * cfg.smem_v_stages,
+        t_inv_cosize=tinv_tile_elems * cfg.smem_t_inv_stages,
+        checkpoint_cosize=cfg.d_k * cfg.d_v * smem_checkpoint_stages
+        if cfg.enable_checkpoints
+        else 1,
+        tma_kq_bytes=(kq_tile_elems // 2) * bpe,
+        tma_v_bytes=v_tile_elems * bpe,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, checkpoints
@@ -3145,34 +3179,8 @@ TENSORMAP_STATIC_SLOTS = 0
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=None)
-def get_compiled_cache(
-    io_dtype_str: str,
-    state_dtype_str: str,
-    HK: int,
-    HV: int,
-    HO: int,
-    is_gqa: bool,
-    use_initial_state: bool,
-    store_final_state: bool,
-    enable_checkpoints: bool,
-    log_gate: bool,
-    safe_gate: bool,
-    beta_sigmoid: bool,
-    dyn_sched: bool,
-    run_order: bool,
-    order_gen: bool,
-    use_int64_offsets: bool,
-    device_index: int,
-    device_major: int,
-    device_minor: int,
-    num_sm: int,
-):
-    """Return a mutable dict that lazily stores compiled entry points."""
-    return {}
-
-
-def compile(
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_gdn_recompute(
     io_dtype,
     state_dtype,
     is_gqa: bool,
@@ -3204,7 +3212,11 @@ def compile(
         safe_gate=safe_gate,
         beta_sigmoid=beta_sigmoid,
         dyn_sched=dyn_sched,
+        n_heads_out=n_heads_out,
+        k_ratio=k_ratio,
+        v_ratio=v_ratio,
     )
+    op = GdnRecomputeOp(cfg, use_int64_offsets)
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, sequence_entries, sequences, work_rows, sched_entries, workspace_words = (
         sym_int() for _ in range(6)
@@ -3216,8 +3228,7 @@ def compile(
     )
     beta_dtype = io_dtype if beta_sigmoid else cutlass.Float32
     return compile_tvm_ffi(
-        host,
-        cfg,
+        op,
         tma_tensor(io_dtype, (tokens, n_heads_out // k_ratio, 128)),
         tma_tensor(io_dtype, (tokens, n_heads_out // v_ratio, 128)),
         make_strided_signature_tensor(
@@ -3246,12 +3257,62 @@ def compile(
         make_counter_signature(sched_entries) if dyn_sched else None,
         cutlass.Int32(checkpoint_every_n_tokens),
         make_workspace_signature(workspace_words),
+    )
+
+
+@jit_cache(extra_sources=(Path(__file__).parent,))
+def _compile_gdn_recompute_prologue(
+    io_dtype: type[cutlass.Numeric],
+    h_k: int,
+    h_v: int,
+    h_out: int,
+    enable_checkpoints: bool,
+    run_order: bool,
+    order_gen: bool,
+    dyn_sched: bool,
+    checkpoint_every_n_tokens: int,
+    use_int64_offsets: bool,
+):
+    """JIT-compile the prologue from static specialization arguments."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    tokens, sequence_entries, checkpoint_rows, work_rows, sched_entries, workspace_words = (
+        sym_int() for _ in range(6)
+    )
+    tma_tensor = partial(
+        make_strided_signature_tensor,
+        assumed_align=16,
+        use_int64_offsets=use_int64_offsets,
+    )
+    work_items_signature = make_work_items_signature(work_rows)
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        tma_tensor(io_dtype, (tokens, h_k, 128)),
+        tma_tensor(io_dtype, (tokens, h_v, 128)),
+        make_strided_signature_tensor(
+            cutlass.Float32,
+            (tokens, h_out),
+            assumed_align=4,
+            use_int64_offsets=use_int64_offsets,
+        ),
+        make_cu_seqlens_signature(sequence_entries),
+        tma_tensor(io_dtype, (checkpoint_rows, h_out, 128, 128))
+        if enable_checkpoints
+        else None,
+        work_items_signature if run_order and not order_gen else None,
+        make_counter_signature(),
+        work_items_signature,
+        make_counter_signature(sched_entries) if run_order else None,
+        cutlass.Int32(checkpoint_every_n_tokens),
+        make_workspace_signature(workspace_words),
         name=(
-            f"gdn_mega_recompute_{io_dtype.__name__.lower()}_{state_dtype.__name__.lower()}"
-            f"_hk{n_heads_out // k_ratio}_hv{n_heads_out // v_ratio}_ho{n_heads_out}"
-            f"_g{int(is_gqa)}_i{int(use_initial_state)}f{int(store_final_state)}"
-            f"c{int(enable_checkpoints)}_l{int(log_gate)}s{int(safe_gate)}"
-            f"b{int(beta_sigmoid)}_d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+            f"gdn_mega_recompute_prologue_{io_dtype.__name__.lower()}"
+            f"_hk{h_k}_hv{h_v}_ho{h_out}_c{int(enable_checkpoints)}"
+            f"_r{int(run_order)}o{int(order_gen)}d{int(dyn_sched)}"
+            f"_i64{int(use_int64_offsets)}"
         ),
     )
 
@@ -3405,12 +3466,10 @@ def chunk_gdn_recompute_sm100(
         raise ValueError("the active CUDA device must match k.device")
     device_properties = get_device_properties(device_index)
     num_sm = device_properties.multi_processor_count
-    cache = get_compiled_cache(
-        str(k.dtype),
-        str(state_dtype_src),
-        h_k,
-        h_v,
-        h_out,
+    io_dtype = get_dtype(k.dtype)
+    compiled = _compile_gdn_recompute(
+        io_dtype,
+        get_dtype(state_dtype_src),
         is_gqa,
         use_initial_state,
         store_final_state,
@@ -3418,80 +3477,28 @@ def chunk_gdn_recompute_sm100(
         log_gate,
         safe_gate,
         use_beta_sigmoid,
+        k_ratio,
+        v_ratio,
+        h_out,
         dyn_sched,
-        run_order,
-        order_gen,
         use_int64_offsets,
-        device_index,
-        device_properties.major,
-        device_properties.minor,
-        num_sm,
+        num_sm=num_sm,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
     )
 
-    io_dtype = get_dtype(k.dtype)
-    if "compiled" not in cache:
-        cache["compiled"] = compile(
-            io_dtype,
-            get_dtype(state_dtype_src),
-            is_gqa,
-            use_initial_state,
-            store_final_state,
-            enable_checkpoints,
-            log_gate,
-            safe_gate,
-            use_beta_sigmoid,
-            k_ratio,
-            v_ratio,
-            h_out,
-            dyn_sched,
-            use_int64_offsets,
-            num_sm=num_sm,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        )
-
-    if "prologue" not in cache:
-        sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-        tokens, sequence_entries, checkpoint_rows, work_rows, sched_entries, workspace_words = (
-            sym_int() for _ in range(6)
-        )
-        tma_tensor = partial(
-            make_strided_signature_tensor,
-            assumed_align=16,
-            use_int64_offsets=use_int64_offsets,
-        )
-        work_items_signature = make_work_items_signature(work_rows)
-        cache["prologue"] = compile_tvm_ffi(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            run_order,
-            order_gen,
-            tma_tensor(io_dtype, (tokens, h_k, 128)),
-            tma_tensor(io_dtype, (tokens, h_v, 128)),
-            make_strided_signature_tensor(
-                cutlass.Float32,
-                (tokens, h_out),
-                assumed_align=4,
-                use_int64_offsets=use_int64_offsets,
-            ),
-            make_cu_seqlens_signature(sequence_entries),
-            tma_tensor(io_dtype, (checkpoint_rows, h_out, 128, 128))
-            if checkpoints_for_descs is not None
-            else None,
-            work_items_signature if run_order and not order_gen else None,
-            make_counter_signature(),
-            work_items_signature,
-            make_counter_signature(sched_entries) if run_order else None,
-            cutlass.Int32(checkpoint_every_n_tokens),
-            make_workspace_signature(workspace_words),
-            name=(
-                f"gdn_mega_recompute_prologue_{io_dtype.__name__.lower()}"
-                f"_hk{h_k}_hv{h_v}_ho{h_out}_c{int(enable_checkpoints)}"
-                f"_r{int(run_order)}o{int(order_gen)}d{int(dyn_sched)}"
-                f"_i64{int(use_int64_offsets)}"
-            ),
-        )
-    cache["prologue"](
+    compiled_prologue = _compile_gdn_recompute_prologue(
+        io_dtype,
+        h_k,
+        h_v,
+        h_out,
+        enable_checkpoints,
+        run_order,
+        order_gen,
+        dyn_sched,
+        checkpoint_every_n_tokens,
+        use_int64_offsets,
+    )
+    compiled_prologue(
         k,
         v,
         gate,
@@ -3504,7 +3511,7 @@ def chunk_gdn_recompute_sm100(
         checkpoint_every_n_tokens,
         tensormap_workspace,
     )
-    cache["compiled"](
+    compiled(
         k,
         v,
         gate,
