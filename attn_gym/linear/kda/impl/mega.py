@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Autograd integration for the experimental CuTeDSL 4.7 KDA forward."""
+"""Autograd integration for the experimental CuTeDSL 4.7 KDA kernels."""
 
 from __future__ import annotations
 
@@ -11,36 +11,17 @@ from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.linear.kda.impl.mega_ops import (
-    chunk_mega_dense_training_fwd_op,
     chunk_mega_packed_fwd_op,
     chunk_mega_packed_fwd_paged_op,
     chunk_mega_packed_fwd_with_initial_state_op,
     chunk_mega_packed_fwd_with_state_op,
     chunk_mega_packed_local_bwd_op,
-    chunk_mega_packed_training_fwd_op,
-    plain_gate_bwd_dense_cute_op,
     validate_mega_available,
 )
-from attn_gym.linear.kda.ops import (
-    chunk_bwd_recompute_factors_op,
-    chunk_bwd_recompute_factors_with_state_grad_op,
-)
+from attn_gym.linear.kda.ops import chunk_bwd_recompute_factors_with_state_grad_op
 
 _CHUNK_SIZE = 64
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-
-# NOTE [Mega backward crossover]
-# These thresholds correspond to the dense and packed crossover cases in benchmarks/kda.py.
-# Re-run those boundary cases before changing the policy; the public approximation policy remains
-# independent and is controlled only by split_backward.
-_DENSE_LOCAL_BACKWARD_MIN_TOKENS = 32768
-_PACKED_LOCAL_BACKWARD_MIN_TOKENS = 4096
-_LOCAL_BACKWARD_MIN_HEADS = 64
-
-
-def use_local_backward(q: torch.Tensor, min_tokens: int) -> bool:
-    """Select the Mega backward where its launch savings amortize setup."""
-    return q.shape[1] >= min_tokens and q.shape[2] >= _LOCAL_BACKWARD_MIN_HEADS
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -48,197 +29,62 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
     return torch.zeros_like(value) if d_output is None else d_output.contiguous()
 
 
-class ChunkKdaMegaDense(torch.autograd.Function):
-    """Attach autograd to the dense no-state Mega path."""
+class ChunkKdaMega(torch.autograd.Function):
+    """Attach a backward to Mega's forward: Mega's own without an entry state, fused with one.
 
-    @staticmethod
-    def forward(ctx, q, k, value, gate, beta, cu_seqlens, scale, split_backward, split_forward):
-        ctx.use_local_backward = split_backward and use_local_backward(
-            q, _DENSE_LOCAL_BACKWARD_MIN_TOKENS
-        )
-        ctx.split_backward = split_backward
-        ctx.scale = scale
-        if ctx.use_local_backward:
-            output = chunk_mega_packed_fwd_op(
-                q, k, value, gate, beta, cu_seqlens, split_forward, scale
-            )
-            ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
-        else:
-            output, cumulative_gate = chunk_mega_dense_training_fwd_op(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                cu_seqlens,
-                split_forward,
-                scale,
-            )
-            ctx.save_for_backward(q, k, value, cumulative_gate, beta)
-        ctx.set_materialize_grads(False)
-        return output
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, d_output):
-        if ctx.use_local_backward:
-            q, k, value, gate, beta, cu_seqlens = ctx.saved_tensors
-            return (
-                *chunk_mega_packed_local_bwd_op(
-                    q,
-                    k,
-                    value,
-                    gate,
-                    beta,
-                    normalize_output_grad(d_output, value),
-                    cu_seqlens,
-                    ctx.split_backward,
-                    ctx.scale,
-                ),
-                None,
-                None,
-                None,
-                None,
-            )
-
-        q, k, value, cumulative_gate, beta = ctx.saved_tensors
-        dq, dk, dv, d_cumulative, d_beta = chunk_bwd_recompute_factors_op(
-            q,
-            k,
-            value,
-            cumulative_gate,
-            beta,
-            None,
-            None,
-            normalize_output_grad(d_output, value),
-            None,
-            None,
-            ctx.scale,
-            False,
-            False,
-            "auto",
-        )
-        d_gate = plain_gate_bwd_dense_cute_op(d_cumulative.contiguous())
-        return dq, dk, dv, d_gate, d_beta, None, None, None, None
-
-
-class ChunkKdaMegaPacked(torch.autograd.Function):
-    """Attach autograd to packed Mega calls with optional recurrent state."""
+    The kernel choice depends only on whether an entry state is present, never on the span
+    length, so a document's bits do not depend on the span it is packed into. With an entry
+    state the fused stateful backward carries the state cotangent in FP32 between chunks
+    (``test/linear/test_delta_rule_state_precision.py``); Mega's BT16 backward requantizes it.
+    """
 
     @staticmethod
     def forward(
         ctx,
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        initial_state,
-        cu_seqlens,
-        chunk_offsets,
-        scale,
-        split_backward,
-        split_forward,
-        output_final_state,
-    ):
-        ctx.has_initial_state = initial_state is not None
-        ctx.use_local_backward = not ctx.has_initial_state and use_local_backward(
-            q, _PACKED_LOCAL_BACKWARD_MIN_TOKENS
-        )
+        q: torch.Tensor,
+        k: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        cu_seqlens: torch.Tensor,
+        chunk_offsets: torch.Tensor,
+        scale: float,
+        split_backward: bool,
+        split_forward: bool,
+        output_final_state: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         ctx.split_backward = split_backward
         ctx.scale = scale
-        if ctx.use_local_backward:
+        if initial_state is None:
             output = chunk_mega_packed_fwd_op(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                cu_seqlens,
-                split_forward,
-                scale,
+                q, k, value, gate, beta, cu_seqlens, split_forward, scale
             )
-            ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
-        elif ctx.has_initial_state:
-            if output_final_state:
-                output, final_state = chunk_mega_packed_fwd_with_state_op(
-                    q,
-                    k,
-                    value,
-                    gate,
-                    beta,
-                    initial_state,
-                    cu_seqlens,
-                    scale,
-                )
-            else:
-                output = chunk_mega_packed_fwd_with_initial_state_op(
-                    q,
-                    k,
-                    value,
-                    gate,
-                    beta,
-                    initial_state,
-                    cu_seqlens,
-                    scale,
-                )
-            ctx.save_for_backward(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                initial_state,
-                cu_seqlens,
-                chunk_offsets,
+        elif output_final_state:
+            output, final_state = chunk_mega_packed_fwd_with_state_op(
+                q, k, value, gate, beta, initial_state, cu_seqlens, scale
             )
         else:
-            output, cumulative_gate = chunk_mega_packed_training_fwd_op(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                cu_seqlens,
-                chunk_offsets,
-                split_forward,
-                scale,
+            output = chunk_mega_packed_fwd_with_initial_state_op(
+                q, k, value, gate, beta, initial_state, cu_seqlens, scale
             )
-            ctx.save_for_backward(q, k, value, cumulative_gate, beta, cu_seqlens, chunk_offsets)
+        ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens, chunk_offsets)
         ctx.set_materialize_grads(False)
         if output_final_state:
-            assert ctx.has_initial_state
             return output, final_state
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
-    def backward(ctx, d_output, d_final_state=None):
-        if ctx.use_local_backward:
-            q, k, value, gate, beta, cu_seqlens = ctx.saved_tensors
-            return (
-                *chunk_mega_packed_local_bwd_op(
-                    q,
-                    k,
-                    value,
-                    gate,
-                    beta,
-                    normalize_output_grad(d_output, value),
-                    cu_seqlens,
-                    ctx.split_backward,
-                    ctx.scale,
-                ),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+    def backward(ctx, d_output: torch.Tensor | None, d_final_state: torch.Tensor | None = None):
+        q, k, value, gate, beta, initial_state, cu_seqlens, chunk_offsets = ctx.saved_tensors
+        d_output = normalize_output_grad(d_output, value)
+        if initial_state is None:
+            dq, dk, dv, d_gate, d_beta = chunk_mega_packed_local_bwd_op(
+                q, k, value, gate, beta, d_output, cu_seqlens, ctx.split_backward, ctx.scale
             )
-
-        if ctx.has_initial_state:
-            q, k, value, gate, beta, initial_state, cu_seqlens, chunk_offsets = ctx.saved_tensors
+            d_initial_state = None
+        else:
             cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
             dq, dk, dv, d_cumulative, d_beta, d_initial_state = (
                 chunk_bwd_recompute_factors_with_state_grad_op(
@@ -249,7 +95,7 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                     beta,
                     cu_seqlens,
                     chunk_offsets,
-                    normalize_output_grad(d_output, value),
+                    d_output,
                     d_final_state,
                     initial_state,
                     ctx.scale,
@@ -258,40 +104,10 @@ class ChunkKdaMegaPacked(torch.autograd.Function):
                     "auto",
                 )
             )
-        else:
-            q, k, value, cumulative_gate, beta, cu_seqlens, chunk_offsets = ctx.saved_tensors
-            dq, dk, dv, d_cumulative, d_beta = chunk_bwd_recompute_factors_op(
-                q,
-                k,
-                value,
-                cumulative_gate,
-                beta,
-                cu_seqlens,
-                chunk_offsets,
-                normalize_output_grad(d_output, value),
-                None,
-                None,
-                ctx.scale,
-                False,
-                False,
-                "auto",
+            d_gate = _plain_gate_scan_op(
+                d_cumulative.contiguous(), cu_seqlens, chunk_offsets, True
             )
-            d_initial_state = None
-        d_gate = _plain_gate_scan_op(d_cumulative.contiguous(), cu_seqlens, chunk_offsets, True)
-        return (
-            dq,
-            dk,
-            dv,
-            d_gate,
-            d_beta,
-            d_initial_state,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return dq, dk, dv, d_gate, d_beta, d_initial_state, None, None, None, None, None, None
 
 
 def validate_mega_constraints(
@@ -354,31 +170,6 @@ def chunk_forward(
     if not torch.compiler.is_compiling():
         validate_mega_available(q)
 
-    # The dense kernels specialize for complete BT64 chunks; a partial tail takes the packed path
-    # with synthesized boundaries, as the fused backend does.
-    if (
-        cu_seqlens is None
-        and initial_state is None
-        and not output_final_state
-        and q.shape[1] % _CHUNK_SIZE == 0
-    ):
-        validate_mega_constraints(q, k, value, gate, beta, None, None)
-        dense_cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
-        return (
-            ChunkKdaMegaDense.apply(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                dense_cu_seqlens,
-                scale,
-                split_backward,
-                split_forward,
-            ),
-            None,
-        )
-
     if cu_seqlens is None:
         cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
     if output_final_state and initial_state is None:
@@ -391,8 +182,9 @@ def chunk_forward(
             device=q.device,
         )
     validate_mega_constraints(q, k, value, gate, beta, initial_state, cu_seqlens)
+    # The fused stateful backward chunks each subsequence on its own 64-token grid.
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], _CHUNK_SIZE)
-    result = ChunkKdaMegaPacked.apply(
+    result = ChunkKdaMega.apply(
         q,
         k,
         value,

@@ -1,4 +1,4 @@
-"""Training integration for the CuTeDSL 4.7 KDA forward."""
+"""Training integration for the CuTeDSL 4.7 KDA kernels."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,
@@ -549,8 +548,6 @@ def test_mega_packed_local_backward_matches_exact_gradients(
 def test_mega_public_packed_unsplit_local_backward_matches_exact_gradients(monkeypatch) -> None:
     from attn_gym.linear.kda.impl import mega as backend
 
-    monkeypatch.setattr(backend, "_PACKED_LOCAL_BACKWARD_MIN_TOKENS", 1)
-    monkeypatch.setattr(backend, "_LOCAL_BACKWARD_MIN_HEADS", 1)
     selected = []
     local_backward_op = backend.chunk_mega_packed_local_bwd_op
 
@@ -581,6 +578,45 @@ def test_mega_public_packed_unsplit_local_backward_matches_exact_gradients(monke
             f"public packed unsplit gradient {index}",
             torch.bfloat16,
         )
+
+
+def test_mega_document_aligned_spans_are_bitwise_equal() -> None:
+    """A document's output and gradients must not depend on its enclosing span length."""
+    from attn_gym.linear import chunk_kda
+
+    lengths = (64, 128, 4096)
+    offsets = (0, *accumulate(lengths))
+    inputs = make_kda_test_inputs(
+        sum(lengths), heads=64, seed=109, normalize_qk=True, requires_grad=True
+    )
+    output, _ = chunk_kda(
+        *inputs,
+        cu_seqlens=cumulative_sequence_offsets(lengths),
+        kernel_options={"backend": "mega"},
+    )
+    d_output = torch.randn_like(output)
+    gradients = torch.autograd.grad(output, inputs, d_output)
+    for first, last in ((0, 1), (1, 2), (2, 3), (0, 2)):
+        start, end = offsets[first], offsets[last]
+        for packed in (False, True) if last == first + 1 else (True,):
+            local_inputs = tuple(
+                tensor[:, start:end].detach().clone().requires_grad_() for tensor in inputs
+            )
+            local_output, _ = chunk_kda(
+                *local_inputs,
+                cu_seqlens=cumulative_sequence_offsets(lengths[first:last]) if packed else None,
+                kernel_options={"backend": "mega"},
+            )
+            local_gradients = torch.autograd.grad(
+                local_output, local_inputs, d_output[:, start:end]
+            )
+            for name, actual, expected in zip(
+                ("output", "dq", "dk", "dv", "dgate", "dbeta"),
+                (local_output, *local_gradients),
+                (output, *gradients),
+                strict=True,
+            ):
+                assert torch.equal(actual, expected[:, start:end]), (name, first, last, packed)
 
 
 def test_mega_kernel_options_are_strict() -> None:
@@ -687,9 +723,6 @@ def test_mega_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear._delta_rule.mega import schedule
     from attn_gym.linear.kda.impl import mega as backend
 
-    monkeypatch.setattr(backend, "_DENSE_LOCAL_BACKWARD_MIN_TOKENS", 1)
-    monkeypatch.setattr(backend, "_PACKED_LOCAL_BACKWARD_MIN_TOKENS", 1)
-    monkeypatch.setattr(backend, "_LOCAL_BACKWARD_MIN_HEADS", 1)
     local_backward = backend.chunk_mega_packed_local_bwd_op
     compute_ideal_chunks = schedule.compute_ideal_chunks
     selected = []
@@ -723,16 +756,12 @@ def test_mega_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     )
     torch.autograd.grad(packed_output, packed_inputs[:5], torch.randn_like(packed_output))
 
-    assert selected == [True, True]
+    assert selected == [False, True, True]
     assert len(geometries) == 2 and geometries[0] == geometries[1]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mega_local_backward_fullgraph(monkeypatch, dtype: torch.dtype) -> None:
-    from attn_gym.linear.kda.impl import mega as backend
-
-    monkeypatch.setattr(backend, "_DENSE_LOCAL_BACKWARD_MIN_TOKENS", 1)
-    monkeypatch.setattr(backend, "_LOCAL_BACKWARD_MIN_HEADS", 1)
+def test_mega_local_backward_fullgraph(dtype: torch.dtype) -> None:
     expected_inputs = list(_make_inputs(requires_grad=True, dtype=dtype))
     actual_inputs = list(_make_inputs(requires_grad=True, dtype=dtype))
     dense_cu = torch.tensor([0, expected_inputs[0].shape[1]], dtype=torch.int32, device="cuda")
@@ -977,13 +1006,10 @@ def test_mega_packed_tail_isolated_from_next_sequence() -> None:
 @pytest.mark.parametrize("outer_strided", [False, True])
 def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -> None:
     from attn_gym.linear.kda.impl.mega_ops import (
-        chunk_mega_dense_training_fwd_op,
         chunk_mega_packed_fwd_op,
         chunk_mega_packed_fwd_with_initial_state_op,
         chunk_mega_packed_fwd_with_state_op,
         chunk_mega_packed_local_bwd_op,
-        chunk_mega_packed_training_fwd_op,
-        plain_gate_bwd_dense_cute_op,
     )
 
     inputs = _make_inputs(requires_grad=False, heads=2, dtype=dtype)
@@ -991,18 +1017,10 @@ def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -
         q, k, value, gate = (_swap_token_head_storage(tensor) for tensor in inputs[:4])
         initial_state = _swap_state_head_value_storage(inputs[5])
         inputs = (q, k, value, gate, inputs[4], initial_state, inputs[6])
-    dense_cu_seqlens = cumulative_sequence_offsets([inputs[0].shape[1]])
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(
         chunk_mega_packed_fwd_op,
         (*inputs[:5], inputs[-1], False, SCALE),
-        test_utils=test_utils,
-        rtol=2e-2,
-        atol=2e-2,
-    )
-    torch.library.opcheck(
-        chunk_mega_dense_training_fwd_op,
-        (*inputs[:5], dense_cu_seqlens, False, SCALE),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
@@ -1022,20 +1040,6 @@ def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -
         rtol=2e-2,
         atol=2e-2,
     )
-    backward_metadata = prepare_ragged_chunk_metadata(inputs[-1], inputs[0].shape[1], 64)
-    torch.library.opcheck(
-        chunk_mega_packed_training_fwd_op,
-        (
-            *inputs[:5],
-            backward_metadata.cu_seqlens,
-            backward_metadata.chunk_offsets,
-            False,
-            SCALE,
-        ),
-        test_utils=test_utils,
-        rtol=2e-2,
-        atol=2e-2,
-    )
     torch.library.opcheck(
         chunk_mega_packed_fwd_with_initial_state_op,
         (*inputs, SCALE),
@@ -1046,13 +1050,6 @@ def test_mega_forward_op_registration(dtype: torch.dtype, outer_strided: bool) -
     torch.library.opcheck(
         chunk_mega_packed_fwd_with_state_op,
         (*inputs, SCALE),
-        test_utils=test_utils,
-        rtol=2e-2,
-        atol=2e-2,
-    )
-    torch.library.opcheck(
-        plain_gate_bwd_dense_cute_op,
-        (torch.randn(1, 128, 1, D, device="cuda"),),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
@@ -1073,7 +1070,7 @@ def test_mega_initial_state_forward_op_fullgraph() -> None:
 
 
 @pytest.mark.parametrize("candidate", [_candidate_dense, _candidate_no_state])
-def test_mega_multistream_fullgraph_cuda_graph_replay(candidate) -> None:
+def test_mega_no_state_fullgraph_cuda_graph_replay(candidate) -> None:
     inputs = _make_inputs(requires_grad=False)
     compiled = torch.compile(candidate, fullgraph=True)
     expected = compiled(*inputs)
@@ -1106,10 +1103,7 @@ def test_mega_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
         kda_prefill_f16,
         kda_recompute_f16,
     )
-    from attn_gym.linear.kda.impl import mega as backend
 
-    monkeypatch.setattr(backend, "_PACKED_LOCAL_BACKWARD_MIN_TOKENS", 1)
-    monkeypatch.setattr(backend, "_LOCAL_BACKWARD_MIN_HEADS", 1)
     expected_inputs = _make_inputs(requires_grad=True, dtype=torch.float16)
     actual_inputs = _make_inputs(requires_grad=True, dtype=torch.float16)
     d_output = torch.randn_like(expected_inputs[2])

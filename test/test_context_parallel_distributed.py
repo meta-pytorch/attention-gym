@@ -54,12 +54,14 @@ OPS = {"kda": (chunk_kda, context_parallel_kda), "gdn": (chunk_gdn, context_para
 # sequence where cp rank 0 owns three fragments and cp rank 1 two, so its chain alternates ranks
 # through all five slots and cp rank 1 gathers a padding slot; "empty-document" adds a
 # zero-length sequence to the stream; "one-document" gives each rank one whole subsequence of
-# complete chunks, the layout that dispatches the dense kernels.
+# complete chunks, the layout that dispatches the dense kernels; "documents" cuts only on
+# document boundaries, so no state crosses ranks and the result must be the unsharded bits.
 TABLES = {
     "zigzag": (CU_SEQLENS, [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
     "one-document": ((0, 384), [[(0, 192)], [(192, 384)]]),
     "uneven": ((0, 384), [[(0, 64), (128, 192), (256, 384)], [(64, 128), (192, 256)]]),
     "empty-document": ((0, 40, 40, 100, 384), [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
+    "documents": ((0, 100, 260, 384), [[(0, 100), (260, 384)], [(100, 260)]]),
 }
 
 
@@ -196,6 +198,40 @@ def _rank_main(
         _assert_matches_unsharded(
             plan, ids, (local_output, grads, exit_states), (output, expected_grads, final)
         )
+        if table == "documents":
+            # No document crosses ranks, so every document runs from the zero state on the rank
+            # that owns it: the recipe at CP=2 is bitwise the recipe at CP=1 (a one-rank group
+            # over the whole stream), and for KDA also the public op, whose kernels the staged
+            # path shares. GDN's staged path is not the public op's kernel sequence.
+            alone = ContextParallelPlan.from_fragments(cu_seqlens, [[(0, cu_seqlens[-1])]], 0)
+            solo = tuple(t.clone().requires_grad_() for t in operands)
+            solo_output, solo_exit = cp(
+                *solo, routing=alone.routing(device), group=dist.new_group([cp_rank])
+            )
+            solo_grads = torch.autograd.grad(
+                (solo_output, solo_exit),
+                solo,
+                grad_outputs=(d_output, _exit_cotangent(alone, d_final, solo_exit.shape[0])),
+            )
+            if not final_state_loss:
+                solo_grads = torch.autograd.grad(
+                    cp(*solo, routing=alone.routing(device), group=dist.new_group([cp_rank]))[0],
+                    solo,
+                    grad_outputs=(d_output,),
+                )
+            references = [(solo_output, solo_grads)]
+            if op_name == "kda":
+                references.append((output, expected_grads))
+            for ref_output, ref_grads in references:
+                for actual, expected in zip(
+                    (local_output, *grads), (ref_output, *ref_grads), strict=True
+                ):
+                    assert torch.equal(actual, expected[:, ids])
+            for index in plan.terminal:
+                sequence = plan.subsequences[index].sequence
+                assert torch.equal(exit_states[index], solo_exit[sequence])
+                if op_name == "kda":
+                    assert torch.equal(exit_states[index], final[sequence])
 
         # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
         qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)

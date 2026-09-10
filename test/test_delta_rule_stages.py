@@ -54,7 +54,8 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
-    # Mega stages reproduce its native backward bitwise, not the public op's fused recompute.
+    # Mega stages reproduce its native stateful backward bitwise (public_gradients would route
+    # the no-state case through the no-state op).
     # Other variants use public_gradients directly.
     backward: Callable[..., tuple[torch.Tensor, ...]] | None = None
 

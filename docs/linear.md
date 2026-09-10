@@ -603,6 +603,19 @@ updates that cotangent buffer before each replay, setting nonterminal rows to ze
 an index selection from them does **not** make it follow later layouts. Update routing only
 between complete forward/backward steps, not while backward still needs the previous layout.
 
+### Document-aligned fragments: CP-invariant bits
+
+If every fragment boundary is a document boundary, no rank needs another rank's state: each
+document runs from the zero state to its end on the rank that owns it, exactly as the unsharded
+op runs it. The recipe above then composes nothing (every entry state is zero), and its output,
+gradients, and final states are **bitwise identical for any CP degree and any document-aligned
+fragment table, including CP=1**; for KDA they are also bitwise the public `chunk_kda`. Nothing
+else is required: no flag, no tiling, no change to the kernels. `document_aligned_fragments` in
+`examples/linear/delta_rule_context_parallel.py` (`--partition documents`) assigns whole documents
+to ranks, longest first onto the least-loaded rank, so ranks stay within one document's length of
+each other. What it cannot do is split a document that does not fit on one rank; that is what
+the summaries above are for.
+
 ### Mega local execution
 
 `kernel_options={"backend": "mega"}` runs each rank's local passes with Mega's kernels. The

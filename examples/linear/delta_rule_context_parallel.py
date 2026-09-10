@@ -13,6 +13,9 @@ K3 model. Launch with:
     torchrun --standalone --nproc-per-node=2 examples/linear/delta_rule_context_parallel.py --batch-size 4 --tokens 1024
 
 Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to vary the recipe.
+``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
+document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
+independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
 ``--core-backend mega`` selects the KDA Mega backend (SM100/SM103). ``--cuda-graph`` checks a
 changed-input replay; ``--profile`` writes a merged native Perfetto trace. ``--no-validate`` skips
 the unsharded reference at scales where it does not fit. Batch construction, loss/backward, and
@@ -25,7 +28,7 @@ from __future__ import annotations
 import gc
 from enum import Enum
 from functools import partial
-from itertools import accumulate
+from itertools import accumulate, pairwise
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -64,6 +67,7 @@ class PartitionOption(str, Enum):
 
     CONTIGUOUS = "contiguous"
     ZIGZAG = "zigzag"
+    DOCUMENTS = "documents"
 
 
 class TraceFormatOption(str, Enum):
@@ -104,6 +108,38 @@ def partition_fragments(
         [(block * tokens // blocks, (block + 1) * tokens // blocks) for block in rank_blocks]
         for rank_blocks in owned
     ]
+
+
+def document_aligned_fragments(
+    offsets: tuple[int, ...], world_size: int
+) -> list[list[tuple[int, int]]]:
+    """Assign whole documents to ranks so no fragment ever splits one.
+
+    Every document then runs from the zero state to its end on the rank that owns it, exactly as
+    the unsharded op runs it: the recipe exchanges nothing across ranks and its result is bitwise
+    the same for any CP degree, including 1. The price is balance: longest documents first onto
+    the least-loaded rank keeps ranks within one document's length of each other, and a document
+    longer than a rank can hold has no document-aligned cut at all. Consecutive documents on one
+    rank merge into one fragment.
+    """
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    documents = list(pairwise(offsets))
+    if len(documents) < world_size:
+        raise ValueError(f"{len(documents)} documents cannot give {world_size} ranks work")
+    loads = [0] * world_size
+    owner = [0] * len(documents)
+    for index in sorted(range(len(documents)), key=lambda i: documents[i][0] - documents[i][1]):
+        rank = loads.index(min(loads))
+        owner[index] = rank
+        loads[rank] += documents[index][1] - documents[index][0]
+    fragments: list[list[tuple[int, int]]] = [[] for _ in range(world_size)]
+    for (start, stop), rank in zip(documents, owner, strict=True):
+        if fragments[rank] and fragments[rank][-1][1] == start:
+            fragments[rank][-1] = (fragments[rank][-1][0], stop)
+        else:
+            fragments[rank].append((start, stop))
+    return fragments
 
 
 class ContextParallelDeltaRuleAttention(DeltaRuleAttention):
@@ -279,11 +315,13 @@ def main(
             offsets = (0, *accumulate(lengths))
         if dist.get_rank() == 0:
             print(f"packed_sequence_lengths={lengths} cu_seqlens={offsets}", flush=True)
-        plan = ContextParallelPlan.from_fragments(
-            offsets,
-            partition_fragments(offsets[-1], dist.get_world_size(), partition.value),
-            dist.get_rank(),
-        )
+        if partition is PartitionOption.DOCUMENTS:
+            fragments = document_aligned_fragments(offsets, dist.get_world_size())
+        else:
+            fragments = partition_fragments(offsets[-1], dist.get_world_size(), partition.value)
+        if dist.get_rank() == 0:
+            print(f"fragments={fragments}", flush=True)
+        plan = ContextParallelPlan.from_fragments(offsets, fragments, dist.get_rank())
         batch = make_context_parallel_batch(
             plan,
             offsets,
