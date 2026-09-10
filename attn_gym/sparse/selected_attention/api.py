@@ -179,6 +179,7 @@ def selected_attention(
     backend: str = ...,
     mode: str = ...,
     *,
+    scale: float | None = None,
     return_aux: None = ...,
 ) -> Tensor: ...
 
@@ -195,6 +196,7 @@ def selected_attention(
     backend: str = ...,
     mode: str = ...,
     *,
+    scale: float | None = None,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, SelectedAttentionAux]: ...
 
@@ -210,6 +212,7 @@ def selected_attention(
     backend: str = "triton",
     mode: str = "auto",
     *,
+    scale: float | None = None,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, SelectedAttentionAux]:
     """
@@ -256,6 +259,9 @@ def selected_attention(
 
         mode: Currently only chunked is supported; auto defaults to chunked
 
+        scale: Positive multiplier for query-key logits. Defaults to 1 / sqrt(head_dim).
+            Attention sink logits are not scaled.
+
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return a tuple of (output, SelectedAttentionAux) containing the
             requested auxiliary outputs (e.g. LSE when return_aux.lse is True).
@@ -282,6 +288,10 @@ def selected_attention(
         share_kv,
     )
 
+    if scale is not None and not scale > 0:
+        raise ValueError("scale must be greater than 0.")
+    scale = query.shape[-1] ** -0.5 if scale is None else scale
+
     match backend:
         case "eager":
             from .impl import reference
@@ -299,6 +309,7 @@ def selected_attention(
                 doc_ids,
                 sliding_window_size,
                 share_kv,
+                scale=scale,
             )
         case "triton":
             from .impl import triton as triton_backend
@@ -316,6 +327,7 @@ def selected_attention(
                 doc_ids,
                 sliding_window_size,
                 share_kv,
+                scale=scale,
             )
         case "cute":
             from .impl import cute as cute_backend
@@ -329,6 +341,7 @@ def selected_attention(
                 doc_ids,
                 sliding_window_size,
                 share_kv,
+                scale=scale,
             )
         case _:
             raise NotImplementedError(f"Backend {backend!r} is not supported yet.")

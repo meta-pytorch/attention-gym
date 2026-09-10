@@ -20,6 +20,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         doc_ids: torch.Tensor | None,
         sliding_window_size: int,
         share_kv: bool,
+        scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
@@ -33,6 +34,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             attention_sink,
             doc_ids,
             sliding_window_size,
+            scale,
         )
         # Keep the output-owned fallback available if deterministic mode is enabled before backward.
         selected_queries, block_offsets = _build_index_query_map(kv_indices, sparse_kv.shape[2])
@@ -50,6 +52,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         ctx.doc_ids = doc_ids
         ctx.sliding_window_size = sliding_window_size
         ctx.share_kv = share_kv
+        ctx.scale = scale
         ctx.mark_non_differentiable(lse)
         return output, lse
 
@@ -80,8 +83,9 @@ class _SelectedAttentionFunction(torch.autograd.Function):
             grad_output,
             ctx.sliding_window_size,
             ctx.share_kv,
+            ctx.scale,
         )
-        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None, None
+        return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None, None, None
 
 
 def selected_attention(
@@ -93,6 +97,8 @@ def selected_attention(
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
+    *,
+    scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton implementation of selected attention.
 
@@ -105,6 +111,7 @@ def selected_attention(
         doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
         sliding_window_size: size of the causal sliding window.
         share_kv: if True, broadcast single-head KV and return single-head gradients.
+        scale: Multiplier for query-key logits; does not scale sink logits.
 
     Returns:
         Tuple of (output, lse) where output has same shape as query and lse has
@@ -138,11 +145,12 @@ def selected_attention(
             doc_ids,
             sliding_window_size,
             share_kv,
+            scale,
         )
 
     if share_kv:
         local_kv = local_kv.expand(-1, heads, -1, -1)
         sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
     return _launch_forward(
-        query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
+        query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size, scale
     )

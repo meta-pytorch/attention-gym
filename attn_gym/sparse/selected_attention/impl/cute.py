@@ -16,8 +16,6 @@ Constraints
 
 from __future__ import annotations
 
-import math
-
 import torch
 from flash_attn.cute.interface import flash_attn_func
 
@@ -117,6 +115,8 @@ def selected_attention(
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool = True,
+    *,
+    scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL (SM100) forward+backward for selected attention.
 
@@ -131,7 +131,7 @@ def selected_attention(
         query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
     )
 
-    _b, _h, s, d = query.shape
+    _b, _h, s, _d = query.shape
     device = query.device
     local_kv_len = local_kv.shape[2]
 
@@ -153,8 +153,6 @@ def selected_attention(
     qv_bshd = query.permute(0, 2, 1, 3)
     v_bshd = unified_kv.permute(0, 2, 1, 3)
 
-    softmax_scale = 1.0 / math.sqrt(d)
-
     # Call FA4's public interface.
     # Passing k=v (same object) with hdim=512 triggers MLA mode internally:
     # FA4 moves q into qv and nulls q/k, then routes to the sparse MLA kernels.
@@ -163,7 +161,7 @@ def selected_attention(
         k=v_bshd,
         v=v_bshd,
         gather_kv_indices=gather_indices,
-        softmax_scale=softmax_scale,
+        softmax_scale=scale,
         learnable_sink=attention_sink,
         causal=False,
         pack_gqa=True,

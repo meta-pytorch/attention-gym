@@ -53,6 +53,7 @@ def assert_matches_low_precision_eager(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
 @pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_topk", [16, 32, 64, 128])
 @pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
@@ -63,7 +64,7 @@ def assert_matches_low_precision_eager(
 )
 @pytest.mark.parametrize("sliding_window_size", [64, 128])
 def test_cute_precision_vs_fp64(
-    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype
+    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
 ):
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
@@ -142,6 +143,7 @@ def test_cute_precision_vs_fp64(
         doc_ids,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_ref = selected_attention(
         query_lp_ref,
@@ -152,6 +154,7 @@ def test_cute_precision_vs_fp64(
         doc_ids,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_cute = selected_attention(
         query_lp_cute,
@@ -162,6 +165,7 @@ def test_cute_precision_vs_fp64(
         doc_ids,
         sliding_window_size,
         backend="cute",
+        scale=scale,
     )
 
     # --- Backward ---
@@ -230,8 +234,9 @@ def test_cute_precision_vs_fp64(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
 @pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
-def test_cute_lse_matches_manual_computation(sink_dtype):
+def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
     _skip_no_sm100()
     device = torch.device("cuda")
@@ -261,6 +266,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype):
         None,
         window,
         backend="cute",
+        scale=scale,
         return_aux=AuxRequest(lse=True),
     )
     lse_cute = aux_cute.lse
@@ -275,6 +281,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype):
         None,
         window,
         backend="eager",
+        scale=scale,
         return_aux=AuxRequest(lse=True),
     )
     lse_eager = aux_eager.lse
