@@ -25,7 +25,11 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.target import detect_compile_target, set_compile_target
+from attn_gym._backends.cute.target import (
+    detect_compile_target,
+    get_compile_target,
+    set_compile_target,
+)
 
 _HEAD_DIM_GRANULARITY = 16
 _ALIGNMENT = 16
@@ -1575,14 +1579,18 @@ def index(
     output = torch.empty((*q.shape[:2], topk), dtype=torch.int32, device=q.device)
     heads, head_dim = q.shape[2:]
     score_scale = 1.0 / math.sqrt(heads * head_dim)
-    set_compile_target(detect_compile_target(q.device.index))
-    compiled = _compile_indexer(
-        INDEXER_DTYPES[q.dtype].name,
-        heads,
-        head_dim,
-        topk,
-        causal,
-    )
+    previous = get_compile_target()
+    try:
+        set_compile_target(detect_compile_target(q.device.index))
+        compiled = _compile_indexer(
+            INDEXER_DTYPES[q.dtype].name,
+            heads,
+            head_dim,
+            topk,
+            causal,
+        )
+    finally:
+        set_compile_target(previous)
     compiled(q.detach(), k.detach(), weights.detach(), output, Float32(score_scale))
     return output
 
