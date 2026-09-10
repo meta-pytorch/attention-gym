@@ -2,7 +2,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear import Impl, chunk_gdn
+from attn_gym.linear import Impl
+from attn_gym.linear import chunk_gdn as _chunk_gdn
 from attn_gym.linear import recurrent_gdn as _recurrent_gdn
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.validation import resolve_kernel_options
@@ -12,6 +13,11 @@ from attn_gym.testing import cumulative_sequence_offsets
 def recurrent_gdn(*args, **kwargs):
     kwargs.setdefault("impl", Impl.REFERENCE)
     return _recurrent_gdn(*args, **kwargs)
+
+
+def chunk_gdn(*args, **kwargs):
+    kwargs.setdefault("impl", Impl.REFERENCE)
+    return _chunk_gdn(*args, **kwargs)
 
 
 REFERENCE_CASES = [recurrent_gdn, chunk_gdn]
