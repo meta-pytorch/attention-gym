@@ -9,22 +9,11 @@ import importlib
 import torch
 
 from attn_gym.linear._delta_rule.paged_state import PagedState
-from attn_gym.utils import fork_join_streams
 
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
     "bool split, float scale) -> Tensor",
-)
-torch.library.define(
-    "attn_gym::kda_chunk_mega_dense_training_fwd",
-    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "bool split, float scale) -> (Tensor, Tensor)",
-)
-torch.library.define(
-    "attn_gym::kda_chunk_mega_packed_training_fwd",
-    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, bool split, float scale) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_mega_packed_fwd_with_initial_state",
@@ -60,13 +49,6 @@ torch.library.define(
     "Tensor cu_seqlens, Tensor? d_final_state, float scale) "
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
-torch.library.define(
-    "attn_gym::kda_plain_gate_bwd_dense_cute",
-    "(Tensor d_cumulative) -> Tensor",
-)
-
-_GATE_STREAMS: dict[int, torch.cuda.Stream] = {}
-_MAIN_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _backend(q: torch.Tensor):
@@ -84,17 +66,8 @@ def validate_mega_available(q: torch.Tensor) -> None:
     _backend(q)
 
 
-def _stream(cache: dict[int, torch.cuda.Stream], device: torch.device, priority: int = 0):
-    index = torch.cuda.current_device() if device.index is None else device.index
-    stream = cache.get(index)
-    if stream is None:
-        stream = torch.cuda.Stream(device=index, priority=priority)
-        cache[index] = stream
-    return stream
-
-
-def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, *, backend=None):
-    backend = _backend(q) if backend is None else backend
+def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
+    backend = _backend(q)
     return backend.chunk_delta_rule_fwd_mega(
         q,
         k,
@@ -105,53 +78,6 @@ def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, *, backe
         scale,
         split=split,
     )
-
-
-def _dense_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
-    from attn_gym.linear._delta_rule.triton.plain_gate import _plain_gate_scan_cuda
-
-    backend = _backend(q)
-    # Prioritize the persistent one-CTA-per-SM Mega grid; the scan can fill its drain tail.
-    cumulative_gate, output = fork_join_streams(
-        torch.cuda.current_stream(q.device),
-        _stream(_MAIN_STREAMS, q.device, priority=-1),
-        lambda: _packed_fwd_cuda(
-            q,
-            k,
-            value,
-            gate,
-            beta,
-            cu_seqlens,
-            split,
-            scale,
-            backend=backend,
-        ),
-        lambda: _plain_gate_scan_cuda(gate, None, None, False),
-    )
-    return output, cumulative_gate
-
-
-def _packed_training_fwd_cuda(q, k, value, gate, beta, cu_seqlens, chunk_offsets, split, scale):
-    from attn_gym.linear._delta_rule.triton.plain_gate import _plain_gate_scan_cuda
-
-    backend = _backend(q)
-    output, cumulative_gate = fork_join_streams(
-        torch.cuda.current_stream(q.device),
-        _stream(_GATE_STREAMS, q.device),
-        lambda: _plain_gate_scan_cuda(gate, cu_seqlens, chunk_offsets, False),
-        lambda: _packed_fwd_cuda(
-            q,
-            k,
-            value,
-            gate,
-            beta,
-            cu_seqlens,
-            split,
-            scale,
-            backend=backend,
-        ),
-    )
-    return output, cumulative_gate
 
 
 def _packed_fwd_with_initial_state_cuda(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
@@ -263,19 +189,7 @@ def _packed_bwd_with_exit_cotangent_cuda(
     )[:5]
 
 
-def _plain_gate_bwd_cuda(d_cumulative):
-    from attn_gym.linear._delta_rule.mega.kernels.kda_plain_gate_bwd import (
-        plain_gate_cumsum_dense_bwd_cute,
-    )
-
-    return plain_gate_cumsum_dense_bwd_cute(d_cumulative)
-
-
 torch.library.impl("attn_gym::kda_chunk_mega_packed_fwd", "CUDA", _packed_fwd_cuda)
-torch.library.impl("attn_gym::kda_chunk_mega_dense_training_fwd", "CUDA", _dense_training_fwd_cuda)
-torch.library.impl(
-    "attn_gym::kda_chunk_mega_packed_training_fwd", "CUDA", _packed_training_fwd_cuda
-)
 torch.library.impl(
     "attn_gym::kda_chunk_mega_packed_fwd_with_initial_state",
     "CUDA",
@@ -294,25 +208,12 @@ torch.library.impl(
     "CUDA",
     _packed_bwd_with_exit_cotangent_cuda,
 )
-torch.library.impl("attn_gym::kda_plain_gate_bwd_dense_cute", "CUDA", _plain_gate_bwd_cuda)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_fwd")
 def _packed_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale):
     del q, k, gate, beta, cu_seqlens, split, scale
     return torch.empty_like(value)
-
-
-@torch.library.register_fake("attn_gym::kda_chunk_mega_dense_training_fwd")
-def _dense_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale):
-    del q, k, beta, cu_seqlens, split, scale
-    return torch.empty_like(value), gate.new_empty(gate.shape)
-
-
-@torch.library.register_fake("attn_gym::kda_chunk_mega_packed_training_fwd")
-def _packed_training_fwd_fake(q, k, value, gate, beta, cu_seqlens, chunk_offsets, split, scale):
-    del q, k, beta, cu_seqlens, chunk_offsets, split, scale
-    return torch.empty_like(value), gate.new_empty(gate.shape)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_mega_packed_fwd_with_initial_state")
@@ -371,15 +272,8 @@ def _packed_bwd_with_exit_cotangent_fake(
     return _token_gradients_fake(q, k, value, gate, beta)
 
 
-@torch.library.register_fake("attn_gym::kda_plain_gate_bwd_dense_cute")
-def _plain_gate_bwd_fake(d_cumulative):
-    return torch.empty_like(d_cumulative)
-
-
 chunk_mega_packed_fwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_fwd.default
 chunk_mega_packed_fwd_paged_op = torch.ops.attn_gym.kda_chunk_mega_packed_fwd_paged.default
-chunk_mega_dense_training_fwd_op = torch.ops.attn_gym.kda_chunk_mega_dense_training_fwd.default
-chunk_mega_packed_training_fwd_op = torch.ops.attn_gym.kda_chunk_mega_packed_training_fwd.default
 chunk_mega_packed_fwd_with_initial_state_op = (
     torch.ops.attn_gym.kda_chunk_mega_packed_fwd_with_initial_state.default
 )
@@ -393,11 +287,9 @@ chunk_mega_packed_bwd_with_state_op = (
 chunk_mega_packed_bwd_with_exit_cotangent_op = (
     torch.ops.attn_gym.kda_chunk_mega_packed_bwd_with_exit_cotangent.default
 )
-plain_gate_bwd_dense_cute_op = torch.ops.attn_gym.kda_plain_gate_bwd_dense_cute.default
 
 
 __all__ = [
-    "chunk_mega_dense_training_fwd_op",
     "chunk_mega_packed_bwd_with_exit_cotangent_op",
     "chunk_mega_packed_bwd_with_state_op",
     "chunk_mega_packed_fwd_op",
@@ -405,7 +297,5 @@ __all__ = [
     "chunk_mega_packed_fwd_with_initial_state_op",
     "chunk_mega_packed_fwd_with_state_op",
     "chunk_mega_packed_local_bwd_op",
-    "chunk_mega_packed_training_fwd_op",
-    "plain_gate_bwd_dense_cute_op",
     "validate_mega_available",
 ]
