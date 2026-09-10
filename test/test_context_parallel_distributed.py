@@ -201,8 +201,7 @@ def _rank_main(
         if table == "documents":
             # No document crosses ranks, so every document runs from the zero state on the rank
             # that owns it: the recipe at CP=2 is bitwise the recipe at CP=1 (a one-rank group
-            # over the whole stream), and for KDA also the public op, whose kernels the staged
-            # path shares. GDN's staged path is not the public op's kernel sequence.
+            # over the whole stream) and the unsharded op, whose kernels the staged path shares.
             alone = ContextParallelPlan.from_fragments(cu_seqlens, [[(0, cu_seqlens[-1])]], 0)
             solo = tuple(t.clone().requires_grad_() for t in operands)
             solo_output, solo_exit = cp(
@@ -219,10 +218,7 @@ def _rank_main(
                     solo,
                     grad_outputs=(d_output,),
                 )
-            references = [(solo_output, solo_grads)]
-            if op_name == "kda":
-                references.append((output, expected_grads))
-            for ref_output, ref_grads in references:
+            for ref_output, ref_grads in ((solo_output, solo_grads), (output, expected_grads)):
                 for actual, expected in zip(
                     (local_output, *grads), (ref_output, *ref_grads), strict=True
                 ):
@@ -230,8 +226,7 @@ def _rank_main(
             for index in plan.terminal:
                 sequence = plan.subsequences[index].sequence
                 assert torch.equal(exit_states[index], solo_exit[sequence])
-                if op_name == "kda":
-                    assert torch.equal(exit_states[index], final[sequence])
+                assert torch.equal(exit_states[index], final[sequence])
 
         # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
         qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)
