@@ -349,7 +349,6 @@ class IndexerPrefillKernel:
         logical_tid: Int32,
         query_slot: cutlass.Constexpr,
         selection_barrier,
-        sort_span: cutlass.Constexpr,
     ):
         """Retain Top-128 from 512 keys with warp-local runs and two merge levels."""
         tile_candidates = self.tile_candidates
@@ -366,7 +365,7 @@ class IndexerPrefillKernel:
         pair_tid = logical_tid & Int32(63)
         pair_a_base = query_base + pair * Int32(2 * tile_candidates)
         pair_b_base = pair_a_base + Int32(tile_candidates)
-        scratch_base = Int32(self.queries_per_cta * sort_span) + Int32(
+        scratch_base = Int32(self.queries_per_cta * self.sort_span) + Int32(
             query_slot * 2 * tile_candidates
         )
         pair_output_base = scratch_base + pair * Int32(tile_candidates)
@@ -407,8 +406,6 @@ class IndexerPrefillKernel:
         logical_tid: Int32,
         query_slot: cutlass.Constexpr,
         selection_barrier,
-        run_size: cutlass.Constexpr,
-        sort_span: cutlass.Constexpr,
     ):
         """Sort the long-term-buffer/buffer2 union and retain its first run_size keys.
 
@@ -421,7 +418,7 @@ class IndexerPrefillKernel:
         owned by the same thread.
         """
         selection_threads = self.selection_threads
-        if cutlass.const_expr(run_size == 128 and sort_span == 512):
+        if cutlass.const_expr(self.run_size == 128 and self.sort_span == 512):
             self._drain_hierarchical_512_128(
                 keys,
                 buffer_counts,
@@ -429,12 +426,11 @@ class IndexerPrefillKernel:
                 logical_tid,
                 query_slot,
                 selection_barrier,
-                sort_span,
             )
             return
 
-        items_per_thread = sort_span // selection_threads
-        levels = int(math.log2(sort_span))
+        items_per_thread = self.sort_span // selection_threads
+        levels = int(math.log2(self.sort_span))
         values = cute.make_rmem_tensor(cute.make_layout((items_per_thread,)), Int64)
         for item in cutlass.range_constexpr(items_per_thread):
             global_index = logical_tid + Int32(item * selection_threads)
@@ -813,9 +809,9 @@ class IndexerPrefillKernel:
         candidate_tiles,
         head_tiles,
         score_scale,
-        causal: cutlass.Constexpr,
     ):
         """Reduce every score tile and publish one ordinal per reducer thread."""
+        causal = self.causal
         tile_candidates = self.tile_candidates
         tile_heads = self.tile_heads
         acc_stages = self.config.acc_stages
@@ -928,9 +924,6 @@ class IndexerPrefillKernel:
         lane,
         query_slot: cutlass.Constexpr,
         candidate_tiles,
-        topk: cutlass.Constexpr,
-        run_size: cutlass.Constexpr,
-        sort_span: cutlass.Constexpr,
     ):
         """Consume reduced ordinals and maintain the exact shared-memory Top-run_size.
 
@@ -951,14 +944,14 @@ class IndexerPrefillKernel:
             barrier_id=selection_barrier_id,
             num_threads=selection_threads,
         )
-        query_base = Int32(query_slot * sort_span)
-        items_per_thread = sort_span // selection_threads
+        query_base = Int32(query_slot * self.sort_span)
+        items_per_thread = self.sort_span // selection_threads
         for item in cutlass.range_constexpr(items_per_thread):
             if cutlass.const_expr(
                 not (
-                    topk == run_size
-                    and run_size == tile_candidates
-                    and sort_span == 4 * tile_candidates
+                    self.topk == self.run_size
+                    and self.run_size == tile_candidates
+                    and self.sort_span == 4 * tile_candidates
                     and item == 0
                 )
             ):
@@ -969,16 +962,16 @@ class IndexerPrefillKernel:
             buffer_counts[query_slot] = Int32(0)
         if cutlass.const_expr(
             not (
-                topk == run_size
-                and run_size == tile_candidates
-                and sort_span == 4 * tile_candidates
+                self.topk == self.run_size
+                and self.run_size == tile_candidates
+                and self.sort_span == 4 * tile_candidates
             )
         ):
             selection_barrier.arrive_and_wait()
 
         cutoff_key = Int64(_INVALID_KEY)
         cutoff_ordinal = Int32(_INVALID_ORDINAL)
-        buffer_capacity = sort_span - run_size
+        buffer_capacity = self.sort_span - self.run_size
         drain_threshold = buffer_capacity - tile_candidates
         lane_in_group = lane & Int32(3)
         candidate_group = lane >> Int32(2)
@@ -1007,9 +1000,9 @@ class IndexerPrefillKernel:
 
             direct_seed = cutlass.Boolean(False)
             if cutlass.const_expr(
-                topk == run_size
-                and run_size == tile_candidates
-                and sort_span == 4 * tile_candidates
+                self.topk == self.run_size
+                and self.run_size == tile_candidates
+                and self.sort_span == 4 * tile_candidates
             ):
                 direct_seed = candidate_tile == Int32(0)
 
@@ -1025,7 +1018,7 @@ class IndexerPrefillKernel:
                     other = Int64(cute.arch.shuffle_sync_bfly(seed_min, 1 << shuffle_stage))
                     seed_min = other if other < seed_min else seed_min  # noqa: FURB136
                 seed_scratch_base = Int32(
-                    self.queries_per_cta * sort_span + query_slot * 2 * tile_candidates
+                    self.queries_per_cta * self.sort_span + query_slot * 2 * tile_candidates
                 )
                 if lane == Int32(0):
                     selection_keys[seed_scratch_base + warp_idx] = seed_min
@@ -1055,7 +1048,7 @@ class IndexerPrefillKernel:
                     )
                 warp_base = Int32(cute.arch.shuffle_sync(warp_base, 0))
                 if accept:
-                    selection_keys[query_base + Int32(run_size) + warp_base + lane_rank] = (
+                    selection_keys[query_base + Int32(self.run_size) + warp_base + lane_rank] = (
                         candidate_key
                     )
 
@@ -1089,10 +1082,8 @@ class IndexerPrefillKernel:
                         tidx,
                         query_slot,
                         selection_barrier,
-                        run_size,
-                        sort_span,
                     )
-                    cutoff_key = Int64(selection_keys[query_base + Int32(run_size - 1)])
+                    cutoff_key = Int64(selection_keys[query_base + Int32(self.run_size - 1)])
                     cutoff_ordinal = Int32(cutoff_key >> Int64(32))
 
         occupied = Int32(buffer_counts[query_slot])
@@ -1104,8 +1095,6 @@ class IndexerPrefillKernel:
                 tidx,
                 query_slot,
                 selection_barrier,
-                run_size,
-                sort_span,
             )
 
     @cute.kernel
@@ -1120,14 +1109,12 @@ class IndexerPrefillKernel:
         mOut_btk: cute.Tensor,
         k_smem_layout: cute.ComposedLayout,
         q_smem_layout: cute.ComposedLayout,
-        io_dtype: cutlass.Constexpr,
         score_scale: Float32,
-        topk: cutlass.Constexpr,
-        sort_span: cutlass.Constexpr,
-        causal: cutlass.Constexpr,
     ):
         """Dispatch the reducer, selector, MMA, and load warp roles."""
         config = self.config
+        causal = self.causal
+        io_dtype = self.dtype.cute_type
         tile_candidates = self.tile_candidates
         tile_heads = self.tile_heads
         tile_d = config.tile_d
@@ -1147,7 +1134,6 @@ class IndexerPrefillKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = tidx & Int32(_WARP_SIZE - 1)
         query_pair, batch, _ = cute.arch.block_idx()
-        run_size = sort_span // 4
 
         num_candidates = cute.size(mK_sdb.shape[0])
         num_heads = cute.size(mQ_hdtb.shape[0])
@@ -1177,7 +1163,7 @@ class IndexerPrefillKernel:
         selection_keys = smem.allocate_tensor(
             Int64,
             cute.make_layout(
-                (queries_per_cta * sort_span + queries_per_cta * 2 * tile_candidates,)
+                (queries_per_cta * self.sort_span + queries_per_cta * 2 * tile_candidates,)
             ),
             byte_alignment=128,
         )
@@ -1316,7 +1302,6 @@ class IndexerPrefillKernel:
                 candidate_tiles,
                 head_tiles,
                 score_scale,
-                causal,
             )
         elif warp_idx < Int32(selector_q0_start):
             self._run_query_reducer_mailbox(
@@ -1337,7 +1322,6 @@ class IndexerPrefillKernel:
                 candidate_tiles,
                 head_tiles,
                 score_scale,
-                causal,
             )
         elif warp_idx < Int32(selector_q1_start):
             self._run_query_selector_mailbox(
@@ -1351,9 +1335,6 @@ class IndexerPrefillKernel:
                 lane,
                 0,
                 candidate_tiles,
-                topk,
-                run_size,
-                sort_span,
             )
         elif warp_idx < Int32(mma_warp):
             self._run_query_selector_mailbox(
@@ -1367,9 +1348,6 @@ class IndexerPrefillKernel:
                 lane,
                 1,
                 candidate_tiles,
-                topk,
-                run_size,
-                sort_span,
             )
 
         if warp_idx == Int32(load_warp):
@@ -1408,14 +1386,14 @@ class IndexerPrefillKernel:
         selection_tid = (tidx - Int32(selector_q0_start * _WARP_SIZE)) & Int32(
             selection_threads - 1
         )
-        selection_base = selection_query * Int32(sort_span)
+        selection_base = selection_query * Int32(self.sort_span)
         query_index = query0 if selection_query == Int32(0) else query1
         query_active = selection_query == Int32(0) or query1_active
         is_selection_warp = warp_idx >= Int32(selector_q0_start) and warp_idx < Int32(mma_warp)
         if is_selection_warp:
-            for write_round in cutlass.range_constexpr(cute.ceil_div(topk, selection_threads)):
+            for write_round in cutlass.range_constexpr(cute.ceil_div(self.topk, selection_threads)):
                 slot = selection_tid + Int32(write_round * selection_threads)
-                if query_active and slot < Int32(topk):
+                if query_active and slot < Int32(self.topk):
                     key = Int64(selection_keys[selection_base + slot])
                     mOut_btk[batch, query_index, slot] = ~Int32(key & Int64(0xFFFFFFFF))
         tmem.relinquish_alloc_permit()
@@ -1435,9 +1413,6 @@ class IndexerPrefillKernel:
     ):
         """Build the SM100 TMA/MMA objects and launch exactly one kernel."""
         config = self.config
-        topk = self.topk
-        sort_span = self.sort_span
-        causal = self.causal
         mma_tile = self.mma_tile
 
         q_hdtb = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 3, 1, 0]))
@@ -1494,11 +1469,7 @@ class IndexerPrefillKernel:
             output,
             k_smem_layout,
             q_smem_layout,
-            q.element_type,
             score_scale,
-            topk,
-            sort_span,
-            causal,
         ).launch(
             grid=(cute.ceil_div(q.shape[1], self.queries_per_cta), q.shape[0], 1),
             block=(self.threads, 1, 1),
