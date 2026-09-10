@@ -16,8 +16,26 @@ from attn_gym.linear.context_parallel import (
     neutral_summary,
 )
 
-VALUE_DIM = 2
-KEY_DIM = 2
+# The fused fold kernel needs a real head: folds run on CUDA with these dims.
+VALUE_DIM = 32
+KEY_DIM = 16
+FOLD_DEVICE = "cuda"
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="folds run on CUDA")
+
+
+def _gathered(*shape: int, seed: int) -> torch.Tensor:
+    """Random packed ``[bias; transition]`` maps ``[*shape, 1, V + K, K]`` on the fold device.
+
+    Transitions are scaled to unit spectral size so chains do not amplify rounding differences
+    between the fused fold and the plain matmul reference.
+    """
+    generator = torch.Generator(device=FOLD_DEVICE).manual_seed(seed)
+    maps = torch.randn(
+        *shape, 1, VALUE_DIM + KEY_DIM, KEY_DIM, device=FOLD_DEVICE, generator=generator
+    )
+    maps[..., VALUE_DIM:, :] /= KEY_DIM**0.5
+    return maps
+
 
 # Sequences [0,1), [1,7), [7,8) over four ranks of two contiguous tokens each, with a width-4
 # short convolution (three tokens of history).
@@ -153,6 +171,7 @@ def test_plan_skips_empty_sequences_and_links_adjacent_fragments_on_one_rank():
     assert plan.terminal == (0,)
 
 
+@needs_cuda
 @pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
 @pytest.mark.parametrize("cu_seqlens", LAYOUTS)
 def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence(
@@ -163,19 +182,21 @@ def test_entry_and_exit_folds_follow_subsequence_geometry_for_every_subsequence(
         ContextParallelPlan.from_fragments(cu_seqlens, fragments, cp_rank)
         for cp_rank in range(len(fragments))
     ]
-    generator = torch.Generator().manual_seed(3)
-    gathered = torch.randn(len(plans), plans[0].slots, 1, 4, 2, generator=generator)
+    gathered = _gathered(len(plans), plans[0].slots, seed=3)
+    generator = torch.Generator(device=FOLD_DEVICE).manual_seed(3)
     everything = [
         (r, s, piece)
         for r, row in enumerate(plans[0].table)
         for s, fragment in enumerate(row)
         for piece in fragment
     ]
-    zero = torch.zeros(1, VALUE_DIM, KEY_DIM)
+    zero = torch.zeros(1, VALUE_DIM, KEY_DIM, device=FOLD_DEVICE)
     for plan in plans:
-        routing = plan.routing("cpu")
+        routing = plan.routing(FOLD_DEVICE)
         count = len(plan.subsequences)
-        d_final_state = torch.randn(count, 1, VALUE_DIM, KEY_DIM, generator=generator)
+        d_final_state = torch.randn(
+            count, 1, VALUE_DIM, KEY_DIM, device=FOLD_DEVICE, generator=generator
+        )
         entries = compose_entry_states(gathered, routing)
         exits = compose_exit_cotangents(gathered, torch.zeros_like(d_final_state), routing)
         exits_with_loss = compose_exit_cotangents(gathered, d_final_state, routing)
@@ -243,6 +264,7 @@ def test_short_conv_history_backward_is_the_transpose_of_forward_routing():
     assert compose_conv_histories(tails, CONV_ROUTINGS[0]).requires_grad
 
 
+@needs_cuda
 @pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
 @pytest.mark.parametrize("cu_seqlens", LAYOUTS)
 def test_routing_tensors_follow_fragment_geometry(cu_seqlens, fragments):
@@ -252,11 +274,10 @@ def test_routing_tensors_follow_fragment_geometry(cu_seqlens, fragments):
         for cp_rank in range(len(fragments))
     ]
     world, slots = len(plans), plans[0].slots
-    generator = torch.Generator().manual_seed(11)
-    gathered = torch.randn(world, slots, 1, 4, 2, generator=generator)
+    gathered = _gathered(world, slots, seed=11)
     for plan in plans:
         capacity = len(plan.subsequences) + 1
-        routing = plan.routing("cpu", max_subsequences=capacity)
+        routing = plan.routing(FOLD_DEVICE, max_subsequences=capacity)
         count = len(plan.subsequences)
         assert routing.slots == slots and routing.world == world
         assert routing.predecessors.shape == routing.successors.shape == (slots, world * slots - 1)
@@ -270,7 +291,7 @@ def test_routing_tensors_follow_fragment_geometry(cu_seqlens, fragments):
         assert routing.terminal.tolist() == [i in plan.terminal for i in range(capacity)]
         entries = compose_entry_states(gathered, routing)
         exits = compose_exit_cotangents(
-            gathered, torch.zeros(capacity, 1, VALUE_DIM, KEY_DIM), routing
+            gathered, torch.zeros(capacity, 1, VALUE_DIM, KEY_DIM, device=FOLD_DEVICE), routing
         )
         assert entries.shape == exits.shape == (capacity, 1, VALUE_DIM, KEY_DIM)
         assert torch.equal(entries[count:], torch.zeros_like(entries[count:]))
@@ -342,23 +363,23 @@ def test_routing_rejects_layouts_beyond_the_caps():
         plan.routing("cpu", slots=1)
 
 
+@needs_cuda
 def test_slots_cap_pads_every_rank_to_the_same_shapes_across_fragment_tables():
     """Two tables with different fragment counts route identically shaped tensors under one cap."""
     cu_seqlens = (0, 5, 12, 16)
     tables = [FRAGMENTS, [[(0, 6)], [(6, 9), (12, 16)], [(9, 12)]]]  # 5 fragments, then 4
-    generator = torch.Generator().manual_seed(7)
-    gathered = torch.randn(3, 3, 1, 4, 2, generator=generator)
+    gathered = _gathered(3, 3, seed=7)
     for table in tables:
         for cp_rank in range(3):
             plan = ContextParallelPlan.from_fragments(cu_seqlens, table, cp_rank)
-            capped = plan.routing("cpu", slots=3, max_subsequences=4, conv_history=2)
+            capped = plan.routing(FOLD_DEVICE, slots=3, max_subsequences=4, conv_history=2)
             assert capped.slots == 3
             assert capped.forward_bounds.shape == capped.reverse_bounds.shape == (3, 2)
             assert capped.predecessors.shape == capped.successors.shape == (3, 8)  # 3 * 3 - 1
             assert capped.tail_sources.shape == (3, 2) and capped.conv_sources.shape == (4, 2)
             # Padding slots are empty and unrouted, so the folds match the uncapped routing.
-            exact = plan.routing("cpu", max_subsequences=4)
-            assert torch.equal(capped.forward_bounds[plan.slots :], torch.zeros(3 - plan.slots, 2))
+            exact = plan.routing(FOLD_DEVICE, max_subsequences=4)
+            assert not capped.forward_bounds[plan.slots :].any()
             torch.testing.assert_close(
                 compose_entry_states(gathered, capped),
                 compose_entry_states(gathered[:, : plan.slots], exact),
