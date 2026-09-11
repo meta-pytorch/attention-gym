@@ -13,6 +13,7 @@ import torch
 
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_op
+from attn_gym.testing.indexer import assert_indexer_selection
 
 
 def _skip_no_sm100():
@@ -342,12 +343,14 @@ def test_cute_backend_under_torch_compile(causal, dtype, topk):
     assert compiled_out.shape == (batch, queries, topk)
     assert compiled_out.dtype == torch.int32
 
-    torch.testing.assert_close(compiled_out, eager_out, rtol=0, atol=0)
+    # Selection order and exact boundary ties are not part of the API contract.
+    assert_indexer_selection(eager_out, q, k, w, topk, causal)
+    assert_indexer_selection(compiled_out, q, k, w, topk, causal)
 
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("topk", [0, 16])
+@pytest.mark.parametrize("topk", [0, 65])
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_cute_op_registration(causal, dtype, topk, requires_grad):
     """Check registration, including partial tiles and nondifferentiable indices."""
@@ -355,6 +358,8 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
     q = torch.randn(2, 65, 64, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(2, 65, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
+    # AOT opcheck compares integer outputs exactly. Full selection has a stable
+    # output order; selective rows are checked semantically in the compile tests.
     torch.library.opcheck(_indexer_op, (q, k, w, topk, causal, "cute"))
     result = lightning_indexer(q, k, w, topk, causal=causal, impl="fused")
     assert not result.requires_grad
@@ -362,12 +367,15 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
 
 
 def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
+    """Reuse both score and selection artifacts, including after a persistent reload."""
     _skip_no_sm100()
     from attn_gym.sparse.indexer.impl import cute as impl
 
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
-    impl._compile_indexer.cache_clear()
+    compilers = (impl._compile_scores, impl._compile_topk)
+    for compiler in compilers:
+        compiler.cache_clear()
     torch.manual_seed(2026)
     try:
         for batch, tokens in ((2, 65), (3, 65), (3, 129), (1, 257)):
@@ -375,29 +383,28 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             k = torch.randn(batch, tokens, 128, device="cuda", dtype=torch.bfloat16)
             w = torch.randn(batch, tokens, 64, device="cuda", dtype=torch.bfloat16)
             actual = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
-            torch.cuda.synchronize()
-            assert actual.shape == (batch, tokens, 16)
-            assert actual.dtype == torch.int32
-            _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
-            cache_info = impl._compile_indexer.cache_info()
-            assert cache_info.misses == 1
-            assert cache_info.currsize == 1
-        assert impl._compile_indexer.cache_info().hits == 3
-        assert impl._compile_indexer.is_cached("bf16", 64, 128, 16, True)
-        impl._compile_indexer.cache_clear()
+            assert_indexer_selection(actual, q, k, w, 16, True)
+            for compiler in compilers:
+                assert compiler.cache_info().misses == 1
+                assert compiler.cache_info().currsize == 1
+        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, False)
+        assert impl._compile_topk.is_cached(16, True, False)
+        for compiler in compilers:
+            assert compiler.cache_info().hits == 3
+            compiler.cache_clear()
         actual = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
-        torch.cuda.synchronize()
-        _validate_indices(actual, _reference_scores(q.float(), k.float(), w.float()), 16, True)
-        cache_info = impl._compile_indexer.cache_info()
-        assert cache_info.hits == 1
-        assert cache_info.misses == 0
-        assert cache_info.currsize == 1
+        assert_indexer_selection(actual, q, k, w, 16, True)
+        for compiler in compilers:
+            assert compiler.cache_info().hits == 1
+            assert compiler.cache_info().misses == 0
+            assert compiler.cache_info().currsize == 1
     finally:
-        impl._compile_indexer.cache_clear()
+        for compiler in compilers:
+            compiler.cache_clear()
 
 
 def test_cute_dynamic_fullgraph():
-    """Reuse a public graph while the launcher specializes for each sequence length."""
+    """Reuse a symbolic public graph across sequence lengths with semantic selection checks."""
     _skip_no_sm100()
     compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True)
     for tokens in (65, 129):
@@ -406,4 +413,5 @@ def test_cute_dynamic_fullgraph():
         w = torch.randn(2, tokens, 64, device="cuda", dtype=torch.bfloat16)
         actual = compiled(q, k, w, 16, causal=True, impl="fused")
         expected = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert_indexer_selection(expected, q, k, w, 16, True)
+        assert_indexer_selection(actual, q, k, w, 16, True)

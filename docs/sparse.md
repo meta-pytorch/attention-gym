@@ -19,7 +19,7 @@ Weights may be negative. Query and candidate lengths must match. With causal sel
 query `t` considers only candidates `0..t`; rows with fewer than `topk` candidates contain
 `-1` padding. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
 position rather than an invalid position. `topk=0` returns an empty last dimension.
-Output order and tie-breaking are not guaranteed to match between implementations.
+Output order and tie-breaking are unspecified, including between repeated calls.
 
 ### Implementations and device dispatch
 
@@ -28,7 +28,11 @@ Output order and tie-breaking are not guaranteed to match between implementation
   and is intended for correctness checks and small inputs.
 - `impl="fused"` (the default) selects **CuTe on SM100**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
-  keep their selection state on chip and allocate no quadratic global score workspace.
+  keep their selection state on chip. CuTe separates score generation from radix Top-K and
+  reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
+  batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
+  allocation. This scratch is additional to the returned indices; Triton needs no global
+  score scratch.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
   Omit options for automatic selection. Options are rejected for `impl="reference"`.
   Unsupported shapes, missing dependencies, and launch errors propagate;

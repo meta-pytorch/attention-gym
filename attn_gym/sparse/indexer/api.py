@@ -122,7 +122,7 @@ def lightning_indexer(
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
-        guaranteed across backends. Causal rows with fewer than topk candidates
+        guaranteed, including across repeated calls. Causal rows with fewer than topk candidates
         contain -1 padding; topk=0 returns an empty last dimension.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
@@ -130,6 +130,9 @@ def lightning_indexer(
     even H, D divisible by 16, and contiguous, 16-byte-aligned inputs. Triton requires
     SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with unit last strides
     and 16-byte-aligned bases and outer strides; weights may be strided.
+    CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
+    rows. Large inputs use slabs rather than an unbounded quadratic score allocation.
+    This workspace is additional to the returned indices and is not shared across calls.
 
     Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
