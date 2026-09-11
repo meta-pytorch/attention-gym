@@ -1,5 +1,8 @@
 """Benchmark the indexer's Top-K selection across backends and shapes.
 
+Requires Transformer Nuggets with CUDA graph sample statistics:
+    uv pip install "git+https://github.com/drisspg/transformer_nuggets.git@b8ae46be93f7c9d2133c025a7f15310484df8685"
+
 Usage:
     python benchmarks/sparse/indexer_benchmark.py
     python benchmarks/sparse/indexer_benchmark.py --impl reference fused
@@ -7,9 +10,9 @@ Usage:
 """
 
 import argparse
+from functools import partial
 
 import torch
-import triton
 
 from attn_gym.sparse.indexer import lightning_indexer
 
@@ -36,10 +39,11 @@ def useful_flops(args: argparse.Namespace) -> int:
     if not args.causal:
         return b * h * s * s * d * 2
     else:
-        return b * h * s * s * d
+        return b * h * s * (s + 1) * d
 
 
 def make_inputs(args: argparse.Namespace):
+    """Create one shared set of inputs for every measured implementation."""
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -55,6 +59,7 @@ def make_inputs(args: argparse.Namespace):
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse shapes, implementations, and graph-replay iteration counts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--heads", type=int, default=128)
@@ -64,18 +69,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--impl", nargs="+", default=["fused"], choices=["reference", "fused"])
-    parser.add_argument("--warmup", type=int, default=200, help="Warmup duration in ms")
-    parser.add_argument("--rep", type=int, default=1000, help="Measurement duration in ms")
+    parser.add_argument(
+        "--backend",
+        nargs="+",
+        choices=["cute", "triton"],
+        default=[None],
+        help="Override fused backend selection; omit to select by device",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=25, help="Warmup iterations before/after capture"
+    )
+    parser.add_argument("--rep", type=int, default=100, help="Number of timed graph replays")
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
 
 def main() -> None:
+    """Measure public forward selection with setup excluded from graph replay."""
     args = parse_args()
-    if "fused" in args.impl:
-        assert args.heads % 2 == 0, "cute backend requires an even number of heads"
-        assert args.head_dim % 16 == 0, "cute backend requires head_dim divisible by 16"
-        assert args.dtype in ("float16", "bfloat16"), "cute backend requires fp16 or bf16"
+    try:
+        from transformer_nuggets.utils.benchmark import benchmark_cuda_function_stats
+    except ImportError:
+        raise SystemExit(
+            "This benchmark requires Transformer Nuggets with benchmark_cuda_function_stats. "
+            "Install the compatible revision using the uv pip install command in --help."
+        ) from None
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 
@@ -85,19 +103,32 @@ def main() -> None:
 
     fwd_flops = useful_flops(args)
 
+    print(
+        "contract: warm fixed-pointer CUDA graph replay; forward only (indices have no backward)"
+    )
+    q, k, weights = make_inputs(args)
     for impl in args.impl:
-        q, k, weights = make_inputs(args)
-
-        def fwd(_q=q, _k=k, _weights=weights, _impl=impl):
-            return lightning_indexer(_q, _k, _weights, args.topk, causal=args.causal, impl=_impl)
-
-        fwd()
-        fwd_ms = triton.testing.do_bench(
-            fwd, warmup=args.warmup, rep=args.rep, return_mode="median"
-        )
-        fwd_tflops = fwd_flops / (fwd_ms * 1e9)
-
-        print(f"[{impl}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} TFLOP/s)")
+        for backend in args.backend if impl == "fused" else [None]:
+            fwd = partial(
+                lightning_indexer,
+                q,
+                k,
+                weights,
+                args.topk,
+                causal=args.causal,
+                impl=impl,
+                kernel_options={"backend": backend} if backend else None,
+            )
+            stats = benchmark_cuda_function_stats(
+                fwd,
+                USE_CUDA_GRAPHS=True,
+                NUM_ITERS=args.rep,
+                CUDAGRAPH_WARMUP_ITERS=args.warmup,
+            )
+            fwd_ms = stats.median_us / 1000
+            fwd_tflops = fwd_flops / (fwd_ms * 1e9)
+            route = f"{impl}/{backend}" if backend else impl
+            print(f"[{route}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} useful TFLOP/s)")
 
 
 if __name__ == "__main__":

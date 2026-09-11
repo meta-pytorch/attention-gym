@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from attn_gym.sparse.indexer import lightning_indexer
-from attn_gym.sparse.indexer.ops import _indexer_cute_op
+from attn_gym.sparse.indexer.ops import _indexer_op
 
 
 def _skip_no_sm100():
@@ -355,7 +355,7 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
     q = torch.randn(2, 65, 64, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(2, 65, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
-    torch.library.opcheck(_indexer_cute_op, (q, k, w, topk, causal))
+    torch.library.opcheck(_indexer_op, (q, k, w, topk, causal, "cute"))
     result = lightning_indexer(q, k, w, topk, causal=causal, impl="fused")
     assert not result.requires_grad
     assert result.grad_fn is None
@@ -363,7 +363,7 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
 
 def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
     _skip_no_sm100()
-    from attn_gym.sparse.indexer.impl.cute import impl
+    from attn_gym.sparse.indexer.impl import cute as impl
 
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)

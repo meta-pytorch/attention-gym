@@ -71,6 +71,7 @@ nav:
       - Masks: masks.md
       - Score Mods: mods.md
       - Linear Attention: linear.md
+      - Sparse Attention: sparse.md
       - Utilities: utilities.md
   - Examples: examples.md
   - Development:

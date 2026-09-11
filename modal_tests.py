@@ -47,6 +47,7 @@ def configure_local_image(
     return (
         configured.add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
         .add_local_dir(ROOT_PATH / "examples", remote_path="/root/examples")
+        .add_local_dir(ROOT_PATH / "benchmarks", remote_path="/root/benchmarks")
         .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
         .add_local_file(ROOT_PATH / "README.md", remote_path="/root/README.md")
     )

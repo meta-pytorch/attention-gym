@@ -1,4 +1,4 @@
-"""Pure-PyTorch reference indexer implementation."""
+"""Private PyTorch launcher for the public ``lightning_indexer`` API."""
 
 import math
 
@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 
-def index(
+def launch(
     q: Tensor,
     k: Tensor,
     weights: Tensor,
