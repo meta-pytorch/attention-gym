@@ -1173,6 +1173,8 @@ def _compile_affine_summary(
 # so a work item must carry enough chunks for the shortened chain to pay for them. Measured
 # crossover on GB200 is ~32 chunks total; 16 chunks per item keeps every split a win.
 MIN_CHUNKS_PER_ITEM = 16
+# Widening an otherwise one-wave scan pays for the extra planner/fold at long spans.
+MIN_CHUNKS_FOR_WIDE_SPLIT = 128
 # The forward launches and both Triton fallbacks put ranges or work items on grid.z (limit
 # 65535); leave room for the work budget, which is at most the SM count.
 MAX_RANGES = 65535 - 1024
@@ -1187,6 +1189,18 @@ def plan_work_budget(max_chunks: int, work_tiles: int, sm_count: int) -> int:
     length); the items themselves are cut on the device by ``plan_work_items``.
     """
     return max(1, min(max_chunks // MIN_CHUNKS_PER_ITEM, sm_count // work_tiles))
+
+
+def select_state_columns(max_chunks: int, heads: int, ranges: int, sm_count: int) -> int:
+    """Choose the native state tile from span capacity and available time parallelism."""
+    narrow_tiles = heads * (SUMMARY_DIM // 32)
+    if ranges * narrow_tiles > sm_count:
+        return 64
+    # BN32 is faster per chunk, but BN64 can split a long otherwise-unsplit recurrence
+    # while keeping its active pieces in one wave. Already-split scans keep the narrower tile.
+    if max_chunks >= MIN_CHUNKS_FOR_WIDE_SPLIT and sm_count // narrow_tiles == 1:
+        return 64
+    return 32
 
 
 @torch.compiler.disable
@@ -1282,10 +1296,7 @@ def build_state_summaries(
         state_bn = _select_block_columns(heads, capability)
     else:
         kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
-        # BN=32 is faster per CTA (measured ~1.5x vs BN=64 on GB200); fall back to
-        # BN=64 only when the extra column tiles would spill past one CTA wave and
-        # serialize whole recurrence chains.
-        state_bn = 32 if ranges * heads * (SUMMARY_DIM // 32) <= sm_count else 64
+        state_bn = select_state_columns(cdiv(tokens, BT), heads, ranges, sm_count)
     # The bounds live on the device, so the budget comes from the span's chunk count (a static
     # upper bound) and the device cuts the ranges' actual chunks into that many items.
     budget = plan_work_budget(cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), sm_count)
