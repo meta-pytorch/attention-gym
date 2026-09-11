@@ -447,6 +447,65 @@ def test_plan_work_budget_fills_one_wave_without_tiny_items(
     assert budget == 1 or max_chunks // budget >= native_fwd.MIN_CHUNKS_PER_ITEM
 
 
+@pytest.mark.parametrize(
+    ("max_chunks", "heads", "ranges", "sm_count", "expected"),
+    [
+        (127, 16, 1, 152, 32),  # The wider split must pay for planning and composition.
+        (128, 16, 1, 152, 64),
+        (129, 16, 1, 152, 64),
+        (512, 9, 1, 152, 32),  # Narrow tiles already leave room for time splitting.
+        (512, 10, 1, 152, 64),
+        (512, 19, 1, 152, 64),
+        (512, 20, 1, 152, 64),  # Narrow tiles already overflow one wave.
+        (512, 18, 1, 148, 64),
+        (512, 19, 1, 148, 64),
+        (127, 16, 2, 152, 64),  # Preserve the packed-range choice.
+        (512, 16, 2, 152, 64),
+        (512, 1, 1, 152, 32),
+    ],
+)
+def test_state_columns_leave_room_for_long_time_splits(
+    max_chunks, heads, ranges, sm_count, expected
+):
+    assert native_fwd.select_state_columns(max_chunks, heads, ranges, sm_count) == expected
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tokens", [8128, 8193])
+def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch):
+    """The public selector preserves tail arithmetic and replay across empty/short ranges."""
+    if not is_sm100_kda_capability(torch.cuda.get_device_capability()):
+        pytest.skip("native state tile selection requires SM100/SM103")
+    heads = torch.cuda.get_device_properties().multi_processor_count // 8
+    _, kg, w, u, _, _, gate = make_summary_inputs(89, dtype, tokens, heads)
+    bounds = whole_stream(kg)
+    compile_summary = Mock(wraps=native_fwd._compile_affine_summary)
+    monkeypatch.setattr(native_fwd, "_compile_affine_summary", compile_summary)
+    expected_bn = 32 if tokens == 8128 else 64
+    for _ in range(2):
+        native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+    assert compile_summary.call_args.args[2] == expected_bn
+    assert compile_summary.call_args.kwargs["whole_ranges"] == (expected_bn == 32)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+    for start, stop in ((0, tokens), (0, 0), ((tokens // 64 - 1) * 64, tokens)):
+        bounds.copy_(torch.tensor([[start, stop]], device=kg.device, dtype=torch.int32))
+        graph.replay()
+        if start == stop:
+            expected = torch.cat(
+                (
+                    torch.zeros(heads, 128, 128, device=kg.device),
+                    torch.eye(128, device=kg.device).expand(heads, -1, -1),
+                ),
+                dim=1,
+            )
+        else:
+            expected = state_summary_reference(*(t[:, start:stop] for t in (kg, w, u, gate)))
+        torch.testing.assert_close(actual[0], expected, atol=2e-4, rtol=2e-4)
+
+
 WORK_LAYOUTS = [
     pytest.param([[0, 300], [300, 300], [300, 428], [428, 500], [500, 640]], 4, id="mixed"),
     pytest.param([[0, 32768]] + [[32768, 32768]] * 7, 18, id="one-long-seven-empty"),
