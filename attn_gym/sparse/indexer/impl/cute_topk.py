@@ -15,8 +15,8 @@ score reads at all. Output ordering and selection among ties are unspecified;
 the monotonic key supports signed finite FP32 scores.
 """
 
-import cuda.bindings.driver as cuda_driver
 import cutlass
+from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
@@ -298,7 +298,7 @@ class IndexerTopKKernel:
         scores: cute.Tensor,
         output: cute.Tensor,
         pair_start: Int32 | Int64,
-        stream: cuda_driver.CUstream,
+        stream: cuda.CUstream,
     ):
         """Launch one 512-thread CTA per physical query row in the score slab."""
         self.kernel.set_name_prefix(self.get_name())

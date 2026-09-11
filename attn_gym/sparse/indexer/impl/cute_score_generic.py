@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by Attention Gym in 2026: bounded score slabs and general head/dimension tiling.
 
 """Tiled SM100 indexer score generation without shape-sized shared buffers.
 
@@ -10,9 +11,9 @@ another query or batch. This module allocates no global workspace and performs
 no selection; masked and inactive slab entries remain untouched.
 """
 
-import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -27,9 +28,12 @@ class IndexerGenericScoreKernel:
 
     Warps 0--3 each own 32 candidates, warp 4 issues UMMA, warp 5 loads both
     operands with TMA, and warps 6--7 participate only in CTA synchronization.
-    Two combined operand stages feed a two-stage accumulator ring. Inputs are
-    contiguous, 16-byte-aligned FP16/BF16. The caller supplies Int32 pair_start
-    and dynamic shapes/strides, or their Int64 equivalents for wide offsets.
+    Two combined operand stages feed a two-stage accumulator ring. Q/K require
+    unit D strides and 16-byte-aligned bases and outer slice origins. Remaining
+    strides are independent; weights need only element alignment and may be strided,
+    with ``contiguous_weight_heads`` recording a promised unit head stride. The caller
+    supplies Int32 pair_start and dynamic shapes/strides, or their Int64 equivalents
+    for wide offsets.
     """
 
     tile_candidates = 128
@@ -48,6 +52,8 @@ class IndexerGenericScoreKernel:
         head_dim: int,
         causal: bool,
         use_int64_offsets: bool = False,
+        *,
+        contiguous_weight_heads: bool,
     ):
         if heads <= 0 or heads % 2 != 0:
             raise ValueError("IndexerGenericScoreKernel requires positive even H")
@@ -57,6 +63,7 @@ class IndexerGenericScoreKernel:
         self.head_dim = head_dim
         self.causal = causal
         self.use_int64_offsets = use_int64_offsets
+        self.contiguous_weight_heads = contiguous_weight_heads
         self.head_tiles = (heads + self.tile_heads - 1) // self.tile_heads
         self.d_tiles = (head_dim + self.tile_dim - 1) // self.tile_dim
         self.mma_tile = (self.tile_candidates, self.tile_heads, self.tile_dim)
@@ -70,10 +77,10 @@ class IndexerGenericScoreKernel:
         self.SharedStorage = SharedStorage
 
     def get_name(self) -> str:
-        """Return a stable name for the static shape, mask, and offset width."""
+        """Return a stable name for the shape, mask, weight layout, and offset width."""
         return (
             f"indexer_score_generic_h{self.heads}_d{self.head_dim}_c{int(self.causal)}_"
-            f"i64{int(self.use_int64_offsets)}"
+            f"i64{int(self.use_int64_offsets)}_wh{int(self.contiguous_weight_heads)}"
         )
 
     @cute.jit
@@ -90,7 +97,7 @@ class IndexerGenericScoreKernel:
         scores: cute.Tensor,
         pair_start,
         score_scale: Float32,
-        stream: cuda_driver.CUstream,
+        stream: cuda.CUstream,
     ):
         """Build boundary-preserving TMA descriptors and launch two CTAs per pair."""
         assert q.element_type in (cutlass.Float16, cutlass.BFloat16)

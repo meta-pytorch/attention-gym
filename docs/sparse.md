@@ -46,7 +46,10 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
 | Sequence length `T` | `1..2**20` | `1..2**20` |
 | `topk` | `0..min(T, 512)` | `0..min(T, 512)` |
-| Layout | All inputs contiguous, with 16-byte-aligned bases | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
+| Layout | Q/K last stride 1, bases and non-singleton outer strides 16-byte aligned; weights may be strided | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
+
+CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
+materializing contiguous copies. Weights need only element alignment, not TMA alignment.
 
 CuTe additionally requires the optional `linear` dependencies. Its support is specifically
 SM100, not every Blackwell variant; other supported devices use Triton by default.
@@ -68,8 +71,8 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
 has no gradient function. Selected attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
-into the indexer's queries, keys, or scoring weights. Train those scoring parameters with
-a separate objective; this API supplies no surrogate gradient or indexer-training loss.
+into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
+or indexer-training loss.
 
 Selection with NaN/Inf scores is unspecified and may differ across backends.
 

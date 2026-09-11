@@ -10,16 +10,14 @@ the epilogue independently computes ``scale * sum_h(weight * ReLU(Q @ K))``
 for each query. This module owns only score generation, not Top-K or allocation
 of the caller's [P, 2, T] FP32 slab.
 
-The schedule uses one TMA warp, one UMMA warp, and a 128-thread epilogue, with
-no persistent scheduler. Q remains resident for the CTA's entire candidate
-scan; two K stages and two accumulator stages connect the warp roles. Batch
-is a separate TMA mode, so packing heads with tokens cannot overfetch another
-batch when T is odd. Only valid rows/candidates are written.
+Head, query, and batch remain separate TMA modes despite the logical packing,
+so their physical strides are independent and odd query tails are zero-filled.
+Only valid rows/candidates are written.
 """
 
-import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -27,11 +25,21 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 class IndexerScoreKernel:
     """Generate a slab of scores for H=32/64, D=128, FP16/BF16 inputs on SM100.
 
-    Inputs must be contiguous and 16-byte aligned. ``pair_start`` is a dynamic
-    Int32 scalar, or Int64 when ``use_int64_offsets`` is enabled; the latter
-    also requires int64 dynamic shapes/strides in the caller's fake signature.
-    Each CTA owns flattened pair ``pair_start + blockIdx.x``. Pair numbering
-    restarts at each batch boundary, including an unpaired final query for odd T.
+    Each CTA scores two adjacent queries against M128 candidate tiles. UMMA
+    computes ``K[128,D] @ Q[2*H,D].T``; each of the 128 epilogue threads owns
+    one candidate and separately reduces ``weight * ReLU(dot)`` for each query.
+    Warp 5 loads Q once and streams K through two shared-memory stages; warp 4
+    issues UMMA into a two-stage TMEM ring consumed by warps 0--3. Warps 6--7
+    participate only in CTA synchronization. There is no persistent scheduler.
+
+    Q/K require unit D strides and 16-byte-aligned bases and outer slice origins;
+    their remaining strides are independent. Weights may have arbitrary strides
+    and require only element alignment; ``contiguous_weight_heads`` records whether
+    the caller's ABI promises a unit head stride. ``pair_start`` is a dynamic Int32
+    scalar, or Int64 when ``use_int64_offsets`` is enabled; the latter also requires
+    int64 dynamic shapes/strides in the caller's fake signature. Each CTA owns
+    flattened pair ``pair_start + blockIdx.x``. Pair numbering restarts at each
+    batch boundary, including an unpaired final query for odd T.
     """
 
     tile_candidates = 128
@@ -48,6 +56,8 @@ class IndexerScoreKernel:
         head_dim: int,
         causal: bool,
         use_int64_offsets: bool = False,
+        *,
+        contiguous_weight_heads: bool,
     ):
         if heads not in (32, 64) or head_dim != 128:
             raise ValueError("IndexerScoreKernel requires H=32/64 and D=128")
@@ -55,6 +65,7 @@ class IndexerScoreKernel:
         self.head_dim = head_dim
         self.causal = causal
         self.use_int64_offsets = use_int64_offsets
+        self.contiguous_weight_heads = contiguous_weight_heads
         self.packed_heads = 2 * heads
         self.mma_tile = (self.tile_candidates, self.packed_heads, head_dim)
 
@@ -68,10 +79,10 @@ class IndexerScoreKernel:
         self.SharedStorage = SharedStorage
 
     def get_name(self) -> str:
-        """Return a stable name for the static shape, mask, and offset width."""
+        """Return a stable name for the shape, mask, weight layout, and offset width."""
         return (
             f"indexer_score_h{self.heads}_d{self.head_dim}_c{int(self.causal)}_"
-            f"i64{int(self.use_int64_offsets)}"
+            f"i64{int(self.use_int64_offsets)}_wh{int(self.contiguous_weight_heads)}"
         )
 
     @cute.jit
@@ -88,22 +99,17 @@ class IndexerScoreKernel:
         scores: cute.Tensor,
         pair_start,
         score_scale: Float32,
-        stream: cuda_driver.CUstream,
+        stream: cuda.CUstream,
     ):
         """Build TMA descriptors and launch one CTA per output-slab query pair."""
         assert q.element_type in (cutlass.Float16, cutlass.BFloat16)
         assert k.element_type == q.element_type and weights.element_type == q.element_type
         assert scores.element_type == Float32
 
-        # Flatten only heads and tokens, retaining an independent batch mode
-        # for TMA's tail zero-fill. Widen before forming the packed extent.
-        q_packed = cute.make_tensor(
-            q.iterator,
-            cute.make_layout(
-                (self.upcast_offset(q.shape[1]) * self.heads, self.head_dim, q.shape[0]),
-                stride=(q.stride[2], q.stride[3], q.stride[0]),
-            ),
-        )
+        # The logical N coordinate is h + H*t, but H/T retain independent physical strides.
+        # TMA sees their separate extents, including the zero-filled query of an odd tail.
+        q_htdb = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 1, 3, 0]))
+        q_packed = cute.group_modes(q_htdb, 0, 2)
         k_sdb = cute.make_tensor(k.iterator, cute.select(k.layout, mode=[1, 2, 0]))
         tiled_mma = cute.make_tiled_mma(
             tcgen05.MmaF16BF16Op(

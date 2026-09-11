@@ -4,7 +4,7 @@ A slab contains at most 1024 query rows and 32 MiB of FP32 scores, independent
 of batch size and sequence length. Consecutive launches reuse that per-call
 allocation on the current stream; the only retained result is the INT32 index
 array. Slabs contain whole query pairs, including a masked second row for odd T.
-The existing registered operator calls this launcher; there is no backend fallback.
+The registered operator calls this launcher; there is no backend fallback.
 """
 
 import math
@@ -13,28 +13,33 @@ from pathlib import Path
 
 import torch
 
-from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
+from attn_gym._backends.cute import (
+    TMA_ALIGNMENT_BYTES,
+    compile_tvm_ffi,
+    get_device_properties,
+    jit_cache,
+    make_fake_strided_tensor,
+    tensor_supports_tma,
+)
 from attn_gym._backends.cute.target import (
     detect_compile_target,
     get_compile_target,
     set_compile_target,
 )
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
+from attn_gym.utils import cdiv
 
-# Limit both the row count (linear storage as T grows) and absolute scratch bytes.
 _HEAD_DIM_GRANULARITY = 16
-_ALIGNMENT = 16
 _MAX_SEQUENCE = 1 << 20
 _MAX_SUPPORTED_TOPK = 512
+# Limit both the row count (linear storage as T grows) and absolute scratch bytes.
 _MAX_SCORE_PAIRS = 512
 _SCORE_WORKSPACE_BYTES = 32 * 1024 * 1024
 
 
 def score_workspace_pairs(batch: int, tokens: int) -> int:
     """Size a slab for positive B and the validated CuTe domain 1 <= T <= 2**20."""
-    return min(
-        _MAX_SCORE_PAIRS, batch * ((tokens + 1) // 2), _SCORE_WORKSPACE_BYTES // (8 * tokens)
-    )
+    return min(_MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * tokens))
 
 
 @jit_cache(
@@ -44,9 +49,14 @@ def score_workspace_pairs(batch: int, tokens: int) -> int:
     )
 )
 def _compile_scores(
-    dtype: torch.dtype, heads: int, head_dim: int, causal: bool, use_int64_offsets: bool
+    dtype: torch.dtype,
+    heads: int,
+    head_dim: int,
+    causal: bool,
+    use_int64_offsets: bool,
+    contiguous_weight_heads: bool,
 ) -> Callable[..., None]:
-    """Compile score production with symbolic B, T and slab capacity."""
+    """Compile symbolic B/T/strides, specializing only an available unit weight-head stride."""
     import cutlass
     from cutlass import cute
 
@@ -54,38 +64,42 @@ def _compile_scores(
     from .cute_score_generic import IndexerGenericScoreKernel
 
     operation = (
-        IndexerScoreKernel(heads, head_dim, causal, use_int64_offsets)
-        if heads in (32, 64) and head_dim == 128
-        else IndexerGenericScoreKernel(heads, head_dim, causal, use_int64_offsets)
+        IndexerScoreKernel if heads in (32, 64) and head_dim == 128 else IndexerGenericScoreKernel
+    )(
+        heads,
+        head_dim,
+        causal,
+        use_int64_offsets,
+        contiguous_weight_heads=contiguous_weight_heads,
     )
     io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     batch, tokens, pairs = sym(), sym(), sym()
-    # The public compact-input contract permits arbitrary singleton batch strides.
-    q = cute.runtime.make_fake_tensor(
+    q = make_fake_strided_tensor(
         io_dtype,
         (batch, tokens, heads, head_dim),
-        stride=(sym(divisibility=8), heads * head_dim, head_dim, 1),
-        assumed_align=16,
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
     )
-    k = cute.runtime.make_fake_tensor(
+    k = make_fake_strided_tensor(
         io_dtype,
         (batch, tokens, head_dim),
-        stride=(sym(divisibility=8), head_dim, 1),
-        assumed_align=16,
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
     )
-    weights = cute.runtime.make_fake_tensor(
+    weights = make_fake_strided_tensor(
         io_dtype,
         (batch, tokens, heads),
-        stride=(sym(), heads, 1),
-        assumed_align=16,
+        contiguous_dim=-1 if contiguous_weight_heads else None,
+        use_int64_strides=use_int64_offsets,
     )
     scores = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (pairs, 2, tokens),
         stride_order=(2, 1, 0),
-        assumed_align=16,
+        assumed_align=TMA_ALIGNMENT_BYTES,
+        use_32bit_stride=not use_int64_offsets,
     )
     return compile_tvm_ffi(
         operation,
@@ -113,13 +127,15 @@ def _compile_topk(topk: int, causal: bool, use_int64_offsets: bool) -> Callable[
         cutlass.Float32,
         (pairs, 2, tokens),
         stride_order=(2, 1, 0),
-        assumed_align=16,
+        assumed_align=TMA_ALIGNMENT_BYTES,
+        use_32bit_stride=not use_int64_offsets,
     )
     output = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (batch, tokens, topk),
         stride_order=(2, 1, 0),
-        assumed_align=16,
+        assumed_align=TMA_ALIGNMENT_BYTES,
+        use_32bit_stride=not use_int64_offsets,
     )
     return compile_tvm_ffi(
         IndexerTopKKernel(topk, causal, use_int64_offsets), scores, output, integer(0)
@@ -127,7 +143,7 @@ def _compile_topk(topk: int, causal: bool, use_int64_offsets: bool) -> Callable[
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int) -> None:
-    """Preserve the CuTe input and error contract without inspecting tensor values."""
+    """Validate SM100 indexer tensor metadata and base alignment."""
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B,T,H,D], got {tuple(q.shape)}")
     if k.ndim != 3:
@@ -176,10 +192,12 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         raise TypeError(
             f"q, k, and weights must have one dtype, got {q.dtype}, {k.dtype}, {weights.dtype}"
         )
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("q, k, and weights must be contiguous")
-    if any(tensor.data_ptr() % _ALIGNMENT for tensor in tensors):
-        raise ValueError(f"q, k, and weights must be {_ALIGNMENT}-byte aligned")
+    # Singleton strides do not address another slice; TVM-FFI normalizes them for TMA.
+    if any(not tensor_supports_tma(tensor.squeeze()) for tensor in (q, k)):
+        raise ValueError(
+            f"q and k require unit last strides and {TMA_ALIGNMENT_BYTES}-byte aligned "
+            "bases and non-singleton outer strides"
+        )
     properties = get_device_properties(q.device)
     if (properties.major, properties.minor) != (10, 0):
         raise RuntimeError("this tcgen05 kernel requires an SM100 GPU")
@@ -192,7 +210,7 @@ def launch(
     topk: int,
     causal: bool = False,
 ) -> torch.Tensor:
-    """Run bounded score generation and radix selection for the existing CuTe domain."""
+    """Compute weighted-ReLU Top-K with bounded per-call score storage."""
     import cutlass
 
     _validate(q, k, weights, topk)
@@ -208,17 +226,22 @@ def launch(
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(q.device.index))
-        score_kernel = _compile_scores(q.dtype, heads, head_dim, causal, use_int64_offsets)
+        # A unit head stride avoids the generic reducer's measured strided-load overhead.
+        score_kernel = _compile_scores(
+            q.dtype, heads, head_dim, causal, use_int64_offsets, weights.stride(-1) == 1
+        )
         topk_kernel = _compile_topk(topk, causal, use_int64_offsets)
     finally:
         set_compile_target(previous)
 
     q, k, weights = q.detach(), k.detach(), weights.detach()
     scale = cutlass.Float32(1.0 / math.sqrt(heads * head_dim))
+    total_pairs = batch * cdiv(tokens, 2)
     with initialized_cuda_device(q):
-        for start in range(0, batch * ((tokens + 1) // 2), pairs):
-            score_kernel(q, k, weights, scores, integer(start), scale)
-            topk_kernel(scores, output, integer(start))
+        for start in range(0, total_pairs, pairs):
+            active_scores = scores[: min(pairs, total_pairs - start)]
+            score_kernel(q, k, weights, active_scores, integer(start), scale)
+            topk_kernel(active_scores, output, integer(start))
     return output
 
 

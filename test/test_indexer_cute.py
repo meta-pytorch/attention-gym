@@ -382,12 +382,16 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             q = torch.randn(batch, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
             k = torch.randn(batch, tokens, 128, device="cuda", dtype=torch.bfloat16)
             w = torch.randn(batch, tokens, 64, device="cuda", dtype=torch.bfloat16)
+            if batch == 3:
+                q = q.transpose(1, 2).contiguous().transpose(1, 2)
+                k = k.transpose(0, 1).contiguous().transpose(0, 1)
+                w = torch.empty(batch, tokens, 65, device="cuda", dtype=w.dtype)[..., :64].copy_(w)
             actual = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
             assert_indexer_selection(actual, q, k, w, 16, True)
             for compiler in compilers:
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
-        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, False)
+        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, False, True)
         assert impl._compile_topk.is_cached(16, True, False)
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
@@ -403,14 +407,20 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             compiler.cache_clear()
 
 
-def test_cute_dynamic_fullgraph():
-    """Reuse a symbolic public graph across sequence lengths with semantic selection checks."""
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("heads,dim", [(64, 128), (66, 96)])
+def test_cute_dynamic_fullgraph(strided, heads, dim):
+    """Reuse a symbolic public graph across sequence lengths and independent input strides."""
     _skip_no_sm100()
     compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True)
     for tokens in (65, 129):
-        q = torch.randn(2, tokens, 64, 128, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(2, tokens, 128, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(2, tokens, 64, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(2, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(2, tokens, dim, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2, tokens, heads, device="cuda", dtype=torch.bfloat16)
+        if strided:
+            q = q.transpose(1, 2).contiguous().transpose(1, 2)
+            k = k.transpose(0, 1).contiguous().transpose(0, 1)
+            w = w.transpose(1, 2).contiguous().transpose(1, 2)
         actual = compiled(q, k, w, 16, causal=True, impl="fused")
         expected = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
         assert_indexer_selection(expected, q, k, w, 16, True)
