@@ -8,6 +8,20 @@ import pytest
 from benchmarks.sparse import indexer_benchmark
 
 
+def test_benchmark_rejects_explicit_auto(monkeypatch):
+    """Automatic dispatch is requested by omission, not an explicit backend value."""
+    monkeypatch.setattr(sys, "argv", ["indexer_benchmark.py", "--backend", "auto"])
+    with pytest.raises(SystemExit) as exc:
+        indexer_benchmark.parse_args()
+    assert exc.value.code == 2
+
+
+def test_benchmark_omitted_backend_uses_device_selection(monkeypatch):
+    """The default CLI leaves the backend override unset."""
+    monkeypatch.setattr(sys, "argv", ["indexer_benchmark.py"])
+    assert indexer_benchmark.parse_args().backend == [None]
+
+
 @pytest.mark.parametrize("dependency", [None, ModuleType("transformer_nuggets.utils.benchmark")])
 def test_benchmark_help_without_compatible_nuggets(monkeypatch, capsys, dependency):
     """Help remains available when Nuggets is absent or lacks graph sample statistics."""

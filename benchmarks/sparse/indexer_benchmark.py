@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         nargs="+",
-        choices=["auto", "cute", "triton"],
+        choices=["cute", "triton"],
         default=[None],
         help="Override fused backend selection; omit to select by device",
     )

@@ -150,7 +150,6 @@ def lightning_indexer(
             if kernel_options not in (
                 None,
                 {},
-                {"backend": "auto"},
                 {"backend": "cute"},
                 {"backend": "triton"},
             ):

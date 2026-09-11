@@ -77,6 +77,7 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
 @pytest.mark.parametrize(
     "options",
     [
+        {"backend": "auto"},
         {"backend": "missing"},
         {"other": "triton"},
         {"backend": "triton", "other": "x"},
