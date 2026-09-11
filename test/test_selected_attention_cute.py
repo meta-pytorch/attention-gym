@@ -29,6 +29,7 @@ def assert_matches_low_precision_eager(
     low_precision_expected,
     high_precision_expected,
     reduction_sizes,
+    computation_dtype=None,
 ):
     """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
     assert torch.isfinite(actual).all()
@@ -37,7 +38,7 @@ def assert_matches_low_precision_eager(
     accumulation_eps = (
         sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
     )
-    output_rounding_eps = torch.finfo(actual.dtype).eps
+    output_rounding_eps = torch.finfo(computation_dtype or actual.dtype).eps
     rounding_eps = accumulation_eps + output_rounding_eps
     mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
     max_atol = (accumulation_eps + len(reduction_sizes) * output_rounding_eps) * (
@@ -52,6 +53,8 @@ def assert_matches_low_precision_eager(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
+@pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_topk", [16, 32, 64, 128])
 @pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
 @pytest.mark.parametrize(
@@ -61,7 +64,7 @@ def assert_matches_low_precision_eager(
 )
 @pytest.mark.parametrize("sliding_window_size", [64, 128])
 def test_cute_precision_vs_fp64(
-    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size
+    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
 ):
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
@@ -106,7 +109,11 @@ def test_cute_precision_vs_fp64(
     scores = torch.randn(batch, seq_len, sparse_seq_len, dtype=dtype, device=device, generator=gen)
     _, kv_indices = torch.topk(scores, k=min(num_topk, sparse_seq_len), dim=-1)
 
-    sink = None
+    sink = (
+        torch.linspace(-2, 8, heads * 2, device=device, dtype=sink_dtype)[::2]
+        if sink_dtype is not None
+        else None
+    )
 
     # --- Derive FP64 inputs from the same quantized values ---
     query_64 = query_lp.double().requires_grad_(True)
@@ -122,36 +129,43 @@ def test_cute_precision_vs_fp64(
     local_kv_lp_cute = local_kv_lp.clone().requires_grad_(True)
     sparse_kv_lp_cute = sparse_kv_lp.clone().requires_grad_(True)
 
+    sink_64 = sink.double().requires_grad_(True) if sink is not None else None
+    sink_ref = sink.detach().requires_grad_(True) if sink is not None else None
+    sink_cute = sink.detach().requires_grad_(True) if sink is not None else None
+
     # --- Forward ---
     out_64 = selected_attention(
         query_64,
         local_kv_64,
         sparse_kv_64,
         kv_indices,
-        sink,
+        sink_64,
         doc_ids,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_ref = selected_attention(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
         kv_indices,
-        sink,
+        sink_ref,
         doc_ids,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_cute = selected_attention(
         query_lp_cute,
         local_kv_lp_cute,
         sparse_kv_lp_cute,
         kv_indices,
-        sink,
+        sink_cute,
         doc_ids,
         sliding_window_size,
         backend="cute",
+        scale=scale,
     )
 
     # --- Backward ---
@@ -202,13 +216,27 @@ def test_cute_precision_vs_fp64(
             reduction_sizes=dsparse_kv_reduction_sizes,
         )
 
+    if sink is not None:
+        assert sink_cute.grad.dtype == sink_dtype
+        assert_matches_low_precision_eager(
+            sink_cute.grad,
+            sink_ref.grad,
+            sink_64.grad,
+            reduction_sizes=fwd_reduction_sizes + (head_dim, batch * seq_len),
+            # FA4 computes dsink from the BF16 output and upstream gradient,
+            # even when the sink parameter and its gradient are stored in FP32.
+            computation_dtype=dtype,
+        )
+
 
 # ---------------------------------------------------------------------------
 # LSE correctness
 # ---------------------------------------------------------------------------
 
 
-def test_cute_lse_matches_manual_computation():
+@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
+@pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
+def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
     _skip_no_sm100()
     device = torch.device("cuda")
@@ -223,7 +251,11 @@ def test_cute_lse_matches_manual_computation():
     local_kv = torch.randn(batch, 1, seq_len, head_dim, device=device, dtype=dtype)
     sparse_kv = torch.randn(batch, 1, sparse_seq_len, head_dim, device=device, dtype=dtype)
     kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, num_topk), device=device)
-    sink = None
+    sink = (
+        torch.linspace(-2, 8, heads, device=device, dtype=sink_dtype)
+        if sink_dtype is not None
+        else None
+    )
 
     _, aux_cute = selected_attention(
         query,
@@ -234,6 +266,7 @@ def test_cute_lse_matches_manual_computation():
         None,
         window,
         backend="cute",
+        scale=scale,
         return_aux=AuxRequest(lse=True),
     )
     lse_cute = aux_cute.lse
@@ -244,10 +277,11 @@ def test_cute_lse_matches_manual_computation():
         local_kv.double(),
         sparse_kv.double(),
         kv_indices,
-        sink,
+        sink.double() if sink is not None else None,
         None,
         window,
         backend="eager",
+        scale=scale,
         return_aux=AuxRequest(lse=True),
     )
     lse_eager = aux_eager.lse

@@ -11,13 +11,10 @@ Constraints
 -----------
 - head_dim = 512, nheads = 128, share_kv = True
 - dtype = bfloat16, SM100 (compute capability 10.0)
-- Attention sinks are not supported
-- Requires FA4 with the -1 sentinel backward fix (commit c68c592+)
+- Requires FA4 with sparse MLA attention sink support (commit 62892fe+)
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 from flash_attn.cute.interface import flash_attn_func
@@ -94,8 +91,6 @@ def _validate_cute_constraints(
         raise TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
         raise ValueError("CuTe backend requires share_kv=True.")
-    if attention_sink is not None:
-        raise NotImplementedError("CuTe backend does not support attention sinks.")
 
     _b, h, _s, d = query.shape
     if d != 512:
@@ -120,11 +115,13 @@ def selected_attention(
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool = True,
+    *,
+    scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL (SM100) forward+backward for selected attention.
 
     Eager-only — torch.compile is not supported for this backend.
-    Attention sinks are not supported (assumes sink weight ≈ 0).
+    Optional per-head attention sinks are forwarded to FA4, which owns their gradients.
 
     Returns:
         Tuple of (output, lse) where output has shape (batch, heads, seq, head_dim)
@@ -134,7 +131,7 @@ def selected_attention(
         query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
     )
 
-    _b, _h, s, d = query.shape
+    _b, _h, s, _d = query.shape
     device = query.device
     local_kv_len = local_kv.shape[2]
 
@@ -156,8 +153,6 @@ def selected_attention(
     qv_bshd = query.permute(0, 2, 1, 3)
     v_bshd = unified_kv.permute(0, 2, 1, 3)
 
-    softmax_scale = 1.0 / math.sqrt(d)
-
     # Call FA4's public interface.
     # Passing k=v (same object) with hdim=512 triggers MLA mode internally:
     # FA4 moves q into qv and nulls q/k, then routes to the sparse MLA kernels.
@@ -166,7 +161,8 @@ def selected_attention(
         k=v_bshd,
         v=v_bshd,
         gather_kv_indices=gather_indices,
-        softmax_scale=softmax_scale,
+        softmax_scale=scale,
+        learnable_sink=attention_sink,
         causal=False,
         pack_gqa=True,
         return_lse=True,

@@ -1,7 +1,5 @@
 """Backward kernels and launcher for Triton selected attention."""
 
-import math
-
 import torch
 import triton
 import triton.language as tl
@@ -543,6 +541,7 @@ def _launch_backward(
     grad_output: torch.Tensor,
     sliding_window_size: int,
     share_kv: bool,
+    scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch backward kernels for selected attention."""
     batch, heads, seq_len, head_dim = query.shape
@@ -551,7 +550,6 @@ def _launch_backward(
     block_m = 64
     block_n = 32
     block_d = max(16, triton.next_power_of_2(head_dim))
-    scale = 1.0 / math.sqrt(head_dim)
     grad_output = grad_output.contiguous()
 
     grad_query = torch.empty_like(query)

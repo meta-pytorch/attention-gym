@@ -72,6 +72,8 @@ def selected_attention(
     doc_ids: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
+    *,
+    scale: float,
 ) -> tuple[Tensor, Tensor]:
     """
     Performs selected attention as follows:
@@ -81,7 +83,7 @@ def selected_attention(
             first_token_of_document = torch.where(doc_ids == doc_ids[i])[0].min()
             farthest_past_token_index = max(i - sliding_window, first_token_of_document)
             KV = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
-            P = Q @ KV.T / head_dim ** 0.5
+            P = (Q @ KV.T) * scale
             P = softmax(cat([P, sink]))[:P.sequence_length]
             return P @ V
 
@@ -115,6 +117,7 @@ def selected_attention(
         sliding_window_size: Integer, size of sliding window
 
         share_kv: bool, true iff all query heads attend to the same KV head
+        scale: Multiplier for query-key logits; does not scale sink logits.
     Returns:
         Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
         head_dim) and lse has shape (batch_size, num_heads, sequence_length).
@@ -122,7 +125,7 @@ def selected_attention(
     device = query.device
     dtype = query.dtype
     accumulation_dtype = torch.promote_types(dtype, torch.float32)
-    b, h, s, head_dim = query.shape
+    b, h, s, _head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     if share_kv:
         local_kv = local_kv.expand(-1, h, -1, -1)
@@ -162,12 +165,10 @@ def selected_attention(
     query_acc = query.to(accumulation_dtype)
     attention_kv_acc = attention_kv.to(accumulation_dtype)
 
-    scale = head_dim**0.5
-
     # Match the optimized backends' mixed-precision boundaries: accumulate QK and
     # softmax in FP32 for low-precision inputs, then quantize P for the PV dot.
     logits = (
-        torch.matmul(query_acc, torch.permute(attention_kv_acc, (0, 1, 3, 2))) / scale
+        torch.matmul(query_acc, torch.permute(attention_kv_acc, (0, 1, 3, 2))) * scale
         + attention_mask
     )
 

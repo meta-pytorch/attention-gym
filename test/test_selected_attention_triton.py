@@ -121,7 +121,8 @@ def _make_inputs(
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 1, 4])
 @pytest.mark.parametrize("head_dim", [32, 64, 128])
-def test_triton_forward_matches_reference(share_kv, num_topk, head_dim):
+@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+def test_triton_forward_matches_reference(share_kv, num_topk, head_dim, scale):
     """Triton forward matches the eager reference implementation."""
     _skip_no_cuda()
     inputs = _make_inputs(
@@ -129,8 +130,8 @@ def test_triton_forward_matches_reference(share_kv, num_topk, head_dim):
     )
 
     with torch.inference_mode():
-        expected = selected_attention(**inputs, backend="eager")
-        actual = selected_attention(**inputs, backend="triton")
+        expected = selected_attention(**inputs, backend="eager", scale=scale)
+        actual = selected_attention(**inputs, backend="triton", scale=scale)
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -164,7 +165,8 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 1, 2, 3])
 @pytest.mark.parametrize("sliding_window_size", [0, 8])
-def test_triton_backward(share_kv, num_topk, sliding_window_size):
+@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+def test_triton_backward(share_kv, num_topk, sliding_window_size, scale):
     """Triton backward produces correct gradients for all differentiable inputs."""
     _skip_no_cuda()
 
@@ -183,8 +185,8 @@ def test_triton_backward(share_kv, num_topk, sliding_window_size):
         seed=42,
     )
 
-    out_ref = selected_attention(**inputs_ref, backend="eager")
-    out_tri = selected_attention(**inputs_tri, backend="triton")
+    out_ref = selected_attention(**inputs_ref, backend="eager", scale=scale)
+    out_tri = selected_attention(**inputs_tri, backend="triton", scale=scale)
 
     grad_gen = torch.Generator(device=out_ref.device).manual_seed(7777)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
@@ -304,7 +306,8 @@ def test_triton_larger_sequence():
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
-def test_precision_vs_fp64(share_kv, num_topk, dtype):
+@pytest.mark.parametrize("scale", [None, 0.025, 0.25])
+def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
     """Report max forward/backward diffs between a lower-precision dtype and fp64.
 
     This characterizes the numerical error introduced by the given precision so that
@@ -368,6 +371,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         None,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_ref = selected_attention(
         query_lp_ref,
@@ -378,6 +382,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         None,
         sliding_window_size,
         backend="eager",
+        scale=scale,
     )
     out_lp_tri = selected_attention(
         query_lp_tri,
@@ -388,6 +393,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype):
         None,
         sliding_window_size,
         backend="triton",
+        scale=scale,
     )
 
     # --- Backward ---

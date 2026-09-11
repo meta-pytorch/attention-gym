@@ -205,7 +205,8 @@ def test_selected_block_only_manual(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_joint_normalization(backend):
+@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+def test_joint_normalization(backend, scale):
     """When both local and sparse branches are active, they share normalization.
 
     We verify against a manual computation that runs a single softmax over the
@@ -226,11 +227,11 @@ def test_joint_normalization(backend):
     kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
     out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
+        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend, scale=scale
     )
 
     # --- Manual: single softmax over gathered sparse + local window + sink ---
-    scale = d**0.5
+    resolved_scale = d**-0.5 if scale is None else scale
     q = query[0, 0]  # (s, d)
     lkv = local_kv[0, 0]  # (s, d)
     skv = sparse_kv[0, 0]  # (sparse_seq_len, d)
@@ -249,7 +250,7 @@ def test_joint_normalization(backend):
         all_kv = torch.cat([gathered_sparse, local_entries], dim=0)  # (num_topk + window_len, d)
 
         # Compute logits over all entries + sink
-        logits = (q[seq] @ all_kv.T) / scale  # (num_topk + window_len,)
+        logits = (q[seq] @ all_kv.T) * resolved_scale  # (num_topk + window_len,)
         logits_with_sink = torch.cat([logits, sink_val.unsqueeze(0)])
         probs_with_sink = torch.softmax(logits_with_sink, dim=0)
 
@@ -928,7 +929,8 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
-def test_torch_compile_fullgraph_forward():
+@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+def test_torch_compile_fullgraph_forward(scale):
     """The Triton inference path compiles with torch.compile(fullgraph=True)."""
     backend = "triton"
     device = torch.device("cuda")
@@ -948,7 +950,15 @@ def test_torch_compile_fullgraph_forward():
 
     def fn(query, local_kv, sparse_kv, kv_indices, sink):
         return selected_attention(
-            query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            sink,
+            None,
+            window,
+            backend=backend,
+            scale=scale,
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
@@ -962,7 +972,8 @@ def test_torch_compile_fullgraph_forward():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_torch_compile_fullgraph_backward(backend):
+@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+def test_torch_compile_fullgraph_backward(backend, scale):
     """selected_attention backward works under torch.compile(fullgraph=True)."""
     device = torch.device("cuda")
     dtype = _dtype_for_backend(backend)
@@ -977,7 +988,15 @@ def test_torch_compile_fullgraph_backward(backend):
 
     def fn(query, local_kv, sparse_kv, sink):
         return selected_attention(
-            query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            sink,
+            None,
+            window,
+            backend=backend,
+            scale=scale,
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)

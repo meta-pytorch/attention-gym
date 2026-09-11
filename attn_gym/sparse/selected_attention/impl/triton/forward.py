@@ -1,7 +1,5 @@
 """Forward kernels and launcher for Triton selected attention."""
 
-import math
-
 import torch
 import triton
 import triton.language as tl
@@ -426,6 +424,7 @@ def _launch_forward(
     attention_sink: torch.Tensor,
     doc_ids: torch.Tensor | None,
     sliding_window_size: int,
+    scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the forward kernel and return its output and log-sum-exp state."""
     batch, heads, seq_len, head_dim = query.shape
@@ -470,7 +469,7 @@ def _launch_forward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             WINDOW=sliding_window_size,
-            SCALE=1.0 / math.sqrt(head_dim),
+            SCALE=scale,
             HAS_DOC_IDS=has_doc_ids,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
@@ -507,7 +506,7 @@ def _launch_forward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             WINDOW=sliding_window_size,
-            SCALE=1.0 / math.sqrt(head_dim),
+            SCALE=scale,
             HAS_DOC_IDS=has_doc_ids,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
@@ -536,7 +535,7 @@ def _launch_forward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             WINDOW=sliding_window_size,
-            SCALE=1.0 / math.sqrt(head_dim),
+            SCALE=scale,
             HAS_DOC_IDS=has_doc_ids,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
