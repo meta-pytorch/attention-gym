@@ -24,9 +24,9 @@ SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_kda`` backend selection, Mega switches, and ragged launch schedule."""
+    """Validated ``chunk_kda`` backend selection, cuDNN switches, and ragged launch schedule."""
 
-    backend: Literal["fused", "mega"]
+    backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
     schedule: ScheduleRequest = ScheduleRequest.AUTO
@@ -43,15 +43,15 @@ def resolve_kernel_options(
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported chunk_kda kernel options: {names}")
     backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "mega"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'mega'")
+    if backend not in ("fused", "cudnn"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
     splits = {}
     for name in ("split_backward", "split_forward"):
         value = kernel_options.get(name, False)
         if not isinstance(value, bool):
             raise TypeError(f"kernel_options['{name}'] must be a bool")
-        if value and backend != "mega":
-            raise ValueError(f"{name} requires kernel_options['backend']='mega'")
+        if value and backend != "cudnn":
+            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
         splits[name] = value
     schedule = kernel_options.get("schedule", "auto")
     if schedule not in ("auto", "static", "persistent"):

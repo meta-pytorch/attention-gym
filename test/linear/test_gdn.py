@@ -319,18 +319,18 @@ def test_impl_accepts_enum_and_string(function):
 
 
 def test_chunk_kernel_options_are_strict():
-    """Keep the repo-local path as default and validate the Mega opt-in selector."""
+    """Keep the repo-local path as default and validate the cuDNN opt-in selector."""
     assert resolve_kernel_options(None) == "fused"
     assert resolve_kernel_options({}) == "fused"
     inputs = make_inputs(sequence=2)
     with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'mega'"):
+    with pytest.raises(ValueError, match="must be 'fused' or 'cudnn'"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "other"})
     with pytest.raises(ValueError, match="not supported with impl='reference'"):
-        chunk_gdn(*inputs[:-1], impl="reference", kernel_options={"backend": "mega"})
-    with pytest.raises(ValueError, match="Mega GDN backend requires CUDA"):
-        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "mega"})
+        chunk_gdn(*inputs[:-1], impl="reference", kernel_options={"backend": "cudnn"})
+    with pytest.raises(ValueError, match="cuDNN GDN backend requires CUDA"):
+        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "cudnn"})
 
 
 @pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])

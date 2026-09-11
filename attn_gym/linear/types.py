@@ -13,18 +13,18 @@ from typing import Literal, TypedDict
 class BackendOptions(TypedDict, total=False):
     """Backend selection shared by optimized linear-attention operations."""
 
-    backend: Literal["fused", "mega"]
-    """Select the repo-local fused backend or the optional Mega backend."""
+    backend: Literal["fused", "cudnn"]
+    """Select the repo-local fused backend or the optional cuDNN backend."""
 
 
 class KernelOptions(BackendOptions, total=False):
     """KDA backend controls and experimental scheduling options."""
 
     split_backward: bool
-    """Allow KDA Mega to use its approximate split-backward schedule."""
+    """Allow KDA cuDNN to use its approximate split-backward schedule."""
 
     split_forward: bool
-    """Allow KDA Mega to use its approximate forgetting-horizon split forward schedule."""
+    """Allow KDA cuDNN to use its approximate forgetting-horizon split forward schedule."""
 
     schedule: Literal["auto", "static", "persistent"]
     """Set ``"persistent"`` for CUDA graphs whose replays can carry far fewer tokens than the

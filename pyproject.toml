@@ -30,7 +30,7 @@ linear = [
     "apache-tvm-ffi>=0.1.12",
 ]
 
-mega = [
+cudnn = [
     "nvidia-cutlass-dsl[cu13]>=4.7.0,<4.8.0; sys_platform == 'linux'",
     "cuda-python>=13.0; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.12",
@@ -75,7 +75,7 @@ docs = [
 [tool.uv]
 conflicts = [
     [
-        { extra = "mega" },
+        { extra = "cudnn" },
         { extra = "tests" },
     ],
 ]
@@ -124,20 +124,20 @@ exclude = [
     "site-packages",
     "venv",
     "*.ipynb",
-    # Vendored NVIDIA Apache-2.0/MIT source; lint the maintained Mega adapters instead.
-    "attn_gym/linear/_delta_rule/mega/kernels/common",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_bprop_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_bprop_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_prefill_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_prefill_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_recompute_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/gdn_recompute_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_bprop_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_bprop_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_prefill_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_prefill_f16.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_config.py",
-    "attn_gym/linear/_delta_rule/mega/kernels/kda_recompute_f16.py",
+    # Vendored NVIDIA Apache-2.0/MIT source; lint the maintained cuDNN adapters instead.
+    "attn_gym/linear/_delta_rule/cudnn/kernels/common",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_f16.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_f16.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_recompute_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_recompute_f16.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_bprop_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_bprop_f16.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_prefill_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_prefill_f16.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_recompute_config.py",
+    "attn_gym/linear/_delta_rule/cudnn/kernels/kda_recompute_f16.py",
 ]
 
 [tool.ruff.lint]

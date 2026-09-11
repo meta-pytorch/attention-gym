@@ -69,7 +69,7 @@ def test_heavy_ragged_kernels_stay_static_under_auto(monkeypatch, shape):
         (None, ScheduleRequest.AUTO),
         ({"schedule": "static"}, ScheduleRequest.STATIC),
         ({"backend": "fused", "schedule": "persistent"}, ScheduleRequest.PERSISTENT),
-        ({"backend": "mega", "schedule": "auto"}, ScheduleRequest.AUTO),
+        ({"backend": "cudnn", "schedule": "auto"}, ScheduleRequest.AUTO),
     ],
 )
 def test_kernel_options_resolve_schedule(kernel_options, expected_schedule):
@@ -81,7 +81,7 @@ def test_kernel_options_resolve_schedule(kernel_options, expected_schedule):
     [
         ({"schedule": "eager"}, "must be 'auto', 'static', or 'persistent'"),
         (
-            {"backend": "mega", "schedule": "static"},
+            {"backend": "cudnn", "schedule": "static"},
             "requires kernel_options\\['backend'\\]='fused'",
         ),
     ],

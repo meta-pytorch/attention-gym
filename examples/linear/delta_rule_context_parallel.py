@@ -16,7 +16,7 @@ Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to
 ``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
 document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
 independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
-``--core-backend mega`` selects the KDA Mega backend (SM100/SM103). ``--cuda-graph`` checks a
+``--core-backend cudnn`` selects the KDA cuDNN backend (SM100/SM103). ``--cuda-graph`` checks a
 changed-input replay; ``--profile`` writes a merged native Perfetto trace. ``--no-validate`` skips
 the unsharded reference at scales where it does not fit. Batch construction, loss/backward, and
 capture are shown in ``delta_rule_training.py`` and imported here. Numerical assertions, trace
@@ -255,7 +255,7 @@ def main(
         typer.Option(
             "--core-backend",
             "--kda-backend",
-            help="Local KDA chunk kernels: fused or Mega (SM100).",
+            help="Local KDA chunk kernels: fused or cuDNN (SM100).",
         ),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
@@ -341,13 +341,13 @@ def main(
             "compute_dtype": getattr(torch, compute_dtype.value),
             "device": device,
         }
-        # The reference keeps the repo-local core; only each rank's local KDA pass may use Mega.
+        # The reference keeps the repo-local core; only each rank's local KDA pass may use cuDNN.
         make_model = partial(
             ContextParallelDeltaRuleAttention,
             **model_options,
             group=dist.group.WORLD,
             kernel_options={"backend": core_backend.value}
-            if core_backend is CoreBackendOption.MEGA
+            if core_backend is CoreBackendOption.CUDNN
             else None,
         )
         model = make_model()

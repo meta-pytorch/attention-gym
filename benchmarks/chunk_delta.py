@@ -1,4 +1,4 @@
-"""Public Mega chunk-delta performance and memory matrix for GDN and KDA."""
+"""Public cuDNN chunk-delta performance and memory matrix for GDN and KDA."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ CASES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark the public Mega GDN and KDA chunk training paths."
+        description="Benchmark the public cuDNN GDN and KDA chunk training paths."
     )
     parser.add_argument(
         "--op",
@@ -119,7 +119,7 @@ def operation_forward(
     inputs: tuple[torch.Tensor, ...],
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run one public Mega chunk implementation without final-state output."""
+    """Run one public cuDNN chunk implementation without final-state output."""
     q, k, value, gate, beta = inputs
     if operation == "gdn":
         return chunk_gdn(
@@ -141,7 +141,7 @@ def operation_forward(
         cu_seqlens=cu_seqlens,
         autotune=False,
         impl="fused",
-        kernel_options={"backend": "mega"},
+        kernel_options={"backend": "cudnn"},
     )[0]
 
 
@@ -205,7 +205,7 @@ def measure_incremental_peak_bytes(function: Callable[[], object], warmups: int)
 
 
 def confirm_kernel_route(function: Callable[[], object], operation: Operation) -> list[str]:
-    """Record and validate the selected Mega kernel family outside the timed region."""
+    """Record and validate the selected cuDNN kernel family outside the timed region."""
     pattern = "Gdn" if operation == "gdn" else "Kda"
     with cuda_kernel_profiler(pattern, record_name=f"{operation}_route") as result:
         function()
@@ -226,7 +226,7 @@ def benchmark_case(
     dtype: torch.dtype,
     enforce_budgets: bool,
 ) -> dict[str, object]:
-    """Measure one public Mega operation under the frozen chunk workload."""
+    """Measure one public cuDNN operation under the frozen chunk workload."""
     inputs, cu_seqlens = make_inputs(operation, case, dtype)
     d_output = torch.randn_like(inputs[2])
     callables = make_callables(operation, inputs, cu_seqlens, d_output)

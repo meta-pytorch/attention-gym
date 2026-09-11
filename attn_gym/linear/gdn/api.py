@@ -10,8 +10,8 @@ from attn_gym.linear._delta_rule.validation import (
     validate_decode_inputs,
     validate_paged_state,
 )
-from attn_gym.linear.gdn.impl.mega import chunk_forward as mega_chunk_forward
-from attn_gym.linear.gdn.impl.mega import paged_chunk_forward as mega_paged_chunk_forward
+from attn_gym.linear.gdn.impl.cudnn import chunk_forward as cudnn_chunk_forward
+from attn_gym.linear.gdn.impl.cudnn import paged_chunk_forward as cudnn_paged_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
@@ -62,7 +62,7 @@ def chunk_gdn(
             capability 8.0+ with FP16/BF16 QKV and ``K = V = 128``, as ``chunk_kda`` does;
             ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
-            default; ``{"backend": "mega"}`` selects the optional CuTeDSL 4.7 Mega backend.
+            default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -74,8 +74,8 @@ def chunk_gdn(
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if backend == "mega":
-            return mega_chunk_forward(
+        if backend == "cudnn":
+            return cudnn_chunk_forward(
                 q,
                 k,
                 v,
@@ -147,7 +147,7 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "mega"}`` selects the optional CuTeDSL 4.7 Mega backend, which
+            ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins.
 
     Returns:
@@ -157,7 +157,7 @@ def paged_chunk_gdn(
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     validate_paged_state(q, v, state_cache, cu_seqlens, state_indices, has_initial_state)
     paged_chunk_forward = (
-        mega_paged_chunk_forward if backend == "mega" else fused_paged_chunk_forward
+        cudnn_paged_chunk_forward if backend == "cudnn" else fused_paged_chunk_forward
     )
     return paged_chunk_forward(
         q,

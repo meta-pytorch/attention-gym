@@ -41,8 +41,8 @@ Notes:
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
 - On x86_64 Linux, `[tests]` brings FlashAttention's CuTeDSL 4.6 pin and conflicts with the
-  CuTeDSL 4.7+ `[mega]` extra. For Mega worktrees, install `-e '.[mega,dev]' pytest pytest-xdist`
-  instead; Mega tests import-skip optional FlashAttention coverage.
+  CuTeDSL 4.7+ `[cudnn]` extra. For cuDNN worktrees, install `-e '.[cudnn,dev]' pytest pytest-xdist`
+  instead; cuDNN tests import-skip optional FlashAttention coverage.
 
 ## Running commands
 
