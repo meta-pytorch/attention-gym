@@ -1,5 +1,8 @@
 """Benchmark the indexer's Top-K selection across backends and shapes.
 
+Requires Transformer Nuggets with CUDA graph sample statistics:
+    uv pip install "git+https://github.com/drisspg/transformer_nuggets.git@b8ae46be93f7c9d2133c025a7f15310484df8685"
+
 Usage:
     python benchmarks/sparse/indexer_benchmark.py
     python benchmarks/sparse/indexer_benchmark.py --impl reference fused
@@ -10,7 +13,6 @@ import argparse
 from functools import partial
 
 import torch
-from transformer_nuggets.utils.benchmark import benchmark_cuda_function_stats
 
 from attn_gym.sparse.indexer import lightning_indexer
 
@@ -68,7 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--impl", nargs="+", default=["fused"], choices=["reference", "fused"])
     parser.add_argument(
-        "--backend", nargs="+", choices=["auto", "cute", "triton"], default=["auto"]
+        "--backend",
+        nargs="+",
+        choices=["auto", "cute", "triton"],
+        default=[None],
+        help="Override fused backend selection; omit to select by device",
     )
     parser.add_argument(
         "--warmup", type=int, default=25, help="Warmup iterations before/after capture"
@@ -81,6 +87,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Measure public forward selection with setup excluded from graph replay."""
     args = parse_args()
+    try:
+        from transformer_nuggets.utils.benchmark import benchmark_cuda_function_stats
+    except ImportError:
+        raise SystemExit(
+            "This benchmark requires Transformer Nuggets with benchmark_cuda_function_stats. "
+            "Install the compatible revision using the uv pip install command in --help."
+        ) from None
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 

@@ -74,8 +74,7 @@ def launch(q: Tensor, k: Tensor, weights: Tensor, topk: int, causal: bool) -> Te
 
     Q/K require contiguous last dimensions and 16-byte-aligned bases/outer
     strides. FP16/BF16, H/D <= 256, T <= 2**20, and Top-K <= 512 are supported.
-    Inputs and FP32 intermediate scores must be finite. Gradient-requiring
-    inputs are allowed: selection returns indices, not trainable scores.
+    Gradient-requiring inputs are allowed: selection returns indices, not trainable scores.
     The public registered operator keeps host descriptors outside graph tracing.
     """
     if torch.version.hip or not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] < 9:

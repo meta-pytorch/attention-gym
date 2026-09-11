@@ -100,12 +100,12 @@ def lightning_indexer(
         output[b, t, :]  = topk(score[b, t, :]).indices
 
     Args:
-        q: Finite query tensor, [B, T, H, D].
+        q: Query tensor, [B, T, H, D].
 
-        k: Finite key candidate pool shared across heads, [B, S, D].
+        k: Key candidate pool shared across heads, [B, S, D].
             Nonsquare inputs (S != T) are not supported yet.
 
-        weights: Finite per-head weights, [B, T, H]. May be negative.
+        weights: Per-head weights, [B, T, H]. May be negative.
 
         topk: Number of candidates to select per query.  Must be in [0, S].
 
@@ -116,7 +116,7 @@ def lightning_indexer(
             optimized CUDA kernels. Defaults to ``"fused"``.
 
         kernel_options: Fused backend override: ``{"backend": "cute"}`` or
-            ``{"backend": "triton"}``. Omitted options or ``"auto"`` select CuTe
+            ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
 
@@ -131,8 +131,7 @@ def lightning_indexer(
     SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with unit last strides
     and 16-byte-aligned bases and outer strides; weights may be strided.
 
-    Inputs and intermediate FP32 scores must remain finite. NaN/Inf behavior is
-    unsupported and may differ across backends; values are not checked at runtime.
+    Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
     attention over the selected positions does not propagate gradients through
     selection into q, k, or weights; scoring weights need a separate training loss.

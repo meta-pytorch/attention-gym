@@ -30,8 +30,8 @@ Output order and tie-breaking are not guaranteed to match between implementation
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
   keep their selection state on chip and allocate no quadratic global score workspace.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
-  `{"backend": "auto"}` is equivalent to omitting the options. Options are rejected for
-  `impl="reference"`. Unsupported shapes, missing dependencies, and launch errors propagate;
+  Omit options for automatic selection. Options are rejected for `impl="reference"`.
+  Unsupported shapes, missing dependencies, and launch errors propagate;
   there is no retry with another backend.
 
 | Restriction | CuTe | Triton |
@@ -67,14 +67,6 @@ these indices held fixed. It does **not** propagate gradients through the select
 into the indexer's queries, keys, or scoring weights. Train those scoring parameters with
 a separate objective; this API supplies no surrogate gradient or indexer-training loss.
 
-**Only finite inputs and finite intermediate FP32 scores are supported.** NaN and infinity
-handling may differ between implementations (including ReLU NaN behavior). These value
-constraints are the caller's responsibility and are not checked with a device-to-host sync.
-
-### Backend organization
-
-`lightning_indexer` is the sole exported indexer API. The private implementations are flat
-modules under `attn_gym/sparse/indexer/impl/{cute,triton,reference}.py`, each with a `launch`
-entrypoint. There is no separate backend-package re-export or `impl/cute/impl.py` wrapper.
+Selection with NaN/Inf scores is unspecified and may differ across backends.
 
 ::: attn_gym.sparse.indexer.lightning_indexer
