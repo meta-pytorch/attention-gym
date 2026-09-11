@@ -37,10 +37,11 @@ def useful_flops(args: argparse.Namespace) -> int:
     if not args.causal:
         return b * h * s * s * d * 2
     else:
-        return b * h * s * s * d
+        return b * h * s * (s + 1) * d
 
 
 def make_inputs(args: argparse.Namespace):
+    """Create one shared set of inputs for every measured implementation."""
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -56,6 +57,7 @@ def make_inputs(args: argparse.Namespace):
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse shapes, implementations, and graph-replay iteration counts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--heads", type=int, default=128)
@@ -77,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Measure public forward selection with setup excluded from graph replay."""
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")

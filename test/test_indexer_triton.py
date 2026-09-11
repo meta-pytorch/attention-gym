@@ -142,6 +142,9 @@ def test_triton_strided_inputs(causal):
         q, k, weights, 37, causal=causal, impl="fused", kernel_options={"backend": "triton"}
     )
     assert_selection(actual, q, k, weights, 37, causal)
+    from attn_gym.sparse.indexer.ops import _indexer_op
+
+    torch.library.opcheck(_indexer_op, (q, k, weights, 37, causal, "triton"))
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 
 from attn_gym.sparse.indexer import lightning_indexer, ops
 
@@ -97,13 +98,48 @@ def test_auto_fullgraph_uses_device_backend():
     if capability[0] < 9:
         pytest.skip("fused indexer requires Hopper or newer")
     expected_backend = "cute" if capability == (10, 0) else "triton"
-    compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True)
-    for tokens in (17, 33):
-        q = torch.randn(1, tokens, 2, 16, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(1, tokens, 16, device="cuda", dtype=torch.bfloat16)
-        weights = torch.randn(1, tokens, 2, device="cuda", dtype=torch.bfloat16)
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True, backend=counter)
+    for batch, tokens in ((2, 17), (3, 33), (4, 65)):
+        q = torch.randn(batch, tokens, 2, 16, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(batch, tokens, 16, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(batch, tokens, 2, device="cuda", dtype=torch.bfloat16)
         expected = lightning_indexer(
             q, k, weights, 4, causal=True, kernel_options={"backend": expected_backend}
         )
         actual = compiled(q, k, weights, 4, causal=True)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert counter.frame_count == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("backend", ["auto", "cute", "triton"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_backend_cuda_graph_replay(backend, causal):
+    """All public fused routes replay after static inputs change."""
+    capability = torch.cuda.get_device_capability()
+    if capability[0] < 9 or (backend == "cute" and capability != (10, 0)):
+        pytest.skip("backend is unsupported on this GPU")
+    inputs = (
+        torch.randn(2, 65, 2, 16, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2, 65, 16, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2, 65, 2, device="cuda", dtype=torch.bfloat16),
+    )
+
+    def run():
+        return lightning_indexer(*inputs, 16, causal=causal, kernel_options={"backend": backend})
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = run()
+    for _ in range(3):
+        for tensor in inputs:
+            tensor.normal_()
+        graph.replay()
+        torch.testing.assert_close(actual, run(), rtol=0, atol=0)
