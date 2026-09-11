@@ -100,7 +100,8 @@ def test_auto_fullgraph_uses_device_backend():
     expected_backend = "cute" if capability == (10, 0) else "triton"
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True, backend=counter)
-    for batch, tokens in ((2, 17), (3, 33), (4, 65)):
+    # Distinct initial dimensions avoid Dynamo's incidental batch == heads duck-shape guard.
+    for batch, tokens in ((3, 17), (4, 33), (5, 65)):
         q = torch.randn(batch, tokens, 2, 16, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(batch, tokens, 16, device="cuda", dtype=torch.bfloat16)
         weights = torch.randn(batch, tokens, 2, device="cuda", dtype=torch.bfloat16)
