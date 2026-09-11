@@ -8,7 +8,8 @@ kernel.  The launcher is guarded by an
 in-process and persistent TVM-FFI compile cache keyed on the static shape/dtype
 contract (dtype, heads, head_dim, topk, causal) and compile target. Batch and
 sequence dimensions are symbolic. The public API invokes it through the private operator in
-``attn_gym.sparse.indexer.ops``; there is no fallback implementation.
+``attn_gym.sparse.indexer.ops``. ``launch`` is a private backend entrypoint;
+``lightning_indexer`` is the public API. This launcher never falls back to another backend.
 """
 
 import math
@@ -1553,7 +1554,7 @@ def _compile_indexer(
     )
 
 
-def index(
+def launch(
     q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
@@ -1595,4 +1596,4 @@ def index(
     return output
 
 
-__all__ = ["index"]
+__all__ = ["launch"]

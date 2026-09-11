@@ -1,7 +1,9 @@
+"""Public weighted-ReLU Top-K selection and backend-independent validation."""
+
 import torch
 from torch import Tensor
 
-from .ops import _indexer_cute_op
+from .ops import _indexer_op
 
 
 def _validate_inputs(
@@ -11,6 +13,7 @@ def _validate_inputs(
     topk: int,
     causal: bool,
 ) -> None:
+    """Validate metadata without synchronizing or inspecting tensor values."""
     # --- type checks ---
     for name, tensor in {"q": q, "k": k, "weights": weights}.items():
         if not isinstance(tensor, torch.Tensor):
@@ -97,25 +100,42 @@ def lightning_indexer(
         output[b, t, :]  = topk(score[b, t, :]).indices
 
     Args:
-        q: Query tensor, [B, T, H, D].
+        q: Finite query tensor, [B, T, H, D].
 
-        k: Key candidate pool shared across heads, [B, S, D].
+        k: Finite key candidate pool shared across heads, [B, S, D].
             Nonsquare inputs (S != T) are not supported yet.
 
-        weights: Per-head weights, [B, T, H].  May be negative.
+        weights: Finite per-head weights, [B, T, H]. May be negative.
 
         topk: Number of candidates to select per query.  Must be in [0, S].
 
         causal: If True, query at position t can only attend to candidates
             at positions <= t.  Requires S == T.
 
-        impl: One of "reference" or "fused". Defaults to "fused".
+        impl: ``"reference"`` uses eager PyTorch on CPU or CUDA; ``"fused"`` uses
+            optimized CUDA kernels. Defaults to ``"fused"``.
 
-        kernel_options: Fused kernel options; the supported backend is "cute".
+        kernel_options: Fused backend override: ``{"backend": "cute"}`` or
+            ``{"backend": "triton"}``. Omitted options or ``"auto"`` select CuTe
+            on SM100 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
+            no fallback when the selected backend rejects a shape or layout.
 
     Returns:
-        [B, T, topk] INT32 tensor of selected candidate indices.
-        Not guaranteed to be sorted
+        Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
+        guaranteed across backends. Causal rows with fewer than topk candidates
+        contain -1 padding; topk=0 returns an empty last dimension.
+
+    Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
+    Both require FP16/BF16 inputs, T <= 2**20, and topk <= 512. CuTe requires SM100,
+    even H, D divisible by 16, and contiguous, 16-byte-aligned inputs. Triton requires
+    SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with unit last strides
+    and 16-byte-aligned bases and outer strides; weights may be strided.
+
+    Inputs and intermediate FP32 scores must remain finite. NaN/Inf behavior is
+    unsupported and may differ across backends; values are not checked at runtime.
+    Indices are nondifferentiable even when inputs require gradients. Training
+    attention over the selected positions does not propagate gradients through
+    selection into q, k, or weights; scoring weights need a separate training loss.
     """
 
     _validate_inputs(q, k, weights, topk, causal)
@@ -126,10 +146,19 @@ def lightning_indexer(
                 raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
-            return reference.index(q, k, weights, topk, causal)
+            return reference.launch(q, k, weights, topk, causal)
         case "fused":
-            if kernel_options not in (None, {}, {"backend": "cute"}):
+            if kernel_options not in (
+                None,
+                {},
+                {"backend": "auto"},
+                {"backend": "cute"},
+                {"backend": "triton"},
+            ):
                 raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
-            return _indexer_cute_op(q, k, weights, topk, causal)
+            if not q.is_cuda:
+                raise ValueError("the fused lightning_indexer requires CUDA tensors")
+            backend = (kernel_options or {}).get("backend", "auto")
+            return _indexer_op(q, k, weights, topk, causal, backend)
         case _:
             raise ValueError(f"unknown impl {impl!r}; expected 'reference' or 'fused'")

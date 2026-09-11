@@ -7,9 +7,10 @@ Usage:
 """
 
 import argparse
+from functools import partial
 
 import torch
-import triton
+from transformer_nuggets.utils.benchmark import benchmark_cuda_function_stats
 
 from attn_gym.sparse.indexer import lightning_indexer
 
@@ -64,18 +65,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--impl", nargs="+", default=["fused"], choices=["reference", "fused"])
-    parser.add_argument("--warmup", type=int, default=200, help="Warmup duration in ms")
-    parser.add_argument("--rep", type=int, default=1000, help="Measurement duration in ms")
+    parser.add_argument(
+        "--backend", nargs="+", choices=["auto", "cute", "triton"], default=["auto"]
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=25, help="Warmup iterations before/after capture"
+    )
+    parser.add_argument("--rep", type=int, default=100, help="Number of timed graph replays")
     parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if "fused" in args.impl:
-        assert args.heads % 2 == 0, "cute backend requires an even number of heads"
-        assert args.head_dim % 16 == 0, "cute backend requires head_dim divisible by 16"
-        assert args.dtype in ("float16", "bfloat16"), "cute backend requires fp16 or bf16"
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
 
@@ -85,19 +87,32 @@ def main() -> None:
 
     fwd_flops = useful_flops(args)
 
+    print(
+        "contract: warm fixed-pointer CUDA graph replay; forward only (indices have no backward)"
+    )
+    q, k, weights = make_inputs(args)
     for impl in args.impl:
-        q, k, weights = make_inputs(args)
-
-        def fwd(_q=q, _k=k, _weights=weights, _impl=impl):
-            return lightning_indexer(_q, _k, _weights, args.topk, causal=args.causal, impl=_impl)
-
-        fwd()
-        fwd_ms = triton.testing.do_bench(
-            fwd, warmup=args.warmup, rep=args.rep, return_mode="median"
-        )
-        fwd_tflops = fwd_flops / (fwd_ms * 1e9)
-
-        print(f"[{impl}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} TFLOP/s)")
+        for backend in args.backend if impl == "fused" else [None]:
+            fwd = partial(
+                lightning_indexer,
+                q,
+                k,
+                weights,
+                args.topk,
+                causal=args.causal,
+                impl=impl,
+                kernel_options={"backend": backend} if backend else None,
+            )
+            stats = benchmark_cuda_function_stats(
+                fwd,
+                USE_CUDA_GRAPHS=True,
+                NUM_ITERS=args.rep,
+                CUDAGRAPH_WARMUP_ITERS=args.warmup,
+            )
+            fwd_ms = stats.median_us / 1000
+            fwd_tflops = fwd_flops / (fwd_ms * 1e9)
+            route = f"{impl}/{backend}" if backend else impl
+            print(f"[{route}] forward: {fwd_ms:.3f} ms  ({fwd_tflops:.2f} useful TFLOP/s)")
 
 
 if __name__ == "__main__":
