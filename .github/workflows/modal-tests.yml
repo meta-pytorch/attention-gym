@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Attached Modal apps stop on client exit/disconnection; never add --detach below.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -31,4 +36,4 @@ jobs:
         run: python -m pip install modal
 
       - name: Run pytest on a B200
-        run: modal run -m modal_tests
+        run: exec modal run -m modal_tests

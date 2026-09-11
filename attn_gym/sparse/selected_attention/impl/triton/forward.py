@@ -95,7 +95,8 @@ def _selected_attention_fwd(
             offsets_d,
             valid[:, None] & dimension_mask[None, :],
         )
-        logit = tl.sum(query * sparse_value, axis=1) * SCALE
+        # Promote before multiplying: tl.sum preserves floating-point input dtypes.
+        logit = tl.sum(query.to(tl.float32) * sparse_value.to(tl.float32), axis=1) * SCALE
         logit = tl.where(valid, logit, -float("inf"))
         new_max = tl.maximum(running_max, logit)
         alpha = tl.exp(running_max - new_max)
@@ -375,7 +376,7 @@ def _selected_attention_fwd_tma(
             offsets_d,
             valid[:, None] & dimension_mask[None, :],
         )
-        logit = tl.sum(query * sparse_value, axis=1) * SCALE
+        logit = tl.sum(query.to(tl.float32) * sparse_value.to(tl.float32), axis=1) * SCALE
         logit = tl.where(valid, logit, -float("inf"))
         new_max = tl.maximum(running_max, logit)
         alpha = tl.exp(running_max - new_max)

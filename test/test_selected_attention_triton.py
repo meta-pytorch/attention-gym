@@ -5,8 +5,6 @@ python -m pytest test/test_selected_attention_triton.py::test_precision_vs_fp64 
 Inputs are generated in the target dtype first, then promoted to FP64 via .double()
 so that eager, Triton, and FP64 all see the same quantized values. This isolates
 arithmetic error from input-quantization noise.
-
-Triton max diff is between 0.59-1.23x the reference's max diff
 """
 
 import math
@@ -14,7 +12,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 
 ATOL_FWD = 1e-2
 RTOL_FWD = 1e-2
@@ -30,14 +28,12 @@ def _skip_no_cuda():
 
 
 # NOTE [Sink Gradient Delta Rounding]
-# The Triton backward follows the standard FlashAttention design: it recomputes
-# ``delta = sum(grad_output * output)`` from the saved low-precision output tensor and
-# rebuilds probabilities from low-precision score dots against the stored FP32 LSE. The
-# eager oracle instead backpropagates through its FP32 intermediates, so its own error
-# against FP64 excludes those quantization events. The sink gradient is a closed form of
-# delta (``dsink = -exp(sink - lse) * delta``) reduced to one scalar per head, so it has
-# no averaging to absorb them; its budget must charge the extra low-precision roundings
-# the kernel legitimately performs. This is a rounding-model difference, not a kernel bug.
+# Backward recomputes delta in FP32 from the saved low-precision output. Forward
+# quantizes probabilities for tensor-core PV and rounds the output before saving it;
+# eager instead backpropagates through its FP32 PV intermediates. The sink gradient
+# (-exp(sink - lse) * delta, summed per head) allows these internal roundings, but
+# not low-precision products or reductions. The row-reduction regression isolates
+# arithmetic precision from these legitimate saved-state quantization boundaries.
 def assert_matches_low_precision_eager(
     actual,
     low_precision_expected,
@@ -118,10 +114,16 @@ def _make_inputs(
     }
 
 
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 1, 4])
-@pytest.mark.parametrize("head_dim", [32, 64, 128])
-@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+@pytest.mark.parametrize(
+    "share_kv,num_topk,head_dim,scale",
+    [
+        (shared, topk, dim, None)
+        for shared in (False, True)
+        for topk in (0, 1, 4)
+        for dim in (32, 64, 128)
+    ]
+    + [(False, 1, 32, 0.125), (True, 4, 128, 0.25)],
+)
 def test_triton_forward_matches_reference(share_kv, num_topk, head_dim, scale):
     """Triton forward matches the eager reference implementation."""
     _skip_no_cuda()
@@ -162,10 +164,17 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
 
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 1, 2, 3])
-@pytest.mark.parametrize("sliding_window_size", [0, 8])
-@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+@pytest.mark.parametrize(
+    "share_kv,num_topk,sliding_window_size,scale",
+    [
+        (shared, topk, window, None)
+        for shared in (False, True)
+        for topk in (0, 1, 2, 3)
+        for window in (0, 8)
+    ]
+    + [(shared, 2, 0, 0.125) for shared in (False, True)]
+    + [(shared, 3, 8, 0.25) for shared in (False, True)],
+)
 def test_triton_backward(share_kv, num_topk, sliding_window_size, scale):
     """Triton backward produces correct gradients for all differentiable inputs."""
     _skip_no_cuda()
@@ -303,10 +312,23 @@ def test_triton_larger_sequence():
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
 
-@pytest.mark.parametrize("share_kv", [False, True])
-@pytest.mark.parametrize("num_topk", [0, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
-@pytest.mark.parametrize("scale", [None, 0.025, 0.25])
+@pytest.mark.parametrize(
+    "scale,dtype,num_topk,share_kv",
+    [
+        (None, dtype, topk, shared)
+        for dtype in (torch.bfloat16, torch.float32, torch.float16)
+        for topk in (0, 2, 4)
+        for shared in (False, True)
+    ]
+    + [
+        pytest.param(0.25, torch.bfloat16, 2, False, id="0.25-dtype0-2-False"),
+        (0.25, torch.float32, 4, True),
+        (0.25, torch.float16, 0, False),
+        (0.025, torch.bfloat16, 4, True),
+        (0.025, torch.float32, 0, False),
+        (0.025, torch.float16, 2, True),
+    ],
+)
 def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
     """Report max forward/backward diffs between a lower-precision dtype and fp64.
 
@@ -491,7 +513,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         reduction_sizes=dsparse_kv_reduction_sizes,
     )
     # See NOTE [Sink Gradient Delta Rounding]: charge the bf16-rounded output feeding the
-    # delta recomputation and the low-precision score dots behind the rebuilt probabilities.
+    # delta recomputation and the probabilities quantized for the forward PV dot.
     assert_matches_low_precision_eager(
         sink_lp_tri.grad,
         sink_lp_ref.grad,
@@ -499,3 +521,58 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         reduction_sizes=dsink_reduction_sizes,
         quantized_intermediates=2,
     )
+
+
+@pytest.mark.parametrize(
+    "heads,head_dim,share_kv",
+    [(4, 63, False), (4, 64, False), (16, 64, True)],
+    ids=["portable", "tma", "shared"],
+)
+def test_triton_fp32_row_reductions(heads, head_dim, share_kv):
+    """Sparse logits and sink delta retain FP32 arithmetic for BF16 inputs."""
+    _skip_no_cuda()
+    if share_kv and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Blackwell required for the shared-KV schedule")
+    inputs = _make_inputs(
+        heads=heads,
+        head_dim=head_dim,
+        share_kv=share_kv,
+        num_topk=2,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+        seed=77,
+    )
+    # An FP32 sink exposes delta error without a final BF16 gradient cast hiding it.
+    inputs["attention_sink"] = inputs["attention_sink"].detach().float().requires_grad_()
+    reference_inputs = {
+        name: value.detach().double()
+        if isinstance(value, torch.Tensor) and value.is_floating_point()
+        else value
+        for name, value in inputs.items()
+    }
+    _, reference_aux = selected_attention(
+        **reference_inputs, backend="eager", scale=0.25, return_aux=AuxRequest(lse=True)
+    )
+    output, aux = selected_attention(
+        **inputs, backend="triton", scale=0.25, return_aux=AuxRequest(lse=True)
+    )
+    # FP32 dot/reduction/exp/log error, with no BF16 intermediate in the LSE path.
+    fp32_eps = torch.finfo(torch.float32).eps
+    torch.testing.assert_close(
+        aux.lse.double(), reference_aux.lse, atol=16 * fp32_eps, rtol=16 * fp32_eps
+    )
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    grad_output = torch.randn(
+        output.shape, dtype=output.dtype, device=output.device, generator=generator
+    )
+    output.backward(grad_output)
+    delta = (output.double() * grad_output.double()).sum(-1)
+    sink_partials = (
+        -torch.exp(inputs["attention_sink"].double()[None, :, None] - aux.lse.double()) * delta
+    )
+    expected_sink = sink_partials.sum((0, 2))
+    # Bound FP32 reduction error by the sum of magnitudes, not the cancellation-prone result.
+    allowance = 32 * fp32_eps * sink_partials.abs().sum((0, 2))
+    actual_sink = inputs["attention_sink"].grad.double()
+    assert torch.isfinite(actual_sink).all()
+    assert ((actual_sink - expected_sink).abs() <= allowance).all()

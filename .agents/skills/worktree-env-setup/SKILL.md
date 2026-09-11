@@ -40,8 +40,8 @@ Notes:
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
-- On x86_64 Linux, `[tests]` brings FlashAttention's CuTeDSL 4.6 pin and conflicts with the
-  CuTeDSL 4.7+ `[cudnn]` extra. For cuDNN worktrees, install `-e '.[cudnn,dev]' pytest pytest-xdist`
+- `[tests]` and `[cudnn]` are declared conflicting extras in `pyproject.toml`; keep them in
+  separate environments. For cuDNN worktrees, install `-e '.[cudnn,dev]' pytest pytest-xdist`
   instead; cuDNN tests import-skip optional FlashAttention coverage.
 
 ## Running commands

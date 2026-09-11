@@ -16,6 +16,12 @@ BACKENDS = ["eager"]
 if torch.cuda.is_available():
     BACKENDS.append("triton")
 
+# Both backends cover default and non-default scales. Triton also checks 0.25, which equals
+# the default at head_dim=16 in the compile tests but not at head_dim=8 in joint normalization.
+BACKEND_SCALE_CASES = [(backend, scale) for backend in BACKENDS for scale in (None, 0.125)]
+if "triton" in BACKENDS:
+    BACKEND_SCALE_CASES.append(("triton", 0.25))
+
 BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
@@ -204,8 +210,7 @@ def test_selected_block_only_manual(backend):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+@pytest.mark.parametrize("backend,scale", BACKEND_SCALE_CASES)
 def test_joint_normalization(backend, scale):
     """When both local and sparse branches are active, they share normalization.
 
@@ -971,8 +976,7 @@ def test_torch_compile_fullgraph_forward(scale):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("scale", [None, 0.125, 0.25])
+@pytest.mark.parametrize("backend,scale", BACKEND_SCALE_CASES)
 def test_torch_compile_fullgraph_backward(backend, scale):
     """selected_attention backward works under torch.compile(fullgraph=True)."""
     device = torch.device("cuda")

@@ -2,6 +2,19 @@
 We want to make contributing to this project as easy and transparent as
 possible.
 
+## GPU test environment
+
+Use an isolated `.venv` in each checkout, with the same nightly and test extra as CI:
+
+```bash
+uv venv --python 3.13
+uv pip install --python .venv/bin/python --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
+uv pip install --python .venv/bin/python --prerelease allow -e '.[tests,linear,dev]'
+uv run --no-sync pytest -n 6 test
+```
+
+CuTe sink cases skip when the installed FlashAttention MLA kernel lacks the sink argument;
+no-sink coverage still runs. They enable automatically when a supporting wheel is installed.
 
 ## Pull Requests
 We actively welcome your pull requests.
