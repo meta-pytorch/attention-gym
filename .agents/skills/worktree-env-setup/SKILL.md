@@ -21,7 +21,7 @@ From the worktree root (mirrors `.github/workflows/test.yml`):
 uv venv --python 3.13
 source .venv/bin/activate
 uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
-uv pip install --prerelease allow -e '.[tests,linear,dev]' -r requirements-test.txt
+uv pip install --prerelease allow -e '.[tests,linear,dev]'
 ```
 
 Notes:
@@ -29,8 +29,6 @@ Notes:
 - uv hard-links wheels from its cache, so after the first nightly download this
   takes seconds and costs almost no extra disk per worktree.
 - Activate `.venv` before installing so an already-active foreign environment is not modified.
-- `requirements-test.txt` pins the unreleased FA4 sparse-MLA sink support used by CI.
-  Keep this source override when testing sinks; the published beta30 wheel rejects them.
 - `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`.
   `[tests]` omits FlashAttention on aarch64, so its transitive CuTeDSL pin does not apply
   there or to linear-only installs. When updating CuTeDSL, run
@@ -42,8 +40,8 @@ Notes:
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
-- On x86_64 Linux, `[tests]` brings FlashAttention's CuTeDSL 4.6 pin and conflicts with the
-  CuTeDSL 4.7+ `[cudnn]` extra. For cuDNN worktrees, install `-e '.[cudnn,dev]' pytest pytest-xdist`
+- `[tests]` and `[cudnn]` are declared conflicting extras in `pyproject.toml`; keep them in
+  separate environments. For cuDNN worktrees, install `-e '.[cudnn,dev]' pytest pytest-xdist`
   instead; cuDNN tests import-skip optional FlashAttention coverage.
 
 ## Running commands

@@ -39,7 +39,6 @@ cudnn = [
 tests = [
     "pytest",
     "pytest-xdist",
-    "pytest-instafail",
     "typer",
     "jsonargparse",
     "docstring-parser",
@@ -49,7 +48,6 @@ tests = [
 dev = [
     "prek",
     "pytest",
-    "pytest-instafail",
     "pytest-xdist",  # pytest addopts pass --dist, so xdist must be present even for -n 0
     "ruff",
     "typer",

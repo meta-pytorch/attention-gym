@@ -18,17 +18,9 @@ if torch.cuda.is_available():
 
 # Both backends cover default and non-default scales. Triton also checks 0.25, which equals
 # the default at head_dim=16 in the compile tests but not at head_dim=8 in joint normalization.
-BACKEND_SCALE_CASES = [
-    (backend, scale)
-    for backend, scale in [
-        ("eager", None),
-        ("triton", None),
-        ("eager", 0.125),
-        ("triton", 0.125),
-        ("triton", 0.25),
-    ]
-    if backend in BACKENDS
-]
+BACKEND_SCALE_CASES = [(backend, scale) for backend in BACKENDS for scale in (None, 0.125)]
+if "triton" in BACKENDS:
+    BACKEND_SCALE_CASES.append(("triton", 0.25))
 
 BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 

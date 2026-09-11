@@ -27,14 +27,10 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
 
 @pytest.mark.parametrize("extras", [["tests"], ["cudnn", "dev"]])
-def test_image_ships_runner_and_only_overrides_fa4_for_tests(
-    runner: ModuleType, extras: list[str]
-):
+def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extras: list[str]):
     """Keep runner regression tests mounted and the two dependency environments separate."""
     image = Mock()
     image.pip_install_from_pyproject.return_value = image
-    image.apt_install.return_value = image
-    image.pip_install_from_requirements.return_value = image
     image.add_local_python_source.return_value = image
     image.add_local_dir.return_value = image
     image.add_local_file.return_value = image
@@ -44,13 +40,9 @@ def test_image_ships_runner_and_only_overrides_fa4_for_tests(
     image.add_local_file.assert_any_call(
         runner.ROOT_PATH / "modal_tests.py", remote_path="/root/modal_tests.py"
     )
-    if "tests" in extras:
-        image.apt_install.assert_called_once_with("git")
-        image.pip_install_from_requirements.assert_called_once_with(
-            str(runner.ROOT_PATH / "requirements-test.txt"), pre=True
-        )
-    else:
-        image.pip_install_from_requirements.assert_not_called()
+    image.pip_install_from_pyproject.assert_called_once_with(
+        str(runner.ROOT_PATH / "pyproject.toml"), optional_dependencies=extras, pre=True
+    )
 
 
 def test_failure_report_includes_assertions_and_errors(runner: ModuleType, tmp_path: Path):
@@ -76,11 +68,10 @@ def test_pytest_failure_budget_and_missing_report(
     """Remove stale reports and expose signal termination without hiding the pytest command."""
     report = tmp_path / "report.xml"
     report.write_text("stale report")
-    monkeypatch.setattr(runner, "Path", lambda name: report)
     run = Mock(return_value=SimpleNamespace(returncode=-9))
     monkeypatch.setattr(runner.subprocess, "run", run)
 
-    return_code, summary = runner.execute_pytest(["test"], "report", "Suite")
+    return_code, summary = runner.execute_pytest(["test"], report, "Suite")
 
     assert return_code == -9
     assert "exited with code -9 before writing a report" in summary

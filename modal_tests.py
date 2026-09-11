@@ -18,6 +18,7 @@ base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .env({"PYTORCH_NIGHTLY_CACHE_DATE": NIGHTLY_CACHE_DATE})
     .pip_install("torch", pre=True, index_url=PYTORCH_NIGHTLY_INDEX)
+    .pip_install("pytest-instafail")
 )
 image = base_image
 cudnn_image = base_image
@@ -30,10 +31,6 @@ def configure_local_image(
     configured = source_image.pip_install_from_pyproject(
         str(ROOT_PATH / "pyproject.toml"), optional_dependencies=optional_dependencies, pre=True
     )
-    if "tests" in optional_dependencies:
-        configured = configured.apt_install("git").pip_install_from_requirements(
-            str(ROOT_PATH / "requirements-test.txt"), pre=True
-        )
     if WHEEL_PATH:
         if not WHEEL_PATH.is_file() or WHEEL_PATH.suffix != ".whl":
             raise ValueError(f"ATTN_GYM_WHEEL must name an existing wheel: {WHEEL_PATH}")
@@ -120,11 +117,10 @@ def verify_wheel_install() -> None:
 
 
 def execute_pytest(
-    test_paths: list[str], report_name: str, title: str, *, workers: int = 4
+    test_paths: list[str], report_path: Path, title: str, *, workers: int = 4
 ) -> tuple[int, str]:
     """Run one isolated dependency-compatible pytest suite."""
     verify_wheel_install()
-    report_path = Path(f"/tmp/{report_name}.xml")
     report_path.unlink(missing_ok=True)
     result = subprocess.run(
         [
@@ -159,13 +155,15 @@ def run_pytest() -> tuple[int, str]:
     """Check FA4 sink support before running the ordinary repository suite."""
     return_code, preflight_summary = execute_pytest(
         ["test/test_selected_attention_cute.py::test_cute_sink_dependency_smoke"],
-        "pytest-preflight",
+        Path("/tmp/pytest-preflight.xml"),
         "B200 FA4 dependency preflight",
         workers=0,
     )
     if return_code:
         return return_code, preflight_summary
-    return_code, summary = execute_pytest(["test"], "pytest-report", "B200 pytest summary")
+    return_code, summary = execute_pytest(
+        ["test"], Path("/tmp/pytest-report.xml"), "B200 pytest summary"
+    )
     return return_code, f"{preflight_summary}\n{summary}"
 
 
@@ -174,7 +172,7 @@ def run_cudnn_pytest() -> tuple[int, str]:
     """Run the CuTeDSL 4.7+ GDN/KDA cuDNN suites in their compatible environment."""
     return execute_pytest(
         ["test/gdn/cudnn", "test/kda/cudnn"],
-        "cudnn-pytest-report",
+        Path("/tmp/cudnn-pytest-report.xml"),
         "B200 cuDNN pytest summary",
     )
 

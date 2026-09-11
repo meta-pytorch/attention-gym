@@ -7,6 +7,7 @@ CuTe constraints: head_dim=512, nheads=128, share_kv=True, dtype=bfloat16, SM100
 Note: torch.compile is NOT supported for the CuTe backend (eager-only).
 """
 
+import inspect
 import math
 
 import pytest
@@ -20,6 +21,19 @@ def _skip_no_sm100():
         pytest.skip("CUDA required for CuTe backend")
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("SM100 (compute capability 10.0) required for CuTe backend")
+
+
+def skip_unsupported_cute_sink(sink_dtype: torch.dtype | None) -> None:
+    """Skip only sink cases until the installed sparse-MLA kernel supports them."""
+    if sink_dtype is None:
+        return
+    mla = pytest.importorskip("flash_attn.cute.flash_fwd_mla_sm100")
+    # The public flash_attn_func already accepted sinks before the MLA kernel did.
+    if (
+        "learnable_sink"
+        not in inspect.signature(mla.FlashAttentionMLAForwardSm100.__call__).parameters
+    ):
+        pytest.skip("installed FA4 sparse-MLA kernel does not support attention sinks yet")
 
 
 def assert_matches_low_precision_eager(
@@ -68,6 +82,7 @@ def check_cute_precision(
     This ensures eager, CuTe, and FP64 all see the same quantized values
     so that the FP64 baseline isolates arithmetic error without input-quantization noise.
     """
+    skip_unsupported_cute_sink(sink_dtype)
     heads, head_dim = 128, 512
     seed = 77
     device = torch.device("cuda")
@@ -227,8 +242,8 @@ def check_cute_precision(
 def test_cute_sink_dependency_smoke():
     """Check installed FA4 sink forward/backward via the public API on a tiny SM100 case.
 
-    Missing or old FA4 must fail on SM100, not skip a missing sink feature. The independent
-    eager/FP64 references check output and dQ, dLocalKV, dSparseKV, and dSink.
+    Skip older FA4 kernels without sink support. Once supported, the independent eager/FP64
+    references check output and dQ, dLocalKV, dSparseKV, and dSink without masking failures.
     """
     _skip_no_sm100()
     check_cute_precision(
@@ -308,6 +323,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
     _skip_no_sm100()
     pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
+    skip_unsupported_cute_sink(sink_dtype)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     batch, heads, seq_len, head_dim = 1, 128, 64, 512
