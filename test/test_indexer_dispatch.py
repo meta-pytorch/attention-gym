@@ -9,7 +9,7 @@ import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
 from attn_gym.sparse.indexer import lightning_indexer, ops
-from attn_gym.testing.indexer import make_indexer_test_inputs
+from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
 
 
 def require_backend(backend: str | None = None) -> str:
@@ -134,7 +134,8 @@ def test_auto_fullgraph_uses_device_backend():
             q, k, weights, 4, causal=True, kernel_options={"backend": expected_backend}
         )
         actual = compiled(q, k, weights, 4, causal=True)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert_indexer_selection(expected, q, k, weights, 4, True)
+        assert_indexer_selection(actual, q, k, weights, 4, True)
     assert counter.frame_count == 1
 
 
@@ -171,4 +172,5 @@ def test_backend_cuda_graph_replay(backend, dtype, tokens, heads, dim, topk, cau
         for tensor in inputs:
             tensor.normal_()
         graph.replay()
-        torch.testing.assert_close(actual, run(), rtol=0, atol=0)
+        assert_indexer_selection(actual, *inputs, topk, causal)
+        assert_indexer_selection(run(), *inputs, topk, causal)

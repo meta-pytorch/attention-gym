@@ -95,26 +95,28 @@ def make_fake_strided_tensor(
     dtype: Any,
     shape: tuple[Any, ...],
     *,
-    contiguous_dim: int = -1,
+    contiguous_dim: int | None = -1,
     stride_divisibility: int = 1,
     assumed_align: int | None = None,
     use_int64_strides: bool = True,
 ) -> Any:
-    """Create a fake tensor with one contiguous mode and dynamic other strides.
+    """Create a fake tensor with dynamic strides and an optional contiguous mode.
 
+    ``contiguous_dim=None`` leaves every stride dynamic, for ordinary scalar loads.
     ``stride_divisibility`` is measured in elements. When ``assumed_align`` is omitted,
     it is derived from that divisibility and the element width, matching the weakest
     alignment promised by the dynamic stride layout.
     """
     if not shape:
         raise ValueError("make_fake_strided_tensor requires at least one dimension")
-    if not -len(shape) <= contiguous_dim < len(shape):
+    if contiguous_dim is not None and not -len(shape) <= contiguous_dim < len(shape):
         raise ValueError(f"contiguous_dim is out of range for rank {len(shape)}")
     if not 1 <= stride_divisibility:
         raise ValueError("stride_divisibility must be positive")
     if assumed_align is not None and assumed_align < 1:
         raise ValueError("assumed_align must be positive")
-    contiguous_dim %= len(shape)
+    if contiguous_dim is not None:
+        contiguous_dim %= len(shape)
     from cutlass import cute
 
     sym_int = cute.sym_int64 if use_int64_strides else cute.sym_int

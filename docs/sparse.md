@@ -19,7 +19,7 @@ Weights may be negative. Query and candidate lengths must match. With causal sel
 query `t` considers only candidates `0..t`; rows with fewer than `topk` candidates contain
 `-1` padding. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
 position rather than an invalid position. `topk=0` returns an empty last dimension.
-Output order and tie-breaking are not guaranteed to match between implementations.
+Output order and tie-breaking are unspecified, including between repeated calls.
 
 ### Implementations and device dispatch
 
@@ -28,7 +28,11 @@ Output order and tie-breaking are not guaranteed to match between implementation
   and is intended for correctness checks and small inputs.
 - `impl="fused"` (the default) selects **CuTe on SM100**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
-  keep their selection state on chip and allocate no quadratic global score workspace.
+  keep their selection state on chip. CuTe separates score generation from radix Top-K and
+  reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
+  batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
+  allocation. This scratch is additional to the returned indices; Triton needs no global
+  score scratch.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
   Omit options for automatic selection. Options are rejected for `impl="reference"`.
   Unsupported shapes, missing dependencies, and launch errors propagate;
@@ -42,7 +46,10 @@ Output order and tie-breaking are not guaranteed to match between implementation
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
 | Sequence length `T` | `1..2**20` | `1..2**20` |
 | `topk` | `0..min(T, 512)` | `0..min(T, 512)` |
-| Layout | All inputs contiguous, with 16-byte-aligned bases | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
+| Layout | Q/K last stride 1, bases and non-singleton outer strides 16-byte aligned; weights may be strided | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
+
+CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
+materializing contiguous copies. Weights need only element alignment, not TMA alignment.
 
 CuTe additionally requires the optional `linear` dependencies. Its support is specifically
 SM100, not every Blackwell variant; other supported devices use Triton by default.
@@ -64,8 +71,8 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
 has no gradient function. Selected attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
-into the indexer's queries, keys, or scoring weights. Train those scoring parameters with
-a separate objective; this API supplies no surrogate gradient or indexer-training loss.
+into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
+or indexer-training loss.
 
 Selection with NaN/Inf scores is unspecified and may differ across backends.
 

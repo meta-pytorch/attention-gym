@@ -122,19 +122,24 @@ def lightning_indexer(
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
-        guaranteed across backends. Causal rows with fewer than topk candidates
+        guaranteed, including across repeated calls. Causal rows with fewer than topk candidates
         contain -1 padding; topk=0 returns an empty last dimension.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
     Both require FP16/BF16 inputs, T <= 2**20, and topk <= 512. CuTe requires SM100,
-    even H, D divisible by 16, and contiguous, 16-byte-aligned inputs. Triton requires
-    SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with unit last strides
-    and 16-byte-aligned bases and outer strides; weights may be strided.
+    even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
+    bases and non-singleton outer strides. Other Q/K strides may vary independently;
+    weights may have arbitrary strides and need only element alignment.
+    Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with
+    unit last strides and 16-byte-aligned bases and outer strides; weights may be strided.
+    CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
+    rows. Large inputs use slabs rather than an unbounded quadratic score allocation.
+    This workspace is additional to the returned indices and is not shared across calls.
 
     Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
     attention over the selected positions does not propagate gradients through
-    selection into q, k, or weights; scoring weights need a separate training loss.
+    selection into q, k, or weights.
     """
 
     _validate_inputs(q, k, weights, topk, causal)

@@ -1,0 +1,13 @@
+The score-generation and radix-selection kernels in cute_score.py,
+cute_score_generic.py and cute_topk.py adapt cuDNN Frontend source at commit
+1ab7d63be81f1ef2eb3b2dea5367219cf9674a5f. Attention Gym changes their interfaces,
+workspace layout, scheduling and outputs; they do not depend on the cuDNN
+Frontend package. The applicable license is in LICENSE.Apache-2.0.
+
+Upstream attribution:
+
+cudnn-frontend
+Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This product includes software developed at NVIDIA CORPORATION
+(https://www.nvidia.com/).

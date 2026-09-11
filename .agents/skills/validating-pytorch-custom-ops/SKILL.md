@@ -400,6 +400,12 @@ for utility, result in results.items():
 `opcheck` does not validate numerical correctness. A kernel can pass every utility and still compute
 wrong values. Pair it with reference forward tests and gradient tests.
 
+For unordered index outputs, AOT opcheck's exact tensor comparison can reject a valid permutation.
+Keep all utilities on a stable-output case (for example, selecting every candidate), then test the
+selective production path under fullgraph/dynamic compilation and replay with range, uniqueness,
+valid-count and reference-score checks. Do not widen integer tolerances or require deterministic
+ordering merely to satisfy opcheck when ordering and boundary tie choices are unspecified.
+
 ## Numerical correctness
 
 Every optimized backend needs a trusted eager/reference oracle. Compare:
