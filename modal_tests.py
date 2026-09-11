@@ -30,6 +30,10 @@ def configure_local_image(
     configured = source_image.pip_install_from_pyproject(
         str(ROOT_PATH / "pyproject.toml"), optional_dependencies=optional_dependencies, pre=True
     )
+    if "tests" in optional_dependencies:
+        configured = configured.apt_install("git").pip_install_from_requirements(
+            str(ROOT_PATH / "requirements-test.txt"), pre=True
+        )
     if WHEEL_PATH:
         if not WHEEL_PATH.is_file() or WHEEL_PATH.suffix != ".whl":
             raise ValueError(f"ATTN_GYM_WHEEL must name an existing wheel: {WHEEL_PATH}")
@@ -50,6 +54,7 @@ def configure_local_image(
         .add_local_dir(ROOT_PATH / "benchmarks", remote_path="/root/benchmarks")
         .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
         .add_local_file(ROOT_PATH / "README.md", remote_path="/root/README.md")
+        .add_local_file(ROOT_PATH / "modal_tests.py", remote_path="/root/modal_tests.py")
     )
 
 
@@ -114,7 +119,9 @@ def verify_wheel_install() -> None:
     print(f"attn_gym imported from {package_path}", flush=True)
 
 
-def execute_pytest(test_paths: list[str], report_name: str, title: str) -> tuple[int, str]:
+def execute_pytest(
+    test_paths: list[str], report_name: str, title: str, *, workers: int = 4
+) -> tuple[int, str]:
     """Run one isolated dependency-compatible pytest suite."""
     verify_wheel_install()
     report_path = Path(f"/tmp/{report_name}.xml")
@@ -126,10 +133,12 @@ def execute_pytest(test_paths: list[str], report_name: str, title: str) -> tuple
             "pytest",
             *test_paths,
             "-n",
-            "4",
+            str(workers),
             "--dist=worksteal",
-            "-ra",
+            "-vra",
             "--tb=short",
+            "--instafail",
+            "--maxfail=5",
             "--durations=50",
             f"--junitxml={report_path}",
         ],
@@ -144,13 +153,23 @@ def execute_pytest(test_paths: list[str], report_name: str, title: str) -> tuple
     return result.returncode, summary
 
 
-@app.function(gpu="B200", timeout=30 * 60)
+# Four compile-heavy pytest workers should not depend on spare host CPU capacity.
+@app.function(gpu="B200", cpu=4.0, timeout=30 * 60)
 def run_pytest() -> tuple[int, str]:
-    """Run the ordinary repository suite with the FlashAttention-compatible test extra."""
-    return execute_pytest(["test"], "pytest-report", "B200 pytest summary")
+    """Check FA4 sink support before running the ordinary repository suite."""
+    return_code, preflight_summary = execute_pytest(
+        ["test/test_selected_attention_cute.py::test_cute_sink_dependency_smoke"],
+        "pytest-preflight",
+        "B200 FA4 dependency preflight",
+        workers=0,
+    )
+    if return_code:
+        return return_code, preflight_summary
+    return_code, summary = execute_pytest(["test"], "pytest-report", "B200 pytest summary")
+    return return_code, f"{preflight_summary}\n{summary}"
 
 
-@app.function(image=cudnn_image, gpu="B200", timeout=30 * 60)
+@app.function(image=cudnn_image, gpu="B200", cpu=4.0, timeout=30 * 60)
 def run_cudnn_pytest() -> tuple[int, str]:
     """Run the CuTeDSL 4.7+ GDN/KDA cuDNN suites in their compatible environment."""
     return execute_pytest(
@@ -162,12 +181,12 @@ def run_cudnn_pytest() -> tuple[int, str]:
 
 @app.local_entrypoint()
 def main() -> None:
-    """Run both B200 suites and publish their summaries to GitHub Actions."""
-    results = (run_pytest.remote(), run_cudnn_pytest.remote())
-    combined_summary = "\n".join(summary for _return_code, summary in results)
-    print(f"\n{combined_summary}")
-    if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
-        with Path(summary_path).open("a") as summary_file:
-            summary_file.write(combined_summary)
-    if any(return_code != 0 for return_code, _summary in results):
-        raise SystemExit(1)
+    """Publish each suite immediately and stop allocating GPUs after a failed suite."""
+    for suite in (run_pytest, run_cudnn_pytest):
+        return_code, summary = suite.remote()
+        print(f"\n{summary}", flush=True)
+        if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+            with Path(summary_path).open("a") as summary_file:
+                summary_file.write(summary)
+        if return_code != 0:
+            raise SystemExit(1)

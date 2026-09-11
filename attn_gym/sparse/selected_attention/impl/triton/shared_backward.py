@@ -88,7 +88,7 @@ def _selected_attention_bwd_dq_shared(
         mask=head_mask,
         other=0.0,
     )
-    delta = tl.sum(grad_output * output, axis=1)
+    delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_query = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
     if TOPK:
@@ -299,7 +299,7 @@ def _selected_attention_bwd_dsparse_kv_shared_atomic(
         tl.trans(sparse_values),
         input_precision="tf32x3",
     )
-    delta = tl.sum(grad_output * output, axis=1)
+    delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_scores = probabilities * (grad_probabilities - delta[:, None])
     grad_values = tl.dot(
         tl.trans(probabilities.to(grad_output.dtype)),
@@ -444,7 +444,7 @@ def _selected_attention_bwd_dsparse_kv_shared(
         scores = tl.sum(score_tile * (dot_rows[None, :] == 0), axis=1) * SCALE
         grad_probability_tile = tl.dot(grad_output, dot_value, input_precision="tf32x3")
         grad_probabilities = tl.sum(grad_probability_tile * (dot_rows[None, :] == 0), axis=1)
-        delta = tl.sum(grad_output * output, axis=1)
+        delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
         probabilities = tl.where(flat_row_mask, tl.exp(scores - lse), 0.0)
         grad_scores = probabilities * (grad_probabilities - delta)
         combined_weights = tl.cat(probabilities, grad_scores * SCALE, dim=0)

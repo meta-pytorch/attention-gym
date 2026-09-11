@@ -21,7 +21,7 @@ From the worktree root (mirrors `.github/workflows/test.yml`):
 uv venv --python 3.13
 source .venv/bin/activate
 uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
-uv pip install --prerelease allow -e '.[tests,linear,dev]'
+uv pip install --prerelease allow -e '.[tests,linear,dev]' -r requirements-test.txt
 ```
 
 Notes:
@@ -29,6 +29,8 @@ Notes:
 - uv hard-links wheels from its cache, so after the first nightly download this
   takes seconds and costs almost no extra disk per worktree.
 - Activate `.venv` before installing so an already-active foreign environment is not modified.
+- `requirements-test.txt` pins the unreleased FA4 sparse-MLA sink support used by CI.
+  Keep this source override when testing sinks; the published beta30 wheel rejects them.
 - `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`.
   `[tests]` omits FlashAttention on aarch64, so its transitive CuTeDSL pin does not apply
   there or to linear-only installs. When updating CuTeDSL, run

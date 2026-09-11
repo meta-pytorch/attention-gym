@@ -75,7 +75,8 @@ def _selected_attention_bwd_dq(
         mask=query_mask,
         other=0.0,
     )
-    delta = tl.sum(grad_output * output, axis=1)
+    # Keep both products and the reduction in FP32, not the saved output dtype.
+    delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_query = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
     if HAS_DOC_IDS:
@@ -100,9 +101,9 @@ def _selected_attention_bwd_dq(
             offsets_d,
             valid[:, None] & dimension_mask[None, :],
         )
-        scores = tl.sum(query * sparse_value, axis=1) * SCALE
+        scores = tl.sum(query.to(tl.float32) * sparse_value.to(tl.float32), axis=1) * SCALE
         probabilities = tl.where(valid, tl.exp(scores - lse), 0.0)
-        grad_probs = tl.sum(grad_output * sparse_value, axis=1)
+        grad_probs = tl.sum(grad_output.to(tl.float32) * sparse_value.to(tl.float32), axis=1)
         grad_scores = probabilities * (grad_probs - delta)
         grad_query += grad_scores[:, None] * sparse_value * SCALE
 
@@ -228,7 +229,7 @@ def _selected_attention_bwd_dlocal_kv(
             mask=query_mask,
             other=0.0,
         )
-        delta = tl.sum(grad_output * output, axis=1)
+        delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
             query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
@@ -337,7 +338,7 @@ def _selected_attention_bwd_dlocal_kv_tma(
             mask=query_mask,
             other=0.0,
         )
-        delta = tl.sum(grad_output * output, axis=1)
+        delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
         if HAS_DOC_IDS:
             query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
@@ -476,7 +477,7 @@ def _selected_attention_bwd_dsparse_kv(
         scores = tl.sum(score_tile * (dot_rows[None, :] == 0), axis=1) * SCALE
         grad_probability_tile = tl.dot(grad_output, dot_value, input_precision="tf32x3")
         grad_probabilities = tl.sum(grad_probability_tile * (dot_rows[None, :] == 0), axis=1)
-        delta = tl.sum(grad_output * output, axis=1)
+        delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
         probabilities = tl.where(query_mask, tl.exp(scores - lse), 0.0)
         grad_scores = probabilities * (grad_probabilities - delta)
         combined_weights = tl.cat(probabilities, grad_scores * SCALE, dim=0)

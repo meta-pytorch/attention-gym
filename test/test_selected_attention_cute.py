@@ -12,8 +12,6 @@ import math
 import pytest
 import torch
 
-pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
-
 from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 
 
@@ -53,27 +51,24 @@ def assert_matches_low_precision_eager(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
-@pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("num_topk", [16, 32, 64, 128])
-@pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
-@pytest.mark.parametrize(
-    "seq_len,sparse_seq_len",
-    [(128, 128), (256, 128), (256, 256), (128, 256)],
-    ids=["s128_sp128", "s256_sp128", "s256_sp256", "s128_sp256"],
-)
-@pytest.mark.parametrize("sliding_window_size", [64, 128])
-def test_cute_precision_vs_fp64(
-    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
-):
+def check_cute_precision(
+    *,
+    batch: int,
+    num_topk: int,
+    test_docids: bool,
+    seq_len: int,
+    sparse_seq_len: int,
+    sliding_window_size: int,
+    sink_dtype: torch.dtype | None,
+    scale: float | None,
+) -> None:
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
     Inputs are generated in bf16 first, then promoted to FP64 via .double().
     This ensures eager, CuTe, and FP64 all see the same quantized values
     so that the FP64 baseline isolates arithmetic error without input-quantization noise.
     """
-    _skip_no_sm100()
-    batch, heads, head_dim = 2, 128, 512
+    heads, head_dim = 128, 512
     seed = 77
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -229,16 +224,90 @@ def test_cute_precision_vs_fp64(
         )
 
 
+def test_cute_sink_dependency_smoke():
+    """Check installed FA4 sink forward/backward via the public API on a tiny SM100 case.
+
+    Missing or old FA4 must fail on SM100, not skip a missing sink feature. The independent
+    eager/FP64 references check output and dQ, dLocalKV, dSparseKV, and dSink.
+    """
+    _skip_no_sm100()
+    check_cute_precision(
+        batch=1,
+        num_topk=2,
+        test_docids=True,
+        seq_len=8,
+        sparse_seq_len=8,
+        sliding_window_size=4,
+        sink_dtype=torch.float32,
+        scale=0.025,
+    )
+
+
+# Keep every original shape/top-k pair, crossed only with window and doc masking (64 cases).
+# Every sink/scale combination occurs, and every shape and top-k sees all three sink/scale
+# values. Sinks are strided here; the LSE cases below exercise contiguous sinks.
+@pytest.mark.parametrize(
+    "seq_len,sparse_seq_len,num_topk,sink_dtype,scale",
+    [
+        pytest.param(128, 128, 16, None, None, id="s128-sp128-k16-no-sink-default"),
+        pytest.param(128, 128, 32, torch.bfloat16, 0.025, id="s128-sp128-k32-bf16-small"),
+        pytest.param(128, 128, 64, torch.float32, 0.125, id="s128-sp128-k64-fp32-large"),
+        pytest.param(128, 128, 128, None, None, id="s128-sp128-k128-no-sink-default"),
+        pytest.param(256, 128, 16, torch.bfloat16, 0.125, id="s256-sp128-k16-bf16-large"),
+        pytest.param(256, 128, 32, torch.float32, None, id="s256-sp128-k32-fp32-default"),
+        pytest.param(256, 128, 64, None, 0.025, id="s256-sp128-k64-no-sink-small"),
+        pytest.param(256, 128, 128, torch.float32, 0.025, id="s256-sp128-k128-fp32-small"),
+        pytest.param(256, 256, 16, torch.float32, 0.025, id="s256-sp256-k16-fp32-small"),
+        pytest.param(256, 256, 32, None, 0.125, id="s256-sp256-k32-no-sink-large"),
+        pytest.param(256, 256, 64, torch.bfloat16, None, id="s256-sp256-k64-bf16-default"),
+        pytest.param(256, 256, 128, torch.bfloat16, 0.025, id="s256-sp256-k128-bf16-small"),
+        pytest.param(128, 256, 16, None, 0.025, id="s128-sp256-k16-no-sink-small"),
+        pytest.param(128, 256, 32, torch.bfloat16, None, id="s128-sp256-k32-bf16-default"),
+        pytest.param(128, 256, 64, torch.float32, None, id="s128-sp256-k64-fp32-default"),
+        pytest.param(128, 256, 128, None, 0.125, id="s128-sp256-k128-no-sink-large"),
+    ],
+)
+@pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
+@pytest.mark.parametrize("sliding_window_size", [64, 128])
+def test_cute_precision_vs_fp64(
+    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
+):
+    """Cover the original shape grid with representative sink/scale forward and gradients."""
+    _skip_no_sm100()
+    pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
+    check_cute_precision(
+        batch=2,
+        num_topk=num_topk,
+        test_docids=test_docids,
+        seq_len=seq_len,
+        sparse_seq_len=sparse_seq_len,
+        sliding_window_size=sliding_window_size,
+        sink_dtype=sink_dtype,
+        scale=scale,
+    )
+
+
 # ---------------------------------------------------------------------------
 # LSE correctness
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scale", [None, 0.025, 0.125])
-@pytest.mark.parametrize("sink_dtype", [None, torch.bfloat16, torch.float32])
+# Default plus one custom scale per sink; the precision matrix covers all nine pairs.
+@pytest.mark.parametrize(
+    "sink_dtype,scale",
+    [
+        pytest.param(None, None, id="no-sink-default"),
+        pytest.param(None, 0.025, id="no-sink-small"),
+        pytest.param(torch.bfloat16, None, id="bf16-default"),
+        pytest.param(torch.bfloat16, 0.125, id="bf16-large"),
+        pytest.param(torch.float32, None, id="fp32-default"),
+        pytest.param(torch.float32, 0.025, id="fp32-small"),
+    ],
+)
 def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
     _skip_no_sm100()
+    pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
     device = torch.device("cuda")
     dtype = torch.bfloat16
     batch, heads, seq_len, head_dim = 1, 128, 64, 512

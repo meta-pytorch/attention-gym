@@ -1,0 +1,4 @@
+# FA4 beta30 predates sparse MLA attention sinks (upstream PR #2768).
+# Keep the source override out of published package metadata: PyPI rejects direct URLs.
+# Remove this override once a tested PyPI release includes this commit.
+flash-attn-4[cu13] @ git+https://github.com/Dao-AILab/flash-attention.git@62892fe4a7582f1837ef72a206639a8563498e9e#subdirectory=flash_attn/cute ; sys_platform == 'linux' and platform_machine == 'x86_64'
