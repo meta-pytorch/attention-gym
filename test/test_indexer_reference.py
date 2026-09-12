@@ -1,5 +1,6 @@
 """Tests for the indexer reference implementation."""
 
+import pytest
 import torch
 
 from attn_gym.sparse.indexer import lightning_indexer
@@ -71,3 +72,65 @@ def test_output_dtype_and_shape():
 
     assert out.dtype == torch.int32
     assert out.shape == (B, T, K)
+
+
+def test_compressed_candidates_causal_masking():
+    """Each candidate summarizes compress_ratio tokens; a row sees only completed windows.
+
+    With T=10 and compress_ratio=4 there are S=2 candidates: tokens 0..3 and 4..7.
+    Tokens 8..9 form no candidate. Query t sees (t + 1) // 4 candidates.
+    """
+    torch.manual_seed(0)
+    T, ratio, topk = 10, 4, 2
+    q = torch.randn(1, T, 2, 8, dtype=torch.float64)
+    k = torch.randn(1, T // ratio, 8, dtype=torch.float64)
+    w = torch.ones(1, T, 2, dtype=torch.float64)
+
+    actual = lightning_indexer(q, k, w, topk, causal=True, compress_ratio=ratio, impl="reference")
+
+    for t in range(T):
+        row = actual[0, t]
+        visible = (t + 1) // ratio
+        valid = row[row >= 0]
+        assert len(valid) == min(visible, topk), f"t={t}"
+        assert (valid < visible).all(), f"t={t}: candidate not yet complete"
+        assert (row == -1).sum() == topk - len(valid), f"t={t}"
+    assert (actual[0, :3] == -1).all()
+    assert set(actual[0, 7].tolist()) == {0, 1}
+
+
+def test_compressed_candidates_rank_within_visible_prefix():
+    """Selection ranks by score among the visible candidates, not merely masks them."""
+    torch.manual_seed(1)
+    T, ratio = 13, 4
+    q = torch.randn(1, T, 2, 8, dtype=torch.float64)
+    k = torch.randn(1, T // ratio, 8, dtype=torch.float64)
+    w = torch.randn(1, T, 2, dtype=torch.float64).abs() + 0.25
+    scores = (torch.einsum("bthd,bsd->bths", q, k).relu() * w.unsqueeze(-1)).sum(2)[0]
+
+    actual = lightning_indexer(q, k, w, 1, causal=True, compress_ratio=ratio, impl="reference")
+
+    assert actual[0, 7, 0] == scores[7, :2].argmax()
+    assert actual[0, 11, 0] == scores[11, :3].argmax()
+    assert actual[0, 12, 0] == scores[12, :3].argmax()
+
+
+@pytest.mark.parametrize(
+    "kwargs,candidates,error,message",
+    [
+        ({"causal": True, "compress_ratio": 4}, 3, ValueError, "S = T // compress_ratio"),
+        ({"causal": True, "compress_ratio": 3}, 2, ValueError, "S = T // compress_ratio"),
+        ({"compress_ratio": 4}, 2, ValueError, "pass causal=True"),
+        ({"causal": True, "compress_ratio": 0}, 2, ValueError, "must be positive"),
+        ({"causal": True, "compress_ratio": 4.0}, 2, TypeError, "Python int"),
+        ({"causal": True}, 2, ValueError, "S = T // compress_ratio"),
+    ],
+    ids=["too_many", "not_ratio", "noncausal", "zero", "float", "square_required"],
+)
+def test_compress_ratio_validation(kwargs, candidates, error, message):
+    """Reject mismatched candidate counts, noncausal ratios, and non-int ratios."""
+    q = torch.randn(1, 10, 2, 8)
+    k = torch.randn(1, candidates, 8)
+    w = torch.randn(1, 10, 2)
+    with pytest.raises(error, match=message):
+        lightning_indexer(q, k, w, 1, impl="reference", **kwargs)

@@ -18,9 +18,11 @@ SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10,
 @pytest.mark.parametrize("tokens", [1, 65, 1023, 1024, 1025, 4096, 65537, 2**20])
 def test_score_workspace_bound(batch, tokens):
     """Score scratch has both an absolute cap and a sequence-independent row cap."""
-    pairs = impl.score_workspace_pairs(batch, tokens)
+    pairs = impl.score_workspace_pairs(batch, tokens, tokens)
     assert 1 <= pairs <= min(512, batch * ((tokens + 1) // 2))
     assert pairs * 2 * tokens * 4 <= 32 * 1024 * 1024
+    # Compressed candidates shrink each row, so more pairs fit in the same bytes.
+    assert impl.score_workspace_pairs(batch, tokens, max(1, tokens // 4)) >= pairs
 
 
 @pytest.fixture
@@ -100,9 +102,9 @@ def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight
     pytest.importorskip("cutlass.cute")
     monkeypatch.setattr(impl, "compile_tvm_ffi", lambda operation, *args: args)
     q, k, weights, scores, *_ = impl._compile_scores.__wrapped__(
-        torch.bfloat16, 32, 128, True, use_int64_offsets, contiguous_weight_heads
+        torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads
     )
-    topk_scores, output, _ = impl._compile_topk.__wrapped__(37, True, use_int64_offsets)
+    topk_scores, output, _ = impl._compile_topk.__wrapped__(37, True, 1, use_int64_offsets)
     width = 64 if use_int64_offsets else 32
     assert q._assumed_align == k._assumed_align == 16
     assert weights._assumed_align == 2
@@ -192,7 +194,7 @@ def test_radix_rejects_non_tma_layout(radix_impl, operand, layout):
 
 
 @pytest.mark.parametrize("distribution", ["random", "ties", "clustered", "signed_zero"])
-@pytest.mark.parametrize("topk", [1, 37, 512])
+@pytest.mark.parametrize("topk", [1, 37, 512, 1024, 4096])
 def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
     """Radix refinement handles negative scores, exact ties and shrink-buffer overflow."""
     import cutlass
@@ -219,7 +221,7 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, False, False)
+        kernel = radix_impl._compile_topk(topk, False, 1, False)
     finally:
         set_compile_target(previous)
     kernel(scores, output, cutlass.Int32(0))
@@ -233,15 +235,18 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("heads,head_dim", [(64, 128), (66, 48)])
-def test_radix_forced_int64(radix_impl, monkeypatch, heads, head_dim):
+def test_radix_forced_int64(radix_impl, monkeypatch, heads, head_dim, compress_ratio):
     """The wide ABI agrees with the ordinary address path on real data."""
-    inputs = make_indexer_test_inputs(65, heads, head_dim, torch.float16)
+    inputs = make_indexer_test_inputs(
+        65, heads, head_dim, torch.float16, compress_ratio=compress_ratio
+    )
     assert not requires_int64_abi(*inputs)
-    expected = radix_impl.launch(*inputs, 16, True)
+    expected = radix_impl.launch(*inputs, 16, True, compress_ratio)
     monkeypatch.setattr(radix_impl, "requires_int64_abi", lambda *args: True)
-    actual = radix_impl.launch(*inputs, 16, True)
-    assert_indexer_selection(actual, *inputs, 16, True)
+    actual = radix_impl.launch(*inputs, 16, True, compress_ratio)
+    assert_indexer_selection(actual, *inputs, 16, True, compress_ratio)
     torch.testing.assert_close(actual.sort(-1).values, expected.sort(-1).values)
 
 

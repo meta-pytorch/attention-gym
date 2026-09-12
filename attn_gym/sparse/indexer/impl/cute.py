@@ -31,15 +31,16 @@ from attn_gym.utils import cdiv
 
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20
-_MAX_SUPPORTED_TOPK = 512
 # Limit both the row count (linear storage as T grows) and absolute scratch bytes.
 _MAX_SCORE_PAIRS = 512
 _SCORE_WORKSPACE_BYTES = 32 * 1024 * 1024
 
 
-def score_workspace_pairs(batch: int, tokens: int) -> int:
-    """Size a slab for positive B and the validated CuTe domain 1 <= T <= 2**20."""
-    return min(_MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * tokens))
+def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
+    """Size a slab for positive B and the validated CuTe domain 1 <= S <= T <= 2**20."""
+    return min(
+        _MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * candidates)
+    )
 
 
 @jit_cache(
@@ -53,10 +54,11 @@ def _compile_scores(
     heads: int,
     head_dim: int,
     causal: bool,
+    compress_ratio: int,
     use_int64_offsets: bool,
     contiguous_weight_heads: bool,
 ) -> Callable[..., None]:
-    """Compile symbolic B/T/strides, specializing only an available unit weight-head stride."""
+    """Compile symbolic B/T/S/strides, specializing only an available unit weight-head stride."""
     import cutlass
     from cutlass import cute
 
@@ -70,12 +72,13 @@ def _compile_scores(
         head_dim,
         causal,
         use_int64_offsets,
+        compress_ratio=compress_ratio,
         contiguous_weight_heads=contiguous_weight_heads,
     )
     io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    batch, tokens, pairs = sym(), sym(), sym()
+    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
     q = make_fake_strided_tensor(
         io_dtype,
         (batch, tokens, heads, head_dim),
@@ -84,7 +87,7 @@ def _compile_scores(
     )
     k = make_fake_strided_tensor(
         io_dtype,
-        (batch, tokens, head_dim),
+        (batch, candidates, head_dim),
         stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
         use_int64_strides=use_int64_offsets,
     )
@@ -96,7 +99,7 @@ def _compile_scores(
     )
     scores = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (pairs, 2, tokens),
+        (pairs, 2, candidates),
         stride_order=(2, 1, 0),
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
@@ -113,8 +116,10 @@ def _compile_scores(
 
 
 @jit_cache(extra_sources=(Path(__file__).with_name("cute_topk.py"),))
-def _compile_topk(topk: int, causal: bool, use_int64_offsets: bool) -> Callable[..., None]:
-    """Compile indices-only radix selection with symbolic B, T and slab capacity."""
+def _compile_topk(
+    topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool
+) -> Callable[..., None]:
+    """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
     import cutlass
     from cutlass import cute
 
@@ -122,10 +127,10 @@ def _compile_topk(topk: int, causal: bool, use_int64_offsets: bool) -> Callable[
 
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    batch, tokens, pairs = sym(), sym(), sym()
+    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
     scores = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (pairs, 2, tokens),
+        (pairs, 2, candidates),
         stride_order=(2, 1, 0),
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
@@ -138,24 +143,32 @@ def _compile_topk(topk: int, causal: bool, use_int64_offsets: bool) -> Callable[
         use_32bit_stride=not use_int64_offsets,
     )
     return compile_tvm_ffi(
-        IndexerTopKKernel(topk, causal, use_int64_offsets), scores, output, integer(0)
+        IndexerTopKKernel(topk, causal, use_int64_offsets, compress_ratio=compress_ratio),
+        scores,
+        output,
+        integer(0),
     )
 
 
-def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int) -> None:
+def _validate(
+    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int, compress_ratio: int
+) -> None:
     """Validate SM100 indexer tensor metadata and base alignment."""
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B,T,H,D], got {tuple(q.shape)}")
     if k.ndim != 3:
-        raise ValueError(f"k must have shape [B,T,D], got {tuple(k.shape)}")
+        raise ValueError(f"k must have shape [B,S,D], got {tuple(k.shape)}")
     if weights.ndim != 3:
         raise ValueError(f"weights must have shape [B,T,H], got {tuple(weights.shape)}")
 
     batch, queries, heads, head_dim = q.shape
-    if tuple(k.shape) != (batch, queries, head_dim):
+    if compress_ratio < 1:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    candidates = queries // compress_ratio
+    if tuple(k.shape) != (batch, candidates, head_dim):
         raise ValueError(
-            "prefill requires equal query/key lengths and matching B,D: "
-            f"q={tuple(q.shape)}, k={tuple(k.shape)}"
+            f"k must have shape {(batch, candidates, head_dim)} for T={queries} and "
+            f"compress_ratio={compress_ratio}, got {tuple(k.shape)}"
         )
     if tuple(weights.shape) != (batch, queries, heads):
         raise ValueError(
@@ -174,12 +187,8 @@ def _validate(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int
         )
     if not isinstance(topk, int) or isinstance(topk, bool):
         raise TypeError(f"topk must be an int, got {type(topk).__name__}")
-    if topk < 0 or topk > queries:
-        raise ValueError(f"topk must be in [0, {queries}], got {topk}")
-    if topk > _MAX_SUPPORTED_TOPK:
-        raise ValueError(
-            f"topk must be <= {_MAX_SUPPORTED_TOPK} for the CuTeDSL indexer, got {topk}"
-        )
+    if topk < 0 or topk > candidates:
+        raise ValueError(f"topk must be in [0, {candidates}], got {topk}")
 
     tensors = (q, k, weights)
     if any(not tensor.is_cuda for tensor in tensors):
@@ -209,18 +218,20 @@ def launch(
     weights: torch.Tensor,
     topk: int,
     causal: bool = False,
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage."""
     import cutlass
 
-    _validate(q, k, weights, topk)
+    _validate(q, k, weights, topk, compress_ratio)
     batch, tokens, heads, head_dim = q.shape
+    candidates = k.shape[1]
     output = torch.empty((batch, tokens, topk), dtype=torch.int32, device=q.device)
     if topk == 0:
         return output
 
-    pairs = score_workspace_pairs(batch, tokens)
-    scores = torch.empty((pairs, 2, tokens), dtype=torch.float32, device=q.device)
+    pairs = score_workspace_pairs(batch, tokens, candidates)
+    scores = torch.empty((pairs, 2, candidates), dtype=torch.float32, device=q.device)
     use_int64_offsets = requires_int64_abi(q, k, weights, scores, output)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     previous = get_compile_target()
@@ -228,9 +239,15 @@ def launch(
         set_compile_target(detect_compile_target(q.device.index))
         # A unit head stride avoids the generic reducer's measured strided-load overhead.
         score_kernel = _compile_scores(
-            q.dtype, heads, head_dim, causal, use_int64_offsets, weights.stride(-1) == 1
+            q.dtype,
+            heads,
+            head_dim,
+            causal,
+            compress_ratio,
+            use_int64_offsets,
+            weights.stride(-1) == 1,
         )
-        topk_kernel = _compile_topk(topk, causal, use_int64_offsets)
+        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets)
     finally:
         set_compile_target(previous)
 

@@ -4,7 +4,7 @@
 
 """Tiled SM100 indexer score generation without shape-sized shared buffers.
 
-One CTA owns one query in the caller's [P, 2, T] FP32 score slab. Candidate,
+One CTA owns one query in the caller's [P, 2, S] FP32 score slab. Candidate,
 head, and reduction tiles bound shared-memory and TMEM usage independently of
 H and D. Separate head/query/batch TMA modes zero-fill tails without reading
 another query or batch. This module allocates no global workspace and performs
@@ -53,6 +53,7 @@ class IndexerGenericScoreKernel:
         causal: bool,
         use_int64_offsets: bool = False,
         *,
+        compress_ratio: int = 1,
         contiguous_weight_heads: bool,
     ):
         if heads <= 0 or heads % 2 != 0:
@@ -62,6 +63,7 @@ class IndexerGenericScoreKernel:
         self.heads = heads
         self.head_dim = head_dim
         self.causal = causal
+        self.compress_ratio = compress_ratio
         self.use_int64_offsets = use_int64_offsets
         self.contiguous_weight_heads = contiguous_weight_heads
         self.head_tiles = (heads + self.tile_heads - 1) // self.tile_heads
@@ -80,13 +82,21 @@ class IndexerGenericScoreKernel:
         """Return a stable name for the shape, mask, weight layout, and offset width."""
         return (
             f"indexer_score_generic_h{self.heads}_d{self.head_dim}_c{int(self.causal)}_"
-            f"i64{int(self.use_int64_offsets)}_wh{int(self.contiguous_weight_heads)}"
+            f"r{self.compress_ratio}_i64{int(self.use_int64_offsets)}_"
+            f"wh{int(self.contiguous_weight_heads)}"
         )
 
     @cute.jit
     def upcast_offset(self, value):
         """Widen origins before address arithmetic in the wide specialization."""
         return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else Int32(value)
+
+    @cute.jit
+    def visible_candidates(self, query):
+        """Causal candidate count for query; the static ratio keeps r=1 division-free."""
+        if cutlass.const_expr(self.compress_ratio == 1):
+            return query + 1
+        return (query + 1) // self.compress_ratio
 
     @cute.jit
     def __call__(
@@ -180,6 +190,7 @@ class IndexerGenericScoreKernel:
         slab_pair = self.upcast_offset(block_id) // 2
         qi = block_id % 2
         num_queries = self.upcast_offset(weights.shape[1])
+        num_candidates = self.upcast_offset(scores.shape[2])
         pairs_per_batch = cute.ceil_div(num_queries, 2)
         global_pair = pair_start + slab_pair
         batch = global_pair // pairs_per_batch
@@ -187,11 +198,8 @@ class IndexerGenericScoreKernel:
         active = batch < self.upcast_offset(weights.shape[0]) and query < num_queries
 
         if active:
-            candidate_tiles = (
-                cute.ceil_div(query + 1, self.tile_candidates)
-                if self.causal
-                else cute.ceil_div(num_queries, self.tile_candidates)
-            )
+            candidate_end = self.visible_candidates(query) if self.causal else num_candidates
+            candidate_tiles = cute.ceil_div(candidate_end, self.tile_candidates)
             smem = utils.SmemAllocator()
             storage = smem.allocate(self.SharedStorage)
             sK = smem.allocate_tensor(
@@ -248,7 +256,7 @@ class IndexerGenericScoreKernel:
                     qi,
                     tidx,
                     query,
-                    num_queries,
+                    num_candidates,
                     candidate_tiles,
                     score_scale,
                 )
@@ -383,7 +391,7 @@ class IndexerGenericScoreKernel:
         qi: Int32,
         tidx: Int32,
         query,
-        num_queries,
+        num_candidates,
         candidate_tiles,
         score_scale: Float32,
     ):
@@ -408,9 +416,9 @@ class IndexerGenericScoreKernel:
             candidate = (
                 self.upcast_offset(candidate_tile) * self.tile_candidates + coordinates[0][0]
             )
-            valid = candidate < num_queries
+            valid = candidate < num_candidates
             if cutlass.const_expr(self.causal):
-                valid = valid and candidate <= query
+                valid = valid and candidate < self.visible_candidates(query)
             sum0 = Float32(0.0)
             sum1 = Float32(0.0)
             sum2 = Float32(0.0)

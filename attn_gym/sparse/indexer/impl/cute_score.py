@@ -8,7 +8,7 @@ Adapted from cuDNN Frontend's ``dense_score_recompute_sm100.py`` and
 heads are packed into the B operand. One FP32 MMA tile has shape [128, 2*H];
 the epilogue independently computes ``scale * sum_h(weight * ReLU(Q @ K))``
 for each query. This module owns only score generation, not Top-K or allocation
-of the caller's [P, 2, T] FP32 slab.
+of the caller's [P, 2, S] FP32 slab.
 
 Head, query, and batch remain separate TMA modes despite the logical packing,
 so their physical strides are independent and odd query tails are zero-filled.
@@ -57,6 +57,7 @@ class IndexerScoreKernel:
         causal: bool,
         use_int64_offsets: bool = False,
         *,
+        compress_ratio: int = 1,
         contiguous_weight_heads: bool,
     ):
         if heads not in (32, 64) or head_dim != 128:
@@ -64,6 +65,7 @@ class IndexerScoreKernel:
         self.heads = heads
         self.head_dim = head_dim
         self.causal = causal
+        self.compress_ratio = compress_ratio
         self.use_int64_offsets = use_int64_offsets
         self.contiguous_weight_heads = contiguous_weight_heads
         self.packed_heads = 2 * heads
@@ -82,13 +84,21 @@ class IndexerScoreKernel:
         """Return a stable name for the shape, mask, weight layout, and offset width."""
         return (
             f"indexer_score_h{self.heads}_d{self.head_dim}_c{int(self.causal)}_"
-            f"i64{int(self.use_int64_offsets)}_wh{int(self.contiguous_weight_heads)}"
+            f"r{self.compress_ratio}_i64{int(self.use_int64_offsets)}_"
+            f"wh{int(self.contiguous_weight_heads)}"
         )
 
     @cute.jit
     def upcast_offset(self, value):
         """Widen origins before address arithmetic in the wide specialization."""
         return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else Int32(value)
+
+    @cute.jit
+    def visible_candidates(self, query):
+        """Causal candidate count for query; the static ratio keeps r=1 division-free."""
+        if cutlass.const_expr(self.compress_ratio == 1):
+            return query + 1
+        return (query + 1) // self.compress_ratio
 
     @cute.jit
     def __call__(
@@ -178,6 +188,7 @@ class IndexerScoreKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         local_pair, _, _ = cute.arch.block_idx()
         num_queries = self.upcast_offset(weights.shape[1])
+        num_candidates = self.upcast_offset(scores.shape[2])
         pairs_per_batch = cute.ceil_div(num_queries, 2)
         global_pair = pair_start + self.upcast_offset(local_pair)
         batch = global_pair // pairs_per_batch
@@ -186,9 +197,9 @@ class IndexerScoreKernel:
         active = global_pair < self.upcast_offset(weights.shape[0]) * pairs_per_batch
         query_last = query0 + 1 if query0 + 1 < num_queries else query0
         candidate_tiles = (
-            cute.ceil_div(query_last + 1, self.tile_candidates)
+            cute.ceil_div(self.visible_candidates(query_last), self.tile_candidates)
             if self.causal
-            else cute.ceil_div(num_queries, self.tile_candidates)
+            else cute.ceil_div(num_candidates, self.tile_candidates)
         )
 
         smem = utils.SmemAllocator()
@@ -259,6 +270,7 @@ class IndexerScoreKernel:
                     tidx,
                     query0,
                     num_queries,
+                    num_candidates,
                     candidate_tiles,
                     score_scale,
                 )
@@ -382,6 +394,7 @@ class IndexerScoreKernel:
         tidx: Int32,
         query0,
         num_queries,
+        num_candidates,
         candidate_tiles,
         score_scale: Float32,
     ):
@@ -417,9 +430,9 @@ class IndexerScoreKernel:
             )
             for qi in cutlass.range_constexpr(2):
                 query = query0 + qi
-                valid = query < num_queries and candidate < num_queries
+                valid = query < num_queries and candidate < num_candidates
                 if cutlass.const_expr(self.causal):
-                    valid = valid and candidate <= query
+                    valid = valid and candidate < self.visible_candidates(query)
                 if valid:
                     # Four independent FP32 chains keep head reduction latency
                     # bounded without packed-PTX or cross-thread reductions.

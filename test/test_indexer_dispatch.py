@@ -62,11 +62,11 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
         )
     if fails:
         with pytest.raises(RuntimeError) as exc:
-            ops._indexer_cuda(q, k, weights, 1, True, backend)
+            ops._indexer_cuda(q, k, weights, 1, True, 1, backend)
         assert exc.value is failure
     else:
-        assert ops._indexer_cuda(q, k, weights, 1, True, backend) is launch.return_value
-    launch.assert_called_once_with(q, k, weights, 1, True)
+        assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
+    launch.assert_called_once_with(q, k, weights, 1, True, 1)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
@@ -174,3 +174,78 @@ def test_backend_cuda_graph_replay(backend, dtype, tokens, heads, dim, topk, cau
         graph.replay()
         assert_indexer_selection(actual, *inputs, topk, causal)
         assert_indexer_selection(run(), *inputs, topk, causal)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize(
+    "tokens,heads,dim,topk,compress_ratio",
+    [
+        (10, 32, 128, 2, 4),
+        (1027, 64, 128, 16, 4),
+        (1027, 66, 96, 37, 4),
+        (1027, 32, 128, 37, 3),
+        (4099, 64, 128, 1024, 4),
+        (2048, 32, 128, 1024, 1),
+        (8200, 32, 128, 2048, 1),
+        (3, 2, 16, 1, 3),
+    ],
+    ids=[
+        "zero_tile_rows",
+        "packed",
+        "generic",
+        "odd_ratio",
+        "topk_1024_all_candidates",
+        "topk_1024",
+        "topk_2048",
+        "one_candidate",
+    ],
+)
+def test_compressed_candidates(backend, tokens, heads, dim, topk, compress_ratio):
+    """Both fused backends score T queries against T // compress_ratio candidates.
+
+    Rows before the first completed window select nothing, the last window is
+    dropped when T is not a multiple of the ratio, and any topk <= S is accepted.
+    """
+    require_backend(backend)
+    inputs = make_indexer_test_inputs(
+        tokens, heads, dim, torch.bfloat16, compress_ratio=compress_ratio
+    )
+    actual = lightning_indexer(
+        *inputs,
+        topk,
+        causal=True,
+        compress_ratio=compress_ratio,
+        kernel_options={"backend": backend},
+    )
+    assert_indexer_selection(actual, *inputs, topk, True, compress_ratio)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compressed_candidates_fullgraph_and_graph_replay():
+    """The public compressed route reuses one dynamic graph and replays under CUDA Graphs."""
+    require_backend()
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True, backend=counter)
+    # S must differ from B, H and D on the first call to avoid Dynamo's duck-shape guard.
+    for tokens in (65, 131):
+        inputs = make_indexer_test_inputs(tokens, 2, 32, torch.bfloat16, compress_ratio=4)
+        actual = compiled(*inputs, 7, causal=True, compress_ratio=4)
+        assert_indexer_selection(actual, *inputs, 7, True, 4)
+    assert counter.frame_count == 1
+
+    def run():
+        return lightning_indexer(*inputs, 7, causal=True, compress_ratio=4)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        replayed = run()
+    for tensor in inputs:
+        tensor.normal_()
+    graph.replay()
+    assert_indexer_selection(replayed, *inputs, 7, True, 4)

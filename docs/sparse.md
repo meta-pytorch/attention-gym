@@ -11,13 +11,20 @@ from attn_gym.sparse import lightning_indexer
 indices = lightning_indexer(q, k, weights, topk=128, causal=True)
 # q: [B, T, H, D], k: [B, T, D], weights: [B, T, H]
 # indices: [B, T, 128], int32
+
+# DeepSeek compressed sparse attention: one candidate per 4 consecutive tokens.
+indices = lightning_indexer(q, k_compressed, weights, topk=128, causal=True, compress_ratio=4)
+# k_compressed: [B, T // 4, D]; query t may select candidates s < (t + 1) // 4
 ```
 
 The score for a query/candidate pair is
 `sum_h(weights[h] * relu(dot(q[h], k))) / sqrt(H * D)`.
-Weights may be negative. Query and candidate lengths must match. With causal selection,
-query `t` considers only candidates `0..t`; rows with fewer than `topk` candidates contain
-`-1` padding. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
+Weights may be negative. `k` holds `S = T // compress_ratio` candidates, each summarizing
+`compress_ratio` consecutive tokens (a trailing partial window forms no candidate). With
+causal selection, query `t` considers only candidates `s < (t + 1) // compress_ratio`, those
+whose tokens all lie at positions `<= t` (candidates `0..t` with the default ratio of 1);
+rows with fewer than `topk` candidates contain `-1` padding. `compress_ratio != 1` requires
+`causal=True`. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
 position rather than an invalid position. `topk=0` returns an empty last dimension.
 Output order and tie-breaking are unspecified, including between repeated calls.
 
@@ -45,7 +52,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 | Heads `H` | Positive and even | `1..256` |
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
 | Sequence length `T` | `1..2**20` | `1..2**20` |
-| `topk` | `0..min(T, 512)` | `0..min(T, 512)` |
+| `topk` | `0..S` | `0..S`; per-tile cost grows with `topk` |
 | Layout | Q/K last stride 1, bases and non-singleton outer strides 16-byte aligned; weights may be strided | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
 
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without

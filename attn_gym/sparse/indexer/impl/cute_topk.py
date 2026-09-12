@@ -76,7 +76,7 @@ def _block_scan_inclusive(
 
 
 class IndexerTopKKernel:
-    """Select static K indices per row from a contiguous symbolic [P, 2, T] slab.
+    """Select static K indices per row from a contiguous symbolic [P, 2, S] slab.
 
     ``pair_start`` locates the slab in flattened (batch, query-pair) order; odd
     sequence tails do not share pairs across batches. The caller handles K=0
@@ -86,15 +86,23 @@ class IndexerTopKKernel:
 
     block_threads = 512
 
-    def __init__(self, topk: int, causal: bool, use_int64_offsets: bool = False):
+    def __init__(
+        self,
+        topk: int,
+        causal: bool,
+        use_int64_offsets: bool = False,
+        *,
+        compress_ratio: int = 1,
+    ):
         self.topk = topk
         self.causal = causal
+        self.compress_ratio = compress_ratio
         self.use_int64_offsets = use_int64_offsets
 
     def get_name(self) -> str:
         """Return a stable artifact name including all static specialization fields."""
         return (
-            f"indexer_topk_k{self.topk}_c{int(self.causal)}_"
+            f"indexer_topk_k{self.topk}_c{int(self.causal)}_r{self.compress_ratio}_"
             f"i64{int(self.use_int64_offsets)}_th{self.block_threads}"
         )
 
@@ -102,6 +110,13 @@ class IndexerTopKKernel:
     def upcast_offset(self, value):
         """Widen indices before any address arithmetic in the wide specialization."""
         return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
+
+    @cute.jit
+    def visible_candidates(self, query):
+        """Causal candidate count for query; the static ratio keeps r=1 division-free."""
+        if cutlass.const_expr(self.compress_ratio == 1):
+            return query + 1
+        return (query + 1) // self.compress_ratio
 
     @cute.jit
     def find_threshold(
@@ -150,8 +165,9 @@ class IndexerTopKKernel:
         block_id = self.upcast_offset(cute.arch.block_idx()[0])
         slab_pair = block_id // 2
         qi = block_id % 2
-        seq_len = self.upcast_offset(scores.shape[2])
-        pairs_per_batch = cute.ceil_div(seq_len, 2)
+        num_queries = self.upcast_offset(output.shape[1])
+        num_candidates = self.upcast_offset(scores.shape[2])
+        pairs_per_batch = cute.ceil_div(num_queries, 2)
         global_pair = self.upcast_offset(pair_start) + slab_pair
         batch = global_pair // pairs_per_batch
         q = (global_pair % pairs_per_batch) * 2 + qi
@@ -173,11 +189,11 @@ class IndexerTopKKernel:
             Int32, cute.make_layout((_SHRINK_MAX,)), byte_alignment=128
         )
 
-        if batch < output.shape[0] and q < seq_len:
+        if batch < output.shape[0] and q < num_queries:
             row_output = output[batch, q, None]
-            seg_len = Int32(seq_len)
+            seg_len = Int32(num_candidates)
             if cutlass.const_expr(self.causal):
-                seg_len = Int32(q + 1)
+                seg_len = Int32(self.visible_candidates(q))
 
             if seg_len <= self.topk:
                 for slot in range(tidx, self.topk, self.block_threads):
