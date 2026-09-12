@@ -12,6 +12,7 @@ def launch(
     weights: Tensor,
     topk: int,
     causal: bool,
+    compress_ratio: int,
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
@@ -25,7 +26,8 @@ def launch(
         k: [B, S, D]
         weights: [B, T, H]
         topk: number of candidates to select per query
-        causal: mask out candidates at positions beyond the query position
+        causal: keep only the ``(t + 1) // compress_ratio`` leading candidates of query t
+        compress_ratio: tokens summarized per candidate; ``S == T // compress_ratio``
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -51,17 +53,15 @@ def launch(
     scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
 
     if causal:
-        query_positions = torch.arange(queries, device=q.device)[:, None]
+        visible = (torch.arange(1, queries + 1, device=q.device) // compress_ratio)[:, None]
         key_positions = torch.arange(candidates, device=q.device)[None, :]
-        scores.masked_fill_(key_positions > query_positions, float("-inf"))
+        scores.masked_fill_(key_positions >= visible, float("-inf"))
 
     indices = scores.topk(topk, dim=-1).indices.to(torch.int32)
 
     # Slots that selected a causally invalid candidate are replaced with -1.
-    # This happens when topk exceeds the number of valid candidates for a row
-    # (i.e. query position t < topk).
+    # This happens when topk exceeds the number of visible candidates for a row.
     if causal:
-        row = torch.arange(queries, device=q.device).view(1, queries, 1)
-        indices.masked_fill_(indices > row, -1)
+        indices.masked_fill_(indices >= visible.view(1, queries, 1), -1)
 
     return indices

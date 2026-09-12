@@ -74,7 +74,7 @@ def test_triton_strided_inputs(causal):
     assert_indexer_selection(actual, q, k, weights, 37, causal)
     from attn_gym.sparse.indexer.ops import _indexer_op
 
-    torch.library.opcheck(_indexer_op, (q, k, weights, 37, causal, "triton"))
+    torch.library.opcheck(_indexer_op, (q, k, weights, 37, causal, 1, "triton"))
 
 
 @pytest.mark.parametrize(
@@ -84,7 +84,6 @@ def test_triton_strided_inputs(causal):
         (None, 65, 3, 18, 1, torch.bfloat16, ValueError, "H <= 256"),
         (None, 65, 3, 264, 1, torch.bfloat16, ValueError, "H <= 256"),
         (None, 65, 257, 16, 1, torch.bfloat16, ValueError, "H <= 256"),
-        (None, 513, 3, 16, 513, torch.bfloat16, ValueError, "K <= 512"),
         ("q", 65, 3, 16, 1, torch.bfloat16, ValueError, "contiguous last dimension"),
         ("k", 65, 3, 16, 1, torch.bfloat16, ValueError, "contiguous last dimension"),
         ("outer", 65, 3, 17, 1, torch.bfloat16, ValueError, "16-byte outer strides"),
@@ -94,7 +93,6 @@ def test_triton_strided_inputs(causal):
         "dim_unaligned",
         "dim_large",
         "heads",
-        "topk",
         "q_layout",
         "k_layout",
         "outer_stride",
@@ -124,7 +122,7 @@ def test_triton_opcheck(dtype, requires_grad, topk):
     inputs = make_indexer_test_inputs(65, 3, 48, dtype)
     for tensor in inputs:
         tensor.requires_grad_(requires_grad)
-    torch.library.opcheck(_indexer_op, (*inputs, topk, True, "triton"))
+    torch.library.opcheck(_indexer_op, (*inputs, topk, True, 1, "triton"))
     actual = lightning_indexer(
         *inputs, topk, causal=True, impl="fused", kernel_options={"backend": "triton"}
     )

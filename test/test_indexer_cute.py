@@ -187,8 +187,8 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         "topk_127",
         "topk_129",
         "topk_512",
-        "topk_1024",
-        "topk_4096",
+        "candidates_1024",
+        "candidates_4096",
     ],
 )
 def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal, dtype):
@@ -360,7 +360,7 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
     w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
     # AOT opcheck compares integer outputs exactly. Full selection has a stable
     # output order; selective rows are checked semantically in the compile tests.
-    torch.library.opcheck(_indexer_op, (q, k, w, topk, causal, "cute"))
+    torch.library.opcheck(_indexer_op, (q, k, w, topk, causal, 1, "cute"))
     result = lightning_indexer(q, k, w, topk, causal=causal, impl="fused")
     assert not result.requires_grad
     assert result.grad_fn is None
@@ -391,8 +391,8 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             for compiler in compilers:
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
-        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, False, True)
-        assert impl._compile_topk.is_cached(16, True, False)
+        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True)
+        assert impl._compile_topk.is_cached(16, True, 1, False)
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
             compiler.cache_clear()

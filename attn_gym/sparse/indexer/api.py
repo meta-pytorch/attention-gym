@@ -12,6 +12,7 @@ def _validate_inputs(
     weights: Tensor,
     topk: int,
     causal: bool,
+    compress_ratio: int,
 ) -> None:
     """Validate metadata without synchronizing or inspecting tensor values."""
     # --- type checks ---
@@ -24,6 +25,15 @@ def _validate_inputs(
 
     if not isinstance(causal, bool):
         raise TypeError(f"causal must be a bool, got {type(causal).__name__}.")
+
+    if not isinstance(compress_ratio, int) or isinstance(compress_ratio, bool):
+        raise TypeError(
+            f"compress_ratio must be a Python int, got {type(compress_ratio).__name__}."
+        )
+    if compress_ratio < 1:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}.")
+    if compress_ratio != 1 and not causal:
+        raise ValueError("compress_ratio != 1 requires causal selection; pass causal=True.")
 
     # --- ndim ---
     if q.ndim != 4:
@@ -72,10 +82,11 @@ def _validate_inputs(
     if topk < 0 or topk > candidates:
         raise ValueError(f"topk must be in [0, {candidates}], got {topk}.")
 
-    # --- square constraint (nonsquare not yet supported) ---
-    if candidates != queries:
-        raise NotImplementedError(
-            f"Nonsquare inputs are not supported yet (T={queries}, S={candidates})."
+    # --- candidate count: one key per completed window of compress_ratio tokens ---
+    if candidates != queries // compress_ratio:
+        raise ValueError(
+            f"k must hold S = T // compress_ratio = {queries // compress_ratio} candidates, "
+            f"got S={candidates} (T={queries}, compress_ratio={compress_ratio})."
         )
 
 
@@ -86,6 +97,7 @@ def lightning_indexer(
     topk: int,
     *,
     causal: bool = False,
+    compress_ratio: int = 1,
     impl: str = "fused",
     kernel_options: dict[str, str] | None = None,
 ) -> Tensor:
@@ -102,15 +114,21 @@ def lightning_indexer(
     Args:
         q: Query tensor, [B, T, H, D].
 
-        k: Key candidate pool shared across heads, [B, S, D].
-            Nonsquare inputs (S != T) are not supported yet.
+        k: Key candidate pool shared across heads, [B, S, D], with
+            ``S = T // compress_ratio``.
 
         weights: Per-head weights, [B, T, H]. May be negative.
 
         topk: Number of candidates to select per query.  Must be in [0, S].
 
-        causal: If True, query at position t can only attend to candidates
-            at positions <= t.  Requires S == T.
+        causal: If True, query t can only select candidates
+            ``s < (t + 1) // compress_ratio``, i.e. those whose covered tokens all
+            lie at positions <= t (candidates ``0..t`` when ``compress_ratio=1``).
+
+        compress_ratio: Number of consecutive tokens summarized by each
+            candidate, as in DeepSeek compressed sparse attention. A trailing
+            partial window forms no candidate, so ``S = T // compress_ratio``.
+            Values other than 1 require ``causal=True``.
 
         impl: ``"reference"`` uses eager PyTorch on CPU or CUDA; ``"fused"`` uses
             optimized CUDA kernels. Defaults to ``"fused"``.
@@ -126,12 +144,13 @@ def lightning_indexer(
         contain -1 padding; topk=0 returns an empty last dimension.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
-    Both require FP16/BF16 inputs, T <= 2**20, and topk <= 512. CuTe requires SM100,
-    even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
+    Both require FP16/BF16 inputs and T <= 2**20 and accept any topk <= S. CuTe requires
+    SM100, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
     bases and non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
     Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with
     unit last strides and 16-byte-aligned bases and outer strides; weights may be strided.
+    Its register-resident selection makes per-tile cost grow with topk.
     CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
     rows. Large inputs use slabs rather than an unbounded quadratic score allocation.
     This workspace is additional to the returned indices and is not shared across calls.
@@ -142,7 +161,7 @@ def lightning_indexer(
     selection into q, k, or weights.
     """
 
-    _validate_inputs(q, k, weights, topk, causal)
+    _validate_inputs(q, k, weights, topk, causal, compress_ratio)
 
     match impl:
         case "reference":
@@ -150,7 +169,7 @@ def lightning_indexer(
                 raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
-            return reference.launch(q, k, weights, topk, causal)
+            return reference.launch(q, k, weights, topk, causal, compress_ratio)
         case "fused":
             if kernel_options not in (
                 None,
@@ -162,6 +181,6 @@ def lightning_indexer(
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
             backend = (kernel_options or {}).get("backend", "auto")
-            return _indexer_op(q, k, weights, topk, causal, backend)
+            return _indexer_op(q, k, weights, topk, causal, compress_ratio, backend)
         case _:
             raise ValueError(f"unknown impl {impl!r}; expected 'reference' or 'fused'")

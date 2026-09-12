@@ -14,6 +14,7 @@ def make_indexer_test_inputs(
     dtype: torch.dtype,
     *,
     batch: int = 2,
+    compress_ratio: int = 1,
     device: str | torch.device = "cuda",
     seed: int = 77,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -22,7 +23,8 @@ def make_indexer_test_inputs(
     q = torch.randn(
         batch, tokens, heads, head_dim, device=device, dtype=dtype, generator=generator
     )
-    k = torch.randn(batch, tokens, head_dim, device=device, dtype=dtype, generator=generator)
+    candidates = tokens // compress_ratio
+    k = torch.randn(batch, candidates, head_dim, device=device, dtype=dtype, generator=generator)
     weights = torch.randn(batch, tokens, heads, device=device, dtype=dtype, generator=generator)
     weights[..., 0] = weights[..., 0].abs() + 0.25
     if heads > 1:
@@ -69,6 +71,7 @@ def assert_indexer_selection(
     weights: torch.Tensor,
     topk: int,
     causal: bool,
+    compress_ratio: int = 1,
 ) -> None:
     """Check index invariants and FP64 boundary regret against eager's regret.
 
@@ -77,18 +80,21 @@ def assert_indexer_selection(
     bounds a selection boundary swap; scores have no FP16/BF16 output rounding.
     """
     batch, tokens, heads, dim = q.shape
+    candidates = k.shape[1]
+    assert candidates == tokens // compress_ratio
     assert actual.shape == (batch, tokens, topk)
     assert actual.dtype == torch.int32
     assert actual.device == q.device
     assert actual.is_contiguous()
     assert not actual.requires_grad
     valid = actual >= 0
-    assert not ((actual < -1) | (actual >= tokens)).any()
+    assert not ((actual < -1) | (actual >= candidates)).any()
     row = torch.arange(tokens, device=q.device).view(1, tokens, 1)
-    counts = (row + 1).clamp_max(topk) if causal else torch.full_like(row, topk)
+    visible = (row + 1) // compress_ratio
+    counts = visible.clamp_max(topk) if causal else torch.full_like(row, topk)
     assert torch.equal(valid.sum(-1, keepdim=True), counts.expand(batch, -1, -1))
     if causal:
-        assert not (valid & (actual > row)).any()
+        assert not (valid & (actual >= visible)).any()
     ordered = actual.sort(-1).values
     assert not ((ordered[..., 1:] == ordered[..., :-1]) & (ordered[..., 1:] >= 0)).any()
     if topk == 0:
@@ -103,13 +109,15 @@ def assert_indexer_selection(
     magnitude = (absolute_dots * w64.abs().transpose(1, 2).unsqueeze(-1)).sum(1)
     magnitude /= math.sqrt(heads * dim)
     if causal:
-        future = torch.arange(tokens, device=q.device).view(1, 1, tokens) > row
+        future = torch.arange(candidates, device=q.device).view(1, 1, candidates) >= visible
         scores.masked_fill_(future, -torch.inf)
         magnitude.masked_fill_(future, 0)
     boundary = scores.sort(-1, descending=True).values.gather(
-        -1, (counts - 1).expand(batch, -1, -1)
+        -1, (counts - 1).clamp_min(0).expand(batch, -1, -1)
     )
-    eager = lightning_indexer(q, k, weights, topk, causal=causal, impl="reference")
+    eager = lightning_indexer(
+        q, k, weights, topk, causal=causal, compress_ratio=compress_ratio, impl="reference"
+    )
     actual_scores = scores.gather(-1, actual.long().clamp_min(0))
     eager_scores = scores.gather(-1, eager.long().clamp_min(0))
     actual_error = (boundary - actual_scores).clamp_min(0).masked_fill(~valid, 0)
