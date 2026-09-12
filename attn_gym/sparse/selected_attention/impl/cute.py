@@ -9,9 +9,11 @@ FA4 exposes a compile-friendly public wrapper upstream.
 
 Constraints
 -----------
-- head_dim = 512, nheads = 128, share_kv = True
+- head_dim = 512, 1 <= nheads <= 128, share_kv = True (fewer than 128 heads are
+  zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
 - dtype = bfloat16, SM100 (compute capability 10.0)
-- Requires FA4 with sparse MLA attention sink support (commit 62892fe+)
+- Requires FA4 with sparse MLA attention sink support (commit 62892fe+); fewer than
+  128 heads also require FA4's sparse-MLA head-padding support (PR #2883)
 """
 
 from __future__ import annotations
@@ -96,15 +98,19 @@ def _validate_cute_constraints(query, share_kv):
     _b, h, _s, d = query.shape
     if d != 512:
         raise ValueError(f"CuTe backend requires head_dim=512, got {d}.")
-    if h != 128:
-        raise ValueError(f"CuTe backend requires 128 query heads, got {h}.")
+    if not 0 < h <= 128:
+        raise ValueError(f"CuTe backend requires at most 128 query heads, got {h}.")
 
 
 @cache
-def _fa4_available(with_sink: bool) -> bool:
+def _fa4_available(with_sink: bool, *, padded_heads: bool = False) -> bool:
     """Probe the optional dependency once, only after tensor metadata qualifies."""
     try:
         from flash_attn.cute.interface import flash_attn_func  # noqa: F401
+
+        if padded_heads:
+            # Added with FA4's arbitrary-head sparse MLA kernels; older FA4 requires H=128.
+            from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile  # noqa: F401
 
         if with_sink:
             from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
@@ -124,7 +130,15 @@ def is_supported(query, attention_sink, share_kv) -> bool:
         _validate_cute_constraints(query, share_kv)
     except (ValueError, TypeError):
         return False
-    return _fa4_available(attention_sink is not None)
+    # FA4 requires a unit leading stride. Its contiguous repair skips singleton views,
+    # which PyTorch considers contiguous even when their stride is not one.
+    if (
+        attention_sink is not None
+        and attention_sink.numel() == 1
+        and attention_sink.stride(0) != 1
+    ):
+        return False
+    return _fa4_available(attention_sink is not None, padded_heads=query.shape[1] != 128)
 
 
 def _check_backward_mode(grad: torch.Tensor) -> torch.Tensor:
