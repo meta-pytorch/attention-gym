@@ -12,6 +12,7 @@ from .primitives import (
     causal_window_mask,
     load_bhsd,
     load_bs,
+    prune_wide_backward_configs,
     store_bhsd,
 )
 from .shared_backward import (
@@ -156,7 +157,14 @@ def _selected_attention_bwd_dq(
     sink = tl.load(attention_sink_ptr + head)
     sink_probability = tl.exp(sink - lse)
     sink_gradient = tl.where(query_mask, -sink_probability * delta, 0.0)
-    tl.atomic_add(grad_sink_ptr + head, tl.sum(sink_gradient, axis=0))
+    if D == 512:
+        # Output-owned partials also keep the generic D=512 fallback deterministic.
+        tl.store(
+            grad_sink_ptr + batch_head * tl.cdiv(S, BLOCK_M) + query_block,
+            tl.sum(sink_gradient, axis=0),
+        )
+    else:
+        tl.atomic_add(grad_sink_ptr + head, tl.sum(sink_gradient, axis=0))
 
 
 @triton.jit
@@ -380,6 +388,7 @@ def _selected_attention_bwd_dlocal_kv_tma(
         for num_stages in (1, 3)
     ],
     key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    prune_configs_by={"early_config_prune": prune_wide_backward_configs},
     cache_results=True,
 )
 @triton.jit
@@ -548,8 +557,9 @@ def _launch_backward(
     batch, heads, seq_len, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     topk = kv_indices.shape[-1]
-    block_m = 64
-    block_n = 32
+    # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
+    block_m = 16 if head_dim == 512 else 64
+    block_n = 16 if head_dim == 512 else 32
     block_d = max(16, triton.next_power_of_2(head_dim))
     grad_output = grad_output.contiguous()
 
@@ -570,11 +580,11 @@ def _launch_backward(
     use_shared_schedule = (
         share_kv
         and can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size)
-        and head_dim <= 128
+        and (head_dim <= 128 or head_dim == 512)
     )
     if use_shared_schedule:
-        block_h = min(32, triton.next_power_of_2(heads))
-        block_k = max(16, min(64, triton.next_power_of_2(topk)))
+        block_h = 16 if head_dim == 512 else min(32, triton.next_power_of_2(heads))
+        block_k = 16 if head_dim == 512 else max(16, min(64, triton.next_power_of_2(topk)))
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32
         )
@@ -615,7 +625,17 @@ def _launch_backward(
         num_local_key_tiles = (
             triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
         )
-        grad_sink_fp32 = torch.zeros(heads, device=query.device, dtype=torch.float32)
+        grad_sink_fp32 = (
+            torch.empty(
+                batch,
+                heads,
+                triton.cdiv(seq_len, block_m),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            if head_dim == 512
+            else torch.zeros(heads, device=query.device, dtype=torch.float32)
+        )
         _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
             query,
             sparse_kv,
@@ -646,9 +666,11 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=8,
-            num_stages=3,
+            num_warps=4 if head_dim == 512 else 8,
+            num_stages=1 if head_dim == 512 else 3,
         )
+        if head_dim == 512:
+            grad_sink_fp32 = grad_sink_fp32.sum(dim=(0, 2))
 
     local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
     if use_tma:
@@ -702,8 +724,8 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=8,
-            num_stages=3,
+            num_warps=4 if head_dim == 512 else 8,
+            num_stages=1 if head_dim == 512 else 3,
         )
 
     if topk == 0:
@@ -754,7 +776,9 @@ def _launch_backward(
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
     else:
-        if use_shared_schedule:
+        # The shared CSR schedule flattens heads x query rows into a large D-wide tile.
+        # Use the per-head output-owned kernel for deterministic D=512 gradients instead.
+        if use_shared_schedule and head_dim != 512:
             grad_sparse_kv_partials = torch.zeros(
                 sparse_kv.shape,
                 device=sparse_kv.device,

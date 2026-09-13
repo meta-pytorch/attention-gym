@@ -478,8 +478,9 @@ def _launch_forward(
         )
         return output, lse
 
-    block_m = 64
-    block_n = 128
+    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
+    block_m = 16 if head_dim == 512 else 64
+    block_n = 16 if head_dim == 512 else 128
     num_local_tiles = (
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
@@ -542,7 +543,7 @@ def _launch_forward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=8,
-            num_stages=3,
+            num_warps=4 if head_dim == 512 else 8,
+            num_stages=1 if head_dim == 512 else 3,
         )
     return output, lse

@@ -32,6 +32,19 @@ def can_use_shared_kv_schedule(
     )
 
 
+def prune_wide_backward_configs(configs, _named_args, D, **_):
+    """Bound full-width D=512 gradient tiles without changing smaller-head tuning."""
+    if D != 512:
+        return configs
+    return [
+        config
+        for config in configs
+        if config.num_warps == 4
+        and config.num_stages == 1
+        and all(size <= 16 for size in config.kwargs.values())
+    ]
+
+
 @triton.jit
 def load_bhsd(
     tensor_ptr,
