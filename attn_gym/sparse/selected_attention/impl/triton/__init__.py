@@ -130,11 +130,6 @@ def selected_attention(
     requires_grad = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (query, local_kv, sparse_kv, attention_sink)
     )
-    if requires_grad and query.shape[-1] == 512:
-        raise NotImplementedError(
-            "The Triton selected-attention backend currently supports head_dim=512 only for "
-            "inference."
-        )
     if requires_grad:
         return _SelectedAttentionFunction.apply(
             query,

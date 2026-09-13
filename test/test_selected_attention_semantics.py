@@ -870,17 +870,6 @@ def test_shared_kv_blackwell_dsv4_forward():
         high_precision_expected,
         reduction_sizes=(head_dim, topk + window, topk + window),
     )
-    with pytest.raises(NotImplementedError, match="head_dim=512 only for inference"):
-        selected_attention(
-            query.requires_grad_(),
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            attention_sink,
-            None,
-            window,
-            backend="triton",
-        )
 
 
 # ---------------------------------------------------------------------------

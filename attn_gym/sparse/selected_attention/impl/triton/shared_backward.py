@@ -10,14 +10,23 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
 
+from .primitives import prune_wide_backward_configs
+
+
+def prune_shared_dq_configs(configs, named_args, D, **kwargs):
+    if D == 512:
+        return prune_wide_backward_configs(configs, named_args, D=D, **kwargs)
+    return [config for config in configs if config.kwargs["BLOCK_N"] != 16]
+
 
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-        for block_n in (64, 128)
+        for block_n in (16, 64, 128)
         for num_warps in (4, 8)
     ],
     key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    prune_configs_by={"early_config_prune": prune_shared_dq_configs},
     cache_results=True,
 )
 @triton.jit
@@ -211,6 +220,7 @@ def _selected_attention_bwd_dq_shared(
     ],
     key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
     reset_to_zero=["grad_sparse_kv_ptr"],
+    prune_configs_by={"early_config_prune": prune_wide_backward_configs},
     cache_results=True,
 )
 @triton.jit

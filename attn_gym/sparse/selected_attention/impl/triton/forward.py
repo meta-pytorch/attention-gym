@@ -438,9 +438,7 @@ def _launch_forward(
     doc_ids = query if doc_ids is None else doc_ids
 
     # This head-major schedule is tuned for shared KV on Blackwell.
-    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size) and (
-        head_dim <= 128 or head_dim == 512
-    ):
+    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
         # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
         block_h = (
             triton.next_power_of_2(heads)
@@ -478,8 +476,10 @@ def _launch_forward(
         )
         return output, lse
 
-    block_m = 64
-    block_n = 128
+    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
+    block_m, block_n, num_warps, num_stages = (
+        (16, 16, 4, 1) if head_dim == 512 else (64, 128, 8, 3)
+    )
     num_local_tiles = (
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
@@ -542,7 +542,7 @@ def _launch_forward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=8,
-            num_stages=3,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     return output, lse
