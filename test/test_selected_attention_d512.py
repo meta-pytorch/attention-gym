@@ -1,12 +1,14 @@
 """D=512 training coverage for portable and Blackwell shared-KV Triton schedules."""
 
-import math
 from collections.abc import Callable
 from typing import NamedTuple
 
 import pytest
 import torch
-from test_selected_attention_triton import assert_matches_low_precision_eager
+from test_selected_attention_triton import (
+    assert_matches_low_precision_eager,
+    assert_sink_gradient_fp32,
+)
 
 from attn_gym.sparse.selected_attention import (
     AuxRequest,
@@ -71,33 +73,6 @@ def make_inputs(
         else None
     )
     return AttentionInputs(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
-
-
-def assert_sink_matches_reference(
-    actual: torch.Tensor,
-    low_precision_expected: torch.Tensor,
-    high_precision_expected: torch.Tensor,
-    query_dtype: torch.dtype,
-    reduction_sizes: tuple[int, ...],
-) -> None:
-    # NOTE [Sink Gradient Delta Rounding] in test_selected_attention_triton applies to
-    # the saved output and PV probabilities, not the FP32 sink's output dtype.
-    accumulation_eps = (
-        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
-    )
-    intermediate_eps = 2 * torch.finfo(query_dtype).eps
-    output_eps = torch.finfo(actual.dtype).eps
-    actual_error = (actual.double() - high_precision_expected).abs()
-    eager_error = (low_precision_expected.double() - high_precision_expected).abs()
-    scale = high_precision_expected.abs()
-    mean_allowance = (accumulation_eps + output_eps + intermediate_eps) * scale.mean()
-    max_allowance = (
-        accumulation_eps + len(reduction_sizes) * output_eps + intermediate_eps
-    ) * scale.max()
-    assert actual.dtype == torch.float32
-    assert torch.isfinite(actual).all()
-    assert actual_error.mean() <= eager_error.mean() + mean_allowance
-    assert actual_error.max() <= eager_error.max() + max_allowance
 
 
 def check_training(
@@ -178,21 +153,17 @@ def check_training(
             high_precision_grads[index],
             reductions,
         )
-    assert_sink_matches_reference(
+    assert_matches_low_precision_eager(
         actual_grads[3],
         low_precision_grads[3],
         high_precision_grads[3],
-        query.dtype,
         forward_reductions + (head_dim, seq_len),
+        quantized_intermediates=2,
+        intermediate_dtype=query.dtype,
     )
 
-    # Independently isolate FP32 sink arithmetic from the legitimate BF16 saved-state error.
     assert aux.lse is not None
-    delta = (actual.double() * grad_output.double()).sum(-1)
-    sink_partials = -torch.exp(sink.double()[None, :, None] - aux.lse.double()) * delta
-    sink_expected = sink_partials.sum((0, 2))
-    allowance = 32 * torch.finfo(torch.float32).eps * sink_partials.abs().sum((0, 2))
-    assert ((actual_grads[3].double() - sink_expected).abs() <= allowance).all()
+    assert_sink_gradient_fp32(sink, aux.lse, actual, grad_output, actual_grads[3])
     if topk == 0:
         assert actual_grads[2].count_nonzero() == 0
     if window == 0:
@@ -236,6 +207,19 @@ def test_d512_torch_compile_fullgraph(heads, share_kv):
     for seq_len in (17, 33):
         inputs = make_inputs(heads, share_kv, torch.bfloat16, seq_len=seq_len)
         check_training(inputs, 19, operation=compiled)
+
+
+@pytest.mark.parametrize("head_dim", [16, 64, 128, 144, 256, 496, 512, 528])
+def test_shared_schedule_head_dimensions(monkeypatch, head_dim):
+    pytest.importorskip("triton")
+    from attn_gym.sparse.selected_attention.impl.triton.primitives import (
+        can_use_shared_kv_schedule,
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    query = torch.empty(1, 16, 1, head_dim, dtype=torch.bfloat16, device="meta")
+    kv = torch.empty(1, 1, 1, head_dim, dtype=query.dtype, device="meta").expand(-1, 16, -1, -1)
+    assert can_use_shared_kv_schedule(query, kv, kv, 128) == (head_dim in (16, 64, 128, 512))
 
 
 @pytest.mark.full_autotune

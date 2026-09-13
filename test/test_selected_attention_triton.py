@@ -40,12 +40,14 @@ def assert_matches_low_precision_eager(
     high_precision_expected,
     reduction_sizes,
     quantized_intermediates=0,
+    intermediate_dtype: torch.dtype | None = None,
 ):
     """Bound kernel error by low-precision eager error against an FP64 measuring stick.
 
     ``quantized_intermediates`` counts low-precision rounding events inside the kernel's
     numerical tree beyond the final output cast that the eager oracle computes in FP32;
-    see NOTE [Sink Gradient Delta Rounding].
+    see NOTE [Sink Gradient Delta Rounding]. ``intermediate_dtype`` defaults to the output
+    dtype; set it when, for example, an FP32 sink gradient uses BF16 saved intermediates.
     """
     assert torch.isfinite(actual).all()
     actual_difference = (actual.double() - high_precision_expected).abs()
@@ -54,13 +56,33 @@ def assert_matches_low_precision_eager(
         sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
     )
     output_rounding_eps = torch.finfo(actual.dtype).eps
-    rounding_eps = accumulation_eps + (1 + quantized_intermediates) * output_rounding_eps
+    intermediate_eps = (
+        quantized_intermediates
+        * torch.finfo(actual.dtype if intermediate_dtype is None else intermediate_dtype).eps
+    )
+    rounding_eps = accumulation_eps + output_rounding_eps + intermediate_eps
     mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
     max_atol = (
-        accumulation_eps + (len(reduction_sizes) + quantized_intermediates) * output_rounding_eps
+        accumulation_eps + len(reduction_sizes) * output_rounding_eps + intermediate_eps
     ) * high_precision_expected.abs().max().item()
     assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
     assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
+
+
+def assert_sink_gradient_fp32(
+    sink: torch.Tensor,
+    lse: torch.Tensor,
+    output: torch.Tensor,
+    grad_output: torch.Tensor,
+    grad_sink: torch.Tensor,
+) -> None:
+    """Check FP32 sink arithmetic independently of the saved output's quantization error."""
+    delta = (output.double() * grad_output.double()).sum(-1)
+    sink_partials = -torch.exp(sink.double()[None, :, None] - lse.double()) * delta
+    # Bound FP32 reduction error by the sum of magnitudes, not the cancellation-prone result.
+    allowance = 32 * torch.finfo(torch.float32).eps * sink_partials.abs().sum((0, 2))
+    assert torch.isfinite(grad_sink).all()
+    assert ((grad_sink.double() - sink_partials.sum((0, 2))).abs() <= allowance).all()
 
 
 def _make_inputs(
@@ -566,13 +588,6 @@ def test_triton_fp32_row_reductions(heads, head_dim, share_kv):
         output.shape, dtype=output.dtype, device=output.device, generator=generator
     )
     output.backward(grad_output)
-    delta = (output.double() * grad_output.double()).sum(-1)
-    sink_partials = (
-        -torch.exp(inputs["attention_sink"].double()[None, :, None] - aux.lse.double()) * delta
+    assert_sink_gradient_fp32(
+        inputs["attention_sink"], aux.lse, output, grad_output, inputs["attention_sink"].grad
     )
-    expected_sink = sink_partials.sum((0, 2))
-    # Bound FP32 reduction error by the sum of magnitudes, not the cancellation-prone result.
-    allowance = 32 * fp32_eps * sink_partials.abs().sum((0, 2))
-    actual_sink = inputs["attention_sink"].grad.double()
-    assert torch.isfinite(actual_sink).all()
-    assert ((actual_sink - expected_sink).abs() <= allowance).all()

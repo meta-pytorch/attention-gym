@@ -13,10 +13,7 @@ def can_use_shared_kv_schedule(
     local_kv: torch.Tensor,
     sliding_window_size: int,
 ) -> bool:
-    """Check Blackwell shared-KV constraints common to forward and backward.
-
-    Callers enforce the head-dimension limits supported by their kernel.
-    """
+    """Check the shared Blackwell forward/backward schedule's layout and shape limits."""
     _, heads, _, head_dim = query.shape
     return (
         torch.cuda.get_device_capability(query.device)[0] >= 10
@@ -28,6 +25,7 @@ def can_use_shared_kv_schedule(
         and local_kv.stride(-1) == 1
         and 16 <= heads <= 128
         and head_dim % 16 == 0
+        and (head_dim <= 128 or head_dim == 512)
         and sliding_window_size <= 2048
     )
 

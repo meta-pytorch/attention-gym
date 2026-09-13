@@ -558,8 +558,7 @@ def _launch_backward(
     sparse_seq_len = sparse_kv.shape[2]
     topk = kv_indices.shape[-1]
     # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
-    block_m = 16 if head_dim == 512 else 64
-    block_n = 16 if head_dim == 512 else 32
+    block_m, block_n, num_warps, num_stages = (16, 16, 4, 1) if head_dim == 512 else (64, 32, 8, 3)
     block_d = max(16, triton.next_power_of_2(head_dim))
     grad_output = grad_output.contiguous()
 
@@ -577,10 +576,8 @@ def _launch_backward(
     )
 
     # Zero head strides share values; share_kv also guarantees autograd will sum dKV heads.
-    use_shared_schedule = (
-        share_kv
-        and can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size)
-        and (head_dim <= 128 or head_dim == 512)
+    use_shared_schedule = share_kv and can_use_shared_kv_schedule(
+        query, sparse_kv, local_kv, sliding_window_size
     )
     if use_shared_schedule:
         block_h = 16 if head_dim == 512 else min(32, triton.next_power_of_2(heads))
@@ -666,8 +663,8 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=4 if head_dim == 512 else 8,
-            num_stages=1 if head_dim == 512 else 3,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
         if head_dim == 512:
             grad_sink_fp32 = grad_sink_fp32.sum(dim=(0, 2))
@@ -724,8 +721,8 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=4 if head_dim == 512 else 8,
-            num_stages=1 if head_dim == 512 else 3,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
     if topk == 0:
