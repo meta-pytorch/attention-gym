@@ -26,6 +26,7 @@ from attn_gym.linear.kda.ops import recurrent_fwd_op as _recurrent_fwd_op
 from attn_gym.linear.kda.ops import (
     recurrent_fwd_paged_op as _recurrent_fwd_paged_op,
 )
+from attn_gym.linear.types import KernelOptions
 
 
 def _launch_kda_recurrent_fwd(
@@ -42,6 +43,7 @@ def _launch_kda_recurrent_fwd(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the vector-gate specialization used by recurrent KDA."""
     return launch_recurrent_delta_rule_fwd(
@@ -58,6 +60,7 @@ def _launch_kda_recurrent_fwd(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         autotune=autotune,
+        kernel_options=kernel_options,
     )
 
 
@@ -71,6 +74,7 @@ def _kda_recurrent_fwd_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = _launch_kda_recurrent_fwd(
         q,
@@ -83,6 +87,7 @@ def _kda_recurrent_fwd_cuda(
         scale=scale,
         store_final_state=True,
         autotune=autotune,
+        kernel_options={"batch_invariant": batch_invariant},
     )
     assert final_state is not None
     return output, final_state
@@ -98,6 +103,7 @@ def _kda_recurrent_fwd_no_state_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -110,6 +116,7 @@ def _kda_recurrent_fwd_no_state_cuda(
         scale=scale,
         store_final_state=False,
         autotune=autotune,
+        kernel_options={"batch_invariant": batch_invariant},
     )[0]
 
 
@@ -124,6 +131,7 @@ def _kda_recurrent_fwd_paged_cuda(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -138,7 +146,69 @@ def _kda_recurrent_fwd_paged_cuda(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         autotune=False,
+        kernel_options={"batch_invariant": batch_invariant},
     )[0]
+
+
+def _kda_recurrent_fwd_batch_invariant_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed sequences as single-token launches matching decode."""
+    num_sequences = int(cu_seqlens.numel()) - 1
+    state_cache = q.new_zeros(
+        num_sequences + 1,
+        v.shape[2],
+        v.shape[3],
+        q.shape[3],
+        dtype=torch.float32,
+    )
+    if initial_state is not None:
+        state_cache[1:].copy_(initial_state)
+    state_indices = torch.arange(
+        1,
+        num_sequences + 1,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    has_initial_state = torch.full(
+        (num_sequences,),
+        initial_state is not None,
+        dtype=torch.bool,
+        device=q.device,
+    )
+    output = torch.zeros_like(v, dtype=q.dtype)
+    step_cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+    for sequence_index in range(num_sequences):
+        start = int(cu_seqlens[sequence_index].item())
+        end = int(cu_seqlens[sequence_index + 1].item())
+        state_index = state_indices[sequence_index : sequence_index + 1]
+        for token_index in range(start, end):
+            token_slice = slice(token_index, token_index + 1)
+            step_output, _ = _launch_kda_recurrent_fwd(
+                q[:, token_slice],
+                k[:, token_slice],
+                v[:, token_slice],
+                gate[:, token_slice],
+                beta[:, token_slice],
+                state_cache,
+                step_cu_seqlens,
+                scale=scale,
+                store_final_state=True,
+                state_indices=state_index,
+                has_initial_state=has_initial_state[sequence_index : sequence_index + 1],
+                autotune=False,
+                kernel_options={"batch_invariant": True},
+            )
+            output[:, token_slice] = step_output
+            has_initial_state[sequence_index] = True
+    return output, state_cache[1:]
 
 
 def _kda_recurrent_decode_cuda(
@@ -176,6 +246,7 @@ def _kda_recurrent_decode_cuda(
 
 
 __all__ = [
+    "_kda_recurrent_fwd_batch_invariant_cuda",
     "_recurrent_decode_op",
     "_recurrent_fwd_no_state_op",
     "_recurrent_fwd_op",

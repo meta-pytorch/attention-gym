@@ -11,7 +11,10 @@ import importlib
 
 import torch
 
+from attn_gym.linear.types import KernelOptions
+
 _CHUNK_SIZE = 64
+_HEAD_DIM = 128
 
 
 # Fixed-arity schema pairs avoid optional outputs on hot paths.
@@ -85,16 +88,23 @@ torch.library.define(
 
 _RECURRENT_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
-    " Tensor? initial_state, Tensor? cu_seqlens, float scale, bool autotune)"
+    " Tensor? initial_state, Tensor? cu_seqlens, float scale, bool autotune,"
+    " bool batch_invariant)"
 )
 torch.library.define("attn_gym::kda_recurrent_fwd", _RECURRENT_FWD_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::kda_recurrent_fwd_no_state", _RECURRENT_FWD_ARGS + " -> Tensor")
+torch.library.define(
+    "attn_gym::kda_recurrent_fwd_batch_invariant",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state,"
+    " Tensor cu_seqlens, float scale) -> (Tensor, Tensor)",
+)
 # Separate schema: the paged variant advances the state pool in place, so the final state
 # is not an output and the alias annotation has to declare the mutation.
 torch.library.define(
     "attn_gym::kda_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache,"
-    " Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale) -> Tensor",
+    " Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale,"
+    " bool batch_invariant) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_recurrent_decode",
@@ -198,6 +208,10 @@ def _recurrent_fwd_paged_cuda(*args):
     return _recurrent_backend()._kda_recurrent_fwd_paged_cuda(*args)
 
 
+def _recurrent_fwd_batch_invariant_cuda(*args):
+    return _recurrent_backend()._kda_recurrent_fwd_batch_invariant_cuda(*args)
+
+
 def _delta_h_cuda(*args):
     return _delta_h_backend()._delta_h_cuda(*args)
 
@@ -253,6 +267,11 @@ torch.library.impl(
     "attn_gym::kda_recurrent_fwd_paged",
     "CUDA",
     _recurrent_fwd_paged_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_recurrent_fwd_batch_invariant",
+    "CUDA",
+    _recurrent_fwd_batch_invariant_cuda,
 )
 torch.library.impl(
     "attn_gym::kda_recurrent_decode",
@@ -515,8 +534,9 @@ def _recurrent_fwd_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del k, gate, beta, initial_state, scale, autotune
+    del k, gate, beta, initial_state, scale, autotune, batch_invariant
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     # The state carries one [V, K] slab per value head; grouped callers have v.shape[2] > HK.
     final_state = q.new_empty(
@@ -536,9 +556,32 @@ def _recurrent_fwd_no_state_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, initial_state, cu_seqlens, scale, autotune
+    del k, gate, beta, initial_state, cu_seqlens, scale, autotune, batch_invariant
     return torch.empty_like(v, dtype=q.dtype)
+
+
+@torch.library.register_fake("attn_gym::kda_recurrent_fwd_batch_invariant")
+def _recurrent_fwd_batch_invariant_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del k, gate, beta, initial_state, scale
+    state_cache = q.new_empty(
+        cu_seqlens.shape[0],
+        v.shape[2],
+        v.shape[-1],
+        q.shape[3],
+        dtype=torch.float32,
+    )
+    return v.new_empty(v.shape, dtype=q.dtype), state_cache[1:]
 
 
 @torch.library.register_fake("attn_gym::kda_recurrent_fwd_paged")
@@ -553,8 +596,19 @@ def _recurrent_fwd_paged_fake(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
+    del (
+        k,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        scale,
+        batch_invariant,
+    )
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -661,11 +715,116 @@ chunk_bwd_recompute_factors_with_state_grad_op = (
 )
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
+recurrent_fwd_batch_invariant_op = torch.ops.attn_gym.kda_recurrent_fwd_batch_invariant.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
 recurrent_decode_op = torch.ops.attn_gym.kda_recurrent_decode.default
 delta_h_op = torch.ops.attn_gym.kda_delta_h.default
 delta_h_with_state_op = torch.ops.attn_gym.kda_delta_h_with_state.default
 delta_h_paged_op = torch.ops.attn_gym.kda_delta_h_paged.default
+
+
+def _run_recurrent_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    scale: float,
+    output_final_state: bool,
+    autotune: bool,
+    batch_invariant: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if batch_invariant and cu_seqlens is not None:
+        output, final_state = recurrent_fwd_batch_invariant_op(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            scale,
+        )
+        return output, final_state if output_final_state else None
+
+    args = (
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        scale,
+        autotune,
+        batch_invariant,
+    )
+    if output_final_state:
+        return recurrent_fwd_op(*args)
+    return recurrent_fwd_no_state_op(*args), None
+
+
+class _RecurrentKDA(torch.autograd.Function):
+    """Attach first-order chunk-KDA gradients to recurrent execution."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        scale,
+        output_final_state,
+        autotune,
+        batch_invariant,
+    ):
+        ctx.save_for_backward(q, k, v, gate, beta, initial_state, cu_seqlens)
+        ctx.scale = scale
+        ctx.autotune = autotune
+        ctx.set_materialize_grads(False)
+        output, final_state = _run_recurrent_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            scale,
+            output_final_state,
+            autotune,
+            batch_invariant,
+        )
+        if output_final_state:
+            return output, final_state
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, d_output, d_final_state=None):
+        q, k, v, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
+        from attn_gym.linear.kda.impl.fused import chunk_backward_recompute
+
+        gradients = chunk_backward_recompute(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            d_output,
+            d_final_state,
+            scale=ctx.scale,
+            autotune=ctx.autotune,
+        )
+        return (*gradients, None, None, None, None, None)
 
 
 def recurrent_forward(
@@ -682,8 +841,10 @@ def recurrent_forward(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and invoke the lazily loaded fused recurrent implementation."""
+    batch_invariant = bool(kernel_options and kernel_options.get("batch_invariant", False))
     if q.shape[-1] > 256:
         raise ValueError(f"recurrent_kda requires K in [1, 256], got {q.shape[-1]}")
     if not q.is_cuda:
@@ -691,10 +852,18 @@ def recurrent_forward(
     data_tensors = (q, k, v, gate, beta)
     if initial_state is not None:
         data_tensors += (initial_state,)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
+    requires_grad = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in data_tensors
+    )
+    if requires_grad and state_indices is not None:
         raise RuntimeError(
-            "recurrent_kda is inference-only and has no backward; use chunk_kda for "
-            "training or call under torch.no_grad() / torch.inference_mode()"
+            "paged recurrent_kda mutates its state cache and does not support backward"
+        )
+    if requires_grad and (
+        q.shape[-1] != _HEAD_DIM or v.shape[-1] != _HEAD_DIM or q.shape[2] != v.shape[2]
+    ):
+        raise ValueError(
+            "fused recurrent_kda backward requires K=V=128 and matching Q/K and V heads"
         )
 
     q, k, v, beta = (tensor.contiguous() for tensor in (q, k, v, beta))
@@ -714,13 +883,40 @@ def recurrent_forward(
             has_initial_state,
             cu_seqlens,
             scale,
+            batch_invariant,
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
-    args = (q, k, v, gate, beta, initial_state, cu_seqlens, scale, autotune)
-    if output_final_state:
-        return recurrent_fwd_op(*args)
-    return recurrent_fwd_no_state_op(*args), None
+    if requires_grad:
+        result = _RecurrentKDA.apply(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial_state,
+            cu_seqlens,
+            scale,
+            output_final_state,
+            autotune,
+            batch_invariant,
+        )
+        if output_final_state:
+            return result
+        return result, None
+    return _run_recurrent_forward(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        scale,
+        output_final_state,
+        autotune,
+        batch_invariant,
+    )
 
 
 def recurrent_decode_forward(
@@ -779,6 +975,7 @@ __all__ = [
     "recurrent_decode_forward",
     "recurrent_decode_op",
     "recurrent_forward",
+    "recurrent_fwd_batch_invariant_op",
     "recurrent_fwd_no_state_op",
     "recurrent_fwd_op",
     "recurrent_fwd_paged_op",

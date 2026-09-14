@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from attn_gym.linear import recurrent_kda
+from attn_gym.linear import chunk_kda, recurrent_kda
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_no_state_op,
@@ -22,6 +22,7 @@ from attn_gym.linear.kda.fwd.triton.recurrent import (
     _recurrent_fwd_paged_op,
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
+from attn_gym.linear.kda.ops import recurrent_fwd_batch_invariant_op
 from attn_gym.testing import cumulative_sequence_offsets, strided_state_pool
 
 pytestmark = pytest.mark.skipif(
@@ -114,6 +115,104 @@ def test_recurrent_autotunes_value_tile():
     expected, _ = recurrent_kda(q, k, v, gate, beta, autotune=False)
 
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_recurrent_batch_invariant_is_bitwise_across_batch_partitioning():
+    q, k, v, gate, beta, state = _inputs(
+        batch=3,
+        tokens=7,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.bfloat16,
+        initial_state=True,
+        seed=23,
+    )
+    expected_output, expected_state = recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+        kernel_options={"batch_invariant": True},
+    )
+
+    outputs = []
+    states = []
+    for sequence in range(q.shape[0]):
+        output, final_state = recurrent_kda(
+            q[sequence : sequence + 1],
+            k[sequence : sequence + 1],
+            v[sequence : sequence + 1],
+            gate[sequence : sequence + 1],
+            beta[sequence : sequence + 1],
+            state[sequence : sequence + 1],
+            output_final_state=True,
+            kernel_options={"batch_invariant": True},
+        )
+        assert final_state is not None
+        outputs.append(output)
+        states.append(final_state)
+
+    assert expected_state is not None
+    torch.testing.assert_close(torch.cat(outputs), expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(states), expected_state, rtol=0, atol=0)
+
+
+def test_recurrent_packed_batch_invariant_matches_token_decode():
+    q, k, v, gate, beta, _ = _inputs(
+        batch=1,
+        tokens=9,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.bfloat16,
+        seed=29,
+    )
+    cu_seqlens = cumulative_sequence_offsets([4, 5])
+    output, final_state = recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        kernel_options={"batch_invariant": True},
+    )
+
+    state_cache = torch.zeros(
+        3,
+        v.shape[2],
+        v.shape[3],
+        q.shape[3],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expected = torch.zeros_like(output)
+    step_cu_seqlens = cumulative_sequence_offsets([1])
+    for sequence_index, (start, end) in enumerate(pairwise(cu_seqlens.tolist())):
+        state_index = torch.tensor([sequence_index + 1], dtype=torch.int32, device="cuda")
+        has_initial_state = torch.zeros(1, dtype=torch.bool, device="cuda")
+        for token_index in range(start, end):
+            token_slice = slice(token_index, token_index + 1)
+            expected[:, token_slice], _ = recurrent_kda(
+                q[:, token_slice],
+                k[:, token_slice],
+                v[:, token_slice],
+                gate[:, token_slice],
+                beta[:, token_slice],
+                state_cache,
+                cu_seqlens=step_cu_seqlens,
+                state_indices=state_index,
+                has_initial_state=has_initial_state,
+                kernel_options={"batch_invariant": True},
+            )
+            has_initial_state.fill_(True)
+
+    assert final_state is not None
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(final_state, state_cache[1:], rtol=0, atol=0)
 
 
 def test_recurrent_paged_skips_autotune(monkeypatch):
@@ -259,7 +358,7 @@ def test_recurrent_grouped_heads_registration():
     state = torch.randn(1, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         _recurrent_fwd_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
 
 
@@ -561,22 +660,111 @@ def test_recurrent_validates_public_contract():
         recurrent_kda(big, big, big, big, q.new_zeros(1, 4, 2))
     with pytest.raises(TypeError, match="inputs must use one of"):
         recurrent_kda(q.double(), k.double(), v.double(), gate.double(), beta.double())
+    with pytest.raises(ValueError, match="backward requires K=V=128"):
+        recurrent_kda(q.requires_grad_(), k, v, gate, beta)
 
 
-@pytest.mark.parametrize("operand", range(6))
-def test_recurrent_rejects_gradient_tracking(operand: int):
-    """State a clear inference-only contract for every gradient-tracking operand."""
-    tensors = list(_inputs(tokens=4, initial_state=True))
-    tensors[operand] = tensors[operand].float().requires_grad_()
-    with pytest.raises(RuntimeError, match="inference-only"):
-        recurrent_kda(*tensors)
-    with torch.no_grad():
-        output, _ = recurrent_kda(*tensors)
-    assert not output.requires_grad
+@pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk KDA requires CUDA capability 8.0+")
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("output_final_state", [False, True])
+@pytest.mark.parametrize("use_initial_state", [False, True])
+def test_recurrent_gradients_match_chunk(
+    packed: bool,
+    output_final_state: bool,
+    use_initial_state: bool,
+):
+    """Recurrent execution uses the training kernel's first-order gradients."""
+    q, k, v, gate, beta, state = _inputs(
+        batch=1 if packed else 2,
+        tokens=64,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.bfloat16,
+        initial_state=use_initial_state,
+        seed=31,
+    )
+    cu_seqlens = cumulative_sequence_offsets([17, 47]) if packed else None
+    if packed and state is not None:
+        state = torch.randn(
+            2,
+            q.shape[2],
+            v.shape[-1],
+            q.shape[-1],
+            device="cuda",
+        )
+    data_tensors = (q, k, v, gate, beta) + (() if state is None else (state,))
+    recurrent_inputs = tuple(tensor.detach().requires_grad_() for tensor in data_tensors)
+    chunk_inputs = tuple(tensor.detach().requires_grad_() for tensor in data_tensors)
+    d_output = torch.randn_like(v)
+
+    output, final_state = recurrent_kda(
+        *recurrent_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state,
+        kernel_options={"batch_invariant": packed},
+    )
+    expected_output, expected_state = chunk_kda(
+        *chunk_inputs,
+        cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state,
+    )
+    loss = (output * d_output).sum()
+    expected_loss = (expected_output * d_output).sum()
+    if output_final_state:
+        assert final_state is not None and expected_state is not None
+        d_state = torch.randn_like(final_state)
+        loss = loss + (final_state * d_state).sum()
+        expected_loss = expected_loss + (expected_state * d_state).sum()
+    loss.backward()
+    expected_loss.backward()
+
+    for actual, expected in zip(recurrent_inputs, chunk_inputs):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk KDA requires CUDA capability 8.0+")
+@pytest.mark.parametrize(
+    "tokens,lengths",
+    [(64, [19, 45]), (96, [31, 65])],
+)
+def test_recurrent_packed_batch_invariant_fullgraph_forward_backward(
+    tokens: int,
+    lengths: list[int],
+):
+    q, k, v, gate, beta, _ = _inputs(
+        batch=1,
+        tokens=tokens,
+        key_dim=128,
+        value_dim=128,
+        dtype=torch.bfloat16,
+        seed=tokens,
+    )
+    eager_inputs = tuple(tensor.detach().requires_grad_() for tensor in (q, k, v, gate, beta))
+    compiled_inputs = tuple(tensor.detach().requires_grad_() for tensor in (q, k, v, gate, beta))
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+
+    def operation(*args):
+        return recurrent_kda(
+            *args,
+            cu_seqlens=cu_seqlens,
+            kernel_options={"batch_invariant": True},
+        )[0]
+
+    expected = operation(*eager_inputs)
+    actual = torch.compile(operation, fullgraph=True)(*compiled_inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    d_output = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(expected, eager_inputs, d_output)
+    actual_gradients = torch.autograd.grad(actual, compiled_inputs, d_output)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_recurrent_custom_op_registration(packed: bool):
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_recurrent_custom_op_registration(packed: bool, batch_invariant: bool):
     """Exercise the schema and fake implementation for both modes."""
     batch = 1 if packed else 2
     q, k, v, gate, beta, _ = _inputs(batch=batch, tokens=17)
@@ -585,17 +773,56 @@ def test_recurrent_custom_op_registration(packed: bool):
     state = torch.randn(num_sequences, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         _recurrent_fwd_op,
-        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
+        (
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            cu_seqlens,
+            q.shape[-1] ** -0.5,
+            True,
+            batch_invariant,
+        ),
     )
     torch.library.opcheck(
         _recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
+        (
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            cu_seqlens,
+            q.shape[-1] ** -0.5,
+            True,
+            batch_invariant,
+        ),
     )
+    if packed and batch_invariant:
+        torch.library.opcheck(
+            recurrent_fwd_batch_invariant_op,
+            (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5),
+        )
     _, state_pool = strided_state_pool(num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens, q.shape[-1] ** -0.5),
+        (
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_pool,
+            slots,
+            None,
+            cu_seqlens,
+            q.shape[-1] ** -0.5,
+            batch_invariant,
+        ),
     )
 
 
@@ -609,21 +836,23 @@ def test_recurrent_custom_op_registration_mixed_dtype():
 
     torch.library.opcheck(
         _recurrent_fwd_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
     torch.library.opcheck(
         _recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5),
+        (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5, False),
     )
 
 
 @pytest.mark.parametrize("output_final_state", [False, True])
-@pytest.mark.parametrize("autotune", [False, True])
-def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
+@pytest.mark.parametrize("autotune,batch_invariant", [(False, False), (True, False), (True, True)])
+def test_recurrent_fullgraph_compile(
+    output_final_state: bool, autotune: bool, batch_invariant: bool
+):
     """Compile both optional-state branches of the public operation."""
     q, k, v, gate, beta, state = _inputs(initial_state=True)
     scale = 0.25
@@ -638,6 +867,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
+        kernel_options={"batch_invariant": batch_invariant},
     )
     compiled = torch.compile(recurrent_kda, fullgraph=True)
     output, final_state = compiled(
@@ -650,6 +880,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         scale=scale,
         output_final_state=output_final_state,
         autotune=autotune,
+        kernel_options={"batch_invariant": batch_invariant},
     )
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     if output_final_state:
@@ -668,10 +899,28 @@ def test_recurrent_paged_mixed_dtype_fullgraph_compile():
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     scale = 0.25
 
-    expected, _ = recurrent_kda(q, k, v, gate, beta, eager_pool, scale=scale, state_indices=slots)
+    expected, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        eager_pool,
+        scale=scale,
+        state_indices=slots,
+        kernel_options={"batch_invariant": True},
+    )
     compiled = torch.compile(recurrent_kda, fullgraph=True)
     output, final_state = compiled(
-        q, k, v, gate, beta, compiled_pool, scale=scale, state_indices=slots
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        compiled_pool,
+        scale=scale,
+        state_indices=slots,
+        kernel_options={"batch_invariant": True},
     )
 
     assert output.dtype == q.dtype and final_state is None
@@ -688,13 +937,13 @@ def test_recurrent_cuda_graph_replay():
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
     initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     scale = 0.25
-    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True)
+    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output, captured_state = _recurrent_fwd_op(
-            q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
+            q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False
         )
 
     active_tokens = 23
@@ -707,7 +956,7 @@ def test_recurrent_cuda_graph_replay():
     torch.cuda.synchronize()
 
     expected_output, expected_state = _recurrent_fwd_op(
-        q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
+        q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens],
@@ -724,13 +973,13 @@ def test_recurrent_paged_cuda_graph_replay():
     storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     scale = 0.25
-    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)
+    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale, False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output = _recurrent_fwd_paged_op(
-            q, k, v, gate, beta, pool, slots, None, None, scale
+            q, k, v, gate, beta, pool, slots, None, None, scale, False
         )
 
     with torch.no_grad():

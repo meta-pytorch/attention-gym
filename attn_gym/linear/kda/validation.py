@@ -63,6 +63,20 @@ def resolve_kernel_options(
     )
 
 
+def resolve_recurrent_kernel_options(kernel_options: Mapping[str, object] | None) -> bool:
+    """Validate recurrent-only kernel options and return batch-invariant mode."""
+    if kernel_options is None:
+        return False
+    unknown = kernel_options.keys() - {"batch_invariant"}
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported recurrent_kda kernel options: {names}")
+    batch_invariant = kernel_options.get("batch_invariant", False)
+    if not isinstance(batch_invariant, bool):
+        raise TypeError("kernel_options['batch_invariant'] must be a bool")
+    return batch_invariant
+
+
 def validate_kda_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -104,4 +118,9 @@ def validate_kda_inputs(
         raise TypeError(f"{op_name} inputs must use one of {supported}")
 
 
-__all__ = ["SUPPORTED_INPUT_DTYPES", "resolve_kernel_options", "validate_kda_inputs"]
+__all__ = [
+    "SUPPORTED_INPUT_DTYPES",
+    "resolve_kernel_options",
+    "resolve_recurrent_kernel_options",
+    "validate_kda_inputs",
+]

@@ -7,7 +7,7 @@
 """Public KDA operations.
 
 ``chunk_kda`` supports training and prefill; ``paged_chunk_kda`` advances a mutable
-state cache during inference; ``recurrent_kda`` supports decode and inference prefill.
+state cache during inference; ``recurrent_kda`` supports training, prefill, and decode.
 Use ``impl`` to select fused kernels or the eager reference where available.
 """
 
@@ -35,7 +35,11 @@ from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
-from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
+from attn_gym.linear.kda.validation import (
+    resolve_kernel_options,
+    resolve_recurrent_kernel_options,
+    validate_kda_inputs,
+)
 from attn_gym.linear.types import Impl, KernelOptions, resolve_impl
 
 _CHUNK_SIZE = 64
@@ -291,8 +295,9 @@ def recurrent_kda(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Apply recurrent KDA for decoding and inference prefill.
+    """Apply recurrent KDA for training, prefill, and decoding.
 
     Args:
         q: Queries shaped ``[B, T, HK, K]``, scaled by ``scale`` internally. ``HK``
@@ -336,9 +341,14 @@ def recurrent_kda(
         autotune: Benchmark candidate value-tile sizes for non-paged execution
             when true; winners are cached and reused. Paged execution and false
             use a deterministic sequence-length heuristic.
-        impl: ``"fused"`` uses the inference-only optimized scan; ``"reference"``
-            uses differentiable eager PyTorch in FP32, with no automatic
+        impl: ``"fused"`` uses the optimized scan and supports first-order gradients
+            for non-paged execution with K=V=128 and matching Q/K and V head counts.
+            ``"reference"`` uses differentiable eager PyTorch in FP32, with no automatic
             fallback.
+        kernel_options: Fused-kernel controls. ``{"batch_invariant": True}`` matches
+            one-token decode execution for packed inputs by advancing each sequence one token
+            at a time. For dense inputs, it selects a fixed launch configuration independent
+            of token count and batch size. Both modes disable autotuning and the shape heuristic.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -349,6 +359,9 @@ def recurrent_kda(
     separate launches, and speculative-decoding rollback is unsupported.
     """
     selected_impl = resolve_impl(impl)
+    batch_invariant = resolve_recurrent_kernel_options(kernel_options)
+    if selected_impl is Impl.REFERENCE and kernel_options:
+        raise ValueError("kernel_options are not supported with impl='reference'")
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(
@@ -388,6 +401,7 @@ def recurrent_kda(
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             autotune=autotune,
+            kernel_options={"batch_invariant": batch_invariant},
         )
     return reference_kda(
         naive_recurrent_kda,

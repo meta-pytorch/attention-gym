@@ -35,6 +35,7 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
+from attn_gym.linear.types import KernelOptions
 
 configure_triton_allocator()
 
@@ -202,6 +203,7 @@ def launch_recurrent_delta_rule_fwd(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = False,
+    kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
 
@@ -233,6 +235,9 @@ def launch_recurrent_delta_rule_fwd(
             this mask every selected slot is treated as real history.
         autotune: Benchmark tile configurations when true; paged launches always use fixed
             heuristics because rerunning candidates would advance the pool repeatedly.
+        kernel_options: Kernel configuration overrides. ``{"batch_invariant": True}`` uses a
+            fixed per-program configuration independent of sequence length and batch size,
+            taking precedence over ``autotune`` and the shape-based heuristic.
 
     Returns:
         The output in ``q.dtype`` plus the final state (``None`` unless requested). In paged
@@ -269,25 +274,29 @@ def launch_recurrent_delta_rule_fwd(
     # One flat launch dimension avoids the 65,535 grid-Y limit for large batches.
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
-    use_autotune = autotune and state_indices is None
+    batch_invariant = bool(kernel_options and kernel_options.get("batch_invariant", False))
+    use_autotune = autotune and state_indices is None and not batch_invariant
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
     if not use_autotune:
-        # Offline B200 sweeps favor small tiles for long scans and low-occupancy decode.
-        average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
-        sequence_heads = num_sequences * heads
-        if average_tokens >= 32:
+        if batch_invariant:
             block_v_limit, num_warps = 8, 4
-        elif average_tokens > 1:
-            block_v_limit, num_warps = 32, 2
-        elif value_dim >= 128:
-            block_v_limit, num_warps = 16, 4
-        elif sequence_heads <= 8:
-            block_v_limit, num_warps = 8, 4
-        elif sequence_heads < 1024:
-            block_v_limit, num_warps = 16, 2
         else:
-            block_v_limit, num_warps = 32, 2
+            # Offline B200 sweeps favor small tiles for long scans and low-occupancy decode.
+            average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+            sequence_heads = num_sequences * heads
+            if average_tokens >= 32:
+                block_v_limit, num_warps = 8, 4
+            elif average_tokens > 1:
+                block_v_limit, num_warps = 32, 2
+            elif value_dim >= 128:
+                block_v_limit, num_warps = 16, 4
+            elif sequence_heads <= 8:
+                block_v_limit, num_warps = 8, 4
+            elif sequence_heads < 1024:
+                block_v_limit, num_warps = 16, 2
+            else:
+                block_v_limit, num_warps = 32, 2
         launch_options = {
             "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
             "num_warps": num_warps,

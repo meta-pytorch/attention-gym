@@ -33,6 +33,9 @@ class KernelOptions(BackendOptions, total=False):
     active. Outputs are bitwise identical. Fused backend only; Hopper or newer for packed
     inputs."""
 
+    batch_invariant: bool
+    """Use batch-invariant recurrent execution. Fused recurrent KDA only."""
+
 
 class Impl(str, Enum):
     """Select a fused or reference implementation without automatic fallback."""
