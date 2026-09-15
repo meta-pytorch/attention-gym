@@ -102,11 +102,14 @@ def test_fused_recurrent_matches_packed_reference(key_heads: int | None):
     torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-5)
 
 
-def test_fused_recurrent_paged_state():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_recurrent_paged_state(state_dtype: torch.dtype):
     q, k, v, gate, beta, _state = make_inputs(batch=3, tokens=5)
     slots = torch.tensor([2, 0, 4], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, False], device="cuda")
-    _storage, state_cache = strided_state_pool(6, q.shape[2], q.shape[-1], v.shape[-1])
+    _storage, state_cache = strided_state_pool(
+        6, q.shape[2], q.shape[-1], v.shape[-1], dtype=state_dtype
+    )
     original_cache = state_cache.clone()
 
     expected_output = torch.zeros_like(v)
@@ -114,7 +117,7 @@ def test_fused_recurrent_paged_state():
     with torch.no_grad():
         for sequence, slot in ((0, 2), (2, 4)):
             initial_state = (
-                original_cache[slot].unsqueeze(0) if has_initial_state[sequence] else None
+                original_cache[slot].unsqueeze(0).float() if has_initial_state[sequence] else None
             )
             output, final_state = recurrent_gdn(
                 q[sequence : sequence + 1],
@@ -146,12 +149,15 @@ def test_fused_recurrent_paged_state():
     torch.testing.assert_close(state_cache, expected_cache, rtol=1e-5, atol=1e-5)
 
 
-def test_fused_recurrent_packed_paged_state():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_recurrent_packed_paged_state(state_dtype: torch.dtype):
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=8)
     cu_seqlens = cumulative_sequence_offsets([3, 0, 4])
     slots = torch.tensor([2, 0, 4], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, False], device="cuda")
-    state_cache = torch.randn(6, q.shape[2], v.shape[-1], q.shape[-1], device="cuda")
+    state_cache = torch.randn(
+        6, q.shape[2], v.shape[-1], q.shape[-1], device="cuda", dtype=state_dtype
+    )
     original_cache = state_cache.clone()
     expected_output = torch.zeros_like(v)
     expected_cache = original_cache.clone()
@@ -165,7 +171,7 @@ def test_fused_recurrent_packed_paged_state():
             if begin == end or slot <= 0:
                 continue
             span = slice(begin, end)
-            initial_state = original_cache[slot].unsqueeze(0) if use_state else None
+            initial_state = original_cache[slot].unsqueeze(0).float() if use_state else None
             span_output, span_state = recurrent_gdn(
                 q[:, span],
                 k[:, span],
@@ -268,9 +274,12 @@ def test_fused_recurrent_packed_paged_empty_sequences():
     torch.testing.assert_close(state_cache[preserved], original_cache[preserved])
 
 
-def test_fused_recurrent_paged_registration():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_recurrent_paged_registration(state_dtype: torch.dtype):
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=3)
-    state_cache = torch.randn(3, q.shape[2], v.shape[-1], q.shape[-1], device="cuda")
+    state_cache = torch.randn(
+        3, q.shape[2], v.shape[-1], q.shape[-1], device="cuda", dtype=state_dtype
+    )
     state_indices = torch.tensor([2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True], device="cuda")
     torch.library.opcheck(
@@ -355,9 +364,12 @@ def test_fused_recurrent_low_precision():
     assert torch.isfinite(output).all() and torch.isfinite(final_state).all()
 
 
-def test_fused_recurrent_paged_fullgraph():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_recurrent_paged_fullgraph(state_dtype: torch.dtype):
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=3)
-    state_cache = torch.randn(3, q.shape[2], v.shape[-1], q.shape[-1], device="cuda")
+    state_cache = torch.randn(
+        3, q.shape[2], v.shape[-1], q.shape[-1], device="cuda", dtype=state_dtype
+    )
     expected_cache = state_cache.clone()
     state_indices = torch.tensor([2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True], device="cuda")

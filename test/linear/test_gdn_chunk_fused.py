@@ -379,7 +379,8 @@ def test_paged_chunk_rejects_unsupported_qkv_dtype(dtype: torch.dtype):
         )
 
 
-def test_paged_chunk_raw_operator_registration():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype):
     """Validate mutation, fake output layout, and dynamic AOT dispatch."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128, key_heads=1, value_heads=2)
     v = token_strided_like(v)
@@ -388,7 +389,7 @@ def test_paged_chunk_raw_operator_registration():
     cumulative = _plain_gate_scan_op(
         gate.unsqueeze(-1), cu_seqlens, metadata.chunk_offsets, False
     ).squeeze(-1)
-    state_cache = torch.randn(4, 2, 128, 128, device="cuda")
+    state_cache = torch.randn(4, 2, 128, 128, device="cuda", dtype=state_dtype)
     state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
 
@@ -411,7 +412,8 @@ def test_paged_chunk_raw_operator_registration():
     )
 
 
-def test_paged_chunk_matches_gather_scatter():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_chunk_matches_gather_scatter(state_dtype: torch.dtype):
     """Advance selected slots directly without copying state through the caller."""
     q, k, v, gate, beta, _state = make_inputs(
         tokens=192,
@@ -424,11 +426,13 @@ def test_paged_chunk_matches_gather_scatter():
     state_indices = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
     state_elements = 4 * 128 * 128
-    storage = torch.randn(6, state_elements + 17, device="cuda")
+    storage = torch.randn(6, state_elements + 17, device="cuda", dtype=state_dtype)
     state_cache = storage[:, :state_elements].view(6, 4, 128, 128)
     expected_storage = storage.clone()
     expected_cache = expected_storage[:, :state_elements].view_as(state_cache)
-    expected_initial_state = torch.stack((expected_cache[4], torch.zeros_like(expected_cache[2])))
+    expected_initial_state = torch.stack(
+        (expected_cache[4], torch.zeros_like(expected_cache[2]))
+    ).float()
 
     expected_output, expected_state = chunk_gdn(
         q,
@@ -442,7 +446,7 @@ def test_paged_chunk_matches_gather_scatter():
         impl="fused",
     )
     assert expected_state is not None
-    expected_cache[state_indices.long()] = expected_state
+    expected_cache[state_indices.long()] = expected_state.to(state_dtype)
 
     with torch.no_grad():
         actual_output = paged_chunk_gdn(
@@ -500,13 +504,14 @@ def test_paged_chunk_dense_batch_matches_gather_scatter():
     torch.testing.assert_close(state_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_paged_chunk_state_continues_in_recurrent_decode():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_chunk_state_continues_in_recurrent_decode(state_dtype: torch.dtype):
     """Use one paged pool directly across chunk prefill and recurrent decode."""
     q, k, v, gate, beta, _state = make_inputs(tokens=65, key_heads=1, value_heads=2)
     state_indices = torch.tensor([3], device="cuda", dtype=torch.int32)
     prefill_offsets = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
     decode_offsets = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    initial_cache = torch.randn(5, 2, 128, 128, device="cuda")
+    initial_cache = torch.randn(5, 2, 128, 128, device="cuda", dtype=state_dtype)
     expected_cache = initial_cache.clone()
     actual_cache = initial_cache.clone()
 
@@ -517,13 +522,13 @@ def test_paged_chunk_state_continues_in_recurrent_decode():
             v[:, :64],
             gate[:, :64],
             beta[:, :64],
-            expected_cache[state_indices.long()].clone(),
+            expected_cache[state_indices.long()].float(),
             cu_seqlens=prefill_offsets,
             output_final_state=True,
             impl="fused",
         )
         assert expected_state is not None
-        expected_cache[state_indices.long()] = expected_state
+        expected_cache[state_indices.long()] = expected_state.to(state_dtype)
         expected_decode, _ = recurrent_gdn(
             q[:, 64:],
             k[:, 64:],
@@ -589,13 +594,14 @@ def test_paged_chunk_handles_padding_and_empty_fresh_slots():
     )
 
 
-def test_paged_chunk_fullgraph_compile():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_chunk_fullgraph_compile(state_dtype: torch.dtype):
     """Keep paged mutation opaque and correctly aliased under fullgraph compilation."""
     q, k, v, gate, beta, _state = make_inputs(tokens=65, key_heads=1, value_heads=2)
     cu_seqlens = torch.tensor([0, 31, 65], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
-    initial_cache = torch.randn(5, 2, 128, 128, device="cuda")
+    initial_cache = torch.randn(5, 2, 128, 128, device="cuda", dtype=state_dtype)
     expected_cache = initial_cache.clone()
     actual_cache = initial_cache.clone()
 
@@ -620,13 +626,14 @@ def test_paged_chunk_fullgraph_compile():
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_paged_chunk_cuda_graph_replay():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_chunk_cuda_graph_replay(state_dtype: torch.dtype):
     """Replay changed cache routing, values, and packed boundaries."""
     q, k, v, gate, beta, _state = make_inputs(tokens=192, key_heads=1, value_heads=2)
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
     state_elements = 2 * 128 * 128
-    storage = torch.randn(7, state_elements + 17, device="cuda")
+    storage = torch.randn(7, state_elements + 17, device="cuda", dtype=state_dtype)
     state_cache = storage[:, :state_elements].view(7, 2, 128, 128)
     with torch.no_grad():
         paged_chunk_gdn(

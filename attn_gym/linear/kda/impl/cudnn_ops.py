@@ -120,6 +120,8 @@ def _packed_fwd_paged_cuda(
     cu_seqlens,
     scale,
 ):
+    if state_cache.dtype != torch.float32:
+        raise TypeError("the cuDNN KDA state pool must use float32")
     backend = _backend(q)
     paged_state = PagedState.validate(
         state_cache,

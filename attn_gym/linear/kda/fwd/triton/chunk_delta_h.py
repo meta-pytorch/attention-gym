@@ -703,8 +703,8 @@ def chunk_gated_delta_rule_fwd_h(
                 "the paged state pool must have shape "
                 f"[num_slots, {heads}, {value_dim}, {key_dim}], got {tuple(initial_state.shape)}"
             )
-        if initial_state.dtype != torch.float32:
-            raise TypeError("the paged state pool must use float32")
+        if initial_state.dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError("the paged state pool must use float32 or bfloat16")
         if initial_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
             raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
         if initial_state.stride(0) < heads * key_dim * value_dim:

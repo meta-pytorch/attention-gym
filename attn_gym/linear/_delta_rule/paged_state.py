@@ -34,7 +34,7 @@ class PagedState:
     """A mutable state pool and its per-sequence device routing metadata.
 
     Attributes:
-        cache: FP32 state pool shaped ``[slots, heads, value_dim, key_dim]``.
+        cache: FP32 or BF16 state pool shaped ``[slots, heads, value_dim, key_dim]``.
             Active routes update their selected slots in place.
         indices: Contiguous int32 route for each sequence. Positive values
             select cache slots; non-positive values produce zero output and
@@ -70,8 +70,8 @@ class PagedState:
             raise ValueError(
                 f"the paged state pool must have shape [slots, {heads}, {value_dim}, {key_dim}]"
             )
-        if cache.dtype != torch.float32:
-            raise TypeError("the paged state pool must use float32")
+        if cache.dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError("the paged state pool must use float32 or bfloat16")
         if cache.device != device:
             raise ValueError("the paged state pool must be on q.device")
         if cache.stride()[1:] != expected_inner_strides:
