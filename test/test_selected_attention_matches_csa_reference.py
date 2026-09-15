@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
+from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
 
 ATOL = 1e-8
 RTOL = 1e-5
@@ -732,9 +732,9 @@ def test_indexer_loss_teacher_logits_use_fp32(dtype):
     torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)
 
 
-LSE_BACKENDS = ["eager"]
+LSE_IMPLEMENTATIONS = [(Impl.REFERENCE, None)]
 if torch.cuda.is_available():
-    LSE_BACKENDS.append("triton")
+    LSE_IMPLEMENTATIONS.append((Impl.FUSED, {"backend": "triton"}))
 
 
 def _dense_qk_softmax_oracle(
@@ -784,9 +784,9 @@ def _dense_qk_softmax_oracle(
     return torch.logsumexp(logits, dim=-1), probabilities[..., : kv_indices.shape[-1]]
 
 
-def _make_lse_inputs(backend, share_kv, with_doc_ids, with_attention_sink):
-    device = torch.device("cuda" if backend == "triton" else "cpu")
-    dtype = torch.float32 if backend == "triton" else torch.float64
+def _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink):
+    device = torch.device("cuda" if impl is Impl.FUSED else "cpu")
+    dtype = torch.float32 if impl is Impl.FUSED else torch.float64
     generator = torch.Generator(device=device).manual_seed(9384)
     batch, heads, sequence_length, head_dim = 2, 3, 9, 32
     sparse_sequence_length, num_topk_blocks = 7, 4
@@ -843,27 +843,28 @@ def _make_lse_inputs(backend, share_kv, with_doc_ids, with_attention_sink):
     }
 
 
-@pytest.mark.parametrize("backend", LSE_BACKENDS)
+@pytest.mark.parametrize("impl,kernel_options", LSE_IMPLEMENTATIONS)
 @pytest.mark.parametrize(
     ("share_kv", "with_doc_ids", "with_attention_sink"),
     [(False, False, True), (True, True, True), (True, False, False)],
 )
 def test_lse_and_selected_key_probabilities_match_dense_qk_softmax_oracle(
-    backend, share_kv, with_doc_ids, with_attention_sink
+    impl, kernel_options, share_kv, with_doc_ids, with_attention_sink
 ):
-    inputs = _make_lse_inputs(backend, share_kv, with_doc_ids, with_attention_sink)
+    inputs = _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink)
 
     with torch.inference_mode():
         expected_lse, expected_selected_probabilities = _dense_qk_softmax_oracle(**inputs)
         _, aux = selected_attention(
             **inputs,
-            backend=backend,
+            impl=impl,
+            kernel_options=kernel_options,
             return_aux=AuxRequest(lse=True),
         )
 
     assert aux.lse is not None
     assert aux.lse.shape == expected_lse.shape
-    tolerance = 1e-3 if backend == "triton" else 1e-12
+    tolerance = 1e-3 if impl is Impl.FUSED else 1e-12
     torch.testing.assert_close(aux.lse, expected_lse, atol=tolerance, rtol=tolerance)
 
     query = inputs["query"].to(expected_lse.dtype)

@@ -16,8 +16,11 @@ Constraints
 
 from __future__ import annotations
 
+import inspect
+import warnings
+from functools import cache
+
 import torch
-from flash_attn.cute.interface import flash_attn_func
 
 # ---------------------------------------------------------------------------
 # Index building
@@ -80,9 +83,7 @@ def _build_unified_gather_indices(
 # ---------------------------------------------------------------------------
 
 
-def _validate_cute_constraints(
-    query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
-):
+def _validate_cute_constraints(query, share_kv):
     if query.device.type != "cuda":
         raise ValueError("CuTe backend requires CUDA tensors.")
     if torch.cuda.get_device_capability(query.device) != (10, 0):
@@ -97,8 +98,46 @@ def _validate_cute_constraints(
         raise ValueError(f"CuTe backend requires head_dim=512, got {d}.")
     if h != 128:
         raise ValueError(f"CuTe backend requires 128 query heads, got {h}.")
-    if local_kv.shape[1] != 1:
-        raise ValueError("CuTe backend requires KV to have 1 head.")
+
+
+@cache
+def _fa4_available(with_sink: bool) -> bool:
+    """Probe the optional dependency once, only after tensor metadata qualifies."""
+    try:
+        from flash_attn.cute.interface import flash_attn_func  # noqa: F401
+
+        if with_sink:
+            from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+
+            return (
+                "learnable_sink"
+                in inspect.signature(FlashAttentionMLAForwardSm100.__call__).parameters
+            )
+    except ImportError:
+        return False
+    return True
+
+
+def is_supported(query, attention_sink, share_kv) -> bool:
+    """Check metadata and optional FA4 features without launching a kernel."""
+    try:
+        _validate_cute_constraints(query, share_kv)
+    except (ValueError, TypeError):
+        return False
+    return _fa4_available(attention_sink is not None)
+
+
+def _check_backward_mode(grad: torch.Tensor) -> torch.Tensor:
+    if torch.are_deterministic_algorithms_enabled():
+        message = (
+            "CuTe selected attention does not support deterministic backward; "
+            "use kernel_options={'backend': 'triton'} for the forward call."
+        )
+        if torch.is_deterministic_algorithms_warn_only_enabled():
+            warnings.warn(message, stacklevel=2)
+        else:
+            raise RuntimeError(message)
+    return grad
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +166,10 @@ def selected_attention(
         Tuple of (output, lse) where output has shape (batch, heads, seq, head_dim)
         and lse has shape (batch, heads, seq).
     """
-    _validate_cute_constraints(
-        query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size, share_kv
-    )
+    _validate_cute_constraints(query, share_kv)
+    if sliding_window_size + kv_indices.shape[-1] == 0:
+        raise ValueError("CuTe selected attention requires at least one window or selected slot.")
+    from flash_attn.cute.interface import flash_attn_func
 
     _b, _h, s, _d = query.shape
     device = query.device
@@ -168,5 +208,9 @@ def selected_attention(
         return_lse=True,
     )
 
-    # FA4's MLA path returns both tensors with sequence before heads.
-    return out.permute(0, 2, 1, 3), lse.permute(0, 2, 1)
+    # Determinism can be enabled after forward; honor its strict/warn-only setting.
+    if out.requires_grad:
+        out.register_hook(_check_backward_mode)
+
+    # Sparse MLA ignores dLSE. Match Triton's nondifferentiable auxiliary contract.
+    return out.permute(0, 2, 1, 3), lse.detach().permute(0, 2, 1)

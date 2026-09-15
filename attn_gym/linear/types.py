@@ -9,6 +9,8 @@
 from enum import Enum
 from typing import Literal, TypedDict
 
+from attn_gym.types import Impl, resolve_impl
+
 
 class BackendOptions(TypedDict, total=False):
     """Backend selection shared by optimized linear-attention operations."""
@@ -32,22 +34,6 @@ class KernelOptions(BackendOptions, total=False):
     while the persistent grid strides over active work only and wins below ~1/4 of capacity
     active. Outputs are bitwise identical. Fused backend only; Hopper or newer for packed
     inputs."""
-
-
-class Impl(str, Enum):
-    """Select a fused or reference implementation without automatic fallback."""
-
-    FUSED = "fused"
-    REFERENCE = "reference"
-
-
-def resolve_impl(impl: Impl | str) -> Impl:
-    """Normalize an implementation selector and report the valid values."""
-    try:
-        return Impl(impl)
-    except ValueError:
-        valid = ", ".join(repr(member.value) for member in Impl)
-        raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
 
 
 class GateTransform(str, Enum):

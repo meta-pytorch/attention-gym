@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse.selected_attention import Impl, selected_attention
 
 
 def _run_selected_attention(
@@ -16,7 +16,7 @@ def _run_selected_attention(
         attention_sink,
         doc_ids,
         sliding_window_size,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     return output
 

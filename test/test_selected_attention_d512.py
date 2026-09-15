@@ -12,6 +12,7 @@ from test_selected_attention_triton import (
 
 from attn_gym.sparse.selected_attention import (
     AuxRequest,
+    Impl,
     SelectedAttentionAux,
     selected_attention,
 )
@@ -81,6 +82,7 @@ def check_training(
     operation: Callable[..., tuple[torch.Tensor, SelectedAttentionAux]] = selected_attention,
     *,
     repeat_backward: bool = False,
+    kernel_options: dict[str, str] | None,
 ) -> None:
     from attn_gym.sparse.selected_attention.impl.triton.primitives import (
         can_use_shared_kv_schedule,
@@ -105,9 +107,11 @@ def check_training(
         sparse_kv=high_precision_tensors[2],
         attention_sink=high_precision_tensors[3],
     )
-    high_precision_output = selected_attention(*high_precision_inputs, window, backend="eager")
-    low_precision_output = selected_attention(*inputs, window, backend="eager")
-    actual, aux = operation(*inputs, window, backend="triton", return_aux=AuxRequest(lse=True))
+    high_precision_output = selected_attention(*high_precision_inputs, window, impl=Impl.REFERENCE)
+    low_precision_output = selected_attention(*inputs, window, impl=Impl.REFERENCE)
+    actual, aux = operation(
+        *inputs, window, kernel_options=kernel_options, return_aux=AuxRequest(lse=True)
+    )
     generator = torch.Generator(device="cuda").manual_seed(1234)
     grad_output = torch.randn(
         query.shape, device=query.device, dtype=query.dtype, generator=generator
@@ -162,7 +166,7 @@ def check_training(
         intermediate_dtype=query.dtype,
     )
 
-    assert aux.lse is not None
+    assert aux.lse is not None and not aux.lse.requires_grad
     assert_sink_gradient_fp32(sink, aux.lse, actual, grad_output, actual_grads[3])
     if topk == 0:
         assert actual_grads[2].count_nonzero() == 0
@@ -191,22 +195,64 @@ def check_training(
 )
 def test_d512_training(heads, share_kv, dtype, seq_len, topk, window, with_docs):
     inputs = make_inputs(heads, share_kv, dtype, seq_len, topk, with_docs)
-    check_training(inputs, window)
+    check_training(inputs, window, kernel_options={"backend": "triton"})
 
 
 @pytest.mark.parametrize("heads,share_kv", [(2, False), (17, True)], ids=["generic", "shared"])
 def test_d512_deterministic_backward(heads, share_kv):
     inputs = make_inputs(heads, share_kv, torch.bfloat16, batch=2)
-    check_training(inputs, 19, repeat_backward=True)
+    check_training(inputs, 19, repeat_backward=True, kernel_options={"backend": "triton"})
 
 
 @pytest.mark.parametrize("heads,share_kv", [(2, False), (17, True)], ids=["generic", "shared"])
-def test_d512_torch_compile_fullgraph(heads, share_kv):
+@pytest.mark.parametrize("kernel_options", [None, {"backend": "triton"}], ids=["auto", "triton"])
+def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
     # Stride tuples are Triton constexpr arguments, so each shape specializes independently.
     compiled = torch.compile(selected_attention, fullgraph=True, dynamic=False)
     for seq_len in (17, 33):
         inputs = make_inputs(heads, share_kv, torch.bfloat16, seq_len=seq_len)
-        check_training(inputs, 19, operation=compiled)
+        check_training(inputs, 19, operation=compiled, kernel_options=kernel_options)
+
+
+def test_cute_eligible_auto_fullgraph_training():
+    from attn_gym.sparse.selected_attention.api import _select_backend
+    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 required")
+    if not _fa4_available(with_sink=False):
+        pytest.skip("FA4 required to exercise compile-driven fallback")
+    torch.manual_seed(0)
+    inputs = make_inputs(128, True, torch.bfloat16, seq_len=17, topk=2, with_docs=False)
+    assert _select_backend(inputs.query, None, True, num_keys=21) == "cute"
+    # Omit the sink: both the metadata and installed FA4 permit CuTe outside compilation.
+    args = inputs[:4]
+    expected = selected_attention(
+        *args, sliding_window_size=19, kernel_options={"backend": "triton"}
+    )
+    compiled = torch.compile(selected_attention, fullgraph=True, dynamic=False)
+    actual = compiled(*args, sliding_window_size=19)
+    assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
+    # Query zero has no valid sparse selections and can attend only to local token zero.
+    torch.testing.assert_close(
+        actual[:, :, 0], inputs.local_kv[:, :, 0].expand_as(actual[:, :, 0]), atol=0, rtol=0
+    )
+    grad_output = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, inputs[:3], grad_output)
+    actual_grads = torch.autograd.grad(actual, inputs[:3], grad_output)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual_grads[0], expected_grads[0], atol=0, rtol=0)
+    # Match the existing compiled/eager shared-KV reduction and atomic-accumulation budgets.
+    torch.testing.assert_close(actual_grads[1], expected_grads[1], atol=0.01, rtol=0.01)
+    torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
+
+
+def test_d512_auto_fallback_training():
+    from attn_gym.sparse.selected_attention.api import _select_backend
+
+    inputs = make_inputs(2, False, torch.bfloat16)
+    assert _select_backend(inputs.query, inputs.attention_sink, False, num_keys=38) == "triton"
+    check_training(inputs, 19, kernel_options=None)
 
 
 @pytest.mark.parametrize("head_dim", [16, 64, 128, 144, 256, 496, 512, 528])

@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
+from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
 
 
 def _skip_no_sm100():
@@ -75,6 +75,7 @@ def check_cute_precision(
     sliding_window_size: int,
     sink_dtype: torch.dtype | None,
     scale: float | None,
+    kernel_options: dict[str, str] | None,
 ) -> None:
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
@@ -152,7 +153,7 @@ def check_cute_precision(
         sink_64,
         doc_ids,
         sliding_window_size,
-        backend="eager",
+        impl=Impl.REFERENCE,
         scale=scale,
     )
     out_lp_ref = selected_attention(
@@ -163,7 +164,7 @@ def check_cute_precision(
         sink_ref,
         doc_ids,
         sliding_window_size,
-        backend="eager",
+        impl=Impl.REFERENCE,
         scale=scale,
     )
     out_lp_cute = selected_attention(
@@ -174,7 +175,7 @@ def check_cute_precision(
         sink_cute,
         doc_ids,
         sliding_window_size,
-        backend="cute",
+        kernel_options=kernel_options,
         scale=scale,
     )
 
@@ -239,13 +240,25 @@ def check_cute_precision(
         )
 
 
-def test_cute_sink_dependency_smoke():
-    """Check installed FA4 sink forward/backward via the public API on a tiny SM100 case.
+@pytest.mark.parametrize(
+    "kernel_options,sink_dtype",
+    [
+        pytest.param({"backend": "cute"}, torch.float32, id="forced-sink"),
+        pytest.param(None, None, id="auto-no-sink"),
+        pytest.param(None, torch.float32, id="auto-sink"),
+    ],
+)
+def test_cute_dependency_smoke(kernel_options, sink_dtype):
+    """Exercise auto dispatch through the real FA4 forward and backward, when supported."""
+    from attn_gym.sparse.selected_attention.api import _select_backend
+    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
 
-    Skip older FA4 kernels without sink support. Once supported, the independent eager/FP64
-    references check output and dQ, dLocalKV, dSparseKV, and dSink without masking failures.
-    """
     _skip_no_sm100()
+    if not _fa4_available(with_sink=sink_dtype is not None):
+        pytest.skip("installed FA4 does not support the requested sparse-MLA features")
+    query = torch.empty(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.empty(128, device="cuda", dtype=sink_dtype) if sink_dtype is not None else None
+    assert _select_backend(query, sink, True, num_keys=6) == "cute"
     check_cute_precision(
         batch=1,
         num_topk=2,
@@ -253,9 +266,53 @@ def test_cute_sink_dependency_smoke():
         seq_len=8,
         sparse_seq_len=8,
         sliding_window_size=4,
-        sink_dtype=torch.float32,
+        sink_dtype=sink_dtype,
         scale=0.025,
+        kernel_options=kernel_options,
     )
+
+
+@pytest.mark.parametrize("kernel_options", [None, {"backend": "cute"}], ids=["auto", "forced"])
+@pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn-only"])
+def test_cute_determinism_enabled_after_forward(kernel_options, warn_only):
+    from attn_gym.sparse.selected_attention.api import _select_backend
+    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
+
+    _skip_no_sm100()
+    if not _fa4_available(with_sink=False):
+        pytest.skip("FA4 is not installed")
+    query = torch.randn(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(1, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros(1, 8, 2, device="cuda", dtype=torch.int32)
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(False)
+        assert _select_backend(query, None, True, num_keys=6) == "cute"
+        out, aux = selected_attention(
+            query,
+            kv,
+            kv,
+            indices,
+            sliding_window_size=4,
+            kernel_options=kernel_options,
+            return_aux=AuxRequest(lse=True),
+        )
+        assert not aux.lse.requires_grad
+        with pytest.raises(RuntimeError, match="does not require grad"):
+            aux.lse.sum().backward()
+        if warn_only:
+            (expected_grad,) = torch.autograd.grad(out.sum(), query, retain_graph=True)
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        if warn_only:
+            with pytest.warns(UserWarning, match="use kernel_options"):
+                out.sum().backward()
+            torch.testing.assert_close(query.grad, expected_grad)
+        else:
+            with pytest.raises(RuntimeError, match="use kernel_options"):
+                out.sum().backward()
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
 
 # Keep every original shape/top-k pair, crossed only with window and doc masking (64 cases).
@@ -299,6 +356,7 @@ def test_cute_precision_vs_fp64(
         sliding_window_size=sliding_window_size,
         sink_dtype=sink_dtype,
         scale=scale,
+        kernel_options={"backend": "cute"},
     )
 
 
@@ -350,7 +408,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
         sink,
         None,
         window,
-        backend="cute",
+        kernel_options={"backend": "cute"},
         scale=scale,
         return_aux=AuxRequest(lse=True),
     )
@@ -365,7 +423,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
         sink.double() if sink is not None else None,
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
         scale=scale,
         return_aux=AuxRequest(lse=True),
     )

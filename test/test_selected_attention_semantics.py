@@ -6,25 +6,33 @@ Tests both eager (reference) and triton backends.
 """
 
 import math
+from functools import partial
 
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse.selected_attention import Impl, selected_attention
 
-BACKENDS = ["eager"]
+IMPLEMENTATIONS = [(Impl.REFERENCE, None)]
 if torch.cuda.is_available():
-    BACKENDS.append("triton")
+    IMPLEMENTATIONS.append((Impl.FUSED, {"backend": "triton"}))
 
 # Both backends cover default and non-default scales. Triton also checks 0.25, which equals
 # the default at head_dim=16 in the compile tests but not at head_dim=8 in joint normalization.
-BACKEND_SCALE_CASES = [(backend, scale) for backend in BACKENDS for scale in (None, 0.125)]
-if "triton" in BACKENDS:
-    BACKEND_SCALE_CASES.append(("triton", 0.25))
+IMPLEMENTATION_SCALE_CASES = [
+    (impl, options, scale) for impl, options in IMPLEMENTATIONS for scale in (None, 0.125)
+]
+if torch.cuda.is_available():
+    IMPLEMENTATION_SCALE_CASES.append((Impl.FUSED, {"backend": "triton"}, 0.25))
 
 BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+
+
+@pytest.fixture
+def attention(impl, kernel_options):
+    return partial(selected_attention, impl=impl, kernel_options=kernel_options)
 
 
 @pytest.fixture
@@ -70,12 +78,8 @@ def shared_kv_blackwell_inputs():
     return query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids
 
 
-def _device_for_backend(backend):
-    return torch.device("cuda") if backend == "triton" else torch.device("cpu")
-
-
-def _dtype_for_backend(backend):
-    return torch.float32
+def _device_for_impl(impl):
+    return torch.device("cuda") if impl is Impl.FUSED else torch.device("cpu")
 
 
 def assert_matches_low_precision_eager(
@@ -104,11 +108,11 @@ def assert_matches_low_precision_eager(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_local_only_matches_manual_computation(backend):
+@pytest.mark.parametrize("impl,kernel_options", IMPLEMENTATIONS)
+def test_local_only_matches_manual_computation(impl, attention):
     """Local-only with sink=0 should match standard causal sliding window softmax."""
-    device = _device_for_backend(backend)
-    dtype = torch.float64 if backend == "eager" else torch.float32
+    device = _device_for_impl(impl)
+    dtype = torch.float64 if impl is Impl.REFERENCE else torch.float32
     b, h, s, d = 1, 1, 6, 8
     window = 3
 
@@ -119,9 +123,7 @@ def test_local_only_matches_manual_computation(backend):
     kv_indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
-    )
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
 
     # Manual: build causal sliding window mask, compute attention
     scale = d**0.5
@@ -141,11 +143,9 @@ def test_local_only_matches_manual_computation(backend):
     expected = probs @ local_kv
 
     sparse_kv2 = torch.randn_like(sparse_kv)
-    out2 = selected_attention(
-        query, local_kv, sparse_kv2, kv_indices, sink, None, window, backend=backend
-    )
+    out2 = attention(query, local_kv, sparse_kv2, kv_indices, sink, None, window)
 
-    atol = 1e-5 if backend == "triton" else 1e-10
+    atol = 1e-5 if impl is Impl.FUSED else 1e-10
     assert out.shape == (b, h, s, d)
     torch.testing.assert_close(out, expected, atol=atol, rtol=1e-5)
     torch.testing.assert_close(out2, expected, atol=atol, rtol=1e-5)
@@ -156,11 +156,11 @@ def test_local_only_matches_manual_computation(backend):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_selected_block_only_manual(backend):
+@pytest.mark.parametrize("impl,kernel_options", IMPLEMENTATIONS)
+def test_selected_block_only_manual(impl, attention):
     """Selected-block-only with sink=0 should match manual gather + softmax."""
-    device = _device_for_backend(backend)
-    dtype = torch.float64 if backend == "eager" else torch.float32
+    device = _device_for_impl(impl)
+    dtype = torch.float64 if impl is Impl.REFERENCE else torch.float32
     b, h, s, d = 1, 1, 4, 8
     sparse_seq_len = 6
 
@@ -173,9 +173,7 @@ def test_selected_block_only_manual(backend):
 
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend=backend
-    )
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, 0)
 
     # Manual computation: for each query, gather the selected sparse_kv positions
     scale = d**0.5
@@ -195,11 +193,9 @@ def test_selected_block_only_manual(backend):
     expected = torch.bmm(probs.unsqueeze(1), gathered).squeeze(1)  # (4, 8)
 
     local_kv2 = torch.randn_like(local_kv)
-    out2 = selected_attention(
-        query, local_kv2, sparse_kv, kv_indices, sink, None, 0, backend=backend
-    )
+    out2 = attention(query, local_kv2, sparse_kv, kv_indices, sink, None, 0)
 
-    atol = 1e-4 if backend == "triton" else 1e-10
+    atol = 1e-4 if impl is Impl.FUSED else 1e-10
     assert out.shape == (b, h, s, d)
     torch.testing.assert_close(out[0, 0], expected, atol=atol, rtol=1e-4)
     torch.testing.assert_close(out2[0, 0], expected, atol=atol, rtol=1e-4)
@@ -210,15 +206,15 @@ def test_selected_block_only_manual(backend):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend,scale", BACKEND_SCALE_CASES)
-def test_joint_normalization(backend, scale):
+@pytest.mark.parametrize("impl,kernel_options,scale", IMPLEMENTATION_SCALE_CASES)
+def test_joint_normalization(impl, attention, scale):
     """When both local and sparse branches are active, they share normalization.
 
     We verify against a manual computation that runs a single softmax over the
     concatenation of sparse and local logits.
     """
-    device = _device_for_backend(backend)
-    dtype = torch.float64 if backend == "eager" else torch.float32
+    device = _device_for_impl(impl)
+    dtype = torch.float64 if impl is Impl.REFERENCE else torch.float32
     b, h, s, d = 1, 1, 4, 8
     window = 2
     sparse_seq_len = 3
@@ -231,9 +227,7 @@ def test_joint_normalization(backend, scale):
 
     kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend, scale=scale
-    )
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window, scale=scale)
 
     # --- Manual: single softmax over gathered sparse + local window + sink ---
     resolved_scale = d**-0.5 if scale is None else scale
@@ -268,7 +262,7 @@ def test_joint_normalization(backend, scale):
         probs = probs_with_sink[:-1]
         expected[seq] = probs @ all_kv
 
-    atol = 1e-4 if backend == "triton" else 1e-10
+    atol = 1e-4 if impl is Impl.FUSED else 1e-10
     torch.testing.assert_close(out[0, 0], expected, atol=atol, rtol=1e-4)
 
 
@@ -277,11 +271,11 @@ def test_joint_normalization(backend, scale):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_sink_large_absorbs_probability(backend):
+@pytest.mark.parametrize("impl,kernel_options", IMPLEMENTATIONS)
+def test_sink_large_absorbs_probability(impl, attention):
     """As sink → +∞, all probability goes to sink, output → 0."""
-    device = _device_for_backend(backend)
-    dtype = _dtype_for_backend(backend)
+    device = _device_for_impl(impl)
+    dtype = torch.float32
     b, h, s, d = 1, 1, 4, 8
     window = 2
 
@@ -294,9 +288,7 @@ def test_sink_large_absorbs_probability(backend):
     # Very large positive sink
     sink = torch.full((h,), 50.0, device=device, dtype=dtype)
 
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
-    )
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
 
     # Output should be near zero (sink absorbs essentially all probability)
     assert out.abs().max().item() < 0.01, (
@@ -304,14 +296,14 @@ def test_sink_large_absorbs_probability(backend):
     )
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_sink_very_negative_has_no_effect(backend):
+@pytest.mark.parametrize("impl,kernel_options", IMPLEMENTATIONS)
+def test_sink_very_negative_has_no_effect(impl, attention):
     """With sink → -∞, the sink contributes nothing to the denominator.
 
     Output should match standard softmax (no sink term in denominator).
     """
-    device = _device_for_backend(backend)
-    dtype = torch.float64 if backend == "eager" else torch.float32
+    device = _device_for_impl(impl)
+    dtype = torch.float64 if impl is Impl.REFERENCE else torch.float32
     b, h, s, d = 1, 1, 6, 8
     window = 3
 
@@ -324,9 +316,7 @@ def test_sink_very_negative_has_no_effect(backend):
     # Very negative sink (contributes nothing)
     sink = torch.full((h,), -100.0, device=device, dtype=dtype)
 
-    out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, window, backend=backend
-    )
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
 
     # Manual standard softmax (no sink in denominator)
     scale = d**0.5
@@ -339,14 +329,14 @@ def test_sink_very_negative_has_no_effect(backend):
     probs = torch.softmax(logits, dim=-1)
     expected = probs @ local_kv
 
-    atol = 1e-4 if backend == "triton" else 1e-6
+    atol = 1e-4 if impl is Impl.FUSED else 1e-6
     torch.testing.assert_close(out, expected, atol=atol, rtol=1e-4)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_float32_attention_sink(backend):
+@pytest.mark.parametrize("impl,kernel_options", IMPLEMENTATIONS)
+def test_float32_attention_sink(impl, attention):
     """A float32 sink is supported with lower-precision query and KV tensors."""
-    device = _device_for_backend(backend)
+    device = _device_for_impl(impl)
     torch.manual_seed(101)
     query = torch.randn(1, 2, 4, 16, device=device, dtype=torch.bfloat16)
     local_kv = torch.randn(1, 2, 4, 16, device=device, dtype=torch.bfloat16)
@@ -362,14 +352,12 @@ def test_float32_attention_sink(backend):
         attention_sink.double(),
         None,
         2,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     low_precision_expected = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend="eager"
+        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, impl=Impl.REFERENCE
     )
-    actual = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, backend=backend
-    )
+    actual = attention(query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2)
 
     assert actual.dtype == torch.bfloat16
     assert_matches_low_precision_eager(
@@ -435,7 +423,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
         attention_sink,
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     actual_float32_sink = selected_attention(
         query,
@@ -445,7 +433,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
         attention_sink.float(),
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -484,7 +472,14 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     kv_indices = torch.full((b, s, num_repeats), 2, dtype=torch.long, device=device)
 
     out_eager = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="eager"
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        sink,
+        None,
+        sliding_window_size,
+        impl=Impl.REFERENCE,
     )
     grad_output = torch.randn_like(out_eager)
     out_eager.backward(grad_output)
@@ -499,7 +494,14 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
     sink.grad = None
 
     out_triton = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, sliding_window_size, backend="triton"
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        sink,
+        None,
+        sliding_window_size,
+        kernel_options={"backend": "triton"},
     )
     out_triton.backward(grad_output)
 
@@ -532,10 +534,10 @@ def test_mixed_repeated_and_unique_indices_backends_match():
     )
 
     out_eager = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 3, backend="eager"
+        query, local_kv, sparse_kv, kv_indices, sink, None, 3, impl=Impl.REFERENCE
     )
     out_triton = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 3, backend="triton"
+        query, local_kv, sparse_kv, kv_indices, sink, None, 3, kernel_options={"backend": "triton"}
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
@@ -565,7 +567,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         high_precision_inputs[3],
         doc_ids,
         19,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     expected = selected_attention(
         query,
@@ -575,7 +577,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         attention_sink,
         doc_ids,
         19,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     actual = selected_attention(
         query,
@@ -585,7 +587,7 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         attention_sink,
         doc_ids,
         19,
-        backend="triton",
+        kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
     high_precision_grads = torch.autograd.grad(
@@ -634,7 +636,7 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
             attention_sink,
             doc_ids,
             19,
-            backend="eager",
+            impl=Impl.REFERENCE,
         )
         actual = selected_attention(
             query,
@@ -644,7 +646,7 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
             attention_sink,
             doc_ids,
             19,
-            backend="triton",
+            kernel_options={"backend": "triton"},
         )
         grad_output = torch.randn_like(expected)
         expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
@@ -701,7 +703,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         attention_sink,
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     actual = selected_attention(
         query,
@@ -711,7 +713,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         attention_sink,
         None,
         window,
-        backend="triton",
+        kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
@@ -772,7 +774,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         high_precision_inputs[3],
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     expected = selected_attention(
         query,
@@ -782,7 +784,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         attention_sink,
         None,
         window,
-        backend="eager",
+        impl=Impl.REFERENCE,
     )
     actual = selected_attention(
         query,
@@ -792,7 +794,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         attention_sink,
         None,
         window,
-        backend="triton",
+        kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
     high_precision_grads = torch.autograd.grad(
@@ -841,7 +843,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             attention_sink.double(),
             None,
             window,
-            backend="eager",
+            impl=Impl.REFERENCE,
         )
         low_precision_expected = selected_attention(
             query,
@@ -851,7 +853,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             attention_sink,
             None,
             window,
-            backend="eager",
+            impl=Impl.REFERENCE,
         )
         actual = selected_attention(
             query,
@@ -861,7 +863,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             attention_sink,
             None,
             window,
-            backend="triton",
+            kernel_options={"backend": "triton"},
         )
 
     assert_matches_low_precision_eager(
@@ -892,7 +894,7 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
             attention_sink,
             doc_ids,
             19,
-            backend="triton",
+            kernel_options={"backend": "triton"},
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
@@ -926,9 +928,9 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
 @pytest.mark.parametrize("scale", [None, 0.125, 0.25])
 def test_torch_compile_fullgraph_forward(scale):
     """The Triton inference path compiles with torch.compile(fullgraph=True)."""
-    backend = "triton"
+    impl, kernel_options = Impl.FUSED, {"backend": "triton"}
     device = torch.device("cuda")
-    dtype = _dtype_for_backend(backend)
+    dtype = torch.float32
     b, h, s, d = 1, 2, 8, 16
     window = 3
     sparse_seq_len = 4
@@ -951,7 +953,8 @@ def test_torch_compile_fullgraph_forward(scale):
             sink,
             None,
             window,
-            backend=backend,
+            impl=impl,
+            kernel_options=kernel_options,
             scale=scale,
         )
 
@@ -965,11 +968,11 @@ def test_torch_compile_fullgraph_forward(scale):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
-@pytest.mark.parametrize("backend,scale", BACKEND_SCALE_CASES)
-def test_torch_compile_fullgraph_backward(backend, scale):
+@pytest.mark.parametrize("impl,kernel_options,scale", IMPLEMENTATION_SCALE_CASES)
+def test_torch_compile_fullgraph_backward(impl, attention, scale):
     """selected_attention backward works under torch.compile(fullgraph=True)."""
     device = torch.device("cuda")
-    dtype = _dtype_for_backend(backend)
+    dtype = torch.float32
     b, h, s, d = 1, 2, 8, 16
     window = 3
     sparse_seq_len = 4
@@ -980,17 +983,7 @@ def test_torch_compile_fullgraph_backward(backend, scale):
     _, kv_indices = torch.topk(scores, k=topk, dim=-1)
 
     def fn(query, local_kv, sparse_kv, sink):
-        return selected_attention(
-            query,
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            sink,
-            None,
-            window,
-            backend=backend,
-            scale=scale,
-        )
+        return attention(query, local_kv, sparse_kv, kv_indices, sink, None, window, scale=scale)
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
@@ -1047,7 +1040,7 @@ def test_repeated_indices_manual_forward_and_backward():
     kv_indices = torch.tensor([[[0, 0, 1], [2, 2, 2], [1, 3, 3]]])
 
     out = selected_attention(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 0, backend="eager"
+        query, local_kv, sparse_kv, kv_indices, sink, None, 0, impl=Impl.REFERENCE
     )
 
     # --- Manual forward ---
