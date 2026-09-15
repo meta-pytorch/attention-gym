@@ -20,9 +20,25 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work,
     load_ragged_sequence_work,
 )
+from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["T", "H", "HK", "K", "V", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_dv_local_kernel(
     q,
@@ -115,6 +131,31 @@ def chunk_gdn_bwd_dv_local_kernel(
         "USE_FINAL_STATE_GRADIENT": lambda args: args["d_final_state"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=2),
+    ],
+    key=[
+        "T",
+        "num_sequences",
+        "H",
+        "HK",
+        "K",
+        "V",
+        "IS_VARLEN",
+        "STORE_INITIAL_STATE_GRADIENT",
+        "USE_FINAL_STATE_GRADIENT",
+    ],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config
+            for config in configs
+            if config.kwargs["BK"] <= K <= 2 * config.kwargs["BK"] and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_delta_h_kernel(
     q,
@@ -167,20 +208,23 @@ def chunk_gdn_bwd_delta_h_kernel(
 
     row = tl.arange(0, BT)
     value = value_tile * BV + tl.arange(0, BV)
-    key_1 = tl.arange(0, BK)
+    NK: tl.constexpr = triton.cdiv(K, BK)
+    key_lane = tl.arange(0, BK)
+    value_mask = value < V
     key_head = head // GROUPS
-    d_state_1 = tl.zeros((BK, BV), dtype=tl.float32)
-    if K > BK:
-        key_2 = BK + key_1
-        d_state_2 = tl.zeros((BK, BV), dtype=tl.float32)
-
     state_base = ptr_offset((sequence, head), (H * V * K, V * K))
-    if USE_FINAL_STATE_GRADIENT:
-        final_offset_1 = state_base + ptr_offset((value[:, None], key_1[None, :]), (K, 1))
-        d_state_1 += tl.trans(tl.load(d_final_state + final_offset_1)).to(tl.float32)
-        if K > BK:
-            final_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
-            d_state_2 += tl.trans(tl.load(d_final_state + final_offset_2)).to(tl.float32)
+    d_states = ()
+    for ki in tl.static_range(NK):
+        key = ki * BK + key_lane
+        state = tl.zeros((BK, BV), dtype=tl.float32)
+        if USE_FINAL_STATE_GRADIENT:
+            offset = state_base + ptr_offset((value[None, :], key[:, None]), (K, 1))
+            state += tl.load(
+                d_final_state + offset,
+                mask=(key[:, None] < K) & value_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        d_states = d_states + (state,)
 
     for local_chunk in range(chunk_count - 1, -1, -1):
         global_chunk = chunk_begin + local_chunk
@@ -190,11 +234,14 @@ def chunk_gdn_bwd_delta_h_kernel(
         token_mask = row < valid_tokens
 
         dh_base = ptr_offset((global_chunk, head), (H * K * V, K * V))
-        dh_offset_1 = dh_base + ptr_offset((key_1[:, None], value[None, :]), (V, 1))
-        tl.store(dh + dh_offset_1, d_state_1.to(dh.dtype.element_ty))
-        if K > BK:
-            dh_offset_2 = dh_base + ptr_offset((key_2[:, None], value[None, :]), (V, 1))
-            tl.store(dh + dh_offset_2, d_state_2.to(dh.dtype.element_ty))
+        for ki in tl.static_range(NK):
+            key = ki * BK + key_lane
+            dh_offset = dh_base + ptr_offset((key[:, None], value[None, :]), (V, 1))
+            tl.store(
+                dh + dh_offset,
+                d_states[ki].to(dh.dtype.element_ty),
+                mask=(key[:, None] < K) & value_mask[None, :],
+            )
 
         gate_offset = ptr_offset((token, head), (H, 1))
         gate = tl.load(
@@ -211,80 +258,68 @@ def chunk_gdn_bwd_delta_h_kernel(
 
         q_base = ptr_offset((token[:, None], key_head), (q_stride_t, K))
         k_base = ptr_offset((token[:, None], key_head), (k_stride_t, K))
-        k_tile_1 = tl.load(
-            k + k_base + key_1[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
-        value_gradient = tl.dot(k_tile_1, d_state_1.to(k_tile_1.dtype))
-        if K > BK:
-            k_tile_2 = tl.load(
-                k + k_base + key_2[None, :],
-                mask=token_mask[:, None],
+        value_gradient = tl.zeros((BT, BV), dtype=tl.float32)
+        for ki in tl.static_range(NK):
+            key = ki * BK + key_lane
+            k_tile = tl.load(
+                k + k_base + key[None, :],
+                mask=token_mask[:, None] & (key[None, :] < K),
                 other=0.0,
             )
-            value_gradient += tl.dot(k_tile_2, d_state_2.to(k_tile_2.dtype))
+            value_gradient += tl.dot(k_tile, d_states[ki].to(k_tile.dtype))
         value_gradient *= restored_decay[:, None]
 
         value_offset = ptr_offset((token[:, None], head, value[None, :]), (H * V, V, 1))
         value_gradient += tl.load(
             dv_local + value_offset,
-            mask=token_mask[:, None],
+            mask=token_mask[:, None] & value_mask[None, :],
             other=0.0,
         )
         tl.store(
             dv + value_offset,
             value_gradient.to(dv.dtype.element_ty),
-            mask=token_mask[:, None],
+            mask=token_mask[:, None] & value_mask[None, :],
         )
 
         state_decay = tl.exp2(final_gate)
-        d_state_1 *= state_decay
-        if K > BK:
-            d_state_2 *= state_decay
         output_tile = tl.load(
             d_output + value_offset,
-            mask=token_mask[:, None],
+            mask=token_mask[:, None] & value_mask[None, :],
             other=0.0,
         )
         query_decay = tl.where(token_mask, tl.exp2(gate), 0.0)
-        q_tile_1 = tl.load(
-            q + q_base + key_1[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
-        q_tile_1 = (q_tile_1 * query_decay[:, None]).to(q_tile_1.dtype)
-        if K > BK:
-            q_tile_2 = tl.load(
-                q + q_base + key_2[None, :],
-                mask=token_mask[:, None],
-                other=0.0,
-            )
-            q_tile_2 = (q_tile_2 * query_decay[:, None]).to(q_tile_2.dtype)
-
         w_base = ptr_offset((token[:, None], head), (H * K, K))
-        w_tile_1 = tl.load(
-            w + w_base + key_1[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
-        d_state_1 += tl.dot(tl.trans(q_tile_1), output_tile) * scale
-        d_state_1 -= tl.dot(tl.trans(w_tile_1), value_gradient.to(w_tile_1.dtype))
-        if K > BK:
-            w_tile_2 = tl.load(
-                w + w_base + key_2[None, :],
-                mask=token_mask[:, None],
+        next_states = ()
+        for ki in tl.static_range(NK):
+            key = ki * BK + key_lane
+            key_mask = token_mask[:, None] & (key[None, :] < K)
+            q_tile = tl.load(
+                q + q_base + key[None, :],
+                mask=key_mask,
                 other=0.0,
             )
-            d_state_2 += tl.dot(tl.trans(q_tile_2), output_tile) * scale
-            d_state_2 -= tl.dot(tl.trans(w_tile_2), value_gradient.to(w_tile_2.dtype))
+            w_tile = tl.load(
+                w + w_base + key[None, :],
+                mask=key_mask,
+                other=0.0,
+            )
+            q_tile = (q_tile * query_decay[:, None]).to(q_tile.dtype)
+
+            state = d_states[ki] * state_decay
+            state += tl.dot(tl.trans(q_tile), output_tile) * scale
+            state -= tl.dot(tl.trans(w_tile), value_gradient.to(w_tile.dtype))
+            next_states = next_states + (state,)
+        d_states = next_states
 
     if STORE_INITIAL_STATE_GRADIENT:
-        initial_offset_1 = state_base + ptr_offset((value[:, None], key_1[None, :]), (K, 1))
-        tl.store(d_initial_state + initial_offset_1, tl.trans(d_state_1))
-        if K > BK:
-            initial_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
-            tl.store(d_initial_state + initial_offset_2, tl.trans(d_state_2))
+        for ki in tl.static_range(NK):
+            key = ki * BK + key_lane
+            offset = state_base + ptr_offset((value[None, :], key[:, None]), (K, 1))
+            tl.store(
+                d_initial_state + offset,
+                d_states[ki],
+                mask=(key[:, None] < K) & value_mask[None, :],
+            )
 
 
 def chunk_gdn_bwd_delta_h(
@@ -305,7 +340,6 @@ def chunk_gdn_bwd_delta_h(
     Public state tensors use ``[N, H, V, K]``, while ``dh`` uses ``[chunk, H, K, V]``.
     """
     bt = 64
-    block_key = block_value = 64
 
     if q.ndim != 4 or k.shape != q.shape:
         raise ValueError("q and k must have matching [B,T,HK,K] shapes")
@@ -409,13 +443,12 @@ def chunk_gdn_bwd_delta_h(
             K=key_dim,
             V=value_dim,
             BT=bt,
-            BK=32,
-            BV=32,
-            num_warps=4,
-            num_stages=2,
         )
 
-    chunk_gdn_bwd_delta_h_kernel[(num_sequences * value_heads, value_dim // block_value)](
+    def grid(meta):
+        return (num_sequences * value_heads, triton.cdiv(value_dim, meta["BV"]))
+
+    chunk_gdn_bwd_delta_h_kernel[grid](
         q,
         k,
         q.stride(1),
@@ -439,10 +472,6 @@ def chunk_gdn_bwd_delta_h(
         K=key_dim,
         V=value_dim,
         BT=bt,
-        BK=block_key,
-        BV=block_value,
-        num_warps=4,
-        num_stages=2,
     )
     return dh, d_initial_state, dv
 

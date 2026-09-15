@@ -104,8 +104,6 @@ def run_with_gradients(
     inputs: tuple[torch.Tensor, ...],
     impl: str,
     cu_seqlens: torch.Tensor | None = None,
-    *,
-    sum_state_loss: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Run output/state and all input gradients under one shared scalar loss."""
     output, state = chunk_gdn(
@@ -116,9 +114,9 @@ def run_with_gradients(
         impl=impl,
     )
     assert state is not None
-    state_loss = state.float().square()
-    state_loss = state_loss.sum() if sum_state_loss else state_loss.mean()
-    gradients = torch.autograd.grad(output.float().square().mean() + state_loss, inputs)
+    gradients = torch.autograd.grad(
+        output.float().square().mean() + state.float().square().mean(), inputs
+    )
     return output, state, *gradients
 
 
@@ -170,6 +168,7 @@ def force_portable_backward(monkeypatch) -> None:
         (1, 64, 1, 2, 64, torch.float16, "mild", None, True),
         (1, 16, 1, 2, 64, torch.bfloat16, "mild", [7, 9], True),
         (1, 16, 1, 2, 64, torch.float16, "mild", [7, 9], True),
+        (1, 192, 1, 4, 64, torch.bfloat16, "spikes", [65, 0, 127], True),
     ],
 )
 def test_fused_chunk_matches_low_precision_reference(
@@ -200,7 +199,6 @@ def test_fused_chunk_matches_low_precision_reference(
     if lengths is not None:
         cu_seqlens = cumulative_sequence_offsets(lengths)
         generator = torch.Generator(device="cuda").manual_seed(29)
-        state_scale = 0.01 if head_dim == 64 else 1.0
         inputs = (
             *inputs[:5],
             torch.randn(
@@ -211,8 +209,7 @@ def test_fused_chunk_matches_low_precision_reference(
                 device="cuda",
                 generator=generator,
                 requires_grad=True,
-            )
-            * state_scale,
+            ),
         )
     else:
         cu_seqlens = None
@@ -220,14 +217,9 @@ def test_fused_chunk_matches_low_precision_reference(
     fused_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     golden_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
-    sum_state_loss = head_dim == 64
-    actual = run_with_gradients(fused_inputs, "fused", cu_seqlens, sum_state_loss=sum_state_loss)
-    expected = run_with_gradients(
-        reference_inputs, "reference", cu_seqlens, sum_state_loss=sum_state_loss
-    )
-    golden = run_with_gradients(
-        golden_inputs, "reference", cu_seqlens, sum_state_loss=sum_state_loss
-    )
+    actual = run_with_gradients(fused_inputs, "fused", cu_seqlens)
+    expected = run_with_gradients(reference_inputs, "reference", cu_seqlens)
+    golden = run_with_gradients(golden_inputs, "reference", cu_seqlens)
 
     for name, result, high_precision, reference in zip(
         ("output", "state", "dq", "dk", "dv", "dgate", "dbeta", "dstate"),
@@ -236,15 +228,7 @@ def test_fused_chunk_matches_low_precision_reference(
         expected,
         strict=True,
     ):
-        if lengths is not None and head_dim == 64 and name == "dstate":
-            # The entry-state cotangent crosses the QKV-dtype chunk checkpoint.
-            # Account for that additional rounding boundary over the eager oracle.
-            high = high_precision.double()
-            actual_error = (result.double() - high).abs().max().item()
-            reference_error = (reference.double() - high).abs().max().item()
-            rounding = torch.finfo(dtype).eps * high.abs().max().item()
-            assert actual_error <= 4 * (reference_error + rounding)
-        elif high_precision.abs().max().item() < 1e-12:
+        if high_precision.abs().max().item() < 1e-12:
             assert torch.isfinite(result).all()
             # The portable gate VJP subtracts two independently reduced FP32 terms.
             # Uniform -20 gates underflow the true result to zero, leaving a sub-nanounit

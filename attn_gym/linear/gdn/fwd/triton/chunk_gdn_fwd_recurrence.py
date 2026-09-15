@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import _delta_h_launch
@@ -31,6 +32,7 @@ def chunk_gdn_fwd_recurrence_kernel(
     K: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     """Keep one KxBV state tile resident while traversing BT64 chunks."""
     batch_head = tl.program_id(0)
@@ -39,7 +41,7 @@ def chunk_gdn_fwd_recurrence_kernel(
     head = batch_head % H
     state_vk = initial_state_desc.load([batch, head, value_tile * BV, 0])
     state = tl.trans(tl.reshape(state_vk, [BV, K])).to(tl.float32)
-    for chunk in tl.range(0, T // BT, warp_specialize=True, num_stages=3):
+    for chunk in tl.range(0, T // BT, warp_specialize=True, num_stages=NUM_STAGES):
         token = chunk * BT
         h_desc.store(
             [batch, chunk, head, 0, value_tile * BV],
@@ -86,7 +88,14 @@ def chunk_gdn_fwd_recurrence_dense(
         raise ValueError("initial_state must have shape [B,H,V,K]")
 
     chunks = tokens // 64
-    block_value = min(64, value_dim)
+    # Chunks execute serially inside each program, so only batch/head/value tiles contribute
+    # launch parallelism. Split D64 values when the unsplit grid cannot fill one GPU wave;
+    # otherwise BV64 avoids duplicating the K/W traffic across two programs.
+    program_count = batch * heads
+    num_sms = get_device_properties(k.device).multi_processor_count
+    use_small_value_tile = value_dim == 64 and program_count < num_sms
+    block_value = 32 if use_small_value_tile else 64
+    num_stages = 2 if use_small_value_tile else 3
     h = torch.empty(batch, chunks, heads, key_dim, value_dim, dtype=k.dtype, device=k.device)
     v_new = torch.empty_like(u)
     final_state = torch.empty_like(initial_state)
@@ -104,8 +113,9 @@ def chunk_gdn_fwd_recurrence_dense(
         K=key_dim,
         BT=64,
         BV=block_value,
+        NUM_STAGES=num_stages,
         num_warps=4,
-        num_stages=3,
+        num_stages=num_stages,
     )
     return h, v_new, final_state
 

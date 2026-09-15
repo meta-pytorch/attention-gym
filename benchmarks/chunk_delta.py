@@ -1,4 +1,4 @@
-"""Public cuDNN chunk-delta performance and memory matrix for GDN and KDA."""
+"""Public fused chunk-delta performance and memory matrix for GDN and KDA."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from attn_gym.linear import chunk_gdn, chunk_kda
 
 Operation = Literal["gdn", "kda"]
 OPERATIONS: tuple[Operation, ...] = ("gdn", "kda")
+HEAD_DIMS = (64, 128)
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,10 @@ class Case:
     kda_budget_us: float | None
     operations: tuple[Operation, ...] = OPERATIONS
 
-    def budget_for(self, operation: Operation) -> float | None:
+    def budget_for(self, operation: Operation, head_dim: int) -> float | None:
         """Return the B200 BF16 train-step budget for one operation."""
+        if head_dim != 128:
+            return None
         return self.gdn_budget_us if operation == "gdn" else self.kda_budget_us
 
 
@@ -58,7 +61,7 @@ CASES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark the public cuDNN GDN and KDA chunk training paths."
+        description="Benchmark the public fused GDN and KDA chunk training paths."
     )
     parser.add_argument(
         "--op",
@@ -80,6 +83,17 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         help="Q/K/V and output-gradient dtype; budgets apply only to BF16",
     )
+    parser.add_argument(
+        "--head-dim",
+        action="append",
+        dest="head_dims",
+        type=int,
+        choices=HEAD_DIMS,
+        help=(
+            "head dimension to benchmark; may be repeated and defaults to 64 and 128 for GDN "
+            "and 128 for KDA"
+        ),
+    )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=10)
@@ -91,12 +105,13 @@ def make_inputs(
     operation: Operation,
     case: Case,
     dtype: torch.dtype,
+    head_dim: int,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None]:
-    """Create one deterministic BF16 public chunk-delta workload."""
+    """Create one deterministic public chunk-delta workload."""
     torch.manual_seed(401)
-    tokens, dim = sum(case.lengths), 128
-    q_shape = (1, tokens, case.key_heads, dim)
-    value_shape = (1, tokens, case.value_heads, dim)
+    tokens = sum(case.lengths)
+    q_shape = (1, tokens, case.key_heads, head_dim)
+    value_shape = (1, tokens, case.value_heads, head_dim)
     q = F.normalize(torch.randn(q_shape, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn_like(q.float()), dim=-1).to(dtype)
     value = torch.randn(value_shape, device="cuda", dtype=dtype)
@@ -119,7 +134,7 @@ def operation_forward(
     inputs: tuple[torch.Tensor, ...],
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run one public cuDNN chunk implementation without final-state output."""
+    """Run one public fused chunk implementation without final-state output."""
     q, k, value, gate, beta = inputs
     if operation == "gdn":
         return chunk_gdn(
@@ -205,7 +220,7 @@ def measure_incremental_peak_bytes(function: Callable[[], object], warmups: int)
 
 
 def confirm_kernel_route(function: Callable[[], object], operation: Operation) -> list[str]:
-    """Record and validate the selected cuDNN kernel family outside the timed region."""
+    """Record and validate the selected kernel family outside the timed region."""
     pattern = "Gdn" if operation == "gdn" else "Kda"
     with cuda_kernel_profiler(pattern, record_name=f"{operation}_route") as result:
         function()
@@ -220,14 +235,15 @@ def confirm_kernel_route(function: Callable[[], object], operation: Operation) -
 def benchmark_case(
     operation: Operation,
     case: Case,
+    head_dim: int,
     rounds: int,
     iterations: int,
     warmups: int,
     dtype: torch.dtype,
     enforce_budgets: bool,
 ) -> dict[str, object]:
-    """Measure one public cuDNN operation under the frozen chunk workload."""
-    inputs, cu_seqlens = make_inputs(operation, case, dtype)
+    """Measure one public fused operation under the frozen chunk workload."""
+    inputs, cu_seqlens = make_inputs(operation, case, dtype, head_dim)
     d_output = torch.randn_like(inputs[2])
     callables = make_callables(operation, inputs, cu_seqlens, d_output)
     for function in callables.values():
@@ -240,10 +256,11 @@ def benchmark_case(
         phase: benchmark_phase(function, rounds, iterations, warmups)
         for phase, function in callables.items()
     }
-    budget_us = case.budget_for(operation)
+    budget_us = case.budget_for(operation, head_dim)
     train_us = phases["train_step"]["median_of_round_medians_us"]
     return {
         "operation": operation,
+        "head_dim": head_dim,
         "case": asdict(case),
         "phases": phases,
         "incremental_peak_bytes": peak_bytes,
@@ -266,12 +283,14 @@ def git_revision() -> str:
 def main() -> None:
     args = parse_args()
     operations = OPERATIONS if args.operations is None else tuple(args.operations)
+    head_dims = HEAD_DIMS if args.head_dims is None else tuple(args.head_dims)
     selected_cases = [case for case in CASES if args.cases is None or case.name in args.cases]
     workloads = [
-        (operation, case)
+        (operation, case, head_dim)
         for operation in operations
         for case in selected_cases
-        if operation in case.operations
+        for head_dim in head_dims
+        if operation in case.operations and (operation == "gdn" or head_dim == 128)
     ]
     if not workloads:
         raise ValueError("the selected operations and cases have no supported combinations")
@@ -298,13 +317,14 @@ def main() -> None:
                 benchmark_case(
                     operation,
                     case,
+                    head_dim,
                     args.rounds,
                     args.iterations,
                     args.warmups,
                     dtype,
                     enforce_budgets,
                 )
-                for operation, case in workloads
+                for operation, case, head_dim in workloads
             ],
         }
     finally:
