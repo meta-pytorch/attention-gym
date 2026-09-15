@@ -5,7 +5,7 @@
 # see https://github.com/fla-org/flash-linear-attention/graphs/contributors.
 # The remaining portions use the BSD-style license in the repository root.
 
-"""Scalar-gate delta-state backward specialized for BT64 and K=V=128."""
+"""Scalar-gate delta-state backward specialized for BT64 and K=V in {64, 128}."""
 
 from __future__ import annotations
 
@@ -168,17 +168,19 @@ def chunk_gdn_bwd_delta_h_kernel(
     row = tl.arange(0, BT)
     value = value_tile * BV + tl.arange(0, BV)
     key_1 = tl.arange(0, BK)
-    key_2 = BK + key_1
     key_head = head // GROUPS
     d_state_1 = tl.zeros((BK, BV), dtype=tl.float32)
-    d_state_2 = tl.zeros((BK, BV), dtype=tl.float32)
+    if K > BK:
+        key_2 = BK + key_1
+        d_state_2 = tl.zeros((BK, BV), dtype=tl.float32)
 
     state_base = ptr_offset((sequence, head), (H * V * K, V * K))
     if USE_FINAL_STATE_GRADIENT:
         final_offset_1 = state_base + ptr_offset((value[:, None], key_1[None, :]), (K, 1))
-        final_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
         d_state_1 += tl.trans(tl.load(d_final_state + final_offset_1)).to(tl.float32)
-        d_state_2 += tl.trans(tl.load(d_final_state + final_offset_2)).to(tl.float32)
+        if K > BK:
+            final_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
+            d_state_2 += tl.trans(tl.load(d_final_state + final_offset_2)).to(tl.float32)
 
     for local_chunk in range(chunk_count - 1, -1, -1):
         global_chunk = chunk_begin + local_chunk
@@ -189,9 +191,10 @@ def chunk_gdn_bwd_delta_h_kernel(
 
         dh_base = ptr_offset((global_chunk, head), (H * K * V, K * V))
         dh_offset_1 = dh_base + ptr_offset((key_1[:, None], value[None, :]), (V, 1))
-        dh_offset_2 = dh_base + ptr_offset((key_2[:, None], value[None, :]), (V, 1))
         tl.store(dh + dh_offset_1, d_state_1.to(dh.dtype.element_ty))
-        tl.store(dh + dh_offset_2, d_state_2.to(dh.dtype.element_ty))
+        if K > BK:
+            dh_offset_2 = dh_base + ptr_offset((key_2[:, None], value[None, :]), (V, 1))
+            tl.store(dh + dh_offset_2, d_state_2.to(dh.dtype.element_ty))
 
         gate_offset = ptr_offset((token, head), (H, 1))
         gate = tl.load(
@@ -213,13 +216,14 @@ def chunk_gdn_bwd_delta_h_kernel(
             mask=token_mask[:, None],
             other=0.0,
         )
-        k_tile_2 = tl.load(
-            k + k_base + key_2[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
         value_gradient = tl.dot(k_tile_1, d_state_1.to(k_tile_1.dtype))
-        value_gradient += tl.dot(k_tile_2, d_state_2.to(k_tile_2.dtype))
+        if K > BK:
+            k_tile_2 = tl.load(
+                k + k_base + key_2[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            value_gradient += tl.dot(k_tile_2, d_state_2.to(k_tile_2.dtype))
         value_gradient *= restored_decay[:, None]
 
         value_offset = ptr_offset((token[:, None], head, value[None, :]), (H * V, V, 1))
@@ -236,7 +240,8 @@ def chunk_gdn_bwd_delta_h_kernel(
 
         state_decay = tl.exp2(final_gate)
         d_state_1 *= state_decay
-        d_state_2 *= state_decay
+        if K > BK:
+            d_state_2 *= state_decay
         output_tile = tl.load(
             d_output + value_offset,
             mask=token_mask[:, None],
@@ -248,13 +253,14 @@ def chunk_gdn_bwd_delta_h_kernel(
             mask=token_mask[:, None],
             other=0.0,
         )
-        q_tile_2 = tl.load(
-            q + q_base + key_2[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
         q_tile_1 = (q_tile_1 * query_decay[:, None]).to(q_tile_1.dtype)
-        q_tile_2 = (q_tile_2 * query_decay[:, None]).to(q_tile_2.dtype)
+        if K > BK:
+            q_tile_2 = tl.load(
+                q + q_base + key_2[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            q_tile_2 = (q_tile_2 * query_decay[:, None]).to(q_tile_2.dtype)
 
         w_base = ptr_offset((token[:, None], head), (H * K, K))
         w_tile_1 = tl.load(
@@ -262,21 +268,23 @@ def chunk_gdn_bwd_delta_h_kernel(
             mask=token_mask[:, None],
             other=0.0,
         )
-        w_tile_2 = tl.load(
-            w + w_base + key_2[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
         d_state_1 += tl.dot(tl.trans(q_tile_1), output_tile) * scale
         d_state_1 -= tl.dot(tl.trans(w_tile_1), value_gradient.to(w_tile_1.dtype))
-        d_state_2 += tl.dot(tl.trans(q_tile_2), output_tile) * scale
-        d_state_2 -= tl.dot(tl.trans(w_tile_2), value_gradient.to(w_tile_2.dtype))
+        if K > BK:
+            w_tile_2 = tl.load(
+                w + w_base + key_2[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            d_state_2 += tl.dot(tl.trans(q_tile_2), output_tile) * scale
+            d_state_2 -= tl.dot(tl.trans(w_tile_2), value_gradient.to(w_tile_2.dtype))
 
     if STORE_INITIAL_STATE_GRADIENT:
         initial_offset_1 = state_base + ptr_offset((value[:, None], key_1[None, :]), (K, 1))
-        initial_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
         tl.store(d_initial_state + initial_offset_1, tl.trans(d_state_1))
-        tl.store(d_initial_state + initial_offset_2, tl.trans(d_state_2))
+        if K > BK:
+            initial_offset_2 = state_base + ptr_offset((value[:, None], key_2[None, :]), (K, 1))
+            tl.store(d_initial_state + initial_offset_2, tl.trans(d_state_2))
 
 
 def chunk_gdn_bwd_delta_h(
@@ -297,19 +305,19 @@ def chunk_gdn_bwd_delta_h(
     Public state tensors use ``[N, H, V, K]``, while ``dh`` uses ``[chunk, H, K, V]``.
     """
     bt = 64
-    key_dim = value_dim = 128
     block_key = block_value = 64
 
     if q.ndim != 4 or k.shape != q.shape:
         raise ValueError("q and k must have matching [B,T,HK,K] shapes")
-    batch, tokens, key_heads, qk_dim = q.shape
-    if batch != 1 or qk_dim != key_dim:
-        raise ValueError("chunk_gdn_bwd_delta_h requires B=1 and K=128")
     if d_output.ndim != 4:
         raise ValueError("d_output must have shape [B,T,H,V]")
+    batch, tokens, key_heads, key_dim = q.shape
+    value_dim = d_output.shape[-1]
+    if batch != 1 or key_dim != value_dim or key_dim not in (64, 128):
+        raise ValueError("chunk_gdn_bwd_delta_h requires B=1 and K=V in {64, 128}")
     value_heads = d_output.shape[2]
     if d_output.shape != (batch, tokens, value_heads, value_dim):
-        raise ValueError("d_output must match the Q/K token axes and have V=128")
+        raise ValueError("d_output must match the Q/K token axes and supported V")
     if key_heads == 0 or value_heads % key_heads:
         raise ValueError("the number of value heads must be divisible by the number of q/k heads")
     if w.shape != (batch, tokens, value_heads, key_dim):

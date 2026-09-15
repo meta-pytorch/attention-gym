@@ -136,9 +136,9 @@ def chunk_gdn_bwd_intra_dense(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense B=1 BT64 scalar-GDN intra-factor gradients."""
     batch, tokens, heads, key_dim = q.shape
-    if batch != 1 or tokens % 64 or key_dim != 128:
+    if batch != 1 or tokens % 64 or key_dim not in (64, 128):
         raise ValueError(
-            "dense fused chunk GDN backward requires B=1, complete BT64 chunks, and K=128"
+            "dense fused chunk GDN backward requires B=1, complete BT64 chunks, and K in {64, 128}"
         )
     if k.shape != q.shape or cumulative_gate.shape != q.shape[:3]:
         raise ValueError("k must match q and cumulative_gate must have shape [B,T,H]")
@@ -193,8 +193,8 @@ def chunk_gdn_bwd_intra_packed(
     """Run fixed-capacity packed scalar-GDN intra-factor gradients."""
     metadata.validate_chunk_size(64)
     batch, tokens, heads, key_dim = q.shape
-    if batch != 1 or key_dim != 128 or k.shape != q.shape:
-        raise ValueError("packed fused chunk GDN backward requires B=1 and K=128")
+    if batch != 1 or key_dim not in (64, 128) or k.shape != q.shape:
+        raise ValueError("packed fused chunk GDN backward requires B=1 and K in {64, 128}")
     expected_factor_shape = (batch, tokens, heads, 64)
     if d_aqk.shape != expected_factor_shape or d_akk.shape != expected_factor_shape:
         raise ValueError(f"factor gradients must have shape {expected_factor_shape}")

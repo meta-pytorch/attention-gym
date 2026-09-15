@@ -456,12 +456,11 @@ def chunk_gdn_fwd_intra_dense(
     if (
         batch != 1
         or tokens % 64
-        or key_dim != 128
-        or value_dim != 128
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
         or v.shape[:2] != k.shape[:2]
         or value_heads % key_heads
     ):
-        raise ValueError("dense fused chunk GDN requires BT64, K=V=128, and H % HK == 0")
+        raise ValueError("dense fused chunk GDN requires BT64, K=V in {64, 128}, and H % HK == 0")
     if (
         cumulative_gate.shape != (batch, tokens, value_heads)
         or beta.shape != cumulative_gate.shape
@@ -512,8 +511,8 @@ def chunk_gdn_fwd_intra_dense(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
+        BK=min(64, key_dim),
+        BV=min(64, value_dim),
         num_warps=4,
         num_stages=4,
     )
@@ -533,12 +532,11 @@ def chunk_gdn_fwd_intra_packed(
     value_heads, value_dim = v.shape[2:]
     if (
         batch != 1
-        or key_dim != 128
-        or value_dim != 128
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
         or v.shape[:2] != k.shape[:2]
         or value_heads % key_heads
     ):
-        raise ValueError("packed fused chunk GDN requires B=1, K=V=128, and H % HK == 0")
+        raise ValueError("packed fused chunk GDN requires B=1, K=V in {64, 128}, and H % HK == 0")
     if (
         cumulative_gate.shape != (batch, tokens, value_heads)
         or beta.shape != cumulative_gate.shape
@@ -591,8 +589,8 @@ def chunk_gdn_fwd_intra_packed(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
+        BK=min(64, key_dim),
+        BV=min(64, value_dim),
         num_warps=4,
         num_stages=4,
     )
@@ -615,9 +613,9 @@ def chunk_gdn_recompute_w_u_qg_kg(
         k.shape != q.shape
         or v.shape[:2] != q.shape[:2]
         or value_heads % key_heads
-        or (key_dim, value_dim) != (128, 128)
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
     ):
-        raise ValueError("fused chunk GDN recompute requires K=V=128 and H % HK == 0")
+        raise ValueError("fused chunk GDN recompute requires K=V in {64, 128} and H % HK == 0")
     if metadata is not None:
         metadata.validate_chunk_size(64)
         if batch != 1:
@@ -656,8 +654,8 @@ def chunk_gdn_recompute_w_u_qg_kg(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
+        BK=min(64, key_dim),
+        BV=min(64, value_dim),
         num_warps=4,
         num_stages=4,
     )

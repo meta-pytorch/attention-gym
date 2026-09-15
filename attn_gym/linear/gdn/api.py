@@ -60,7 +60,7 @@ def chunk_gdn(
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
         impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
-            capability 8.0+ with FP16/BF16 QKV and ``K = V = 128``, as ``chunk_kda`` does;
+            capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
             ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
             default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.

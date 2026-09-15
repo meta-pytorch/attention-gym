@@ -31,6 +31,8 @@ def make_gdn_test_inputs(
     batch: int = 1,
     key_heads: int = 1,
     value_heads: int = 2,
+    key_dim: int = 128,
+    value_dim: int | None = None,
     gate_pattern: GatePattern = "model_range",
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 31,
@@ -56,9 +58,9 @@ def make_gdn_test_inputs(
         state_batch = len(lengths)
         cu_seqlens = cumulative_sequence_offsets(lengths)
 
-    dim = 128
-    q_shape = (batch, tokens, key_heads, dim)
-    value_shape = (batch, tokens, value_heads, dim)
+    value_dim = key_dim if value_dim is None else value_dim
+    q_shape = (batch, tokens, key_heads, key_dim)
+    value_shape = (batch, tokens, value_heads, value_dim)
     gate_shape = value_shape[:-1]
     q = F.normalize(torch.randn(q_shape, device="cuda", generator=generator), dim=-1).to(dtype)
     k = F.normalize(torch.randn(q_shape, device="cuda", generator=generator), dim=-1).to(dtype)
@@ -111,8 +113,8 @@ def make_gdn_test_inputs(
     initial_state = torch.randn(
         state_batch,
         value_heads,
-        dim,
-        dim,
+        value_dim,
+        key_dim,
         device="cuda",
         dtype=torch.float32,
         generator=generator,
