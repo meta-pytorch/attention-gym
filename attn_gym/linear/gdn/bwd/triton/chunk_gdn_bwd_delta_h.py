@@ -20,9 +20,25 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work,
     load_ragged_sequence_work,
 )
+from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["T", "H", "HK", "K", "V", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_dv_local_kernel(
     q,
@@ -114,6 +130,21 @@ def chunk_gdn_bwd_dv_local_kernel(
         "STORE_INITIAL_STATE_GRADIENT": lambda args: args["d_initial_state"] is not None,
         "USE_FINAL_STATE_GRADIENT": lambda args: args["d_final_state"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=2),
+    ],
+    key=["T", "num_sequences", "H", "HK", "K", "V", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config
+            for config in configs
+            if config.kwargs["BK"] <= K <= 2 * config.kwargs["BK"] and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_delta_h_kernel(
@@ -305,7 +336,6 @@ def chunk_gdn_bwd_delta_h(
     Public state tensors use ``[N, H, V, K]``, while ``dh`` uses ``[chunk, H, K, V]``.
     """
     bt = 64
-    block_key = block_value = 64
 
     if q.ndim != 4 or k.shape != q.shape:
         raise ValueError("q and k must have matching [B,T,HK,K] shapes")
@@ -409,13 +439,12 @@ def chunk_gdn_bwd_delta_h(
             K=key_dim,
             V=value_dim,
             BT=bt,
-            BK=32,
-            BV=32,
-            num_warps=4,
-            num_stages=2,
         )
 
-    chunk_gdn_bwd_delta_h_kernel[(num_sequences * value_heads, value_dim // block_value)](
+    def grid(meta):
+        return (num_sequences * value_heads, triton.cdiv(value_dim, meta["BV"]))
+
+    chunk_gdn_bwd_delta_h_kernel[grid](
         q,
         k,
         q.stride(1),
@@ -439,10 +468,6 @@ def chunk_gdn_bwd_delta_h(
         K=key_dim,
         V=value_dim,
         BT=bt,
-        BK=block_key,
-        BV=block_value,
-        num_warps=4,
-        num_stages=2,
     )
     return dh, d_initial_state, dv
 

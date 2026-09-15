@@ -475,10 +475,19 @@ def _delta_h_launch(
     use_warp_specialization = (
         use_16bit_config and key_dim == value_dim == 128 and is_sm100_kda_target(k.device)
     )
-    block_value_dim = min(
-        value_dim,
-        _BLOCK_VALUE_DIM if use_16bit_config else _BLOCK_VALUE_DIM // 2,
+    # Two D64 value tiles improve occupancy for recurrent sequences, but duplicate setup and
+    # descriptor traffic when nearly every packed sequence contains only one or two chunks.
+    short_scalar_sequences = (
+        scalar_gate
+        and key_dim == value_dim == 64
+        and cu_seqlens is not None
+        and capacity <= 2 * state_batch
     )
+    use_small_value_tile = not use_16bit_config or (
+        scalar_gate and key_dim == value_dim == 64 and not short_scalar_sequences
+    )
+    max_block_value_dim = _BLOCK_VALUE_DIM // 2 if use_small_value_tile else _BLOCK_VALUE_DIM
+    block_value_dim = min(value_dim, max_block_value_dim)
     descriptors = (
         TensorDescriptor.from_tensor(k, [1, _CHUNK_SIZE, 1, key_dim]),
         TensorDescriptor.from_tensor(w, [1, _CHUNK_SIZE, 1, key_dim]),
