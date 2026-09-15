@@ -137,7 +137,7 @@ def lightning_indexer(
 
         kernel_options: Fused backend override: ``{"backend": "cute"}`` or
             ``{"backend": "triton"}``. Omit options to select CuTe
-            on SM100 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
+            on SM100/SM103 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
 
     Returns:
@@ -147,7 +147,7 @@ def lightning_indexer(
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
     Both require FP16/BF16 inputs and T <= 2**20 and accept any topk <= S. CuTe requires
-    SM100, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
+    SM100/SM103, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
     bases and non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
     Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with

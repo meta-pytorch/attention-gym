@@ -11,7 +11,10 @@ from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.impl import cute as impl
 from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
 
-SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+CUTE_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+    (10, 0),
+    (10, 3),
+)
 
 
 @pytest.mark.parametrize("batch", [1, 3, 64])
@@ -28,8 +31,8 @@ def test_score_workspace_bound(batch, tokens):
 @pytest.fixture
 def radix_impl():
     """Load the optional backend only on compatible hardware."""
-    if not SM100:
-        pytest.skip("SM100 required for the CuTe radix port")
+    if not CUTE_SUPPORTED:
+        pytest.skip("SM100 or SM103 required for the CuTe radix port")
     pytest.importorskip("cutlass.cute")
     return impl
 

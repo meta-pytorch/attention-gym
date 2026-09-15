@@ -1,4 +1,4 @@
-"""Tests for the CuTeDSL (SM100) indexer backend.
+"""Tests for the CuTeDSL (SM100/SM103) indexer backend.
 
 Validates that the cute backend produces the same Top-K index sets as the
 eager reference, that FP64 scores at kernel-selected positions are at or
@@ -16,11 +16,11 @@ from attn_gym.sparse.indexer.ops import _indexer_op
 from attn_gym.testing.indexer import assert_indexer_selection
 
 
-def _skip_no_sm100():
+def _skip_no_supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 (compute capability 10.0) required for CuTe backend")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100 or SM103 required for CuTe backend")
 
 
 def _reference_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -128,7 +128,7 @@ def _validate_indices(
 )
 def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
     """Cute backend index set matches eager, up to boundary ties."""
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
 
     torch.manual_seed(2026)
     device = torch.device("cuda")
@@ -199,7 +199,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
     isolates arithmetic error only. The tolerance accounts for the reduction
     chain: D (dot product) and H (weighted head sum).
     """
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
 
     torch.manual_seed(77)
     device = torch.device("cuda")
@@ -299,7 +299,7 @@ def _partial_acceptance_inputs(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_cute_partial_acceptance_across_tiles(dtype):
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
 
     device = torch.device("cuda")
     batch, queries, heads, head_dim, topk = 64, 512, 2, 128, 128
@@ -321,7 +321,7 @@ def test_cute_partial_acceptance_across_tiles(dtype):
 @pytest.mark.parametrize("topk", [0, 32])
 def test_cute_backend_under_torch_compile(causal, dtype, topk):
     """Capture the public API as one graph and match uncompiled CuTe output."""
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
 
     torch.manual_seed(2026)
     device = torch.device("cuda")
@@ -354,7 +354,7 @@ def test_cute_backend_under_torch_compile(causal, dtype, topk):
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_cute_op_registration(causal, dtype, topk, requires_grad):
     """Check registration, including partial tiles and nondifferentiable indices."""
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
     q = torch.randn(2, 65, 64, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(2, 65, 128, device="cuda", dtype=dtype, requires_grad=requires_grad)
     w = torch.randn(2, 65, 64, device="cuda", dtype=dtype, requires_grad=requires_grad)
@@ -368,7 +368,7 @@ def test_cute_op_registration(causal, dtype, topk, requires_grad):
 
 def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
     """Reuse both score and selection artifacts, including after a persistent reload."""
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
     from attn_gym.sparse.indexer.impl import cute as impl
 
     monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
@@ -411,7 +411,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
 @pytest.mark.parametrize("heads,dim", [(64, 128), (66, 96)])
 def test_cute_dynamic_fullgraph(strided, heads, dim):
     """Reuse a symbolic public graph across sequence lengths and independent input strides."""
-    _skip_no_sm100()
+    _skip_no_supported_gpu()
     compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True)
     for tokens in (65, 129):
         q = torch.randn(2, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)

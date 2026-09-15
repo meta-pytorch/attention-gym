@@ -33,7 +33,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 - `impl="reference"` evaluates PyTorch scoring and Top-K on CPU or CUDA. FP16/BF16/FP32
   inputs accumulate in FP32; FP64 inputs retain FP64. It materializes the score intermediates
   and is intended for correctness checks and small inputs.
-- `impl="fused"` (the default) selects **CuTe on SM100**, or **Triton on other NVIDIA GPUs
+- `impl="fused"` (the default) selects **CuTe on SM100/SM103**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
   keep their selection state on chip. CuTe separates score generation from radix Top-K and
   reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
@@ -47,7 +47,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 
 | Restriction | CuTe | Triton |
 |---|---|---|
-| GPU | SM100 | SM90 or newer |
+| GPU | SM100 or SM103 | SM90 or newer |
 | Input dtype | FP16 or BF16, shared by all inputs | FP16 or BF16, shared by all inputs |
 | Heads `H` | Positive and even | `1..256` |
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
@@ -58,8 +58,8 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
 materializing contiguous copies. Weights need only element alignment, not TMA alignment.
 
-CuTe additionally requires the optional `linear` dependencies. Its support is specifically
-SM100, not every Blackwell variant; other supported devices use Triton by default.
+CuTe additionally requires the optional `linear` dependencies. It supports SM100 and SM103
+(including GB300), not every Blackwell variant; other supported devices use Triton by default.
 
 ### Compilation and training scope
 
