@@ -6,6 +6,8 @@ from typing import overload
 import torch
 from torch import Tensor
 
+from attn_gym.types import Impl, resolve_impl
+
 
 @dataclass(frozen=True, slots=True)
 class AuxRequest:
@@ -24,7 +26,7 @@ class SelectedAttentionAux:
 
     Attributes:
         lse: Log-sum-exp values with shape (batch_size, num_heads, sequence_length),
-            or None if not requested.
+            or None if not requested. Fused implementations return nondifferentiable LSE.
     """
 
     lse: Tensor | None = None
@@ -167,6 +169,28 @@ def _validate_inputs(
         )
 
 
+def _select_backend(
+    query: Tensor,
+    attention_sink: Tensor | None,
+    share_kv: bool,
+    *,
+    num_keys: int,
+) -> str:
+    """Choose a CUDA backend after public input validation."""
+    # FA4's Python launcher is eager-only, and its sparse backward does not implement
+    # deterministic accumulation. Keep both contracts on the portable Triton path.
+    if (
+        torch.compiler.is_compiling()
+        or torch.are_deterministic_algorithms_enabled()
+        or num_keys == 0
+    ):
+        return "triton"
+
+    from .impl import cute as cute_backend
+
+    return "cute" if cute_backend.is_supported(query, attention_sink, share_kv) else "triton"
+
+
 @overload
 def selected_attention(
     query: Tensor,
@@ -176,9 +200,9 @@ def selected_attention(
     attention_sink: Tensor | None = ...,
     doc_ids: Tensor | None = ...,
     sliding_window_size: int = ...,
-    backend: str = ...,
-    mode: str = ...,
     *,
+    impl: Impl | str = Impl.FUSED,
+    kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
     return_aux: None = ...,
 ) -> Tensor: ...
@@ -193,9 +217,9 @@ def selected_attention(
     attention_sink: Tensor | None = ...,
     doc_ids: Tensor | None = ...,
     sliding_window_size: int = ...,
-    backend: str = ...,
-    mode: str = ...,
     *,
+    impl: Impl | str = Impl.FUSED,
+    kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, SelectedAttentionAux]: ...
@@ -209,9 +233,9 @@ def selected_attention(
     attention_sink: Tensor | None = None,
     doc_ids: Tensor | None = None,
     sliding_window_size: int = 512,
-    backend: str = "triton",
-    mode: str = "auto",
     *,
+    impl: Impl | str = Impl.FUSED,
+    kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, SelectedAttentionAux]:
@@ -253,11 +277,16 @@ def selected_attention(
 
         sliding_window_size: Integer, size of sliding window
 
-        backend: one of eager, triton, or cute, controls which backend executes this code.
-            Triton shared-KV backward uses nondeterministic atomic accumulation unless deterministic
-            algorithms are enabled with torch.use_deterministic_algorithms.
+        impl: Impl.FUSED (default, or "fused") uses optimized CUDA kernels;
+            Impl.REFERENCE (or "reference") uses eager PyTorch on CPU or CUDA.
 
-        mode: Currently only chunked is supported; auto defaults to chunked
+        kernel_options: Fused backend override: {"backend": "cute"} or {"backend": "triton"}.
+            Omit the backend to prefer supported CuTe calls, otherwise Triton.
+            Compiled calls, deterministic mode, and empty attention sets use Triton
+            automatically. Explicit backend requests are honored; execution failures are never
+            retried on another backend. Nonempty options are invalid with Impl.REFERENCE.
+            Triton shared-KV backward uses nondeterministic atomic accumulation unless
+            torch.use_deterministic_algorithms is enabled.
 
         scale: Positive multiplier for query-key logits. Defaults to 1 / sqrt(head_dim).
             Attention sink logits are not scaled.
@@ -273,8 +302,11 @@ def selected_attention(
             output has shape (batch_size, num_heads, sequence_length, head_dim) and
             aux.lse has shape (batch_size, num_heads, sequence_length) when requested.
     """
-    if mode not in ("auto", "chunked"):
-        raise ValueError(f"mode must be 'auto' or 'chunked', got {mode!r}.")
+    selected_impl = resolve_impl(impl)
+    if selected_impl is Impl.REFERENCE and kernel_options:
+        raise ValueError("kernel_options are not supported with impl='reference'")
+    if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
+        raise ValueError(f"unsupported selected_attention kernel options: {kernel_options}")
 
     share_kv = isinstance(sparse_kv, Tensor) and sparse_kv.ndim == 4 and sparse_kv.shape[1] == 1
     _validate_inputs(
@@ -292,59 +324,41 @@ def selected_attention(
         raise ValueError("scale must be greater than 0.")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
 
-    match backend:
-        case "eager":
-            from .impl import reference
-
-            if attention_sink is None:
-                attention_sink = torch.full(
-                    (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
-                )
-            output, lse = reference.selected_attention(
-                query,
-                local_kv,
-                sparse_kv,
-                kv_indices,
-                attention_sink,
-                doc_ids,
-                sliding_window_size,
-                share_kv,
-                scale=scale,
+    backend = (kernel_options or {}).get("backend")
+    if selected_impl is Impl.REFERENCE:
+        from .impl import reference as implementation
+    else:
+        if query.device.type != "cuda":
+            raise ValueError(
+                "fused selected_attention requires CUDA tensors; use impl='reference'"
             )
-        case "triton":
-            from .impl import triton as triton_backend
-
-            if attention_sink is None:
-                attention_sink = torch.full(
-                    (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
-                )
-            output, lse = triton_backend.selected_attention(
+        if backend is None:
+            backend = _select_backend(
                 query,
-                local_kv,
-                sparse_kv,
-                kv_indices,
                 attention_sink,
-                doc_ids,
-                sliding_window_size,
                 share_kv,
-                scale=scale,
+                num_keys=sliding_window_size + kv_indices.shape[-1],
             )
-        case "cute":
-            from .impl import cute as cute_backend
+        if backend == "cute":
+            from .impl import cute as implementation
+        else:
+            from .impl import triton as implementation
 
-            output, lse = cute_backend.selected_attention(
-                query,
-                local_kv,
-                sparse_kv,
-                kv_indices,
-                attention_sink,
-                doc_ids,
-                sliding_window_size,
-                share_kv,
-                scale=scale,
-            )
-        case _:
-            raise NotImplementedError(f"Backend {backend!r} is not supported yet.")
+    if backend != "cute" and attention_sink is None:
+        attention_sink = torch.full(
+            (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
+        )
+    output, lse = implementation.selected_attention(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        doc_ids,
+        sliding_window_size,
+        share_kv,
+        scale=scale,
+    )
 
     if return_aux is None:
         return output

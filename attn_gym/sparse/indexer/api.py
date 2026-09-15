@@ -3,6 +3,8 @@
 import torch
 from torch import Tensor
 
+from attn_gym.types import Impl, resolve_impl
+
 from .ops import _indexer_op
 
 
@@ -98,7 +100,7 @@ def lightning_indexer(
     *,
     causal: bool = False,
     compress_ratio: int = 1,
-    impl: str = "fused",
+    impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
 ) -> Tensor:
     """Return the Top-K candidate indices for every (batch, query) row.
@@ -130,8 +132,8 @@ def lightning_indexer(
             partial window forms no candidate, so ``S = T // compress_ratio``.
             Values other than 1 require ``causal=True``.
 
-        impl: ``"reference"`` uses eager PyTorch on CPU or CUDA; ``"fused"`` uses
-            optimized CUDA kernels. Defaults to ``"fused"``.
+        impl: Impl.REFERENCE (or ``"reference"``) uses eager PyTorch on CPU or CUDA;
+            Impl.FUSED (default, or ``"fused"``) uses optimized CUDA kernels.
 
         kernel_options: Fused backend override: ``{"backend": "cute"}`` or
             ``{"backend": "triton"}``. Omit options to select CuTe
@@ -161,16 +163,17 @@ def lightning_indexer(
     selection into q, k, or weights.
     """
 
+    selected_impl = resolve_impl(impl)
     _validate_inputs(q, k, weights, topk, causal, compress_ratio)
 
-    match impl:
-        case "reference":
+    match selected_impl:
+        case Impl.REFERENCE:
             if kernel_options:
                 raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
             return reference.launch(q, k, weights, topk, causal, compress_ratio)
-        case "fused":
+        case Impl.FUSED:
             if kernel_options not in (
                 None,
                 {},
@@ -182,5 +185,3 @@ def lightning_indexer(
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
             backend = (kernel_options or {}).get("backend", "auto")
             return _indexer_op(q, k, weights, topk, causal, compress_ratio, backend)
-        case _:
-            raise ValueError(f"unknown impl {impl!r}; expected 'reference' or 'fused'")

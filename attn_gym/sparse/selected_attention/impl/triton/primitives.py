@@ -127,8 +127,11 @@ def online_softmax_update(accumulator, running_max, running_sum, logits, values)
     """Merge one selected-attention tile into FP32 online-softmax state."""
     tile_max = tl.max(logits, axis=1)
     new_max = tl.maximum(running_max, tile_max)
-    alpha = tl.exp(running_max - new_max)
-    probabilities = tl.exp(logits - new_max[:, None])
+    # An empty prefix with no sink has max=-inf. Keep that state for later tiles,
+    # but avoid -inf - -inf while computing this tile's zero contribution.
+    safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+    alpha = tl.exp(running_max - safe_max)
+    probabilities = tl.exp(logits - safe_max[:, None])
     accumulator *= alpha[:, None]
     accumulator += tl.dot(probabilities.to(values.dtype), values, input_precision="tf32x3")
     running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)

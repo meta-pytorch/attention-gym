@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
+from attn_gym.sparse import Impl
 from attn_gym.sparse.indexer import lightning_indexer, ops
 from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
 
@@ -99,7 +100,11 @@ def test_fused_cpu_rejected():
         lightning_indexer(torch.zeros(1, 2, 2, 16), torch.zeros(1, 2, 16), torch.zeros(1, 2, 2), 1)
 
 
-@pytest.mark.parametrize("impl", ["reference", "fused"])
+@pytest.mark.parametrize(
+    "impl",
+    ["reference", "fused", Impl.REFERENCE, Impl.FUSED],
+    ids=["reference-string", "fused-string", "reference-enum", "fused-enum"],
+)
 def test_selection_does_not_train_scoring_weights(impl):
     """Gathered values train, but no gradient flows through integer selection."""
     if impl == "fused":

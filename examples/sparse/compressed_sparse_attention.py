@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse.selected_attention import Impl, selected_attention
 
 
 def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
@@ -197,7 +197,6 @@ def _selected_attention_with_causal_blocks(
     # Replace causally invalid selections with -1 sentinel
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
-    backend = "triton" if query.device.type == "cuda" else "eager"
     attn_result = selected_attention(
         query,
         local_kv,
@@ -206,7 +205,7 @@ def _selected_attention_with_causal_blocks(
         attention_sink,
         None,
         sliding_window_size,
-        backend=backend,
+        impl=Impl.FUSED if query.is_cuda else Impl.REFERENCE,
         return_aux=return_aux,
     )
 
