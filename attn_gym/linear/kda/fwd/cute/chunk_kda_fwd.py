@@ -99,8 +99,8 @@ def _validate_paged_private_abi(
 ) -> None:
     _validate_private_abi(q, k, v, cumulative_gate, beta, None)
     heads, key_dim, value_dim = q.shape[2], q.shape[3], v.shape[-1]
-    if state_cache.dtype != torch.float32:
-        raise TypeError("the paged chunk state pool must use float32")
+    if state_cache.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("the paged chunk state pool must use float32 or bfloat16")
     if state_cache.ndim != 4 or state_cache.shape[1:] != (heads, value_dim, key_dim):
         raise ValueError(
             "the paged chunk state pool must have shape "

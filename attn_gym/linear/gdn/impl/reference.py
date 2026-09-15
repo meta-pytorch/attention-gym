@@ -23,10 +23,12 @@ def reference_gdn(
     cu_seqlens: torch.Tensor | None,
     output_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run a GDN reference operation in the documented compute dtype."""
+    """Run a GDN reference operation after promoting inputs and state to the compute dtype."""
     output_dtype = q.dtype
     compute_dtype = torch.promote_types(q.dtype, torch.float32)
     q, k, v, log_decay, beta = (tensor.to(compute_dtype) for tensor in (q, k, v, log_decay, beta))
+    if initial_state is not None:
+        initial_state = initial_state.to(compute_dtype)
     if q.shape[2] != v.shape[2]:
         # Grouped heads: expand each shared query/key head across its value-head group.
         groups = v.shape[2] // q.shape[2]

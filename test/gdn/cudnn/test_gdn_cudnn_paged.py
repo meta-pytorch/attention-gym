@@ -141,6 +141,18 @@ def test_cudnn_paged_rejects_grad_and_misaligned_slot_stride() -> None:
             cu_seqlens=cu_seqlens,
             kernel_options=_CUDNN,
         )
+    with torch.no_grad(), pytest.raises(TypeError, match="initial_state must be float32"):
+        paged_chunk_gdn(
+            q.detach(),
+            k,
+            value,
+            gate,
+            beta,
+            pool.bfloat16(),
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            kernel_options=_CUDNN,
+        )
 
 
 def test_cudnn_paged_raw_operator_registration() -> None:

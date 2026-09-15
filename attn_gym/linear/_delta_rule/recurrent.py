@@ -216,7 +216,8 @@ def launch_recurrent_delta_rule_fwd(
             ``GateKind.SCALAR`` or ``[B, T, H, K]`` for ``GateKind.VECTOR``.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Optional FP32 starting state shaped ``[N, H, V, K]``, or the mutable
-            ``[slots, H, V, K]`` pool that ``state_indices`` addresses in paged mode.
+            FP32/BF16 ``[slots, H, V, K]`` pool that ``state_indices`` addresses in paged mode.
+            Recurrence math remains FP32.
         cu_seqlens: Optional packed boundaries shaped ``[N + 1]``; offsets are trusted and
             must be validated by the caller before launch.
         scale: Multiplier applied to ``q`` before each state read.
