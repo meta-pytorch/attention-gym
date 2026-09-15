@@ -9,6 +9,7 @@ import attn_gym.sparse
 from attn_gym.linear import (
     GateTransform,
     Impl,
+    ReplayState,
     chunk_gdn,
     gate_transform,
     paged_chunk_gdn,
@@ -36,6 +37,11 @@ def test_attention_namespaces_are_exported():
 def test_linear_impl_uses_shared_owner():
     assert Impl is SharedImpl
     assert KDAImpl is SharedImpl
+
+
+def test_replay_state_is_public():
+    assert ReplayState.__module__ == "attn_gym.linear.types"
+    assert "ReplayState" in attn_gym.linear.__all__
 
 
 def test_gate_transform_is_exported():

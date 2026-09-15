@@ -15,6 +15,7 @@ and the naive oracles in
 from attn_gym.linear._lazy import lazy_exports
 from attn_gym.linear.kda.api import (
     KernelOptions,
+    ReplayState,
     chunk_kda,
     paged_chunk_kda,
     recurrent_kda,
@@ -53,6 +54,7 @@ __getattr__ = lazy_exports(
 __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
     [
         "KernelOptions",
+        "ReplayState",
         "MAX_GATE_LOWER_BOUND_MAGNITUDE",
         "active_token_mask",
         "bound_gate",

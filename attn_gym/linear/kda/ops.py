@@ -48,6 +48,40 @@ torch.library.define(
     "Tensor cu_seqlens, "
     "Tensor chunk_offsets, bool autotune, str schedule) -> Tensor",
 )
+torch.library.define(
+    "attn_gym::kda_chunk_replay_prepare",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor state_cache,"
+    " Tensor(a!) replay_q, Tensor(b!) replay_k, Tensor(c!) replay_v,"
+    " Tensor(d!) replay_gate, Tensor(e!) replay_beta, Tensor replay_count,"
+    " Tensor state_indices, Tensor? has_initial_state)"
+    " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_replay_commit",
+    "(Tensor final_state, Tensor state_indices, Tensor? has_initial_state,"
+    " Tensor active_counts, Tensor(a!) state_cache, Tensor(b!) replay_count) -> ()",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_replay_prefill_prepare",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor state_cache,"
+    " Tensor replay_q, Tensor replay_k, Tensor replay_v, Tensor replay_gate,"
+    " Tensor replay_beta, Tensor replay_count, Tensor state_indices,"
+    " Tensor? has_initial_state, Tensor input_cu_seqlens)"
+    " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,"
+    " Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_replay_state_gather",
+    "(Tensor state_cache, Tensor state_indices) -> Tensor",
+)
+torch.library.define(
+    "attn_gym::kda_chunk_replay_prefill_commit",
+    "(Tensor prefix_output, Tensor tail_output, Tensor output_route,"
+    " Tensor tail_q, Tensor tail_k, Tensor tail_v, Tensor tail_gate, Tensor tail_beta,"
+    " Tensor tail_counts, Tensor state_indices, Tensor(a!) replay_q, Tensor(b!) replay_k,"
+    " Tensor(c!) replay_v, Tensor(d!) replay_gate, Tensor(e!) replay_beta,"
+    " Tensor(f!) replay_count, Tensor output_template) -> Tensor",
+)
 
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
@@ -150,6 +184,13 @@ def _delta_h_backend():
         raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
 
 
+def _replay_backend():
+    try:
+        return importlib.import_module("attn_gym.linear.kda.fwd.triton.paged_replay")
+    except ImportError as error:
+        raise ImportError("paged_chunk_kda replay requires CUDA with Triton support") from error
+
+
 def _chunk_fwd_cuda(*args):
     return _chunk_backend()._chunk_kda_fwd_cuda(*args)
 
@@ -168,6 +209,26 @@ def _chunk_fwd_ragged_with_state_cuda(*args):
 
 def _chunk_fwd_ragged_paged_cuda(*args):
     return _chunk_backend()._chunk_kda_fwd_ragged_paged_cuda(*args)
+
+
+def _chunk_replay_prepare_cuda(*args):
+    return _replay_backend().prepare_paged_chunk_replay(*args)
+
+
+def _chunk_replay_commit_cuda(*args):
+    return _replay_backend().commit_paged_chunk_replay(*args)
+
+
+def _chunk_replay_prefill_prepare_cuda(*args):
+    return _replay_backend().prepare_paged_chunk_prefill(*args)
+
+
+def _chunk_replay_state_gather_cuda(*args):
+    return _replay_backend().gather_paged_chunk_state(*args)
+
+
+def _chunk_replay_prefill_commit_cuda(*args):
+    return _replay_backend().commit_paged_chunk_prefill(*args)
 
 
 def _chunk_bwd_cuda(*args):
@@ -226,6 +287,31 @@ torch.library.impl(
     "attn_gym::kda_chunk_fwd_ragged_paged",
     "CUDA",
     _chunk_fwd_ragged_paged_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_replay_prepare",
+    "CUDA",
+    _chunk_replay_prepare_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_replay_commit",
+    "CUDA",
+    _chunk_replay_commit_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_replay_prefill_prepare",
+    "CUDA",
+    _chunk_replay_prefill_prepare_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_replay_state_gather",
+    "CUDA",
+    _chunk_replay_state_gather_cuda,
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_replay_prefill_commit",
+    "CUDA",
+    _chunk_replay_prefill_commit_cuda,
 )
 torch.library.impl("attn_gym::kda_chunk_bwd", "CUDA", _chunk_bwd_cuda)
 torch.library.impl(
@@ -385,6 +471,137 @@ def _chunk_fwd_ragged_paged_fake(
         schedule,
     )
     return v.new_empty(v.shape, dtype=q.dtype)
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_replay_prepare")
+def _chunk_replay_prepare_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    replay_q: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_v: torch.Tensor,
+    replay_gate: torch.Tensor,
+    replay_beta: torch.Tensor,
+    replay_count: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    del k, v, gate, beta, replay_count, has_initial_state
+    num_active = q.shape[0]
+    return (
+        replay_q.new_empty((num_active, *replay_q.shape[1:])),
+        replay_k.new_empty((num_active, *replay_k.shape[1:])),
+        replay_v.new_empty((num_active, *replay_v.shape[1:])),
+        replay_gate.new_empty((num_active, *replay_gate.shape[1:])),
+        replay_beta.new_empty((num_active, *replay_beta.shape[1:])),
+        state_cache.new_empty((num_active, *state_cache.shape[1:])),
+        state_indices.new_empty((num_active,)),
+    )
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_replay_commit")
+def _chunk_replay_commit_fake(
+    final_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    active_counts: torch.Tensor,
+    state_cache: torch.Tensor,
+    replay_count: torch.Tensor,
+) -> None:
+    del final_state, state_indices, has_initial_state, active_counts, state_cache, replay_count
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_replay_prefill_prepare")
+def _chunk_replay_prefill_prepare_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    replay_q: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_v: torch.Tensor,
+    replay_gate: torch.Tensor,
+    replay_beta: torch.Tensor,
+    replay_count: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    input_cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    del k, v, gate, beta, state_cache, has_initial_state, input_cu_seqlens
+    num_sequences = state_indices.shape[0]
+    prefix_capacity = (
+        (q.shape[0] * q.shape[1] + (_CHUNK_SIZE - 1) * num_sequences + _CHUNK_SIZE - 1)
+        // _CHUNK_SIZE
+        * _CHUNK_SIZE
+    )
+    return (
+        *(
+            cache.new_empty((1, prefix_capacity, *cache.shape[2:]))
+            for cache in (replay_q, replay_k, replay_v, replay_gate, replay_beta)
+        ),
+        replay_count.new_empty((num_sequences + 1,)),
+        q.new_empty((q.shape[0] * q.shape[1],), dtype=torch.int64),
+        *(
+            cache.new_empty((num_sequences, _CHUNK_SIZE, *cache.shape[2:]))
+            for cache in (replay_q, replay_k, replay_v, replay_gate, replay_beta)
+        ),
+        replay_count.new_empty((num_sequences,)),
+    )
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_replay_state_gather")
+def _chunk_replay_state_gather_fake(
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> torch.Tensor:
+    return state_cache.new_empty((state_indices.shape[0], *state_cache.shape[1:]))
+
+
+@torch.library.register_fake("attn_gym::kda_chunk_replay_prefill_commit")
+def _chunk_replay_prefill_commit_fake(
+    prefix_output: torch.Tensor,
+    tail_output: torch.Tensor,
+    output_route: torch.Tensor,
+    tail_q: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_v: torch.Tensor,
+    tail_gate: torch.Tensor,
+    tail_beta: torch.Tensor,
+    tail_counts: torch.Tensor,
+    state_indices: torch.Tensor,
+    replay_q: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_v: torch.Tensor,
+    replay_gate: torch.Tensor,
+    replay_beta: torch.Tensor,
+    replay_count: torch.Tensor,
+    output_template: torch.Tensor,
+) -> torch.Tensor:
+    del (
+        prefix_output,
+        tail_output,
+        output_route,
+        tail_q,
+        tail_k,
+        tail_v,
+        tail_gate,
+        tail_beta,
+        tail_counts,
+        state_indices,
+        replay_q,
+        replay_k,
+        replay_v,
+        replay_gate,
+        replay_beta,
+        replay_count,
+    )
+    return output_template.new_empty(output_template.shape)
 
 
 def _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta):
@@ -653,6 +870,11 @@ chunk_fwd_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_with_state.default
 chunk_fwd_ragged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged.default
 chunk_fwd_ragged_with_state_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_with_state.default
 chunk_fwd_ragged_paged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_paged.default
+chunk_replay_prepare_op = torch.ops.attn_gym.kda_chunk_replay_prepare.default
+chunk_replay_commit_op = torch.ops.attn_gym.kda_chunk_replay_commit.default
+chunk_replay_prefill_prepare_op = torch.ops.attn_gym.kda_chunk_replay_prefill_prepare.default
+chunk_replay_state_gather_op = torch.ops.attn_gym.kda_chunk_replay_state_gather.default
+chunk_replay_prefill_commit_op = torch.ops.attn_gym.kda_chunk_replay_prefill_commit.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
 chunk_bwd_recompute_factors_op = torch.ops.attn_gym.kda_chunk_bwd_recompute_factors.default
@@ -773,6 +995,11 @@ __all__ = [
     "chunk_fwd_ragged_paged_op",
     "chunk_fwd_ragged_with_state_op",
     "chunk_fwd_with_state_op",
+    "chunk_replay_commit_op",
+    "chunk_replay_prefill_commit_op",
+    "chunk_replay_prefill_prepare_op",
+    "chunk_replay_prepare_op",
+    "chunk_replay_state_gather_op",
     "delta_h_op",
     "delta_h_paged_op",
     "delta_h_with_state_op",

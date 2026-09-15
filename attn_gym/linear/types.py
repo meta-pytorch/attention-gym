@@ -7,9 +7,25 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, TypedDict
+from typing import Literal, NamedTuple, TypedDict
+
+import torch
 
 from attn_gym.types import Impl, resolve_impl
+
+
+class ReplayState(NamedTuple):
+    """Persistent token cache used by replay-backed paged KDA.
+
+    The Q, K, and V caches use BF16, gate and beta use FP32, and count uses int32.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    gate: torch.Tensor
+    beta: torch.Tensor
+    count: torch.Tensor
 
 
 class BackendOptions(TypedDict, total=False):
@@ -63,6 +79,7 @@ __all__ = [
     "GateTransform",
     "Impl",
     "KernelOptions",
+    "ReplayState",
     "resolve_gate_transform",
     "resolve_impl",
 ]
