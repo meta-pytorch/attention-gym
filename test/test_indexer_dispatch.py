@@ -18,10 +18,10 @@ def require_backend(backend: str | None = None) -> str:
     if torch.version.hip or not torch.cuda.is_available():
         pytest.skip("NVIDIA CUDA required")
     capability = torch.cuda.get_device_capability()
-    selected = backend or ("cute" if capability == (10, 0) else "triton")
+    selected = backend or ("cute" if capability in ((10, 0), (10, 3)) else "triton")
     if selected == "cute":
-        if capability != (10, 0):
-            pytest.skip("SM100 required for CuTe")
+        if capability not in ((10, 0), (10, 3)):
+            pytest.skip("SM100 or SM103 required for CuTe")
         pytest.importorskip("cutlass.cute")
     else:
         if capability[0] < 9:
@@ -35,9 +35,10 @@ def require_backend(backend: str | None = None) -> str:
     [
         ((9, 0), "auto", "triton"),
         ((10, 0), "auto", "cute"),
-        ((10, 3), "auto", "triton"),
+        ((10, 3), "auto", "cute"),
         ((12, 0), "auto", "triton"),
         ((10, 0), "triton", "triton"),
+        ((10, 3), "triton", "triton"),
         ((9, 0), "cute", "cute"),
     ],
 )

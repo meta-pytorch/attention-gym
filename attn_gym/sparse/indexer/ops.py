@@ -25,7 +25,8 @@ def _indexer_cuda(
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries."""
     if backend == "auto":
-        backend = "cute" if torch.cuda.get_device_capability(q.device) == (10, 0) else "triton"
+        capability = torch.cuda.get_device_capability(q.device)
+        backend = "cute" if capability in ((10, 0), (10, 3)) else "triton"
     match backend:
         case "cute":
             from .impl.cute import launch

@@ -1,4 +1,4 @@
-"""Bounded-workspace indexer for SM100 score generation followed by radix Top-K.
+"""Bounded-workspace indexer for SM100/SM103 scoring followed by radix Top-K.
 
 A slab contains at most 1024 query rows and 32 MiB of FP32 scores, independent
 of batch size and sequence length. Consecutive launches reuse that per-call
@@ -153,7 +153,7 @@ def _compile_topk(
 def _validate(
     q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int, compress_ratio: int
 ) -> None:
-    """Validate SM100 indexer tensor metadata and base alignment."""
+    """Validate SM100/SM103 indexer tensor metadata and base alignment."""
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B,T,H,D], got {tuple(q.shape)}")
     if k.ndim != 3:
@@ -208,8 +208,8 @@ def _validate(
             "bases and non-singleton outer strides"
         )
     properties = get_device_properties(q.device)
-    if (properties.major, properties.minor) != (10, 0):
-        raise RuntimeError("this tcgen05 kernel requires an SM100 GPU")
+    if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
+        raise RuntimeError("this tcgen05 kernel requires an SM100 or SM103 GPU")
 
 
 def launch(
