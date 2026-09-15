@@ -131,6 +131,8 @@ def chunk_gdn_prepare(
     """
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
+    if q.shape[-1] != 128:
+        raise ValueError("staged/context-parallel chunk_gdn currently requires K=V=128")
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
         q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
     )

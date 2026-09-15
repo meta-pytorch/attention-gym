@@ -97,8 +97,10 @@ def chunk_gdn_recompute_aqk_dense(
 ) -> torch.Tensor:
     """Run dense B=1 BT64 Aqk recomputation for the reused delta-H backward."""
     batch, tokens, heads, key_dim = q.shape
-    if batch != 1 or tokens % 64 or key_dim != 128 or k.shape != q.shape:
-        raise ValueError("dense fused chunk GDN Aqk recompute requires B=1, BT64, and K=128")
+    if batch != 1 or tokens % 64 or key_dim not in (64, 128) or k.shape != q.shape:
+        raise ValueError(
+            "dense fused chunk GDN Aqk recompute requires B=1, BT64, and K in {64, 128}"
+        )
     aqk = torch.empty(batch, tokens, heads, 64, dtype=q.dtype, device=q.device)
     chunk_gdn_recompute_aqk_kernel[(tokens // 64, heads)](
         q,
@@ -132,8 +134,8 @@ def chunk_gdn_recompute_aqk_packed(
     """Run fixed-capacity packed Aqk recomputation for reused delta-H backward."""
     metadata.validate_chunk_size(64)
     batch, tokens, heads, key_dim = q.shape
-    if batch != 1 or key_dim != 128 or k.shape != q.shape:
-        raise ValueError("packed fused chunk GDN Aqk recompute requires B=1 and K=128")
+    if batch != 1 or key_dim not in (64, 128) or k.shape != q.shape:
+        raise ValueError("packed fused chunk GDN Aqk recompute requires B=1 and K in {64, 128}")
     aqk = torch.empty(batch, tokens, heads, 64, dtype=q.dtype, device=q.device)
     chunk_gdn_recompute_aqk_kernel[(metadata.capacity, heads)](
         q,

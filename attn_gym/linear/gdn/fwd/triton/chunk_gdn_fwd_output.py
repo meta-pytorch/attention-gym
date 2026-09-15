@@ -30,6 +30,11 @@ from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
         triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
     ],
     key=["H", "HV", "K", "V", "BT"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
+        ]
+    },
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "num_sequences"])
@@ -146,8 +151,10 @@ def chunk_gdn_fwd_output_dense(
     value_heads, value_dim = v.shape[2:]
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("dense fused chunk GDN requires matching Q/K and H % HK == 0")
-    if batch != 1 or tokens % 64 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("dense fused chunk GDN requires B=1, complete BT64 chunks, and K=V=128")
+    if batch != 1 or tokens % 64 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError(
+            "dense fused chunk GDN requires B=1, complete BT64 chunks, and K=V in {64, 128}"
+        )
     chunks = tokens // 64
     if h.shape != (batch, chunks, value_heads, key_dim, value_dim):
         raise ValueError("h must contain one [K,V] entry state per chunk and head")
@@ -196,8 +203,8 @@ def chunk_gdn_fwd_output_packed(
     value_heads, value_dim = v.shape[2:]
     if batch != 1 or k.shape != q.shape or v.shape[:2] != q.shape[:2]:
         raise ValueError("packed fused chunk GDN requires B=1 and matching Q/K token axes")
-    if value_heads % key_heads or (key_dim, value_dim) != (128, 128):
-        raise ValueError("packed fused chunk GDN requires K=V=128 and H % HK == 0")
+    if value_heads % key_heads or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError("packed fused chunk GDN requires K=V in {64, 128} and H % HK == 0")
     if h.shape != (batch, metadata.capacity, value_heads, key_dim, value_dim):
         raise ValueError("h must contain one fixed-capacity [K,V] entry state per chunk")
 

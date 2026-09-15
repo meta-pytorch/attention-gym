@@ -76,15 +76,17 @@ def chunk_gdn_fwd_recurrence_dense(
     """Run dense BT64 recurrence with precomputed restored keys."""
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
-    if tokens % 64 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("dense fused chunk GDN requires complete BT64 chunks and K=V=128")
+    if tokens % 64 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError(
+            "dense fused chunk GDN requires complete BT64 chunks and K=V in {64, 128}"
+        )
     if w.shape != k.shape or cumulative_gate.shape != k.shape[:3]:
         raise ValueError("w must match k and cumulative_gate must have shape [B,T,H]")
     if initial_state.shape != (batch, heads, value_dim, key_dim):
         raise ValueError("initial_state must have shape [B,H,V,K]")
 
     chunks = tokens // 64
-    block_value = 64
+    block_value = min(64, value_dim)
     h = torch.empty(batch, chunks, heads, key_dim, value_dim, dtype=k.dtype, device=k.device)
     v_new = torch.empty_like(u)
     final_state = torch.empty_like(initial_state)
@@ -121,8 +123,10 @@ def chunk_gdn_fwd_recurrence_packed(
     batch, tokens, heads, key_dim = restored_k.shape
     value_dim = u.shape[-1]
     num_sequences = metadata.cu_seqlens.shape[0] - 1
-    if batch != 1 or tokens == 0 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("packed fused chunk GDN recurrence requires B=1, T>0, and K=V=128")
+    if batch != 1 or tokens == 0 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError(
+            "packed fused chunk GDN recurrence requires B=1, T>0, and K=V in {64, 128}"
+        )
     expected_state = (num_sequences, heads, value_dim, key_dim)
     if initial_state.shape != expected_state:
         raise ValueError(f"initial_state must have shape {expected_state}")

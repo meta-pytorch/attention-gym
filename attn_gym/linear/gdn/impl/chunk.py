@@ -55,10 +55,12 @@ def validate_supported_device(q: torch.Tensor) -> None:
         raise ValueError("fused chunk_gdn requires CUDA capability 8.0 or newer")
 
 
-def use_blackwell_backward(q: torch.Tensor) -> bool:
-    """Select the CuTe backward only on its validated SM100/SM103 targets."""
+def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
+    """Select the fixed-D128 CuTe backward only on its validated SM100/SM103 targets."""
     properties = get_device_properties(q.device)
-    return properties.major == 10 and properties.minor in (0, 3)
+    return (
+        properties.major == 10 and properties.minor in (0, 3) and q.shape[-1] == v.shape[-1] == 128
+    )
 
 
 def reject_int64_offsets(*tensors: torch.Tensor | None) -> None:
@@ -125,8 +127,10 @@ def chunk_gdn_fwd_dense(
     validate_supported_device(q)
     batch, tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
-    if batch != 1 or tokens % 64 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("dense fused chunk GDN requires B=1, complete BT64 chunks, and K=V=128")
+    if batch != 1 or tokens % 64 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError(
+            "dense fused chunk GDN requires B=1, complete BT64 chunks, and K=V in {64, 128}"
+        )
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("dense fused chunk GDN requires matching Q/K and H % HK == 0")
     if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
@@ -189,8 +193,8 @@ def chunk_gdn_fwd_packed(
     validate_supported_device(q)
     batch, _tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
-    if batch != 1 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("packed fused chunk GDN requires B=1 and K=V=128")
+    if batch != 1 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError("packed fused chunk GDN requires B=1 and K=V in {64, 128}")
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("packed fused chunk GDN requires matching Q/K and H % HK == 0")
     if initial_state is None:
@@ -264,8 +268,8 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     batch, _tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
-    if batch != 1 or (key_dim, value_dim) != (128, 128):
-        raise ValueError("paged fused chunk GDN requires B=1 and K=V=128")
+    if batch != 1 or (key_dim, value_dim) not in ((64, 64), (128, 128)):
+        raise ValueError("paged fused chunk GDN requires B=1 and K=V in {64, 128}")
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("paged fused chunk GDN requires matching Q/K and H % HK == 0")
     if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
@@ -423,7 +427,7 @@ def _finish_chunk_gdn_bwd(
     w, qg, kg, h, v_new = prepared.w, prepared.qg, prepared.kg, prepared.h, prepared.v_new
     assert w is not None and qg is not None and kg is not None
     assert h is not None and v_new is not None
-    if not use_blackwell_backward(q):
+    if not use_blackwell_backward(q, v):
         dh, d_initial_state, dv = chunk_gdn_bwd_delta_h(
             q,
             k,
