@@ -23,7 +23,7 @@ torch.library.define(
 torch.library.define(
     "attn_gym::_cute_short_conv_decode",
     "(Tensor x, Tensor weight, Tensor(a!) state, Tensor? state_indices,"
-    " *, str? activation=None) -> Tensor",
+    " *, str? activation=None, Tensor? has_initial_state=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::_cute_short_conv_paged_fwd",
@@ -34,7 +34,7 @@ torch.library.define(
     "attn_gym::_cute_short_conv_configured_decode",
     "(Tensor x, Tensor weight, Tensor(a!) state, Tensor? state_indices,"
     " int forward_threads, int forward_channels, int forward_times,"
-    " *, str? activation=None) -> Tensor",
+    " *, str? activation=None, Tensor? has_initial_state=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::_cute_short_conv_bwd",

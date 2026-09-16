@@ -185,6 +185,7 @@ def unrolled_dot(
     weights: cute.Tensor,
     input_offset: cutlass.Constexpr,
     width: cutlass.Constexpr,
+    explicit_fma: cutlass.Constexpr = False,
 ):
     """Build a descending compile-time convolution dot product."""
     last_tap = width - 1
@@ -194,10 +195,20 @@ def unrolled_dot(
     )
     for step in cutlass.range_constexpr(width - 1):
         tap = width - 2 - step
-        value = (
-            value
-            + inputs[(None, input_offset + tap)].load().to(Float32) * weights[(None, tap)].load()
-        )
+        if cutlass.const_expr(explicit_fma):
+            # Runtime-masked loads can otherwise swap which of the first two products
+            # contracts into the first FMA, changing resumed FP32 output bits.
+            value = cute.math.fma(
+                inputs[(None, input_offset + tap)].load().to(Float32),
+                weights[(None, tap)].load(),
+                value,
+            )
+        else:
+            value = (
+                value
+                + inputs[(None, input_offset + tap)].load().to(Float32)
+                * weights[(None, tap)].load()
+            )
     return value
 
 
@@ -702,6 +713,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
+        use_has_initial_state: bool = False,
     ):
         assert channels % config.channels_per_thread == 0, (
             f"decode channels ({channels}) must be divisible by channels_per_thread "
@@ -709,12 +721,14 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         )
         super().__init__(0, 1, channels, width, config, dtype)
         self.activation = activation
+        self.use_has_initial_state = use_has_initial_state
 
     def get_name(self) -> str:
         """Name the artifact without the runtime-bound sequence axis."""
         return (
             f"short_conv_{self.kernel_kind}_{self.dtype.name}_c{self.channels}"
             f"_w{self.width}_th{self.threads}_v{self.channels_per_thread}"
+            f"_his{int(self.use_has_initial_state)}"
         )
 
     @cute.kernel
@@ -725,6 +739,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         output: cute.Tensor,
         state: cute.Tensor,
         state_indices: cute.Tensor | None,
+        has_initial_state: cute.Tensor | None,
     ):
         """Advance one packed channel group of one sequence's history."""
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -754,18 +769,27 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                 taps = cute.make_rmem_tensor(
                     (self.channels_per_thread, self.width), self.dtype.cute_type
                 )
-                for row in cutlass.range_constexpr(self.width - 1):
-                    taps[(None, row)].store(
-                        state_groups[((0, 0, None), (slot, row, channel_group))].load()
-                    )
+                if cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
+                    for row in cutlass.range_constexpr(self.width - 1):
+                        taps[(None, row)].store(
+                            state_groups[((0, 0, None), (slot, row, channel_group))].load()
+                        )
+                elif has_initial_state[sequence]:
+                    for row in cutlass.range_constexpr(self.width - 1):
+                        taps[(None, row)].store(
+                            state_groups[((0, 0, None), (slot, row, channel_group))].load()
+                        )
+                else:
+                    # Fresh slots may contain NaNs: never load their old history.
+                    taps.fill(self.dtype.cute_type(0.0))
                 taps[(None, self.width - 1)].store(
                     x_groups[((0, None), (sequence, channel_group))].load()
                 )
 
                 output_groups[((0, None), (sequence, channel_group))].store(
-                    self.activation(unrolled_dot(taps, weights, 0, self.width)).to(
-                        self.dtype.cute_type
-                    )
+                    self.activation(
+                        unrolled_dot(taps, weights, 0, self.width, has_initial_state is not None)
+                    ).to(self.dtype.cute_type)
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
                     state_groups[((0, 0, None), (slot, row, channel_group))].store(
@@ -784,11 +808,12 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         output: cute.Tensor,
         state: cute.Tensor,
         state_indices: cute.Tensor | None,
+        has_initial_state: cute.Tensor | None,
         stream,
     ):
         """Launch the configured decode specialization."""
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(x, weight, output, state, state_indices).launch(
+        self.kernel(x, weight, output, state, state_indices, has_initial_state).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.size(x, mode=[0]),
@@ -2965,6 +2990,7 @@ def _validate_decode_inputs(
     weight: torch.Tensor,
     state: torch.Tensor,
     state_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> None:
     """Validate the one-token in-place decode tensor contract."""
     if x.ndim != 2:
@@ -3002,6 +3028,15 @@ def _validate_decode_inputs(
     ):
         raise ValueError(
             f"state_indices must be contiguous int32 with shape ({sequences},) on x.device"
+        )
+    if has_initial_state is not None and (
+        has_initial_state.shape != (sequences,)
+        or has_initial_state.dtype != torch.bool
+        or has_initial_state.device != x.device
+        or not has_initial_state.is_contiguous()
+    ):
+        raise ValueError(
+            f"has_initial_state must be contiguous bool with shape ({sequences},) on x.device"
         )
 
 
@@ -3581,9 +3616,12 @@ def _compile_decode(
     config: ShortConvConfig,
     paged: bool,
     activation: Activation,
+    use_has_initial_state: bool = False,
 ):
     """Compile one decode specialization, shared across batch sizes and pool depths."""
-    operation = CausalConv1dSiluDecode(channels, width, config, dtype, activation.forward)
+    operation = CausalConv1dSiluDecode(
+        channels, width, config, dtype, activation.forward, use_has_initial_state
+    )
     return compile_tvm_ffi(
         operation,
         _fake_dynamic_rows(dtype, channels),
@@ -3591,6 +3629,7 @@ def _compile_decode(
         _fake_dynamic_rows(dtype, channels),
         _fake_decode_state(dtype, width, channels),
         _fake_state_indices(paged),
+        _fake_has_initial_state(use_has_initial_state),
     )
 
 
@@ -3602,6 +3641,7 @@ def _launch_decode(
     state_indices: torch.Tensor | None,
     *,
     activation: str | None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Allocate the output and launch the compiled decode specialization."""
     resolved_activation = resolve_activation(activation)
@@ -3620,8 +3660,9 @@ def _launch_decode(
         config,
         state_indices is not None,
         resolved_activation,
+        has_initial_state is not None,
     )
-    compiled(x, weight, output, state, state_indices)
+    compiled(x, weight, output, state, state_indices, has_initial_state)
     return output
 
 
@@ -3777,9 +3818,10 @@ def _cute_short_conv_decode_cuda(
     state_indices: torch.Tensor | None = None,
     *,
     activation: str | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the tuned forward defaults through the decode schema."""
-    _validate_decode_inputs(x, weight, state, state_indices)
+    _validate_decode_inputs(x, weight, state, state_indices, has_initial_state)
     config = _default_decode_config(x, weight.shape[1], activation)
     return _launch_decode(
         x,
@@ -3788,6 +3830,7 @@ def _cute_short_conv_decode_cuda(
         config,
         state_indices,
         activation=activation,
+        has_initial_state=has_initial_state,
     )
 
 
@@ -3802,8 +3845,9 @@ def _decode_fake(
     state_indices: torch.Tensor | None = None,
     *,
     activation: str | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del weight, state, state_indices, activation
+    del weight, state, state_indices, activation, has_initial_state
     return torch.empty_like(x)
 
 
@@ -3817,9 +3861,10 @@ def _cute_short_conv_configured_decode_cuda(
     forward_times: int,
     *,
     activation: str | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Keep configured decode compilation and launch work behind an opaque operator."""
-    _validate_decode_inputs(x, weight, state, state_indices)
+    _validate_decode_inputs(x, weight, state, state_indices, has_initial_state)
     return _launch_decode(
         x,
         weight,
@@ -3827,6 +3872,7 @@ def _cute_short_conv_configured_decode_cuda(
         _config(forward_threads, forward_channels, forward_times),
         state_indices,
         activation=activation,
+        has_initial_state=has_initial_state,
     )
 
 
@@ -3848,6 +3894,7 @@ def _configured_decode_fake(
     forward_times: int,
     *,
     activation: str | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del (
         weight,
@@ -3857,6 +3904,7 @@ def _configured_decode_fake(
         forward_channels,
         forward_times,
         activation,
+        has_initial_state,
     )
     return torch.empty_like(x)
 
@@ -4551,6 +4599,7 @@ def causal_conv1d_decode(
     *,
     activation: str | None = None,
     state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     forward_config: ShortConvConfig | None = None,
 ) -> torch.Tensor:
     """Advance the convolution by one token per sequence over a paged history.
@@ -4575,6 +4624,11 @@ def causal_conv1d_decode(
             rows of a paged ``state`` pool. Without them, sequence ``i`` uses slot ``i``.
             Positive slots must be distinct. Non-positive entries produce zero output and
             leave the pool untouched.
+        has_initial_state: Optional contiguous CUDA bool mask, one entry per sequence.
+            ``True`` reads the selected history; ``False`` starts from zeros without
+            reading that slot, even if it contains NaNs. ``None`` resumes every live
+            slot. Non-positive explicit indices remain inactive regardless of this mask;
+            without ``state_indices``, slot zero is a valid sequence slot.
         forward_config: Optional schedule specialization.
 
     Returns:
@@ -4584,7 +4638,7 @@ def causal_conv1d_decode(
     are rejected when autograd is enabled.
     """
     resolve_activation(activation)
-    _validate_decode_inputs(x, weight, state, state_indices)
+    _validate_decode_inputs(x, weight, state, state_indices, has_initial_state)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x, weight, state)):
         raise RuntimeError(
             "causal_conv1d_decode is inference-only and has no backward; use "
@@ -4592,7 +4646,12 @@ def causal_conv1d_decode(
         )
     if forward_config is None:
         return short_conv_ops.short_conv_decode_op(
-            x, weight, state, state_indices, activation=activation
+            x,
+            weight,
+            state,
+            state_indices,
+            activation=activation,
+            has_initial_state=has_initial_state,
         )
     _validate_config(forward_config, x.shape[1], "forward_config")
     return short_conv_ops.short_conv_configured_decode_op(
@@ -4604,6 +4663,7 @@ def causal_conv1d_decode(
         forward_config.channels_per_thread,
         forward_config.times_per_block,
         activation=activation,
+        has_initial_state=has_initial_state,
     )
 
 
