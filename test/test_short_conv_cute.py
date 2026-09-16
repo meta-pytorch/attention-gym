@@ -46,6 +46,7 @@ from attn_gym.linear.short_conv.ops import (
 from attn_gym.linear.short_conv.ops import (
     short_conv_paged_forward_op as _paged_forward_op,
 )
+from attn_gym.testing.kda import assert_relative_rms_within
 
 
 def test_kda_backward_compatibility_exports():
@@ -1971,13 +1972,23 @@ def test_short_conv_decode_fresh_history(dtype, channels, width, config, activat
         # Include the existing FP32 SiLU tolerance for its approximate tanh epilogue.
         # The exact comparison above separately forbids any change to old arithmetic.
         activation_atol = 2e-5 if activation == "silu" else 0
-        allowance = (
+        relative_budget = (
             width * torch.finfo(torch.float32).eps + torch.finfo(dtype).eps + activation_atol
-        ) * (1 + fp64.abs())
+        )
+        allowance = relative_budget * (1 + fp64.abs())
         error = (actual.double() - fp64).abs()
         eager_error = (eager.double() - fp64).abs()
         assert torch.isfinite(actual).all()
         assert torch.all(error <= eager_error + allowance)
+        # The same precision/activation budget bounds aggregate relative error,
+        # without the pointwise absolute floor that can hide distributed errors.
+        assert_relative_rms_within(
+            actual,
+            fp64,
+            "short-convolution decode",
+            max_eps=relative_budget / torch.finfo(dtype).eps,
+            source_dtype=dtype,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
