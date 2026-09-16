@@ -36,7 +36,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.recurrent import GateKind
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 
@@ -71,6 +71,43 @@ def _decode_launch_config(
         block_v = 16
         num_warps = 2 if sequence_heads <= 8 else 1
     return min(triton.next_power_of_2(value_dim), block_v), num_warps
+
+
+def _spec_decode_launch_config(
+    value_dim: int,
+    sequence_heads: int,
+    speculative_width: int,
+    tuned_major: int | None,
+) -> tuple[int, int]:
+    """Select the value tile and warp count for speculative decode."""
+    if tuned_major != 10 or value_dim != 128:
+        return _decode_launch_config(value_dim, sequence_heads, None, GateKind.SCALAR)
+    if sequence_heads >= 256:
+        block_v = 16
+    elif sequence_heads >= 128:
+        block_v = 8 if speculative_width <= 2 else 4
+    elif sequence_heads >= 64:
+        if speculative_width == 1:
+            block_v = 8
+        elif speculative_width <= 8:
+            block_v = 4
+        else:
+            block_v = 2
+    elif sequence_heads >= 32:
+        if speculative_width <= 4:
+            block_v = 4
+        elif speculative_width <= 8:
+            block_v = 2
+        else:
+            block_v = 1
+    else:
+        if speculative_width == 1:
+            block_v = 4
+        elif speculative_width <= 4:
+            block_v = 2
+        else:
+            block_v = 1
+    return block_v, 1
 
 
 # Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
@@ -183,6 +220,127 @@ def _recurrent_delta_rule_decode_kernel(
     tl.store(state_cache + p_state, b_state, mask=m_vk)
 
 
+@triton.jit
+def _recurrent_delta_rule_spec_decode_kernel(
+    packed_qkv,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    output,
+    state_cache,
+    state_indices,
+    num_accepted_tokens,
+    cu_seqlens,
+    scale,
+    state_batch_stride: tl.constexpr,
+    state_indices_stride_n: tl.constexpr,
+    state_indices_stride_t: tl.constexpr,
+    qkv_token_stride: tl.constexpr,
+    gate_token_stride: tl.constexpr,
+    beta_token_stride: tl.constexpr,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Advance ragged speculative sequences and checkpoint every candidate prefix."""
+    pid = tl.program_id(0)
+    if USE_INT64_OFFSETS:
+        pid = pid.to(tl.int64)
+    NV = tl.cdiv(V, BV)
+    i_v = pid % NV
+    i_nh = pid // NV
+    i_n, i_h = i_nh // H, i_nh % H
+    i_hk = i_h // (H // HK)
+
+    bos = tl.load(cu_seqlens + i_n)
+    eos = tl.load(cu_seqlens + i_n + 1)
+    if USE_INT64_OFFSETS:
+        bos = bos.to(tl.int64)
+        eos = eos.to(tl.int64)
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_vk = m_v[:, None] & m_k[None, :]
+
+    accepted_offset = tl.load(num_accepted_tokens + i_n) - 1
+    state_slot = tl.load(
+        state_indices + i_n * state_indices_stride_n + accepted_offset * state_indices_stride_t
+    )
+    if USE_INT64_OFFSETS:
+        state_slot = state_slot.to(tl.int64)
+    if state_slot <= 0:
+        for token in range(bos, eos):
+            row = token * H + i_h
+            tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
+        return
+
+    p_state = ptr_offset(
+        (state_slot, i_h, o_v[:, None], o_k[None, :]),
+        (state_batch_stride, V * K, K, 1),
+    )
+    b_state = tl.load(state_cache + p_state, mask=m_vk, other=0.0).to(tl.float32)
+    b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+    b_dt_bias = tl.load(dt_bias + i_h).to(tl.float32)
+
+    for token_offset in range(eos - bos):
+        token = bos + token_offset
+        row = token * H + i_h
+        p_qkv = packed_qkv + token * qkv_token_stride
+        b_q = tl.load(p_qkv + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
+        b_k = tl.load(
+            p_qkv + HK * K + ptr_offset((i_hk, o_k), (K, 1)),
+            mask=m_k,
+            other=0.0,
+        ).to(tl.float32)
+        b_v = tl.load(
+            p_qkv + 2 * HK * K + ptr_offset((i_h, o_v), (V, 1)),
+            mask=m_v,
+            other=0.0,
+        ).to(tl.float32)
+        b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
+        b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+
+        b_gate_input = tl.load(raw_gate + token * gate_token_stride + i_h).to(tl.float32)
+        b_gate_input += b_dt_bias
+        b_softplus = tl.where(
+            b_gate_input > 20.0,
+            b_gate_input,
+            tl.where(
+                b_gate_input < -10.0,
+                tl.exp(b_gate_input),
+                tl.log(1.0 + tl.exp(b_gate_input)),
+            ),
+        )
+        b_state *= tl.exp(-b_a * b_softplus)
+        b_delta = b_v - tl.sum(b_state * b_k[None, :], axis=1)
+        b_beta = tl.sigmoid(tl.load(raw_beta + token * beta_token_stride + i_h).to(tl.float32))
+        b_state += (b_delta * b_beta)[:, None] * b_k[None, :]
+        b_o = tl.sum(b_state * b_q[None, :], axis=1)
+        tl.store(
+            output + ptr_offset((row, o_v), (V, 1)),
+            b_o.to(output.dtype.element_ty),
+            mask=m_v,
+        )
+
+        final_slot = tl.load(
+            state_indices + i_n * state_indices_stride_n + token_offset * state_indices_stride_t
+        )
+        if USE_INT64_OFFSETS:
+            final_slot = final_slot.to(tl.int64)
+        if final_slot > 0:
+            p_final = ptr_offset(
+                (final_slot, i_h, o_v[:, None], o_k[None, :]),
+                (state_batch_stride, V * K, K, 1),
+            )
+            tl.store(state_cache + p_final, b_state, mask=m_vk)
+
+
 def launch_recurrent_delta_rule_decode(
     packed_qkv: torch.Tensor,
     raw_gate: torch.Tensor,
@@ -287,4 +445,83 @@ def launch_recurrent_delta_rule_decode(
     )
 
 
-__all__ = ["GateTransform", "launch_recurrent_delta_rule_decode"]
+def launch_recurrent_delta_rule_spec_decode(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    key_heads: int,
+    scale: float,
+    op_name: str,
+) -> None:
+    """Launch scalar-gated speculative decode with one state checkpoint per token."""
+    read_only_inputs = (
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_indices,
+        num_accepted_tokens,
+        cu_seqlens,
+    )
+    if any(torch._C._overlaps(output, tensor) for tensor in (*read_only_inputs, state_cache)):
+        raise ValueError(f"out must not alias any {op_name} input")
+    if any(torch._C._overlaps(state_cache, tensor) for tensor in read_only_inputs):
+        raise ValueError(f"state_cache must not alias {op_name} read-only inputs")
+
+    num_sequences = state_indices.shape[0]
+    heads, value_dim, key_dim = state_cache.shape[1:]
+    assert key_heads > 0 and heads % key_heads == 0
+    major = get_device_properties(packed_qkv.device).major
+    measured_shape = (
+        packed_qkv.dtype is torch.bfloat16 and key_heads == heads and key_dim == value_dim == 128
+    )
+    block_v, num_warps = _spec_decode_launch_config(
+        value_dim,
+        num_sequences * heads,
+        state_indices.shape[1],
+        major if measured_shape else None,
+    )
+    grid = (triton.cdiv(value_dim, block_v) * num_sequences * heads,)
+    _recurrent_delta_rule_spec_decode_kernel[grid](
+        packed_qkv,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        output,
+        state_cache,
+        state_indices,
+        num_accepted_tokens,
+        cu_seqlens,
+        scale,
+        state_batch_stride=state_cache.stride(0),
+        state_indices_stride_n=state_indices.stride(0),
+        state_indices_stride_t=state_indices.stride(1),
+        qkv_token_stride=packed_qkv.stride(0),
+        gate_token_stride=raw_gate.stride(0),
+        beta_token_stride=raw_beta.stride(0),
+        H=heads,
+        HK=key_heads,
+        K=key_dim,
+        V=value_dim,
+        BK=triton.next_power_of_2(key_dim),
+        BV=block_v,
+        USE_INT64_OFFSETS=requires_int64_offsets(*read_only_inputs, state_cache, output),
+        num_warps=num_warps,
+    )
+
+
+__all__ = [
+    "GateTransform",
+    "launch_recurrent_delta_rule_decode",
+    "launch_recurrent_delta_rule_spec_decode",
+]

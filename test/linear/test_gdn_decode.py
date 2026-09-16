@@ -1,5 +1,7 @@
 """Correctness, registration, and capture tests for fused raw-ABI GDN decode."""
 
+from itertools import pairwise
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,9 +9,10 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode
-from attn_gym.linear._delta_rule.decode import _decode_launch_config
+from attn_gym.linear._delta_rule import decode as decode_module
+from attn_gym.linear._delta_rule.decode import _decode_launch_config, _spec_decode_launch_config
 from attn_gym.linear._delta_rule.recurrent import GateKind
-from attn_gym.linear.gdn.ops import recurrent_decode_op
+from attn_gym.linear.gdn.ops import recurrent_decode_op, recurrent_spec_decode_op
 from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
@@ -41,6 +44,40 @@ def test_decode_launch_config(
     expected: tuple[int, int],
 ):
     assert _decode_launch_config(value_dim, sequence_heads, tuned_major, gate_kind) == expected
+
+
+@pytest.mark.parametrize(
+    ("sequence_heads", "speculative_width", "expected_block_v"),
+    [
+        (16, 1, 4),
+        (16, 4, 2),
+        (16, 8, 1),
+        (32, 4, 4),
+        (32, 8, 2),
+        (32, 16, 1),
+        (64, 1, 8),
+        (64, 8, 4),
+        (64, 16, 2),
+        (128, 1, 8),
+        (128, 4, 4),
+        (256, 1, 16),
+        (1024, 32, 16),
+    ],
+)
+def test_spec_decode_launch_config(
+    sequence_heads: int,
+    speculative_width: int,
+    expected_block_v: int,
+):
+    assert _spec_decode_launch_config(128, sequence_heads, speculative_width, 10) == (
+        expected_block_v,
+        1,
+    )
+
+
+def test_spec_decode_launch_config_preserves_generic_fallback():
+    assert _spec_decode_launch_config(128, 16, 32, None) == (16, 1)
+    assert _spec_decode_launch_config(24, 8, 32, 10) == (8, 4)
 
 
 def make_decode_inputs(
@@ -123,6 +160,43 @@ def reference_decode(
     return output, pool
 
 
+def reference_spec_decode(
+    inputs: dict[str, torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ordinary decode per token and save every speculative prefix state."""
+    pool = inputs["state_cache"].clone()
+    state_indices = inputs["state_indices"]
+    heads, value_dim = pool.shape[1:3]
+    output = inputs["packed_qkv"].new_zeros(inputs["packed_qkv"].shape[0], heads, value_dim)
+    for sequence, (start, end) in enumerate(pairwise(cu_seqlens.tolist())):
+        source_column = int(num_accepted_tokens[sequence].item()) - 1
+        source_slot = int(state_indices[sequence, source_column].item())
+        if source_slot <= 0:
+            continue
+        working_pool = pool.new_zeros((2, *pool.shape[1:]))
+        working_pool[1].copy_(pool[source_slot])
+        working_index = torch.tensor([1], device="cuda", dtype=torch.int32)
+        for token_offset, token in enumerate(range(start, end)):
+            token_output = recurrent_gdn_decode(
+                inputs["packed_qkv"][token : token + 1],
+                inputs["raw_gate"][:, token : token + 1],
+                inputs["raw_beta"][:, token : token + 1],
+                inputs["A_log"],
+                inputs["dt_bias"],
+                working_pool,
+                working_index,
+                scale=scale,
+            )
+            output[token] = token_output[0, 0]
+            destination_slot = int(state_indices[sequence, token_offset].item())
+            if destination_slot > 0:
+                pool[destination_slot].copy_(working_pool[1])
+    return output, pool
+
+
 @pytest.mark.parametrize("scale", [None, 0.25])
 @pytest.mark.parametrize("key_heads", [None, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -145,6 +219,89 @@ def test_decode_matches_reference(key_heads: int | None, dtype: torch.dtype, sca
     assert output.dtype == dtype and output.shape[0] == 1
     torch.testing.assert_close(output[0].float(), expected_output, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("accepted", [(1, 1), (3, 2)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_spec_decode_matches_token_reference(accepted: tuple[int, int], dtype: torch.dtype):
+    """Speculative decode resumes the accepted checkpoint and saves every new prefix."""
+    inputs = make_decode_inputs(batch=7, num_slots=10, dtype=dtype, seed=11)
+    state_indices = torch.empty_strided(
+        (2, 4),
+        (9, 2),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    state_indices.copy_(torch.tensor([[9, 8, 7, 6], [5, 4, 3, 2]], device="cuda"))
+    inputs["state_indices"] = state_indices
+    cu_seqlens = torch.tensor([0, 4, 7], device="cuda", dtype=torch.int32)
+    num_accepted_tokens = torch.tensor(accepted, device="cuda", dtype=torch.int32)
+    expected_output, expected_pool = reference_spec_decode(
+        inputs,
+        cu_seqlens,
+        num_accepted_tokens,
+    )
+
+    output = recurrent_gdn_decode(
+        inputs["packed_qkv"],
+        inputs["raw_gate"],
+        inputs["raw_beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["state_cache"],
+        inputs["state_indices"],
+        cu_seqlens=cu_seqlens,
+        num_accepted_tokens=num_accepted_tokens,
+    )
+
+    # The speculative kernel retains state in registers across tokens, while the
+    # oracle launches once per token. Triton may schedule their FP32 arithmetic
+    # differently, so checkpoint states can differ by a few FP32 ULPs.
+    torch.testing.assert_close(output[0], expected_output, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=5e-7)
+
+
+def test_spec_decode_int64_offsets_match_default(monkeypatch):
+    """The wide-address specialization matches the ordinary int32 path exactly."""
+    inputs = make_decode_inputs(batch=4, num_slots=6, dtype=torch.bfloat16, seed=13)
+    inputs["state_indices"] = torch.tensor(
+        [[5, 4], [3, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    initial_pool = inputs["state_cache"].clone()
+
+    def run() -> torch.Tensor:
+        return recurrent_gdn_decode(
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            inputs["state_cache"],
+            inputs["state_indices"],
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+
+    expected = run()
+    expected_pool = inputs["state_cache"].clone()
+    inputs["state_cache"].copy_(initial_pool)
+    calls = 0
+
+    def force_int64(*_tensors):
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(decode_module, "requires_int64_offsets", force_int64)
+    actual = run()
+
+    assert calls == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(("major", "heads"), [(9, 8), (10, 16)])
@@ -281,6 +438,31 @@ def test_decode_custom_op_registration():
     )
 
 
+def test_spec_decode_custom_op_registration():
+    inputs = make_decode_inputs(batch=3, heads=1, key_dim=16, value_dim=8, num_slots=5)
+    state_indices_storage = torch.tensor([[4, 0, 3, 0, 2]], device="cuda", dtype=torch.int32)
+    inputs["state_indices"] = state_indices_storage[:, ::2]
+    cu_seqlens = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([2], device="cuda", dtype=torch.int32)
+    out = inputs["packed_qkv"].new_empty(1, 3, 1, 8)
+    torch.library.opcheck(
+        recurrent_spec_decode_op,
+        (
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            inputs["state_cache"],
+            inputs["state_indices"],
+            num_accepted_tokens,
+            cu_seqlens,
+            out,
+            0.25,
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     "decode_kwargs",
     [
@@ -342,4 +524,77 @@ def test_decode_fullgraph_and_cuda_graph(decode_kwargs: dict[str, object]):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(graph_pool, eager_pool, rtol=0, atol=0)
+
+
+def test_spec_decode_fullgraph_and_cuda_graph():
+    """Speculative metadata remains dynamic across compile and CUDA graph replay."""
+    inputs = make_decode_inputs(
+        batch=5,
+        heads=16,
+        key_dim=128,
+        value_dim=128,
+        num_slots=8,
+        dtype=torch.bfloat16,
+        seed=12,
+    )
+    state_indices_storage = torch.empty_strided(
+        (2, 3),
+        (7, 2),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    state_indices_storage.copy_(torch.tensor([[7, 6, 5], [4, 3, 2]], device="cuda"))
+    state_indices = state_indices_storage
+    cu_seqlens = torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    initial_pool = inputs["state_cache"].clone()
+    args = (
+        inputs["packed_qkv"],
+        inputs["raw_gate"],
+        inputs["raw_beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+    )
+
+    def fresh_pool() -> torch.Tensor:
+        _storage, pool = strided_state_pool(8, 16, 128, 128)
+        pool.copy_(initial_pool)
+        return pool
+
+    def run(pool: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        return recurrent_gdn_decode(
+            *args,
+            pool,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
+            out=out,
+        )
+
+    with torch.no_grad():
+        compiled = torch.compile(run, fullgraph=True)
+        warmup_pool = fresh_pool()
+        compiled(warmup_pool)
+        torch.cuda.synchronize()
+
+        graph_pool = fresh_pool()
+        graph_out = args[0].new_empty(1, args[0].shape[0], 16, 128)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(graph_pool, out=graph_out)
+
+        graph_pool.copy_(initial_pool)
+        num_accepted_tokens.copy_(torch.tensor([2, 1], device="cuda", dtype=torch.int32))
+        inputs["packed_qkv"].mul_(0.9)
+        eager_pool = fresh_pool()
+        compiled_pool = fresh_pool()
+        expected = run(eager_pool)
+        actual = compiled(compiled_pool)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_pool, eager_pool, rtol=0, atol=0)
+        torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
         torch.testing.assert_close(graph_pool, eager_pool, rtol=0, atol=0)
