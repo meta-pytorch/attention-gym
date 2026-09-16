@@ -76,6 +76,7 @@ def test_reference_rejects_backend_options(inputs, backend):
         selected_attention(**inputs, impl=Impl.REFERENCE, kernel_options={"backend": backend})
 
 
+@pytest.mark.usefixtures("fresh_compile_cache")
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("impl", [Impl.REFERENCE, "reference"])
 def test_public_reference_fullgraph(inputs, dynamic, impl):
@@ -96,6 +97,7 @@ def test_public_reference_fullgraph(inputs, dynamic, impl):
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+@pytest.mark.usefixtures("fresh_compile_cache")
 @pytest.mark.parametrize("compile_call", [False, True])
 @pytest.mark.parametrize("window", [-1, True, 1.5])
 def test_invalid_window(inputs, compile_call, window):

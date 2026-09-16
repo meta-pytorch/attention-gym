@@ -206,6 +206,7 @@ def test_d512_deterministic_backward(heads, share_kv):
 
 @pytest.mark.parametrize("heads,share_kv", [(2, False), (17, True)], ids=["generic", "shared"])
 @pytest.mark.parametrize("kernel_options", [None, {"backend": "triton"}], ids=["auto", "triton"])
+@pytest.mark.usefixtures("fresh_compile_cache")
 def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
     # Stride tuples are Triton constexpr arguments, so each shape specializes independently.
     compiled = torch.compile(selected_attention, fullgraph=True, dynamic=False)
@@ -214,6 +215,7 @@ def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
         check_training(inputs, 19, operation=compiled, kernel_options=kernel_options)
 
 
+@pytest.mark.usefixtures("fresh_compile_cache")
 def test_cute_eligible_auto_fullgraph_training():
     from attn_gym.sparse.selected_attention.api import _select_backend
     from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
