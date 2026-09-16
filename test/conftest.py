@@ -24,6 +24,16 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture
+def fresh_compile_cache() -> Iterator[None]:
+    """Keep independent compile tests from sharing a function's recompilation budget."""
+    torch.compiler.reset()
+    try:
+        yield
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.fixture
 def paged_short_conv_inputs() -> Callable[..., tuple[torch.Tensor, ...]]:
     """Build one-token inputs and a paged short-convolution history pool."""
 
