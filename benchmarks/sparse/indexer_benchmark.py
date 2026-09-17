@@ -20,6 +20,7 @@ DTYPES = {
     "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
+    "mxfp8": torch.float8_e4m3fn,
 }
 
 
@@ -70,10 +71,21 @@ def useful_flops(args: argparse.Namespace) -> int:
     return 2 * args.batch * args.heads * args.head_dim * pairs
 
 
+def quantize_mxfp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare E4M3 data and group-32 E8M0 scales outside the timed region."""
+    blocks = tensor.float().unflatten(-1, (tensor.shape[-1] // 32, 32))
+    maximum = blocks.abs().amax(-1)
+    maximum = torch.where(maximum > 0, maximum, 1.0)
+    exponent = torch.ceil(torch.log2(maximum / 448.0)).clamp(-127, 127)
+    scale = torch.exp2(exponent).to(torch.float8_e8m0fnu)
+    data = (blocks / scale.float().unsqueeze(-1)).flatten(-2).to(torch.float8_e4m3fn)
+    return data, scale
+
+
 def make_inputs(args: argparse.Namespace):
     """Create one shared set of inputs for every measured implementation."""
     device = torch.device("cuda")
-    dtype = DTYPES[args.dtype]
+    dtype = torch.bfloat16 if args.dtype == "mxfp8" else DTYPES[args.dtype]
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     def randn(*shape):
@@ -82,14 +94,18 @@ def make_inputs(args: argparse.Namespace):
     q = randn(args.batch, args.sequence_length, args.heads, args.head_dim)
     k = randn(args.batch, args.sequence_length // args.compress_ratio, args.head_dim)
     weights = randn(args.batch, args.sequence_length, args.heads)
-    return q, k, weights
+    q_scale = k_scale = None
+    if args.dtype == "mxfp8":
+        q, q_scale = quantize_mxfp8(q)
+        k, k_scale = quantize_mxfp8(k)
+    return q, k, weights, q_scale, k_scale
 
 
 def parse_args() -> argparse.Namespace:
     """Parse shapes, implementations, and graph-replay iteration counts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--heads", type=int, default=128)
+    parser.add_argument("--heads", type=int, help="Default: 64 for MXFP8, otherwise 128")
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--compress-ratio", type=int, default=1)
@@ -113,10 +129,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rep", type=int, default=100, help="Number of timed graph replays")
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
+    if args.heads is None:
+        args.heads = 64 if args.dtype == "mxfp8" else 128
     if args.compress_ratio < 1:
         parser.error("--compress-ratio must be positive")
     if "fused" in args.impl and args.backend == ["triton"] and args.selector == ["gvr2"]:
         parser.error("the GVR2 selector requires the CuTe backend")
+    if args.dtype == "mxfp8":
+        if "fused" in args.impl:
+            if "triton" in args.backend:
+                parser.error("fused MXFP8 scoring requires CuTe; remove triton from --backend")
+            if args.heads not in (32, 64) or args.head_dim != 128:
+                parser.error("fused MXFP8 scoring requires --heads 32 or 64 and --head-dim 128")
+        elif args.head_dim % 32:
+            parser.error("MXFP8 requires --head-dim divisible by 32")
     return args
 
 
@@ -136,7 +162,9 @@ def main() -> None:
     fwd_flops = useful_flops(args)
 
     print("contract: warm fixed-pointer CUDA graph, timing events inside capture; forward only")
-    q, k, weights = make_inputs(args)
+    q, k, weights, q_scale, k_scale = make_inputs(args)
+    if args.dtype == "mxfp8":
+        print("MXFP8 group-32 quantization and scale preparation excluded from timing")
     for impl in args.impl:
         for backend in args.backend if impl == "fused" else [None]:
             for selector in args.selector if impl == "fused" else ["default"]:
@@ -154,6 +182,8 @@ def main() -> None:
                     args.topk,
                     causal=args.causal,
                     compress_ratio=args.compress_ratio,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
                     impl=impl,
                     kernel_options=options,
                 )
