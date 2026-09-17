@@ -196,8 +196,8 @@ def unrolled_dot(
     for step in cutlass.range_constexpr(width - 1):
         tap = width - 2 - step
         if cutlass.const_expr(explicit_fma):
-            # Runtime-masked loads can otherwise swap which of the first two products
-            # contracts into the first FMA, changing resumed FP32 output bits.
+            # Keep decode's accumulation order independent of masking and compiler
+            # contraction decisions (scalar multiplies plus packed adds need not fuse).
             value = cute.math.fma(
                 inputs[(None, input_offset + tap)].load().to(Float32),
                 weights[(None, tap)].load(),
@@ -788,7 +788,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
 
                 output_groups[((0, None), (sequence, channel_group))].store(
                     self.activation(
-                        unrolled_dot(taps, weights, 0, self.width, has_initial_state is not None)
+                        unrolled_dot(taps, weights, 0, self.width, explicit_fma=True)
                     ).to(self.dtype.cute_type)
                 )
                 for row in cutlass.range_constexpr(self.width - 1):
