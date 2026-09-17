@@ -25,6 +25,34 @@ def test_indexer_inputs_are_reproducible_without_changing_global_rng(heads):
         assert (inputs[2][..., 1] <= -0.25).all()
 
 
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_selection_oracle_bounds_query_intermediates(monkeypatch, ratio):
+    """FP64 and eager checks retain every row/key with bounded per-head products."""
+    inputs = make_indexer_test_inputs(
+        257, 2, 16, torch.float32, device="cpu", compress_ratio=ratio
+    )
+    actual = lightning_indexer(*inputs, 7, causal=True, compress_ratio=ratio, impl="reference")
+    matmul, einsum = torch.Tensor.__matmul__, torch.einsum
+    query_sizes, eager_sizes = [], []
+
+    def bounded_matmul(left, right):
+        if left.dtype == torch.float64:
+            query_sizes.append(left.shape[-2])
+            assert left.shape[-2] <= 128
+        return matmul(left, right)
+
+    def bounded_einsum(equation, query, key):
+        eager_sizes.append(query.shape[1])
+        assert query.shape[1] <= 128
+        return einsum(equation, query, key)
+
+    monkeypatch.setattr(torch.Tensor, "__matmul__", bounded_matmul)
+    monkeypatch.setattr(torch, "einsum", bounded_einsum)
+    assert_indexer_selection(actual, *inputs, 7, True, ratio)
+    assert query_sizes == [128, 128, 128, 128, 1, 1]
+    assert eager_sizes == [128, 128, 1]
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal,topk", [(False, 5), (True, 5), (True, 0)])
 def test_selection_oracle_handles_different_row_magnitudes(dtype, causal, topk):

@@ -27,8 +27,12 @@ def _reference_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -
     """Compute the indexer score matrix in the input dtype."""
     _, _, heads, head_dim = q.shape
     scale = 1.0 / math.sqrt(heads * head_dim)
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    return (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
+    chunks = []
+    for start in range(0, q.shape[1], 128):
+        dots = torch.einsum("bthd,bsd->bths", q[:, start : start + 128], k)
+        chunk = (torch.relu(dots) * weights[:, start : start + 128].unsqueeze(-1)).sum(dim=2)
+        chunks.append(chunk * scale)
+    return torch.cat(chunks, dim=1)
 
 
 def _validate_indices(
@@ -168,7 +172,8 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
         (2, 256, 64, 128, 129),
         (2, 512, 64, 128, 512),
         (2, 1024, 64, 128, 512),
-        (2, 4096, 64, 128, 128),
+        # Serialize the large FP64 intermediates with other indexer oracle tests.
+        pytest.param(2, 4096, 64, 128, 128, marks=pytest.mark.xdist_group("indexer_large_oracle")),
     ],
     ids=[
         "base",
@@ -392,7 +397,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
         assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True)
-        assert impl._compile_topk.is_cached(16, True, 1, False)
+        assert impl._compile_topk.is_cached(16, True, 1, False, "gvr2")  # auto picks GVR2 at K=16
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
             compiler.cache_clear()

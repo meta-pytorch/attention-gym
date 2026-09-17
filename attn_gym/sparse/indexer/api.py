@@ -140,6 +140,12 @@ def lightning_indexer(
             on SM100/SM103 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
 
+        ``"selector"`` chooses the exact Top-K algorithm: ``"auto"`` (omitted
+        default) lets CuTe use GVR2 self-sampling selection when ``topk < 2048``
+        and radix otherwise, and keeps Triton's streaming Top-K; ``"default"``
+        forces CuTe radix / Triton streaming; ``"gvr2"`` forces GVR2 on either
+        backend.
+
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
         guaranteed, including across repeated calls. Causal rows with fewer than topk candidates
@@ -150,12 +156,13 @@ def lightning_indexer(
     SM100/SM103, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
     bases and non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
-    Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with
-    unit last strides and 16-byte-aligned bases and outer strides; weights may be strided.
-    Its register-resident selection makes per-tile cost grow with topk.
-    CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
-    rows. Large inputs use slabs rather than an unbounded quadratic score allocation.
-    This workspace is additional to the returned indices and is not shared across calls.
+    Triton requires SM90 or newer, H <= 256 and D <= 256 divisible by 8. Its default
+    scorer requires Q/K unit last strides and 16-byte-aligned bases and outer strides;
+    weights may be strided, and its register-resident selection cost grows with topk.
+    Triton GVR2 accepts arbitrary nonnegative input strides. CuTe and Triton GVR2 score
+    into a per-call FP32 slab of at most 32 MiB / 1024 query rows (additional to the
+    returned indices, not shared across calls); larger inputs loop over slabs. Triton GVR2
+    uses its own tiled scorer, so its scores may round differently from the default path.
 
     Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
@@ -174,14 +181,23 @@ def lightning_indexer(
 
             return reference.launch(q, k, weights, topk, causal, compress_ratio)
         case Impl.FUSED:
-            if kernel_options not in (
-                None,
-                {},
-                {"backend": "cute"},
-                {"backend": "triton"},
+            options = {} if kernel_options is None else kernel_options
+            if (
+                not isinstance(options, dict)
+                or options.keys() - {"backend", "selector"}
+                or ("backend" in options and options["backend"] not in ("cute", "triton"))
+                or options.get("selector", "auto") not in ("auto", "default", "gvr2")
             ):
                 raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
-            backend = (kernel_options or {}).get("backend", "auto")
-            return _indexer_op(q, k, weights, topk, causal, compress_ratio, backend)
+            return _indexer_op(
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                options.get("backend", "auto"),
+                selector=options.get("selector", "auto"),
+            )
