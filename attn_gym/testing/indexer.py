@@ -1,6 +1,7 @@
 """Shared operands and score-selection error checks for lightning indexers."""
 
 import math
+from typing import NamedTuple
 
 import torch
 
@@ -30,6 +31,57 @@ def make_indexer_test_inputs(
     if heads > 1:
         weights[..., 1] = -weights[..., 1].abs() - 0.25
     return q, k, weights
+
+
+class ScaledIndexerInputs(NamedTuple):
+    q: torch.Tensor
+    k: torch.Tensor
+    weights: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+
+
+def make_indexer_mxfp8_test_inputs(
+    tokens: int,
+    heads: int,
+    head_dim: int,
+    weights_dtype: torch.dtype,
+    *,
+    batch: int = 2,
+    compress_ratio: int = 1,
+    device: str | torch.device = "cuda",
+    seed: int = 77,
+) -> ScaledIndexerInputs:
+    """E4M3 data and E8M0 scales varying across queries, heads, keys and D groups."""
+    q, k, weights = make_indexer_test_inputs(
+        tokens,
+        heads,
+        head_dim,
+        torch.bfloat16,
+        batch=batch,
+        compress_ratio=compress_ratio,
+        device=device,
+        seed=seed,
+    )
+    generator = torch.Generator(device=device).manual_seed(seed + 1)
+    if weights_dtype == torch.float32:
+        weights = torch.randn(
+            weights.shape, device=device, dtype=weights_dtype, generator=generator
+        )
+    q_exponents = torch.randint(
+        -3, 3, (*q.shape[:-1], head_dim // 32), device=device, generator=generator
+    )
+    k_exponents = torch.randint(
+        -3, 3, (*k.shape[:-1], head_dim // 32), device=device, generator=generator
+    )
+    q_scale = torch.pow(2.0, q_exponents).to(torch.float8_e8m0fnu)
+    k_scale = torch.pow(2.0, k_exponents).to(torch.float8_e8m0fnu)
+    # MX scales have no zero encoding; zero data groups retain positive scales.
+    q[:, 0, :, :32] = 0
+    k[:, 0, :32] = 0
+    return ScaledIndexerInputs(
+        q.to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn), weights, q_scale, k_scale
+    )
 
 
 def assert_selection_regret_within(
@@ -72,6 +124,9 @@ def assert_indexer_selection(
     topk: int,
     causal: bool,
     compress_ratio: int = 1,
+    *,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
 ) -> None:
     """Check index invariants and FP64 boundary regret against eager's regret.
 
@@ -101,6 +156,10 @@ def assert_indexer_selection(
         return
 
     q64, k64, w64 = q.double(), k.double(), weights.double()
+    if q_scale is not None:
+        q64 = (q64.unflatten(-1, (dim // 32, 32)) * q_scale.double().unsqueeze(-1)).flatten(-2)
+    if k_scale is not None:
+        k64 = (k64.unflatten(-1, (dim // 32, 32)) * k_scale.double().unsqueeze(-1)).flatten(-2)
     # Keep exhaustive rows/keys without materializing [B,H,T,S] FP64 intermediates.
     scores = torch.empty((batch, tokens, candidates), device=q.device, dtype=torch.float64)
     magnitude = torch.empty_like(scores)
@@ -131,12 +190,15 @@ def assert_indexer_selection(
         causal=causal,
         compress_ratio=compress_ratio,
         impl="reference",
+        q_scale=q_scale,
+        k_scale=k_scale,
     )
     actual_scores = scores.gather(-1, actual.long().clamp_min(0))
     eager_scores = scores.gather(-1, eager.long().clamp_min(0))
     actual_error = (boundary - actual_scores).clamp_min(0).masked_fill(~valid, 0)
     eager_error = (boundary - eager_scores).clamp_min(0).masked_fill(eager < 0, 0)
-    reduction_eps = (dim + heads + 2) * torch.finfo(torch.float32).eps
+    scale_ops = int(q_scale is not None) + int(k_scale is not None)
+    reduction_eps = (dim + heads + 2 + scale_ops) * torch.finfo(torch.float32).eps
     assert_selection_regret_within(
         actual_error,
         eager_error,

@@ -39,7 +39,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
   reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
   batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
   allocation. This scratch is additional to the returned indices. Triton's default
-  FP16/BF16 route needs no global score scratch; its GVR2 route uses a separate
+  FP16/BF16 route needs no global score scratch; its MXFP8 and GVR2 routes use a separate
   scorer and the same 32 MiB / 1024-row bound.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
   Omit options for automatic selection. Options are rejected for `impl="reference"`.
@@ -75,12 +75,7 @@ so the result is the exact Top-K of the scorer's finite FP32 values.
 
 ```python
 indices = lightning_indexer(
-    q,
-    k,
-    weights,
-    topk=512,
-    causal=True,
-    compress_ratio=4,
+    q, k, weights, topk=512, causal=True, compress_ratio=4,
     kernel_options={"backend": "cute", "selector": "gvr2"},
 )
 ```
@@ -89,15 +84,39 @@ The `auto` boundary comes from the [selector sweep](indexer_gvr2_performance.md)
 `topk >= 2048` GVR2 falls back to radix in-kernel and cannot win. On Triton, `"gvr2"` also
 switches to a separate tiled scorer, so scores may round differently from the default path.
 
-The benchmark CLI accepts both backend and selector lists. For example:
+### Explicit-scale MXFP8 scoring
 
-```bash
-uv run benchmarks/sparse/indexer_benchmark.py --batch 1 --heads 64 --head-dim 128 --sequence-length 65536 --compress-ratio 4 --topk 512 --dtype bfloat16 --backend cute triton --selector default gvr2 --warmup 5 --rep 30
+For prequantized E4M3 Q/K, pass E8M0 scales for **32-element groups** along the head
+dimension. Both backends support it on SM100/SM103 for `H` in `{32, 64}` and `D=128`; CuTe
+is the faster path.
+
+```python
+indices = lightning_indexer(
+    q8, k8, weights, topk=512, causal=True, compress_ratio=4,
+    q_scale=q_scale, k_scale=k_scale,
+)
+# q8: E4M3FN [B,T,H,128], k8: E4M3FN [B,T//4,128]
+# q_scale: E8M0 [B,T,H,4], k_scale: E8M0 [B,T//4,4]
+# weights: BF16 or FP32 [B,T,H]
 ```
 
-Timing includes scoring, in-kernel scale loading/packing, and selection, but excludes caller
-compilation, allocations, and graph capture. Force `"selector": "default"` or `"gvr2"` to
-compare both exact paths against the `auto` choice on your own shapes.
+The storage dtypes are `torch.float8_e4m3fn` and `torch.float8_e8m0fnu`. Each E8M0
+scale multiplies its corresponding 32 Q/K elements **inside the dot product**;
+scales cannot generally be folded into the head weights. Accumulation and the
+weighted ReLU head reduction use FP32. Both scale tensors are required for MXFP8,
+and ordinary FP16/BF16/FP32/FP64 inputs reject scale arguments.
+
+The caller owns quantization: this API does not compute scales or quantize Q/K.
+E8M0 represents positive powers of two, not zero; use zero data with a valid positive
+scale for an all-zero group. Scale values are not checked on device; non-finite scales or
+scores are outside the contract.
+
+An explicit `kernel_options={"backend": "triton"}` selects the Triton implementation.
+CuTe retains the Q/K TMA layout requirements above; Triton MXFP8 accepts nonnegative
+Q/K strides and byte-aligned bases. Both accept arbitrary nonnegative scale strides,
+including the group dimension; no host-side scale packing is required. See
+[indexer_performance.md](indexer_performance.md) for measurements against DeepGEMM and
+FlashInfer and how to reproduce them.
 
 ### Compilation and training scope
 
@@ -116,7 +135,7 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
 has no gradient function. Selected attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
-into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
+into the indexer's queries, keys, scoring weights, or scales. This API supplies no surrogate gradient
 or indexer-training loss.
 
 Selection with NaN/Inf scores is unspecified and may differ across backends.

@@ -13,6 +13,8 @@ def launch(
     topk: int,
     causal: bool,
     compress_ratio: int,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
@@ -28,6 +30,8 @@ def launch(
         topk: number of candidates to select per query
         causal: keep only the ``(t + 1) // compress_ratio`` leading candidates of query t
         compress_ratio: tokens summarized per candidate; ``S == T // compress_ratio``
+        q_scale: optional E8M0 per-32-element dequantization scales, [B, T, H, D/32].
+        k_scale: optional E8M0 per-32-element dequantization scales, [B, S, D/32].
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -46,6 +50,9 @@ def launch(
     q = q.to(accum_dtype)
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
+    if q_scale is not None:  # The API requires both scales or neither.
+        q = (q.unflatten(-1, (head_dim // 32, 32)) * q_scale.float().unsqueeze(-1)).flatten(-2)
+        k = (k.unflatten(-1, (head_dim // 32, 32)) * k_scale.float().unsqueeze(-1)).flatten(-2)
 
     indices = torch.empty((batch, queries, topk), dtype=torch.int32, device=q.device)
     # Query chunks preserve every candidate while bounding per-head intermediates.

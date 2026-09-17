@@ -54,7 +54,7 @@ def test_benchmark_prints_median_ms(monkeypatch, capsys, samples):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "mock CUDA GPU")
-    monkeypatch.setattr(indexer_benchmark, "make_inputs", lambda args: (None,) * 3)
+    monkeypatch.setattr(indexer_benchmark, "make_inputs", lambda args: (None,) * 5)
     monkeypatch.setattr(indexer_benchmark, "benchmark_graph", lambda *args, **kwargs: samples)
     indexer_benchmark.main()
     assert "forward: 2.000 ms" in capsys.readouterr().out
@@ -133,3 +133,21 @@ def test_timing_events_are_inside_capture(monkeypatch, warmup):
         "replays": warmup + 3,
         "records": 2,
     }
+
+
+def test_mxfp8_benchmark_quantization():
+    generator = torch.Generator().manual_seed(17)
+    original = torch.randn(2, 3, 128, generator=generator)
+    original[0, :, :32] = 0
+    original[1, :, 32:64] *= 16
+    data, scales = indexer_benchmark.quantize_mxfp8(original)
+    assert data.dtype == torch.float8_e4m3fn
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert scales.shape == (2, 3, 4)
+    dequant = (data.float().unflatten(-1, (4, 32)) * scales.float().unsqueeze(-1)).flatten(-2)
+    assert torch.isfinite(dequant).all()
+    assert torch.equal(dequant[0, :, :32], original[0, :, :32])
+    # E4M3 rounding: half an ULP for normals, half the subnormal quantum otherwise.
+    allowance = 0.5 * torch.finfo(torch.float8_e4m3fn).eps * original.abs()
+    allowance += scales.float().repeat_interleave(32, dim=-1) * 2**-10
+    assert ((dequant - original).abs() <= allowance).all()

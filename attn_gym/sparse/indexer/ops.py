@@ -10,7 +10,7 @@ from torch import Tensor
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
-    'str backend, str selector="default") -> Tensor',
+    'str backend, str selector="default", Tensor? q_scale=None, Tensor? k_scale=None) -> Tensor',
 )
 
 
@@ -23,6 +23,8 @@ def _indexer_cuda(
     compress_ratio: int,
     backend: str,
     selector: str = "default",
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries."""
     if selector not in ("auto", "default", "gvr2"):
@@ -40,8 +42,10 @@ def _indexer_cuda(
         case _:
             raise ValueError(f"unknown indexer backend {backend!r}")
     if backend == "cute":
-        return launch(q, k, weights, topk, causal, compress_ratio, selector=selector)
-    return launch(q, k, weights, topk, causal, compress_ratio)
+        return launch(
+            q, k, weights, topk, causal, compress_ratio, q_scale, k_scale, selector=selector
+        )
+    return launch(q, k, weights, topk, causal, compress_ratio, q_scale, k_scale)
 
 
 torch.library.impl("attn_gym::_indexer", "CUDA", _indexer_cuda)
@@ -57,6 +61,8 @@ def _indexer_fake(
     compress_ratio: int,
     backend: str,
     selector: str = "default",
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)
