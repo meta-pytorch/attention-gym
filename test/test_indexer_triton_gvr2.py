@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.testing.indexer import (
     assert_indexer_selection,
     assert_indexer_topk_values,
@@ -36,7 +37,7 @@ def require_hopper():
 )
 @pytest.mark.parametrize("topk", [1, 513, 2047])
 def test_selector_exact_adversarial(pattern, topk):
-    from attn_gym.sparse.indexer.impl.triton_gvr2 import _gvr2_topk_kernel
+    from attn_gym.sparse.indexer.impl.triton_gvr2 import launch_topk
 
     torch.manual_seed(77)
     scores = torch.randn(2, 2, 2049, device="cuda")
@@ -61,15 +62,13 @@ def test_selector_exact_adversarial(pattern, topk):
             scores.copy_(bits.view(torch.float32))
             scores[..., ::2].neg_()
     output = torch.empty(1, 4, topk, device="cuda", dtype=torch.int32)
-    _gvr2_topk_kernel[(4,)](
-        scores, output, 0, 4, 2049, topk, False, 1, False, num_warps=4, enable_fp_fusion=False
-    )
+    launch_topk(scores, output, 0, False, 1, False)
     assert_indexer_topk_values(output[0], scores.view(4, -1))
 
 
 @pytest.mark.parametrize("causal,ratio", [(False, 1), (True, 4)])
 def test_selector_slab_tail_padding_int64(causal, ratio):
-    from attn_gym.sparse.indexer.impl.triton_gvr2 import _gvr2_topk_kernel
+    from attn_gym.sparse.indexer.impl.triton_gvr2 import launch_topk
 
     tokens, candidates, topk, start, pairs = 9, 9 // ratio, 2, 3, 7
     # Slab spans the end of batch 0 and all of batch 1, including odd-T invalid rows.
@@ -77,19 +76,7 @@ def test_selector_slab_tail_padding_int64(causal, ratio):
     output = torch.full((2, tokens, topk), -99, device="cuda", dtype=torch.int32)
     wide = torch.empty_like(output).fill_(-99)
     for destination, use_wide in ((output, False), (wide, True)):
-        _gvr2_topk_kernel[(pairs * 2,)](
-            scores,
-            destination,
-            start,
-            tokens,
-            candidates,
-            topk,
-            causal,
-            ratio,
-            use_wide,
-            num_warps=4,
-            enable_fp_fusion=False,
-        )
+        launch_topk(scores, destination, start, causal, ratio, use_wide)
     torch.testing.assert_close(output, wide, rtol=0, atol=0)
     for local in range(pairs * 2):
         pair, half = divmod(local, 2)
@@ -116,6 +103,31 @@ def test_gvr2_complete_indexer(dtype, tokens, ratio, causal, topk):
     q, k, w = make_indexer_test_inputs(tokens, 5, 48, dtype, compress_ratio=ratio)
     actual = launch(q, k, w, topk, causal, ratio)
     assert_indexer_selection(actual, q, k, w, topk, causal, ratio)
+
+
+@pytest.mark.parametrize(
+    "causal,ratio,topk,dtype", [(False, 1, 9, torch.float16), (True, 4, 7, torch.bfloat16)]
+)
+def test_gvr2_all_fit_skips_scoring(causal, ratio, topk, dtype, triton_compiles):
+    tokens = 9
+    inputs = make_indexer_test_inputs(tokens, 5, 48, dtype, compress_ratio=ratio)
+    q, k, w = (x.transpose(1, -1).contiguous().transpose(1, -1) for x in inputs)
+    actual = lightning_indexer(
+        q,
+        k,
+        w,
+        topk,
+        causal=causal,
+        compress_ratio=ratio,
+        kernel_options={"backend": "triton", "selector": "gvr2"},
+    )
+    ranks = torch.arange(topk, dtype=torch.int32, device=q.device).expand_as(actual)
+    visible = (
+        ((torch.arange(tokens, device=q.device) + 1) // ratio)[:, None] if causal else k.shape[1]
+    )
+    assert torch.equal(actual, torch.where(ranks < visible, ranks, -1))
+    assert triton_compiles["_score_kernel"] == 0
+    assert triton_compiles["_gvr2_topk_kernel"] == 0
 
 
 def test_gvr2_strided_graph_replay_and_wide(monkeypatch):

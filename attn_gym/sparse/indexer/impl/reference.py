@@ -6,6 +6,35 @@ import torch
 from torch import Tensor
 
 
+def score_rows(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
+) -> Tensor:
+    """Score a tile of queries with Q/K/weights already in their accumulation dtype."""
+    # Autocast would narrow the einsum result before the scales and head weights apply.
+    with torch.autocast(q.device.type, enabled=False):
+        if q_scale is None:
+            dots = torch.einsum("bthd,bsd->bths", q, k)
+        else:
+            # Native MX scales a 32-element dot, not each FP8 operand separately. The
+            # product of the E8M0 factors can itself exceed FP32 before scaling the dot.
+            assert k_scale is not None
+            dots = q.new_zeros((*q.shape[:-1], k.shape[1]))
+            for group in range(q.shape[-1] // 32):
+                channels = slice(32 * group, 32 * (group + 1))
+                block = torch.einsum("bthd,bsd->bths", q[..., channels], k[..., channels])
+                factor = (
+                    q_scale[..., group, None].double() * k_scale[:, None, None, :, group].double()
+                )
+                dots = (block * factor + dots).float()
+        return (dots.relu() * weights.unsqueeze(-1)).sum(2) * (
+            1.0 / math.sqrt(q.shape[2] * q.shape[3])
+        )
+
+
 @torch.no_grad()
 def launch(
     q: Tensor,
@@ -16,6 +45,8 @@ def launch(
     compress_ratio: int,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
@@ -34,15 +65,16 @@ def launch(
             for nonpacked calls.
         cu_seqlens: Packed query offsets, [N + 1]; supplied together with cu_seqlens_k.
         cu_seqlens_k: Packed candidate offsets, [N + 1].
+        q_scale: optional E8M0 per-32-element dequantization scales, [B, T, H, D/32].
+        k_scale: optional E8M0 per-32-element dequantization scales, [B, S, D/32].
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
     """
-    batch, queries, heads, head_dim = q.shape
+    batch, queries = q.shape[:2]
     candidates = k.shape[1]
     if topk == 0 or candidates == 0:
         return torch.full((batch, queries, topk), -1, dtype=torch.int32, device=q.device)
-    scale = 1.0 / math.sqrt(heads * head_dim)
 
     # Accumulate scoring in FP32 to match the CuTe backend's accumulation
     # contract, regardless of the input storage dtype (e.g. FP16/BF16 can
@@ -57,8 +89,8 @@ def launch(
     scores = q.new_empty(batch, queries, candidates)
     for start in range(0, queries, 128):
         rows = slice(start, start + 128)
-        dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
-        scores[:, rows] = (torch.relu(dots) * weights[:, rows].unsqueeze(-1)).sum(dim=2) * scale
+        row_scales = q_scale[:, rows] if q_scale is not None else None
+        scores[:, rows] = score_rows(q[:, rows], k, weights[:, rows], row_scales, k_scale)
 
     starts = torch.zeros((queries, 1), dtype=torch.int32, device=q.device)
     if cu_seqlens is not None:
