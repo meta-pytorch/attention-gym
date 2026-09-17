@@ -206,7 +206,9 @@ def paged_chunk_kda(
             Pass per-token values, not cumulative gates; chunking and log-base
             conversion are internal, matching :func:`chunk_kda`.
         beta: Per-token write gate shaped ``[B, T, H]``.
-        state_cache: Mutable FP32 state pool shaped ``[num_slots, H, V, K]``.
+        state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The optional
+            cuDNN backend requires FP32.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
@@ -428,8 +430,9 @@ def recurrent_kda_decode(
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
         A_log: FP32 per-head log decay parameter shaped ``[H]``.
         dt_bias: FP32 per-head/channel gate bias shaped ``[H, K]``.
-        state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots
-            may have padding between them but each ``[H, V, K]`` row must be dense.
+        state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
+            Slots may have padding between them but each ``[H, V, K]`` row must be dense.
+            Recurrence math remains FP32 and the updated state is cast to the pool dtype.
             ``K`` must be at most 256.
             Paged chunk and recurrent prefill use the same ``[H, V, K]`` slot layout, so the
             cache can transition directly from prefill to decode without a layout conversion.

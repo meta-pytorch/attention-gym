@@ -235,6 +235,8 @@ def _packed_fwd_paged_cuda(
     scale: float,
 ) -> Tensor:
     """Advance selected pool slots in place; the pool itself is never copied."""
+    if state_cache.dtype != torch.float32:
+        raise TypeError("the cuDNN GDN state pool must use float32")
     value_template = value
     q, k, value = (_normalize_tma_tensor(tensor) for tensor in (q, k, value))
     gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))

@@ -52,6 +52,7 @@ def make_decode_inputs(
     value_dim: int = 24,
     num_slots: int = 6,
     dtype: torch.dtype = torch.float32,
+    state_dtype: torch.dtype = torch.float32,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Create raw decode operands; ``key_heads`` enables grouped heads."""
@@ -60,7 +61,7 @@ def make_decode_inputs(
     q = torch.randn(batch, key_heads, key_dim, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn(batch, heads, value_dim, device="cuda", dtype=dtype)
-    _storage, pool = strided_state_pool(num_slots, heads, key_dim, value_dim)
+    _storage, pool = strided_state_pool(num_slots, heads, key_dim, value_dim, dtype=state_dtype)
     return {
         "packed_qkv": torch.cat((q.flatten(1), k.flatten(1), v.flatten(1)), dim=1),
         "raw_gate": torch.randn(1, batch, heads, device="cuda", dtype=dtype),
@@ -106,7 +107,7 @@ def reference_decode(
     for row, slot in enumerate(slots.tolist()):
         if slot <= 0:
             continue
-        state = pool[slot].unsqueeze(0).clone()
+        state = pool[slot].unsqueeze(0).float()
         row_output, final_state = recurrent_gdn(
             q[row : row + 1, None],
             k[row : row + 1, None],
@@ -126,25 +127,46 @@ def reference_decode(
 @pytest.mark.parametrize("scale", [None, 0.25])
 @pytest.mark.parametrize("key_heads", [None, 2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_decode_matches_reference(key_heads: int | None, dtype: torch.dtype, scale: float | None):
-    inputs = make_decode_inputs(key_heads=key_heads, dtype=dtype)
-    expected_output, expected_pool = reference_decode(inputs, scale)
+@pytest.mark.parametrize(
+    ("state_dtype", "steps"),
+    [(torch.float32, 1), (torch.bfloat16, 4)],
+)
+def test_decode_matches_reference(
+    key_heads: int | None,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    steps: int,
+    scale: float | None,
+):
+    inputs = make_decode_inputs(key_heads=key_heads, dtype=dtype, state_dtype=state_dtype)
+    expected_inputs = dict(inputs)
+    expected_inputs["state_cache"] = inputs["state_cache"].clone()
 
-    output = recurrent_gdn_decode(
-        inputs["packed_qkv"],
-        inputs["raw_gate"],
-        inputs["raw_beta"],
-        inputs["A_log"],
-        inputs["dt_bias"],
-        inputs["state_cache"],
-        inputs["state_indices"],
-        scale=scale,
-    )
-
-    tolerance = 1e-5 if dtype is torch.float32 else 3e-2
-    assert output.dtype == dtype and output.shape[0] == 1
-    torch.testing.assert_close(output[0].float(), expected_output, rtol=tolerance, atol=tolerance)
-    torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
+    for _ in range(steps):
+        expected_output, expected_pool = reference_decode(expected_inputs, scale)
+        output = recurrent_gdn_decode(
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            inputs["state_cache"],
+            inputs["state_indices"],
+            scale=scale,
+        )
+        tolerance = 1e-5 if dtype is torch.float32 else 3e-2
+        assert output.dtype == dtype and output.shape[0] == 1
+        torch.testing.assert_close(
+            output[0].float(), expected_output, rtol=tolerance, atol=tolerance
+        )
+        state_tolerance = 1e-5 if state_dtype is torch.float32 else 3e-2
+        torch.testing.assert_close(
+            inputs["state_cache"],
+            expected_pool,
+            rtol=state_tolerance,
+            atol=state_tolerance,
+        )
+        expected_inputs["state_cache"] = expected_pool
 
 
 @pytest.mark.parametrize(("major", "heads"), [(9, 8), (10, 16)])
@@ -260,8 +282,16 @@ def test_decode_rejects_bad_inputs():
         )
 
 
-def test_decode_custom_op_registration():
-    inputs = make_decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8, num_slots=3)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_decode_custom_op_registration(state_dtype: torch.dtype):
+    inputs = make_decode_inputs(
+        batch=1,
+        heads=1,
+        key_dim=16,
+        value_dim=8,
+        num_slots=3,
+        state_dtype=state_dtype,
+    )
     inputs["state_indices"] = torch.tensor([1], device="cuda", dtype=torch.int32)
     out = inputs["packed_qkv"].new_empty(1, 1, 1, 8)
     torch.library.opcheck(
@@ -297,11 +327,14 @@ def test_decode_custom_op_registration():
         ),
     ],
 )
-def test_decode_fullgraph_and_cuda_graph(decode_kwargs: dict[str, object]):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_decode_fullgraph_and_cuda_graph(
+    decode_kwargs: dict[str, object], state_dtype: torch.dtype
+):
     """The decode op compiles fullgraph and replays under CUDA graph capture."""
     if decode_kwargs and torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Blackwell-specific decode schedule")
-    inputs = make_decode_inputs(**decode_kwargs)
+    inputs = make_decode_inputs(**decode_kwargs, state_dtype=state_dtype)
     initial_pool = inputs["state_cache"].clone()
     args = (
         inputs["packed_qkv"],
@@ -320,7 +353,9 @@ def test_decode_fullgraph_and_cuda_graph(decode_kwargs: dict[str, object]):
         expected = run(eager_pool)
 
         heads, value_dim, key_dim = inputs["state_cache"].shape[1:]
-        _compiled_storage, compiled_pool = strided_state_pool(6, heads, key_dim, value_dim)
+        _compiled_storage, compiled_pool = strided_state_pool(
+            6, heads, key_dim, value_dim, dtype=state_dtype
+        )
         compiled_pool.copy_(initial_pool)
         compiled = torch.compile(recurrent_gdn_decode, fullgraph=True)
         compiled_out = torch.empty_like(expected)
@@ -329,7 +364,9 @@ def test_decode_fullgraph_and_cuda_graph(decode_kwargs: dict[str, object]):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(compiled_pool, eager_pool, rtol=0, atol=0)
 
-        _graph_storage, graph_pool = strided_state_pool(6, heads, key_dim, value_dim)
+        _graph_storage, graph_pool = strided_state_pool(
+            6, heads, key_dim, value_dim, dtype=state_dtype
+        )
         graph_pool.copy_(initial_pool)
         out = torch.empty_like(expected)
         run(graph_pool, out=out)

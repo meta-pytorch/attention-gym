@@ -136,7 +136,9 @@ def paged_chunk_gdn(
         v: Values shaped ``[B, T, H, V]`` and using the same dtype as ``q``.
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
-        state_cache: Mutable FP32 state pool shaped ``[num_slots, H, V, K]``.
+        state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The optional
+            cuDNN backend requires FP32.
         state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
             unique indices select slots to advance; non-positive indices produce zero output
             and leave the cache untouched.
@@ -155,7 +157,14 @@ def paged_chunk_gdn(
     """
     backend = resolve_kernel_options(kernel_options)
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
-    validate_paged_state(q, v, state_cache, cu_seqlens, state_indices, has_initial_state)
+    validate_paged_state(
+        q,
+        v,
+        state_cache,
+        cu_seqlens,
+        state_indices,
+        has_initial_state,
+    )
     paged_chunk_forward = (
         cudnn_paged_chunk_forward if backend == "cudnn" else fused_paged_chunk_forward
     )
@@ -193,7 +202,7 @@ def recurrent_gdn(
 
     The recurrence consumes tokens in order, carrying an explicit ``[N, H, V, K]`` state. Inputs
     and outputs use the token-major layout ``[batch, sequence, heads, dimension]``. FP16 and BF16
-    inputs use FP32 recurrence math and state.
+    inputs use FP32 recurrence math. Non-paged state is FP32; paged state may use BF16 storage.
 
     Args:
         q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value head count ``H``
@@ -309,9 +318,10 @@ def recurrent_gdn_decode(
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
         A_log: FP32 per-head log decay parameter shaped ``[H]``.
         dt_bias: FP32 per-head gate bias shaped ``[H]``.
-        state_cache: FP32 paged state pool shaped ``[num_slots, H, V, K]``. Slots may
-            have padding between them but each ``[H, V, K]`` row must be dense. ``K``
-            must be at most 256.
+        state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
+            Slots may have padding between them but each ``[H, V, K]`` row must be dense.
+            Recurrence math remains FP32 and the updated state is cast to the pool dtype.
+            ``K`` must be at most 256.
         state_indices: Contiguous int32 slot indices shaped ``[B]``. Non-positive
             indices are padding/null entries: they produce zero output and leave the
             cache untouched. Each positive index must be in ``[1, num_slots)`` and

@@ -31,6 +31,7 @@ def _decode_inputs(
     key_dim: int = 64,
     value_dim: int = 64,
     dtype: torch.dtype = torch.bfloat16,
+    state_dtype: torch.dtype = torch.float32,
     seed: int = 0,
 ):
     torch.manual_seed(seed)
@@ -42,7 +43,7 @@ def _decode_inputs(
     raw_beta = torch.randn(1, batch, heads, device="cuda", dtype=dtype)
     A_log = 0.1 * torch.randn(heads, device="cuda", dtype=torch.float32)
     dt_bias = 0.1 * torch.randn(heads, key_dim, device="cuda", dtype=torch.float32)
-    storage, state_cache = strided_state_pool(7, heads, key_dim, value_dim)
+    storage, state_cache = strided_state_pool(7, heads, key_dim, value_dim, dtype=state_dtype)
     state_indices = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)[:batch]
     return (
         packed_qkv,
@@ -101,11 +102,11 @@ def _reference_decode(
             gate[:, active].transpose(0, 1),
             beta[:, active].transpose(0, 1),
             scale=scale,
-            initial_state=state_cache[active_indices],
+            initial_state=state_cache[active_indices].float(),
             output_final_state=True,
         )
         output[:, active] = active_output.transpose(0, 1).to(output.dtype)
-        expected_cache[active_indices] = active_state
+        expected_cache[active_indices] = active_state.to(expected_cache.dtype)
     return output, expected_cache
 
 
@@ -120,14 +121,21 @@ def _reference_decode(
         (torch.float32, "softplus", -5.0, 80, 48),
     ],
 )
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_recurrent_decode_matches_reference(
     dtype: torch.dtype,
     gate_transform: str,
     lower_bound: float,
     key_dim: int,
     value_dim: int,
+    state_dtype: torch.dtype,
 ):
-    inputs = _decode_inputs(dtype=dtype, key_dim=key_dim, value_dim=value_dim)
+    inputs = _decode_inputs(
+        dtype=dtype,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        state_dtype=state_dtype,
+    )
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
     before = state_cache.clone()
 
@@ -379,14 +387,14 @@ def test_recurrent_decode_validates_contract():
             state_cache,
             state_indices,
         )
-    with pytest.raises(TypeError, match="state_cache must use float32"):
+    with pytest.raises(TypeError, match="state_cache must use float32 or bfloat16"):
         recurrent_kda_decode(
             packed_qkv,
             raw_gate,
             raw_beta,
             A_log,
             dt_bias,
-            state_cache.bfloat16(),
+            state_cache.half(),
             state_indices,
         )
     with pytest.raises(ValueError, match="finite and nonpositive"):
@@ -530,8 +538,9 @@ def test_recurrent_decode_rejects_state_aliasing_read_only_input():
         )
 
 
-def test_recurrent_decode_custom_op_registration():
-    inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_decode_custom_op_registration(state_dtype: torch.dtype):
+    inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8, state_dtype=state_dtype)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
     out = packed_qkv.new_empty(1, 1, state_cache.shape[1], state_cache.shape[2])
     torch.library.opcheck(
@@ -554,12 +563,19 @@ def test_recurrent_decode_custom_op_registration():
 
 
 @pytest.mark.parametrize(("gate_transform", "use_out"), [("bounded", False), ("softplus", True)])
-def test_recurrent_decode_fullgraph_compile(gate_transform: str, use_out: bool):
-    inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_decode_fullgraph_compile(
+    gate_transform: str, use_out: bool, state_dtype: torch.dtype
+):
+    inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8, state_dtype=state_dtype)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, eager_cache, state_indices = inputs
     lower_bound = 0.0 if gate_transform == "bounded" else float("nan")
     _, compiled_cache = strided_state_pool(
-        eager_cache.shape[0], eager_cache.shape[1], eager_cache.shape[3], eager_cache.shape[2]
+        eager_cache.shape[0],
+        eager_cache.shape[1],
+        eager_cache.shape[3],
+        eager_cache.shape[2],
+        dtype=state_dtype,
     )
     compiled_cache.copy_(eager_cache)
     output_shape = (1, 1, eager_cache.shape[1], eager_cache.shape[2])
@@ -644,8 +660,9 @@ def test_recurrent_decode_fullgraph_dynamic_batch():
             torch.testing.assert_close(compiled_cache, eager_cache, rtol=0, atol=0)
 
 
-def test_recurrent_decode_cuda_graph_replay():
-    inputs = _decode_inputs(batch=3, seed=4)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_decode_cuda_graph_replay(state_dtype: torch.dtype):
+    inputs = _decode_inputs(batch=3, seed=4, state_dtype=state_dtype)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, storage, state_cache, state_indices = inputs
     out = packed_qkv.new_empty(1, 3, state_cache.shape[1], state_cache.shape[2])
     recurrent_kda_decode(
