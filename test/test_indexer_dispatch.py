@@ -31,43 +31,52 @@ def require_backend(backend: str | None = None) -> str:
 
 
 @pytest.mark.parametrize(
-    "capability,backend,expected,selector,fails,deterministic",
+    "capability,backend,expected,selector,fails,deterministic,scaled",
     [
-        ((9, 0), "auto", "triton", None, False, False),
-        ((10, 0), "auto", "cute", None, False, False),
-        ((10, 3), "auto", "cute", None, False, False),
-        ((12, 0), "auto", "triton", None, False, False),
-        ((10, 0), "triton", "triton", None, False, False),
-        ((10, 3), "triton", "triton", None, False, False),
-        ((9, 0), "cute", "cute", None, False, False),
-        ((10, 3), "cute", "cute", "auto", False, False),
-        ((10, 3), "cute", "cute", "default", False, False),
-        ((10, 3), "cute", "cute", "gvr2", False, False),
-        ((10, 3), "triton", "triton", "auto", False, False),
-        ((10, 3), "triton", "triton", "default", False, False),
-        ((10, 3), "triton", "triton_gvr2", "gvr2", False, False),
+        ((9, 0), "auto", "triton", None, False, False, False),
+        ((10, 0), "auto", "cute", None, False, False, False),
+        ((10, 3), "auto", "cute", None, False, False, False),
+        ((12, 0), "auto", "triton", None, False, False, False),
+        ((10, 0), "triton", "triton", None, False, False, False),
+        ((10, 3), "triton", "triton", None, False, False, False),
+        ((9, 0), "cute", "cute", None, False, False, False),
+        ((10, 3), "cute", "cute", "auto", False, False, False),
+        ((10, 3), "cute", "cute", "default", False, False, False),
+        ((10, 3), "cute", "cute", "gvr2", False, False, False),
+        ((10, 3), "triton", "triton", "auto", False, False, False),
+        ((10, 3), "triton", "triton", "default", False, False, False),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", False, False, False),
         # Forward deterministic mode through each launcher.
-        ((10, 3), "cute", "cute", "default", False, True),
-        ((10, 3), "triton", "triton", "default", False, True),
-        ((10, 3), "triton", "triton_gvr2", "gvr2", False, True),
+        ((10, 3), "cute", "cute", "default", False, True, False),
+        ((10, 3), "triton", "triton", "default", False, True, False),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", False, True, False),
+        # Forward both scale tensors through each launcher.
+        ((10, 3), "cute", "cute", "default", False, False, True),
+        ((10, 3), "triton", "triton", "default", False, False, True),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", False, False, True),
         # Propagate the original launch failure without retrying another backend.
-        ((10, 3), "cute", "cute", "default", True, False),
-        ((10, 3), "triton", "triton", "default", True, False),
-        ((10, 3), "triton", "triton_gvr2", "gvr2", True, False),
+        ((10, 3), "cute", "cute", "default", True, False, False),
+        ((10, 3), "triton", "triton", "default", True, False, False),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", True, False, False),
     ],
 )
 def test_backend_dispatch_uses_input_device(
-    monkeypatch, capability, backend, expected, selector, fails, deterministic
+    monkeypatch, capability, backend, expected, selector, fails, deterministic, scaled
 ):
     """Dispatch once on the input device and propagate launch errors without retrying.
 
     CuTe receives the run-time deterministic-algorithms setting; Triton is always
     deterministic and takes no flag.
     """
-    q = torch.empty(1, 2, 2, 16)
-    k = torch.empty(1, 2, 16)
-    weights = torch.empty(1, 2, 2)
-    kwargs = {} if selector is None else {"selector": selector}
+    dtype = torch.float8_e4m3fn if scaled else torch.bfloat16
+    q = torch.empty(1, 2, 32, 128, dtype=dtype)
+    k = torch.empty(1, 2, 128, dtype=dtype)
+    weights = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    q_scale = torch.empty(1, 2, 32, 4, dtype=torch.float8_e8m0fnu) if scaled else None
+    k_scale = torch.empty(1, 2, 4, dtype=torch.float8_e8m0fnu) if scaled else None
+    kwargs = {"q_scale": q_scale, "k_scale": k_scale} if scaled else {}
+    if selector is not None:
+        kwargs["selector"] = selector
     failure = RuntimeError("selected backend failed")
     launch = Mock(
         return_value=torch.empty(1, 2, 1, dtype=torch.int32),
@@ -91,9 +100,18 @@ def test_backend_dispatch_uses_input_device(
         assert (
             ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs) is launch.return_value
         )
-    metadata = (deterministic, None) if expected == "cute" else (None, None)
-    forwarded = {"selector": selector or "default"} if expected == "cute" else {}
-    launch.assert_called_once_with(q, k, weights, 1, True, 1, *metadata, **forwarded)
+    forwarded = (
+        {
+            "deterministic": deterministic,
+            "candidate_bounds": None,
+            "selector": selector or "default",
+        }
+        if expected == "cute"
+        else {"cu_seqlens": None, "cu_seqlens_k": None}
+    )
+    launch.assert_called_once_with(
+        q, k, weights, 1, True, 1, q_scale=q_scale, k_scale=k_scale, **forwarded
+    )
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
