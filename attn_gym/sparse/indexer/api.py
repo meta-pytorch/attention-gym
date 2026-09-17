@@ -6,6 +6,7 @@ from torch import Tensor
 from attn_gym.types import Impl, resolve_impl
 
 from .ops import _indexer_op
+from .validation import validate_precision
 
 
 def _validate_inputs(
@@ -15,6 +16,8 @@ def _validate_inputs(
     topk: int,
     causal: bool,
     compress_ratio: int,
+    q_scale: Tensor | None,
+    k_scale: Tensor | None,
 ) -> None:
     """Validate metadata without synchronizing or inspecting tensor values."""
     # --- type checks ---
@@ -62,15 +65,8 @@ def _validate_inputs(
             f"weights must have shape {[batch, queries, heads]}, got {list(weights.shape)}."
         )
 
-    # --- dtype ---
-    if not q.is_floating_point():
-        raise TypeError(f"q must have a floating-point dtype, got {q.dtype}.")
-    if k.dtype != q.dtype:
-        raise ValueError(f"k must have the same dtype as q, but got {k.dtype} and {q.dtype}.")
-    if weights.dtype != q.dtype:
-        raise ValueError(
-            f"weights must have the same dtype as q, but got {weights.dtype} and {q.dtype}."
-        )
+    # --- dtype and optional FP8 scales ---
+    validate_precision(q, k, weights, q_scale, k_scale)
 
     # --- device ---
     if k.device != q.device:
@@ -100,6 +96,8 @@ def lightning_indexer(
     *,
     causal: bool = False,
     compress_ratio: int = 1,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
 ) -> Tensor:
@@ -119,7 +117,8 @@ def lightning_indexer(
         k: Key candidate pool shared across heads, [B, S, D], with
             ``S = T // compress_ratio``.
 
-        weights: Per-head weights, [B, T, H]. May be negative.
+        weights: Per-head weights, [B, T, H]. May be negative. MXFP8 Q/K accept
+            BF16 or FP32 weights; other inputs require matching dtypes.
 
         topk: Number of candidates to select per query.  Must be in [0, S].
 
@@ -132,6 +131,14 @@ def lightning_indexer(
             partial window forms no candidate, so ``S = T // compress_ratio``.
             Values other than 1 require ``causal=True``.
 
+        q_scale: E8M0 (``torch.float8_e8m0fnu``) [B, T, H, D // 32] scales for E4M3FN
+            Q; each multiplies one contiguous 32-element group of D inside the dot
+            product (FP32 accumulation). Required together with k_scale for MXFP8,
+            otherwise None. Values are not checked on device; non-finite scales or
+            scores are outside the contract. This function does not quantize.
+
+        k_scale: E8M0 [B, S, D // 32] scales for K; same semantics as q_scale.
+
         impl: Impl.REFERENCE (or ``"reference"``) uses eager PyTorch on CPU or CUDA;
             Impl.FUSED (default, or ``"fused"``) uses optimized CUDA kernels.
 
@@ -139,12 +146,11 @@ def lightning_indexer(
             ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100/SM103 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
-
-        ``"selector"`` chooses the exact Top-K algorithm: ``"auto"`` (omitted
-        default) lets CuTe use GVR2 self-sampling selection when ``topk < 2048``
-        and radix otherwise, and keeps Triton's streaming Top-K; ``"default"``
-        forces CuTe radix / Triton streaming; ``"gvr2"`` forces GVR2 on either
-        backend.
+            ``"selector"`` chooses the exact Top-K algorithm: ``"auto"`` (omitted
+            default) lets CuTe use GVR2 self-sampling selection when ``topk < 2048``
+            and radix otherwise, and keeps Triton's streaming Top-K; ``"default"``
+            forces CuTe radix / Triton streaming; ``"gvr2"`` forces GVR2 on either
+            backend.
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
@@ -152,26 +158,27 @@ def lightning_indexer(
         contain -1 padding; topk=0 returns an empty last dimension.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
-    Both require FP16/BF16 inputs and T <= 2**20 and accept any topk <= S. CuTe requires
-    SM100/SM103, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
-    bases and non-singleton outer strides. Other Q/K strides may vary independently;
-    weights may have arbitrary strides and need only element alignment.
-    Triton requires SM90 or newer, H <= 256 and D <= 256 divisible by 8. Its default
-    scorer requires Q/K unit last strides and 16-byte-aligned bases and outer strides;
-    weights may be strided, and its register-resident selection cost grows with topk.
-    Triton GVR2 accepts arbitrary nonnegative input strides. CuTe and Triton GVR2 score
-    into a per-call FP32 slab of at most 32 MiB / 1024 query rows (additional to the
-    returned indices, not shared across calls); larger inputs loop over slabs. Triton GVR2
-    uses its own tiled scorer, so its scores may round differently from the default path.
+    Both support FP16/BF16 with T <= 2**20 and any topk <= S, and MXFP8 (E4M3FN Q/K with
+    E8M0 scales) for H in {32, 64}, D=128 on SM100/SM103. CuTe requires SM100/SM103, even H,
+    D divisible by 16, and Q/K with unit last strides and 16-byte-aligned bases and
+    non-singleton outer strides. Other Q/K strides may vary independently; weights may have
+    arbitrary strides and need only element alignment. Triton requires SM90 or newer,
+    H <= 256 and D <= 256 divisible by 8. Its default FP16/BF16 scorer requires Q/K unit
+    last strides and 16-byte-aligned bases and outer strides; weights may be strided, and
+    its register-resident selection cost grows with topk. Triton GVR2 and MXFP8 accept
+    arbitrary nonnegative input strides. CuTe and the Triton MXFP8/GVR2 routes score into a
+    per-call FP32 slab of at most 32 MiB / 1024 query rows (additional to the returned
+    indices, not shared across calls); larger inputs loop over slabs. Triton GVR2 uses its
+    own tiled scorer, so its FP16/BF16 scores may round differently from the default path.
 
     Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
     attention over the selected positions does not propagate gradients through
-    selection into q, k, or weights.
+    selection into q, k, weights, or scales.
     """
 
     selected_impl = resolve_impl(impl)
-    _validate_inputs(q, k, weights, topk, causal, compress_ratio)
+    _validate_inputs(q, k, weights, topk, causal, compress_ratio, q_scale, k_scale)
 
     match selected_impl:
         case Impl.REFERENCE:
@@ -179,7 +186,7 @@ def lightning_indexer(
                 raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
-            return reference.launch(q, k, weights, topk, causal, compress_ratio)
+            return reference.launch(q, k, weights, topk, causal, compress_ratio, q_scale, k_scale)
         case Impl.FUSED:
             options = {} if kernel_options is None else kernel_options
             if (
@@ -199,5 +206,7 @@ def lightning_indexer(
                 causal,
                 compress_ratio,
                 options.get("backend", "auto"),
+                q_scale=q_scale,
+                k_scale=k_scale,
                 selector=options.get("selector", "auto"),
             )

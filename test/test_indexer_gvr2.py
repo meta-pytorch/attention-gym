@@ -7,6 +7,7 @@ from torch._dynamo.testing import CompileCounterWithBackend
 from attn_gym.sparse.indexer import lightning_indexer, ops
 from attn_gym.testing.indexer import (
     assert_indexer_selection,
+    make_indexer_mxfp8_test_inputs,
     make_indexer_test_inputs,
 )
 
@@ -26,6 +27,12 @@ def backend(request):
 
 
 def inputs_for(precision, tokens=65, seed=37):
+    if precision == "mxfp8":
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            pytest.skip("MXFP8 requires SM100/SM103")
+        return make_indexer_mxfp8_test_inputs(
+            tokens, 32, 128, torch.float32, batch=3, compress_ratio=4, seed=seed
+        )._asdict()
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     q, k, weights = make_indexer_test_inputs(
         tokens, 32, 128, dtype, batch=3, compress_ratio=4, seed=seed
@@ -84,7 +91,7 @@ def test_cute_launch_resolves_auto(monkeypatch, topk):
     assert_indexer_selection(actual, q, k, weights, topk, False)
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp16"])
+@pytest.mark.parametrize("precision", ["bf16", "fp16", "mxfp8"])
 @pytest.mark.parametrize("selector", [None, "auto", "default", "gvr2"])
 def test_public_selector(backend, precision, selector):
     inputs = inputs_for(precision)
@@ -97,7 +104,7 @@ def test_public_selector(backend, precision, selector):
     assert_indexer_selection(actual, **inputs, topk=7, causal=True, compress_ratio=4)
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp16"])
+@pytest.mark.parametrize("precision", ["bf16", "fp16", "mxfp8"])
 def test_selector_fullgraph_and_replay(backend, precision):
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(lightning_indexer, fullgraph=True, dynamic=True, backend=counter)
@@ -126,7 +133,7 @@ def test_selector_fullgraph_and_replay(backend, precision):
             assert_indexer_selection(actual, **inputs, topk=7, causal=True, compress_ratio=4)
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp16"])
+@pytest.mark.parametrize("precision", ["bf16", "fp16", "mxfp8"])
 def test_gvr2_registration(backend, precision):
     inputs = inputs_for(precision)
     inputs["weights"].requires_grad_()
@@ -140,12 +147,16 @@ def test_gvr2_registration(backend, precision):
         backend,
     )
     kwargs = {"selector": "gvr2"}
+    if precision == "mxfp8":
+        kwargs.update(q_scale=inputs["q_scale"], k_scale=inputs["k_scale"])
     utilities = [
         "test_schema",
         "test_autograd_registration",
         "test_faketensor",
         "test_aot_dispatch_dynamic",
     ]
+    if precision == "mxfp8":
+        utilities.remove("test_schema")  # SchemaCheckMode's FP8 allclose is unsupported.
     before = {name: tensor.detach().view(torch.uint8).clone() for name, tensor in inputs.items()}
     torch.library.opcheck(ops._indexer_op, args, kwargs, test_utils=tuple(utilities))
     actual = ops._indexer_op(*args, **kwargs)

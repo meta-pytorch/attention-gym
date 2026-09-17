@@ -6,6 +6,7 @@ import torch
 from attn_gym.testing.indexer import (
     assert_indexer_selection,
     assert_indexer_topk_values,
+    make_indexer_mxfp8_test_inputs,
     make_indexer_test_inputs,
 )
 
@@ -104,14 +105,22 @@ def test_selector_slab_tail_padding_int64(causal, ratio):
             assert torch.equal(actual, expected.sort().values)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("tokens,ratio,causal,topk", [(137, 4, True, 17), (65, 1, False, 65)])
 def test_gvr2_complete_indexer(dtype, tokens, ratio, causal, topk):
     from attn_gym.sparse.indexer.impl.triton_gvr2 import launch
 
-    q, k, w = make_indexer_test_inputs(tokens, 5, 48, dtype, compress_ratio=ratio)
-    actual = launch(q, k, w, topk, causal, ratio)
-    assert_indexer_selection(actual, q, k, w, topk, causal, ratio)
+    if dtype == torch.float8_e4m3fn:
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            pytest.skip("Native MXFP8 requires SM100/SM103")
+        q, k, w, qs, ks = make_indexer_mxfp8_test_inputs(
+            tokens, 32, 128, torch.float32, compress_ratio=ratio
+        )
+    else:
+        q, k, w = make_indexer_test_inputs(tokens, 5, 48, dtype, compress_ratio=ratio)
+        qs = ks = None
+    actual = launch(q, k, w, topk, causal, ratio, qs, ks)
+    assert_indexer_selection(actual, q, k, w, topk, causal, ratio, q_scale=qs, k_scale=ks)
 
 
 def test_gvr2_strided_graph_replay_and_wide(monkeypatch):

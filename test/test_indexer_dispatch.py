@@ -31,9 +31,9 @@ def require_backend(backend: str | None = None) -> str:
 
 
 @pytest.mark.parametrize(
-    "capability,backend,expected,fails,selector",
+    "capability,backend,expected,fails,selector,scaled",
     [
-        (capability, backend, expected, fails, None)
+        (capability, backend, expected, fails, None, False)
         for capability, backend, expected in [
             ((9, 0), "auto", "triton"),
             ((10, 0), "auto", "cute"),
@@ -46,21 +46,24 @@ def require_backend(backend: str | None = None) -> str:
         for fails in (False, True)
     ]
     + [
-        ((10, 0), backend, backend, False, selector)
+        ((10, 0), backend, backend, False, selector, scaled)
         for backend in ("cute", "triton")
         for selector in (None, "auto", "default", "gvr2")
+        for scaled in (False, True)
     ]
-    + [((10, 0), "triton", "triton", True, "gvr2")],
+    + [((10, 0), "triton", "triton", True, "gvr2", False)],
 )
 def test_backend_dispatch_uses_input_device(
-    monkeypatch, capability, backend, expected, fails, selector
+    monkeypatch, capability, backend, expected, fails, selector, scaled
 ):
     """Dispatch once on the input device and propagate launch errors without retrying."""
-    dtype = torch.bfloat16
+    dtype = torch.float8_e4m3fn if scaled else torch.bfloat16
     q = torch.empty(1, 2, 32, 128, dtype=dtype)
     k = torch.empty(1, 2, 128, dtype=dtype)
     weights = torch.empty(1, 2, 32, dtype=torch.bfloat16)
-    kwargs = {}
+    q_scale = torch.empty(1, 2, 32, 4, dtype=torch.float8_e8m0fnu) if scaled else None
+    k_scale = torch.empty(1, 2, 4, dtype=torch.float8_e8m0fnu) if scaled else None
+    kwargs = {"q_scale": q_scale, "k_scale": k_scale} if scaled else {}
     if selector is not None:
         kwargs["selector"] = selector
     if expected == "triton" and selector == "gvr2":
@@ -88,7 +91,7 @@ def test_backend_dispatch_uses_input_device(
             ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs) is launch.return_value
         )
     forwarded = {"selector": selector or "default"} if expected == "cute" else {}
-    launch.assert_called_once_with(q, k, weights, 1, True, 1, **forwarded)
+    launch.assert_called_once_with(q, k, weights, 1, True, 1, q_scale, k_scale, **forwarded)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
