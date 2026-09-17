@@ -51,6 +51,7 @@ def make_inputs(
     tokens: int = 64,
     key_heads: int = 2,
     value_heads: int = 2,
+    head_dim: int = 128,
     gate_kind: str = "mild",
     dtype: torch.dtype = torch.bfloat16,
     requires_grad: bool = False,
@@ -66,6 +67,8 @@ def make_inputs(
         batch=batch,
         key_heads=key_heads,
         value_heads=value_heads,
+        key_dim=head_dim,
+        value_dim=head_dim,
         gate_pattern=gate_pattern,
         dtype=dtype,
         seed=23,
@@ -101,6 +104,8 @@ def run_with_gradients(
     inputs: tuple[torch.Tensor, ...],
     impl: str,
     cu_seqlens: torch.Tensor | None = None,
+    *,
+    sum_state_loss: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Run output/state and all input gradients under one shared scalar loss."""
     output, state = chunk_gdn(
@@ -111,9 +116,9 @@ def run_with_gradients(
         impl=impl,
     )
     assert state is not None
-    gradients = torch.autograd.grad(
-        output.float().square().mean() + state.float().square().mean(), inputs
-    )
+    state_loss = state.float().square()
+    state_loss = state_loss.sum() if sum_state_loss else state_loss.mean()
+    gradients = torch.autograd.grad(output.float().square().mean() + state_loss, inputs)
     return output, state, *gradients
 
 
@@ -143,14 +148,28 @@ def force_portable_backward(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("batch", "tokens", "key_heads", "value_heads", "gate_kind", "lengths", "portable"),
+    (
+        "batch",
+        "tokens",
+        "key_heads",
+        "value_heads",
+        "head_dim",
+        "dtype",
+        "gate_kind",
+        "lengths",
+        "portable",
+    ),
     [
-        (1, 64, 2, 2, "mild", None, False),
-        (1, 65, 1, 4, "spikes", None, False),
-        (2, 65, 1, 4, "mild", None, False),
-        (1, 64, 1, 1, "unbounded", None, True),
-        (1, 64, 1, 64, "mild", None, True),
-        (1, 192, 1, 4, "spikes", [65, 0, 127], True),
+        (1, 64, 2, 2, 128, torch.bfloat16, "mild", None, False),
+        (1, 65, 1, 4, 128, torch.bfloat16, "spikes", None, False),
+        (2, 65, 1, 4, 128, torch.bfloat16, "mild", None, False),
+        (1, 64, 1, 1, 128, torch.bfloat16, "unbounded", None, True),
+        (1, 64, 1, 64, 128, torch.bfloat16, "mild", None, True),
+        (1, 192, 1, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], True),
+        (1, 64, 1, 2, 64, torch.bfloat16, "mild", None, True),
+        (1, 64, 1, 2, 64, torch.float16, "mild", None, True),
+        (1, 16, 1, 2, 64, torch.bfloat16, "mild", [7, 9], True),
+        (1, 16, 1, 2, 64, torch.float16, "mild", [7, 9], True),
     ],
 )
 def test_fused_chunk_matches_low_precision_reference(
@@ -158,6 +177,8 @@ def test_fused_chunk_matches_low_precision_reference(
     tokens: int,
     key_heads: int,
     value_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
     gate_kind: str,
     lengths: list[int] | None,
     portable: bool,
@@ -171,21 +192,27 @@ def test_fused_chunk_matches_low_precision_reference(
         tokens=tokens,
         key_heads=key_heads,
         value_heads=value_heads,
+        head_dim=head_dim,
         gate_kind=gate_kind,
+        dtype=dtype,
         requires_grad=True,
     )
     if lengths is not None:
         cu_seqlens = cumulative_sequence_offsets(lengths)
+        generator = torch.Generator(device="cuda").manual_seed(29)
+        state_scale = 0.01 if head_dim == 64 else 1.0
         inputs = (
             *inputs[:5],
             torch.randn(
                 len(lengths),
                 value_heads,
-                128,
-                128,
+                head_dim,
+                head_dim,
                 device="cuda",
+                generator=generator,
                 requires_grad=True,
-            ),
+            )
+            * state_scale,
         )
     else:
         cu_seqlens = None
@@ -193,9 +220,14 @@ def test_fused_chunk_matches_low_precision_reference(
     fused_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     golden_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
-    actual = run_with_gradients(fused_inputs, "fused", cu_seqlens)
-    expected = run_with_gradients(reference_inputs, "reference", cu_seqlens)
-    golden = run_with_gradients(golden_inputs, "reference", cu_seqlens)
+    sum_state_loss = head_dim == 64
+    actual = run_with_gradients(fused_inputs, "fused", cu_seqlens, sum_state_loss=sum_state_loss)
+    expected = run_with_gradients(
+        reference_inputs, "reference", cu_seqlens, sum_state_loss=sum_state_loss
+    )
+    golden = run_with_gradients(
+        golden_inputs, "reference", cu_seqlens, sum_state_loss=sum_state_loss
+    )
 
     for name, result, high_precision, reference in zip(
         ("output", "state", "dq", "dk", "dv", "dgate", "dbeta", "dstate"),
@@ -204,7 +236,15 @@ def test_fused_chunk_matches_low_precision_reference(
         expected,
         strict=True,
     ):
-        if high_precision.abs().max().item() < 1e-12:
+        if lengths is not None and head_dim == 64 and name == "dstate":
+            # The entry-state cotangent crosses the QKV-dtype chunk checkpoint.
+            # Account for that additional rounding boundary over the eager oracle.
+            high = high_precision.double()
+            actual_error = (result.double() - high).abs().max().item()
+            reference_error = (reference.double() - high).abs().max().item()
+            rounding = torch.finfo(dtype).eps * high.abs().max().item()
+            assert actual_error <= 4 * (reference_error + rounding)
+        elif high_precision.abs().max().item() < 1e-12:
             assert torch.isfinite(result).all()
             # The portable gate VJP subtracts two independently reduced FP32 terms.
             # Uniform -20 gates underflow the true result to zero, leaving a sub-nanounit
@@ -212,10 +252,16 @@ def test_fused_chunk_matches_low_precision_reference(
             zero_atol = 1e-9 if portable and name == "dgate" else 1e-12
             assert (result.double() - high_precision).abs().max().item() <= zero_atol
         else:
-            assert_matches_low_precision_reference(result, high_precision, reference, name)
+            assert_matches_low_precision_reference(
+                result, high_precision, reference, name, source_dtype=dtype
+            )
 
     if lengths is not None:
-        torch.testing.assert_close(actual[1][1], inputs[5][1], rtol=0, atol=0)
+        for sequence, length in enumerate(lengths):
+            if length == 0:
+                torch.testing.assert_close(
+                    actual[1][sequence], inputs[5][sequence], rtol=0, atol=0
+                )
 
 
 @pytest.mark.parametrize("portable", [False, True])
@@ -300,12 +346,14 @@ def test_packed_tail_ignores_nan_capacity_slack():
     torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=2e-3)
 
 
-def test_chunk_state_continues_in_recurrent_decode():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_chunk_state_continues_in_recurrent_decode(head_dim: int):
     """Carry the fused training/prefill state directly into Hopper decode."""
     q, k, v, gate, beta, initial_state = make_inputs(
         tokens=65,
         key_heads=1,
         value_heads=4,
+        head_dim=head_dim,
     )
     with torch.no_grad():
         _prefill_output, prefill_state = chunk_gdn(
@@ -411,21 +459,23 @@ def test_paged_chunk_raw_operator_registration():
     )
 
 
-def test_paged_chunk_matches_gather_scatter():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_paged_chunk_matches_gather_scatter(head_dim: int):
     """Advance selected slots directly without copying state through the caller."""
     q, k, v, gate, beta, _state = make_inputs(
         tokens=192,
         key_heads=1,
         value_heads=4,
+        head_dim=head_dim,
     )
     q, k, v = (token_strided_like(tensor) for tensor in (q, k, v))
     assert all(normalize_tma_rows(tensor).data_ptr() == tensor.data_ptr() for tensor in (q, k, v))
     cu_seqlens = torch.tensor([0, 65, 192], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
-    state_elements = 4 * 128 * 128
+    state_elements = 4 * head_dim * head_dim
     storage = torch.randn(6, state_elements + 17, device="cuda")
-    state_cache = storage[:, :state_elements].view(6, 4, 128, 128)
+    state_cache = storage[:, :state_elements].view(6, 4, head_dim, head_dim)
     expected_storage = storage.clone()
     expected_cache = expected_storage[:, :state_elements].view_as(state_cache)
     expected_initial_state = torch.stack((expected_cache[4], torch.zeros_like(expected_cache[2])))
@@ -620,14 +670,20 @@ def test_paged_chunk_fullgraph_compile():
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_paged_chunk_cuda_graph_replay():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_paged_chunk_cuda_graph_replay(head_dim: int):
     """Replay changed cache routing, values, and packed boundaries."""
-    q, k, v, gate, beta, _state = make_inputs(tokens=192, key_heads=1, value_heads=2)
+    q, k, v, gate, beta, _state = make_inputs(
+        tokens=192,
+        key_heads=1,
+        value_heads=2,
+        head_dim=head_dim,
+    )
     cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
-    state_elements = 2 * 128 * 128
+    state_elements = 2 * head_dim * head_dim
     storage = torch.randn(7, state_elements + 17, device="cuda")
-    state_cache = storage[:, :state_elements].view(7, 2, 128, 128)
+    state_cache = storage[:, :state_elements].view(7, 2, head_dim, head_dim)
     with torch.no_grad():
         paged_chunk_gdn(
             q,
@@ -938,19 +994,25 @@ def test_raw_ops_reject_pre_ampere_devices(monkeypatch):
         chunk_fwd_with_state_op(*args)
 
 
-def raw_args(tokens: int = 64, heads: int = 2):
+def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128):
     """Construct detached raw-op arguments and their forward tapes."""
-    q, k, v, gate, beta, state = make_inputs(tokens=tokens, key_heads=heads, value_heads=heads)
+    q, k, v, gate, beta, state = make_inputs(
+        tokens=tokens,
+        key_heads=heads,
+        value_heads=heads,
+        head_dim=head_dim,
+    )
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
-    args = (q, k, v, cumulative, beta, state, 128**-0.5)
+    args = (q, k, v, cumulative, beta, state, head_dim**-0.5)
     with torch.no_grad():
         output, final_state, inverse = chunk_fwd_with_state_op(*args)
     return args, output, final_state, inverse
 
 
-def test_dense_raw_operator_registration():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_dense_raw_operator_registration(head_dim: int):
     """Validate dense forward/backward schemas, fakes, and AOT dispatch."""
-    args, output, final_state, inverse = raw_args()
+    args, output, final_state, inverse = raw_args(head_dim=head_dim)
     torch.library.opcheck(chunk_fwd_op, args)
     torch.library.opcheck(chunk_fwd_with_state_op, args)
     backward_args = (
@@ -968,10 +1030,11 @@ def test_dense_raw_operator_registration():
     torch.library.opcheck(chunk_bwd_with_state_grad_op, backward_args, test_utils=utilities)
 
 
-def test_packed_raw_operator_registration():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_packed_raw_operator_registration(head_dim: int):
     """Validate fixed-capacity packed forward/backward registrations."""
-    q, k, v, gate, beta, _state = make_inputs(tokens=128)
-    state = torch.randn(2, v.shape[2], 128, 128, device="cuda")
+    q, k, v, gate, beta, _state = make_inputs(tokens=128, head_dim=head_dim)
+    state = torch.randn(2, v.shape[2], head_dim, head_dim, device="cuda")
     cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
     cumulative = _plain_gate_scan_op(
@@ -987,7 +1050,7 @@ def test_packed_raw_operator_registration():
         cu_seqlens,
         metadata.chunk_offsets,
         metadata.capacity,
-        128**-0.5,
+        head_dim**-0.5,
     )
     torch.library.opcheck(chunk_fwd_packed_op, args)
     torch.library.opcheck(chunk_fwd_packed_with_state_op, args)
@@ -1001,7 +1064,7 @@ def test_packed_raw_operator_registration():
         state,
         cu_seqlens,
         metadata.chunk_offsets,
-        128**-0.5,
+        head_dim**-0.5,
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)
@@ -1013,10 +1076,14 @@ def test_packed_raw_operator_registration():
 
 
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize(
+    ("head_dim", "portable"),
+    [(128, False), (128, True), (64, False)],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_public_fullgraph_forward_backward(
     packed: bool,
+    head_dim: int,
     portable: bool,
     dtype: torch.dtype,
     monkeypatch,
@@ -1029,6 +1096,7 @@ def test_public_fullgraph_forward_backward(
         tokens=tokens,
         key_heads=1,
         value_heads=4,
+        head_dim=head_dim,
         dtype=dtype,
         requires_grad=True,
     )
@@ -1036,7 +1104,7 @@ def test_public_fullgraph_forward_backward(
     if packed:
         inputs = (
             *inputs[:5],
-            torch.randn(2, 4, 128, 128, device="cuda", requires_grad=True),
+            torch.randn(2, 4, head_dim, head_dim, device="cuda", requires_grad=True),
         )
     expected_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     expected = run_with_gradients(expected_inputs, "fused", cu_seqlens)
@@ -1058,7 +1126,8 @@ def test_public_fullgraph_forward_backward(
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
-def test_public_dynamic_tokens_forward_backward():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_public_dynamic_tokens_forward_backward(head_dim: int):
     """Reuse one dynamic callable across the packed-tail and complete-chunk routes."""
     compiled = torch.compile(
         partial(
@@ -1070,7 +1139,13 @@ def test_public_dynamic_tokens_forward_backward():
         dynamic=True,
     )
     for tokens in (63, 64, 65):
-        inputs = make_inputs(tokens=tokens, key_heads=1, value_heads=4, requires_grad=True)
+        inputs = make_inputs(
+            tokens=tokens,
+            key_heads=1,
+            value_heads=4,
+            head_dim=head_dim,
+            requires_grad=True,
+        )
         reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
         expected = run_with_gradients(reference_inputs, "reference")
         output, state = compiled(*inputs[:5], inputs[5])
@@ -1082,12 +1157,21 @@ def test_public_dynamic_tokens_forward_backward():
             torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-3)
 
 
-@pytest.mark.parametrize("portable", [False, True])
-def test_backward_cuda_graph_replay(portable: bool, monkeypatch):
+@pytest.mark.parametrize(
+    ("head_dim", "portable"),
+    [(128, False), (128, True), (64, False)],
+)
+def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
     """Capture and replay both training backward implementations."""
     if portable:
         force_portable_backward(monkeypatch)
-    inputs = make_inputs(tokens=64, key_heads=1, value_heads=4, requires_grad=True)
+    inputs = make_inputs(
+        tokens=64,
+        key_heads=1,
+        value_heads=4,
+        head_dim=head_dim,
+        requires_grad=True,
+    )
     output, state = chunk_gdn(
         *inputs[:5],
         inputs[5],

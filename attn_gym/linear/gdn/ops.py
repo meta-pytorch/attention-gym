@@ -517,15 +517,15 @@ class _ChunkGDN(torch.autograd.Function):
 
 
 def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
-    """Validate the dtype, device, and fixed dimensions shared by fused chunk paths."""
+    """Validate the dtype, device, and dimensions shared by fused chunk paths."""
     if not q.is_cuda:
         raise ValueError("chunk_gdn(impl='fused') requires CUDA tensors")
     if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("chunk_gdn(impl='fused') requires matching float16 or bfloat16 QKV")
-    if q.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError("chunk_gdn(impl='fused') requires K=V=128")
-    # Triton lowers TensorDescriptor accesses to pointer operations before Hopper. Blackwell
-    # additionally selects the CuTe backward; Ampere and Hopper use the portable Triton backward.
+    if (q.shape[-1], v.shape[-1]) not in ((64, 64), (128, 128)):
+        raise ValueError("chunk_gdn(impl='fused') requires K=V in {64, 128}")
+    # Triton lowers TensorDescriptor accesses to pointer operations before Hopper. D128 on
+    # Blackwell additionally selects the CuTe backward; D64 always uses portable Triton.
     if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 8:
         raise ValueError("fused chunk GDN requires CUDA capability 8.0 or newer")
 

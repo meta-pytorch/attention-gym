@@ -82,13 +82,14 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     its no-state local backward, through a diagonal MMA in the Q/K/V dtype rather than in FP32.
 
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
-and
-`K = V = 128`, but has no cuDNN runtime dependency. Its scalar natural-log gate is not lower-bounded:
+and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Its scalar natural-log gate
+is not lower-bounded:
 kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
-wide-address path. Backward uses the tuned CuTe kernels on SM100/SM103 and portable Triton
-kernels on Ampere, Hopper, and other supported architectures.
+wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100/SM103 and
+portable Triton kernels on other supported architectures. The `K = V = 64` backward uses portable
+Triton on every architecture.
 
 The cuDNN chunk backend requires the optional `cudnn` dependencies and SM100/SM103,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
