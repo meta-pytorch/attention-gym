@@ -300,12 +300,12 @@ def chunk_work_oracle(cu_seqlens: list[int], chunk_size: int) -> list[ChunkWork]
     return work
 
 
-@triton.jit(debug=True, do_not_specialize=["num_sequences"])
+@triton.jit(debug=True, do_not_specialize=["num_sequences", "tokens"])
 def _prepare_ragged_chunk_offsets_kernel(
     cu_seqlens,
     chunk_offsets,
     num_sequences,
-    tokens: tl.constexpr,
+    tokens,
     chunk_size: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -351,7 +351,7 @@ def load_ragged_task_count(chunk_offsets, num_sequences, subtasks_per_chunk):
 
 
 @triton.jit
-def load_ragged_sequence_extent(cu_seqlens, num_sequences: tl.constexpr):
+def load_ragged_sequence_extent(cu_seqlens, num_sequences):
     """Return one past the last sequence slot that may contain tokens."""
     active_tokens = tl.load(cu_seqlens + num_sequences)
     low = 0
