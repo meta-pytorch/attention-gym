@@ -197,6 +197,8 @@ def _winner_key(
         _canonicalize(get_compile_target()),
         getattr(kernel, "__module__", type(kernel).__module__),
         name,
+        # Launch-only configs may share a binary while having different timings.
+        _canonicalize(candidates),
         tuple(
             _canonicalize(kernel.compile_call(candidate, *runtime_args))
             for candidate in candidates
@@ -270,12 +272,14 @@ def run_tunable(
     The return value is ``(launch_result, selected_config)``. Autotuning
     compiles candidates in parallel, benchmarks launches sequentially, then
     performs one final launch with the winner. Winners are cached in memory and
-    under ``<cache>/winners`` keyed by the kernel and its compile-relevant
+    under ``<cache>/winners`` keyed by the kernel, candidate configs, and compile-relevant
     arguments, so repeat invocations skip benchmarking; changing the kernel
     source, candidate set, static dimensions, or ``tuning_key`` re-tunes.
-    ``tuning_key`` may use host-visible tensor metadata and target facts, but
-    must not read device values or synchronize; return ``()`` when compile
-    identities already distinguish every tuning decision. Passing a custom
+    ``tuning_key`` must distinguish runtime metadata that changes generated candidates
+    or their intended winner: the default-config fast memo skips candidate generation.
+    It may use host-visible tensor metadata and target facts, but must not read device
+    values or synchronize; return ``()`` only when compile identities already distinguish
+    every tuning decision and generated candidate set. Passing a custom
     ``benchmark=`` bypasses winner reuse so that timing policy always runs.
     Therefore this convenience API requires repeatable, non-destructive
     launches. An explicit ``target`` is installed process-wide before candidate
