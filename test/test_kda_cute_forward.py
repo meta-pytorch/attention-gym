@@ -1587,85 +1587,43 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
     )
 
 
-def test_paged_chunk_kda_replay_decode_compile_and_cuda_graph():
-    """Compile and CUDA-graph replay the public single-token route."""
-    torch.manual_seed(49)
-    q, k, v, gate, beta = (tensor.detach() for tensor in _inputs(batch=2, tokens=1, heads=2))
-    state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-
-    def operation(state_cache, replay_state):
-        return paged_chunk_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            state_cache,
-            state_indices,
-            autotune=False,
-            kernel_options={"schedule": "static"},
-            replay_state=replay_state,
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
+    """Compile and CUDA-graph replay the public decode and packed-prefill routes."""
+    torch.manual_seed(49 if mode == "decode" else 52)
+    q, k, v, gate, beta = (
+        tensor.detach()
+        for tensor in _inputs(
+            batch=2 if mode == "decode" else 1,
+            tokens=1 if mode == "decode" else 64,
+            heads=2,
         )
-
-    compiled_operation = torch.compile(operation, fullgraph=True)
-    warmup_state = torch.zeros(5, 2, 128, 128, device="cuda")
-    warmup_replay = tuple(
-        tensor.new_zeros((5, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
-    ) + (torch.zeros(5, device=q.device, dtype=torch.int32),)
-    compiled_operation(warmup_state, warmup_replay)
-    torch.cuda.synchronize()
-
-    graph_state = torch.zeros_like(warmup_state)
-    graph_replay = tuple(torch.zeros_like(tensor) for tensor in warmup_replay)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_output = operation(graph_state, graph_replay)
-
-    graph_state.zero_()
-    for cache in graph_replay:
-        cache.zero_()
-    state_indices.copy_(torch.tensor([4, 2], device="cuda", dtype=torch.int32))
-    v.mul_(0.75)
-
-    eager_state = graph_state.clone()
-    compiled_state = graph_state.clone()
-    eager_replay = tuple(tensor.clone() for tensor in graph_replay)
-    compiled_replay = tuple(tensor.clone() for tensor in graph_replay)
-    expected = operation(eager_state, eager_replay)
-    actual = compiled_operation(compiled_state, compiled_replay)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert torch.equal(actual, expected)
-    assert torch.equal(compiled_state, eager_state)
-    assert all(
-        torch.equal(actual, expected)
-        for actual, expected in zip(compiled_replay, eager_replay, strict=True)
     )
-    assert torch.equal(graph_output, expected)
-    assert torch.equal(graph_state, eager_state)
-    assert all(
-        torch.equal(actual, expected)
-        for actual, expected in zip(graph_replay, eager_replay, strict=True)
+    state_indices = torch.tensor(
+        [3, 1] if mode == "decode" else [2, 3],
+        device="cuda",
+        dtype=torch.int32,
     )
-
-
-def test_paged_chunk_kda_replay_prefill_compile_and_cuda_graph():
-    """Packed replay prefill rereads routing, offsets, and counts during graph replay."""
-    torch.manual_seed(52)
-    q, k, v, gate, beta = (tensor.detach() for tensor in _inputs(tokens=64, heads=2))
-    state_indices = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
-    has_initial_state = torch.ones(2, device="cuda", dtype=torch.bool)
-    initial_state = torch.randn(5, 2, 128, 128, device="cuda")
+    cu_seqlens = (
+        None if mode == "decode" else torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
+    )
+    has_initial_state = (
+        None if mode == "decode" else torch.ones(2, device="cuda", dtype=torch.bool)
+    )
+    initial_state = (
+        torch.zeros(5, 2, 128, 128, device="cuda")
+        if mode == "decode"
+        else torch.randn(5, 2, 128, 128, device="cuda")
+    )
     initial_replay = tuple(
         tensor.new_zeros((5, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
     ) + (torch.zeros(5, device=q.device, dtype=torch.int32),)
-    initial_replay[1].copy_(F.normalize(torch.randn_like(initial_replay[1]), dim=-1))
-    initial_replay[2].normal_()
-    initial_replay[3].uniform_(-1.0, 0.0)
-    initial_replay[4].uniform_(0.0, 1.0)
-    initial_replay[-1][3] = 48
+    if mode == "prefill":
+        initial_replay[1].copy_(F.normalize(torch.randn_like(initial_replay[1]), dim=-1))
+        initial_replay[2].normal_()
+        initial_replay[3].uniform_(-1.0, 0.0)
+        initial_replay[4].uniform_(0.0, 1.0)
+        initial_replay[-1][3] = 48
 
     def operation(state_cache, replay_state):
         return paged_chunk_kda(
@@ -1696,10 +1654,15 @@ def test_paged_chunk_kda_replay_prefill_compile_and_cuda_graph():
     graph_state.copy_(initial_state)
     for destination, source in zip(graph_replay, initial_replay, strict=True):
         destination.copy_(source)
-    state_indices.copy_(torch.tensor([3, 2], device="cuda", dtype=torch.int32))
-    cu_seqlens.copy_(torch.tensor([0, 16, 64], device="cuda", dtype=torch.int32))
-    graph_replay[-1][2] = 32
-    graph_replay[-1][3] = 16
+    if mode == "decode":
+        state_indices.copy_(torch.tensor([4, 2], device="cuda", dtype=torch.int32))
+        v.mul_(0.75)
+    else:
+        assert cu_seqlens is not None
+        state_indices.copy_(torch.tensor([3, 2], device="cuda", dtype=torch.int32))
+        cu_seqlens.copy_(torch.tensor([0, 16, 64], device="cuda", dtype=torch.int32))
+        graph_replay[-1][2] = 32
+        graph_replay[-1][3] = 16
 
     eager_state = graph_state.clone()
     compiled_state = graph_state.clone()
