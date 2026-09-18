@@ -57,6 +57,8 @@ from attn_gym.linear.kda.utils import (
     do_not_specialize=[
         "T",
         "num_sequences",
+        "GRID_NT",
+        "MAX_NT",
         "q_stride_t",
         "q_stride_h",
         "k_stride_t",
@@ -88,8 +90,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     USE_INT64_OFFSETS: tl.constexpr,
     USE_GATHER: tl.constexpr,
     CAUSAL_NORMREF: tl.constexpr = True,
-    GRID_NT: tl.constexpr = 0,
-    MAX_NT: tl.constexpr = 0,
+    GRID_NT=0,
+    MAX_NT=0,
 ):
     i_t_start, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if USE_INT64_OFFSETS:
@@ -97,10 +99,12 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
         i_bh = i_bh.to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
-    for _iter in range((MAX_NT + GRID_NT - 1) // GRID_NT):
-        i_t_orig = i_t_start + _iter * GRID_NT
-        _run = i_t_orig < MAX_NT
-        if IS_VARLEN and _run:
+    # Stride directly over chunk indices: a runtime grid must not introduce
+    # integer division into the persistent loop's trip-count calculation.
+    i_t_orig = i_t_start
+    while i_t_orig < MAX_NT:
+        _run = True
+        if IS_VARLEN:
             _run = i_t_orig < load_ragged_chunk_count(chunk_offsets, num_sequences)
         if _run:
             if IS_VARLEN:
@@ -214,6 +218,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                     b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
                 b_Ai += m_I
                 tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_store)
+        i_t_orig += GRID_NT
 
 
 # NOTE [Causal gate reference]
