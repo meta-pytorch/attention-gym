@@ -31,10 +31,13 @@ _BT_LIST = [8, 16, 32, 64, 128]
 
 @triton.autotune(
     configs=[triton.Config({"BT": bt}, num_warps=w) for w in [1, 2, 4, 8, 16] for bt in _BT_LIST],
+    # NB selects a tuned schedule, not a different binary for each row count.
     key=["D", "NB"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["N_ROWS"])
+@triton.jit(
+    do_not_specialize=["N_ROWS", "TOKENS", "NB", "NUM_SEQUENCES", "X_STRIDES", "DY_STRIDES"]
+)
 def l2norm_bwd_kernel(
     x,
     rstd,
@@ -42,18 +45,20 @@ def l2norm_bwd_kernel(
     dx,
     N_ROWS,
     cu_seqlens,
-    X_STRIDES: tl.constexpr,
+    X_STRIDES,
     RSTD_STRIDES: tl.constexpr,
-    DY_STRIDES: tl.constexpr,
+    DY_STRIDES,
     DX_STRIDES: tl.constexpr,
-    TOKENS: tl.constexpr,
+    TOKENS,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
+    NB,
+    NUM_SEQUENCES,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
+    X_ROW_STRIDE: tl.constexpr = 0,
+    DY_ROW_STRIDE: tl.constexpr = 0,
 ):
     # One program per [BT] block of rows; each row is normalized over [BD].
     i_row = tl.program_id(0).to(tl.int64)
@@ -74,8 +79,16 @@ def l2norm_bwd_kernel(
         (o_row % HEADS)[:, None],
         o_d[None, :],
     )
-    b_x = tl.load(x + ptr_offset(o_bthd, X_STRIDES), mask=mask, other=0.0).to(tl.float32)
-    b_dy = tl.load(dy + ptr_offset(o_bthd, DY_STRIDES), mask=mask, other=0.0).to(tl.float32)
+    if X_ROW_STRIDE:
+        x_offsets = o_bt[:, None] * X_ROW_STRIDE + (o_row % HEADS)[:, None] * D + o_d[None, :]
+    else:
+        x_offsets = ptr_offset(o_bthd, X_STRIDES)
+    if DY_ROW_STRIDE:
+        dy_offsets = o_bt[:, None] * DY_ROW_STRIDE + (o_row % HEADS)[:, None] * D + o_d[None, :]
+    else:
+        dy_offsets = ptr_offset(o_bthd, DY_STRIDES)
+    b_x = tl.load(x + x_offsets, mask=mask, other=0.0).to(tl.float32)
+    b_dy = tl.load(dy + dy_offsets, mask=mask, other=0.0).to(tl.float32)
     b_rstd = tl.load(rstd + ptr_offset((o_row,), RSTD_STRIDES), mask=m_row, other=0.0).to(
         tl.float32
     )

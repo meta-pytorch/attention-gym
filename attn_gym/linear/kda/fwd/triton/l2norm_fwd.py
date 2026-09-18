@@ -13,7 +13,7 @@ from attn_gym._backends.triton.utils import ptr_offset
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N_ROWS", "T", "NUM_SEQUENCES", "X_STRIDES"])
 def l2norm_fwd_kernel(
     x,
     y,
@@ -21,16 +21,17 @@ def l2norm_fwd_kernel(
     eps,
     N_ROWS,
     cu_seqlens,
-    X_STRIDES: tl.constexpr,
+    X_STRIDES,
     Y_STRIDES: tl.constexpr,
     RSTD_STRIDES: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
+    NUM_SEQUENCES,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
+    X_ROW_STRIDE: tl.constexpr = 0,
 ):
     i_row = tl.program_id(0).to(tl.int64)
     if IS_VARLEN:
@@ -46,9 +47,10 @@ def l2norm_fwd_kernel(
     # Inductor passes Python floats as fp64; keep the reduction in fp32.
     eps = eps.to(tl.float32)
 
-    b_x = tl.load(
-        x
-        + ptr_offset(
+    if X_ROW_STRIDE:
+        x_offsets = o_bt[:, None] * X_ROW_STRIDE + (o_row % H)[:, None] * D + o_d[None, :]
+    else:
+        x_offsets = ptr_offset(
             (
                 (o_bt // T)[:, None],
                 (o_bt % T)[:, None],
@@ -56,10 +58,8 @@ def l2norm_fwd_kernel(
                 o_d[None, :],
             ),
             X_STRIDES,
-        ),
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
+        )
+    b_x = tl.load(x + x_offsets, mask=mask, other=0.0).to(tl.float32)
     b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x, 1) + eps)
     b_y = b_x * b_rstd[:, None]
 
@@ -73,6 +73,17 @@ def l2norm_fwd_kernel(
         b_rstd.to(rstd.dtype.element_ty),
         mask=m_row,
     )
+
+
+def _l2norm_row_stride(x: torch.Tensor) -> int:
+    """Flatten batch/token for compact head rows, including interleaved QKV views."""
+    if (
+        x.stride(3) == 1
+        and x.stride(2) == x.shape[3]
+        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
+    ):
+        return x.stride(1)
+    return 0
 
 
 def _l2norm_launch_config(rows: int, tuned_major: int | None) -> tuple[int, int]:
@@ -122,6 +133,7 @@ def _l2norm_fwd_cuda(
     ):
         tuned_major = major
     block_tokens, num_warps = _l2norm_launch_config(rows, tuned_major)
+    row_stride = _l2norm_row_stride(x)
     l2norm_fwd_kernel[(triton.cdiv(rows, block_tokens),)](
         x,
         output,
@@ -129,7 +141,8 @@ def _l2norm_fwd_cuda(
         eps,
         rows,
         cu_seqlens,
-        X_STRIDES=x.stride(),
+        X_STRIDES=(0, 0, 0, 0) if row_stride else x.stride(),
+        X_ROW_STRIDE=row_stride,
         Y_STRIDES=output.stride(),
         RSTD_STRIDES=rstd.stride(),
         T=tokens,
@@ -183,6 +196,8 @@ def _l2norm_bwd_cuda(
     d_input = torch.empty(rows, head_dim, dtype=x.dtype, device=x.device)
     block_dim = triton.next_power_of_2(head_dim)
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
+    row_stride = _l2norm_row_stride(x)
+    dy_row_stride = _l2norm_row_stride(d_output)
     l2norm_bwd_kernel[grid](
         x,
         rstd,
@@ -190,9 +205,11 @@ def _l2norm_bwd_cuda(
         d_input,
         rows,
         cu_seqlens,
-        X_STRIDES=x.stride(),
+        X_STRIDES=(0, 0, 0, 0) if row_stride else x.stride(),
+        X_ROW_STRIDE=row_stride,
         RSTD_STRIDES=rstd.stride(),
-        DY_STRIDES=d_output.stride(),
+        DY_STRIDES=(0, 0, 0, 0) if dy_row_stride else d_output.stride(),
+        DY_ROW_STRIDE=dy_row_stride,
         DX_STRIDES=d_input.stride(),
         TOKENS=tokens,
         HEADS=heads,
