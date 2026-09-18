@@ -153,6 +153,136 @@ class IndexerTopKKernel:
         cute.arch.barrier()
         return threshold[0], threshold[1]
 
+    @cute.jit
+    def radix_select(
+        self,
+        row,
+        row_output,
+        seg_len,
+        from_pool: cutlass.Constexpr,
+        histogram,
+        warp_sums,
+        threshold,
+        counters,
+        keys,
+        indices,
+        tidx,
+    ):
+        """Exact 11/11/10-bit refinement, with bounded first-bin shrink on full rows.
+
+        A verified pool contains every value above the sample threshold and at
+        least K entries. Otherwise the source is the entire valid row. Only
+        full-row selection writes the shrink buffer: a pool never overwrites
+        keys that another thread may still be reading.
+        """
+        scan_len = seg_len
+        if cutlass.const_expr(from_pool):
+            scan_len = counters[0]
+        # Publish the old counter to every thread before resetting it.
+        cute.arch.barrier()
+        if tidx == 0:
+            counters[0] = Int32(0)
+            counters[1] = Int32(0)
+            counters[2] = Int32(0)
+        for i in range(tidx, _NUM_BINS_11, self.block_threads):
+            histogram[i] = Int32(0)
+        cute.arch.barrier()
+
+        for i in range(tidx, scan_len, self.block_threads):
+            if cutlass.const_expr(from_pool):
+                key = keys[i]
+            else:
+                key = _ordered_key(row[i])
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            cute.arch.atomic_add(histogram.iterator + bin0, Int32(1), sem="relaxed", scope="cta")
+        cute.arch.barrier()
+        bin0_threshold, need0 = self.find_threshold(
+            histogram, _NUM_BINS_11, Int32(self.topk), warp_sums, threshold, tidx
+        )
+
+        for i in range(tidx, scan_len, self.block_threads):
+            idx = Int32(i)
+            if cutlass.const_expr(from_pool):
+                key = keys[i]
+                idx = indices[i]
+            else:
+                key = _ordered_key(row[i])
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            if bin0 > bin0_threshold:
+                dst = cute.arch.atomic_add(counters.iterator, Int32(1), sem="relaxed", scope="cta")
+                row_output[dst] = idx
+            elif bin0 == bin0_threshold:
+                bin1 = Int32((key >> 10) & Uint32(0x7FF))
+                cute.arch.atomic_add(
+                    histogram.iterator + bin1, Int32(1), sem="relaxed", scope="cta"
+                )
+                if cutlass.const_expr(not from_pool):
+                    slot = cute.arch.atomic_add(
+                        counters.iterator + 2, Int32(1), sem="relaxed", scope="cta"
+                    )
+                    if slot < _SHRINK_MAX:
+                        keys[slot] = key
+                        indices[slot] = idx
+        cute.arch.barrier()
+        bin1_threshold, need1 = self.find_threshold(
+            histogram, _NUM_BINS_11, need0, warp_sums, threshold, tidx
+        )
+        if cutlass.const_expr(from_pool):
+            use_shrink = True
+        else:
+            use_shrink = counters[2] <= _SHRINK_MAX
+            if use_shrink:
+                scan_len = counters[2]
+
+        for i in range(tidx, scan_len, self.block_threads):
+            key = Uint32(0)
+            idx = Int32(i)
+            if use_shrink:
+                key = keys[i]
+                idx = indices[i]
+            else:
+                key = _ordered_key(row[i])
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            if bin0 == bin0_threshold:
+                bin1 = Int32((key >> 10) & Uint32(0x7FF))
+                if bin1 > bin1_threshold:
+                    dst = cute.arch.atomic_add(
+                        counters.iterator, Int32(1), sem="relaxed", scope="cta"
+                    )
+                    row_output[dst] = idx
+                elif bin1 == bin1_threshold:
+                    bin2 = Int32(key & Uint32(0x3FF))
+                    cute.arch.atomic_add(
+                        histogram.iterator + bin2, Int32(1), sem="relaxed", scope="cta"
+                    )
+        cute.arch.barrier()
+        bin2_threshold, need2 = self.find_threshold(
+            histogram, _NUM_BINS_10, need1, warp_sums, threshold, tidx
+        )
+        for i in range(tidx, scan_len, self.block_threads):
+            key = Uint32(0)
+            idx = Int32(i)
+            if use_shrink:
+                key = keys[i]
+                idx = indices[i]
+            else:
+                key = _ordered_key(row[i])
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            bin1 = Int32((key >> 10) & Uint32(0x7FF))
+            if bin0 == bin0_threshold and bin1 == bin1_threshold:
+                bin2 = Int32(key & Uint32(0x3FF))
+                selected = bin2 > bin2_threshold
+                if bin2 == bin2_threshold:
+                    slot = cute.arch.atomic_add(
+                        counters.iterator + 1, Int32(1), sem="relaxed", scope="cta"
+                    )
+                    selected = slot < need2
+                if selected:
+                    dst = cute.arch.atomic_add(
+                        counters.iterator, Int32(1), sem="relaxed", scope="cta"
+                    )
+                    row_output[dst] = idx
+
     @cute.kernel
     def kernel(
         self,
@@ -200,113 +330,19 @@ class IndexerTopKKernel:
                     row_output[slot] = Int32(slot) if slot < seg_len else Int32(-1)
             else:
                 row = scores[slab_pair, qi, None]
-                if tidx == 0:
-                    counters[0] = Int32(0)
-                    counters[1] = Int32(0)
-                    counters[2] = Int32(0)
-                for i in range(tidx, _NUM_BINS_11, self.block_threads):
-                    histogram[i] = Int32(0)
-                cute.arch.barrier()
-
-                # Pass 1: highest 11-bit histogram over exactly the valid row.
-                for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    cute.arch.atomic_add(
-                        histogram.iterator + bin0, Int32(1), sem="relaxed", scope="cta"
-                    )
-                cute.arch.barrier()
-                bin0_threshold, need0 = self.find_threshold(
-                    histogram, _NUM_BINS_11, Int32(self.topk), warp_sums, threshold, tidx
+                self.radix_select(
+                    row,
+                    row_output,
+                    seg_len,
+                    False,
+                    histogram,
+                    warp_sums,
+                    threshold,
+                    counters,
+                    shrink_keys,
+                    shrink_indices,
+                    tidx,
                 )
-
-                # Pass 2: emit strict winners and stage the first boundary bin.
-                for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    if bin0 > bin0_threshold:
-                        dst = cute.arch.atomic_add(
-                            counters.iterator, Int32(1), sem="relaxed", scope="cta"
-                        )
-                        row_output[dst] = Int32(i)
-                    elif bin0 == bin0_threshold:
-                        bin1 = Int32((key >> 10) & Uint32(0x7FF))
-                        cute.arch.atomic_add(
-                            histogram.iterator + bin1, Int32(1), sem="relaxed", scope="cta"
-                        )
-                        slot = cute.arch.atomic_add(
-                            counters.iterator + 2, Int32(1), sem="relaxed", scope="cta"
-                        )
-                        if slot < _SHRINK_MAX:
-                            shrink_keys[slot] = key
-                            shrink_indices[slot] = Int32(i)
-                cute.arch.barrier()
-                bin1_threshold, need1 = self.find_threshold(
-                    histogram, _NUM_BINS_11, need0, warp_sums, threshold, tidx
-                )
-
-                # Derive overflow from the atomic count after the barrier: no
-                # concurrently written non-atomic overflow flag is necessary.
-                shrink_count = counters[2]
-                use_shrink = shrink_count <= _SHRINK_MAX
-                scan_len = shrink_count if use_shrink else seg_len
-
-                # Pass 3: refine the middle 11 bits, falling back to a full scan.
-                for i in range(tidx, scan_len, self.block_threads):
-                    key = Uint32(0)
-                    idx = Int32(0)
-                    if use_shrink:
-                        key = shrink_keys[i]
-                        idx = shrink_indices[i]
-                    else:
-                        key = _ordered_key(row[i])
-                        idx = Int32(i)
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    if bin0 == bin0_threshold:
-                        bin1 = Int32((key >> 10) & Uint32(0x7FF))
-                        if bin1 > bin1_threshold:
-                            dst = cute.arch.atomic_add(
-                                counters.iterator, Int32(1), sem="relaxed", scope="cta"
-                            )
-                            row_output[dst] = idx
-                        elif bin1 == bin1_threshold:
-                            bin2 = Int32(key & Uint32(0x3FF))
-                            cute.arch.atomic_add(
-                                histogram.iterator + bin2, Int32(1), sem="relaxed", scope="cta"
-                            )
-                cute.arch.barrier()
-                bin2_threshold, need2 = self.find_threshold(
-                    histogram, _NUM_BINS_10, need1, warp_sums, threshold, tidx
-                )
-
-                # Pass 4: emit the final strict winners and exactly need2 ties.
-                for i in range(tidx, scan_len, self.block_threads):
-                    key = Uint32(0)
-                    idx = Int32(0)
-                    if use_shrink:
-                        key = shrink_keys[i]
-                        idx = shrink_indices[i]
-                    else:
-                        key = _ordered_key(row[i])
-                        idx = Int32(i)
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    bin1 = Int32((key >> 10) & Uint32(0x7FF))
-                    if bin0 == bin0_threshold and bin1 == bin1_threshold:
-                        bin2 = Int32(key & Uint32(0x3FF))
-                        if bin2 > bin2_threshold:
-                            dst = cute.arch.atomic_add(
-                                counters.iterator, Int32(1), sem="relaxed", scope="cta"
-                            )
-                            row_output[dst] = idx
-                        elif bin2 == bin2_threshold:
-                            slot = cute.arch.atomic_add(
-                                counters.iterator + 1, Int32(1), sem="relaxed", scope="cta"
-                            )
-                            if slot < need2:
-                                dst = cute.arch.atomic_add(
-                                    counters.iterator, Int32(1), sem="relaxed", scope="cta"
-                                )
-                                row_output[dst] = idx
 
     @cute.jit
     def __call__(

@@ -101,13 +101,21 @@ def assert_indexer_selection(
         return
 
     q64, k64, w64 = q.double(), k.double(), weights.double()
-    dots = q64.permute(0, 2, 1, 3) @ k64.transpose(-1, -2).unsqueeze(1)
-    scores = (dots.relu() * w64.transpose(1, 2).unsqueeze(-1)).sum(1)
+    # Keep exhaustive rows/keys without materializing [B,H,T,S] FP64 intermediates.
+    scores = torch.empty((batch, tokens, candidates), device=q.device, dtype=torch.float64)
+    magnitude = torch.empty_like(scores)
+    for start in range(0, tokens, 128):
+        query = q64[:, start : start + 128].permute(0, 2, 1, 3)
+        weight = w64[:, start : start + 128].transpose(1, 2).unsqueeze(-1)
+        scores[:, start : start + 128] = (
+            (query @ k64.transpose(-1, -2).unsqueeze(1)).relu() * weight
+        ).sum(1)
+        magnitude[:, start : start + 128] = (
+            (query.abs() @ k64.abs().transpose(-1, -2).unsqueeze(1)) * weight.abs()
+        ).sum(1)
     scores /= math.sqrt(heads * dim)
-    assert torch.isfinite(scores).all()
-    absolute_dots = q64.abs().permute(0, 2, 1, 3) @ k64.abs().transpose(-1, -2).unsqueeze(1)
-    magnitude = (absolute_dots * w64.abs().transpose(1, 2).unsqueeze(-1)).sum(1)
     magnitude /= math.sqrt(heads * dim)
+    assert torch.isfinite(scores).all()
     if causal:
         future = torch.arange(candidates, device=q.device).view(1, 1, candidates) >= visible
         scores.masked_fill_(future, -torch.inf)
@@ -116,7 +124,13 @@ def assert_indexer_selection(
         -1, (counts - 1).clamp_min(0).expand(batch, -1, -1)
     )
     eager = lightning_indexer(
-        q, k, weights, topk, causal=causal, compress_ratio=compress_ratio, impl="reference"
+        q,
+        k,
+        weights,
+        topk,
+        causal=causal,
+        compress_ratio=compress_ratio,
+        impl="reference",
     )
     actual_scores = scores.gather(-1, actual.long().clamp_min(0))
     eager_scores = scores.gather(-1, eager.long().clamp_min(0))
@@ -130,3 +144,54 @@ def assert_indexer_selection(
         valid,
         2 * reduction_eps / (1 - reduction_eps),
     )
+
+
+def assert_indexer_topk_values(indices: torch.Tensor, rows: torch.Tensor) -> None:
+    """Selection preserves input values: FP64 selected value multisets must be exact."""
+    indices = indices.long()
+    assert ((indices >= 0) & (indices < rows.shape[-1])).all()
+    ordered = indices.sort(-1).values
+    assert not (ordered[..., 1:] == ordered[..., :-1]).any()
+    rows64 = rows.double()
+    actual = rows64.gather(-1, indices).sort(-1).values
+    expected = rows64.topk(indices.shape[-1], sorted=False).values.sort(-1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def indexer_gvr2_sample_positions(candidates: int, topk: int, threads: int = 512) -> torch.Tensor:
+    """Mirror ``IndexerGVR2TopKKernel.sample_plan`` for a 16-byte aligned row.
+
+    Returns every element index the kernel samples (float4 pairs), so a test can
+    place values on exactly the sampled positions and force a sampling outcome.
+    """
+    quads = candidates // 4
+    aim = 11 * topk // 8 if topk >= 1024 else 3 * topk // 2
+    aim = max(min(aim, 4096 // 2), topk)
+    aim = min(max(aim, int(math.sqrt(6 * candidates) + 0.5)), 4096 // 2)
+    factor = 64 if topk >= 1024 else 32
+    selected = min(max(factor * candidates // aim, 256), candidates // 2)
+    half = max(quads >> 1, 1)
+    pairs = min(max(selected >> 3, 1), half, threads)
+    stride = max(half // pairs, 1)
+    sample_threads = 0 if quads < 4 else min(half // stride, threads)
+    quad = torch.arange(sample_threads) * stride * 2
+    return (quad[:, None] * 4 + torch.arange(8)[None, :]).flatten().cuda()
+
+
+def compile_indexer_topk(
+    topk: int, causal: bool = False, ratio: int = 1, wide: bool = False, radix: bool = False
+):
+    """Compile the production selector ABI on the current device for direct tests."""
+    from attn_gym._backends.cute.target import (
+        detect_compile_target,
+        get_compile_target,
+        set_compile_target,
+    )
+    from attn_gym.sparse.indexer.impl.cute import _compile_topk
+
+    previous = get_compile_target()
+    try:
+        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+        return _compile_topk(topk, causal, ratio, wide, "default" if radix else "gvr2")
+    finally:
+        set_compile_target(previous)

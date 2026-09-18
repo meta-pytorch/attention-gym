@@ -47,21 +47,27 @@ def launch(
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
 
-    # dots: [B, T, H, S]
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    # score: [B, T, S]
-    scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
+    indices = torch.empty((batch, queries, topk), dtype=torch.int32, device=q.device)
+    # Query chunks preserve every candidate while bounding per-head intermediates.
+    for start in range(0, queries, 128):
+        end = min(start + 128, queries)
+        # dots: [B, query_chunk, H, S]
+        dots = torch.einsum("bthd,bsd->bths", q[:, start:end], k)
+        # score: [B, query_chunk, S]
+        scores = (torch.relu(dots) * weights[:, start:end].unsqueeze(-1)).sum(dim=2) * scale
 
-    if causal:
-        visible = (torch.arange(1, queries + 1, device=q.device) // compress_ratio)[:, None]
-        key_positions = torch.arange(candidates, device=q.device)[None, :]
-        scores.masked_fill_(key_positions >= visible, float("-inf"))
+        if causal:
+            visible = (torch.arange(start + 1, end + 1, device=q.device) // compress_ratio)[
+                :, None
+            ]
+            key_positions = torch.arange(candidates, device=q.device)[None, :]
+            scores.masked_fill_(key_positions >= visible, float("-inf"))
 
-    indices = scores.topk(topk, dim=-1).indices.to(torch.int32)
+        selected = scores.topk(topk, dim=-1).indices.to(torch.int32)
 
-    # Slots that selected a causally invalid candidate are replaced with -1.
-    # This happens when topk exceeds the number of visible candidates for a row.
-    if causal:
-        indices.masked_fill_(indices >= visible.view(1, queries, 1), -1)
-
+        # Slots that selected a causally invalid candidate are replaced with -1.
+        # This happens when topk exceeds the number of visible candidates for a row.
+        if causal:
+            selected.masked_fill_(selected >= visible.view(1, end - start, 1), -1)
+        indices[:, start:end] = selected
     return indices

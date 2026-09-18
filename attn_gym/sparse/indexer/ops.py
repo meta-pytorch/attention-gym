@@ -10,7 +10,7 @@ from torch import Tensor
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
-    "str backend) -> Tensor",
+    'str backend, str selector="default") -> Tensor',
 )
 
 
@@ -22,18 +22,25 @@ def _indexer_cuda(
     causal: bool,
     compress_ratio: int,
     backend: str,
+    selector: str = "default",
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries."""
+    if selector not in ("auto", "default", "gvr2"):
+        raise ValueError(f"unknown indexer selector {selector!r}")
     if backend == "auto":
         capability = torch.cuda.get_device_capability(q.device)
         backend = "cute" if capability in ((10, 0), (10, 3)) else "triton"
     match backend:
         case "cute":
             from .impl.cute import launch
-        case "triton":
+        case "triton" if selector == "gvr2":
+            from .impl.triton_gvr2 import launch
+        case "triton":  # "auto" keeps the streaming selector (no Triton sweep yet).
             from .impl.triton import launch
         case _:
             raise ValueError(f"unknown indexer backend {backend!r}")
+    if backend == "cute":
+        return launch(q, k, weights, topk, causal, compress_ratio, selector=selector)
     return launch(q, k, weights, topk, causal, compress_ratio)
 
 
@@ -49,6 +56,7 @@ def _indexer_fake(
     causal: bool,
     compress_ratio: int,
     backend: str,
+    selector: str = "default",
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)

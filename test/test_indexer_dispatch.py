@@ -31,23 +31,40 @@ def require_backend(backend: str | None = None) -> str:
 
 
 @pytest.mark.parametrize(
-    "capability,backend,expected",
+    "capability,backend,expected,fails,selector",
     [
-        ((9, 0), "auto", "triton"),
-        ((10, 0), "auto", "cute"),
-        ((10, 3), "auto", "cute"),
-        ((12, 0), "auto", "triton"),
-        ((10, 0), "triton", "triton"),
-        ((10, 3), "triton", "triton"),
-        ((9, 0), "cute", "cute"),
-    ],
+        (capability, backend, expected, fails, None)
+        for capability, backend, expected in [
+            ((9, 0), "auto", "triton"),
+            ((10, 0), "auto", "cute"),
+            ((10, 3), "auto", "cute"),
+            ((12, 0), "auto", "triton"),
+            ((10, 0), "triton", "triton"),
+            ((10, 3), "triton", "triton"),
+            ((9, 0), "cute", "cute"),
+        ]
+        for fails in (False, True)
+    ]
+    + [
+        ((10, 0), backend, backend, False, selector)
+        for backend in ("cute", "triton")
+        for selector in (None, "auto", "default", "gvr2")
+    ]
+    + [((10, 0), "triton", "triton", True, "gvr2")],
 )
-@pytest.mark.parametrize("fails", [False, True])
-def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, expected, fails):
+def test_backend_dispatch_uses_input_device(
+    monkeypatch, capability, backend, expected, fails, selector
+):
     """Dispatch once on the input device and propagate launch errors without retrying."""
-    q = torch.empty(1, 2, 2, 16)
-    k = torch.empty(1, 2, 16)
-    weights = torch.empty(1, 2, 2)
+    dtype = torch.bfloat16
+    q = torch.empty(1, 2, 32, 128, dtype=dtype)
+    k = torch.empty(1, 2, 128, dtype=dtype)
+    weights = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    kwargs = {}
+    if selector is not None:
+        kwargs["selector"] = selector
+    if expected == "triton" and selector == "gvr2":
+        expected = "triton_gvr2"
     failure = RuntimeError("selected backend failed")
     launch = Mock(
         return_value=torch.empty(1, 2, 1, dtype=torch.int32),
@@ -56,7 +73,7 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
     other = Mock(side_effect=AssertionError("the nonselected backend ran"))
     device_capability = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", device_capability)
-    for name in ("cute", "triton"):
+    for name in ("cute", "triton", "triton_gvr2"):
         monkeypatch.setitem(
             sys.modules,
             f"attn_gym.sparse.indexer.impl.{name}",
@@ -64,11 +81,14 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
         )
     if fails:
         with pytest.raises(RuntimeError) as exc:
-            ops._indexer_cuda(q, k, weights, 1, True, 1, backend)
+            ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs)
         assert exc.value is failure
     else:
-        assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
-    launch.assert_called_once_with(q, k, weights, 1, True, 1)
+        assert (
+            ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs) is launch.return_value
+        )
+    forwarded = {"selector": selector or "default"} if expected == "cute" else {}
+    launch.assert_called_once_with(q, k, weights, 1, True, 1, **forwarded)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
@@ -193,7 +213,10 @@ def test_backend_cuda_graph_replay(backend, dtype, tokens, heads, dim, topk, cau
         (1027, 32, 128, 37, 3),
         (4099, 64, 128, 1024, 4),
         (2048, 32, 128, 1024, 1),
-        (8200, 32, 128, 2048, 1),
+        # Full score matrices remain large; do not overlap the backend oracles.
+        pytest.param(
+            8200, 32, 128, 2048, 1, marks=pytest.mark.xdist_group("indexer_large_oracle")
+        ),
         (3, 2, 16, 1, 3),
     ],
     ids=[

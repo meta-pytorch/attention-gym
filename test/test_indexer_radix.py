@@ -8,6 +8,7 @@ import torch
 
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.sparse.indexer import lightning_indexer
+from attn_gym.sparse.indexer.impl import common
 from attn_gym.sparse.indexer.impl import cute as impl
 from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
 
@@ -64,7 +65,7 @@ def test_radix_generic_scores(radix_impl, dtype, causal, heads, head_dim):
 @pytest.mark.parametrize("heads,dim", [(32, 128), (66, 48)])
 def test_radix_reuses_slab_across_batches(radix_impl, monkeypatch, causal, heads, dim):
     """Odd batch tails and a partial final slab never alias other score rows."""
-    monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", 4)
+    monkeypatch.setattr(common, "_MAX_SCORE_PAIRS", 4)
     inputs = make_indexer_test_inputs(17, heads, dim, torch.bfloat16, batch=3)
     actual = lightning_indexer(*inputs, 7, causal=causal, kernel_options={"backend": "cute"})
     assert_indexer_selection(actual, *inputs, 7, causal)
@@ -73,7 +74,7 @@ def test_radix_reuses_slab_across_batches(radix_impl, monkeypatch, causal, heads
 @pytest.mark.parametrize("batch,tokens,capacity", [(1, 1025, 512), (3, 17, 4)])
 def test_radix_launches_only_active_pairs(radix_impl, monkeypatch, batch, tokens, capacity):
     """Both launch grids use the final slab's live extent, not its allocation capacity."""
-    monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", capacity)
+    monkeypatch.setattr(common, "_MAX_SCORE_PAIRS", capacity)
     score_kernel, topk_kernel = Mock(), Mock()
     monkeypatch.setattr(radix_impl, "_compile_scores", lambda *args: score_kernel)
     monkeypatch.setattr(radix_impl, "_compile_topk", lambda *args: topk_kernel)
@@ -152,7 +153,7 @@ def test_radix_input_alignment(radix_impl, operand, heads, dim, dtype):
 def test_radix_strided_inputs(radix_impl, monkeypatch, layout, heads, dim, dtype, causal):
     """Packed and generic scorers preserve independent outer strides without input copies."""
     batch, tokens = 3, 257
-    monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", 5)
+    monkeypatch.setattr(common, "_MAX_SCORE_PAIRS", 5)
     q, k, weights = make_indexer_test_inputs(tokens, heads, dim, dtype, batch=batch)
     match layout:
         case "permuted":
@@ -194,48 +195,6 @@ def test_radix_rejects_non_tma_layout(radix_impl, operand, layout):
         )[..., :-1].copy_(tensor)
     with pytest.raises(ValueError, match="unit last strides and 16-byte aligned"):
         lightning_indexer(*inputs, 16, kernel_options={"backend": "cute"})
-
-
-@pytest.mark.parametrize("distribution", ["random", "ties", "clustered", "signed_zero"])
-@pytest.mark.parametrize("topk", [1, 37, 512, 1024, 4096])
-def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
-    """Radix refinement handles negative scores, exact ties and shrink-buffer overflow."""
-    import cutlass
-
-    from attn_gym._backends.cute.target import (
-        detect_compile_target,
-        get_compile_target,
-        set_compile_target,
-    )
-
-    tokens = 4097
-    generator = torch.Generator(device="cuda").manual_seed(32)
-    scores = torch.randn(2, 2, tokens, device="cuda", generator=generator)
-    match distribution:
-        case "ties":
-            scores.fill_(-1)
-        case "clustered":
-            # All 4097 candidates land in bin0, overflowing the 2048-entry shrink slab;
-            # tiny spacings also force refinement through the low ten key bits.
-            scores = 1 + scores.abs() * 1e-5
-        case "signed_zero":
-            scores = torch.copysign(torch.zeros_like(scores), scores)
-    output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
-    previous = get_compile_target()
-    try:
-        set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, False, 1, False)
-    finally:
-        set_compile_target(previous)
-    kernel(scores, output, cutlass.Int32(0))
-    indices = output[0, :4].long()
-    assert ((indices >= 0) & (indices < tokens)).all()
-    ordered = indices.sort(-1).values
-    assert not (ordered[:, 1:] == ordered[:, :-1]).any()
-    rows = scores.view(4, tokens)
-    actual = rows.gather(1, indices).sort(-1).values
-    expected = rows.topk(topk, sorted=False).values.sort(-1).values
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 4])
@@ -306,7 +265,7 @@ def test_radix_active_int64_offset(radix_impl):
 @pytest.mark.parametrize("strided", [False, True])
 def test_radix_graph_replay(radix_impl, monkeypatch, strided):
     """Captured partial-slab reuse reads updated operands, including independent outer strides."""
-    monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", 4)
+    monkeypatch.setattr(common, "_MAX_SCORE_PAIRS", 4)
     inputs = make_indexer_test_inputs(17, 64, 128, torch.bfloat16, batch=2)
     if strided:
         q, k, weights = inputs

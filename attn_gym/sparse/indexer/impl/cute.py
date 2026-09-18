@@ -29,18 +29,11 @@ from attn_gym._backends.cute.target import (
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
 from attn_gym.utils import cdiv
 
+from .common import score_workspace_pairs
+
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20
 # Limit both the row count (linear storage as T grows) and absolute scratch bytes.
-_MAX_SCORE_PAIRS = 512
-_SCORE_WORKSPACE_BYTES = 32 * 1024 * 1024
-
-
-def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
-    """Size a slab for positive B and the validated CuTe domain 1 <= S <= T <= 2**20."""
-    return min(
-        _MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * candidates)
-    )
 
 
 @jit_cache(
@@ -115,16 +108,30 @@ def _compile_scores(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).with_name("cute_topk.py"),))
+@jit_cache(
+    extra_sources=(
+        Path(__file__).with_name("cute_topk.py"),
+        Path(__file__).with_name("cute_topk_gvr2.py"),
+    )
+)
 def _compile_topk(
-    topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool
+    topk: int,
+    causal: bool,
+    compress_ratio: int,
+    use_int64_offsets: bool,
+    selector: str = "default",
 ) -> Callable[..., None]:
-    """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
+    """Compile indices-only selection with symbolic B, T, S and slab capacity."""
     import cutlass
     from cutlass import cute
 
     from .cute_topk import IndexerTopKKernel
 
+    operation = IndexerTopKKernel
+    if selector == "gvr2":
+        from .cute_topk_gvr2 import IndexerGVR2TopKKernel
+
+        operation = IndexerGVR2TopKKernel
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
@@ -143,7 +150,7 @@ def _compile_topk(
         use_32bit_stride=not use_int64_offsets,
     )
     return compile_tvm_ffi(
-        IndexerTopKKernel(topk, causal, use_int64_offsets, compress_ratio=compress_ratio),
+        operation(topk, causal, use_int64_offsets, compress_ratio=compress_ratio),
         scores,
         output,
         integer(0),
@@ -212,6 +219,20 @@ def _validate(
         raise RuntimeError("this tcgen05 kernel requires an SM100 or SM103 GPU")
 
 
+def resolve_selector(selector: str, topk: int) -> str:
+    """Map ``"auto"`` to the cheaper exact selector: GVR2 below ``NATIVE_TOPK_LIMIT``,
+    where it runs natively; radix at or above it, where GVR2 would only fall back to
+    radix in-kernel. See docs/indexer_gvr2_performance.md.
+    """
+    from .cute_topk_gvr2 import NATIVE_TOPK_LIMIT
+
+    if selector == "auto":
+        return "gvr2" if topk < NATIVE_TOPK_LIMIT else "default"
+    if selector not in ("default", "gvr2"):
+        raise ValueError(f"unknown indexer selector {selector!r}")
+    return selector
+
+
 def launch(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -219,10 +240,12 @@ def launch(
     topk: int,
     causal: bool = False,
     compress_ratio: int = 1,
+    selector: str = "default",
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage."""
     import cutlass
 
+    selector = resolve_selector(selector, topk)
     _validate(q, k, weights, topk, compress_ratio)
     batch, tokens, heads, head_dim = q.shape
     candidates = k.shape[1]
@@ -247,7 +270,7 @@ def launch(
             use_int64_offsets,
             weights.stride(-1) == 1,
         )
-        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets)
+        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets, selector)
     finally:
         set_compile_target(previous)
 
@@ -262,4 +285,4 @@ def launch(
     return output
 
 
-__all__ = ["launch"]
+__all__ = ["launch", "resolve_selector"]
