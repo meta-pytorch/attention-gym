@@ -538,6 +538,80 @@ def test_run_tunable_keys_winners_by_runtime_workload(isolated_cache, monkeypatc
     assert compile_count == len(candidates)
 
 
+@pytest.mark.parametrize("generated", [False, True])
+def test_run_tunable_distinguishes_runtime_only_candidates(isolated_cache, monkeypatch, generated):
+    """Different launch configs may share a binary but must not share a tuning winner."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    compile_count = 0
+    measurements = []
+
+    class RuntimeConfigKernel:
+        @staticmethod
+        def default_config(work_units, *, target):
+            return work_units
+
+        @staticmethod
+        def configs(work_units):
+            return [work_units, 2 * work_units]
+
+        @staticmethod
+        def tuning_key(work_units, *, target):
+            # Generated candidates depend on this workload; the fast memo requires
+            # that dependency even when every candidate uses the same binary.
+            return (work_units,) if generated else ()
+
+        @staticmethod
+        @cute_cache.jit_cache
+        def compile() -> FakeCompiled:
+            nonlocal compile_count
+            compile_count += 1
+            return FakeCompiled("shared")
+
+        @staticmethod
+        def compile_call(config, work_units):
+            return ()
+
+        @staticmethod
+        def launch(compiled, config, work_units):
+            assert compiled() == "shared"
+            return 1.0 / config
+
+    def measure(fn):
+        timing = fn()
+        measurements.append(timing)
+        return timing
+
+    monkeypatch.setattr(tune_module, "benchmark_gpu", measure)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    options = {
+        "autotune": True,
+        "parallel_compile": False,
+        "target": cute_target.CompileTarget("test"),
+    }
+    _, first = run_tunable(
+        RuntimeConfigKernel, 1, configs=None if generated else [1, 2], **options
+    )
+    _, second = run_tunable(
+        RuntimeConfigKernel, 2, configs=None if generated else [2, 4], **options
+    )
+    assert first == 2
+    assert second == 4
+    assert measurements == [1.0, 0.5, 0.5, 0.25]
+    assert compile_count == 1
+
+    # Exercise the fast memo, then the persisted decision with no process-local state.
+    run_tunable(RuntimeConfigKernel, 2, configs=None if generated else [2, 4], **options)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    _, cached = run_tunable(
+        RuntimeConfigKernel, 2, configs=None if generated else [2, 4], **options
+    )
+    assert cached == 4
+    assert measurements == [1.0, 0.5, 0.5, 0.25]
+    assert compile_count == 1
+
+
 def test_run_tunable_sets_target_before_candidate_generation(isolated_cache):
     """Generate target-aware candidates from the explicitly requested device."""
     config = CompileConfig("target-aware", 1.0)
