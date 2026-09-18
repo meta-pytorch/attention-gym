@@ -34,7 +34,7 @@ torch.library.define(
 )
 _CHUNK_PACKED_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
-    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, int capacity, float scale)"
+    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale)"
 )
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed",
@@ -48,7 +48,7 @@ torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, int capacity, float scale) -> Tensor",
+    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale) -> Tensor",
 )
 _RECURRENT_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
