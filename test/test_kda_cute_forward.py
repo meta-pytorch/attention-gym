@@ -1370,6 +1370,33 @@ def test_paged_chunk_kda_validates_public_contract():
         paged_chunk_kda(q.requires_grad_(), k, v, gate, beta, pool, slots)
 
 
+def test_paged_chunk_kda_accepts_disjoint_packed_cache_views():
+    from attn_gym.linear.kda.fwd.triton.paged_replay import _validate_replay_aliases
+
+    num_slots = 3
+    page_size = 96
+    storage = torch.empty((num_slots, page_size), device="cuda", dtype=torch.uint8)
+    replay_q = storage[:, :32].view(torch.bfloat16).view(num_slots, 2, 8)
+    replay_k = storage[:, 32:64].view(torch.bfloat16).view(num_slots, 2, 8)
+    state = storage[:, 64:].view(torch.float32).view(num_slots, 2, 4)
+
+    _validate_replay_aliases(
+        (("q", replay_q), ("k", replay_k)),
+        (("state_cache", state),),
+    )
+
+
+def test_paged_chunk_kda_rejects_overlapping_packed_cache_views():
+    from attn_gym.linear.kda.fwd.triton.paged_replay import _validate_replay_aliases
+
+    storage = torch.empty((3, 64), device="cuda", dtype=torch.uint8)
+    replay_q = storage[:, :32].view(torch.bfloat16).view(3, 2, 8)
+    replay_k = storage[:, 16:48].view(torch.bfloat16).view(3, 2, 8)
+
+    with pytest.raises(ValueError, match="replay_state q must not alias replay_state k"):
+        _validate_replay_aliases((("q", replay_q), ("k", replay_k)), ())
+
+
 @pytest.mark.parametrize(
     "prefill_tokens,total_tokens,slots",
     [

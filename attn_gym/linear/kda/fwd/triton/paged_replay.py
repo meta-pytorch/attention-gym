@@ -25,6 +25,45 @@ def _int64_offset_heuristic(*tensor_names: str):
     }
 
 
+def _packed_rows_are_disjoint(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Prove that two dense-row views of the same paged storage do not overlap."""
+
+    def row_layout(tensor: torch.Tensor) -> tuple[int, int, int, int] | None:
+        if tensor.ndim == 0 or tensor.shape[0] == 0:
+            return None
+        expected_stride = 1
+        for size, stride in reversed(tuple(zip(tensor.shape[1:], tensor.stride()[1:]))):
+            if size != 1 and stride != expected_stride:
+                return None
+            expected_stride *= size
+        element_size = tensor.element_size()
+        return (
+            tensor.storage_offset() * element_size,
+            expected_stride * element_size,
+            tensor.stride(0) * element_size,
+            tensor.shape[0],
+        )
+
+    left_layout = row_layout(left)
+    right_layout = row_layout(right)
+    if left_layout is None or right_layout is None:
+        return False
+    left_start, left_size, left_stride, left_rows = left_layout
+    right_start, right_size, right_stride, right_rows = right_layout
+    if left_rows == right_rows == 1:
+        return left_start + left_size <= right_start or right_start + right_size <= left_start
+    if left_stride <= 0 or left_stride != right_stride:
+        return False
+    if left_size > left_stride or right_size > right_stride:
+        return False
+    right_offset = (right_start - left_start) % left_stride
+    return right_offset >= left_size and left_stride - right_offset >= right_size
+
+
+def _tensors_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return torch._C._overlaps(left, right) and not _packed_rows_are_disjoint(left, right)
+
+
 def _validate_replay_aliases(
     replay_tensors: tuple[tuple[str, torch.Tensor], ...],
     read_only_tensors: tuple[tuple[str, torch.Tensor | None], ...],
@@ -32,10 +71,10 @@ def _validate_replay_aliases(
     """Reject storage aliasing that would make replay updates order-dependent."""
     for index, (name, tensor) in enumerate(replay_tensors):
         for other_name, other_tensor in replay_tensors[index + 1 :]:
-            if torch._C._overlaps(tensor, other_tensor):
+            if _tensors_overlap(tensor, other_tensor):
                 raise ValueError(f"replay_state {name} must not alias replay_state {other_name}")
         for other_name, other_tensor in read_only_tensors:
-            if other_tensor is not None and torch._C._overlaps(tensor, other_tensor):
+            if other_tensor is not None and _tensors_overlap(tensor, other_tensor):
                 raise ValueError(f"replay_state {name} must not alias {other_name}")
 
 
