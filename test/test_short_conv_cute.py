@@ -2085,12 +2085,91 @@ def test_paged_short_conv_prefill_matches_gather_scatter(
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
-def test_paged_short_conv_prefill_forced_int64_matches_default(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("activation", [None, "silu"])
+def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activation: str | None):
+    """Match decode numerically, not bitwise, while advancing exactly the same slots."""
+    torch.manual_seed(111)
+    channels, width = 12, 4
+    x = torch.randn(5, channels, device="cuda", dtype=dtype)
+    weight = torch.randn(channels, width, device="cuda", dtype=dtype)
+    slots = torch.tensor((4, 2, 5, 0, -1), device="cuda", dtype=torch.int32)
+    fresh_mask = torch.tensor((False, True, False, False, True), device="cuda")
+    offsets = torch.arange(x.shape[0] + 1, device="cuda", dtype=torch.int32)
+    convolve = _reference if activation == "silu" else _plain_conv_reference
+    # Both paths accumulate in FP32 but may use different reduction/FMA ordering.
+    # SiLU additionally uses the existing approximate-tanh epilogue tolerance.
+    relative_budget = width * torch.finfo(torch.float32).eps + torch.finfo(dtype).eps
+    if activation == "silu":
+        relative_budget += 2e-5
+
+    with torch.no_grad():
+        for mask in (None, fresh_mask):
+            state = torch.randn(7, width - 1, channels, device="cuda", dtype=dtype)
+            state[0].fill_(float("nan"))
+            x[3:].fill_(float("nan"))
+            if mask is not None:
+                state[4].fill_(float("nan"))
+                state[5].fill_(91)
+            history, expected_state = _decode_history_reference(x, state, slots, mask)
+            eager = convolve(history, weight)[:, -1]
+            fp64 = convolve(history.double(), weight.double())[:, -1]
+            allowance = relative_budget * (1 + fp64.abs())
+            eager_error = (eager.double() - fp64).abs()
+            decode_state = state.clone()
+            decoded = causal_conv1d_decode(
+                x,
+                weight,
+                decode_state,
+                activation=activation,
+                state_indices=slots,
+                has_initial_state=mask,
+            )
+            torch.testing.assert_close(
+                decode_state, expected_state, rtol=0, atol=0, equal_nan=True
+            )
+
+            for packed in (False, True):
+                paged_state = state.clone()
+                actual = paged_causal_conv1d(
+                    x.unsqueeze(0) if packed else x.unsqueeze(1),
+                    weight,
+                    paged_state,
+                    slots,
+                    activation=activation,
+                    cu_seqlens=offsets if packed else None,
+                    has_initial_state=mask,
+                ).reshape_as(x)
+                torch.testing.assert_close(
+                    actual, decoded, rtol=2 * relative_budget, atol=2 * relative_budget
+                )
+                assert torch.isfinite(actual).all()
+                assert torch.all((actual.double() - fp64).abs() <= eager_error + allowance)
+                torch.testing.assert_close(
+                    actual[3:], torch.zeros_like(actual[3:]), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    paged_state, expected_state, rtol=0, atol=0, equal_nan=True
+                )
+
+
+@pytest.mark.parametrize(
+    "batches,tokens,channels,expected",
+    [(32767, 65536, 1, False), (32768, 65536, 1, True), (32767, 65536, 2, True)],
+)
+def test_paged_short_conv_flattened_row_extent_abi(batches, tokens, channels, expected):
+    """The dynamic row count must fit even when its last valid offset still fits int32."""
+    x = torch.empty(batches, tokens, channels, device="meta", dtype=torch.bfloat16)
+    assert cute_backend._paged_forward_uses_int64_offsets(x, torch.empty_like(x)) is expected
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_paged_short_conv_prefill_forced_int64_matches_default(monkeypatch, packed):
     """Widen paged input addresses without changing output or state mutation."""
     torch.manual_seed(107)
     channels, width = 12, 4
-    offsets = torch.tensor((0, 2, 7), device="cuda", dtype=torch.int32)
-    x = torch.randn(1, 7, channels, device="cuda", dtype=torch.bfloat16)
+    offsets = torch.tensor((0, 2, 7), device="cuda", dtype=torch.int32) if packed else None
+    x = torch.randn(1 if packed else 2, 7, channels, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
     state_indices = torch.tensor((4, 2), device="cuda", dtype=torch.int32)
     initial_state = torch.randn(6, width - 1, channels, device="cuda", dtype=x.dtype)
@@ -2303,6 +2382,82 @@ def test_paged_short_conv_prefill_dynamic_dense_tokens():
             actual_output = compiled(x, actual_state)
             torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_paged_short_conv_prefill_reuses_jit_cache(
+    monkeypatch: pytest.MonkeyPatch, packed: bool, with_mask: bool
+):
+    """Bind B/T/N and routing at launch without creating another compiled specialization."""
+    torch.manual_seed(112)
+    channels, width = 12, 4
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    compile_functions = (
+        cute_backend._compile_paged_forward,
+        cute_backend._compile_paged_state_update,
+    )
+    # Disk hits do not increment misses: isolate the in-memory specialization count.
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+    for compile_fn in compile_functions:
+        compile_fn.cache_clear()
+
+    if packed:
+        cases = (
+            (1, 9, (0, 7)),
+            (1, 15, (0, 7)),
+            (1, 15, (0, 0, 3, 12)),
+            (1, 15, (0, 5, 5, 8)),
+            (1, 33, (0, 5, 5, 33)),
+            (1, 33, (0, 0, 0, 0)),
+        )
+    else:
+        cases = (
+            (2, 5, None),
+            (3, 5, None),
+            (3, 9, None),
+            (5, 3, None),
+            (3, 33, None),
+            (2, 5, None),
+        )
+
+    with torch.no_grad():
+        for call, (batch, tokens, boundaries) in enumerate(cases):
+            sequences = batch if boundaries is None else len(boundaries) - 1
+            active_tokens = tokens if boundaries is None else boundaries[-1]
+            offsets = (
+                None
+                if boundaries is None
+                else torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+            )
+            routes = (4, 2, 0, -1, 5) if call % 2 == 0 else (5, 1, -1, 0, 4)
+            state_indices = torch.tensor(routes[:sequences], device="cuda", dtype=torch.int32)
+            mask = torch.arange(sequences, device="cuda") % 2 == 1 if with_mask else None
+            x = torch.randn(batch, tokens, channels, device="cuda", dtype=weight.dtype)
+            x[:, active_tokens:].fill_(float("nan") if call % 2 == 0 else 91)
+            state = torch.randn(7, width - 1, channels, device="cuda", dtype=weight.dtype)
+            expected_output, expected_state = _paged_prefill_reference(
+                x, weight, state, state_indices, mask, offsets
+            )
+            actual = paged_causal_conv1d(
+                x,
+                weight,
+                state,
+                state_indices,
+                activation="silu",
+                cu_seqlens=offsets,
+                has_initial_state=mask,
+            )
+            # Packed output beyond the active endpoint is deliberately undefined.
+            torch.testing.assert_close(
+                actual[:, :active_tokens], expected_output[:, :active_tokens], rtol=0, atol=0
+            )
+            torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+            for compile_fn in compile_functions:
+                info = compile_fn.cache_info()
+                assert info.misses == 1
+                assert info.currsize == 1
+                assert info.hits == call
 
 
 def test_paged_short_conv_prefill_cuda_graph_replays_routing():
