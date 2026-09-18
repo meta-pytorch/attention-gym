@@ -124,7 +124,7 @@ class ShortConvTunedConfig:
 @cute.jit
 def sequence_bounds(cu_seqlens: cute.Tensor, time: Int32):
     """Find the packed sequence containing a physical token position."""
-    if cutlass.const_expr(cute.size(cu_seqlens) == 2):
+    if cutlass.const_expr(cute.is_static(cu_seqlens.shape) and cute.size(cu_seqlens) == 2):
         sequence = Int32(0)
         sequence_start = Int32(cu_seqlens[0])
         sequence_end = Int32(cu_seqlens[1])
@@ -145,7 +145,7 @@ def tile_sequence_bounds(
     cu_seqlens: cute.Tensor | None,
     time: Int32,
     batch: Int32,
-    tokens: cutlass.Constexpr,
+    tokens: Int32,
 ):
     """Initialize sequence metadata for a dense or packed physical tile."""
     if cutlass.const_expr(cu_seqlens is None):
@@ -358,6 +358,7 @@ class ShortConvKernel:
     kernel_kind: ClassVar[str]
     sequence_axis: ClassVar[str] = "b"
     time_tiled: ClassVar[bool] = True
+    dynamic_shape: ClassVar[bool] = False
     tma_stage_tokens: ClassVar[int] = 0
 
     def __init__(
@@ -386,16 +387,18 @@ class ShortConvKernel:
         return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
 
     @cute.jit
-    def flattened_row(self, batch, time):
+    def flattened_row(self, batch, time, tokens=None):
         """Return ``batch * tokens + time`` without overflowing before widening."""
-        return self.upcast_offset(batch) * self.tokens + self.upcast_offset(time)
+        if cutlass.const_expr(tokens is None):
+            tokens = self.tokens
+        return self.upcast_offset(batch) * tokens + self.upcast_offset(time)
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
-        name = (
-            f"short_conv_{self.kernel_kind}_{self.dtype.name}_{self.sequence_axis}{self.sequences}"
-            f"_t{self.tokens}_c{self.channels}_w{self.width}_th{self.threads}"
-        )
+        name = f"short_conv_{self.kernel_kind}_{self.dtype.name}"
+        if not self.dynamic_shape:
+            name += f"_{self.sequence_axis}{self.sequences}_t{self.tokens}"
+        name += f"_c{self.channels}_w{self.width}_th{self.threads}"
         if self.time_tiled:
             name += f"_bt{self.times_per_block}"
         name += f"_v{self.channels_per_thread}"
@@ -459,6 +462,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         state_indices: cute.Tensor | None,
         has_initial_state: cute.Tensor | None,
         full_endpoint: cutlass.Constexpr,
+        tokens: Int32,
     ):
         """Compute the physical time tile owned by this CTA."""
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -466,7 +470,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
-        active_endpoint = Int32(self.tokens)
+        active_endpoint = Int32(tokens)
         if cutlass.const_expr(not full_endpoint):
             active_endpoint = load_ragged_token_count(cu_seqlens)
 
@@ -492,7 +496,10 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 if input_time >= 0 and input_time < active_endpoint:
                     inputs[(None, input_offset)].store(
                         x_groups[
-                            ((0, None), (self.flattened_row(batch, input_time), channel_group))
+                            (
+                                (0, None),
+                                (self.flattened_row(batch, input_time, tokens), channel_group),
+                            )
                         ].load()
                     )
 
@@ -500,7 +507,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 cu_seqlens,
                 Int32(time_start),
                 Int32(batch),
-                self.tokens,
+                tokens,
             )
 
             for time_offset in cutlass.range_constexpr(self.times_per_block):
@@ -578,7 +585,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                             padding.fill(self.dtype.cute_type(0.0))
                             value = padding.load()
                     output_groups[
-                        ((0, None), (self.flattened_row(batch, time), channel_group))
+                        ((0, None), (self.flattened_row(batch, time, tokens), channel_group))
                     ].store(value)
 
     @cute.kernel
@@ -591,12 +598,15 @@ class CausalConv1dSiluForward(ShortConvKernel):
         initial_state: cute.Tensor | None,
         state_indices: cute.Tensor | None,
         has_initial_state: cute.Tensor | None,
+        tokens: Int32 | None = None,
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
+        if cutlass.const_expr(tokens is None):
+            tokens = self.tokens
         time_block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(cu_seqlens is not None):
             active_endpoint = load_ragged_token_count(cu_seqlens)
-            if active_endpoint == self.tokens:
+            if active_endpoint == tokens:
                 self.run_tile(
                     x,
                     weight,
@@ -606,6 +616,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     state_indices,
                     has_initial_state,
                     True,
+                    tokens,
                 )
             elif time_block * self.times_per_block < active_endpoint:
                 self.run_tile(
@@ -617,6 +628,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     state_indices,
                     has_initial_state,
                     False,
+                    tokens,
                 )
         else:
             self.run_tile(
@@ -628,6 +640,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 state_indices,
                 has_initial_state,
                 True,
+                tokens,
             )
 
     @cute.jit
@@ -665,6 +678,7 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
     """Launch forward with direct paged-history addressing."""
 
     kernel_kind = "paged_fwd"
+    dynamic_shape = True
 
     @cute.jit
     def __call__(
@@ -676,6 +690,7 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
         state: cute.Tensor,
         state_indices: cute.Tensor,
         has_initial_state: cute.Tensor | None,
+        tokens: Int32,
         stream,
     ):
         """Launch the mutable-history forward specialization."""
@@ -688,11 +703,12 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
             state,
             state_indices,
             has_initial_state,
+            tokens,
         ).launch(
             grid=(
-                cute.ceil_div(self.tokens, self.times_per_block),
+                cute.ceil_div(tokens, self.times_per_block),
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                self.batches,
+                1 if cutlass.const_expr(cu_seqlens is not None) else cute.size(state_indices),
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -828,6 +844,7 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
     """Write each sequence's final causal history directly into its selected slot."""
 
     kernel_kind = "paged_state"
+    dynamic_shape = True
     sequence_axis = "n"
     time_tiled = False
 
@@ -839,6 +856,7 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
         state_indices: cute.Tensor,
         has_initial_state: cute.Tensor | None,
         cu_seqlens: cute.Tensor | None,
+        tokens: Int32,
     ):
         """Advance one selected history slot without a compact staging tensor."""
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -850,8 +868,8 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
             slot = state_indices[sequence]
             if slot > 0:
                 if cutlass.const_expr(cu_seqlens is None):
-                    sequence_start = self.upcast_offset(sequence) * self.tokens
-                    sequence_end = sequence_start + self.tokens
+                    sequence_start = self.upcast_offset(sequence) * tokens
+                    sequence_end = sequence_start + tokens
                 else:
                     sequence_start = self.upcast_offset(Int32(cu_seqlens[sequence]))
                     sequence_end = self.upcast_offset(Int32(cu_seqlens[sequence + 1]))
@@ -891,14 +909,15 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
         state_indices: cute.Tensor,
         has_initial_state: cute.Tensor | None,
         cu_seqlens: cute.Tensor | None,
+        tokens: Int32,
         stream,
     ):
         """Launch one state-update task per sequence and channel group."""
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens).launch(
+        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens, tokens).launch(
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                self.sequences,
+                cute.size(state_indices),
                 1,
             ),
             block=(self.threads, 1, 1),
@@ -3490,19 +3509,19 @@ def _config(threads: int, channels_per_thread: int, times_per_block: int) -> Sho
     return ShortConvConfig(threads, channels_per_thread, times_per_block)
 
 
-def _fake_dynamic_rows(dtype: ShortConvDType, columns: int):
+def _fake_dynamic_rows(dtype: ShortConvDType, columns: int, use_int64_offsets: bool = False):
     """Create a row-major fake tensor whose row count binds at launch."""
     return cute.runtime.make_fake_compact_tensor(
         dtype.cute_type,
-        (cute.sym_int32(), columns),
+        (cute.sym_int64() if use_int64_offsets else cute.sym_int32(), columns),
         stride_order=(1, 0),
         assumed_align=16,
     )
 
 
-def _fake_state_indices(paged: bool):
-    """Create runtime-bound slot indices or preserve the unpaged specialization."""
-    if not paged:
+def _fake_indices(enabled: bool):
+    """Create runtime-bound int32 routing or packed-boundary storage."""
+    if not enabled:
         return None
     return cute.runtime.make_fake_compact_tensor(
         Int32,
@@ -3540,22 +3559,19 @@ def _fake_has_initial_state(enabled: bool):
 
 @jit_cache
 def _compile_paged_forward(
-    batches: int,
-    tokens: int,
     channels: int,
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
-    num_sequences: int,
     packed: bool,
     use_has_initial_state: bool,
     activation: Activation,
     use_int64_offsets: bool = False,
 ):
-    """Compile a forward specialization that reads history directly from paged slots."""
+    """Compile paged forward with runtime batch, token, and sequence counts."""
     operation = CausalConv1dPagedForward(
-        batches,
-        tokens,
+        0,
+        0,
         channels,
         width,
         config,
@@ -3565,33 +3581,31 @@ def _compile_paged_forward(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
-        _fake_matrix(dtype, batches * tokens, channels),
-        _fake_cu_seqlens(num_sequences if packed else None),
+        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_indices(packed),
         _fake_decode_state(dtype, width, channels),
-        _fake_state_indices(True),
+        _fake_indices(True),
         _fake_has_initial_state(use_has_initial_state),
+        Int32(0),
     )
 
 
 @jit_cache
 def _compile_paged_state_update(
-    batches: int,
-    tokens: int,
     channels: int,
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
-    num_sequences: int,
     packed: bool,
     use_has_initial_state: bool,
     use_int64_offsets: bool = False,
 ):
-    """Compile the direct final-history write for paged prefill."""
+    """Compile paged state updates with runtime token and sequence counts."""
     operation = CausalConv1dPagedStateUpdate(
-        num_sequences,
-        tokens,
+        0,
+        0,
         channels,
         width,
         config,
@@ -3600,11 +3614,12 @@ def _compile_paged_state_update(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_matrix(dtype, batches * tokens, channels),
+        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_decode_state(dtype, width, channels),
-        _fake_state_indices(True),
+        _fake_indices(True),
         _fake_has_initial_state(use_has_initial_state),
-        _fake_cu_seqlens(num_sequences if packed else None),
+        _fake_indices(packed),
+        Int32(0),
     )
 
 
@@ -3628,7 +3643,7 @@ def _compile_decode(
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels),
         _fake_decode_state(dtype, width, channels),
-        _fake_state_indices(paged),
+        _fake_indices(paged),
         _fake_has_initial_state(use_has_initial_state),
     )
 
@@ -3666,6 +3681,11 @@ def _launch_decode(
     return output
 
 
+def _paged_forward_uses_int64_offsets(x: torch.Tensor, output: torch.Tensor) -> bool:
+    # The flattened row count is itself an ABI field, not just an address bound.
+    return x.shape[0] * x.shape[1] > 2**31 - 1 or requires_int64_abi(x, output)
+
+
 def _launch_paged_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3684,20 +3704,16 @@ def _launch_paged_forward(
         raise ValueError("state storage must be 16-byte aligned for the in-place advance")
     batches, tokens, channels = x.shape
     width = weight.shape[1]
-    num_sequences = state_indices.shape[0]
     packed = cu_seqlens is not None
     _validate_config(config, channels, "forward_config")
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = torch.empty_like(x)
-    use_int64_offsets = requires_int64_abi(x, output)
+    use_int64_offsets = _paged_forward_uses_int64_offsets(x, output)
     _compile_paged_forward(
-        batches,
-        tokens,
         channels,
         width,
         dtype,
         config,
-        num_sequences,
         packed,
         has_initial_state is not None,
         resolved_activation,
@@ -3710,15 +3726,13 @@ def _launch_paged_forward(
         state,
         state_indices,
         has_initial_state,
+        tokens,
     )
     _compile_paged_state_update(
-        batches,
-        tokens,
         channels,
         width,
         dtype,
         ShortConvConfig(config.threads, config.channels_per_thread, 1),
-        num_sequences,
         packed,
         has_initial_state is not None,
         use_int64_offsets,
@@ -3728,6 +3742,7 @@ def _launch_paged_forward(
         state_indices,
         has_initial_state,
         cu_seqlens,
+        tokens,
     )
     return output
 
@@ -4562,6 +4577,10 @@ def paged_causal_conv1d(
         only rows before ``cu_seqlens[-1]`` are defined. ``state_cache`` is advanced in place.
         Empty fresh sequences clear their selected history; empty resumed sequences
         preserve it.
+
+    Batch size, token capacity, and sequence count bind at launch and reuse a compiled
+    kernel. Packed/dense mode, optional-mask presence, channels, width, dtype, activation,
+    schedule, and address width remain specialized.
 
     This operation is inference-only. Use :func:`causal_conv1d` for autograd.
     """
