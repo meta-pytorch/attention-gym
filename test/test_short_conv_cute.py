@@ -2302,7 +2302,89 @@ def test_paged_short_conv_prefill_dynamic_dense_tokens():
             )
             actual_output = compiled(x, actual_state)
             torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+        torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+def test_paged_short_conv_prefill_reuses_one_packed_kernel_across_shapes():
+    """Reuse one graph and CuTe artifact across packed token and sequence counts."""
+    torch.manual_seed(109)
+    channels, width = 12, 4
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+
+    def run(x, state, state_indices, has_initial_state, offsets):
+        return paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    cute_backend._compile_dynamic_packed_paged_forward.cache_clear()
+    cute_backend._compile_dynamic_packed_paged_state_update.cache_clear()
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    with torch._dynamo.config.patch(error_on_recompile=True), torch.no_grad():
+        for lengths in ((7, 8), (7, 9), (3, 6, 8), (1, 4, 5, 7)):
+            offsets = torch.tensor(
+                (0, *torch.tensor(lengths).cumsum(0).tolist()),
+                device="cuda",
+                dtype=torch.int32,
+            )
+            x = torch.randn(
+                1,
+                sum(lengths),
+                channels,
+                device="cuda",
+                dtype=weight.dtype,
+            )
+            state_indices = torch.arange(
+                1,
+                len(lengths) + 1,
+                device="cuda",
+                dtype=torch.int32,
+            )
+            has_initial_state = torch.tensor(
+                [index % 2 == 0 for index in range(len(lengths))],
+                device="cuda",
+            )
+            torch._dynamo.mark_dynamic(x, 1, min=1, max=64)
+            torch._dynamo.mark_dynamic(state_indices, 0, min=1, max=8)
+            torch._dynamo.mark_dynamic(has_initial_state, 0, min=1, max=8)
+            torch._dynamo.mark_dynamic(offsets, 0, min=2, max=9)
+            initial_state = torch.randn(
+                8,
+                width - 1,
+                channels,
+                device="cuda",
+                dtype=weight.dtype,
+            )
+            expected_state = initial_state.clone()
+            actual_state = initial_state.clone()
+            expected_output, expected_state = _paged_prefill_reference(
+                x,
+                weight,
+                expected_state,
+                state_indices,
+                has_initial_state,
+                offsets,
+            )
+            actual_output = compiled(
+                x,
+                actual_state,
+                state_indices,
+                has_initial_state,
+                offsets,
+            )
+            torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+    forward_info = cute_backend._compile_dynamic_packed_paged_forward.cache_info()
+    state_info = cute_backend._compile_dynamic_packed_paged_state_update.cache_info()
+    assert forward_info.currsize == state_info.currsize == 1
+    assert forward_info.hits + forward_info.misses == 4
+    assert state_info.hits + state_info.misses == 4
 
 
 def test_paged_short_conv_prefill_cuda_graph_replays_routing():
