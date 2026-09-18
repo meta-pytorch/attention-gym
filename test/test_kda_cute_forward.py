@@ -34,6 +34,13 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_fwd_ragged_paged_op,
     _chunk_kda_fwd_with_state_op,
 )
+from attn_gym.linear.kda.ops import (
+    chunk_replay_commit_op,
+    chunk_replay_prefill_commit_op,
+    chunk_replay_prefill_prepare_op,
+    chunk_replay_prepare_op,
+    chunk_replay_state_gather_op,
+)
 from attn_gym.testing import strided_state_pool
 
 pytestmark = pytest.mark.skipif(
@@ -1361,3 +1368,384 @@ def test_paged_chunk_kda_validates_public_contract():
         paged_chunk_kda(q, k, v, gate, beta, pool, slots.long())
     with pytest.raises(RuntimeError, match="inference-only"):
         paged_chunk_kda(q.requires_grad_(), k, v, gate, beta, pool, slots)
+
+
+def test_paged_chunk_kda_accepts_disjoint_packed_cache_views():
+    from attn_gym.linear.kda.fwd.triton.paged_replay import _validate_replay_aliases
+
+    num_slots = 3
+    page_size = 96
+    storage = torch.empty((num_slots, page_size), device="cuda", dtype=torch.uint8)
+    replay_q = storage[:, :32].view(torch.bfloat16).view(num_slots, 2, 8)
+    replay_k = storage[:, 32:64].view(torch.bfloat16).view(num_slots, 2, 8)
+    state = storage[:, 64:].view(torch.float32).view(num_slots, 2, 4)
+
+    _validate_replay_aliases(
+        (("q", replay_q), ("k", replay_k)),
+        (("state_cache", state),),
+    )
+
+
+def test_paged_chunk_kda_rejects_overlapping_packed_cache_views():
+    from attn_gym.linear.kda.fwd.triton.paged_replay import _validate_replay_aliases
+
+    storage = torch.empty((3, 64), device="cuda", dtype=torch.uint8)
+    replay_q = storage[:, :32].view(torch.bfloat16).view(3, 2, 8)
+    replay_k = storage[:, 16:48].view(torch.bfloat16).view(3, 2, 8)
+
+    with pytest.raises(ValueError, match="replay_state q must not alias replay_state k"):
+        _validate_replay_aliases((("q", replay_q), ("k", replay_k)), ())
+
+
+@pytest.mark.parametrize(
+    "prefill_tokens,total_tokens,slots",
+    [
+        (1, 7, (2,)),
+        (63, 75, (2,)),
+        (64, 75, (2,)),
+        (70, 75, (3, 1)),
+        (130, 139, (2,)),
+        (70, 75, (2, 0)),
+    ],
+    ids=[
+        "decode_from_fresh_slot",
+        "prefill_before_boundary",
+        "prefill_on_boundary",
+        "multiple_active_slots",
+        "multiple_chunks",
+        "padding_slot",
+    ],
+)
+def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
+    prefill_tokens: int,
+    total_tokens: int,
+    slots: tuple[int, ...],
+):
+    """Execution partitioning and cache routing preserve canonical chunk results."""
+    torch.manual_seed(48)
+    q, k, v, gate, beta = (
+        tensor.detach() for tensor in _inputs(batch=len(slots), tokens=total_tokens, heads=2)
+    )
+    expected, _ = chunk_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        autotune=False,
+        kernel_options={"schedule": "static"},
+    )
+    state_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
+    padding = state_indices <= 0
+    expected[padding] = 0
+    num_slots = max(slots) + 1
+    state_cache = torch.randn(num_slots, 2, 128, 128, device="cuda")
+    replay_state = tuple(
+        tensor.new_zeros((num_slots, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
+    ) + (torch.zeros(num_slots, device=q.device, dtype=torch.int32),)
+    for cache in replay_state[1:3]:
+        cache.normal_()
+    replay_state[3].uniform_(-1.0, 0.0)
+    replay_state[4].uniform_(0.0, 1.0)
+    replay_state[-1].fill_(7)
+    padding_slots = state_indices[padding].long()
+    state_before = state_cache[padding_slots].clone()
+    replay_before = tuple(cache[padding_slots].clone() for cache in replay_state)
+
+    outputs = [
+        paged_chunk_kda(
+            q[:, :prefill_tokens],
+            k[:, :prefill_tokens],
+            v[:, :prefill_tokens],
+            gate[:, :prefill_tokens],
+            beta[:, :prefill_tokens],
+            state_cache,
+            state_indices,
+            has_initial_state=padding,
+            autotune=False,
+            kernel_options={"schedule": "static"},
+            replay_state=replay_state,
+        )
+    ]
+    for position in range(prefill_tokens, total_tokens):
+        outputs.append(
+            paged_chunk_kda(
+                q[:, position : position + 1],
+                k[:, position : position + 1],
+                v[:, position : position + 1],
+                gate[:, position : position + 1],
+                beta[:, position : position + 1],
+                state_cache,
+                state_indices,
+                autotune=False,
+                kernel_options={"schedule": "static"},
+                replay_state=replay_state,
+            )
+        )
+
+    assert torch.equal(torch.cat(outputs, dim=1), expected)
+    completed_tokens = total_tokens // 64 * 64
+    active_slots = state_indices[state_indices > 0].long()
+    assert torch.equal(
+        replay_state[-1][active_slots],
+        replay_state[-1].new_full((active_slots.numel(),), total_tokens % 64),
+    )
+    if completed_tokens:
+        _, expected_boundary = chunk_kda(
+            q[:, :completed_tokens],
+            k[:, :completed_tokens],
+            v[:, :completed_tokens],
+            gate[:, :completed_tokens],
+            beta[:, :completed_tokens],
+            output_final_state=True,
+            autotune=False,
+            kernel_options={"schedule": "static"},
+        )
+        assert expected_boundary is not None
+        expected_state = expected_boundary[state_indices > 0]
+    else:
+        expected_state = torch.zeros_like(state_cache[active_slots])
+    assert torch.equal(state_cache[active_slots], expected_state)
+
+    assert torch.equal(state_cache[padding_slots], state_before)
+    assert all(
+        torch.equal(cache[padding_slots], expected)
+        for cache, expected in zip(replay_state, replay_before, strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "slots,has_initial_state,pending_slot",
+    [
+        ((2, 3), (False, True), 3),
+        ((0, 1), (True, False), None),
+    ],
+    ids=["distinct_state", "leading_padding"],
+)
+def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
+    slots: tuple[int, int],
+    has_initial_state: tuple[bool, bool],
+    pending_slot: int | None,
+):
+    """Packed replay uses logical sequence metadata while reading batch row zero."""
+    torch.manual_seed(51)
+    q, k, v, gate, beta = (tensor.detach() for tensor in _inputs(tokens=64, heads=2))
+    cu_seqlens = torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
+    state_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
+    initial_flags = torch.tensor(has_initial_state, device="cuda")
+    num_slots = max(slots) + 2
+    state_cache = torch.randn(num_slots, 2, 128, 128, device="cuda")
+    replay_state = tuple(
+        tensor.new_zeros((num_slots, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
+    ) + (torch.zeros(num_slots, device=q.device, dtype=torch.int32),)
+    replay_state[1].copy_(F.normalize(torch.randn_like(replay_state[1]), dim=-1))
+    replay_state[2].normal_()
+    replay_state[3].uniform_(-1.0, 0.0)
+    replay_state[4].uniform_(0.0, 1.0)
+    if pending_slot is not None:
+        replay_state[-1][pending_slot] = 48
+
+    expected_state = state_cache.clone()
+    expected_replay = tuple(cache.clone() for cache in replay_state)
+    expected_output = torch.zeros_like(v)
+    for sequence in range(2):
+        token_slice = slice(sequence * 32, (sequence + 1) * 32)
+        expected_output[:, token_slice] = paged_chunk_kda(
+            q[:, token_slice],
+            k[:, token_slice],
+            v[:, token_slice],
+            gate[:, token_slice],
+            beta[:, token_slice],
+            expected_state,
+            state_indices[sequence : sequence + 1],
+            has_initial_state=initial_flags[sequence : sequence + 1],
+            autotune=False,
+            kernel_options={"schedule": "static"},
+            replay_state=expected_replay,
+        )
+
+    output = paged_chunk_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        cu_seqlens=cu_seqlens,
+        has_initial_state=initial_flags,
+        autotune=False,
+        kernel_options={"schedule": "static"},
+        replay_state=replay_state,
+    )
+
+    assert torch.equal(output, expected_output)
+    assert torch.equal(state_cache, expected_state)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(replay_state, expected_replay, strict=True)
+    )
+
+
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
+    """Compile and CUDA-graph replay the public decode and packed-prefill routes."""
+    torch.manual_seed(49 if mode == "decode" else 52)
+    q, k, v, gate, beta = (
+        tensor.detach()
+        for tensor in _inputs(
+            batch=2 if mode == "decode" else 1,
+            tokens=1 if mode == "decode" else 64,
+            heads=2,
+        )
+    )
+    state_indices = torch.tensor(
+        [3, 1] if mode == "decode" else [2, 3],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens = (
+        None if mode == "decode" else torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
+    )
+    has_initial_state = (
+        None if mode == "decode" else torch.ones(2, device="cuda", dtype=torch.bool)
+    )
+    initial_state = (
+        torch.zeros(5, 2, 128, 128, device="cuda")
+        if mode == "decode"
+        else torch.randn(5, 2, 128, 128, device="cuda")
+    )
+    initial_replay = tuple(
+        tensor.new_zeros((5, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
+    ) + (torch.zeros(5, device=q.device, dtype=torch.int32),)
+    if mode == "prefill":
+        initial_replay[1].copy_(F.normalize(torch.randn_like(initial_replay[1]), dim=-1))
+        initial_replay[2].normal_()
+        initial_replay[3].uniform_(-1.0, 0.0)
+        initial_replay[4].uniform_(0.0, 1.0)
+        initial_replay[-1][3] = 48
+
+    def operation(state_cache, replay_state):
+        return paged_chunk_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            autotune=False,
+            kernel_options={"schedule": "static"},
+            replay_state=replay_state,
+        )
+
+    compiled_operation = torch.compile(operation, fullgraph=True)
+    compiled_operation(initial_state.clone(), tuple(tensor.clone() for tensor in initial_replay))
+    torch.cuda.synchronize()
+
+    graph_state = initial_state.clone()
+    graph_replay = tuple(tensor.clone() for tensor in initial_replay)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = operation(graph_state, graph_replay)
+
+    graph_state.copy_(initial_state)
+    for destination, source in zip(graph_replay, initial_replay, strict=True):
+        destination.copy_(source)
+    if mode == "decode":
+        state_indices.copy_(torch.tensor([4, 2], device="cuda", dtype=torch.int32))
+        v.mul_(0.75)
+    else:
+        assert cu_seqlens is not None
+        state_indices.copy_(torch.tensor([3, 2], device="cuda", dtype=torch.int32))
+        cu_seqlens.copy_(torch.tensor([0, 16, 64], device="cuda", dtype=torch.int32))
+        graph_replay[-1][2] = 32
+        graph_replay[-1][3] = 16
+
+    eager_state = graph_state.clone()
+    compiled_state = graph_state.clone()
+    eager_replay = tuple(tensor.clone() for tensor in graph_replay)
+    compiled_replay = tuple(tensor.clone() for tensor in graph_replay)
+    expected = operation(eager_state, eager_replay)
+    actual = compiled_operation(compiled_state, compiled_replay)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(compiled_state, eager_state)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(compiled_replay, eager_replay, strict=True)
+    )
+    assert torch.equal(graph_output, expected)
+    assert torch.equal(graph_state, eager_state)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(graph_replay, eager_replay, strict=True)
+    )
+
+
+def test_paged_chunk_kda_replay_custom_op_registration():
+    """Validate mutation schemas and fake metadata for replay cache operations."""
+    q, k, v, gate, beta = (tensor.detach() for tensor in _inputs(batch=2, tokens=1, heads=2))
+    state_cache = torch.zeros(4, 2, 128, 128, device="cuda")
+    replay_state = tuple(
+        tensor.new_zeros((4, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
+    ) + (torch.zeros(4, device=q.device, dtype=torch.int32),)
+    state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    prepare_args = (
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        *replay_state,
+        state_indices,
+        None,
+    )
+    torch.library.opcheck(chunk_replay_prepare_op, prepare_args)
+    prepared = chunk_replay_prepare_op(*prepare_args)
+    torch.library.opcheck(
+        chunk_replay_commit_op,
+        (
+            torch.randn_like(prepared[-2]),
+            state_indices,
+            None,
+            prepared[-1],
+            state_cache,
+            replay_state[-1],
+        ),
+    )
+
+    prefill_args = (
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        *replay_state,
+        state_indices,
+        None,
+        torch.arange(3, device="cuda", dtype=torch.int32),
+    )
+    torch.library.opcheck(chunk_replay_prefill_prepare_op, prefill_args)
+    prefill_prepared = chunk_replay_prefill_prepare_op(*prefill_args)
+    torch.library.opcheck(chunk_replay_state_gather_op, (state_cache, state_indices))
+    torch.library.opcheck(
+        chunk_replay_prefill_commit_op,
+        (
+            prefill_prepared[2],
+            prefill_prepared[9],
+            prefill_prepared[6],
+            prefill_prepared[12],
+            *prefill_prepared[7:12],
+            prefill_prepared[13],
+            state_indices,
+            *replay_state,
+            v,
+        ),
+    )
