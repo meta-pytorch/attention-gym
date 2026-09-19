@@ -8,11 +8,12 @@
 
 One pointwise kernel serves per-head gates ``[B, T, H]`` and per-channel gates ``[B, T, H, D]``:
 the launcher views a per-head gate as ``D=1`` and the kernel tiles ``rows = B*T`` by
-``channels = H*D``, recovering ``(b, t, h, d)`` through compile-time strides so any input layout
-works without copies. Strides are constexpr as elsewhere in the repo: the kernel is
-instruction-bound, and runtime strides measured 8-20% slower; the cost is one JIT per distinct
-stride set (i.e. per new ``T`` for a contiguous gate). The backward is not purely pointwise:
-``d_dt_bias`` and ``d_A_log`` reduce over rows, so each program writes one FP32 partial per
+``channels = H*D``. Compact and uniformly interleaved (element stride two) operands use native
+row/channel indexing, so their batch stride cannot specialize the binary on ``T``. Other
+layouts retain a runtime-stride path without copies. Fully runtime indexing previously measured
+8-20% slower on this instruction-bound kernel; the native paths avoid that tradeoff for ordinary
+training. The backward is not purely pointwise: ``d_dt_bias`` and ``d_A_log`` reduce over rows,
+so each program writes one FP32 partial per
 channel into a shared ``[2, row_blocks, C]`` buffer and the launcher finishes with one row
 ``sum``, keeping the reduction deterministic without atomics. (Accumulating several row tiles per
 program to shrink the partials was measured: it costs 24 registers, helps only the largest
@@ -78,29 +79,32 @@ def _load_gate_operands(
     m_row,
     m_c,
     T,
-    RAW_STRIDES: tl.constexpr,
+    RAW_STRIDES,
     A_LOG_STRIDE: tl.constexpr,
     DT_STRIDES: tl.constexpr,
     D: tl.constexpr,
+    C: tl.constexpr,
+    RAW_ELEMENT_STRIDE: tl.constexpr,
 ):
     """Return ``(s, amplitude)`` with ``s = raw + dt_bias`` in FP32 and ``amplitude = exp(A_log)``."""
     o_h = o_c // D
     o_d = o_c % D
-    raw = tl.load(
-        raw_gate
-        + ptr_offset(
+    if RAW_ELEMENT_STRIDE:
+        raw_offsets = (o_row[:, None] * C + o_c[None, :]) * RAW_ELEMENT_STRIDE
+    else:
+        raw_offsets = ptr_offset(
             ((o_row // T)[:, None], (o_row % T)[:, None], o_h[None, :], o_d[None, :]),
             RAW_STRIDES,
-        ),
-        mask=m_row[:, None] & m_c[None, :],
-        other=0.0,
-    ).to(tl.float32)
+        )
+    raw = tl.load(raw_gate + raw_offsets, mask=m_row[:, None] & m_c[None, :], other=0.0).to(
+        tl.float32
+    )
     bias = tl.load(dt_bias + ptr_offset((o_h, o_d), DT_STRIDES), mask=m_c, other=0.0)
     amplitude = tl.exp(tl.load(A_log + o_h * A_LOG_STRIDE, mask=m_c, other=0.0))
     return raw + bias[None, :], amplitude
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS", "T", "RAW_STRIDES"])
 def softplus_gate_fwd_kernel(
     raw_gate,
     A_log,
@@ -108,15 +112,15 @@ def softplus_gate_fwd_kernel(
     gate,
     ROWS,
     T,
-    RAW_STRIDES: tl.constexpr,
+    RAW_STRIDES,
     A_LOG_STRIDE: tl.constexpr,
     DT_STRIDES: tl.constexpr,
-    GATE_STRIDES: tl.constexpr,
     C: tl.constexpr,
     D: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FASTMATH: tl.constexpr,
+    RAW_ELEMENT_STRIDE: tl.constexpr,
 ):
     o_row = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     o_c = (tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)).to(tl.int64)
@@ -135,20 +139,18 @@ def softplus_gate_fwd_kernel(
         A_LOG_STRIDE,
         DT_STRIDES,
         D,
+        C,
+        RAW_ELEMENT_STRIDE,
     )
     value = -amplitude[None, :] * _softplus(s, FASTMATH)
     tl.store(
-        gate
-        + ptr_offset(
-            ((o_row // T)[:, None], (o_row % T)[:, None], (o_c // D)[None, :], (o_c % D)[None, :]),
-            GATE_STRIDES,
-        ),
+        gate + o_row[:, None] * C + o_c[None, :],
         value,
         mask=m_row[:, None] & m_c[None, :],
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS", "T", "RAW_STRIDES", "D_GATE_STRIDES"])
 def softplus_gate_bwd_kernel(
     raw_gate,
     A_log,
@@ -159,16 +161,17 @@ def softplus_gate_bwd_kernel(
     d_dt_bias_partial,
     ROWS,
     T,
-    RAW_STRIDES: tl.constexpr,
+    RAW_STRIDES,
     A_LOG_STRIDE: tl.constexpr,
     DT_STRIDES: tl.constexpr,
-    D_GATE_STRIDES: tl.constexpr,
-    D_RAW_STRIDES: tl.constexpr,
+    D_GATE_STRIDES,
     C: tl.constexpr,
     D: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FASTMATH: tl.constexpr,
+    RAW_ELEMENT_STRIDE: tl.constexpr,
+    D_GATE_ELEMENT_STRIDE: tl.constexpr,
 ):
     i_row_block = tl.program_id(0).to(tl.int64)
     o_row = i_row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -189,27 +192,47 @@ def softplus_gate_bwd_kernel(
         A_LOG_STRIDE,
         DT_STRIDES,
         D,
+        C,
+        RAW_ELEMENT_STRIDE,
     )
-    element_offsets = (
-        (o_row // T)[:, None],
-        (o_row % T)[:, None],
-        (o_c // D)[None, :],
-        (o_c % D)[None, :],
-    )
-    grad = tl.load(d_gate + ptr_offset(element_offsets, D_GATE_STRIDES), mask=mask, other=0.0)
+    if D_GATE_ELEMENT_STRIDE:
+        grad_offsets = (o_row[:, None] * C + o_c[None, :]) * D_GATE_ELEMENT_STRIDE
+    else:
+        grad_offsets = ptr_offset(
+            (
+                (o_row // T)[:, None],
+                (o_row % T)[:, None],
+                (o_c // D)[None, :],
+                (o_c % D)[None, :],
+            ),
+            D_GATE_STRIDES,
+        )
+    grad = tl.load(d_gate + grad_offsets, mask=mask, other=0.0)
     grad = grad.to(tl.float32)
 
     # gate = -amplitude * softplus(s): d/ds = -amplitude * sigmoid(s); d/dA_log = gate.
     d_s = -amplitude[None, :] * _sigmoid(s, FASTMATH) * grad
     d_amplitude_log = -amplitude[None, :] * _softplus(s, FASTMATH) * grad
     tl.store(
-        d_raw_gate + ptr_offset(element_offsets, D_RAW_STRIDES),
+        d_raw_gate + o_row[:, None] * C + o_c[None, :],
         d_s.to(d_raw_gate.dtype.element_ty),
         mask=mask,
     )
     # Masked rows loaded grad == 0, so they contribute exactly zero to the block partials.
     tl.store(d_dt_bias_partial + i_row_block * C + o_c, tl.sum(d_s, 0), mask=m_c)
     tl.store(d_A_log_partial + i_row_block * C + o_c, tl.sum(d_amplitude_log, 0), mask=m_c)
+
+
+def _softplus_element_stride(tensor: torch.Tensor) -> int:
+    """Select bounded compact/interleaved layouts; zero keeps arbitrary runtime strides."""
+    if tensor.is_contiguous():
+        return 1
+    expected_stride = 2
+    for size, stride in zip(reversed(tensor.shape), reversed(tensor.stride()), strict=True):
+        if size > 1 and stride != expected_stride:
+            return 0
+        expected_stride *= size
+    return 2
 
 
 def _launch_config(channels: int, elements_per_program: int) -> tuple[int, int]:
@@ -226,6 +249,7 @@ def _softplus_gate_fwd_cuda(
 ) -> torch.Tensor:
     """Launch the forward over any input layout and return a compact FP32 gate."""
     shape = raw_gate.shape
+    raw_element_stride = _softplus_element_stride(raw_gate)
     if raw_gate.ndim == 3:  # Per-head gate: view as per-channel with D=1.
         raw_gate, dt_bias = raw_gate.unsqueeze(-1), dt_bias.unsqueeze(-1)
     batch, tokens, heads, head_dim = raw_gate.shape
@@ -242,10 +266,10 @@ def _softplus_gate_fwd_cuda(
         gate,
         rows,
         tokens,
-        RAW_STRIDES=raw_gate.stride(),
+        RAW_STRIDES=(0, 0, 0, 0) if raw_element_stride else raw_gate.stride(),
+        RAW_ELEMENT_STRIDE=raw_element_stride,
         A_LOG_STRIDE=A_log.stride(0),
         DT_STRIDES=dt_bias.stride(),
-        GATE_STRIDES=gate.stride(),
         C=channels,
         D=head_dim,
         BLOCK_ROWS=block_rows,
@@ -265,6 +289,7 @@ def _softplus_gate_bwd_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch the backward; returns ``(d_raw_gate, d_A_log, d_dt_bias)`` with reduced params."""
     shape = raw_gate.shape
+    raw_element_stride = _softplus_element_stride(raw_gate)
     if raw_gate.ndim == 3:  # Per-head gate: view as per-channel with D=1.
         raw_gate, dt_bias, d_gate = (t.unsqueeze(-1) for t in (raw_gate, dt_bias, d_gate))
     batch, tokens, heads, head_dim = raw_gate.shape
@@ -273,6 +298,7 @@ def _softplus_gate_bwd_cuda(
     elements_per_program, num_warps = BWD_PROGRAM
     block_rows, block_channels = _launch_config(channels, elements_per_program)
     row_blocks = triton.cdiv(rows, block_rows)
+    d_gate_element_stride = _softplus_element_stride(d_gate)
     # Both parameter partials share one buffer so a single row reduction finishes them; the
     # separate `view(rb, H, D).sum((0, 2))` pattern was a slow strided reduce (2x the time).
     # d_dt_bias occupies row 0 so the returned view has the compact, zero-offset metadata the
@@ -289,11 +315,12 @@ def _softplus_gate_bwd_cuda(
         d_dt_bias_partial,
         rows,
         tokens,
-        RAW_STRIDES=raw_gate.stride(),
+        RAW_STRIDES=(0, 0, 0, 0) if raw_element_stride else raw_gate.stride(),
+        RAW_ELEMENT_STRIDE=raw_element_stride,
         A_LOG_STRIDE=A_log.stride(0),
         DT_STRIDES=dt_bias.stride(),
-        D_GATE_STRIDES=d_gate.stride(),
-        D_RAW_STRIDES=d_raw_gate.stride(),
+        D_GATE_STRIDES=(0, 0, 0, 0) if d_gate_element_stride else d_gate.stride(),
+        D_GATE_ELEMENT_STRIDE=d_gate_element_stride,
         C=channels,
         D=head_dim,
         BLOCK_ROWS=block_rows,
