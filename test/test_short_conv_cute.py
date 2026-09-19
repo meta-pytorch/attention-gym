@@ -86,14 +86,17 @@ def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.silu(_plain_conv_reference(x, weight))
 
 
-def test_short_conv_forced_int64_matches_default(monkeypatch):
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("channels", [12, 512])
+def test_short_conv_forced_int64_matches_default(monkeypatch, packed, channels):
     """Widen forward and every training gradient without changing bits."""
 
     def run():
         torch.manual_seed(43)
-        x, weight = _inputs(tokens=64, channels=512, batch=2)
+        x, weight = _inputs(tokens=64, channels=channels, batch=1 if packed else 2)
+        offsets = torch.tensor([0, 0, 7, 64], device="cuda", dtype=torch.int32) if packed else None
         initial_state = torch.randn(
-            2,
+            3 if packed else 2,
             weight.shape[1] - 1,
             x.shape[2],
             device="cuda",
@@ -105,6 +108,7 @@ def test_short_conv_forced_int64_matches_default(monkeypatch):
             weight,
             activation="silu",
             initial_state=initial_state,
+            cu_seqlens=offsets,
         )
         gradients = torch.autograd.grad(output.square().sum(), (x, weight, initial_state))
         return output, *gradients
@@ -419,25 +423,21 @@ def test_short_conv_ampere_compiles_portable_gradients(monkeypatch):
     activation = cute_backend.resolve_activation("silu")
 
     input_gradient = cute_backend._compile_input_gradient.__wrapped__(
-        1,
-        24,
         512,
         4,
         descriptor,
         defaults.input_gradient,
-        2,
+        True,
         False,
         activation,
         (8, 6),
     )
     weight_gradient = cute_backend._compile_weight_gradient.__wrapped__(
-        1,
-        24,
         256,
         4,
         descriptor,
         defaults.weight_gradient,
-        2,
+        True,
         False,
         activation,
         (8, 6),
@@ -452,8 +452,6 @@ def test_short_conv_tma_rejects_partial_channel_tiles():
     config = ShortConvTunedConfig.default(torch.bfloat16, packed=True).input_gradient
     with pytest.raises(AssertionError, match="must be divisible by the channel tile"):
         cute_backend.CausalConv1dSiluInputGradientTma(
-            1,
-            384,
             513,
             4,
             config,
@@ -1039,8 +1037,7 @@ def test_short_conv_tuning_projects_device_capability(monkeypatch):
     def fake_tune(configs, compile_fn, launch, *, compile_call, parallel_compile):
         config = next(iter(configs))
         projected = compile_call(config)
-        signature(compile_fn.__wrapped__).bind(*projected)
-        compile_calls[compile_fn] = projected
+        compile_calls[compile_fn] = signature(compile_fn.__wrapped__).bind(*projected).arguments
         return config
 
     class AmpereProperties:
@@ -1060,8 +1057,8 @@ def test_short_conv_tuning_projects_device_capability(monkeypatch):
         weight_grad_configs=(config,),
     )
 
-    assert compile_calls[cute_backend._compile_input_gradient][-1] == (8, 6)
-    assert compile_calls[cute_backend._compile_weight_gradient][-1] == (8, 6)
+    assert compile_calls[cute_backend._compile_input_gradient]["capability"] == (8, 6)
+    assert compile_calls[cute_backend._compile_weight_gradient]["capability"] == (8, 6)
 
 
 def test_short_conv_explicit_config_and_tuning_flow():
@@ -1400,7 +1397,6 @@ def test_short_conv_persistent_tma_input_gradient_replays_phase_wrap():
     device = torch.device("cuda", torch.cuda.current_device())
     channels = input_config.threads * input_config.channels_per_thread
     workers = cute_backend._persistent_tma_dx_workers(
-        32_768,
         channels,
         input_config,
         device,
@@ -2866,3 +2862,260 @@ def test_short_conv_decode_cuda_graph_replay(paged_short_conv_inputs, input_kwar
     expected = causal_conv1d_decode(x, weight, state, activation="silu", state_indices=slots)
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
     torch.testing.assert_close(replayed_state, state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "packed,route",
+    [(False, "portable"), (False, "tma"), (True, "portable"), (True, "tma"), (True, "persistent")],
+)
+@pytest.mark.parametrize("with_state", [False, True])
+def test_short_conv_training_reuses_jit_cache(
+    monkeypatch: pytest.MonkeyPatch, packed: bool, route: str, with_state: bool
+):
+    """Reuse real compiled entrypoints across independent B/T/N and small-grid changes."""
+    if route != "portable" and torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("TMA and persistent training routes require SM90+")
+    torch.manual_seed(129)
+    channels, width = (12 if route == "portable" else 512), 4
+    operations = []
+    compile_tvm_ffi = cute_backend.compile_tvm_ffi
+
+    def record_compile(operation, *args, **kwargs):
+        operations.append(operation)
+        return compile_tvm_ffi(operation, *args, **kwargs)
+
+    monkeypatch.setattr(cute_backend, "compile_tvm_ffi", record_compile)
+    compile_functions = [
+        cute_backend._compile_forward,
+        cute_backend._compile_input_gradient,
+        cute_backend._compile_weight_gradient,
+    ]
+    if with_state:
+        compile_functions.append(cute_backend._compile_initial_state_gradient)
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+    for compile_fn in compile_functions:
+        compile_fn.cache_clear()
+    cases = (
+        [
+            (1, 9, [0, 9]),
+            (1, 33, [0, 33]),
+            (1, 33, [0, 0, 3, 27]),
+            (1, 33, [0, 5, 5, 19]),
+            (1, 65, [0, 5, 5, 61]),
+            (1, 65, [0, 0, 0, 0]),
+        ]
+        if packed
+        else [(1, 9, None), (3, 9, None), (3, 33, None), (2, 65, None)]
+    )
+    for call, (batch, tokens, boundaries) in enumerate(cases):
+        x, weight = _inputs(tokens=tokens, channels=channels, batch=batch)
+        count = batch if boundaries is None else len(boundaries) - 1
+        active = tokens if boundaries is None else boundaries[-1]
+        offsets = (
+            None
+            if boundaries is None
+            else torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+        )
+        initial = (
+            torch.randn(
+                count, width - 1, channels, device="cuda", dtype=x.dtype, requires_grad=True
+            )
+            if with_state
+            else None
+        )
+        incoming = torch.randn_like(x)
+        with torch.no_grad():
+            x[:, active:].fill_(float("nan") if call % 2 else 91)
+            incoming[:, active:].fill_(float("nan"))
+        actual = causal_conv1d(
+            x,
+            weight,
+            activation="silu",
+            cu_seqlens=offsets,
+            initial_state=initial,
+            persistent_tma_input_gradient=route == "persistent",
+        )
+        inputs = (x, weight, initial) if with_state else (x, weight)
+        gradients = torch.autograd.grad(actual, inputs, incoming)
+        _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
+        for compile_fn in compile_functions:
+            info = compile_fn.cache_info()
+            assert info.misses == 1
+            assert info.currsize == 1
+            assert info.hits == call
+    dx = next(op for op in operations if op.kernel_kind == "dx")
+    dw = next(op for op in operations if op.kernel_kind == "dw")
+    assert isinstance(dx, cute_backend.CausalConv1dSiluInputGradientTma) == (route != "portable")
+    assert isinstance(dw, cute_backend.CausalConv1dSiluWeightGradientPartialsTma) == (
+        route != "portable"
+    )
+    if route == "persistent":
+        assert dx.time_workers > 0
+
+
+def _training_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    initial: torch.Tensor | None,
+    boundaries: list[int] | None,
+) -> torch.Tensor:
+    """Independent tap-wise convolution; never read padded physical storage."""
+    outputs = []
+    if boundaries is None:
+        segments = [(b, 0, x.shape[1]) for b in range(x.shape[0])]
+    else:
+        segments = [(0, start, end) for start, end in pairwise(boundaries)]
+    width = weight.shape[1]
+    for sequence, (batch, start, end) in enumerate(segments):
+        history = (
+            x.new_zeros(1, width - 1, x.shape[2])
+            if initial is None
+            else initial[sequence : sequence + 1]
+        )
+        extended = torch.cat((history, x[batch : batch + 1, start:end]), dim=1)
+        value = sum(extended[:, tap : tap + end - start] * weight[:, tap] for tap in range(width))
+        outputs.append(F.silu(value))
+    return torch.cat(outputs, dim=0 if boundaries is None else 1)
+
+
+def _assert_training_reference(
+    actual: torch.Tensor,
+    gradients: tuple[torch.Tensor, ...],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    initial: torch.Tensor | None,
+    incoming: torch.Tensor,
+    boundaries: list[int] | None,
+) -> None:
+    """Check every training result against FP64 and the eager rounding baseline."""
+    active = x.shape[1] if boundaries is None else boundaries[-1]
+    tensors = (x, weight) if initial is None else (x, weight, initial)
+    results = []
+    for dtype in (x.dtype, torch.float64):
+        refs = tuple(t.detach().to(dtype).requires_grad_() for t in tensors)
+        output = _training_reference(
+            refs[0], refs[1], None if initial is None else refs[2], boundaries
+        )
+        grads = torch.autograd.grad(output, refs, incoming[:, :active].to(dtype))
+        results.append((output, grads[0][:, :active], *grads[1:]))
+    observed = (actual[:, :active], gradients[0][:, :active], *gradients[1:])
+    # FP32 accumulation plus final storage rounding; eager can round every tap.
+    allowance = {torch.float16: 1e-3, torch.bfloat16: 8e-3, torch.float32: 5e-6}[x.dtype]
+    for value, eager, high in zip(observed, *results, strict=True):
+        assert torch.isfinite(value).all()
+        if value.numel():
+            scale = high.norm().clamp_min(1e-30)
+            assert (value.double() - high).norm() / scale <= (
+                eager.double() - high
+            ).norm() / scale + allowance
+            torch.testing.assert_close(value.double(), high, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_short_conv_training_public_dynamic_fullgraph(packed: bool, fresh_compile_cache):
+    compiled = torch.compile(causal_conv1d, fullgraph=True, dynamic=True)
+    for batch, tokens, boundaries in (
+        [(1, 16, [0, 16]), (1, 33, [0, 0, 7, 33])] if packed else [(2, 16, None), (3, 33, None)]
+    ):
+        x, weight = _inputs(tokens=tokens, channels=512, batch=batch)
+        initial = torch.randn(
+            batch if boundaries is None else len(boundaries) - 1,
+            3,
+            512,
+            device="cuda",
+            dtype=x.dtype,
+            requires_grad=True,
+        )
+        offsets = (
+            None
+            if boundaries is None
+            else torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+        )
+        incoming = torch.randn_like(x)
+        actual = compiled(x, weight, activation="silu", cu_seqlens=offsets, initial_state=initial)
+        gradients = torch.autograd.grad(actual, (x, weight, initial), incoming)
+        _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
+
+
+@pytest.mark.parametrize("route", ["portable", "tma", "persistent"])
+@pytest.mark.parametrize("tokens", [64, 65])
+def test_short_conv_training_graph_replays_boundaries(route: str, tokens: int):
+    """Capture fwd/all backwards, then change boundaries including empty/poisoned suffixes."""
+    if route != "portable" and torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("TMA and persistent training routes require SM90+")
+    channels = 12 if route == "portable" else 512
+    x, weight = _inputs(tokens=tokens, channels=channels)
+    initial = torch.randn(4, 3, channels, device="cuda", dtype=x.dtype, requires_grad=True)
+    incoming = torch.randn_like(x)
+    offsets = torch.tensor([0, 0, 7, 33, tokens], device="cuda", dtype=torch.int32)
+
+    def run():
+        output = causal_conv1d(
+            x,
+            weight,
+            activation="silu",
+            cu_seqlens=offsets,
+            initial_state=initial,
+            persistent_tma_input_gradient=route == "persistent",
+        )
+        return output, torch.autograd.grad(output, (x, weight, initial), incoming)
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, gradients = run()
+    for boundaries in ([0, 3, 3, 17, 61], [0, 0, 0, 0, 0], [0, 9, 9, 33, tokens]):
+        with torch.no_grad():
+            offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+            x.normal_()
+            initial.normal_()
+            weight.normal_()
+            incoming.normal_()
+            x[:, boundaries[-1] :].fill_(float("nan"))
+            incoming[:, boundaries[-1] :].fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_training_reference(output, gradients, x, weight, initial, incoming, boundaries)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("with_state", [False, True])
+def test_short_conv_training_forward_reuses_tail_classes(monkeypatch, packed, with_state):
+    """Full physical tiles are one bounded class, not an exact-T specialization."""
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+    compile_fn = cute_backend._compile_forward
+    compile_fn.cache_clear()
+    for call, (batch, tokens) in enumerate([(2, 17), (3, 33), (3, 16), (2, 48), (2, 32)]):
+        x, weight = _inputs(tokens=tokens, batch=1 if packed else batch)
+        active = tokens - 3 if packed and call == 3 else tokens
+        if packed and call == 4:
+            active = 0
+        boundaries = [0, 0, active // 2, active] if packed else None
+        offsets = (
+            None
+            if boundaries is None
+            else torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+        )
+        initial = (
+            torch.randn(
+                3 if packed else batch, 3, 12, device="cuda", dtype=x.dtype, requires_grad=True
+            )
+            if with_state
+            else None
+        )
+        incoming = torch.randn_like(x)
+        with torch.no_grad():
+            x[:, active:].fill_(float("nan"))
+            incoming[:, active:].fill_(float("nan"))
+        actual = causal_conv1d(
+            x, weight, activation="silu", cu_seqlens=offsets, initial_state=initial
+        )
+        gradients = torch.autograd.grad(
+            actual, (x, weight) if initial is None else (x, weight, initial), incoming
+        )
+        _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
+        info = compile_fn.cache_info()
+        assert info.misses == (1 if call < 2 else 2)
+        assert info.currsize == (1 if call < 2 else 2)
