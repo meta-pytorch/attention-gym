@@ -37,8 +37,6 @@ from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
 
 module._compile_chunk_kda_bwd_intra(
     heads=1,
-    capacity=1,
-    grid_chunks=1,
     ragged=False,
     io_type=module._IO_TYPES[torch.bfloat16],
     use_int64_offsets=False,

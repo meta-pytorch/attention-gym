@@ -927,8 +927,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     mDg2: cute.Tensor,
     mCuSeqlens: cute.Tensor | None,
     mChunkOffsets: cute.Tensor | None,
-    capacity: Constexpr,
-    grid_chunks: Constexpr,
+    grid_chunks: Int32,
     ragged: Constexpr,
     use_int64_offsets: Constexpr,
     use_packed_f32x2: Constexpr,
@@ -949,12 +948,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     row0 = row_base + gid
     row1 = row0 + 8
 
-    # Ragged graph replays read the active count on-device; dense launches use
-    # their shape-derived compile-time capacity.
+    # Both bounds are runtime values: packed replays read the active count
+    # on-device, while dense launches derive it from the symbolic token extent.
     if cutlass.const_expr(ragged):
         active_chunks = load_ragged_chunk_count(mChunkOffsets)
     else:
-        active_chunks = Int32(capacity)
+        active_chunks = cute.size(mQ.shape[1]) // BT
     iters = (active_chunks - chunk_start + grid_chunks - 1) // grid_chunks
 
     # SMEM is allocated once and reused across the chunk-loop iterations.
@@ -1944,15 +1943,11 @@ class ChunkKdaBwdIntraHmmaGrid:
 
     def __init__(
         self,
-        capacity: int,
-        grid_chunks: int,
         ragged: bool,
         use_int64_offsets: bool,
         use_packed_f32x2: bool,
         use_stmatrix: bool,
     ):
-        self.capacity = capacity
-        self.grid_chunks = grid_chunks
         self.ragged = ragged
         self.use_int64_offsets = use_int64_offsets
         self.use_packed_f32x2 = use_packed_f32x2
@@ -1976,6 +1971,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         mDg2: cute.Tensor,
         mCuSeqlens: cute.Tensor | None,
         mChunkOffsets: cute.Tensor | None,
+        grid_chunks: Int32,
         stream: cuda.CUstream = None,
     ):
         _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix("cutlass_dsl_chunk_kda_bwd_intra")
@@ -1995,21 +1991,20 @@ class ChunkKdaBwdIntraHmmaGrid:
             mDg2,
             mCuSeqlens,
             mChunkOffsets,
-            self.capacity,
-            self.grid_chunks,
+            grid_chunks,
             self.ragged,
             self.use_int64_offsets,
             self.use_packed_f32x2,
             self.use_stmatrix,
         ).launch(
-            grid=(KC_TOTAL, self.grid_chunks, cute.size(mQ.shape[2])),
+            grid=(KC_TOTAL, grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),
             stream=stream,
         )
 
 
 class ChunkKdaBwdIntraConfig(NamedTuple):
-    """Compile-time persistent-grid choice for intra-chunk backward."""
+    """Persistent-grid choice for intra-chunk backward."""
 
     grid_chunks: int
 
@@ -2017,22 +2012,16 @@ class ChunkKdaBwdIntraConfig(NamedTuple):
 @jit_cache
 def _compile_chunk_kda_bwd_intra(
     heads: int,
-    capacity: int,
-    grid_chunks: int,
     ragged: bool,
     io_type: type[cutlass.Numeric],
     use_int64_offsets: bool = False,
 ):
     """Compile one persistent intra-chunk backward specialization."""
-    if not 1 <= grid_chunks <= capacity:
-        raise ValueError(f"grid_chunks must be in [1, {capacity}], got {grid_chunks}")
     target = get_compile_target()
     capability = target.effective_capability
     if target.device_type != "cuda" or capability is None or capability < (8, 0):
         raise ValueError(f"KDA backward intra requires CUDA capability >= 8.0; got {target}")
     op = ChunkKdaBwdIntraHmmaGrid(
-        capacity=capacity,
-        grid_chunks=grid_chunks,
         ragged=ragged,
         use_int64_offsets=use_int64_offsets,
         use_packed_f32x2=is_sm100_kda_capability(capability),
@@ -2102,8 +2091,9 @@ def _compile_chunk_kda_bwd_intra(
         dg2,
         cu_seqlens,
         chunk_offsets,
+        Int32(1),
         name=(
-            f"kda_bwd_intra_h{heads}_c{capacity}_gc{grid_chunks}_{_IO_TYPE_NAMES[io_type]}_rg{int(ragged)}"
+            f"kda_bwd_intra_h{heads}_{_IO_TYPE_NAMES[io_type]}_rg{int(ragged)}"
             f"_i64{int(use_int64_offsets)}"
         ),
     )
@@ -2147,11 +2137,11 @@ class ChunkKdaBwdIntraTunable:
         return ChunkKdaBwdIntraConfig(grid_chunks)
 
     @staticmethod
-    def tuning_key(_args: Args, *, target: CompileTarget) -> tuple[()]:
-        """Reuse winners because capacity is already a compile specialization."""
+    def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
+        """Keep capacity-specific tuning winners without specializing compilation."""
         if target.sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        return ()
+        return (args.capacity,)
 
     @classmethod
     def configs(cls, args: Args) -> tuple[ChunkKdaBwdIntraConfig, ...]:
@@ -2173,12 +2163,14 @@ class ChunkKdaBwdIntraTunable:
     def compile_call(
         config: ChunkKdaBwdIntraConfig,
         args: Args,
-    ) -> tuple[int, int, int, bool, type[cutlass.Numeric], bool]:
+    ) -> tuple[int, bool, type[cutlass.Numeric], bool]:
+        if not 1 <= config.grid_chunks <= args.capacity:
+            raise ValueError(
+                f"grid_chunks must be in [1, {args.capacity}], got {config.grid_chunks}"
+            )
         io_type = _IO_TYPES[args.q.dtype]
         return (
             args.q.shape[2],
-            args.capacity,
-            config.grid_chunks,
             args.chunk_offsets is not None,
             io_type,
             requires_int64_abi(
@@ -2204,7 +2196,6 @@ class ChunkKdaBwdIntraTunable:
     def launch(
         compiled, config: ChunkKdaBwdIntraConfig, args: Args
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        del config
         compiled(
             _column_token_head(args.q),
             _column_token_head(args.k),
@@ -2221,6 +2212,7 @@ class ChunkKdaBwdIntraTunable:
             _column_token_head(args.dg2),
             args.cu_seqlens,
             args.chunk_offsets,
+            config.grid_chunks,
         )
         db2 = torch.empty_like(args.db)
         elements = args.db.numel()
