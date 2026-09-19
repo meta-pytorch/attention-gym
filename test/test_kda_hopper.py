@@ -352,6 +352,7 @@ def test_hopper_raw_operator_registration():
         initial_state.detach(),
         128**-0.5,
         False,
+        "auto",
     )
     torch.library.opcheck(
         _chunk_kda_fwd_with_state_op,
@@ -379,6 +380,7 @@ def test_hopper_raw_operator_registration():
             128**-0.5,
             False,
             False,
+            "auto",
         ),
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
