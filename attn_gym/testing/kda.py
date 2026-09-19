@@ -169,6 +169,33 @@ def assert_matches_low_precision_reference(
     )
 
 
+@torch.no_grad()
+def assert_rms_matches_low_precision_reference(
+    actual: torch.Tensor,
+    high_precision: torch.Tensor,
+    low_precision: torch.Tensor,
+    name: str,
+    *,
+    source_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Apply the pointwise reference-error policy to aggregate RMS error.
+
+    This is an accuracy envelope, not an analytical bound for every kernel's
+    rounding tree. Pair it with ``assert_matches_low_precision_reference`` so
+    neither isolated outliers nor widespread errors can hide in the other metric.
+    """
+    high_precision = high_precision.double()
+    scale = high_precision.square().mean().sqrt().item()
+    actual_error = (actual.double() - high_precision).square().mean().sqrt().item()
+    reference_error = (low_precision.double() - high_precision).square().mean().sqrt().item()
+    budget = 2 * (reference_error + torch.finfo(source_dtype).eps * scale)
+    assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
+    assert actual_error <= budget, (
+        f"{name}: RMS error {actual_error:.3e} exceeds {budget:.3e} "
+        f"(reference error {reference_error:.3e})"
+    )
+
+
 def assert_relative_rms_within(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -401,6 +428,7 @@ def bwd_wy_dqkg_reference(
 __all__ = [
     "assert_matches_low_precision_reference",
     "assert_relative_rms_within",
+    "assert_rms_matches_low_precision_reference",
     "bwd_daqk_reference",
     "bwd_intra_reference",
     "bwd_wy_dqkg_reference",

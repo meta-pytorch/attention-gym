@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import importlib
-from functools import partial
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -11,7 +11,6 @@ import torch
 pytest.importorskip("cutlass")
 
 from attn_gym.linear import Impl, chunk_kda, paged_chunk_kda
-from attn_gym.linear._delta_rule.reference import packed_delta_rule_reference
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
@@ -20,11 +19,13 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _chunk_kda_bwd_with_state_grad_op,
     _chunk_kda_fwd_with_state_op,
 )
-from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
+from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
+    assert_rms_matches_low_precision_reference,
     clone_kda_inputs,
     cumulative_sequence_offsets,
+    kda_reference,
     make_kda_test_inputs,
     strided_state_pool,
 )
@@ -35,36 +36,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _high_precision_reference(
-    inputs: tuple[torch.Tensor, ...],
-    cu_seqlens: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Evaluate the public natural-log gate contract without its FP32 cast."""
-    q, k, v, gate, beta, initial_state = inputs
-    dense_op = partial(naive_chunk_kda, chunk_size=64)
-    if cu_seqlens is None:
-        return dense_op(
-            q,
-            k,
-            v,
-            gate * LOG2_E,
-            beta,
-            initial_state=initial_state,
-            scale=128**-0.5,
-            output_final_state=True,
-        )
-    return packed_delta_rule_reference(
-        dense_op,
-        q,
-        k,
-        v,
-        gate * LOG2_E,
-        beta,
-        initial_state,
-        cu_seqlens,
-        True,
-        scale=128**-0.5,
-    )
+@pytest.fixture(autouse=True)
+def deterministic_rng() -> Iterator[None]:
+    """Isolate state and cotangent draws as well as the separately seeded Q/K/V factory."""
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.random.default_generator.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        yield
 
 
 def _training_inputs(
@@ -113,23 +91,8 @@ def _assert_training_matches_reference(
         output_final_state=True,
         impl=Impl.REFERENCE,
     )
-    high_output, high_state = _high_precision_reference(high_inputs, cu_seqlens)
+    high_output, high_state = kda_reference(*high_inputs, cu_seqlens=cu_seqlens)
     assert actual_state is not None and reference_state is not None and high_state is not None
-    assert_matches_low_precision_reference(
-        actual_output,
-        high_output,
-        reference_output,
-        "Hopper chunk KDA output",
-        source_dtype=dtype,
-    )
-    assert_matches_low_precision_reference(
-        actual_state,
-        high_state,
-        reference_state,
-        "Hopper chunk KDA final state",
-        source_dtype=dtype,
-    )
-
     d_output = torch.randn_like(actual_output)
     d_state = torch.randn_like(actual_state)
     actual_gradients = torch.autograd.grad(
@@ -142,18 +105,21 @@ def _assert_training_matches_reference(
         (high_output, high_state), high_inputs, (d_output.double(), d_state.double())
     )
     for name, actual, high, reference in zip(
-        ("q", "k", "v", "gate", "beta", "initial_state"),
-        actual_gradients,
-        high_gradients,
-        reference_gradients,
+        ("output", "final_state", "dq", "dk", "dv", "dgate", "dbeta", "dinitial_state"),
+        (actual_output, actual_state, *actual_gradients),
+        (high_output, high_state, *high_gradients),
+        (reference_output, reference_state, *reference_gradients),
         strict=True,
     ):
         assert_matches_low_precision_reference(
             actual,
             high,
             reference,
-            f"Hopper chunk KDA gradient {name}",
+            f"Hopper chunk KDA {name}",
             source_dtype=dtype,
+        )
+        assert_rms_matches_low_precision_reference(
+            actual, high, reference, f"Hopper chunk KDA {name}", source_dtype=dtype
         )
 
 
@@ -185,51 +151,29 @@ def test_hopper_fastmath_backward_matches_reference(monkeypatch):
     assert received_fastmath == [True]
 
 
+@pytest.mark.parametrize("seed", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("lengths", [None, [65, 63]], ids=["dense", "packed"])
 def test_hopper_bc16_rebase_matches_reference_at_lower_bound_five(
     dtype: torch.dtype,
     lengths: list[int] | None,
+    seed: int,
 ):
-    """Pin the BC16 rebase numerics at the model's default gate lower bound."""
+    """Pin the BC16 rebase numerics, including known canceled terminal-dK cases."""
+    torch.cuda.manual_seed(seed)
     inputs, cu_seqlens = _training_inputs(dtype, lengths)
     gate = torch.full_like(inputs[3], -5.0, requires_grad=True)
-    actual_inputs = (*inputs[:3], gate, *inputs[4:])
-    reference_inputs = clone_kda_inputs(actual_inputs)
-    actual_output, actual_state = chunk_kda(
-        *actual_inputs,
-        cu_seqlens=cu_seqlens,
-        output_final_state=True,
-        autotune=False,
-    )
-    reference_output, reference_state = chunk_kda(
-        *reference_inputs,
-        cu_seqlens=cu_seqlens,
-        output_final_state=True,
-        impl=Impl.REFERENCE,
-    )
-    assert actual_state is not None and reference_state is not None
-    atol = 6e-3 if dtype is torch.bfloat16 else 5e-4
-    torch.testing.assert_close(actual_output, reference_output, rtol=3e-2, atol=atol)
-    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=atol)
-
-    d_output = torch.randn_like(actual_output)
-    d_state = torch.randn_like(actual_state)
-    actual_gradients = torch.autograd.grad(
-        (actual_output, actual_state), actual_inputs, (d_output, d_state)
-    )
-    reference_gradients = torch.autograd.grad(
-        (reference_output, reference_state), reference_inputs, (d_output, d_state)
-    )
-    for actual, reference in zip(actual_gradients, reference_gradients, strict=True):
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual, reference, rtol=3e-2, atol=atol)
+    # Residual/state-cotangent MMA operands use the source dtype. Terminal dK can
+    # cancel despite large dot products, so a fixed atol against the FP32 eager
+    # result is not the source-precision contract. Keep the known failing seeds
+    # and compare both paths with a true FP64 oracle using max and RMS envelopes.
+    _assert_training_matches_reference((*inputs[:3], gate, *inputs[4:]), cu_seqlens, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hopper_delta_h_masks_upper_aqk(dtype: torch.dtype):
     """Ignore poisoned upper-triangular Aqk entries in the reverse recurrence."""
-    torch.manual_seed(97)
+    torch.cuda.manual_seed(97)
     shape = (1, 64, 1, 128)
     qg = torch.randn(shape, device="cuda", dtype=dtype) / 8
     kg = torch.randn_like(qg) / 8
@@ -284,7 +228,7 @@ def test_hopper_final_state_only_gradient(dtype: torch.dtype):
         output_final_state=True,
         impl=Impl.REFERENCE,
     )
-    _, high_state = _high_precision_reference(high_inputs, cu_seqlens)
+    _, high_state = kda_reference(*high_inputs, cu_seqlens=cu_seqlens)
     assert actual_state is not None and reference_state is not None and high_state is not None
     d_state = torch.randn_like(actual_state)
     actual_gradients = torch.autograd.grad(actual_state, actual_inputs[1:], d_state)
