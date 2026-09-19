@@ -310,7 +310,7 @@ def chunk_delta_h_kernel_k128_wsp(
     )
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NUM_SEQUENCES"])
 def chunk_delta_h_kernel_k128_persistent(
     k_desc,
     w_desc,
@@ -352,16 +352,16 @@ def chunk_delta_h_kernel_k128_persistent(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
-    NUM_SEQUENCES: tl.constexpr,
-    NUM_WORKERS: tl.constexpr,
+    NUM_SEQUENCES,
 ):
     """Stride persistent workers over sequence recurrences after the first wave."""
     worker = tl.program_id(0)
+    num_workers = tl.num_programs(0)
     i_v = tl.program_id(1)
     sequence_extent = load_ragged_sequence_extent(cu_seqlens, NUM_SEQUENCES)
     active_tasks = sequence_extent * H
     task_end = NUM_SEQUENCES * H if STORE_FINAL_STATE else active_tasks
-    for i_nh in tl.range(NUM_WORKERS + worker, task_end, NUM_WORKERS):
+    for i_nh in tl.range(num_workers + worker, task_end, num_workers):
         _run_chunk_delta_h_sequence(
             k_desc,
             w_desc,
@@ -548,7 +548,6 @@ def _delta_h_launch(
             *kernel_args,
             **persistent_options,
             NUM_SEQUENCES=state_batch,
-            NUM_WORKERS=sequence_workers,
         )
     else:
         chunk_delta_h_kernel_k128_wsp[(state_batch * heads, value_tiles)](
