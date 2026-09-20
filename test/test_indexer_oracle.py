@@ -58,6 +58,38 @@ DEVICES = [
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_reference_scores_bound_intermediates_without_changing_values(monkeypatch, device, dtype):
+    batch, queries, heads, dim, candidates = 2, 17, 3, 8, 11
+    # Dyadic operands keep the reductions exactly representable in both dtypes.
+    q = (torch.arange(batch * queries * heads * dim, device=device) % 17 - 8).to(dtype)
+    k = (torch.arange(batch * candidates * dim, device=device) % 13 - 6).to(dtype)
+    weights = (torch.arange(batch * queries * heads, device=device) % 7 - 3).to(dtype)
+    q, k, weights = (
+        q.view(batch, queries, heads, dim) / 8,
+        k.view(batch, candidates, dim) / 4,
+        weights.view(batch, queries, heads) / 4,
+    )
+    einsum = torch.einsum
+    expected = (einsum("bthd,bsd->bths", q, k).relu() * weights.unsqueeze(-1)).sum(2)
+    expected *= 1.0 / math.sqrt(heads * dim)
+    seen = []
+
+    def bounded_dot(equation, left, right):
+        assert left.shape[1] <= 4
+        seen.append(left.shape[1])
+        return einsum(equation, left, right)
+
+    monkeypatch.setattr(
+        indexer, "_SCORE_TILE_BYTES", batch * heads * 4 * candidates * q.element_size()
+    )
+    monkeypatch.setattr(torch, "einsum", bounded_dot)
+    actual = indexer.indexer_reference_scores(q, k, weights)
+    assert seen == [4, 4, 4, 4, 1]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "causal,ratio,topk",
