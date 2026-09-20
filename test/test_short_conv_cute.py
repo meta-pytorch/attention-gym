@@ -3066,7 +3066,12 @@ def test_short_conv_training_graph_replays_boundaries(route: str, tokens: int):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output, gradients = run()
-    for boundaries in ([0, 3, 3, 17, 61], [0, 0, 0, 0, 0], [0, 9, 9, 33, tokens]):
+    for boundaries in (
+        [0, 3, 3, 17, 61],
+        [0, 3, 3, 17, 64],  # Complete active tiles even when physical T=65 has a tail.
+        [0, 0, 0, 0, 0],
+        [0, 9, 9, 33, tokens],
+    ):
         with torch.no_grad():
             offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
             x.normal_()
