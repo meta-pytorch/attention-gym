@@ -15,9 +15,9 @@ import os
 import socket
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -168,12 +168,18 @@ def _assert_matches_unsharded(
 # NOTE [Collectives Before Assertions]
 # Both ranks run every case of a spawn in one process group, in the same order, so a case that
 # fails on one rank must not desync the other: each case issues all of its collectives (the cp
-# forward/backward, the single-rank ``new_group`` calls, the halo all-gather) before its first
-# assertion, and ``_rank_main`` records the failure and moves on to the next case.
+# forward/backward and the halo all-gather) before its first assertion, and ``_rank_main``
+# records the failure and moves on to the next case. Singleton groups are created once,
+# in identical rank order, before any cases run.
 
 
 def _check_case(
-    cp_rank: int, device: torch.device, op_name: str, final_state_loss: bool, table: str
+    cp_rank: int,
+    device: torch.device,
+    op_name: str,
+    final_state_loss: bool,
+    table: str,
+    solo_group: dist.ProcessGroup,
 ) -> None:
     """One (loss structure, fragment table) case; raises ``AssertionError`` on any mismatch."""
     chunk, cp = OPS[op_name]
@@ -216,9 +222,7 @@ def _check_case(
         # over the whole stream) and the unsharded op, whose kernels the staged path shares.
         alone = ContextParallelPlan.from_fragments(cu_seqlens, [[(0, cu_seqlens[-1])]], 0)
         solo = tuple(t.clone().requires_grad_() for t in operands)
-        solo_output, solo_exit = cp(
-            *solo, routing=alone.routing(device), group=dist.new_group([cp_rank])
-        )
+        solo_output, solo_exit = cp(*solo, routing=alone.routing(device), group=solo_group)
         solo_grads = torch.autograd.grad(
             (solo_output, solo_exit),
             solo,
@@ -226,7 +230,7 @@ def _check_case(
         )
         if not final_state_loss:
             solo_grads = torch.autograd.grad(
-                cp(*solo, routing=alone.routing(device), group=dist.new_group([cp_rank]))[0],
+                cp(*solo, routing=alone.routing(device), group=solo_group)[0],
                 solo,
                 grad_outputs=(d_output,),
             )
@@ -255,14 +259,51 @@ def _check_case(
 def _rank_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
     """Run every case in one process group (both ranks in the same order); report all failures."""
     with _process_group(cp_rank, world, port) as device:
-        failures = {}
-        for final_state_loss, loss_id in ((True, "with-final"), (False, "output-only")):
-            for table in TABLES:
-                try:
-                    _check_case(cp_rank, device, op_name, final_state_loss, table)
-                except AssertionError as error:
-                    failures[f"{loss_id}-{table}"] = str(error)
-        assert not failures, "\n".join(f"{case}: {message}" for case, message in failures.items())
+        # Every rank must create the same groups in the same order. Reuse them so
+        # a late case cannot create a group after rank 0 has closed the TCPStore.
+        solo_groups = [dist.new_group([rank]) for rank in range(world)]
+        solo_group = solo_groups[cp_rank]
+        try:
+            failures = {}
+            for final_state_loss, loss_id in ((True, "with-final"), (False, "output-only")):
+                for table in TABLES:
+                    try:
+                        _check_case(cp_rank, device, op_name, final_state_loss, table, solo_group)
+                    except AssertionError as error:
+                        failures[f"{loss_id}-{table}"] = str(error)
+            assert not failures, "\n".join(
+                f"{case}: {message}" for case, message in failures.items()
+            )
+        finally:
+            dist.destroy_process_group(solo_group)
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+@pytest.mark.parametrize("fails", [False, True])
+def test_singleton_groups_have_global_order_and_owned_cleanup(monkeypatch, cp_rank, fails):
+    groups = [object(), object()]
+    created = []
+
+    def new_group(ranks):
+        created.append(ranks)
+        return groups[ranks[0]] if ranks == [cp_rank] else dist.GroupMember.NON_GROUP_MEMBER
+
+    def check_case(rank, device, op, final_state_loss, table, group):
+        assert created == [[0], [1]]
+        assert group is groups[rank]
+        if fails:
+            raise AssertionError("numerical failure")
+
+    destroy = Mock()
+    monkeypatch.setitem(
+        globals(), "_process_group", lambda *args: nullcontext(torch.device("cpu"))
+    )
+    monkeypatch.setitem(globals(), "_check_case", check_case)
+    monkeypatch.setattr(dist, "new_group", new_group)
+    monkeypatch.setattr(dist, "destroy_process_group", destroy)
+    with pytest.raises(AssertionError, match="numerical failure") if fails else nullcontext():
+        _rank_main(cp_rank, 2, 0, "kda")
+    destroy.assert_called_once_with(groups[cp_rank])
 
 
 def _spawn(target, args: tuple) -> None:

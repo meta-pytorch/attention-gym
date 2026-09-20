@@ -13,7 +13,7 @@ import torch
 
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_op
-from attn_gym.testing.indexer import assert_indexer_selection
+from attn_gym.testing.indexer import assert_indexer_selection, indexer_reference_scores
 
 
 def _skip_no_supported_gpu():
@@ -21,14 +21,6 @@ def _skip_no_supported_gpu():
         pytest.skip("CUDA required for CuTe backend")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("SM100 or SM103 required for CuTe backend")
-
-
-def _reference_scores(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Compute the indexer score matrix in the input dtype."""
-    _, _, heads, head_dim = q.shape
-    scale = 1.0 / math.sqrt(heads * head_dim)
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    return (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
 
 
 def _validate_indices(
@@ -139,7 +131,7 @@ def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
     w = torch.randn(batch, queries, heads, device=device, dtype=dtype)
 
     actual = lightning_indexer(q, k, w, topk, causal=causal, impl="fused")
-    scores = _reference_scores(q.float(), k.float(), w.float())
+    scores = indexer_reference_scores(q.float(), k.float(), w.float())
 
     assert actual.dtype == torch.int32
     assert actual.shape == (batch, queries, topk)
@@ -213,7 +205,7 @@ def test_cute_topk_scores_vs_fp64(batch, queries, heads, head_dim, topk, causal,
         assert cute_indices.shape == (batch, queries, 0)
         return
 
-    scores_64 = _reference_scores(q_lp.double(), k_lp.double(), w_lp.double())
+    scores_64 = indexer_reference_scores(q_lp.double(), k_lp.double(), w_lp.double())
 
     # Apply causal mask
     if causal:

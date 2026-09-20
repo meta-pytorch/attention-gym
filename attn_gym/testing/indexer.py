@@ -8,6 +8,29 @@ import torch
 _SCORE_TILE_BYTES = 64 * 1024 * 1024
 
 
+@torch.no_grad()
+def indexer_reference_scores(
+    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    """Compute input-dtype reference scores with bounded query-tile intermediates.
+
+    The returned [B, T, S] matrix is still quadratic; query tiling avoids retaining
+    the much larger [B, T, H, S] dot/ReLU/product buffers. Keep the full head and
+    channel reductions and their original scaling order.
+    """
+    batch, queries, heads, head_dim = q.shape
+    candidates = k.shape[1]
+    bytes_per_row = max(1, batch * heads * candidates * q.element_size())
+    tile_rows = max(1, _SCORE_TILE_BYTES // bytes_per_row)
+    scores = q.new_empty(batch, queries, candidates)
+    scale = 1.0 / math.sqrt(heads * head_dim)
+    for start in range(0, queries, tile_rows):
+        rows = slice(start, start + tile_rows)
+        dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
+        scores[:, rows] = (dots.relu() * weights[:, rows].unsqueeze(-1)).sum(2) * scale
+    return scores
+
+
 def make_indexer_test_inputs(
     tokens: int,
     heads: int,
@@ -89,9 +112,9 @@ def _selection_errors(
     # accumulation dtype. Its launcher has no query-offset argument or score helper:
     # tiling the public API would violate S == T // compress_ratio and reset causality.
     accum_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
-    eager_dots = torch.einsum("bthd,bsd->bths", q.to(accum_dtype), k.to(accum_dtype))
-    eager_scores = (eager_dots.relu() * weights.to(accum_dtype).unsqueeze(-1)).sum(2)
-    eager_scores *= 1.0 / math.sqrt(heads * dim)
+    eager_scores = indexer_reference_scores(
+        q.to(accum_dtype), k.to(accum_dtype), weights.to(accum_dtype)
+    )
     if causal:
         future = torch.arange(k.shape[1], device=q.device).view(1, 1, -1) >= visible
         scores.masked_fill_(future, -torch.inf)
