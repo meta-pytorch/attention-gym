@@ -435,7 +435,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         )
         self.activation = activation
         # The exact launch grid and T % BT == 0 prove full physical tile ownership.
-        # Packed calls still retain upper bounds whenever their active endpoint is shorter.
+        # Other calls classify each CTA against the runtime active endpoint.
         self.full_time_tiles = full_time_tiles
 
     def get_name(self) -> str:
@@ -452,7 +452,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
         initial_state: cute.Tensor | None,
         state_indices: cute.Tensor | None,
         has_initial_state: cute.Tensor | None,
-        full_endpoint: cutlass.Constexpr,
+        full_tile: cutlass.Constexpr,
+        active_endpoint: Int32,
         tokens: Int32,
     ):
         """Compute the physical time tile owned by this CTA."""
@@ -463,12 +464,9 @@ class CausalConv1dSiluForward(ShortConvKernel):
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
         time_start = time_block * self.times_per_block
-        active_endpoint = Int32(tokens)
-        if cutlass.const_expr(not full_endpoint):
-            active_endpoint = load_ragged_token_count(cu_seqlens)
-
+        # The caller proves this tile starts before the active endpoint.
         # See NOTE [Packed forward active endpoint].
-        if channel < self.channels and time_start < active_endpoint:
+        if channel < self.channels:
             weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                 for tap in cutlass.range_constexpr(self.width):
@@ -487,8 +485,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
             for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
                 input_time = time_start + input_offset - (self.width - 1)
                 if input_time >= 0 and (
-                    cutlass.const_expr(self.full_time_tiles and full_endpoint)
-                    or input_time < active_endpoint
+                    cutlass.const_expr(full_tile) or input_time < active_endpoint
                 ):
                     inputs[(None, input_offset)].store(
                         x_groups[
@@ -510,10 +507,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 time = time_start + time_offset
                 sequence = tile_sequence
                 sequence_start = tile_sequence_start
-                if (
-                    cutlass.const_expr(self.full_time_tiles and full_endpoint)
-                    or time < active_endpoint
-                ):
+                if cutlass.const_expr(full_tile) or time < active_endpoint:
                     if cutlass.const_expr(cu_seqlens is not None):
                         sequence, sequence_start, _ = advance_sequence_bounds(
                             cu_seqlens,
@@ -601,33 +595,11 @@ class CausalConv1dSiluForward(ShortConvKernel):
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
         time_block, _, _ = cute.arch.block_idx()
+        time_start = time_block * self.times_per_block
+        active_endpoint = Int32(tokens)
         if cutlass.const_expr(cu_seqlens is not None):
             active_endpoint = load_ragged_token_count(cu_seqlens)
-            if active_endpoint == tokens:
-                self.run_tile(
-                    x,
-                    weight,
-                    output,
-                    cu_seqlens,
-                    initial_state,
-                    state_indices,
-                    has_initial_state,
-                    True,
-                    tokens,
-                )
-            elif time_block * self.times_per_block < active_endpoint:
-                self.run_tile(
-                    x,
-                    weight,
-                    output,
-                    cu_seqlens,
-                    initial_state,
-                    state_indices,
-                    has_initial_state,
-                    False,
-                    tokens,
-                )
-        else:
+        if cutlass.const_expr(cu_seqlens is None and self.full_time_tiles):
             self.run_tile(
                 x,
                 weight,
@@ -637,8 +609,37 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 state_indices,
                 has_initial_state,
                 True,
+                active_endpoint,
                 tokens,
             )
+        else:
+            # Subtraction avoids overflowing the last physical tile's upper edge.
+            if active_endpoint - time_start >= self.times_per_block:
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    initial_state,
+                    state_indices,
+                    has_initial_state,
+                    True,
+                    active_endpoint,
+                    tokens,
+                )
+            elif time_start < active_endpoint:
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    initial_state,
+                    state_indices,
+                    has_initial_state,
+                    False,
+                    active_endpoint,
+                    tokens,
+                )
 
     @cute.jit
     def __call__(
