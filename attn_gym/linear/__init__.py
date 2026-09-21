@@ -13,6 +13,7 @@ from attn_gym.linear._delta_rule.gate import gate_transform
 from attn_gym.linear.gdn import chunk_gdn, paged_chunk_gdn, recurrent_gdn, recurrent_gdn_decode
 from attn_gym.linear.kda import (
     KernelOptions,
+    ReplayState,
     active_token_mask,
     chunk_kda,
     mask_inactive_token_gradients,
@@ -55,6 +56,7 @@ GENERIC_OPS = [
     "GateTransform",
     "Impl",
     "KernelOptions",
+    "ReplayState",
     "active_token_mask",
     "causal_conv1d",
     "causal_conv1d_decode",

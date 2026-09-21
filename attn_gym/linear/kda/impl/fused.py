@@ -18,7 +18,13 @@ from attn_gym.linear.kda.ops import (
     chunk_fwd_ragged_paged_op,
     chunk_fwd_ragged_with_state_op,
     chunk_fwd_with_state_op,
+    chunk_replay_commit_op,
+    chunk_replay_prefill_commit_op,
+    chunk_replay_prefill_prepare_op,
+    chunk_replay_prepare_op,
+    chunk_replay_state_gather_op,
 )
+from attn_gym.linear.types import ReplayState
 
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
@@ -260,22 +266,196 @@ def paged_chunk_forward(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
-    """Normalize inputs and invoke the registered paged chunk operator."""
+    """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
     if torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (q, k, v, gate, beta, state_cache)
+        tensor.requires_grad
+        for tensor in (q, k, v, gate, beta, state_cache, *(replay_state or ()))
     ):
         raise RuntimeError(
             "paged_chunk_kda is inference-only; call under torch.no_grad() or "
             "torch.inference_mode()"
         )
 
+    if replay_state is None:
+        return _paged_chunk_state_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            autotune=autotune,
+            schedule=schedule,
+        )
+
+    replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
+    if cu_seqlens is None and q.shape[1] == 1:
+        (
+            active_q,
+            active_k,
+            active_v,
+            active_gate,
+            active_beta,
+            active_state,
+            active_counts,
+        ) = chunk_replay_prepare_op(
+            q.to(torch.bfloat16),
+            k.to(torch.bfloat16),
+            v.to(torch.bfloat16),
+            gate.float(),
+            beta.float(),
+            state_cache,
+            replay_q,
+            replay_k,
+            replay_v,
+            replay_gate,
+            replay_beta,
+            replay_count,
+            state_indices,
+            has_initial_state,
+        )
+        output, final_state = chunk_forward(
+            active_q,
+            active_k,
+            active_v,
+            active_gate,
+            active_beta,
+            active_state,
+            scale=q.shape[-1] ** -0.5,
+            output_final_state=True,
+            fastmath=False,
+            autotune=autotune,
+            schedule=schedule,
+        )
+        assert final_state is not None
+        chunk_replay_commit_op(
+            final_state,
+            state_indices,
+            has_initial_state,
+            active_counts,
+            state_cache,
+            replay_count,
+        )
+        return (
+            output[
+                torch.arange(
+                    active_counts.shape[0],
+                    dtype=torch.int64,
+                    device=active_counts.device,
+                ),
+                active_counts,
+            ]
+            .unsqueeze(1)
+            .to(q.dtype)
+        )
+
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+    (
+        prefix_q,
+        prefix_k,
+        prefix_v,
+        prefix_gate,
+        prefix_beta,
+        prefix_cu_seqlens,
+        output_route,
+        tail_q,
+        tail_k,
+        tail_v,
+        tail_gate,
+        tail_beta,
+        tail_counts,
+    ) = chunk_replay_prefill_prepare_op(
+        q.to(torch.bfloat16),
+        k.to(torch.bfloat16),
+        v.to(torch.bfloat16),
+        gate.float(),
+        beta.float(),
+        state_cache,
+        replay_q,
+        replay_k,
+        replay_v,
+        replay_gate,
+        replay_beta,
+        replay_count,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+    )
+    prefix_output = _paged_chunk_state_forward(
+        prefix_q,
+        prefix_k,
+        prefix_v,
+        prefix_gate,
+        prefix_beta,
+        state_cache,
+        state_indices,
+        cu_seqlens=prefix_cu_seqlens,
+        has_initial_state=has_initial_state,
+        autotune=autotune,
+        schedule=schedule,
+    )
+    tail_output, _ = chunk_forward(
+        tail_q,
+        tail_k,
+        tail_v,
+        tail_gate,
+        tail_beta,
+        chunk_replay_state_gather_op(state_cache, state_indices),
+        scale=q.shape[-1] ** -0.5,
+        output_final_state=False,
+        fastmath=False,
+        autotune=autotune,
+        schedule=schedule,
+    )
+    return chunk_replay_prefill_commit_op(
+        prefix_output,
+        tail_output,
+        output_route,
+        tail_q,
+        tail_k,
+        tail_v,
+        tail_gate,
+        tail_beta,
+        tail_counts,
+        state_indices,
+        replay_q,
+        replay_k,
+        replay_v,
+        replay_gate,
+        replay_beta,
+        replay_count,
+        q,
+    )
+
+
+def _paged_chunk_state_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    autotune: bool,
+    schedule: ScheduleRequest,
+) -> torch.Tensor:
+    """Run the original paged state-only chunk path."""
     output_dtype = q.dtype
     output_shape = q.shape
     q, k, v = (tensor.to(torch.bfloat16) for tensor in (q, k, v))
     gate = gate.float()
     beta = beta.float().contiguous()
+
     batch, tokens, heads, head_dim = output_shape
     if cu_seqlens is None:
         packed_shape = (1, batch * tokens, heads, head_dim)

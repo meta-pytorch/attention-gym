@@ -36,7 +36,7 @@ from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
-from attn_gym.linear.types import Impl, KernelOptions, resolve_impl
+from attn_gym.linear.types import Impl, KernelOptions, ReplayState, resolve_impl
 
 _CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
@@ -195,6 +195,7 @@ def paged_chunk_kda(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     kernel_options: KernelOptions | None = None,
+    replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
 
@@ -222,6 +223,25 @@ def paged_chunk_kda(
             the optional CuTeDSL 4.7 cuDNN backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies to the fused backend as in ``chunk_kda``.
+        replay_state: Optional :class:`ReplayState` persistent cache.
+            Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
+            token caches have shape ``[num_slots, 64, ...]``; every count must remain in
+            ``[0, 63]``, and no replay-state tensors may alias. Together, ``state_cache`` and
+            ``replay_state`` own the logical recurrent state: ``state_cache`` is the FP32 state
+            after the last complete 64-token chunk, while ``replay_state`` retains the unfinished
+            suffix. For example, after 150 tokens they hold the state at token 128 and the final
+            22 tokens, respectively. Callers must preserve and pass both across invocations;
+            switching to state-only decode would discard that suffix. When supplied, calls with
+            one token per dense batch row use replay-backed decode; other calls use streaming
+            prefill. Both paths support ``torch.compile`` and CUDA graph capture.
+
+            Persistent storage consists of the five per-slot token caches plus their counts.
+            Replay prefill additionally allocates five prefix buffers with token capacity
+            ``round_up(total_input_capacity + 63 * num_requests, 64)`` and five tail buffers
+            shaped ``[num_requests, 64, ...]``, plus routing and compute intermediates. CUDA graph
+            users such as vLLM must budget this workspace for every captured bucket. Graph replay
+            may change packed offsets, slot routing, initialization flags, and replay counts while
+            tensor shapes remain fixed to that bucket.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -248,6 +268,58 @@ def paged_chunk_kda(
     options = resolve_kernel_options(kernel_options)
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
+    if replay_state is not None:
+        replay_state = ReplayState(*replay_state)
+        if options.backend != "fused":
+            raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
+        num_slots = state_cache.shape[0]
+        for name, tensor, expected_dtype, expected_shape in zip(
+            ("q", "k", "v", "gate", "beta"),
+            replay_state[:-1],
+            (
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.float32,
+            ),
+            (
+                (num_slots, _CHUNK_SIZE, *q.shape[2:]),
+                (num_slots, _CHUNK_SIZE, *k.shape[2:]),
+                (num_slots, _CHUNK_SIZE, *v.shape[2:]),
+                (num_slots, _CHUNK_SIZE, *gate.shape[2:]),
+                (num_slots, _CHUNK_SIZE, *beta.shape[2:]),
+            ),
+            strict=True,
+        ):
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"replay_state {name} tensor must have shape {expected_shape}, "
+                    f"got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != expected_dtype or tensor.device != q.device:
+                raise TypeError(
+                    f"replay_state {name} tensor must use {expected_dtype} on the input device"
+                )
+            expected_stride = 1
+            dense_inner = True
+            for size, stride in reversed(tuple(zip(tensor.shape[2:], tensor.stride()[2:]))):
+                dense_inner &= size == 1 or stride == expected_stride
+                expected_stride *= size
+            if not dense_inner or tensor.stride(1) != expected_stride:
+                raise ValueError(f"replay_state {name} tensor must have dense per-token rows")
+            if num_slots > 1 and tensor.stride(0) < _CHUNK_SIZE * expected_stride:
+                raise ValueError(f"replay_state {name} tensor slots must not overlap")
+        if replay_state.count.shape not in ((num_slots,), (num_slots, 1)):
+            raise ValueError(
+                f"replay_state count tensor must have shape ({num_slots},) or "
+                f"({num_slots}, 1), got {tuple(replay_state.count.shape)}"
+            )
+        if replay_state.count.dtype != torch.int32 or replay_state.count.device != q.device:
+            raise TypeError("replay_state count tensor must be int32 on the input device")
+        if num_slots > 1 and replay_state.count.stride(0) == 0:
+            raise ValueError("replay_state count tensor slots must not overlap")
+        # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
     if options.backend == "cudnn":
         return _cudnn_paged_chunk_forward(
             q,
@@ -273,6 +345,7 @@ def paged_chunk_kda(
         has_initial_state=has_initial_state,
         autotune=autotune,
         schedule=options.schedule,
+        replay_state=replay_state,
     )
 
 
@@ -525,6 +598,7 @@ def recurrent_kda_decode(
 __all__ = [
     "Impl",
     "KernelOptions",
+    "ReplayState",
     "chunk_kda",
     "paged_chunk_kda",
     "recurrent_kda",
