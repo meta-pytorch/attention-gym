@@ -88,6 +88,10 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
     # Device: all offsets LOCAL, all of them read from the routing tensors. This is what
     # context_parallel_chunk does.
     routing = plan.routing(device)
+    # Alternatively, if you only need routing and have not built a plan:
+    # routing = ContextParallelRouting.from_fragments(
+    #     cu_seqlens_global, fragments_global, cp_rank=1, device=device
+    # )
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
     #   a span that is one whole subsequence (cu_seqlens has one segment) passes None instead
     #   and runs the dense kernels
@@ -328,6 +332,29 @@ class ContextParallelRouting:
     terminal: torch.Tensor
     tail_sources: torch.Tensor
     conv_sources: torch.Tensor
+
+    @classmethod
+    def from_fragments(
+        cls,
+        cu_seqlens_global: Sequence[int],
+        fragments: Sequence[Sequence[tuple[int, int]]],
+        cp_rank: int,
+        device: torch.device | str,
+        *,
+        slots: int | None = None,
+        max_subsequences: int | None = None,
+        conv_history: int = 0,
+    ) -> ContextParallelRouting:
+        """Build device routing directly from global sequence offsets and rank fragments."""
+        routing = ContextParallelPlan.from_fragments(
+            cu_seqlens_global, fragments, cp_rank
+        ).routing(
+            device,
+            slots=slots,
+            max_subsequences=max_subsequences,
+            conv_history=conv_history,
+        )
+        return cls(**vars(routing))
 
     def validate(self, span: torch.Tensor, group: dist.ProcessGroup) -> None:
         """Reject a routing built for another group, rank, span length, or device (host-only)."""
