@@ -87,9 +87,11 @@ integers; ``plan.routing(device)`` turns it into the span-local tensors the kern
 
     # Device: all offsets LOCAL, all of them read from the routing tensors. This is what
     # context_parallel_chunk does.
-    routing = ContextParallelRouting.from_fragments(
-        cu_seqlens_global, fragments_global, cp_rank=1, device=device
-    )
+    routing = plan.routing(device)
+    # Alternatively, if you only need routing and have not built a plan:
+    # routing = ContextParallelRouting.from_fragments(
+    #     cu_seqlens_global, fragments_global, cp_rank=1, device=device
+    # )
     prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=routing.cu_seqlens)
     #   a span that is one whole subsequence (cu_seqlens has one segment) passes None instead
     #   and runs the dense kernels
