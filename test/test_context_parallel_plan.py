@@ -7,6 +7,7 @@ import torch
 
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
+    ContextParallelRouting,
     Subsequence,
     compose_conv_histories,
     compose_entry_states,
@@ -129,6 +130,28 @@ def test_plan_rejects_fragments_that_do_not_tile_the_stream(cu_seqlens, fragment
 def test_plan_rejects_rank_outside_table():
     with pytest.raises(ValueError, match="cp_rank 2"):
         ContextParallelPlan.from_fragments((0, 4), [[(0, 2)], [(2, 4)]], cp_rank=2)
+
+
+def test_routing_builds_directly_from_fragments():
+    expected = ContextParallelPlan.from_fragments(
+        CONV_CU_SEQLENS, CONV_FRAGMENTS, cp_rank=1
+    ).routing("cpu", slots=2, max_subsequences=3, conv_history=3)
+    actual = ContextParallelRouting.from_fragments(
+        CONV_CU_SEQLENS,
+        CONV_FRAGMENTS,
+        cp_rank=1,
+        device="cpu",
+        slots=2,
+        max_subsequences=3,
+        conv_history=3,
+    )
+
+    for name, expected_value in vars(expected).items():
+        actual_value = getattr(actual, name)
+        if isinstance(expected_value, torch.Tensor):
+            torch.testing.assert_close(actual_value, expected_value)
+        else:
+            assert actual_value == expected_value
 
 
 def test_plan_cuts_fragments_at_sequences_and_orders_neighbors():
