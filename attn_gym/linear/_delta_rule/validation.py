@@ -148,6 +148,87 @@ def validate_decode_inputs(
     return batch, heads, value_dim, key_dim
 
 
+def validate_spec_decode_inputs(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    op_name: str,
+) -> tuple[int, int, int, int, int]:
+    """Validate the family-independent speculative decode contract."""
+    if packed_qkv.ndim != 2 or packed_qkv.shape[0] < 1 or packed_qkv.stride(1) != 1:
+        raise ValueError("packed_qkv must have shape [T, C] and be contiguous within each token")
+    if state_cache.ndim != 4:
+        raise ValueError("state_cache must have shape [num_slots, H, V, K]")
+    num_slots, heads, value_dim, key_dim = state_cache.shape
+    num_tokens = packed_qkv.shape[0]
+    if num_slots < 1 or heads < 1 or key_dim < 1 or value_dim < 1:
+        raise ValueError(
+            f"state_cache must have nonempty dimensions, got {tuple(state_cache.shape)}"
+        )
+    if A_log.shape != (heads,) or A_log.dtype != torch.float32 or not A_log.is_contiguous():
+        raise ValueError(f"A_log must be contiguous float32 with shape ({heads},)")
+    if state_cache.dtype != torch.float32:
+        raise TypeError("state_cache must use float32")
+    if state_cache.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+        raise TypeError("state_cache must be contiguous within each [H, V, K] slot")
+    if state_cache.stride(0) < heads * key_dim * value_dim:
+        raise ValueError("state_cache slots must not overlap")
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.shape[0] < 2
+        or cu_seqlens.dtype != torch.int32
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise ValueError("cu_seqlens must be contiguous int32 with shape [N + 1]")
+    num_sequences = cu_seqlens.shape[0] - 1
+    if (
+        state_indices.ndim != 2
+        or state_indices.shape[0] != num_sequences
+        or state_indices.shape[1] < 1
+        or state_indices.dtype != torch.int32
+        or not state_indices.is_contiguous()
+    ):
+        raise ValueError(
+            "state_indices must be contiguous int32 with shape [N, num_speculative_tokens + 1]"
+        )
+    if (
+        num_accepted_tokens.shape != (num_sequences,)
+        or num_accepted_tokens.dtype != torch.int32
+        or not num_accepted_tokens.is_contiguous()
+    ):
+        raise ValueError(
+            f"num_accepted_tokens must be contiguous int32 with shape ({num_sequences},)"
+        )
+    if key_dim > 256:
+        raise ValueError(f"{op_name} requires K in [1, 256], got {key_dim}")
+
+    device = packed_qkv.device
+    all_tensors = (
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_cache,
+        state_indices,
+        num_accepted_tokens,
+        cu_seqlens,
+    )
+    if any(tensor.device != device for tensor in all_tensors):
+        raise ValueError(f"all {op_name} inputs must be on the same device")
+    activation_tensors = (packed_qkv, raw_gate, raw_beta)
+    if any(tensor.dtype not in SUPPORTED_ACTIVATION_DTYPES for tensor in activation_tensors):
+        supported = ", ".join(str(dtype) for dtype in SUPPORTED_ACTIVATION_DTYPES)
+        raise TypeError(f"decode activation inputs must use one of {supported}")
+    return num_tokens, num_sequences, heads, value_dim, key_dim
+
+
 def resolve_decode_out(
     packed_qkv: torch.Tensor,
     out: torch.Tensor | None,
@@ -200,4 +281,5 @@ __all__ = [
     "validate_delta_rule_inputs",
     "validate_has_initial_state",
     "validate_paged_state",
+    "validate_spec_decode_inputs",
 ]

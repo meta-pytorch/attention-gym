@@ -67,6 +67,12 @@ torch.library.define(
     " Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, Tensor(b!) out,"
     " float scale) -> ()",
 )
+torch.library.define(
+    "attn_gym::gdn_recurrent_spec_decode",
+    "(Tensor packed_qkv, Tensor raw_gate, Tensor raw_beta, Tensor A_log, Tensor dt_bias,"
+    " Tensor(a!) state_cache, Tensor state_indices, Tensor num_accepted_tokens,"
+    " Tensor cu_seqlens, Tensor(b!) out, float scale) -> ()",
+)
 
 
 def _chunk_backend():
@@ -129,6 +135,10 @@ def _recurrent_decode_cuda(*args):
     return _recurrent_backend()._gdn_recurrent_decode_cuda(*args)
 
 
+def _recurrent_spec_decode_cuda(*args):
+    return _recurrent_backend()._gdn_recurrent_spec_decode_cuda(*args)
+
+
 torch.library.impl("attn_gym::gdn_chunk_fwd", "CUDA", _chunk_fwd_cuda)
 torch.library.impl(
     "attn_gym::gdn_chunk_fwd_with_state",
@@ -167,6 +177,11 @@ torch.library.impl(
     "attn_gym::gdn_recurrent_decode",
     "CUDA",
     _recurrent_decode_cuda,
+)
+torch.library.impl(
+    "attn_gym::gdn_recurrent_spec_decode",
+    "CUDA",
+    _recurrent_spec_decode_cuda,
 )
 
 
@@ -404,6 +419,23 @@ def _recurrent_decode_fake(
     """The decode op returns nothing and mutates preallocated buffers; no metadata to fake."""
 
 
+@torch.library.register_fake("attn_gym::gdn_recurrent_spec_decode")
+def _recurrent_spec_decode_fake(
+    packed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+) -> None:
+    """The speculative op mutates caller-owned state and output buffers."""
+
+
 chunk_fwd_op = torch.ops.attn_gym.gdn_chunk_fwd.default
 chunk_fwd_with_state_op = torch.ops.attn_gym.gdn_chunk_fwd_with_state.default
 chunk_bwd_op = torch.ops.attn_gym.gdn_chunk_bwd.default
@@ -415,6 +447,7 @@ recurrent_fwd_op = torch.ops.attn_gym.gdn_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.gdn_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.gdn_recurrent_fwd_paged.default
 recurrent_decode_op = torch.ops.attn_gym.gdn_recurrent_decode.default
+recurrent_spec_decode_op = torch.ops.attn_gym.gdn_recurrent_spec_decode.default
 
 
 class _ChunkGDN(torch.autograd.Function):
@@ -705,6 +738,8 @@ def recurrent_decode_forward(
     state_cache: torch.Tensor,
     state_indices: torch.Tensor,
     has_initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
     out: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
@@ -717,18 +752,34 @@ def recurrent_decode_forward(
             "recurrent_gdn_decode is inference-only and has no backward; "
             "call under torch.no_grad() / torch.inference_mode()"
         )
-    recurrent_decode_op(
-        packed_qkv,
-        raw_gate,
-        raw_beta,
-        A_log,
-        dt_bias,
-        state_cache,
-        state_indices,
-        has_initial_state,
-        out,
-        scale,
-    )
+    if num_accepted_tokens is not None:
+        assert cu_seqlens is not None
+        recurrent_spec_decode_op(
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            num_accepted_tokens,
+            cu_seqlens,
+            out,
+            scale,
+        )
+    else:
+        recurrent_decode_op(
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_cache,
+            state_indices,
+            has_initial_state,
+            out,
+            scale,
+        )
     return out
 
 
@@ -748,4 +799,5 @@ __all__ = [
     "recurrent_fwd_no_state_op",
     "recurrent_fwd_op",
     "recurrent_fwd_paged_op",
+    "recurrent_spec_decode_op",
 ]
