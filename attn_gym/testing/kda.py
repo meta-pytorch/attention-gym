@@ -32,8 +32,9 @@ def strided_state_pool(
     *,
     prefix: int = 11,
     suffix: int = 17,
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create the slot-strided FP32 recurrent state view produced by vLLM's packed byte pages.
+    """Create the slot-strided recurrent state view produced by vLLM's packed byte pages.
 
     Returns the flat backing storage plus a non-contiguous ``[num_slots, heads, V, K]`` view
     whose slots are separated by padding, matching how serving engines carve recurrent state
@@ -44,9 +45,7 @@ def strided_state_pool(
     the pool pointer, so their tests must pass ``prefix=0`` to keep the base 16-byte aligned.
     """
     state_elements = heads * key_dim * value_dim
-    storage = torch.randn(
-        num_slots, prefix + state_elements + suffix, device="cuda", dtype=torch.float32
-    )
+    storage = torch.randn(num_slots, prefix + state_elements + suffix, device="cuda", dtype=dtype)
     state = storage[:, prefix : prefix + state_elements].view(num_slots, heads, value_dim, key_dim)
     assert not state.is_contiguous()
     assert state.stride()[1:] == (value_dim * key_dim, key_dim, 1)

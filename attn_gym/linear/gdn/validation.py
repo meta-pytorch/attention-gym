@@ -58,9 +58,9 @@ def validate_gdn_inputs(
         raise ValueError("q, k, and v must have the same dtype")
 
     compute_dtype = torch.promote_types(q.dtype, torch.float32)
-    if initial_state is not None and initial_state.dtype != compute_dtype:
+    if initial_state is not None and initial_state.dtype not in (compute_dtype, torch.bfloat16):
         raise ValueError(
-            f"initial_state must have dtype {compute_dtype} for {q.dtype} q, "
+            f"initial_state must have dtype {compute_dtype} or torch.bfloat16 for {q.dtype} q, "
             f"got {initial_state.dtype}"
         )
 

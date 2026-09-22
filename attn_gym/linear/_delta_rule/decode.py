@@ -212,9 +212,9 @@ def launch_recurrent_delta_rule_decode(
             as ``sigmoid``.
         A_log: FP32 per-head log decay parameter shaped ``[H]``.
         dt_bias: FP32 gate bias, ``[H]`` for scalar or ``[H, K]`` for vector gates.
-        state_cache: Mutable FP32 pool shaped ``[num_slots, H, V, K]``; selected slots are
-            advanced in place. Slots may have padding between them but each ``[H, V, K]``
-            row must be dense.
+        state_cache: Mutable FP32 or BF16 pool shaped ``[num_slots, H, V, K]``; selected slots
+            are advanced in place using FP32 recurrence math. Slots may have padding between
+            them but each ``[H, V, K]`` row must be dense.
         state_indices: Contiguous int32 slot indices shaped ``[B]``; nonpositive entries
             are padding that produce zero output and leave the pool untouched.
         output: Preallocated output written in place, one row of ``H * V`` per sequence.

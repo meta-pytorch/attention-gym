@@ -369,11 +369,12 @@ def test_recurrent_scale_rejects_bool():
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_recurrent_paged_matches_gather_scatter(packed: bool):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_paged_matches_gather_scatter(packed: bool, state_dtype: torch.dtype):
     """Slot indexing equals a native gather, dense scan, and scatter round trip."""
     q, k, v, gate, beta, _ = _inputs(batch=1 if packed else 3, tokens=32, seed=8)
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5]) if packed else None
-    storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
+    storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype)
     storage_before = storage.clone()
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     before = pool.clone()
@@ -400,11 +401,11 @@ def test_recurrent_paged_matches_gather_scatter(packed: bool):
         gate * LOG2_E,
         beta,
         scale=scale,
-        initial_state=before[slots.long()],
+        initial_state=before[slots.long()].float(),
         output_final_state=True,
         cu_seqlens=cu_seqlens,
     )
-    expected_pool[slots.long()] = expected_state
+    expected_pool[slots.long()] = expected_state.to(state_dtype)
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-5)
     # Rows the indices never name stay bitwise untouched.
@@ -444,11 +445,12 @@ def test_recurrent_paged_fresh_slot_ignores_existing_state():
     torch.testing.assert_close(pool[slots.long()], expected_state, rtol=1e-5, atol=1e-5)
 
 
-def test_recurrent_paged_decode_accumulates_in_place():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_paged_decode_accumulates_in_place(state_dtype: torch.dtype):
     """Successive single-token steps advance each slot without a round trip."""
-    _, pool = strided_state_pool(5, 2, 64, 64)
+    _, pool = strided_state_pool(5, 2, 64, 64, dtype=state_dtype)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    state = pool[slots.long()].clone()
+    state = pool[slots.long()].float()
 
     for step in range(3):
         q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=20 + step)
@@ -457,7 +459,9 @@ def test_recurrent_paged_decode_accumulates_in_place():
             q, k, v, gate * LOG2_E, beta, initial_state=state, output_final_state=True
         )
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+        state = state.to(state_dtype)
         torch.testing.assert_close(pool[slots.long()], state, rtol=1e-5, atol=1e-5)
+        state = state.float()
 
 
 @pytest.mark.parametrize("padding_slot", [0, -1])
@@ -495,8 +499,8 @@ def test_recurrent_paged_validates_contract():
         recurrent_kda(q, k, v, gate, beta, state_indices=slots)
     with pytest.raises(ValueError, match="paged state pool must have shape"):
         recurrent_kda(q, k, v, gate, beta, pool[:, :, :-1], state_indices=slots)
-    with pytest.raises(TypeError, match="use float32"):
-        recurrent_kda(q, k, v, gate, beta, pool.bfloat16(), state_indices=slots)
+    with pytest.raises(TypeError, match="use float32 or bfloat16"):
+        recurrent_kda(q, k, v, gate, beta, pool.half(), state_indices=slots)
     with pytest.raises(TypeError, match="contiguous within each"):
         recurrent_kda(q, k, v, gate, beta, pool.transpose(-1, -2), state_indices=slots)
     overlapping = torch.as_strided(
@@ -576,7 +580,8 @@ def test_recurrent_rejects_gradient_tracking(operand: int):
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_recurrent_custom_op_registration(packed: bool):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_custom_op_registration(packed: bool, state_dtype: torch.dtype):
     """Exercise the schema and fake implementation for both modes."""
     batch = 1 if packed else 2
     q, k, v, gate, beta, _ = _inputs(batch=batch, tokens=17)
@@ -591,7 +596,9 @@ def test_recurrent_custom_op_registration(packed: bool):
         _recurrent_fwd_no_state_op,
         (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
     )
-    _, state_pool = strided_state_pool(num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1])
+    _, state_pool = strided_state_pool(
+        num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype
+    )
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         _recurrent_fwd_paged_op,
@@ -658,12 +665,15 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         assert final_state is None and expected_state is None
 
 
-def test_recurrent_paged_mixed_dtype_fullgraph_compile():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_paged_mixed_dtype_fullgraph_compile(state_dtype: torch.dtype):
     """Compile the public paged path used by vLLM's FP32-normalized Q/K decode."""
     q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, dtype=torch.bfloat16)
     q, k = q.float(), k.float()
-    _, eager_pool = strided_state_pool(4, q.shape[2], q.shape[3], v.shape[-1])
-    compiled_storage, compiled_pool = strided_state_pool(4, q.shape[2], q.shape[3], v.shape[-1])
+    _, eager_pool = strided_state_pool(4, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype)
+    compiled_storage, compiled_pool = strided_state_pool(
+        4, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype
+    )
     compiled_pool.copy_(eager_pool)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     scale = 0.25
@@ -718,10 +728,11 @@ def test_recurrent_cuda_graph_replay():
     torch.testing.assert_close(captured_state, expected_state, rtol=0, atol=0)
 
 
-def test_recurrent_paged_cuda_graph_replay():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_recurrent_paged_cuda_graph_replay(state_dtype: torch.dtype):
     """Replay paged decode with changed strided-cache routing, values, and history."""
     q, k, v, gate, beta, _ = _inputs(batch=3, tokens=1, dtype=torch.bfloat16, seed=31)
-    storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1])
+    storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype)
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     scale = 0.25
     _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)

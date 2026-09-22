@@ -172,7 +172,10 @@ def test_chunk_gradients_match_recurrent():
 @pytest.mark.parametrize("function", REFERENCE_CASES)
 @pytest.mark.parametrize("qkv_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fp32_gate", [False, True])
-def test_low_precision_compute_and_gradient_dtypes(function, qkv_dtype, fp32_gate):
+@pytest.mark.parametrize("initial_state_dtype", [torch.float32, torch.bfloat16])
+def test_low_precision_compute_and_gradient_dtypes(
+    function, qkv_dtype, fp32_gate, initial_state_dtype
+):
     query, key, value, gate, beta, initial_state = make_inputs(sequence=7)
     gate_dtype = torch.float32 if fp32_gate else qkv_dtype
     inputs = [
@@ -181,7 +184,7 @@ def test_low_precision_compute_and_gradient_dtypes(function, qkv_dtype, fp32_gat
         value.to(qkv_dtype),
         gate.to(gate_dtype),
         beta.to(gate_dtype),
-        initial_state,
+        initial_state.to(initial_state_dtype),
     ]
     inputs = [tensor.requires_grad_() for tensor in inputs]
     expected_inputs = [tensor.detach().float() for tensor in inputs]
@@ -207,7 +210,7 @@ def test_low_precision_compute_and_gradient_dtypes(function, qkv_dtype, fp32_gat
         qkv_dtype,
         gate_dtype,
         gate_dtype,
-        torch.float32,
+        initial_state_dtype,
     )
 
 
@@ -388,14 +391,16 @@ def test_gate_and_beta_accept_independent_floating_dtypes():
 
 def test_invalid_initial_state_dtype_fails_clearly():
     query, key, value, gate, beta, initial_state = make_inputs(sequence=2)
-    with pytest.raises(ValueError, match="initial_state must have dtype torch.float32"):
+    with pytest.raises(
+        ValueError, match="initial_state must have dtype torch.float32 or torch.bfloat16"
+    ):
         recurrent_gdn(
             query.bfloat16(),
             key.bfloat16(),
             value.bfloat16(),
             gate,
             beta,
-            initial_state=initial_state.bfloat16(),
+            initial_state=initial_state.half(),
         )
 
 
