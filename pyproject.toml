@@ -44,7 +44,7 @@ tests = [
     "typer",
     "jsonargparse",
     "docstring-parser",
-    "flash-attn-4[cu13]~=4.0.0b23; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-attn-4[cu13]~=4.0.0b32; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 dev = [

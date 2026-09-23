@@ -12,8 +12,8 @@ Constraints
 - head_dim = 512, 1 <= nheads <= 128, share_kv = True (fewer than 128 heads are
   zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
 - dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
-- Requires FA4 with sparse MLA attention sink support (commit 62892fe+); fewer than
-  128 heads also require FA4's sparse-MLA head-padding support (PR #2883)
+- Requires FA4 4.0.0b32+ for sparse MLA attention sinks and, with fewer than 128
+  heads, sparse-MLA head padding
 """
 
 from __future__ import annotations
