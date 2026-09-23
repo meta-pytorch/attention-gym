@@ -1422,7 +1422,7 @@ def _compile_affine_summary_rev(
     heads: int,
     use_int64_offsets: bool,
     whole_ranges: bool,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     """Compile one reverse-summary dtype/head specialization."""
     target = get_compile_target()

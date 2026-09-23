@@ -102,8 +102,11 @@ def chunk_kda(
         scale: Query scale, applied inside the kernels in FP32. Defaults to
             ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        fastmath: Allow fast, approximate gating exponentials (default ``True``). ``False``
-            selects non-fast exponentials for fused forward, backward, and recomputation.
+        fastmath: ``True`` is the default because it’s faster, and turning it off usually
+            didn’t improve accuracy in our tests. If you’re seeing unexpected outputs or
+            gradients, especially with strong negative gates, try ``False`` and compare
+            against the reference. It can preserve small contributions that fast math
+            drops when intermediate values fall into the subnormal range.
             The reference backend uses normal PyTorch math for either value; native cuDNN
             requires ``True``. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.

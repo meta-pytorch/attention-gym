@@ -288,24 +288,13 @@ def chunk_kda_fwd_k3_triton_kernel(
         kg2 = (k2 * row_scale2).to(k.dtype.element_ty)
         kg3 = (k3 * row_scale3).to(k.dtype.element_ty)
 
-        k0g1 = (k0 * masked_exp2(reference1[None, :] - gate0, mask0, FASTMATH)).to(
-            k.dtype.element_ty
-        )
-        k0g2 = (k0 * masked_exp2(reference2[None, :] - gate0, mask0, FASTMATH)).to(
-            k.dtype.element_ty
-        )
-        k1g2 = (k1 * masked_exp2(reference2[None, :] - gate1, mask1, FASTMATH)).to(
-            k.dtype.element_ty
-        )
-        k0g3 = (k0 * masked_exp2(reference3[None, :] - gate0, mask0, FASTMATH)).to(
-            k.dtype.element_ty
-        )
-        k1g3 = (k1 * masked_exp2(reference3[None, :] - gate1, mask1, FASTMATH)).to(
-            k.dtype.element_ty
-        )
-        k2g3 = (k2 * masked_exp2(reference3[None, :] - gate2, mask2, FASTMATH)).to(
-            k.dtype.element_ty
-        )
+        k_dtype = k.dtype.element_ty
+        k0g1 = (k0 * masked_exp2(reference1[None, :] - gate0, mask0, FASTMATH)).to(k_dtype)
+        k0g2 = (k0 * masked_exp2(reference2[None, :] - gate0, mask0, FASTMATH)).to(k_dtype)
+        k1g2 = (k1 * masked_exp2(reference2[None, :] - gate1, mask1, FASTMATH)).to(k_dtype)
+        k0g3 = (k0 * masked_exp2(reference3[None, :] - gate0, mask0, FASTMATH)).to(k_dtype)
+        k1g3 = (k1 * masked_exp2(reference3[None, :] - gate1, mask1, FASTMATH)).to(k_dtype)
+        k2g3 = (k2 * masked_exp2(reference3[None, :] - gate2, mask2, FASTMATH)).to(k_dtype)
 
         aqk10 += tl.dot(qg1, tl.trans(k0g1))
         aqk20 += tl.dot(qg2, tl.trans(k0g2))
