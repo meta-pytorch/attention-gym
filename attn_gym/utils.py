@@ -15,14 +15,6 @@ from torch.nn.attention.flex_attention import (
 from torch.profiler import ProfilerActivity, profile
 from torch.utils._pytree import tree_map_only_
 
-# TODO This was moved on nightly, this enables 2.5 and 2.6 | we should remove this once 2.5 is no longer supported
-try:
-    from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
-except ImportError:
-    from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
-
-from torch._inductor.utils import do_bench_using_profiling
-
 Tensor = torch.Tensor
 CurrentOutputT = TypeVar("CurrentOutputT")
 SideOutputT = TypeVar("SideOutputT")
@@ -35,6 +27,9 @@ def ceildiv(number: int, divisor: int) -> int:
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench_using_profiling"""
+    # Imported lazily: torch._inductor/torch._dynamo add ~1s to ``import attn_gym``.
+    from torch._inductor.utils import do_bench_using_profiling
+
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
     return time * 1e3
@@ -134,6 +129,13 @@ def create_score_mod(
     if _compile:
         ctx = nullcontext()
     else:
+        # Imported lazily: torch._dynamo adds ~1s to ``import attn_gym``.
+        # TODO: drop the fallback once torch 2.5 is no longer supported.
+        try:
+            from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+        except ImportError:
+            from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
+
         ctx = TransformGetItemToIndex()
 
     with ctx:

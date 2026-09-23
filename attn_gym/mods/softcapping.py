@@ -1,13 +1,9 @@
 """Implementation of tanh softcapping score mod popularized in Gemma2 and Grok-1"""
 
-from functools import partial
+import functools
 
 import torch
 from torch import Tensor
-from torch._inductor.lowering import make_pointwise, register_lowering
-
-# Some internal torch.compile details
-from torch._inductor.virtualized import ops
 from torch.nn.attention.flex_attention import _score_mod_signature
 
 torch.library.define("approx::tanh", "(Tensor inp) -> Tensor")
@@ -26,12 +22,17 @@ def _(inp: torch.Tensor) -> torch.Tensor:
     return torch.tanh(inp)
 
 
-def _tanh_approx_lowering(inp):
-    fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
-    return make_pointwise(fn)(inp)
+@functools.cache
+def _register_tanh_approx_lowering() -> None:
+    """Register the PTX lowering on first use; importing Inductor costs ~1s at import time."""
+    from torch._inductor.lowering import make_pointwise, register_lowering
+    from torch._inductor.virtualized import ops
 
+    def lowering(inp):
+        fn = functools.partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+        return make_pointwise(fn)(inp)
 
-register_lowering(torch.ops.approx.tanh)(_tanh_approx_lowering)
+    register_lowering(torch.ops.approx.tanh)(lowering)
 
 
 class _TanhApprox(torch.autograd.Function):
@@ -68,6 +69,8 @@ def generate_tanh_softcap(soft_cap: int, approx: bool = False) -> _score_mod_sig
     Returns:
         tanh_softcap: score_mod
     """
+    if approx:
+        _register_tanh_approx_lowering()
     tanh = _tanh_approx if approx else torch.tanh
 
     def tanh_softcap(score, b, h, q_idx, kv_idx):
