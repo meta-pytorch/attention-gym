@@ -13,6 +13,7 @@ from typing import NamedTuple
 
 import pytest
 
+from attn_gym._backends.cute import _key as cute_key
 from attn_gym._backends.cute import cache as cute_cache
 from attn_gym._backends.cute import compile as cute_compile
 from attn_gym._backends.cute import target as cute_target
@@ -1227,3 +1228,120 @@ def test_winner_key_tracks_candidates_and_namespace():
     assert tune_module._winner_key(Kernel, [1, 2], (64,), ("other",)) != base
     _FakeCompile.namespace = "namespace-b"
     assert tune_module._winner_key(Kernel, [1, 2], (64,), ()) != base
+
+
+# A synthetic package: ``pkg.entry.compile_kernel`` reaches every module except the two excluded
+# below, through each import form the source key must follow.
+SYNTHETIC_PACKAGE = {
+    "__init__.py": "",
+    "entry.py": """
+import pkg.absolute
+import pkg.aliased as aliased
+import pkg.sub.leaf
+from . import relative
+from pkg.lazymap import thing
+from pkg.nested import VALUE
+from pkg.reexport import NAME
+from pkg.starred import *
+
+from attn_gym._backends.cute.cache import jit_cache
+
+
+@jit_cache
+def compile_kernel():
+    from pkg import local
+""",
+    "absolute.py": "from pkg import cycle\n",
+    "cycle.py": "from pkg import absolute\n",
+    "aliased.py": "VALUE = 1\n",
+    "starred.py": "VALUE = 1\n",
+    "relative.py": "VALUE = 1\n",
+    "local.py": "VALUE = 1\n",
+    # Excluded: ``import pkg.sub.leaf`` runs this ``__init__`` only implicitly.
+    "sub/__init__.py": "from pkg import unrelated\n",
+    "sub/leaf.py": "from ..relative import VALUE\n",
+    "nested/__init__.py": "from . import child\nfrom .. import upper\nVALUE = 1\n",
+    "nested/child.py": "VALUE = 1\n",
+    "upper.py": "VALUE = 1\n",
+    "reexport/__init__.py": "from .impl import NAME\n",
+    "reexport/impl.py": "NAME = 1\n",
+    # Lazy exports name their owners only as strings (see attn_gym/linear/_lazy.py).
+    "lazymap.py": """
+EXPORTS = {"thing": "pkg.lazy_target"}
+
+
+def __getattr__(name):
+    import importlib
+
+    if name not in EXPORTS:
+        raise AttributeError(name)
+    return getattr(importlib.import_module(EXPORTS[name]), name)
+""",
+    "lazy_target.py": "thing = 1\n",
+    # Excluded: nothing imports it.
+    "unrelated.py": "VALUE = 1\n",
+}
+
+
+@pytest.fixture
+def synthetic_package(tmp_path, monkeypatch):
+    """Import ``SYNTHETIC_PACKAGE`` as ``pkg`` and treat it as the package the key follows."""
+    root = tmp_path / "pkg"
+    for name, source in SYNTHETIC_PACKAGE.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(cute_key, "_PACKAGE_ROOT", root)
+    yield root
+    for name in [name for name in sys.modules if name == "pkg" or name.startswith("pkg.")]:
+        del sys.modules[name]
+
+
+@pytest.mark.parametrize("module", sorted(SYNTHETIC_PACKAGE))
+def test_cache_namespace_changes_only_with_imported_sources(synthetic_package, module):
+    """Editing a module the compile function transitively imports recompiles; others do not."""
+    pytest.importorskip("cutlass")
+    compile_kernel = importlib.import_module("pkg.entry").compile_kernel
+    baseline = compile_kernel.cache_namespace()
+    with (synthetic_package / module).open("a") as source:
+        source.write("EDITED = 1\n")
+    cute_key.source_fingerprint.cache_clear()
+
+    changed = compile_kernel.cache_namespace() != baseline
+    assert changed == (module not in {"sub/__init__.py", "unrelated.py"})
+
+
+def test_callers_outside_the_package_key_on_their_package_imports(
+    synthetic_package, tmp_path_factory, monkeypatch
+):
+    """A compile function outside the package keys on its own file and package imports."""
+    pytest.importorskip("cutlass")
+    caller = tmp_path_factory.mktemp("outside") / "outside_kernels.py"
+    caller.write_text(
+        "import pkg.sub.leaf\nfrom attn_gym._backends.cute.cache import jit_cache\n\n"
+        "@jit_cache\ndef compile_kernel():\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(caller.parent))
+    module = importlib.import_module("outside_kernels")
+    monkeypatch.setitem(sys.modules, "outside_kernels", module)  # Removed at teardown.
+    compile_kernel = module.compile_kernel
+
+    def namespace_after_editing(path: Path) -> str:
+        with path.open("a") as source:
+            source.write("EDITED = 1\n")
+        cute_key.source_fingerprint.cache_clear()
+        return compile_kernel.cache_namespace()
+
+    baseline = compile_kernel.cache_namespace()
+    assert namespace_after_editing(synthetic_package / "unrelated.py") == baseline
+    assert namespace_after_editing(synthetic_package / "relative.py") != baseline
+    assert namespace_after_editing(caller) != baseline
+
+
+def test_kernel_constants_are_part_of_the_kernel_key():
+    """Regression: constants a kernel inlines once escaped the key outside ``cute/`` paths."""
+    package = cute_key._PACKAGE_ROOT
+    closure = cute_key.module_closure(package / "linear/kda/fwd/cute/gate_fwd.py")
+    assert package / "linear/kda/constants.py" in closure
+    assert package / "linear/short_conv/cute.py" not in closure

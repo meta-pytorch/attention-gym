@@ -9,7 +9,6 @@ The registered operator calls this launcher; there is no backend fallback.
 
 import math
 from collections.abc import Callable
-from pathlib import Path
 
 import torch
 
@@ -43,12 +42,7 @@ def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
     )
 
 
-@jit_cache(
-    extra_sources=(
-        Path(__file__).with_name("cute_score.py"),
-        Path(__file__).with_name("cute_score_generic.py"),
-    )
-)
+@jit_cache
 def _compile_scores(
     dtype: torch.dtype,
     heads: int,
@@ -115,7 +109,7 @@ def _compile_scores(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).with_name("cute_topk.py"),))
+@jit_cache
 def _compile_topk(
     topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool
 ) -> Callable[..., None]:

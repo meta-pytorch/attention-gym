@@ -85,7 +85,6 @@ Requires the public CuTeDSL 4.7 API, including `cutlass.experimental.*`.
 
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -2537,7 +2536,7 @@ def prologue(
 # ---- Torch adapter / host-side compilation ---------------------------------------
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_kda_recompute(
     io_dtype,
     state_dtype,
@@ -2618,7 +2617,7 @@ def _compile_kda_recompute(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_kda_recompute_prologue(
     io_dtype: type[cutlass.Numeric],
     HK: int,

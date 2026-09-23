@@ -74,7 +74,6 @@ Warp assignments (12 warps = 384 threads):
 
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
 from typing import NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -3180,7 +3179,7 @@ TENSORMAP_STATIC_SLOTS = 0
 # ---------------------------------------------------------------------------
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_gdn_recompute(
     io_dtype,
     state_dtype,
@@ -3261,7 +3260,7 @@ def _compile_gdn_recompute(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_gdn_recompute_prologue(
     io_dtype: type[cutlass.Numeric],
     h_k: int,

@@ -84,6 +84,35 @@ Line length: 99 chars. Python target: 3.10+. Formatter/linter: ruff.
 Do not use `ghstack` in this repository. For commit stacks, use `stack-pr` or GitHub's
 native stacked-PR support through `gh stack`.
 
+## Adding CuTeDSL Kernels
+
+Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache`
+(`attn_gym/_backends/cute/cache.py`); see the `cutedsl-tunable-kernel-template` skill for the
+full adapter. A compiled kernel is stored on disk and reused until one of its key inputs changes:
+
+- the compile function's arguments (static, pickleable values) and the compile target;
+- the Python, cutlass, tvm_ffi, torch, and CUDA versions and the codegen environment variables
+  listed in `attn_gym/_backends/cute/_key.py` (`CUTE_DSL_ARCH` reaches it through the target);
+- the source of the compile function's module and of every `attn_gym` module it imports,
+  directly or transitively (`_key.module_closure`). Unrelated modules do not invalidate it.
+
+Imports are found statically, so keep the code a kernel traces reachable by import:
+
+- Import kernel helpers, constants, and ops with ordinary `import`/`from` statements (local and
+  relative imports are fine). A module named as a string literal, as in
+  `importlib.import_module("attn_gym.x.y")`, also counts; computed module names do not.
+- `import pkg.sub.module` does not add `pkg/sub/__init__.py`; keep package `__init__` files to
+  plain re-exports rather than state a kernel depends on.
+- Pass `extra_sources=(...)` to `jit_cache` only for inputs import analysis cannot see: files read
+  while tracing, or code outside `attn_gym` other than the versioned dependencies above. A class
+  passed as a compile argument is keyed by its module and name only, so if its module is not
+  imported by the compile module, list that module in `extra_sources`.
+- Do not add `extra_sources` for modules the compile module already imports; they are hashed.
+
+When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct keys in
+`currsize`, launches in `hits + misses`) instead of disabling the disk cache with
+`CUTE_DSL_NO_CACHE`, which forces cold compiles.
+
 ## Project-local Agent Skills
 
 Repository-specific workflows live under `.agents/skills/`. Load the matching `SKILL.md`

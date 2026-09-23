@@ -234,8 +234,11 @@ def jit_cache(
     generated code. Their canonical encoding provides the process-local key;
     ``cache_key`` may define an explicit structural key instead. Persistent
     hashing and path construction occur only after a process-local miss.
-    ``persistent=False`` keeps only the process-local cache. ``extra_sources``
-    explicitly adds downstream files or trees to source invalidation.
+    ``persistent=False`` keeps only the process-local cache. Disk entries are
+    invalidated by edits to the function's module and every ``attn_gym`` module it
+    transitively imports (``_key.module_closure``), not by unrelated modules.
+    ``extra_sources`` adds inputs that import analysis cannot see, such as files
+    read at trace time or code outside ``attn_gym``.
     """
     if fn is None:
         return functools.partial(
