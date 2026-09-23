@@ -385,7 +385,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
         assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True)
-        assert impl._compile_topk.is_cached(16, True, 1, False)
+        assert impl._compile_topk.is_cached(16, True, 1, False, False)
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
             compiler.cache_clear()

@@ -111,7 +111,7 @@ def _compile_scores(
 
 @jit_cache
 def _compile_topk(
-    topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool
+    topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool, deterministic: bool
 ) -> Callable[..., None]:
     """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
     import cutlass
@@ -137,7 +137,13 @@ def _compile_topk(
         use_32bit_stride=not use_int64_offsets,
     )
     return compile_tvm_ffi(
-        IndexerTopKKernel(topk, causal, use_int64_offsets, compress_ratio=compress_ratio),
+        IndexerTopKKernel(
+            topk,
+            causal,
+            use_int64_offsets,
+            compress_ratio=compress_ratio,
+            deterministic=deterministic,
+        ),
         scores,
         output,
         integer(0),
@@ -213,8 +219,13 @@ def launch(
     topk: int,
     causal: bool = False,
     compress_ratio: int = 1,
+    deterministic: bool = False,
 ) -> torch.Tensor:
-    """Compute weighted-ReLU Top-K with bounded per-call score storage."""
+    """Compute weighted-ReLU Top-K with bounded per-call score storage.
+
+    ``deterministic`` returns ascending indices with exact ties resolved to the
+    lowest indices; otherwise order and tie choice depend on thread timing.
+    """
     import cutlass
 
     _validate(q, k, weights, topk, compress_ratio)
@@ -241,7 +252,7 @@ def launch(
             use_int64_offsets,
             weights.stride(-1) == 1,
         )
-        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets)
+        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets, deterministic)
     finally:
         set_compile_target(previous)
 

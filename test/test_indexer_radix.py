@@ -107,7 +107,7 @@ def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight
     q, k, weights, scores, *_ = impl._compile_scores.__wrapped__(
         torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads
     )
-    topk_scores, output, _ = impl._compile_topk.__wrapped__(37, True, 1, use_int64_offsets)
+    topk_scores, output, _ = impl._compile_topk.__wrapped__(37, True, 1, use_int64_offsets, False)
     width = 64 if use_int64_offsets else 32
     assert q._assumed_align == k._assumed_align == 16
     assert weights._assumed_align == 2
@@ -196,10 +196,29 @@ def test_radix_rejects_non_tma_layout(radix_impl, operand, layout):
         lightning_indexer(*inputs, 16, kernel_options={"backend": "cute"})
 
 
-@pytest.mark.parametrize("distribution", ["random", "ties", "clustered", "signed_zero"])
+def _lowest_index_topk(rows: torch.Tensor, topk: int) -> torch.Tensor:
+    """Exact CuTe selection contract: highest ordered FP32 keys, lowest index on ties."""
+    bits = rows.view(torch.int32).long()
+    # Same monotonic key as the kernel, so -0.0 ranks below +0.0.
+    keys = torch.where(bits < 0, ~bits & 0xFFFFFFFF, bits + 2**31)
+    ranked = keys.sort(dim=-1, descending=True, stable=True).indices
+    return ranked[:, :topk].sort(-1).values
+
+
+@pytest.mark.parametrize(
+    "distribution", ["random", "ties", "few_values", "clustered", "signed_zero"]
+)
 @pytest.mark.parametrize("topk", [1, 37, 512, 1024, 4096])
-def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
-    """Radix refinement handles negative scores, exact ties and shrink-buffer overflow."""
+@pytest.mark.parametrize("tokens", [4097, 65536 + 97])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, deterministic):
+    """Selection is exact across ties and shrink overflow; deterministic mode is repeatable.
+
+    The deterministic kernel must return the ascending lowest-index selection on every
+    call; the fast kernel must return some valid Top-K set. ``few_values`` leaves
+    ambiguous ties inside the shrink buffer; ``ties`` and ``clustered`` overflow it.
+    Rows above 65536 candidates take the multi-window sort.
+    """
     import cutlass
 
     from attn_gym._backends.cute.target import (
@@ -208,14 +227,15 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
         set_compile_target,
     )
 
-    tokens = 4097
     generator = torch.Generator(device="cuda").manual_seed(32)
     scores = torch.randn(2, 2, tokens, device="cuda", generator=generator)
     match distribution:
         case "ties":
             scores.fill_(-1)
+        case "few_values":
+            scores = torch.randint(0, 16, scores.shape, device="cuda", generator=generator).float()
         case "clustered":
-            # All 4097 candidates land in bin0, overflowing the 2048-entry shrink slab;
+            # Every candidate lands in bin0, overflowing the 2048-entry shrink slab;
             # tiny spacings also force refinement through the low ten key bits.
             scores = 1 + scores.abs() * 1e-5
         case "signed_zero":
@@ -224,18 +244,98 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk):
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, False, 1, False)
+        kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic)
     finally:
         set_compile_target(previous)
-    kernel(scores, output, cutlass.Int32(0))
-    indices = output[0, :4].long()
-    assert ((indices >= 0) & (indices < tokens)).all()
-    ordered = indices.sort(-1).values
-    assert not (ordered[:, 1:] == ordered[:, :-1]).any()
     rows = scores.view(4, tokens)
-    actual = rows.gather(1, indices).sort(-1).values
-    expected = rows.topk(topk, sorted=False).values.sort(-1).values
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected = _lowest_index_topk(rows, topk)
+    for _ in range(3 if deterministic else 1):
+        # The deterministic kernel may overwrite its score slab, so use fresh scores.
+        kernel(scores.clone(), output, cutlass.Int32(0))
+        actual = output[0, :4].long()
+        if deterministic:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            ordered = actual.sort(-1).values
+            assert ((ordered >= 0) & (ordered < tokens)).all()
+            assert not (ordered[:, 1:] == ordered[:, :-1]).any()
+            torch.testing.assert_close(
+                rows.gather(1, ordered).sort(-1).values,
+                rows.gather(1, expected).sort(-1).values,
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.parametrize("distribution", ["ties", "few_values"])
+@pytest.mark.parametrize("compress_ratio,topk", [(1, 37), (1, 512), (4, 37)])
+@pytest.mark.parametrize("use_int64_offsets", [False, True])
+def test_radix_deterministic_causal_window_boundary(
+    radix_impl, distribution, compress_ratio, topk, use_int64_offsets
+):
+    """Causal rows whose visible candidates straddle one 65536-bit bitmap window."""
+    import cutlass
+
+    from attn_gym._backends.cute.target import (
+        detect_compile_target,
+        get_compile_target,
+        set_compile_target,
+    )
+
+    candidates = 65538
+    tokens = candidates * compress_ratio
+    # Four query pairs whose visible candidate counts cross 65536, the last within S.
+    first_query = candidates - 8 if compress_ratio == 1 else 65537 * compress_ratio - 6
+    first_pair = first_query // 2
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    if distribution == "ties":
+        scores = torch.full((4, 2, candidates), -1.0, device="cuda")
+    else:
+        scores = torch.randint(
+            0, 16, (4, 2, candidates), device="cuda", generator=generator
+        ).float()
+    output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
+    previous = get_compile_target()
+    try:
+        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+        kernel = radix_impl._compile_topk(topk, True, compress_ratio, use_int64_offsets, True)
+    finally:
+        set_compile_target(previous)
+    integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
+    kernel(scores.clone(), output, integer(first_pair))
+    visible = []
+    for pair in range(4):
+        for qi in range(2):
+            query = (first_pair + pair) * 2 + qi
+            seg_len = (query + 1) // compress_ratio
+            visible.append(seg_len)
+            expected = _lowest_index_topk(scores[pair, qi, :seg_len][None], topk)[0]
+            torch.testing.assert_close(output[0, query].long(), expected, rtol=0, atol=0)
+    assert min(visible) <= 65536 < max(visible)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_radix_deterministic_algorithms_mode(radix_impl, causal):
+    """``torch.use_deterministic_algorithms`` makes eager and compiled CuTe calls repeatable."""
+    inputs = make_indexer_test_inputs(1024, 64, 128, torch.bfloat16)
+
+    def select(q, k, weights):
+        return lightning_indexer(
+            q, k, weights, 64, causal=causal, kernel_options={"backend": "cute"}
+        )
+
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        outputs = [select(*inputs) for _ in range(3)]
+        outputs.append(torch.compile(select, fullgraph=True)(*inputs))
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+    assert all(torch.equal(output, outputs[0]) for output in outputs)
+    valid = outputs[0][..., 1:] >= 0
+    assert (outputs[0][..., 1:] > outputs[0][..., :-1])[valid].all()
+    assert_indexer_selection(outputs[0], *inputs, 64, causal)
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 4])
