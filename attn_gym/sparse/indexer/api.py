@@ -141,9 +141,13 @@ def lightning_indexer(
             no fallback when the selected backend rejects a shape or layout.
 
     Returns:
-        Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are not
-        guaranteed, including across repeated calls. Causal rows with fewer than topk candidates
-        contain -1 padding; topk=0 returns an empty last dimension.
+        Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are unspecified, and
+        CuTe's may differ across repeated calls. Under
+        ``torch.use_deterministic_algorithms(True)`` each fused backend is repeatable for
+        identical inputs (results may differ between backends), and CuTe returns valid
+        indices ascending, resolving equal ordered-FP32 scores toward lower indices.
+        Causal rows with fewer than topk candidates contain -1 padding after the valid
+        indices; topk=0 returns an empty last dimension.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
     Both require FP16/BF16 inputs and T <= 2**20 and accept any topk <= S. CuTe requires

@@ -23,13 +23,20 @@ def _indexer_cuda(
     compress_ratio: int,
     backend: str,
 ) -> Tensor:
-    """Select a launcher on the input device without tracing device queries."""
+    """Select a launcher on the input device without tracing device queries.
+
+    Deterministic mode is read when this implementation executes, so compiled
+    calls see the current setting; CUDA Graph replay keeps the kernel captured.
+    """
     if backend == "auto":
         capability = torch.cuda.get_device_capability(q.device)
         backend = "cute" if capability in ((10, 0), (10, 3)) else "triton"
     match backend:
         case "cute":
             from .impl.cute import launch
+
+            deterministic = torch.are_deterministic_algorithms_enabled()
+            return launch(q, k, weights, topk, causal, compress_ratio, deterministic)
         case "triton":
             from .impl.triton import launch
         case _:

@@ -43,8 +43,15 @@ def require_backend(backend: str | None = None) -> str:
     ],
 )
 @pytest.mark.parametrize("fails", [False, True])
-def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, expected, fails):
-    """Dispatch once on the input device and propagate launch errors without retrying."""
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_backend_dispatch_uses_input_device(
+    monkeypatch, capability, backend, expected, fails, deterministic
+):
+    """Dispatch once on the input device and propagate launch errors without retrying.
+
+    CuTe receives the run-time deterministic-algorithms setting; Triton is always
+    deterministic and takes no flag.
+    """
     q = torch.empty(1, 2, 2, 16)
     k = torch.empty(1, 2, 16)
     weights = torch.empty(1, 2, 2)
@@ -56,6 +63,7 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
     other = Mock(side_effect=AssertionError("the nonselected backend ran"))
     device_capability = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", device_capability)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: deterministic)
     for name in ("cute", "triton"):
         monkeypatch.setitem(
             sys.modules,
@@ -68,7 +76,8 @@ def test_backend_dispatch_uses_input_device(monkeypatch, capability, backend, ex
         assert exc.value is failure
     else:
         assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
-    launch.assert_called_once_with(q, k, weights, 1, True, 1)
+    flag = (deterministic,) if expected == "cute" else ()
+    launch.assert_called_once_with(q, k, weights, 1, True, 1, *flag)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
