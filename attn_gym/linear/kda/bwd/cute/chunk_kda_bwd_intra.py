@@ -24,6 +24,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym._backends.triton.utils import requires_int64_offsets
@@ -957,7 +958,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     iters = (active_chunks - chunk_start + grid_chunks - 1) // grid_chunks
 
     # SMEM is allocated once and reused across the chunk-loop iterations.
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     sQ_tile = smem.allocate_tensor(
         element_type=mQ.element_type,
         layout=cute.make_layout((BT * KEY_DIM_PER_CTA,), stride=(1,)),

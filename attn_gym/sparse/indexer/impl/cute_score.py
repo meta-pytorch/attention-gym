@@ -18,8 +18,14 @@ Only valid rows/candidates are written.
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cuda.bindings import driver as cuda
-from cutlass import Float32, Int32, Int64, cute, pipeline, utils
+from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
+
+from attn_gym._backends.cute.compat import (
+    SmemAllocator,
+    TmemAllocator,
+    get_num_tmem_alloc_cols,
+)
 
 
 class IndexerScoreKernel:
@@ -202,7 +208,7 @@ class IndexerScoreKernel:
             else cute.ceil_div(num_candidates, self.tile_candidates)
         )
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.SharedStorage)
         sK = smem.allocate_tensor(
             io_dtype, k_layout.outer, byte_alignment=128, swizzle=k_layout.inner
@@ -248,12 +254,12 @@ class IndexerScoreKernel:
         accumulator_template = tiled_mma.make_fragment_C(
             cute.append(accumulator_shape, self.acc_stages)
         )
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads),
             allocator_warp_id=self.mma_warp,
         )
-        tmem.allocate(utils.get_num_tmem_alloc_cols(accumulator_template))
+        tmem.allocate(get_num_tmem_alloc_cols(accumulator_template))
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(Float32)
         accumulator = cute.make_tensor(tmem_ptr, accumulator_template.layout)

@@ -30,6 +30,7 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
 
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleKind
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
@@ -207,7 +208,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         ci = pair_idx - (ri * (ri - 1)) // 2
 
         # ── Shared memory, allocated once and reused across persistent iterations ──
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQg = storage.sQg.get_tensor(sGated_layout)
         sKp = storage.sKp.get_tensor(sGated_layout)

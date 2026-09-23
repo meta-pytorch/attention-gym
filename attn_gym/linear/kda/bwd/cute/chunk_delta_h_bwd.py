@@ -37,7 +37,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass import cute, pipeline, utils
+from cutlass import cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
@@ -49,6 +49,7 @@ from attn_gym._backends.cute import (
     tensor_supports_contiguous_dim,
 )
 from attn_gym._backends.cute.cache import jit_cache
+from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
@@ -594,7 +595,7 @@ class BlackwellDeltaHBwd:
         # R2S store view for dh B-operand
         s_dhb_store_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BK, self.BV),
             1,
         )
@@ -631,7 +632,7 @@ class BlackwellDeltaHBwd:
         # R2S store view for dv2 B-operand
         s_dv2b_store_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BT, self.BV),
             1,
         )
@@ -647,14 +648,14 @@ class BlackwellDeltaHBwd:
         # dh snapshot epilogue: (V, K) for Store warp TMA S2G
         s_dh_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BV, self.BK),
             self.dh_epi_depth,
         )
         # R2S dh → sH_epi (ROW_MAJOR transposed for stmatrix)
         s_dh_r2s_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BK, self.BV),
             self.dh_epi_depth,
         )
@@ -662,14 +663,14 @@ class BlackwellDeltaHBwd:
         # dv2 epilogue: (V, T) for Store warp TMA S2G
         s_dv2_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BV, self.BT),
             self.dv2_epi_depth,
         )
         # R2S dv → sVst (ROW_MAJOR transposed for stmatrix)
         s_dv2_r2s_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BT, self.BV),
             self.dv2_epi_depth,
         )
@@ -1103,7 +1104,7 @@ class BlackwellDeltaHBwd:
 
         # R2S dh → sDhb (COL_MAJOR, partition matches T2R qdo)
         r2s_atom_dhb = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             self.acc_type,
             tc_t2r_qdo,
@@ -1113,7 +1114,7 @@ class BlackwellDeltaHBwd:
 
         # R2S dh → sDhEpi (ROW_MAJOR, transposed for TMA store)
         r2s_atom_dh_epi = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             self.io_type,
             self.acc_type,
             tc_t2r_qdo,
@@ -1123,7 +1124,7 @@ class BlackwellDeltaHBwd:
 
         # R2S dv2 → sDv2b (COL_MAJOR, partition matches T2R dv)
         r2s_atom_dv2b = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             self.acc_type,
             tc_t2r_dv,
@@ -1133,7 +1134,7 @@ class BlackwellDeltaHBwd:
 
         # R2S dv2 → sDv2Epi (ROW_MAJOR, transposed for TMA store)
         r2s_atom_dv2_epi = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             self.io_type,
             self.acc_type,
             tc_t2r_dv,
@@ -1666,7 +1667,7 @@ class BlackwellDeltaHBwd:
             cpasync.prefetch_descriptor(atom_gk)
 
         # SMEM allocation
-        sa = utils.SmemAllocator()
+        sa = SmemAllocator()
         sm = sa.allocate(self.shared_type)
 
         gk_exp_buf = sm.sGK_exp.get_tensor(cute.make_layout((self.BK, self.gk_depth)))
@@ -1818,7 +1819,7 @@ class BlackwellDeltaHBwd:
         # TMEM allocation
         #
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             sm.tmem_buf,
             barrier_for_retrieve=tmem_bar,
             allocator_warp_id=WarpRole.LOAD,

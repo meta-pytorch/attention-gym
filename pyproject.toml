@@ -26,14 +26,16 @@ dependencies = [
 
 [project.optional-dependencies]
 linear = [
-    "nvidia-cutlass-dsl[cu13]>=4.5.0; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.12",
+    "packaging",
 ]
 
 cudnn = [
-    "nvidia-cutlass-dsl[cu13]>=4.7.0,<4.8.0; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]>=4.7.0; sys_platform == 'linux'",
     "cuda-python>=13.0; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.12",
+    "packaging",
 ]
 
 tests = [

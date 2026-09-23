@@ -86,13 +86,14 @@ import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import cute, pipeline, utils
+from cutlass import cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
+from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
@@ -361,7 +362,7 @@ class _AffineSummaryFwdOp:
         s_xb_staged = sm100_utils.make_smem_layout_b(mma_wx, self.wx_tile, self.io_type, 2)
         s_xb_store_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (KEY_DIM, self.BN),
             2,
         )
@@ -381,7 +382,7 @@ class _AffineSummaryFwdOp:
         s_tmpb_staged = sm100_utils.make_smem_layout_b(mma_kt, self.kt_tile, self.io_type, 2)
         s_tmpb_store_staged = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (BT, self.BN),
             2,
         )
@@ -732,7 +733,7 @@ class _AffineSummaryFwdOp:
 
         # R2S X snapshot → sXb (COL_MAJOR, partition matches T2R kt).
         r2s_atom_xb = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             Float32,
             tc_t2r_kt,
@@ -742,7 +743,7 @@ class _AffineSummaryFwdOp:
 
         # R2S Tmp → sTmpb (COL_MAJOR, partition matches T2R wx).
         r2s_atom_tmpb = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             Float32,
             tc_t2r_wx,
@@ -867,7 +868,7 @@ class _AffineSummaryFwdOp:
             cpasync.prefetch_descriptor(tma.u.atom)
             cpasync.prefetch_descriptor(tma.gk.atom)
 
-        sa = utils.SmemAllocator()
+        sa = SmemAllocator()
         sm = sa.allocate(self.shared_type)
 
         gk_3d = sm.sGK.get_tensor(
@@ -958,7 +959,7 @@ class _AffineSummaryFwdOp:
         # TMEM allocation
         #
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             sm.tmem_buf,
             barrier_for_retrieve=tmem_bar,
             allocator_warp_id=WarpRole.LOAD,

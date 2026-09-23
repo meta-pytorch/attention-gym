@@ -117,6 +117,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 from cutlass.experimental import cuda
 
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
@@ -4723,7 +4724,7 @@ def kernel(
         space=SMEM,
         alignment=128,
     )
-    storage = cutlass.utils.SmemAllocator().allocate(shared_type)
+    storage = SmemAllocator().allocate(shared_type)
 
     bpe = cfg.io_dtype.width // 8
     SWZ = 2

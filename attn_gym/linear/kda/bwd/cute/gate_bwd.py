@@ -51,6 +51,7 @@ from attn_gym._backends.cute import (
     make_fake_strided_tensor,
     tensor_supports_tma,
 )
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -179,7 +180,7 @@ class _GateTransformBwdTmaOp:
             Int64(mG.shape[1]) - tile_start,
         ).to(Int32)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         tile_bar = smem.allocate_array(Int64, self.stages * 2)
         warp_partials = smem.allocate_tensor(
             Float32,

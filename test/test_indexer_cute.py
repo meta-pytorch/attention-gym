@@ -118,6 +118,7 @@ def _validate_indices(
         "long_seq",
     ],
 )
+@pytest.mark.filterwarnings("error:cutlass\\.utils\\..*deprecated:DeprecationWarning")
 def test_cute_matches_eager(batch, queries, heads, head_dim, topk, causal):
     """Cute backend index set matches eager, up to boundary ties."""
     _skip_no_supported_gpu()

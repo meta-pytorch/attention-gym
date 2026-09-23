@@ -33,6 +33,7 @@ from attn_gym._backends.cute import (
     jit_cache,
     make_fake_strided_tensor,
 )
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 
@@ -105,7 +106,7 @@ class PlainGateBwdOp:
         subtiles = self.chunk_size // self.tokens_per_stage
         tile_start = chunk.to(Int64) * Int64(self.chunk_size)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         barriers = smem.allocate_array(Int64, self.stages * 2)
         sD = smem.allocate_tensor(Float32, self._staged_layout(), byte_alignment=128)
         tile_pipeline = pipeline.PipelineTmaAsync.create(

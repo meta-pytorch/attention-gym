@@ -42,13 +42,14 @@ import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import Float32, Int32, cute, pipeline, utils
+from cutlass import Float32, Int32, cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Int64
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
+from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
@@ -301,7 +302,7 @@ class BlackwellDeltaAffineSummaryRev:
         )
         s_state_store = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BK, self.BN),
             2,
         )
@@ -331,7 +332,7 @@ class BlackwellDeltaAffineSummaryRev:
         )
         s_dv_store = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             (self.BT, self.BN),
             2,
         )
@@ -577,7 +578,7 @@ class BlackwellDeltaAffineSummaryRev:
         state = cute.make_rmem_tensor(state_coordinates.shape, self.acc_type)
 
         r2s_state_atom = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             self.acc_type,
             t2r_qdo,
@@ -586,7 +587,7 @@ class BlackwellDeltaAffineSummaryRev:
         r2s_state_slice = r2s_state.get_slice(local_tid)
 
         r2s_dv_atom = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR,
+            LayoutEnum.COL_MAJOR,
             self.io_type,
             self.acc_type,
             t2r_dv,
@@ -1075,7 +1076,7 @@ class BlackwellDeltaAffineSummaryRev:
             cpasync.prefetch_descriptor(tma.aqk.atom)
             cpasync.prefetch_descriptor(tma.gate.atom)
 
-        allocator = utils.SmemAllocator()
+        allocator = SmemAllocator()
         storage = allocator.allocate(self.shared_type)
 
         gate_3d = storage.sGate.get_tensor(
@@ -1187,7 +1188,7 @@ class BlackwellDeltaAffineSummaryRev:
         ).make_participants()
 
         tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_buf,
             barrier_for_retrieve=tmem_barrier,
             allocator_warp_id=WarpRole.LOAD,
