@@ -1,5 +1,8 @@
 """Exercise the Modal CI failure budget and reporting without allocating a GPU."""
 
+import contextlib
+import os
+import time
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -90,6 +93,7 @@ def test_dependency_preflight_gates_full_suite(
     """A failed or uncollected dependency smoke never launches the expensive matrix."""
     execute = Mock(side_effect=[(preflight_code, "preflight"), (0, "suite")])
     monkeypatch.setattr(runner, "execute_pytest", execute)
+    monkeypatch.setattr(runner, "persistent_compile_cache", lambda suite: contextlib.nullcontext())
 
     return_code, summary = runner.run_pytest.local()
 
@@ -103,6 +107,33 @@ def test_dependency_preflight_gates_full_suite(
     assert execute.call_count == (1 if preflight_code else 2)
     if not preflight_code:
         assert "suite" in summary
+
+
+def test_compile_cache_round_trip_keeps_recent_entries(runner: ModuleType, tmp_path: Path):
+    """A saved cache restores byte-for-byte with its compile times; stale entries are dropped."""
+    archive = tmp_path / "volume" / "main.tar"
+    runner.restore_compile_cache(archive, tmp_path / "cold")  # a missing archive is a cold start
+    assert not (tmp_path / "cold").exists()
+
+    cache = tmp_path / "cache"
+    fresh = cache / "attn_gym_cute" / "v5" / "kernel.o"
+    stale = cache / "triton" / "old" / "kernel.cubin"
+    for path in (fresh, stale):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(path.name.encode())
+    week_ago = time.time() - 7 * 24 * 60 * 60
+    os.utime(stale, (week_ago, week_ago))
+    compiled_at = fresh.stat().st_mtime
+
+    runner.save_compile_cache(cache, archive, max_age_seconds=24 * 60 * 60)
+    restored = tmp_path / "restored"
+    runner.restore_compile_cache(archive, restored)
+
+    files = [path.relative_to(restored) for path in restored.rglob("*") if path.is_file()]
+    assert files == [fresh.relative_to(cache)]
+    assert (restored / files[0]).read_bytes() == b"kernel.o"
+    assert (restored / files[0]).stat().st_mtime == pytest.approx(compiled_at, abs=1)
+    assert [path.name for path in archive.parent.iterdir()] == ["main.tar"]
 
 
 @pytest.mark.parametrize("first_code", [0, 1, -9])
