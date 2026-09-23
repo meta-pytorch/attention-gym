@@ -583,7 +583,7 @@ def test_chunk_kda_bwd_daqk(tokens, heads):
     torch.testing.assert_close(actual, expected, rtol=4e-3, atol=4e-3)
 
 
-def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64, use_exp2=True):
+def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64):
     """Reference for ``chunk_gla_fwd_kernel_o``: ``o = scale*(q*2^g) @ h + tril(A) @ v``.
 
     ``h`` is the per-chunk state stack ``(B*num_chunks, H, K, V)``; ``A`` is the causal intra-chunk
@@ -594,7 +594,7 @@ def _fwd_o_ref(q, g, h, A, v, scale, chunk_size=64, use_exp2=True):
     num_chunks = (T + chunk_size - 1) // chunk_size
     acc = torch.float64 if q.dtype == torch.float64 else torch.float32
     qc, gc, vc, Ac, hc = q.to(acc), g.to(acc), v.to(acc), A.to(acc), h.to(acc)
-    decay = gc.exp2() if use_exp2 else gc.exp()
+    decay = gc.exp2()
     qg = qc * decay
     o = torch.zeros(B, T, H, V, dtype=acc, device=q.device)
     hcr = hc.reshape(B, num_chunks, H, hc.shape[-2], V)  # (b, chunk, h, k, v)
@@ -652,7 +652,6 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         V=V,
         BT=64,
         num_sequences=0,
-        USE_EXP2=True,
     )
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o T={T} H={H} K={K} V={V}")
 

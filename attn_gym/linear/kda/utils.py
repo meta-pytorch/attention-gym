@@ -27,7 +27,6 @@ import torch
 import triton
 import triton.language as tl
 from packaging import version
-from triton.language.extra import libdevice
 
 from attn_gym._backends.triton import utils as triton_utils
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
@@ -136,12 +135,6 @@ def masked_exp2(value, mask, FASTMATH: tl.constexpr = True):
     """Mask exponent inputs and select approximate or precise exponentiation."""
     exponent = tl.where(mask, value, 0.0)
     return tl.where(mask, exp2(exponent, FASTMATH), 0.0)
-
-
-@triton.jit
-def exp(x, FASTMATH: tl.constexpr = True):
-    value = x.to(tl.float32)
-    return tl.exp(value) if FASTMATH else libdevice.exp(value)
 
 
 if not IS_GATHER_SUPPORTED:

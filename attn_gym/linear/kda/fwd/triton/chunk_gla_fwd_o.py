@@ -32,7 +32,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work,
     load_ragged_task_count,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
+from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
 
 
 @triton.heuristics(
@@ -90,7 +90,6 @@ def chunk_gla_fwd_kernel_o(
     num_sequences,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     FASTMATH: tl.constexpr = True,
@@ -157,10 +156,7 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
         # [BT, BK]
-        if USE_EXP2:
-            b_qg = (b_q * exp2(b_g, FASTMATH)).to(b_q.dtype)
-        else:
-            b_qg = (b_q * exp(b_g, FASTMATH)).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g, FASTMATH)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, mask=m_k[:, None] & m_v[None, :], other=0.0)
         # works but dkw, owing to divine benevolence
@@ -681,7 +677,6 @@ def chunk_gla_fwd_o_gk(
             V=value_dim,
             BT=chunk_size,
             num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
-            USE_EXP2=True,
             FASTMATH=fastmath,
             enable_reflect_ftz=fastmath,
         )
