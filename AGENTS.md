@@ -66,7 +66,8 @@ test. Much of the suite is CuTeDSL and `torch.compile` work that is CPU-bound du
 compilation, so a serial run leaves the machine idle and takes minutes where a parallel one
 takes tens of seconds. The workers share one GPU, so raise the count only if the GPU has
 headroom, and drop back to `-n 0` when a failure needs a clean serial repro or readable
-output.
+output. On a 144-core GB300 host the warm full suite takes 112s at `-n 6`, 78s at `-n 12`,
+and plateaus near 75s beyond that; use `-n 12` there for full runs.
 
 ### Docs
 
