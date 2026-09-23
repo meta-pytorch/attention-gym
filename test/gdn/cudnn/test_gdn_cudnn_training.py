@@ -298,11 +298,23 @@ def test_gdn_cudnn_backward_fake_preserves_leading_strides() -> None:
     assert tuple(tensor.stride() for tensor in fake) == expected_strides
 
 
-@pytest.mark.parametrize("offsets", ([1, 3], [0, 4, 3], [0, 9]))
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
-@pytest.mark.parametrize("mode", ["no_state", "initial_only", "with_state"])
+# Each case is a fresh subprocess (a device assert poisons the CUDA context). Every state mode
+# runs eager and compiled, and every invalid-offset class (nonzero start, decreasing, past the
+# end) reaches both; test_ragged_chunk_scheduler_rejects_invalid_boundaries covers the shared
+# validator's individual branches.
+@pytest.mark.parametrize(
+    ("mode", "compiled", "offsets"),
+    [
+        pytest.param("no_state", False, [1, 3], id="no_state-eager-nonzero-start"),
+        pytest.param("no_state", True, [0, 4, 3], id="no_state-compiled-decreasing"),
+        pytest.param("initial_only", False, [0, 9], id="initial_only-eager-past-end"),
+        pytest.param("initial_only", True, [1, 3], id="initial_only-compiled-nonzero-start"),
+        pytest.param("with_state", False, [0, 4, 3], id="with_state-eager-decreasing"),
+        pytest.param("with_state", True, [0, 9], id="with_state-compiled-past-end"),
+    ],
+)
 def test_public_gdn_cudnn_rejects_invalid_packed_offset_values(
-    offsets: list[int], compiled: bool, mode: str
+    mode: str, compiled: bool, offsets: list[int]
 ) -> None:
     """Device-side boundary validation must fail before invalid TMA descriptors execute."""
     code = f"""

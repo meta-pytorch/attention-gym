@@ -2382,9 +2382,7 @@ def test_paged_short_conv_prefill_dynamic_dense_tokens():
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("with_mask", [False, True])
-def test_paged_short_conv_prefill_reuses_jit_cache(
-    monkeypatch: pytest.MonkeyPatch, packed: bool, with_mask: bool
-):
+def test_paged_short_conv_prefill_reuses_jit_cache(packed: bool, with_mask: bool):
     """Bind B/T/N and routing at launch without creating another compiled specialization."""
     torch.manual_seed(112)
     channels, width = 12, 4
@@ -2393,8 +2391,6 @@ def test_paged_short_conv_prefill_reuses_jit_cache(
         cute_backend._compile_paged_forward,
         cute_backend._compile_paged_state_update,
     )
-    # Disk hits do not increment misses: isolate the in-memory specialization count.
-    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
     for compile_fn in compile_functions:
         compile_fn.cache_clear()
 
@@ -2450,10 +2446,7 @@ def test_paged_short_conv_prefill_reuses_jit_cache(
             )
             torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
             for compile_fn in compile_functions:
-                info = compile_fn.cache_info()
-                assert info.misses == 1
-                assert info.currsize == 1
-                assert info.hits == call
+                _assert_specializations(compile_fn, calls=call + 1, specializations=1)
 
 
 def test_paged_short_conv_prefill_cuda_graph_replays_routing():
@@ -2877,14 +2870,6 @@ def test_short_conv_training_reuses_jit_cache(
         pytest.skip("TMA and persistent training routes require SM90+")
     torch.manual_seed(129)
     channels, width = (12 if route == "portable" else 512), 4
-    operations = []
-    compile_tvm_ffi = cute_backend.compile_tvm_ffi
-
-    def record_compile(operation, *args, **kwargs):
-        operations.append(operation)
-        return compile_tvm_ffi(operation, *args, **kwargs)
-
-    monkeypatch.setattr(cute_backend, "compile_tvm_ffi", record_compile)
     compile_functions = [
         cute_backend._compile_forward,
         cute_backend._compile_input_gradient,
@@ -2892,9 +2877,16 @@ def test_short_conv_training_reuses_jit_cache(
     ]
     if with_state:
         compile_functions.append(cute_backend._compile_initial_state_gradient)
-    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
     for compile_fn in compile_functions:
         compile_fn.cache_clear()
+    static_arguments = {}
+    for compile_fn in compile_functions[1:3]:
+
+        def record(*args, _compile_fn=compile_fn, **kwargs):
+            static_arguments[_compile_fn] = (args, kwargs)
+            return _compile_fn(*args, **kwargs)
+
+        monkeypatch.setattr(cute_backend, compile_fn.__name__, record)
     cases = (
         [
             (1, 9, [0, 9]),
@@ -2939,18 +2931,32 @@ def test_short_conv_training_reuses_jit_cache(
         gradients = torch.autograd.grad(actual, inputs, incoming)
         _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
         for compile_fn in compile_functions:
-            info = compile_fn.cache_info()
-            assert info.misses == 1
-            assert info.currsize == 1
-            assert info.hits == call
-    dx = next(op for op in operations if op.kernel_kind == "dx")
-    dw = next(op for op in operations if op.kernel_kind == "dw")
+            _assert_specializations(compile_fn, calls=call + 1, specializations=1)
+    # The kernels may come from the disk cache: rebuild the operations from the recorded keys.
+    monkeypatch.setattr(cute_backend, "compile_tvm_ffi", lambda operation, *_, **__: operation)
+
+    def build_operation(compile_fn):
+        args, kwargs = static_arguments[compile_fn]
+        return compile_fn.__wrapped__(*args, **kwargs)
+
+    dx, dw = map(build_operation, compile_functions[1:3])
     assert isinstance(dx, cute_backend.CausalConv1dSiluInputGradientTma) == (route != "portable")
     assert isinstance(dw, cute_backend.CausalConv1dSiluWeightGradientPartialsTma) == (
         route != "portable"
     )
     if route == "persistent":
         assert dx.time_workers > 0
+
+
+def _assert_specializations(compile_fn, *, calls: int, specializations: int) -> None:
+    """Every launch reached ``compile_fn``, which holds only ``specializations`` entries.
+
+    Memory entries count distinct keys whether they were compiled or loaded from disk, so the
+    persistent cache can stay enabled.
+    """
+    info = compile_fn.cache_info()
+    assert info.currsize == specializations
+    assert info.hits + info.misses == calls
 
 
 def _training_reference(
@@ -3087,9 +3093,8 @@ def test_short_conv_training_graph_replays_boundaries(route: str, tokens: int):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("with_state", [False, True])
-def test_short_conv_training_forward_reuses_tail_classes(monkeypatch, packed, with_state):
+def test_short_conv_training_forward_reuses_tail_classes(packed, with_state):
     """Full physical tiles are one bounded class, not an exact-T specialization."""
-    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
     compile_fn = cute_backend._compile_forward
     compile_fn.cache_clear()
     for call, (batch, tokens) in enumerate([(2, 17), (3, 33), (3, 16), (2, 48), (2, 32)]):
@@ -3121,6 +3126,4 @@ def test_short_conv_training_forward_reuses_tail_classes(monkeypatch, packed, wi
             actual, (x, weight) if initial is None else (x, weight, initial), incoming
         )
         _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
-        info = compile_fn.cache_info()
-        assert info.misses == (1 if call < 2 else 2)
-        assert info.currsize == (1 if call < 2 else 2)
+        _assert_specializations(compile_fn, calls=call + 1, specializations=1 if call < 2 else 2)

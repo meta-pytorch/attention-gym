@@ -10,8 +10,14 @@ from attn_gym._backends.cute.compile import precompile_many
 from attn_gym._backends.cute.target import CompileTarget
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("ragged", [False, True])
+# Each case is a deliberately cold ~10s compile; the diagonal covers both dtypes and layouts.
+@pytest.mark.parametrize(
+    ("dtype", "ragged"),
+    [
+        pytest.param(torch.bfloat16, False, id="bf16-dense"),
+        pytest.param(torch.float16, True, id="fp16-ragged"),
+    ],
+)
 def test_wy_backward_nvvm_compatibility(
     dtype: torch.dtype, ragged: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

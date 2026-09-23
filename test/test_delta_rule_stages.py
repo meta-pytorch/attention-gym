@@ -359,15 +359,26 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
         assert_relative_rms_within(part, high[index], name, max_eps=1.0)
 
 
+# Every op runs every state x loss pair; packing and scale are assigned so that every pair of
+# (state, loss, packing, scale) values also occurs (a covering array instead of 36 products),
+# and each stateful layout runs dense with both an output and a final-state cotangent.
 @requires_kda_target
 @op_param
-@pytest.mark.parametrize("scale", [None, 0.5], ids=["default-scale", "custom-scale"])
 @pytest.mark.parametrize(
-    "loss", ["both", "output-only", "final-state-only"], ids=lambda loss: f"loss-{loss}"
+    ("state", "loss", "packing", "scale"),
+    [
+        ("contiguous", "both", "packed", None),
+        ("contiguous", "output-only", "dense", None),
+        ("contiguous", "final-state-only", "dense", 0.5),
+        ("strided-key", "both", "packed", None),
+        ("strided-key", "output-only", "dense", None),
+        ("strided-key", "final-state-only", "dense", 0.5),
+        ("none", "both", "dense", 0.5),
+        ("none", "output-only", "packed", 0.5),
+        ("none", "final-state-only", "packed", None),
+    ],
 )
-@pytest.mark.parametrize("state", ["contiguous", "strided-key", "none"])
-@pytest.mark.parametrize("packing", ["packed", "dense"])
-def test_prepare_backward_run_matches_chunk_op_gradients(op, scale, loss, state, packing):
+def test_prepare_backward_run_matches_chunk_op_gradients(op, state, loss, packing, scale):
     """All six staged gradients match the selected backward bitwise, including optional losses.
 
     cuDNN uses its native stateful backward and also checks BF16 agreement with the public op.

@@ -1,9 +1,21 @@
 """Shared pytest fixtures."""
 
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+
+# Both caches are read at import or CUDA-init time, so set them before any test module loads;
+# subprocess tests inherit them. Explicit user settings win.
+# Cached CuTeDSL objects are finalized by the driver on load and memoized in its ComputeCache.
+# One suite run writes ~1 GiB there; the smaller default limit evicts warm entries, and each
+# xdist worker then re-finalizes them (up to ~30 s per GDN backward test).
+os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(4 << 30))
+# FA4 otherwise recompiles every specialization in every process; its disk cache is keyed by
+# the FA4 source fingerprint, so editing a flash-attention checkout still invalidates it.
+os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+
 import torch
 
 
@@ -21,6 +33,15 @@ def pytest_configure(config: pytest.Config) -> None:
         "a sibling checkout; follow .agents/skills/worktree-env-setup/SKILL.md to create this "
         "worktree's own .venv."
     )
+
+
+@pytest.fixture(autouse=True)
+def _seed_global_rng() -> None:
+    """Make unseeded draws independent of which tests an xdist worker ran first.
+
+    Otherwise adding, removing, or reparametrizing any test reshuffles other tests' data.
+    """
+    torch.manual_seed(0)
 
 
 @pytest.fixture
