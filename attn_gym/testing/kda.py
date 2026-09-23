@@ -154,13 +154,17 @@ def assert_matches_low_precision_reference(
     name: str,
     *,
     source_dtype: torch.dtype = torch.bfloat16,
+    budget_scale: float = 1.0,
 ) -> None:
-    """Bound pointwise kernel error by reference error and source precision."""
+    """Bound pointwise kernel error by reference error and source precision.
+
+    ``budget_scale`` loosens one call site's budget; every use needs a TODO explaining why.
+    """
     high_precision = high_precision.double()
     rounding_band = torch.finfo(source_dtype).eps * high_precision.abs().max().item()
     actual_error = (actual.double() - high_precision).abs().max().item()
     reference_error = (low_precision.double() - high_precision).abs().max().item()
-    budget = 2 * (reference_error + rounding_band)
+    budget = 2 * budget_scale * (reference_error + rounding_band)
     assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
     assert actual_error <= budget, (
         f"{name}: kernel error {actual_error:.3e} exceeds {budget:.3e} "
