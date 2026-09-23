@@ -1244,28 +1244,12 @@ from pkg.nested import VALUE
 from pkg.reexport import NAME
 from pkg.starred import *
 
-from attn_gym._backends.cute.cache import EXPORT_FUNCTION_NAME, jit_cache
-
-COMPILES = []
-
-
-# Exports the artifact format load_fake_compiled reads back.
-class Compiled(str):
-
-    def __call__(self):
-        return str(self)
-
-    def export_to_c(self, object_file_path, function_name):
-        with open(object_file_path, "w") as artifact:
-            artifact.write(f"{function_name}:{self}")
+from attn_gym._backends.cute.cache import jit_cache
 
 
 @jit_cache
-def compile_kernel(variant):
+def compile_kernel():
     from pkg import local
-
-    COMPILES.append(variant)
-    return Compiled(f"{variant}{len(COMPILES)}")
 """,
     "absolute.py": "from pkg import cycle\n",
     "cycle.py": "from pkg import absolute\n",
@@ -1361,25 +1345,3 @@ def test_kernel_constants_are_part_of_the_kernel_key():
     closure = cute_key.module_closure(package / "linear/kda/fwd/cute/gate_fwd.py")
     assert package / "linear/kda/constants.py" in closure
     assert package / "linear/short_conv/cute.py" not in closure
-
-
-def test_sources_edited_after_import_bypass_the_disk_cache(
-    synthetic_package, isolated_cache, monkeypatch, caplog
-):
-    """Code traced from pre-edit memory must neither load nor publish a disk entry."""
-    entry = importlib.import_module("pkg.entry")
-    snapshot = time.time()
-    monkeypatch.setattr(cute_key, "_SOURCE_SNAPSHOT_TIME", snapshot)
-    assert entry.compile_kernel("a")() == "a1"
-    assert len(list(isolated_cache.rglob("*.o"))) == 1
-
-    os.utime(synthetic_package / "reexport/impl.py", (snapshot + 10, snapshot + 10))
-    entry.compile_kernel.cache_clear()
-    assert entry.compile_kernel("a")() == "a2"  # Compiled again instead of loading "a1".
-    assert entry.compile_kernel("b")() == "b3"
-    assert len(list(isolated_cache.rglob("*.o"))) == 1
-    assert caplog.text.count("sources changed after import") == 1
-
-    monkeypatch.setattr(cute_key, "_SOURCE_SNAPSHOT_TIME", snapshot + 20)
-    entry.compile_kernel.cache_clear()
-    assert entry.compile_kernel("a")() == "a1"

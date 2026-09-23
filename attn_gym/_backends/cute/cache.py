@@ -30,7 +30,6 @@ from typing_extensions import Self
 from ._key import make_key as _make_key
 from ._key import make_runtime_key as _make_runtime_key
 from ._key import source_fingerprint as _source_fingerprint
-from ._key import sources_modified_since_import as _sources_modified_since_import
 from .target import CompileTarget, get_compile_target
 
 try:
@@ -259,7 +258,6 @@ def jit_cache(
     cache_pid = os.getpid()
     hits = 0
     misses = 0
-    warned_modified_sources = False
 
     def reset_after_fork() -> None:
         nonlocal cache_pid, hits, misses, state_lock
@@ -320,19 +318,7 @@ def jit_cache(
             return None
 
     def disk_cache_enabled() -> bool:
-        nonlocal warned_modified_sources
-        if not (persistent and cache_enabled()):
-            return False
-        if modified := _sources_modified_since_import(fn, source_paths):
-            if not warned_modified_sources:
-                warned_modified_sources = True
-                logger.warning(
-                    "%s sources changed after import (%s); compiling without the disk cache",
-                    fn.__qualname__,
-                    ", ".join(str(path) for path in modified[:3]),
-                )
-            return False
-        return True
+        return persistent and cache_enabled()
 
     def key_arguments(
         args: tuple[Any, ...], kwargs: dict[str, Any]
