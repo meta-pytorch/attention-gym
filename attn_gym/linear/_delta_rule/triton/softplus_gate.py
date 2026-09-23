@@ -85,6 +85,7 @@ def _load_gate_operands(
     D: tl.constexpr,
     C: tl.constexpr,
     RAW_ELEMENT_STRIDE: tl.constexpr,
+    FASTMATH: tl.constexpr,
 ):
     """Return ``(s, amplitude)`` with ``s = raw + dt_bias`` in FP32 and ``amplitude = exp(A_log)``."""
     o_h = o_c // D
@@ -100,7 +101,8 @@ def _load_gate_operands(
         tl.float32
     )
     bias = tl.load(dt_bias + ptr_offset((o_h, o_d), DT_STRIDES), mask=m_c, other=0.0)
-    amplitude = tl.exp(tl.load(A_log + o_h * A_LOG_STRIDE, mask=m_c, other=0.0))
+    log_amplitude = tl.load(A_log + o_h * A_LOG_STRIDE, mask=m_c, other=0.0)
+    amplitude = tl.exp(log_amplitude) if FASTMATH else libdevice.exp(log_amplitude)
     return raw + bias[None, :], amplitude
 
 
@@ -141,6 +143,7 @@ def softplus_gate_fwd_kernel(
         D,
         C,
         RAW_ELEMENT_STRIDE,
+        FASTMATH,
     )
     value = -amplitude[None, :] * _softplus(s, FASTMATH)
     tl.store(
@@ -194,6 +197,7 @@ def softplus_gate_bwd_kernel(
         D,
         C,
         RAW_ELEMENT_STRIDE,
+        FASTMATH,
     )
     if D_GATE_ELEMENT_STRIDE:
         grad_offsets = (o_row[:, None] * C + o_c[None, :]) * D_GATE_ELEMENT_STRIDE
@@ -275,6 +279,7 @@ def _softplus_gate_fwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=num_warps,
     )
     return gate.view(shape)
@@ -326,6 +331,7 @@ def _softplus_gate_bwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=num_warps,
     )
     d_dt_bias, d_A_log_channels = partials.sum(1)

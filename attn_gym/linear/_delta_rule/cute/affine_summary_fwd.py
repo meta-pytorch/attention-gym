@@ -247,6 +247,7 @@ class _AffineSummaryFwdOp:
         state_bn: int,
         use_int64_offsets: bool,
         whole_ranges: bool,
+        fastmath: bool = True,
     ):
         assert state_bn in (32, 64), f"state_bn must be 32 or 64, got {state_bn}"
         assert SUMMARY_DIM % state_bn == 0
@@ -255,6 +256,7 @@ class _AffineSummaryFwdOp:
         self.heads = heads
         self.BN = state_bn
         self.use_int64_offsets = use_int64_offsets
+        self.fastmath = fastmath
         # With ``whole_ranges`` the work table is ``bounds`` itself, ``[R, 2]`` token ranges,
         # and every row is one item: the ``budget == 1`` case needs no planner and no fold.
         self.whole_ranges = whole_ranges
@@ -283,6 +285,7 @@ class _AffineSummaryFwdOp:
         return (
             f"delta_affine_summary_fwd_h{self.heads}_bn{self.BN}_{self.dtype_name}"
             f"_i64{int(self.use_int64_offsets)}_whole{int(self.whole_ranges)}"
+            f"_fm{int(self.fastmath)}"
         )
 
     # ------------------------------------------------------------------
@@ -821,7 +824,7 @@ class _AffineSummaryFwdOp:
             gkh = pgk_C.wait_and_advance()
             for ei in cutlass.range(cute.size(st), unroll_full=True):
                 kc, nc = coords_kv[ei]
-                st[ei] = st[ei] * cute.math.exp2(gk_buf[kc, gkh.index], fastmath=True)
+                st[ei] = st[ei] * cute.math.exp2(gk_buf[kc, gkh.index], fastmath=self.fastmath)
             gkh.release()
 
             kth = pkt_C.wait_and_advance()
@@ -1133,6 +1136,7 @@ def _compile_affine_summary(
     state_bn: int,
     use_int64_offsets: bool,
     whole_ranges: bool,
+    fastmath: bool = True,
 ):
     """Compile one dtype/head-count specialization from fake tensors."""
     target = get_compile_target()
@@ -1160,7 +1164,9 @@ def _compile_affine_summary(
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
-        _AffineSummaryFwdOp(dtype_name, heads, state_bn, use_int64_offsets, whole_ranges),
+        _AffineSummaryFwdOp(
+            dtype_name, heads, state_bn, use_int64_offsets, whole_ranges, fastmath
+        ),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, VAL_DIM),
@@ -1211,6 +1217,8 @@ def build_state_summaries(
     u: torch.Tensor,
     cumulative_gate: torch.Tensor,
     bounds: torch.Tensor,
+    *,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Compute one packed affine state summary per token range of a stream's WY chunk factors.
 
@@ -1225,6 +1233,8 @@ def build_state_summaries(
             64-token chunk grid, ``stop`` on the grid or at the sequence's end (a partial last
             chunk is neutralized in-kernel). The values are not checked (that would sync);
             other ranges return a plausible but wrong map.
+        fastmath: Use the flushing approximate ``exp2`` for the per-chunk state decay. Pass
+            the same value the local chunk pass used so the summary decays match its own.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as state bias then state
@@ -1307,7 +1317,15 @@ def build_state_summaries(
     )
     if portable:
         launch_affine_summary_fwd(
-            kg, w, u, cumulative_gate, work, partials, capability, whole_ranges=range_ids is None
+            kg,
+            w,
+            u,
+            cumulative_gate,
+            work,
+            partials,
+            capability,
+            whole_ranges=range_ids is None,
+            fastmath=fastmath,
         )
     else:
         use_int64_offsets = requires_int64_abi(kg, w, u, cumulative_gate, partials)
@@ -1317,6 +1335,7 @@ def build_state_summaries(
             state_bn,
             use_int64_offsets,
             whole_ranges=range_ids is None,
+            fastmath=fastmath,
         )
         compiled(kg.detach(), w.detach(), u.detach(), cumulative_gate.detach(), work, partials)
     return compose_work_items(partials, range_ids, ranges, reverse=False)

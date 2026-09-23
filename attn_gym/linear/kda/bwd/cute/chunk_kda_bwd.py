@@ -56,10 +56,13 @@ def _prepare_chunk_kda_bwd(
     chunk_size: int,
     autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = False,
 ) -> ChunkKDABwdPrepared:
     """Resolve intra factors and recompute local state before CP communication."""
     if Aqk is None:
-        Aqk, Akk = chunk_kda_fwd_factors(q, k, g, beta, scale, metadata, chunk_size=chunk_size)
+        Aqk, Akk = chunk_kda_fwd_factors(
+            q, k, g, beta, scale, metadata, chunk_size=chunk_size, fastmath=fastmath
+        )
     assert Akk is not None
     with profiler_range("kda/triton/backward_recompute_w_u"):
         w, u, qg, kg = recompute_w_u_fwd_triton(
@@ -73,6 +76,7 @@ def _prepare_chunk_kda_bwd(
             chunk_size=chunk_size,
             autotune=autotune,
             schedule=schedule,
+            fastmath=fastmath,
         )
     assert qg is not None and kg is not None
     with profiler_range("kda/triton/backward_recompute_state"):
@@ -86,6 +90,7 @@ def _prepare_chunk_kda_bwd(
             output_final_state=False,
             metadata=metadata,
             autotune=autotune,
+            fastmath=fastmath,
         )
     with profiler_range("kda/triton/backward_daqk"):
         d_aqk = chunk_kda_bwd_daqk(
@@ -140,6 +145,7 @@ def _finish_chunk_kda_bwd(
                 d_final_state=d_final_state,
                 scale=scale,
                 metadata=metadata,
+                fastmath=fastmath,
             )
         else:
             dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
@@ -154,6 +160,7 @@ def _finish_chunk_kda_bwd(
                 scale=scale,
                 chunk_size=chunk_size,
                 metadata=metadata,
+                fastmath=fastmath,
             )
     prepared.aqk = prepared.qg = prepared.kg = prepared.w = None
 
@@ -213,6 +220,7 @@ def _finish_chunk_kda_bwd(
             dg,
             metadata,
             autotune=autotune,
+            fastmath=fastmath,
         )
     prepared.d_aqk = None
     return dq, dk, dv, dg, db, d_initial_state
@@ -271,6 +279,7 @@ def chunk_kda_bwd(
         chunk_size=chunk_size,
         autotune=autotune,
         schedule=schedule,
+        fastmath=fastmath,
     )
     return _finish_chunk_kda_bwd(
         q,

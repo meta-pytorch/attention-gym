@@ -127,6 +127,7 @@ def _compile_k3b(
     schedule_kind: ScheduleKind,
     chunk_workers: int = 0,
     use_int64_offsets: bool = False,
+    fastmath: bool = True,
 ):
     """Compile K3b for independent layout and execution schedules."""
     _check_compile_target()
@@ -141,6 +142,7 @@ def _compile_k3b(
         schedule_kind=schedule_kind,
         chunk_workers=chunk_workers,
         use_int64_offsets=use_int64_offsets,
+        fastmath=fastmath,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
@@ -198,7 +200,7 @@ def _compile_k3b(
         name=(
             f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_{io_name}"
             f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
-            f"_cw{chunk_workers}_i64{int(use_int64_offsets)}"
+            f"_cw{chunk_workers}_i64{int(use_int64_offsets)}_fm{int(fastmath)}"
         ),
     )
 
@@ -278,6 +280,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
     resolved: ResolvedSchedule,
     subchunk_size: int = _SUPPORTED_SUBCHUNK_SIZE,
     AkkOD: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute K3 with an execution plan shared by composed ragged stages.
 
@@ -323,6 +326,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         resolved.kind,
         chunk_workers,
         use_int64_offsets=requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
+        fastmath=fastmath,
     )
     k3b(
         q_flat,
@@ -349,10 +353,13 @@ def chunk_kda_fwd_k3b_ragged_cute(
     scale: float,
     metadata: RaggedChunkMetadata,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run eager ragged K3 with functional input semantics."""
     resolved = _resolve_ragged_execution(k, metadata, schedule)
-    return _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk.clone(), scale, metadata, resolved)
+    return _chunk_kda_fwd_k3b_ragged_impl(
+        q, k, gk, beta, Aqk.clone(), scale, metadata, resolved, fastmath=fastmath
+    )
 
 
 def _chunk_kda_fwd_k4b_ragged_impl(
@@ -496,10 +503,13 @@ def chunk_kda_fwd_inter_solve_ragged_cute(
     Aqk: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run K3 and K4 with one shared automatic scheduling decision."""
     resolved = _resolve_ragged_execution(k, metadata, ScheduleRequest.AUTO)
-    Aqk, AkkOD = _chunk_kda_fwd_k3b_ragged_impl(q, k, gk, beta, Aqk, scale, metadata, resolved)
+    Aqk, AkkOD = _chunk_kda_fwd_k3b_ragged_impl(
+        q, k, gk, beta, Aqk, scale, metadata, resolved, fastmath=fastmath
+    )
     return Aqk, _chunk_kda_fwd_k4b_ragged_impl(
         AkkOD, Akkd, metadata, resolved, output_dtype=q.dtype
     )
@@ -517,7 +527,9 @@ def chunk_kda_fwd_inter_solve_cute(
     Akk: torch.Tensor | None = None,
     AkkOD: torch.Tensor | None = None,
     profile_ranges: bool = False,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run dense K3 and K4; ``fastmath`` selects K3's rebasing ``exp2`` as in the ragged path."""
     assert Akkd.ndim == 4, f"Akkd must be 4D, got shape {tuple(Akkd.shape)}"
     B, T, H, K = k.shape
     BT = chunk_size
@@ -588,6 +600,7 @@ def chunk_kda_fwd_inter_solve_cute(
             use_int64_offsets=requires_int64_abi(
                 q_flat, k_flat, g_flat, beta_flat, Aqk_flat, akk_od
             ),
+            fastmath=fastmath,
         )
         k3b(
             q_flat,

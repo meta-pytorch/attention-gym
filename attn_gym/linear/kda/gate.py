@@ -20,7 +20,7 @@ def bound_gate(
     dt_bias: torch.Tensor,
     *,
     lower_bound: float = -5.0,
-    fastmath: bool = False,
+    fastmath: bool = True,
     impl: Impl | str = Impl.FUSED,
 ) -> torch.Tensor:
     """Map projection outputs to bounded per-channel natural-log decays.
@@ -34,7 +34,9 @@ def bound_gate(
         A_log: FP32 per-head log scale shaped ``[H]``.
         dt_bias: FP32 per-channel bias shaped ``[H, D]``.
         lower_bound: Finite nonpositive gate floor.
-        fastmath: Use approximate fused exponentials; rejected by the reference path.
+        fastmath: Allow approximate gating exponentials (default ``True``). ``False`` selects
+            non-fast forward and backward math. Reference execution uses normal PyTorch math
+            for either value; ``chunk_kda`` has its own flag.
         impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private CuTeDSL
             kernels and requires CUDA capability 9.0 or newer, ``D=128``, and FP16, BF16,
             or FP32 logits.

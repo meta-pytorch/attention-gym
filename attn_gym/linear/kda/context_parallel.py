@@ -34,17 +34,16 @@ def context_parallel_kda(
     group: dist.ProcessGroup,
     scale: float | None = None,
     autotune: bool = True,
-    fastmath: bool = False,
+    fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run ``chunk_kda`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale``, ``autotune``, and ``kernel_options`` follow ``chunk_kda``. With
-    ``kernel_options={"backend": "cudnn"}`` the local pass and forward summaries run on cuDNN
-    (native BT16 probes define a new standard-CP numerical baseline); only reverse summaries
-    still use fused factors. Its backward is cuDNN's native stateful kernel, so ``fastmath``
-    applies only to the fused backend's backward.
+    ``scale``, ``autotune``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
+    Forward, backward, and their summaries share the same math policy.
+    ``kernel_options={"backend": "cudnn"}`` selects cuDNN for the local pass and summaries
+    and requires ``fastmath=True``.
     """
     stages = _kda_stages(scale, autotune, fastmath, kernel_options)
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
@@ -55,7 +54,13 @@ def _kda_stages(
 ) -> StagedOp:
     """Bind ``chunk_kda``'s options to its staged entry points."""
     return StagedOp(
-        partial(chunk_kda_prepare, scale=scale, autotune=autotune, kernel_options=kernel_options),
+        partial(
+            chunk_kda_prepare,
+            scale=scale,
+            autotune=autotune,
+            fastmath=fastmath,
+            kernel_options=kernel_options,
+        ),
         partial(
             chunk_kda_prepare_backward,
             autotune=autotune,

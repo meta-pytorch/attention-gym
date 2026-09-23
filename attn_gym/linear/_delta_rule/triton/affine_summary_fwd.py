@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import exp2, ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.work_items import load_work_item
 
 _CHUNK_SIZE = 64
@@ -53,11 +53,13 @@ def affine_summary_fwd_kernel(
     BN: tl.constexpr,
     WHOLE_RANGES: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr,
 ):
     """Scan one work item, head, and augmented-state column tile through its BT64 chunks.
 
     ``work_items.py`` defines the work-row layout. The partial last chunk is masked so
     tokens past the range's end contribute nothing; unused rows store the identity.
+    ``FASTMATH`` selects the flushing ``tl.exp2`` or libdevice ``exp2`` for the state decay.
     """
     head = tl.program_id(0)
     column_tile = tl.program_id(1)
@@ -103,7 +105,8 @@ def affine_summary_fwd_kernel(
             (tl.minimum(token_start + BT - 1, stop - 1), head, key),
             (H * K, K, 1),
         )
-        state *= tl.exp2(tl.load(cumulative_gate + gate_offset))[:, None]
+        decay = tl.load(cumulative_gate + gate_offset)
+        state *= exp2(decay, FASTMATH)[:, None]
 
         kg_tile = tl.load(kg + token_key_offset, mask=valid, other=0.0)
         tmp_hi = tmp.to(kg_tile.dtype)
@@ -128,6 +131,7 @@ def launch_affine_summary_fwd(
     capability: tuple[int, int],
     *,
     whole_ranges: bool,
+    fastmath: bool,
 ) -> None:
     """Scan one item per work row into ``partials[W, H, V + K, K]``."""
     heads = kg.shape[2]
@@ -146,6 +150,8 @@ def launch_affine_summary_fwd(
         BN=block_columns,
         WHOLE_RANGES=whole_ranges,
         USE_INT64_OFFSETS=requires_int64_offsets(kg, w, u, cumulative_gate, partials),
+        FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=8 if block_columns == 32 else 4,
         num_stages=2,
     )

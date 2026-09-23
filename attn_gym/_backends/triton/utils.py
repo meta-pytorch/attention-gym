@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # Kernels fold natural-log inputs into the faster exp2 with ``exp(x) == exp2(x * LOG2_E)``.
 # Wrapped as a constexpr so ``@triton.jit`` functions can reference it as a module global.
@@ -30,6 +31,17 @@ def configure_triton_allocator() -> None:
                 size, device=torch.device("cuda", torch.cuda.current_device()), dtype=torch.int8
             )
         )
+
+
+@triton.jit
+def exp2(x, FASTMATH: tl.constexpr = True):
+    """Select approximate or libdevice exp2.
+
+    Launch with ``enable_reflect_ftz=FASTMATH`` to give libdevice the same math policy.
+    """
+    if FASTMATH:
+        return tl.math.exp2(x)
+    return libdevice.exp2(x)
 
 
 @triton.jit

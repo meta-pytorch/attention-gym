@@ -93,6 +93,21 @@ def test_reference_matches_formula(shape: str, kind: str, dtype: torch.dtype):
         assert ((actual >= lower_bound) & (actual <= 0)).all()
 
 
+def test_softplus_nonfast_uses_accurate_amplitude():
+    """Resolve a subnormal exp(A_log) accurately before finite amplification."""
+    raw = torch.full((1, 1, 1), 2.0**100, device="cuda")
+    log_scale = torch.tensor([-90.0], device="cuda", requires_grad=True)
+    bias = torch.zeros(1, device="cuda")
+    assert not _softplus_uses_cute(raw)
+    expected = expected_gate(raw, log_scale, bias, "softplus")
+    accurate = gate_transform(raw, log_scale, bias, kind="softplus", fastmath=False)
+    # Allow two FP32 subnormal quanta before multiplication by the large finite factor.
+    atol = 2 * 2.0**-149 * 2.0**100
+    torch.testing.assert_close(accurate.double(), expected, rtol=0, atol=atol)
+    (accurate_grad,) = torch.autograd.grad(accurate.sum(), log_scale)
+    torch.testing.assert_close(accurate_grad.double(), expected.reshape(1), rtol=0, atol=atol)
+
+
 def test_kind_is_required_and_validated():
     inputs = make_gate_inputs(SCALAR)
     with pytest.raises(TypeError):
@@ -129,8 +144,8 @@ def test_shape_and_dtype_validation():
         gate_transform(raw_gate.int(), A_log, dt_bias, kind="softplus")
     with pytest.raises(ValueError, match="same device"):
         gate_transform(raw_gate, A_log.cpu(), dt_bias, kind="softplus")
-    with pytest.raises(ValueError, match="fastmath"):
-        gate_transform(raw_gate, A_log, dt_bias, kind="softplus", impl="reference", fastmath=True)
+    with pytest.raises(TypeError, match="fastmath must be bool"):
+        gate_transform(raw_gate, A_log, dt_bias, kind="softplus", impl="reference", fastmath=1)
 
 
 def test_fused_rejections():

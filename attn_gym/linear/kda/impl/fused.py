@@ -70,11 +70,29 @@ class _ChunkKDA(torch.autograd.Function):
             assert chunk_offsets is None
             if output_final_state:
                 output, state, aqk, akk = chunk_fwd_with_state_op(
-                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune, schedule
+                    q,
+                    k,
+                    v,
+                    cumulative_gate,
+                    beta,
+                    initial_state,
+                    scale,
+                    autotune,
+                    schedule,
+                    fastmath,
                 )
             else:
                 output, aqk, akk = chunk_fwd_op(
-                    q, k, v, cumulative_gate, beta, initial_state, scale, autotune, schedule
+                    q,
+                    k,
+                    v,
+                    cumulative_gate,
+                    beta,
+                    initial_state,
+                    scale,
+                    autotune,
+                    schedule,
+                    fastmath,
                 )
         elif output_final_state:
             assert chunk_offsets is not None
@@ -90,6 +108,7 @@ class _ChunkKDA(torch.autograd.Function):
                 scale,
                 autotune,
                 schedule,
+                fastmath,
             )
         else:
             assert chunk_offsets is not None
@@ -105,6 +124,7 @@ class _ChunkKDA(torch.autograd.Function):
                 scale,
                 autotune,
                 schedule,
+                fastmath,
             )
         ctx.save_for_backward(
             q,
@@ -185,7 +205,7 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     scale: float,
     output_final_state: bool = False,
-    fastmath: bool = False,
+    fastmath: bool = True,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -329,7 +349,7 @@ def paged_chunk_forward(
             active_state,
             scale=q.shape[-1] ** -0.5,
             output_final_state=True,
-            fastmath=False,
+            fastmath=True,
             autotune=autotune,
             schedule=schedule,
         )
@@ -410,7 +430,7 @@ def paged_chunk_forward(
         chunk_replay_state_gather_op(state_cache, state_indices),
         scale=q.shape[-1] ** -0.5,
         output_final_state=False,
-        fastmath=False,
+        fastmath=True,
         autotune=autotune,
         schedule=schedule,
     )

@@ -128,6 +128,7 @@ def chunk_kda_fwd_k3_triton_kernel(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Produce six off-diagonal Aqk/Akk blocks for one chunk and head."""
     global_chunk = tl.program_id(0)
@@ -277,9 +278,9 @@ def chunk_kda_fwd_k3_triton_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        row_scale1 = masked_exp2(gate1 - reference1[None, :], mask1)
-        row_scale2 = masked_exp2(gate2 - reference2[None, :], mask2)
-        row_scale3 = masked_exp2(gate3 - reference3[None, :], mask3)
+        row_scale1 = masked_exp2(gate1 - reference1[None, :], mask1, FASTMATH)
+        row_scale2 = masked_exp2(gate2 - reference2[None, :], mask2, FASTMATH)
+        row_scale3 = masked_exp2(gate3 - reference3[None, :], mask3, FASTMATH)
         qg1 = (q1 * row_scale1).to(q.dtype.element_ty)
         qg2 = (q2 * row_scale2).to(q.dtype.element_ty)
         qg3 = (q3 * row_scale3).to(q.dtype.element_ty)
@@ -287,12 +288,24 @@ def chunk_kda_fwd_k3_triton_kernel(
         kg2 = (k2 * row_scale2).to(k.dtype.element_ty)
         kg3 = (k3 * row_scale3).to(k.dtype.element_ty)
 
-        k0g1 = (k0 * masked_exp2(reference1[None, :] - gate0, mask0)).to(k.dtype.element_ty)
-        k0g2 = (k0 * masked_exp2(reference2[None, :] - gate0, mask0)).to(k.dtype.element_ty)
-        k1g2 = (k1 * masked_exp2(reference2[None, :] - gate1, mask1)).to(k.dtype.element_ty)
-        k0g3 = (k0 * masked_exp2(reference3[None, :] - gate0, mask0)).to(k.dtype.element_ty)
-        k1g3 = (k1 * masked_exp2(reference3[None, :] - gate1, mask1)).to(k.dtype.element_ty)
-        k2g3 = (k2 * masked_exp2(reference3[None, :] - gate2, mask2)).to(k.dtype.element_ty)
+        k0g1 = (k0 * masked_exp2(reference1[None, :] - gate0, mask0, FASTMATH)).to(
+            k.dtype.element_ty
+        )
+        k0g2 = (k0 * masked_exp2(reference2[None, :] - gate0, mask0, FASTMATH)).to(
+            k.dtype.element_ty
+        )
+        k1g2 = (k1 * masked_exp2(reference2[None, :] - gate1, mask1, FASTMATH)).to(
+            k.dtype.element_ty
+        )
+        k0g3 = (k0 * masked_exp2(reference3[None, :] - gate0, mask0, FASTMATH)).to(
+            k.dtype.element_ty
+        )
+        k1g3 = (k1 * masked_exp2(reference3[None, :] - gate1, mask1, FASTMATH)).to(
+            k.dtype.element_ty
+        )
+        k2g3 = (k2 * masked_exp2(reference3[None, :] - gate2, mask2, FASTMATH)).to(
+            k.dtype.element_ty
+        )
 
         aqk10 += tl.dot(qg1, tl.trans(k0g1))
         aqk20 += tl.dot(qg2, tl.trans(k0g2))
@@ -466,6 +479,7 @@ def chunk_kda_fwd_k3b_triton(
     aqk: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata | None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Complete the caller-owned Aqk tensor and return the temporary Akk blocks."""
     batch, tokens, heads, key_dim = q.shape
@@ -534,6 +548,8 @@ def chunk_kda_fwd_k3b_triton(
             cu_seqlens,
             chunk_offsets,
         ),
+        FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=4,
         num_stages=2,
     )

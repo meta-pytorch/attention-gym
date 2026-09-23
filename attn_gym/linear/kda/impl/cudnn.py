@@ -19,6 +19,7 @@ from attn_gym.linear.kda.impl.cudnn_ops import (
     validate_cudnn_available,
 )
 from attn_gym.linear.kda.ops import chunk_bwd_recompute_factors_with_state_grad_op
+from attn_gym.linear.kda.validation import validate_cudnn_fastmath
 
 _CHUNK_SIZE = 64
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
@@ -153,15 +154,14 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
-    fastmath: bool = False,
+    fastmath: bool = True,
     autotune: bool = True,
     split_backward: bool = False,
     split_forward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the optional cuDNN implementation behind the shared ``chunk_kda`` contract."""
+    validate_cudnn_fastmath(fastmath)
     scale = resolve_scale(scale, q.shape[-1])
-    if fastmath:
-        raise ValueError("fastmath is not supported by the cuDNN backend")
     if split_backward and (initial_state is not None or output_final_state):
         raise ValueError("split_backward currently requires a no-state call")
     if split_forward and (initial_state is not None or output_final_state):

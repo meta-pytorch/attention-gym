@@ -66,7 +66,7 @@ def chunk_kda(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
-    fastmath: bool = False,
+    fastmath: bool = True,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: KernelOptions | None = None,
@@ -102,8 +102,11 @@ def chunk_kda(
         scale: Query scale, applied inside the kernels in FP32. Defaults to
             ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        fastmath: Allow less precise fused math for speed; rejected by the cuDNN
-            backend and ``"reference"``.
+        fastmath: Allow fast, approximate gating exponentials (default ``True``). ``False``
+            selects non-fast exponentials for fused forward, backward, and recomputation.
+            The reference backend uses normal PyTorch math for either value; native cuDNN
+            requires ``True``. Configure gate production separately with ``bound_gate`` or
+            ``gate_transform``.
         autotune: Benchmark candidate fused-kernel configurations when true. cuDNN
             accepts this argument for API compatibility but uses its fixed schedule.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
@@ -120,11 +123,8 @@ def chunk_kda(
     """
     selected_impl = resolve_impl(impl)
     options = resolve_kernel_options(kernel_options)
-    if selected_impl is Impl.REFERENCE:
-        if fastmath:
-            raise ValueError("fastmath applies only to impl='fused'")
-        if kernel_options:
-            raise ValueError("kernel_options are not supported with impl='reference'")
+    if selected_impl is Impl.REFERENCE and kernel_options:
+        raise ValueError("kernel_options are not supported with impl='reference'")
     validate_kda_inputs(
         q,
         k,
@@ -198,6 +198,8 @@ def paged_chunk_kda(
     replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
+
+    Paged and replay-backed calls use ``fastmath=True``.
 
     Args:
         q: Queries shaped ``[B, T, H, K]``, scaled by ``1/sqrt(K)`` internally.

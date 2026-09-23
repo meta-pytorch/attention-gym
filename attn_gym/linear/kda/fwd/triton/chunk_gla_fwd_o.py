@@ -59,7 +59,7 @@ from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp, exp2
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=4),
         triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
     ],
-    key=["H", "K", "V", "T", "BT"],
+    key=["H", "K", "V", "T", "BT", "FASTMATH"],
     **autotune_cache_kwargs,
 )
 @triton.jit(
@@ -93,6 +93,7 @@ def chunk_gla_fwd_kernel_o(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if USE_INT64_OFFSETS:
@@ -157,9 +158,9 @@ def chunk_gla_fwd_kernel_o(
         b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
         # [BT, BK]
         if USE_EXP2:
-            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+            b_qg = (b_q * exp2(b_g, FASTMATH)).to(b_q.dtype)
         else:
-            b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+            b_qg = (b_q * exp(b_g, FASTMATH)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, mask=m_k[:, None] & m_v[None, :], other=0.0)
         # works but dkw, owing to divine benevolence
@@ -197,6 +198,7 @@ def _compose_output_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FASTMATH: tl.constexpr,
 ):
     """Compose one complete output tile with TMA-backed tensor descriptors."""
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
@@ -206,7 +208,7 @@ def _compose_output_tma(
         b_q = tl.reshape(b_q, [BT, BK])
         b_g = g_desc.load([batch, token_start, head, key_start])
         b_g = tl.reshape(b_g, [BT, BK]).to(tl.float32)
-        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g, FASTMATH)).to(b_q.dtype)
 
         b_h = h_desc.load([batch, chunk, head, key_start, value_tile * BV])
         b_h = tl.reshape(b_h, [BK, BV]).to(b_qg.dtype)
@@ -241,6 +243,7 @@ def chunk_gla_fwd_kernel_o_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Compose fixed KDA output tiles with TMA-backed tensor descriptors."""
     value_tile, chunk, batch_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -262,6 +265,7 @@ def chunk_gla_fwd_kernel_o_tma(
         BT,
         BK,
         BV,
+        FASTMATH,
     )
 
 
@@ -294,6 +298,7 @@ def _compose_ragged_output_task(
     BK: tl.constexpr,
     BV: tl.constexpr,
     num_sequences,
+    FASTMATH: tl.constexpr,
 ):
     """Compose one active (value-tile, chunk, head) ragged output tile.
 
@@ -324,6 +329,7 @@ def _compose_ragged_output_task(
             BT,
             BK,
             BV,
+            FASTMATH,
         )
     else:
         o_i = tl.arange(0, BT)
@@ -345,7 +351,7 @@ def _compose_ragged_output_task(
             )
             b_q = tl.load(p_q, mask=m_qg, other=0.0)
             b_g = tl.load(p_g, mask=m_qg, other=0.0).to(tl.float32)
-            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+            b_qg = (b_q * exp2(b_g, FASTMATH)).to(b_q.dtype)
             b_h = tl.load(p_h, mask=m_k[:, None] & m_v[None, :], other=0.0)
             b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
 
@@ -386,6 +392,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     BK: tl.constexpr,
     BV: tl.constexpr,
     num_sequences,
+    FASTMATH: tl.constexpr = True,
 ):
     """Launch one CTA per capacity task; capacity-only CTAs exit immediately."""
     i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -419,6 +426,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
         BK,
         BV,
         num_sequences,
+        FASTMATH,
     )
 
 
@@ -449,6 +457,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
     BV: tl.constexpr,
     num_sequences,
     num_workers,
+    FASTMATH: tl.constexpr = True,
 ):
     """Stride a bounded worker grid over active (chunk, head, value-tile) tasks."""
     worker = tl.program_id(0)
@@ -491,6 +500,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
             BK,
             BV,
             num_sequences,
+            FASTMATH,
         )
 
 
@@ -514,6 +524,7 @@ def chunk_gla_fwd_o_gk(
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms.
 
@@ -521,6 +532,7 @@ def chunk_gla_fwd_o_gk(
         schedule: Ragged launch geometry, as ``chunk_kda``'s ``kernel_options['schedule']``.
             AUTO keeps the static grid; dense inputs always use
             their exact launch grid.
+        fastmath: Select fast or non-fast query-gating exponentials.
 
     Raises:
         ValueError: If persistent scheduling is forced for a packed input outside
@@ -592,6 +604,8 @@ def chunk_gla_fwd_o_gk(
             BT=chunk_size,
             BK=block_key_dim,
             BV=block_value_dim,
+            FASTMATH=fastmath,
+            enable_reflect_ftz=fastmath,
             num_warps=2,
             num_stages=3,
         )
@@ -627,6 +641,8 @@ def chunk_gla_fwd_o_gk(
                 "BK": block_key_dim,
                 "BV": block_value_dim,
                 "num_sequences": metadata.cu_seqlens.shape[0] - 1,
+                "FASTMATH": fastmath,
+                "enable_reflect_ftz": fastmath,
                 "num_warps": 2,
                 "num_stages": 3,
                 # The partial-tail pointer branch otherwise pushes this kernel
@@ -666,6 +682,8 @@ def chunk_gla_fwd_o_gk(
             BT=chunk_size,
             num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
             USE_EXP2=True,
+            FASTMATH=fastmath,
+            enable_reflect_ftz=fastmath,
         )
     return output
 

@@ -172,7 +172,9 @@ class DeltaRuleAttention(nn.Module):
     ``variant="kda"`` learns a bounded per-channel log decay through ``f_a_proj``/``f_b_proj``
     and the bounded ``gate_transform``; ``variant="gdn"`` learns one softplus log decay per head
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
-    both fused gates and to the KDA core. ``kernel_options`` are passed through to the chunk
+    both fused gates and to the KDA core. Its default ``True`` permits approximate math;
+    reference execution keeps ordinary PyTorch math, and native cuDNN KDA rejects ``False``.
+    ``kernel_options`` are passed through to the chunk
     core (``{"backend": "cudnn"}`` selects the SM100 cuDNN kernels for either variant).
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
@@ -195,7 +197,7 @@ class DeltaRuleAttention(nn.Module):
         short_conv_kernel_size: int = 4,
         lower_bound: float = -5.0,
         backend: Backend = "reference",
-        fastmath: bool = False,
+        fastmath: bool = True,
         kernel_options: KernelOptions | None = None,
         rms_norm_eps: float = 1e-5,
         compute_dtype: torch.dtype | None = None,
@@ -227,8 +229,6 @@ class DeltaRuleAttention(nn.Module):
             )
         if backend == "fused" and head_dim != 128:
             raise ValueError("the fused backend requires head_dim=128")
-        if backend == "reference" and fastmath:
-            raise ValueError("fastmath applies only to backend='fused'")
         if backend == "reference" and kernel_options:
             raise ValueError("kernel_options apply only to backend='fused'")
 
@@ -905,8 +905,12 @@ def main(
         typer.Option(help="Chunk kernels for the fused backend: repo-local or cuDNN (SM100)."),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
-        bool, typer.Option(help="Use approximate exponentials in the fused gate and KDA core.")
-    ] = False,
+        bool,
+        typer.Option(
+            help="Permit approximate gating math (default); --no-fastmath requests non-fast "
+            "math and is unsupported by native cuDNN KDA. Reference math is unchanged."
+        ),
+    ] = True,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
     batch_size: Annotated[
         int,

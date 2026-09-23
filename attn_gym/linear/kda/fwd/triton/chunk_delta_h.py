@@ -82,6 +82,7 @@ def _run_chunk_delta_h_sequence(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
+    FASTMATH: tl.constexpr,
 ):
     """Process one sequence, head, and value tile through the state recurrence.
 
@@ -169,10 +170,10 @@ def _run_chunk_delta_h_sequence(
         )
         if SCALAR_GATE:
             b_decay = tl.load(gk + (tok + BT - 1) * H + i_h)
-            b_h = b_h * exp2(b_decay)
+            b_h = b_h * exp2(b_decay, FASTMATH)
         else:
             b_decay = tl.reshape(gk_desc.load([0, tok + BT - 1, i_h, 0]), [K])
-            b_h = b_h * exp2(b_decay)[:, None]
+            b_h = b_h * exp2(b_decay, FASTMATH)[:, None]
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
@@ -206,10 +207,10 @@ def _run_chunk_delta_h_sequence(
         )
         if SCALAR_GATE:
             b_decay = tl.load(gk + (bos + T - 1) * H + i_h)
-            b_h = b_h * exp2(b_decay)
+            b_h = b_h * exp2(b_decay, FASTMATH)
         else:
             b_decay = tl.reshape(gk_desc.load([0, bos + T - 1, i_h, 0]), [K])
-            b_h = b_h * exp2(b_decay)[:, None]
+            b_h = b_h * exp2(b_decay, FASTMATH)[:, None]
         b_k = tl.load(
             k + ptr_offset((o_t[:, None], i_h, o_k[None, :]), (H * K, K, 1)),
             mask=m_t[:, None],
@@ -267,6 +268,7 @@ def chunk_delta_h_kernel_k128_wsp(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Primary K=128 inter-chunk recurrence launcher."""
     _run_chunk_delta_h_sequence(
@@ -307,6 +309,7 @@ def chunk_delta_h_kernel_k128_wsp(
         USE_HAS_INITIAL_STATE,
         USE_INT64_OFFSETS,
         SCALAR_GATE,
+        FASTMATH,
     )
 
 
@@ -353,6 +356,7 @@ def chunk_delta_h_kernel_k128_persistent(
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
     NUM_SEQUENCES,
+    FASTMATH: tl.constexpr = True,
 ):
     """Stride persistent workers over sequence recurrences after the first wave."""
     worker = tl.program_id(0)
@@ -400,6 +404,7 @@ def chunk_delta_h_kernel_k128_persistent(
             USE_HAS_INITIAL_STATE,
             USE_INT64_OFFSETS,
             SCALAR_GATE,
+            FASTMATH,
         )
 
 
@@ -451,6 +456,7 @@ def _delta_h_launch(
     capacity: int,
     final_state: torch.Tensor | None,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
     batch, tokens, heads, key_dim = k.shape
@@ -516,6 +522,8 @@ def _delta_h_launch(
             k, w, u, gk, v_new, h, initial_state, final_state
         ),
         "SCALAR_GATE": scalar_gate,
+        "FASTMATH": fastmath,
+        "enable_reflect_ftz": fastmath,
         "num_warps": 4,
     }
     value_tiles = value_dim // block_value_dim
@@ -567,9 +575,21 @@ def _delta_h_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
-        k, w, u, gk, initial_state, None, None, cu_seqlens, chunk_offsets, capacity, None
+        k,
+        w,
+        u,
+        gk,
+        initial_state,
+        None,
+        None,
+        cu_seqlens,
+        chunk_offsets,
+        capacity,
+        None,
+        fastmath=fastmath,
     )
 
 
@@ -582,6 +602,7 @@ def _delta_h_with_state_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = torch.empty(
@@ -599,6 +620,7 @@ def _delta_h_with_state_cuda(
         chunk_offsets,
         capacity,
         final_state,
+        fastmath=fastmath,
     )
     return h, v_new, final_state
 
@@ -614,6 +636,7 @@ def _delta_h_paged_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
         k,
@@ -627,6 +650,7 @@ def _delta_h_paged_cuda(
         chunk_offsets,
         capacity,
         state_cache,
+        fastmath=fastmath,
     )
 
 
@@ -643,6 +667,7 @@ def chunk_gated_delta_rule_fwd_h(
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
@@ -650,7 +675,7 @@ def chunk_gated_delta_rule_fwd_h(
     scalar decay per head (GDN). ``autotune`` is accepted for launcher-ABI
     parity with the other stages;
     the warp-specialized kernel has a single fixed configuration, so pinned
-    and autotuned launches are identical.
+    and autotuned launches are identical. ``fastmath`` selects the decay ``exp2``.
     """
     del autotune
     batch, tokens, heads, key_dim = k.shape
@@ -767,14 +792,15 @@ def chunk_gated_delta_rule_fwd_h(
             cu_seqlens,
             chunk_offsets,
             chunks,
+            fastmath,
         )
         return h, v_new, None
     if output_final_state:
         h, v_new, final_state = _delta_h_with_state_op(
-            k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks
+            k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks, fastmath
         )
         return h, v_new, final_state
-    h, v_new = _delta_h_op(k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks)
+    h, v_new = _delta_h_op(k, w, u, gk, initial_state, cu_seqlens, chunk_offsets, chunks, fastmath)
     return h, v_new, None
 
 

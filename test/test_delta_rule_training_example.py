@@ -42,9 +42,9 @@ def test_example_validates_public_gate_configuration():
     make(variant="gdn", lower_bound=too_low, backend="fused")
     with pytest.raises(ValueError, match="finite and nonpositive"):
         make(lower_bound=1.0, backend="reference")
-    with pytest.raises(ValueError, match="fastmath applies only"):
-        make(fastmath=True, backend="reference")
-    # Both fused gates accept fastmath; only the reference backend rejects it.
+    assert make(backend="reference").fastmath is True
+    make(fastmath=True, backend="reference")
+    # Reference may keep its normal math even when approximations are permitted.
     make(variant="gdn", fastmath=True, backend="fused")
     with pytest.raises(ValueError, match="variant must be"):
         make(variant="mamba")

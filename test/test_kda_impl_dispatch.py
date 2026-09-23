@@ -241,11 +241,13 @@ def test_chunk_kernel_options_plumbing():
         )
 
 
-def test_chunk_reference_rejects_fastmath():
-    """Keep fused-only knobs from silently changing meaning."""
+@pytest.mark.parametrize("fastmath", [False, True])
+def test_chunk_reference_accepts_fastmath_permission(fastmath):
+    """Permission to approximate does not require the reference to change its math."""
     q, k, v, gate, beta = _inputs(tokens=8)
-    with pytest.raises(ValueError, match="fastmath"):
-        chunk_kda(q, k, v, gate, beta, fastmath=True, impl="reference")
+    expected, _ = chunk_kda(q, k, v, gate, beta, impl="reference")
+    actual, _ = chunk_kda(q, k, v, gate, beta, fastmath=fastmath, impl="reference")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk_kda requires CUDA capability 8.0")

@@ -63,6 +63,15 @@ def resolve_kernel_options(
     )
 
 
+def validate_cudnn_fastmath(fastmath: bool) -> None:
+    """Reject a precision request that the native cuDNN KDA kernels cannot honor."""
+    if not fastmath:
+        raise ValueError(
+            "cuDNN KDA cannot honor fastmath=False; "
+            "use fastmath=True or the repo-local fused backend"
+        )
+
+
 def validate_kda_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -104,4 +113,9 @@ def validate_kda_inputs(
         raise TypeError(f"{op_name} inputs must use one of {supported}")
 
 
-__all__ = ["SUPPORTED_INPUT_DTYPES", "resolve_kernel_options", "validate_kda_inputs"]
+__all__ = [
+    "SUPPORTED_INPUT_DTYPES",
+    "resolve_kernel_options",
+    "validate_cudnn_fastmath",
+    "validate_kda_inputs",
+]
