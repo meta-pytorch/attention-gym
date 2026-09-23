@@ -218,10 +218,16 @@ def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
 @pytest.mark.usefixtures("fresh_compile_cache")
 def test_cute_eligible_auto_fullgraph_training():
     from attn_gym.sparse.selected_attention.api import _select_backend
-    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
+    from attn_gym.sparse.selected_attention.impl.cute import (
+        SUPPORTED_CAPABILITIES,
+        _fa4_available,
+    )
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 required")
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES
+    ):
+        pytest.skip("SM100 or SM103 required")
     if not _fa4_available(with_sink=False):
         pytest.skip("FA4 required to exercise compile-driven fallback")
     torch.manual_seed(0)

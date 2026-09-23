@@ -42,9 +42,9 @@ def cuda_inputs():
         }
 
 
-@pytest.fixture
-def fa4_available(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+@pytest.fixture(params=[(10, 0), (10, 3)], ids=["sm100", "sm103"])
+def fa4_available(monkeypatch, request):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: request.param)
     available = Mock(return_value=True)
     monkeypatch.setattr(cute, "_fa4_available", available)
     return available
@@ -71,7 +71,7 @@ def test_default_prefers_cute(cuda_inputs, fa4_available, monkeypatch, heads):
         (128, 512, torch.float32, 1, (10, 0)),
         (128, 512, torch.bfloat16, 128, (10, 0)),
         (128, 512, torch.bfloat16, 1, (9, 0)),
-        (128, 512, torch.bfloat16, 1, (10, 3)),
+        (128, 512, torch.bfloat16, 1, (12, 0)),
     ],
 )
 def test_unsupported_metadata_uses_triton(

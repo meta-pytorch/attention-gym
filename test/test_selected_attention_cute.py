@@ -1,8 +1,8 @@
 """
-Tests for the CuTe DSL (SM100) backend of selected attention.
+Tests for the CuTe DSL (SM100/SM103) backend of selected attention.
 
 Validates forward and backward precision against an FP64 eager baseline.
-CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100.
+CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
 Fewer than 128 heads require FA4's sparse-MLA head-padding support.
 
 Note: torch.compile is NOT supported for the CuTe backend (eager-only).
@@ -15,14 +15,15 @@ import pytest
 import torch
 
 from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
+from attn_gym.sparse.selected_attention.impl.cute import SUPPORTED_CAPABILITIES
 from attn_gym.testing.kda import assert_relative_rms_within
 
 
 def _skip_no_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 (compute capability 10.0) required for CuTe backend")
+    if torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES:
+        pytest.skip("SM100 or SM103 required for CuTe backend")
 
 
 def skip_unsupported_cute_sink(sink_dtype: torch.dtype | None) -> None:

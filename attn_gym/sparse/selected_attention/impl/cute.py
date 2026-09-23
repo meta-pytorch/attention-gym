@@ -1,4 +1,4 @@
-"""CuTe DSL (SM100) backend for selected attention.
+"""CuTe DSL (SM100/SM103) backend for selected attention.
 
 Delegates to FlashAttention-4's public ``flash_attn_func`` with
 ``gather_kv_indices`` for index-gather mode.  FA4 owns autograd,
@@ -11,7 +11,7 @@ Constraints
 -----------
 - head_dim = 512, 1 <= nheads <= 128, share_kv = True (fewer than 128 heads are
   zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
-- dtype = bfloat16, SM100 (compute capability 10.0)
+- dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
 - Requires FA4 with sparse MLA attention sink support (commit 62892fe+); fewer than
   128 heads also require FA4's sparse-MLA head-padding support (PR #2883)
 """
@@ -84,12 +84,14 @@ def _build_unified_gather_indices(
 # Validation
 # ---------------------------------------------------------------------------
 
+SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
+
 
 def _validate_cute_constraints(query, share_kv):
     if query.device.type != "cuda":
         raise ValueError("CuTe backend requires CUDA tensors.")
-    if torch.cuda.get_device_capability(query.device) != (10, 0):
-        raise ValueError("CuTe backend requires SM100.")
+    if torch.cuda.get_device_capability(query.device) not in SUPPORTED_CAPABILITIES:
+        raise ValueError("CuTe backend requires SM100 or SM103.")
     if query.dtype != torch.bfloat16:
         raise TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
@@ -171,7 +173,7 @@ def selected_attention(
     *,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """CuTe DSL (SM100) forward+backward for selected attention.
+    """CuTe DSL (SM100/SM103) forward+backward for selected attention.
 
     Eager-only — torch.compile is not supported for this backend.
     Optional per-head attention sinks are forwarded to FA4, which owns their gradients.
