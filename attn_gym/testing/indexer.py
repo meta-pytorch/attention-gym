@@ -104,8 +104,8 @@ def _selection_errors(
     scores = (dots.relu() * w64.transpose(1, 2).unsqueeze(-1)).sum(1)
     scores /= math.sqrt(heads * dim)
     assert torch.isfinite(scores).all()
-    absolute_dots = q64.abs().permute(0, 2, 1, 3) @ k64.abs().transpose(-1, -2).unsqueeze(1)
-    magnitude = (absolute_dots * w64.abs().transpose(1, 2).unsqueeze(-1)).sum(1)
+    # sum_h |w_h| (|q_h| . |k_s|) == (sum_h |w_h| |q_h|) . |k_s|: fold heads before the product.
+    magnitude = (w64.abs().unsqueeze(-1) * q64.abs()).sum(2) @ k64.abs().transpose(-1, -2)
     magnitude /= math.sqrt(heads * dim)
 
     # Match impl/reference.py's eager scoring, including its reduction layout and
