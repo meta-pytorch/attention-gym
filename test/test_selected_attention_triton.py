@@ -605,3 +605,41 @@ def test_triton_fp32_row_reductions(heads, head_dim, share_kv):
     assert_sink_gradient_fp32(
         inputs["attention_sink"], aux.lse, output, grad_output, inputs["attention_sink"].grad
     )
+
+
+def test_triton_deterministic_sink_gradient():
+    """Deterministic mode gives bitwise-repeatable sink gradients for non-512 head dims.
+
+    Batch 2 with several query blocks per head reliably exposed the old cross-block
+    atomic_add sink reduction within five repeats.
+    """
+    _skip_no_cuda()
+    inputs = _make_inputs(
+        batch=2,
+        heads=4,
+        seq_len=256,
+        head_dim=64,
+        share_kv=False,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+        seed=5,
+    )
+    inputs["attention_sink"] = inputs["attention_sink"].detach().float().requires_grad_()
+    differentiable = [
+        inputs[name] for name in ("query", "local_kv", "sparse_kv", "attention_sink")
+    ]
+    grad_output = torch.randn_like(inputs["query"])
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        grads = []
+        for _ in range(5):
+            output = selected_attention(**inputs, kernel_options={"backend": "triton"})
+            grads.append(torch.autograd.grad(output, differentiable, grad_output))
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
+
+    for repeated in grads[1:]:
+        for actual, first in zip(repeated, grads[0], strict=True):
+            torch.testing.assert_close(actual, first, atol=0, rtol=0)

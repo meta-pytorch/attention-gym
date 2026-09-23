@@ -157,14 +157,12 @@ def _selected_attention_bwd_dq(
     sink = tl.load(attention_sink_ptr + head)
     sink_probability = tl.exp(sink - lse)
     sink_gradient = tl.where(query_mask, -sink_probability * delta, 0.0)
-    if D == 512:
-        # Output-owned partials also keep the generic D=512 fallback deterministic.
-        tl.store(
-            grad_sink_ptr + batch_head * tl.cdiv(S, BLOCK_M) + query_block,
-            tl.sum(sink_gradient, axis=0),
-        )
-    else:
-        tl.atomic_add(grad_sink_ptr + head, tl.sum(sink_gradient, axis=0))
+    # Output-owned per-block partials, reduced in a fixed order on the host, keep the
+    # sink gradient deterministic; atomics across query blocks would not be.
+    tl.store(
+        grad_sink_ptr + batch_head * tl.cdiv(S, BLOCK_M) + query_block,
+        tl.sum(sink_gradient, axis=0),
+    )
 
 
 @triton.jit
@@ -622,16 +620,12 @@ def _launch_backward(
         num_local_key_tiles = (
             triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
         )
-        grad_sink_fp32 = (
-            torch.empty(
-                batch,
-                heads,
-                triton.cdiv(seq_len, block_m),
-                device=query.device,
-                dtype=torch.float32,
-            )
-            if head_dim == 512
-            else torch.zeros(heads, device=query.device, dtype=torch.float32)
+        grad_sink_partials = torch.empty(
+            batch,
+            heads,
+            triton.cdiv(seq_len, block_m),
+            device=query.device,
+            dtype=torch.float32,
         )
         _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
             query,
@@ -644,7 +638,7 @@ def _launch_backward(
             lse,
             attention_sink,
             grad_query,
-            grad_sink_fp32,
+            grad_sink_partials,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             LOCAL_KV_STRIDES=local_kv.stride(),
@@ -666,8 +660,7 @@ def _launch_backward(
             num_warps=num_warps,
             num_stages=num_stages,
         )
-        if head_dim == 512:
-            grad_sink_fp32 = grad_sink_fp32.sum(dim=(0, 2))
+        grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
 
     local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
     if use_tma:
