@@ -41,24 +41,6 @@ def _hash_file(hasher: Any, label: str, source: Path) -> None:
     hasher.update(content)
 
 
-def _hash_source_tree(hasher: Any, root: Path) -> None:
-    for source in sorted(root.rglob("*.py")):
-        if source.is_file():
-            _hash_file(hasher, source.relative_to(root).as_posix(), source)
-
-
-def _module_file(root: Path, name: str) -> Path | None:
-    """Resolve a dotted module name under ``root``'s parent to its source file."""
-    relative = Path(*name.split("."))
-    for candidate in (
-        root.parent / relative.with_suffix(".py"),
-        root.parent / relative / "__init__.py",
-    ):
-        if candidate.is_file():
-            return candidate
-    return None
-
-
 @functools.cache
 def _direct_imports(root: Path, source: Path) -> frozenset[Path]:
     """Return package modules that ``source`` may import, as a static superset.
@@ -71,17 +53,20 @@ def _direct_imports(root: Path, source: Path) -> frozenset[Path]:
     reachable only through an explicit import of the package.
     """
     package = root.name
-    if source.is_relative_to(root.parent):
-        module = source.relative_to(root.parent).with_suffix("").parts
-        containing_package = module[:-1]
-    else:  # A caller outside the package: only its absolute package imports resolve.
-        containing_package = ()
+    # A caller outside the package resolves only its absolute package imports.
+    containing_package = (
+        source.parent.relative_to(root.parent).parts if source.is_relative_to(root.parent) else ()
+    )
     found: set[Path] = set()
 
     def add(name: str) -> None:
-        in_package = name == package or name.startswith(f"{package}.")
-        if in_package and (resolved := _module_file(root, name)) is not None:
-            found.add(resolved)
+        if name != package and not name.startswith(f"{package}."):
+            return
+        module = root.parent.joinpath(*name.split("."))
+        for candidate in (module.with_suffix(".py"), module / "__init__.py"):
+            if candidate.is_file():
+                found.add(candidate)
+                return
 
     for node in ast.walk(ast.parse(source.read_bytes(), filename=str(source))):
         if isinstance(node, ast.Import):
@@ -105,32 +90,48 @@ def _direct_imports(root: Path, source: Path) -> frozenset[Path]:
     return frozenset(found)
 
 
-def module_closure(source: Path, root: Path | None = None) -> tuple[Path, ...]:
+def module_closure(source: Path) -> tuple[Path, ...]:
     """Return ``source`` and every package module it transitively imports, sorted.
 
     Compiled kernels inline whatever package code runs while tracing, including module-level
     constants, so every module reachable by import from the compile function's module is part
     of its source identity. Unrelated package modules are not.
     """
-    root = (_PACKAGE_ROOT if root is None else root).resolve()
     seen: set[Path] = set()
     pending = [source.resolve()]
     while pending:
         current = pending.pop()
         if current not in seen:
             seen.add(current)
-            pending.extend(_direct_imports(root, current) - seen)
+            pending.extend(_direct_imports(_PACKAGE_ROOT, current) - seen)
     return tuple(sorted(seen))
 
 
-def _fingerprinted_files(fn: Callable[..., Any], extra_sources: tuple[str, ...]) -> list[Path]:
+def _fingerprinted_files(
+    fn: Callable[..., Any], extra_sources: tuple[str, ...]
+) -> list[tuple[str, Path]]:
+    """Return ``(label, path)`` for every source in ``fn``'s fingerprint.
+
+    Package labels are package-relative so different checkouts and installs share entries.
+    """
+    files: list[tuple[str, Path]] = []
     module_file = getattr(sys.modules.get(fn.__module__), "__file__", None)
-    files = []
     if module_file is not None and module_file.endswith(".py"):
-        files.extend(module_closure(Path(module_file)))
+        for path in module_closure(Path(module_file)):
+            if path.is_relative_to(_PACKAGE_ROOT):
+                files.append((path.relative_to(_PACKAGE_ROOT).as_posix(), path))
+            else:  # Only the caller itself can be outside the package.
+                files.append((fn.__module__, path))
     for extra_source in extra_sources:
         path = Path(extra_source).expanduser().resolve()
-        files.extend(sorted(path.rglob("*.py")) if path.is_dir() else [path])
+        if path.is_dir():
+            files.extend(
+                (file.relative_to(path).as_posix(), file) for file in sorted(path.rglob("*.py"))
+            )
+        elif path.is_file():
+            files.append((str(path), path))
+        else:
+            raise FileNotFoundError(f"extra CuTeDSL cache source does not exist: {path}")
     return files
 
 
@@ -145,8 +146,8 @@ def sources_modified_since_import(
     """
     return [
         path
-        for path in _fingerprinted_files(fn, extra_sources)
-        if path.is_file() and path.stat().st_mtime > _SOURCE_SNAPSHOT_TIME
+        for _, path in _fingerprinted_files(fn, extra_sources)
+        if path.stat().st_mtime > _SOURCE_SNAPSHOT_TIME
     ]
 
 
@@ -173,26 +174,8 @@ def source_fingerprint(
     )
     hasher.update(pickle.dumps(stamps, protocol=pickle.HIGHEST_PROTOCOL))
 
-    module = sys.modules.get(fn.__module__)
-    module_file = getattr(module, "__file__", None)
-    if module_file is not None:
-        source = Path(module_file).resolve()
-        if source.suffix == ".py" and source.is_file():
-            _hash_file(hasher, fn.__module__, source)
-            # Labels are package-relative so different checkouts and installs share entries.
-            for dependency in module_closure(source):
-                if dependency.is_relative_to(_PACKAGE_ROOT):
-                    label = dependency.relative_to(_PACKAGE_ROOT).as_posix()
-                    _hash_file(hasher, label, dependency)
-
-    for extra_source in extra_sources:
-        path = Path(extra_source).expanduser().resolve()
-        if path.is_dir():
-            _hash_source_tree(hasher, path)
-        elif path.is_file():
-            _hash_file(hasher, str(path), path)
-        else:
-            raise FileNotFoundError(f"extra CuTeDSL cache source does not exist: {path}")
+    for label, path in _fingerprinted_files(fn, extra_sources):
+        _hash_file(hasher, label, path)
 
     cutlass_root = Path(cutlass.__file__).resolve().parent
     for relative_path in (
