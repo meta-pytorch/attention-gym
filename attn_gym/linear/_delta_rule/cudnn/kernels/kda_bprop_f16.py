@@ -73,7 +73,6 @@ Warp assignments (16 warps = 512 threads):
 
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -4145,7 +4144,7 @@ TENSORMAP_STATIC_SLOTS = 0
 # ---- Torch adapter / host-side compilation ---------------------------------------
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_kda_bprop(
     io_dtype: type[cutlass.Numeric],
     HQ: int,
@@ -4234,7 +4233,7 @@ def _compile_kda_bprop(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_kda_bprop_prologue(
     io_dtype: type[cutlass.Numeric],
     HQ: int,

@@ -1227,3 +1227,23 @@ def test_winner_key_tracks_candidates_and_namespace():
     assert tune_module._winner_key(Kernel, [1, 2], (64,), ("other",)) != base
     _FakeCompile.namespace = "namespace-b"
     assert tune_module._winner_key(Kernel, [1, 2], (64,), ()) != base
+
+
+def test_sources_modified_after_import_bypass_the_disk_cache(isolated_cache, monkeypatch, caplog):
+    """A kernel traced from stale in-memory code must not be published under the new source."""
+    modified = [Path("edited.py")]
+    monkeypatch.setattr(cute_cache, "_sources_modified_since_import", lambda *_: modified)
+
+    @cute_cache.jit_cache
+    def compile_kernel(variant: str) -> FakeCompiled:
+        return FakeCompiled(variant)
+
+    assert compile_kernel("a")() == "a"
+    assert compile_kernel("b")() == "b"
+    assert not list(isolated_cache.rglob("*.o"))
+    assert caplog.text.count("sources changed after import") == 1
+
+    modified.clear()
+    compile_kernel.cache_clear()
+    assert compile_kernel("a")() == "a"
+    assert len(list(isolated_cache.rglob("*.o"))) == 1

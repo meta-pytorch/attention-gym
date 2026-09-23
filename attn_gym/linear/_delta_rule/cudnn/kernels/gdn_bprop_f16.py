@@ -107,7 +107,6 @@ Warp assignments (12 warps = 384 threads):
 
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
@@ -5433,7 +5432,7 @@ def _validate_scalar_fp32(name, tensor, expected_shape) -> None:
         raise ValueError(f"{name} outer strides must be nonnegative")
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_gdn_bprop(
     io_dtype: type[cutlass.Numeric],
     h_q: int,
@@ -5504,7 +5503,7 @@ def _compile_gdn_bprop(
     )
 
 
-@jit_cache(extra_sources=(Path(__file__).parent,))
+@jit_cache
 def _compile_gdn_bprop_prologue(
     io_dtype: type[cutlass.Numeric],
     h_q: int,

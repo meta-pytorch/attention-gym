@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import dis
 import enum
@@ -11,8 +12,10 @@ import inspect
 import os
 import pickle
 import platform
+import re
 import sys
 import threading
+import time
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -20,7 +23,13 @@ from typing import Any
 
 from .target import CompileTarget
 
-CACHE_FORMAT_VERSION = 4
+CACHE_FORMAT_VERSION = 5
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+# Keys read sources from disk at the first cache miss, possibly long after the traced code was
+# imported. Files modified after this point may no longer match the code in memory.
+_SOURCE_SNAPSHOT_TIME = time.time()
+_MODULE_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 
 
 def _hash_file(hasher: Any, label: str, source: Path) -> None:
@@ -36,6 +45,109 @@ def _hash_source_tree(hasher: Any, root: Path) -> None:
     for source in sorted(root.rglob("*.py")):
         if source.is_file():
             _hash_file(hasher, source.relative_to(root).as_posix(), source)
+
+
+def _module_file(root: Path, name: str) -> Path | None:
+    """Resolve a dotted module name under ``root``'s parent to its source file."""
+    relative = Path(*name.split("."))
+    for candidate in (
+        root.parent / relative.with_suffix(".py"),
+        root.parent / relative / "__init__.py",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+@functools.cache
+def _direct_imports(root: Path, source: Path) -> frozenset[Path]:
+    """Return package modules that ``source`` may import, as a static superset.
+
+    Follows ``import``/``from`` statements anywhere in the file, including function-local and
+    ``TYPE_CHECKING`` imports, plus string literals naming package modules, which covers
+    ``importlib.import_module("pkg.module")``. ``from pkg import name`` adds ``pkg``, where
+    ``name`` may be defined, and the ``pkg.name`` submodule if one exists. Parent ``__init__``
+    files that ``import pkg.sub.module`` executes implicitly are not followed: their names are
+    reachable only through an explicit import of the package.
+    """
+    package = root.name
+    if source.is_relative_to(root.parent):
+        module = source.relative_to(root.parent).with_suffix("").parts
+        containing_package = module[:-1]
+    else:  # A caller outside the package: only its absolute package imports resolve.
+        containing_package = ()
+    found: set[Path] = set()
+
+    def add(name: str) -> None:
+        in_package = name == package or name.startswith(f"{package}.")
+        if in_package and (resolved := _module_file(root, name)) is not None:
+            found.add(resolved)
+
+    for node in ast.walk(ast.parse(source.read_bytes(), filename=str(source))):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = containing_package[: len(containing_package) - node.level + 1]
+                name = ".".join((*base, node.module) if node.module else base)
+            else:
+                name = node.module or ""
+            add(name)
+            for alias in node.names:
+                add(f"{name}.{alias.name}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _MODULE_NAME.fullmatch(node.value)
+        ):
+            add(node.value)
+    return frozenset(found)
+
+
+def module_closure(source: Path, root: Path | None = None) -> tuple[Path, ...]:
+    """Return ``source`` and every package module it transitively imports, sorted.
+
+    Compiled kernels inline whatever package code runs while tracing, including module-level
+    constants, so every module reachable by import from the compile function's module is part
+    of its source identity. Unrelated package modules are not.
+    """
+    root = (_PACKAGE_ROOT if root is None else root).resolve()
+    seen: set[Path] = set()
+    pending = [source.resolve()]
+    while pending:
+        current = pending.pop()
+        if current not in seen:
+            seen.add(current)
+            pending.extend(_direct_imports(root, current) - seen)
+    return tuple(sorted(seen))
+
+
+def _fingerprinted_files(fn: Callable[..., Any], extra_sources: tuple[str, ...]) -> list[Path]:
+    module_file = getattr(sys.modules.get(fn.__module__), "__file__", None)
+    files = []
+    if module_file is not None and module_file.endswith(".py"):
+        files.extend(module_closure(Path(module_file)))
+    for extra_source in extra_sources:
+        path = Path(extra_source).expanduser().resolve()
+        files.extend(sorted(path.rglob("*.py")) if path.is_dir() else [path])
+    return files
+
+
+def sources_modified_since_import(
+    fn: Callable[..., Any], extra_sources: tuple[str, ...] = ()
+) -> list[Path]:
+    """Return fingerprinted sources modified after the cache module was imported.
+
+    Such a file may differ from the code this process traces, so publishing or loading under
+    its current fingerprint could pair one source with another's kernel. Callers must bypass
+    the disk cache for the function while this list is nonempty.
+    """
+    return [
+        path
+        for path in _fingerprinted_files(fn, extra_sources)
+        if path.is_file() and path.stat().st_mtime > _SOURCE_SNAPSHOT_TIME
+    ]
 
 
 @functools.cache
@@ -67,12 +179,11 @@ def source_fingerprint(
         source = Path(module_file).resolve()
         if source.suffix == ".py" and source.is_file():
             _hash_file(hasher, fn.__module__, source)
-
-    package_root = Path(__file__).resolve().parents[2]
-    for source in sorted(package_root.rglob("*.py")):
-        relative_path = source.relative_to(package_root)
-        if "cute" in relative_path.parts:
-            _hash_file(hasher, relative_path.as_posix(), source)
+            # Labels are package-relative so different checkouts and installs share entries.
+            for dependency in module_closure(source):
+                if dependency.is_relative_to(_PACKAGE_ROOT):
+                    label = dependency.relative_to(_PACKAGE_ROOT).as_posix()
+                    _hash_file(hasher, label, dependency)
 
     for extra_source in extra_sources:
         path = Path(extra_source).expanduser().resolve()
