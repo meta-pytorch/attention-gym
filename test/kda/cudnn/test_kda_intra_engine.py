@@ -70,11 +70,13 @@ def test_fwd_engine_matches_shipped_trio(lengths, heads, saturated):
         g = _saturate(g, lengths)
     scale = D**-0.5
 
-    eaqk, eakkod, eakkd = kda_intra_engine_fwd(q, k, g, beta, scale, metadata)
+    eaqk, eakkod, eakkd = kda_intra_engine_fwd(q, k, g, beta, scale, metadata, fastmath=False)
     eakk = chunk_kda_fwd_k4b_ragged_cute(eakkod, eakkd, metadata)
 
-    saqk, sakkd = chunk_kda_fwd_intra_diagonal(q, k, g, beta, scale, metadata)
-    saqk, sakkod = chunk_kda_fwd_k3b_ragged_cute(q, k, g, beta, saqk, scale, metadata)
+    saqk, sakkd = chunk_kda_fwd_intra_diagonal(q, k, g, beta, scale, metadata, fastmath=True)
+    saqk, sakkod = chunk_kda_fwd_k3b_ragged_cute(
+        q, k, g, beta, saqk, scale, metadata, fastmath=True
+    )
     sakk = chunk_kda_fwd_k4b_ragged_cute(sakkod, sakkd, metadata)
 
     for name, got, ref, tol in (
@@ -103,10 +105,12 @@ def test_fwd_engine_dense_matches_shipped(saturated):
         g = _saturate(g, [128])
     scale = D**-0.5
 
-    eaqk, eakkod, eakkd = kda_intra_engine_fwd(q, k, g, beta, scale, None)
+    eaqk, eakkod, eakkd = kda_intra_engine_fwd(q, k, g, beta, scale, None, fastmath=False)
     eakk = chunk_kda_fwd_k4b_dense_cute(eakkod, eakkd)
-    saqk, sakkd = chunk_kda_fwd_intra_diagonal(q, k, g, beta, scale, None)
-    saqk, sakk = chunk_kda_fwd_inter_solve_cute(q, k, g, beta, sakkd, scale, Aqk=saqk)
+    saqk, sakkd = chunk_kda_fwd_intra_diagonal(q, k, g, beta, scale, None, fastmath=True)
+    saqk, sakk = chunk_kda_fwd_inter_solve_cute(
+        q, k, g, beta, sakkd, scale, Aqk=saqk, fastmath=True
+    )
 
     for name, got, ref, tol in (
         ("Aqk", eaqk, saqk, 2e-3),
@@ -131,7 +135,7 @@ def test_fwd_engine_normalizes_misaligned_gate_and_beta():
     assert misaligned_gate.data_ptr() % 128
     assert misaligned_beta.data_ptr() % 8
 
-    expected = kda_intra_engine_fwd(q, k, gate, beta, D**-0.5, metadata)
+    expected = kda_intra_engine_fwd(q, k, gate, beta, D**-0.5, metadata, fastmath=False)
     actual = kda_intra_engine_fwd(
         q,
         k,
@@ -139,6 +143,7 @@ def test_fwd_engine_normalizes_misaligned_gate_and_beta():
         misaligned_beta,
         D**-0.5,
         metadata,
+        fastmath=False,
     )
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
@@ -159,7 +164,7 @@ def test_fwd_engine_preserves_zero_capacity_shapes(packed):
         if packed
         else None
     )
-    aqk, akkod, akkd = kda_intra_engine_fwd(q, k, gate, beta, D**-0.5, metadata)
+    aqk, akkod, akkd = kda_intra_engine_fwd(q, k, gate, beta, D**-0.5, metadata, fastmath=False)
     akk = (
         chunk_kda_fwd_k4b_ragged_cute(akkod, akkd, metadata)
         if metadata is not None

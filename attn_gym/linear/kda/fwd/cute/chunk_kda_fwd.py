@@ -146,7 +146,7 @@ def _prepare_chunk_kda_fwd(
     scale: float,
     autotune: bool,
     schedule: ScheduleRequest,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> ChunkKDAFactors:
     """Compute the local factors needed by both CP summaries and ordinary output."""
     with profiler_range("kda/fused/chunk_kda_fwd_intra"):
@@ -181,7 +181,7 @@ def _finish_chunk_kda_fwd(
     output_final_state: bool,
     autotune: bool,
     schedule: ScheduleRequest,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply an initial state and compose token outputs from prepared local factors."""
     with profiler_range("kda/triton/inter_chunk_state"):
@@ -231,7 +231,7 @@ def _chunk_kda_fwd(
     output_final_state: bool,
     autotune: bool,
     schedule: ScheduleRequest,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
     factors = _prepare_chunk_kda_fwd(
@@ -274,7 +274,7 @@ def _chunk_kda_fwd_shared(
     autotune: bool,
     schedule: str,
     output_final_state: bool,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     """Keep the complete composed forward behind one compiler-opaque boundary."""
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
@@ -307,7 +307,7 @@ def _chunk_kda_fwd_cuda(
     scale: float,
     autotune: bool,
     schedule: str,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, _final_state, Aqk, Akk = _chunk_kda_fwd_shared(
         q,
@@ -335,7 +335,7 @@ def _chunk_kda_fwd_with_state_cuda(
     scale: float,
     autotune: bool,
     schedule: str,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _chunk_kda_fwd_shared(
         q,
@@ -365,7 +365,7 @@ def _chunk_kda_fwd_ragged_shared(
     autotune: bool,
     schedule: str,
     output_final_state: bool,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     """Run ragged forward with caller-prepared routing and fixed-schema factors."""
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
@@ -401,7 +401,7 @@ def _chunk_kda_fwd_ragged_cuda(
     scale: float,
     autotune: bool,
     schedule: str,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     output, _state, Aqk, Akk = _chunk_kda_fwd_ragged_shared(
         q,
@@ -433,7 +433,7 @@ def _chunk_kda_fwd_ragged_with_state_cuda(
     scale: float,
     autotune: bool,
     schedule: str,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     return _chunk_kda_fwd_ragged_shared(
         q,

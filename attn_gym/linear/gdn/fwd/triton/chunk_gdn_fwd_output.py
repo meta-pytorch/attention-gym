@@ -111,12 +111,12 @@ def chunk_fwd_kernel_o(
     g += ptr_offset((bos, i_h), (HV, 1))
     p_g = g + ptr_offset((o_t,), (HV,))
     b_g = tl.load(p_g, mask=m_t, other=0.0)
-    b_o = b_o * exp2(b_g)[:, None]
+    b_o = b_o * exp2(b_g, True)[:, None]
     decay_mask = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     gate_delta = b_g[:, None] - b_g[None, :]
     decay = tl.where(
         decay_mask,
-        exp2(tl.where(decay_mask, gate_delta, 0.0)),
+        exp2(tl.where(decay_mask, gate_delta, 0.0), True),
         0.0,
     )
     b_A = b_A * decay

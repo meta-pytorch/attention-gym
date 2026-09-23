@@ -205,7 +205,8 @@ class BlackwellDeltaHBwd:
         use_int64_offsets: bool = False,
         bound_sequence_extent: bool = False,
         dynamic_state_layout: bool = False,
-        fastmath: bool = False,
+        *,
+        fastmath: bool,
     ):
         assert head_bv in (16, 32), f"BV must be 16 or 32, got {head_bv}"
         self.head_k = 128
@@ -2231,9 +2232,7 @@ def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
 
 
 @jit_cache
-def _compile_delta_h_bwd(
-    H, bv, io_type, use_int64_offsets, dynamic_state_layout, fastmath: bool = False
-):
+def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout, fastmath: bool):
     """Compile one dense BlackwellDeltaHBwd variant."""
     target = get_compile_target()
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
@@ -2302,7 +2301,7 @@ def _compile_delta_h_bwd_packed(
     use_int64_offsets: bool,
     bound_sequence_extent: bool,
     dynamic_state_layout: bool,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
     target = get_compile_target()
@@ -2382,7 +2381,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
     scale: float = 1.0,
     chunk_size: int = 64,
     *,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run packed delta-H with fused intra-chunk dV.
 
@@ -2506,7 +2505,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     chunk_size: int = 64,
     bv: int = 16,
     *,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the dense B=1 CuTeDSL SM100 delta-H backward leaf."""
     B, T, H, K = q.shape
@@ -2614,7 +2613,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
     *,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the dense or packed dv-fused kernel with automatic BV selection."""
     batch, _tokens, heads, _head_dim = q.shape

@@ -40,9 +40,9 @@ When warps have named protocol responsibilities, represent them with a module-sc
 such as `WarpRole.TMA_PRODUCER`; do not compare warp indices with unexplained integer literals. Name
 the responsibility precisely when one warp performs more than one role.
 
-Make approximation choices such as `fastmath` explicit compile-time arguments. Default them to
-`False` unless the public numerical contract deliberately chooses approximate math, encode them in
-cache and profiler names, and correctness-test every exposed mode.
+Resolve approximation choices such as `fastmath` at the public boundary, then require them
+explicitly in internal wrappers, compile arguments, and kernels. Encode them in cache and profiler
+names, and correctness-test every exposed mode.
 
 Put ordinary specialization defaults directly in the owning constructor or public function
 signature. Avoid module constants that only alias those defaults or a one-kernel policy limit; keep

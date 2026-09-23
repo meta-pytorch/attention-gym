@@ -206,16 +206,18 @@ def chunk_gdn_fwd_kkt_solve_kernel(
     mask30 = m_tc3[:, None] & m_tc0[None, :]
     mask31 = m_tc3[:, None] & m_tc1[None, :]
     mask32 = m_tc3[:, None] & m_tc2[None, :]
-    b_A00 *= tl.where(mask00, exp2(tl.where(mask00, b_g0[:, None] - b_g0[None, :], 0.0)), 0.0)
-    b_A11 *= tl.where(mask11, exp2(tl.where(mask11, b_g1[:, None] - b_g1[None, :], 0.0)), 0.0)
-    b_A22 *= tl.where(mask22, exp2(tl.where(mask22, b_g2[:, None] - b_g2[None, :], 0.0)), 0.0)
-    b_A33 *= tl.where(mask33, exp2(tl.where(mask33, b_g3[:, None] - b_g3[None, :], 0.0)), 0.0)
-    b_A10 *= tl.where(mask10, exp2(tl.where(mask10, b_g1[:, None] - b_g0[None, :], 0.0)), 0.0)
-    b_A20 *= tl.where(mask20, exp2(tl.where(mask20, b_g2[:, None] - b_g0[None, :], 0.0)), 0.0)
-    b_A21 *= tl.where(mask21, exp2(tl.where(mask21, b_g2[:, None] - b_g1[None, :], 0.0)), 0.0)
-    b_A30 *= tl.where(mask30, exp2(tl.where(mask30, b_g3[:, None] - b_g0[None, :], 0.0)), 0.0)
-    b_A31 *= tl.where(mask31, exp2(tl.where(mask31, b_g3[:, None] - b_g1[None, :], 0.0)), 0.0)
-    b_A32 *= tl.where(mask32, exp2(tl.where(mask32, b_g3[:, None] - b_g2[None, :], 0.0)), 0.0)
+    # fmt: off
+    b_A00 *= tl.where(mask00, exp2(tl.where(mask00, b_g0[:, None] - b_g0[None, :], 0.0), True), 0.0)
+    b_A11 *= tl.where(mask11, exp2(tl.where(mask11, b_g1[:, None] - b_g1[None, :], 0.0), True), 0.0)
+    b_A22 *= tl.where(mask22, exp2(tl.where(mask22, b_g2[:, None] - b_g2[None, :], 0.0), True), 0.0)
+    b_A33 *= tl.where(mask33, exp2(tl.where(mask33, b_g3[:, None] - b_g3[None, :], 0.0), True), 0.0)
+    b_A10 *= tl.where(mask10, exp2(tl.where(mask10, b_g1[:, None] - b_g0[None, :], 0.0), True), 0.0)
+    b_A20 *= tl.where(mask20, exp2(tl.where(mask20, b_g2[:, None] - b_g0[None, :], 0.0), True), 0.0)
+    b_A21 *= tl.where(mask21, exp2(tl.where(mask21, b_g2[:, None] - b_g1[None, :], 0.0), True), 0.0)
+    b_A30 *= tl.where(mask30, exp2(tl.where(mask30, b_g3[:, None] - b_g0[None, :], 0.0), True), 0.0)
+    b_A31 *= tl.where(mask31, exp2(tl.where(mask31, b_g3[:, None] - b_g1[None, :], 0.0), True), 0.0)
+    b_A32 *= tl.where(mask32, exp2(tl.where(mask32, b_g3[:, None] - b_g2[None, :], 0.0), True), 0.0)
+    # fmt: on
 
     # diagonal blocks: scaled by beta
     b_A00 = b_A00 * b_b0[:, None]

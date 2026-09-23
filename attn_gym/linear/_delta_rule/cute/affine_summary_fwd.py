@@ -247,7 +247,7 @@ class _AffineSummaryFwdOp:
         state_bn: int,
         use_int64_offsets: bool,
         whole_ranges: bool,
-        fastmath: bool = True,
+        fastmath: bool,
     ):
         assert state_bn in (32, 64), f"state_bn must be 32 or 64, got {state_bn}"
         assert SUMMARY_DIM % state_bn == 0
@@ -1136,7 +1136,7 @@ def _compile_affine_summary(
     state_bn: int,
     use_int64_offsets: bool,
     whole_ranges: bool,
-    fastmath: bool = True,
+    fastmath: bool,
 ):
     """Compile one dtype/head-count specialization from fake tensors."""
     target = get_compile_target()
@@ -1218,7 +1218,7 @@ def build_state_summaries(
     cumulative_gate: torch.Tensor,
     bounds: torch.Tensor,
     *,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> torch.Tensor:
     """Compute one packed affine state summary per token range of a stream's WY chunk factors.
 

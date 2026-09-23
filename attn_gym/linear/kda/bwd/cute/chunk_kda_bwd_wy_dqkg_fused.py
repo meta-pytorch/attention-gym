@@ -481,7 +481,8 @@ class ChunkKdaBwdWyDqkgFused:
         g_dtype: type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
         grid_waves: int = 1,
-        use_fast_math: bool = True,
+        *,
+        use_fast_math: bool,
         use_int64_offsets: bool = False,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
@@ -3601,7 +3602,7 @@ def chunk_kda_bwd_wy_dqkg(
     *,
     scale: float,
     chunk_size: int = 64,
-    fastmath: bool = False,
+    fastmath: bool,
     config: ChunkKdaBwdWyDqkgConfig | None = None,
     autotune: bool = False,
     configs: Iterable[ChunkKdaBwdWyDqkgConfig] | None = None,

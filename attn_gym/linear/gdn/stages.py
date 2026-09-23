@@ -41,6 +41,7 @@ from attn_gym.linear.gdn.impl.chunk import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -87,6 +88,7 @@ class ChunkGDNPrepared:
             self.factors.u,
             _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
             bounds,
+            fastmath=True,
         )
 
     def run(
@@ -189,6 +191,7 @@ class ChunkGDNBackward:
             _vector_gate(saved.cumulative_gate, saved.q.shape[-1]),
             self.scale,
             bounds,
+            fastmath=not is_sm100_kda_target(saved.q.device),
         )
 
     def run(

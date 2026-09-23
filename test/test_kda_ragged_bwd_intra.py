@@ -40,6 +40,7 @@ module._compile_chunk_kda_bwd_intra(
     ragged=False,
     io_type=module._IO_TYPES[torch.bfloat16],
     use_int64_offsets=False,
+    fastmath=True,
 )
 """
     environment = os.environ.copy()
@@ -78,6 +79,7 @@ def _run(inputs: tuple[torch.Tensor, ...], lengths: list[int]):
         *inputs,
         metadata,
         config=ChunkKdaBwdIntraConfig(metadata.capacity),
+        fastmath=True,
     )
 
 
@@ -200,7 +202,7 @@ def test_bwd_intra_diagonal_is_gate_independent(dtype: torch.dtype) -> None:
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([64]), 64, 32)
     with pytest.raises(ValueError, match="metadata chunk size"):
-        chunk_kda_bwd_intra(*_inputs(64), metadata)
+        chunk_kda_bwd_intra(*_inputs(64), metadata, fastmath=True)
 
 
 @pytest.mark.parametrize("lengths", [[65, 63], [0, 1, 64, 0, 65]])
@@ -213,7 +215,7 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
         assert active_chunks < metadata.capacity
 
     config = ChunkKdaBwdIntraConfig(metadata.capacity) if 0 in lengths else None
-    actual = chunk_kda_bwd_intra(*inputs, metadata, config=config)
+    actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, fastmath=True)
     expected = _sequence_local_reference(inputs, lengths)
 
     for packed, sequence_local in zip(actual, expected, strict=True):
@@ -223,7 +225,11 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
 @pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
 def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)
-    outputs = chunk_kda_bwd_intra(*inputs, None) if metadata is None else _run(inputs, [0, 0])
+    outputs = (
+        chunk_kda_bwd_intra(*inputs, None, fastmath=True)
+        if metadata is None
+        else _run(inputs, [0, 0])
+    )
     dq, dk, dg, db = outputs
 
     assert dq.shape == dk.shape == dg.shape == (1, 0, 1, 128)
@@ -237,13 +243,13 @@ def test_ragged_bwd_intra_replays_aligned_to_partial():
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
     config = ChunkKdaBwdIntraConfig(warm_metadata.capacity)
-    chunk_kda_bwd_intra(*inputs, warm_metadata, config=config)
+    chunk_kda_bwd_intra(*inputs, warm_metadata, config=config, fastmath=True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        actual = chunk_kda_bwd_intra(*inputs, metadata, config=config)
+        actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, fastmath=True)
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
     graph.replay()

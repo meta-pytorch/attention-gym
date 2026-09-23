@@ -36,7 +36,7 @@ def test_ragged_forward_stages_match_independent_sequences(dtype: torch.dtype):
     beta = torch.rand(1, tokens, 1, device="cuda")
     scale = 128**-0.5
 
-    actual = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, _metadata(lengths))
+    actual = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, _metadata(lengths), fastmath=False)
     expected_parts: list[list[torch.Tensor]] = [[] for _ in actual]
     begin = 0
     for length in lengths:
@@ -51,6 +51,7 @@ def test_ragged_forward_stages_match_independent_sequences(dtype: torch.dtype):
             beta[:, begin:end].clone(),
             scale,
             _metadata([length]),
+            fastmath=False,
         )
         for parts, output in zip(expected_parts, sequence_outputs):
             parts.append(output)
@@ -75,18 +76,18 @@ def test_ragged_forward_stages_replay_aligned_to_ragged(dtype: torch.dtype):
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
 
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-    chunk_kda_fwd_intra(q, k, v, gk, beta, scale, warm_metadata)
+    chunk_kda_fwd_intra(q, k, v, gk, beta, scale, warm_metadata, fastmath=False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-        actual = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, metadata)
+        actual = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, metadata, fastmath=False)
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, _metadata([65, 63]))
+    expected = chunk_kda_fwd_intra(q, k, v, gk, beta, scale, _metadata([65, 63]), fastmath=False)
     for captured, eager in zip(actual, expected):
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)

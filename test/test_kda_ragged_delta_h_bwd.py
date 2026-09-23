@@ -65,7 +65,17 @@ def _run_ragged(
     metadata = prepare_ragged_chunk_metadata(offsets, q.shape[1], 64)
     if bv is None:
         return blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
-            q, k, w, do, aqk, gk=gk, h0=h0, dht=dht, scale=128**-0.5, metadata=metadata
+            q,
+            k,
+            w,
+            do,
+            aqk,
+            gk=gk,
+            h0=h0,
+            dht=dht,
+            scale=128**-0.5,
+            metadata=metadata,
+            fastmath=False,
         )
     return _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         q,
@@ -79,6 +89,7 @@ def _run_ragged(
         dht=dht,
         scale=128**-0.5,
         bv=bv,
+        fastmath=False,
     )
 
 
@@ -114,6 +125,7 @@ def _run_without_initial_state(
         dht=dht,
         scale=128**-0.5,
         bv=bv,
+        fastmath=False,
     )
 
 
@@ -156,6 +168,7 @@ def test_ragged_delta_h_rejects_mismatched_chunk_size():
             dht=inputs[7],
             scale=128**-0.5,
             metadata=metadata,
+            fastmath=False,
         )
 
 
@@ -321,6 +334,7 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
         dht=inputs[7] if use_dht else None,
         scale=128**-0.5,
         bv=bv,
+        fastmath=False,
     )
     torch.cuda.synchronize()
 
@@ -339,6 +353,7 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
             dht=inputs[7] if use_dht else None,
             scale=128**-0.5,
             bv=bv,
+            fastmath=False,
         )
     assert actual_dh0 is None
 
@@ -362,6 +377,7 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
         dht=inputs[7][:sequence_extent].clone() if use_dht else None,
         scale=128**-0.5,
         bv=bv,
+        fastmath=False,
     )
     assert expected_dh0 is None
     active_chunks = compact_metadata.chunk_offsets[-1].item()

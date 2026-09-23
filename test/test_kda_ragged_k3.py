@@ -45,6 +45,7 @@ def _run(
         scale=128**-0.5,
         metadata=metadata,
         schedule=schedule,
+        fastmath=True,
     )
     return metadata, Aqk, AkkOD
 
@@ -160,7 +161,9 @@ def test_ragged_k3_ignores_poisoned_inactive_capacity():
         torch.zeros(1, tokens, 1, 64, device="cuda", dtype=torch.bfloat16),
     )
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([0, 0]), tokens, 64)
-    aqk, akk_od = chunk_kda_fwd_k3b_ragged_cute(*inputs, scale=128**-0.5, metadata=metadata)
+    aqk, akk_od = chunk_kda_fwd_k3b_ragged_cute(
+        *inputs, scale=128**-0.5, metadata=metadata, fastmath=True
+    )
 
     assert metadata.capacity > 0
     assert not akk_od.isnan().any()
@@ -177,6 +180,7 @@ def test_ragged_k3_rejects_mismatched_metadata_chunk_size():
             *inputs,
             scale=128**-0.5,
             metadata=metadata,
+            fastmath=True,
         )
 
 
@@ -190,6 +194,7 @@ def test_ragged_k3_replays_aligned_to_ragged(schedule):
         scale=128**-0.5,
         metadata=warm_metadata,
         schedule=schedule,
+        fastmath=True,
     )
     torch.cuda.synchronize()
 
@@ -201,6 +206,7 @@ def test_ragged_k3_replays_aligned_to_ragged(schedule):
             scale=128**-0.5,
             metadata=metadata,
             schedule=schedule,
+            fastmath=True,
         )
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
@@ -227,12 +233,14 @@ def test_persistent_ragged_k3_matches_static_over_capacity():
         scale=128**-0.5,
         metadata=metadata,
         schedule=ScheduleRequest.STATIC,
+        fastmath=True,
     )
     persistent = chunk_kda_fwd_k3b_ragged_cute(
         *inputs,
         scale=128**-0.5,
         metadata=metadata,
         schedule=ScheduleRequest.PERSISTENT,
+        fastmath=True,
     )
 
     assert torch.equal(persistent[0][:, :active_tokens], static[0][:, :active_tokens])
@@ -265,12 +273,14 @@ def test_persistent_ragged_k3_strides_multiple_chunks_per_worker(monkeypatch):
         scale=128**-0.5,
         metadata=metadata,
         schedule=ScheduleRequest.STATIC,
+        fastmath=True,
     )
     persistent = chunk_kda_fwd_k3b_ragged_cute(
         *inputs,
         scale=128**-0.5,
         metadata=metadata,
         schedule=ScheduleRequest.PERSISTENT,
+        fastmath=True,
     )
 
     # Capacity exceeds the active count even for exact inputs (the shape-derived
