@@ -42,35 +42,36 @@ def cuda_inputs():
         }
 
 
-@pytest.fixture
-def fa4_available(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+@pytest.fixture(params=[(10, 0), (10, 3)], ids=["sm100", "sm103"])
+def fa4_available(monkeypatch, request):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: request.param)
     available = Mock(return_value=True)
     monkeypatch.setattr(cute, "_fa4_available", available)
     return available
 
 
-def test_default_prefers_cute(cuda_inputs, fa4_available, monkeypatch):
+@pytest.mark.parametrize("heads", [1, 24, 64, 96, 127, 128])
+def test_default_prefers_cute(cuda_inputs, fa4_available, monkeypatch, heads):
+    cuda_inputs["query"] = cuda_inputs["query"][:, :heads]
+    cuda_inputs["attention_sink"] = cuda_inputs["attention_sink"][:heads]
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
     monkeypatch.setattr(cute, "selected_attention", launch)
     assert selected_attention(**cuda_inputs) is query
     launch.assert_called_once()
-    fa4_available.assert_called_once_with(True)
+    fa4_available.assert_called_once_with(True, padded_heads=heads != 128)
 
 
 @pytest.mark.parametrize(
     "heads,head_dim,dtype,kv_heads,capability",
     [
-        (127, 512, torch.bfloat16, 1, (10, 0)),
         (129, 512, torch.bfloat16, 1, (10, 0)),
-        (64, 512, torch.bfloat16, 1, (10, 0)),
         (128, 256, torch.bfloat16, 1, (10, 0)),
         (128, 512, torch.float16, 1, (10, 0)),
         (128, 512, torch.float32, 1, (10, 0)),
         (128, 512, torch.bfloat16, 128, (10, 0)),
         (128, 512, torch.bfloat16, 1, (9, 0)),
-        (128, 512, torch.bfloat16, 1, (10, 3)),
+        (128, 512, torch.bfloat16, 1, (12, 0)),
     ],
 )
 def test_unsupported_metadata_uses_triton(
@@ -189,7 +190,7 @@ def test_fa4_sink_feature_probe(monkeypatch, supports_sink):
 
 
 def test_missing_sink_feature_uses_triton(cuda_inputs, fa4_available):
-    fa4_available.side_effect = lambda with_sink: not with_sink
+    fa4_available.side_effect = lambda with_sink, **kwargs: not with_sink
     assert (
         _select_backend(
             cuda_inputs["query"],
@@ -200,3 +201,27 @@ def test_missing_sink_feature_uses_triton(cuda_inputs, fa4_available):
         == "triton"
     )
     assert _select_backend(cuda_inputs["query"], None, True, num_keys=6) == "cute"
+
+
+@pytest.mark.parametrize("heads,expected", [(1, "triton"), (64, "triton"), (128, "cute")])
+def test_old_fa4_head_limit(cuda_inputs, fa4_available, heads, expected):
+    fa4_available.side_effect = lambda with_sink, *, padded_heads: not padded_heads
+    query = cuda_inputs["query"][:, :heads]
+    assert _select_backend(query, None, True, num_keys=6) == expected
+
+
+def test_singleton_strided_sink_uses_triton(cuda_inputs, fa4_available):
+    query = cuda_inputs["query"][:, :1]
+    sink = cuda_inputs["attention_sink"][::2][:1]
+    assert sink.is_contiguous() and sink.stride(0) == 2
+    assert _select_backend(query, sink, True, num_keys=6) == "triton"
+    fa4_available.assert_not_called()
+
+
+def test_probe_old_fa4_head_limit(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "flash_attn.cute.interface", SimpleNamespace(flash_attn_func=Mock())
+    )
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.pack_gqa", None)
+    assert cute._fa4_available(False)
+    assert not cute._fa4_available(False, padded_heads=True)

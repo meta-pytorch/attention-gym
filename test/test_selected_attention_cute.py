@@ -1,8 +1,9 @@
 """
-Tests for the CuTe DSL (SM100) backend of selected attention.
+Tests for the CuTe DSL (SM100/SM103) backend of selected attention.
 
 Validates forward and backward precision against an FP64 eager baseline.
-CuTe constraints: head_dim=512, nheads=128, share_kv=True, dtype=bfloat16, SM100.
+CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
+Fewer than 128 heads require FA4's sparse-MLA head-padding support.
 
 Note: torch.compile is NOT supported for the CuTe backend (eager-only).
 """
@@ -14,13 +15,15 @@ import pytest
 import torch
 
 from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
+from attn_gym.sparse.selected_attention.impl.cute import SUPPORTED_CAPABILITIES
+from attn_gym.testing.kda import assert_relative_rms_within
 
 
 def _skip_no_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 (compute capability 10.0) required for CuTe backend")
+    if torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES:
+        pytest.skip("SM100 or SM103 required for CuTe backend")
 
 
 def skip_unsupported_cute_sink(sink_dtype: torch.dtype | None) -> None:
@@ -58,6 +61,14 @@ def assert_matches_low_precision_eager(
     )
     assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
     assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
+    # The pointwise budgets above catch outliers; two source-dtype eps bound aggregate drift.
+    assert_relative_rms_within(
+        actual,
+        high_precision_expected,
+        "selected_attention",
+        max_eps=2,
+        source_dtype=computation_dtype or actual.dtype,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +87,7 @@ def check_cute_precision(
     sink_dtype: torch.dtype | None,
     scale: float | None,
     kernel_options: dict[str, str] | None,
+    heads: int = 128,
 ) -> None:
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
 
@@ -84,7 +96,7 @@ def check_cute_precision(
     so that the FP64 baseline isolates arithmetic error without input-quantization noise.
     """
     skip_unsupported_cute_sink(sink_dtype)
-    heads, head_dim = 128, 512
+    head_dim = 512
     seed = 77
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -241,24 +253,33 @@ def check_cute_precision(
 
 
 @pytest.mark.parametrize(
-    "kernel_options,sink_dtype",
-    [
-        pytest.param({"backend": "cute"}, torch.float32, id="forced-sink"),
-        pytest.param(None, None, id="auto-no-sink"),
-        pytest.param(None, torch.float32, id="auto-sink"),
+    "heads,kernel_options,sink_dtype",
+    [pytest.param(128, {"backend": "cute"}, torch.float32, id="forced-sink")]
+    + [
+        pytest.param(
+            heads, None, sink_dtype, id=f"auto-{heads}-{'sink' if sink_dtype else 'no-sink'}"
+        )
+        for heads in (1, 24, 64, 128)
+        for sink_dtype in (None, torch.float32)
     ],
 )
-def test_cute_dependency_smoke(kernel_options, sink_dtype):
+def test_cute_dependency_smoke(heads, kernel_options, sink_dtype):
     """Exercise auto dispatch through the real FA4 forward and backward, when supported."""
     from attn_gym.sparse.selected_attention.api import _select_backend
     from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
 
     _skip_no_sm100()
-    if not _fa4_available(with_sink=sink_dtype is not None):
+    if not _fa4_available(with_sink=sink_dtype is not None, padded_heads=heads != 128):
         pytest.skip("installed FA4 does not support the requested sparse-MLA features")
-    query = torch.empty(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16)
-    sink = torch.empty(128, device="cuda", dtype=sink_dtype) if sink_dtype is not None else None
-    assert _select_backend(query, sink, True, num_keys=6) == "cute"
+    query = torch.empty(1, heads, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sink = (
+        torch.empty(heads * 2, device="cuda", dtype=sink_dtype)[::2]
+        if sink_dtype is not None
+        else None
+    )
+    # A singleton strided sink is unsupported by FA4's layout conversion.
+    expected_backend = "triton" if heads == 1 and sink is not None else "cute"
+    assert _select_backend(query, sink, True, num_keys=6) == expected_backend
     check_cute_precision(
         batch=1,
         num_topk=2,
@@ -269,6 +290,7 @@ def test_cute_dependency_smoke(kernel_options, sink_dtype):
         sink_dtype=sink_dtype,
         scale=0.025,
         kernel_options=kernel_options,
+        heads=heads,
     )
 
 
