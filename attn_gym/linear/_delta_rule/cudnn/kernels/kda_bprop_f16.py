@@ -83,6 +83,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 from attn_gym.linear._delta_rule.cudnn.kernels.common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
@@ -3485,7 +3486,7 @@ def kernel(
         space=SMEM,
         alignment=64,
     )
-    storage = cutlass.utils.SmemAllocator().allocate(shared_type)
+    storage = SmemAllocator().allocate(shared_type)
     sState_raw = storage.state.get_tensor(cute.make_layout((cfg.state_cosize,)))
     sDstate_raw = storage.dstate.get_tensor(cute.make_layout((cfg.d_k * cfg.d_v,)))
     sK_decay_raw = storage.k_decay.get_tensor(cute.make_layout((cfg.operand_cosize,)))

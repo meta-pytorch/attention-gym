@@ -95,6 +95,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 from attn_gym.linear._delta_rule.cudnn.kernels.common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
@@ -1889,7 +1890,7 @@ def kernel(
     bars = make_kda_bars(cfg)
     sTmem_base = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=4)
     sSched = cutlass.Array(cutlass.Int32, cfg.sched_stages, space=SMEM, alignment=16)
-    storage = cutlass.utils.SmemAllocator().allocate(shared_type)
+    storage = SmemAllocator().allocate(shared_type)
     sK_decay_raw = storage.k_decay.get_tensor(cute.make_layout((cfg.k_decay_cosize,)))
     sK_restore_raw = storage.k_restore.get_tensor(cute.make_layout((cfg.k_restore_cosize,)))
     sIntermediate_raw = storage.intermediate.get_tensor(

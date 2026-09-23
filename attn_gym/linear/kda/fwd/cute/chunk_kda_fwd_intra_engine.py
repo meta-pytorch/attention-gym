@@ -27,7 +27,7 @@ import torch
 # ---------------------------------------------------------------------------
 import triton
 import triton.language as tl
-from cutlass import cute, pipeline, utils
+from cutlass import cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
@@ -38,6 +38,7 @@ from attn_gym._backends.cute import (
     tensor_supports_contiguous_dim,
 )
 from attn_gym._backends.cute.cache import jit_cache
+from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
@@ -294,9 +295,9 @@ class KdaIntraFwdEngine:
 
         tma_ld = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         s_kraw = sm100_utils.make_smem_layout_epi(
-            self.io_type, utils.LayoutEnum.ROW_MAJOR, (BT, BK), self.raw_depth
+            self.io_type, LayoutEnum.ROW_MAJOR, (BT, BK), self.raw_depth
         )
-        s_graw = sm100_utils.make_smem_layout_epi(Float32, utils.LayoutEnum.ROW_MAJOR, (BT, BK), 1)
+        s_graw = sm100_utils.make_smem_layout_epi(Float32, LayoutEnum.ROW_MAJOR, (BT, BK), 1)
         atom_q, desc_q = cpasync.make_tiled_tma_atom(
             tma_ld, g_q, cute.select(s_kraw, mode=[0, 1]), (BT, BK)
         )
@@ -312,12 +313,12 @@ class KdaIntraFwdEngine:
         s_sb_op = sm100_utils.make_smem_layout_b(mma16, strip_tile, self.io_type, self.op_depth)
         s_op_store = sm100_utils.make_smem_layout_epi(
             self.io_type,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.mma_rows, BK),
             self.op_depth,
         )
         s_opb_store = sm100_utils.make_smem_layout_epi(
-            self.io_type, utils.LayoutEnum.ROW_MAJOR, (16, BK), self.op_depth
+            self.io_type, LayoutEnum.ROW_MAJOR, (16, BK), self.op_depth
         )
 
         @cute.struct
@@ -432,7 +433,7 @@ class KdaIntraFwdEngine:
         p_t_akk = sl_s.partition_S(t_akk_acc[((None, None), 0, 0, None)])
         sreg_shape = sl_s.partition_D(cute.make_identity_tensor((self.mma_rows, BT))).shape
         r2s_atom = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR, Float32, self.acc_type, tc_s
+            LayoutEnum.ROW_MAJOR, Float32, self.acc_type, tc_s
         )
         tc_r2s = cute.make_tiled_copy_D(r2s_atom, tc_s)
         thr_r2s = tc_r2s.get_slice(local_tid % 128)
@@ -786,7 +787,7 @@ class KdaIntraFwdEngine:
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
 
-        sa = utils.SmemAllocator()
+        sa = SmemAllocator()
         sm = sa.allocate(self.shared_type)
         n_cuda = self.WARP_SZ * len(self.CUDA_WARP_IDS)
 
@@ -822,7 +823,7 @@ class KdaIntraFwdEngine:
         ).make_participants()
 
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             sm.tmem_buf, barrier_for_retrieve=tmem_bar, allocator_warp_id=WarpRole.LOAD
         )
         tmem.allocate(self.tm_tot)

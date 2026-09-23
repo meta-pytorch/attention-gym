@@ -15,7 +15,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass import cute, pipeline, utils
+from cutlass import cute, pipeline
 
 # ============================================================================
 # SM100 primitives used by this kernel
@@ -41,6 +41,7 @@ from cutlass.cute.typing import BFloat16, Float16, Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
+from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
@@ -923,28 +924,28 @@ class ChunkKdaBwdWyDqkgFused:
         # --- Epilogue (non-MMA) layouts ---
         g_epi_smem_layout = sm100_utils.make_smem_layout_epi(
             self.g_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK),
             self.kloop_stage,
         )
 
         k_epi_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK),
             self.kloop_stage,
         )
 
         q_epi_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK),
             1,
         )
 
         dg_epi_smem_layout = sm100_utils.make_smem_layout_epi(
             self.g_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK),
             self.kloop_stage,
         )
@@ -1353,7 +1354,7 @@ class ChunkKdaBwdWyDqkgFused:
             cpasync.prefetch_descriptor(tma_atom_dg)
 
         # ===================== SMEM allocation =====================
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Barrier Initialization
@@ -1517,7 +1518,7 @@ class ChunkKdaBwdWyDqkgFused:
 
         # ===================== TMEM allocation =====================
         tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_bar,
             allocator_warp_id=self.load_warp_id,

@@ -20,7 +20,8 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.utils.smem_allocator import SmemAllocator
+
+from attn_gym._backends.cute.compat import SmemAllocator
 
 _NUM_BINS_11 = 2048
 _NUM_BINS_10 = 1024

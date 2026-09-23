@@ -34,6 +34,7 @@ from attn_gym._backends.cute import (
     jit_cache,
     tune,
 )
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -1435,7 +1436,7 @@ class ShortConvTmaKernel:
     ):
         """Allocate and partition the shared two-input TMA pipeline."""
         channels_per_block = self.threads * self.channels_per_thread
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         barriers = smem.allocate_array(Int64, self.stages * 2)
         sX = smem.allocate_tensor(
             self.dtype.cute_type,

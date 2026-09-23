@@ -95,6 +95,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 from cutlass.cutlass_dsl import min
 
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import get_device_properties, requires_int64_abi, validate_tma_tensor
 
@@ -3347,7 +3348,7 @@ def kernel(
     STRIDE = 8 * 128
     KT_LEAD = (cfg.d_v // 2) * 128
     V_LEAD = (cfg.d_v // 2) * 128
-    storage = cutlass.utils.SmemAllocator().allocate(shared_type)
+    storage = SmemAllocator().allocate(shared_type)
     sO_raw = storage.output.get_tensor(cute.make_layout((cfg.o_cosize,)))
     sCheckpoint_raw = storage.checkpoint.get_tensor(cute.make_layout((cfg.checkpoint_cosize,)))
     sKQ_raw = storage.kq.get_tensor(cute.make_layout((cfg.kq_cosize,)))

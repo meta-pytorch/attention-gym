@@ -9,6 +9,7 @@ from cutlass import Int32, cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
 
@@ -114,7 +115,7 @@ class ChunkSchedulerDiagnostic:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = tidx % cute.arch.WARP_SIZE
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         work = storage.work.get_tensor(cute.make_layout(self.fields))
 
