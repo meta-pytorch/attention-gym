@@ -46,6 +46,7 @@ def chunk_kda_fwd_factors(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
+    fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce the BT64 Aqk/Akk factors used by forward and backward recompute."""
     assert chunk_size == 64, "chunk_kda_fwd_factors requires chunk_size=64"
@@ -58,15 +59,19 @@ def chunk_kda_fwd_factors(
         return k.new_empty(shape), k.new_empty(shape)
 
     if not is_sm100_kda_target(k.device):
-        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(q, k, gk, beta, scale, metadata, chunk_size)
-        AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata)
+        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
+            q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
+        )
+        AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata, fastmath=fastmath)
         return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
 
     if q.dtype == torch.float16:
         # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their
         # public gate-bound exponent fits BF16 but can overflow FP16, so keep the
         # diagonal products in FP32/TF32 and use FP16 only for the safe solved factors.
-        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(q, k, gk, beta, scale, metadata, chunk_size)
+        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
+            q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
+        )
         if metadata is None:
             return chunk_kda_fwd_inter_solve_cute(
                 q,
@@ -78,6 +83,7 @@ def chunk_kda_fwd_factors(
                 chunk_size,
                 Aqk=Aqk,
                 profile_ranges=profile_ranges,
+                fastmath=fastmath,
             )
         return chunk_kda_fwd_inter_solve_ragged_cute(
             q,
@@ -88,6 +94,7 @@ def chunk_kda_fwd_factors(
             Aqk,
             scale,
             metadata,
+            fastmath=fastmath,
         )
 
     with (
@@ -95,7 +102,7 @@ def chunk_kda_fwd_factors(
         if profile_ranges
         else nullcontext()
     ):
-        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata)
+        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata, fastmath=fastmath)
         Akk = (
             chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size, output_dtype=q.dtype)
             if metadata is None
@@ -116,6 +123,7 @@ def chunk_kda_fwd_intra(
     profile_ranges: bool = False,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -135,6 +143,7 @@ def chunk_kda_fwd_intra(
         metadata,
         chunk_size=chunk_size,
         profile_ranges=profile_ranges,
+        fastmath=fastmath,
     )
     with (
         torch.profiler.record_function("kda/triton/recompute_w_u")
@@ -150,6 +159,7 @@ def chunk_kda_fwd_intra(
             A=Akk,
             gk=gk,
             metadata=metadata,
+            fastmath=fastmath,
         )
     assert kg is not None
     return w, u, kg, Aqk, Akk

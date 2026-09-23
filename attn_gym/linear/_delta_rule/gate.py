@@ -232,7 +232,7 @@ def gate_transform(
     *,
     kind: GateTransform | str,
     lower_bound: float | None = None,
-    fastmath: bool = False,
+    fastmath: bool = True,
     impl: Impl | str = Impl.FUSED,
 ) -> torch.Tensor:
     """Map raw gate projections to per-token natural-log decays.
@@ -252,7 +252,9 @@ def gate_transform(
             recurrence convention.
         lower_bound: Finite nonpositive floor, required by ``"bounded"`` and rejected by
             ``"softplus"``.
-        fastmath: Use approximate fused exponentials; rejected by the reference path.
+        fastmath: Allow approximate amplitude, sigmoid, and softplus math (default ``True``).
+            ``False`` selects non-fast primitives for forward and backward. The reference
+            implementation uses normal PyTorch math for either value.
         impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private CuTeDSL kernels
             for per-channel ``D=128`` gates on CUDA capability 9.0+ (both kinds) and a
             portable Triton kernel for every other ``"softplus"`` configuration. Fused paths
@@ -265,13 +267,11 @@ def gate_transform(
     kind = resolve_gate_transform(kind)
     _validate_gate_inputs(raw_gate, A_log, dt_bias)
     lower_bound = _validate_lower_bound(kind, lower_bound)
-    if resolve_impl(impl) is Impl.REFERENCE:
-        if fastmath:
-            raise ValueError("fastmath applies only to impl='fused'")
-        return _gate_transform_reference(raw_gate, A_log, dt_bias, kind, lower_bound)
-
     if not isinstance(fastmath, bool):
         raise TypeError(f"fastmath must be bool, got {type(fastmath).__name__}")
+    if resolve_impl(impl) is Impl.REFERENCE:
+        return _gate_transform_reference(raw_gate, A_log, dt_bias, kind, lower_bound)
+
     if raw_gate.dtype not in _SUPPORTED_FUSED_DTYPES or not raw_gate.is_cuda:
         raise ValueError("gate_transform(impl='fused') requires CUDA FP16, BF16, or FP32 raw_gate")
     if min(raw_gate.shape) < 1:

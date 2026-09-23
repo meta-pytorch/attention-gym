@@ -618,6 +618,7 @@ def chunk_kda_bwd_wy_triton(
         IS_RAGGED=ragged,
         USE_INT64_OFFSETS=use_int64_offsets,
         FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=4,
         num_stages=2,
     )
@@ -649,6 +650,7 @@ def chunk_kda_bwd_wy_triton(
         IS_RAGGED=ragged,
         USE_INT64_OFFSETS=use_int64_offsets,
         FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=4,
         num_stages=2,
     )
@@ -677,6 +679,7 @@ def chunk_kda_bwd_wy_triton(
         IS_RAGGED=ragged,
         USE_INT64_OFFSETS=use_int64_offsets,
         FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=4,
         num_stages=2,
     )

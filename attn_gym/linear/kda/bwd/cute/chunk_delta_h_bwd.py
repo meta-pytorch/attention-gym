@@ -205,6 +205,7 @@ class BlackwellDeltaHBwd:
         use_int64_offsets: bool = False,
         bound_sequence_extent: bool = False,
         dynamic_state_layout: bool = False,
+        fastmath: bool = False,
     ):
         assert head_bv in (16, 32), f"BV must be 16 or 32, got {head_bv}"
         self.head_k = 128
@@ -216,6 +217,7 @@ class BlackwellDeltaHBwd:
         self.use_int64_offsets = use_int64_offsets
         self.bound_sequence_extent = bound_sequence_extent
         self.dynamic_state_layout = dynamic_state_layout
+        self.fastmath = fastmath
         assert not bound_sequence_extent or varlen, "sequence extent applies only to varlen inputs"
 
         # Tile dimensions
@@ -269,7 +271,7 @@ class BlackwellDeltaHBwd:
             f"kda_bwd_dhu_dv_fused_vl{int(self.varlen)}_h{self.num_heads}"
             f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{_IO_TYPE_NAMES[self.io_type]}"
             f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
-            f"_ds{int(self.dynamic_state_layout)}"
+            f"_ds{int(self.dynamic_state_layout)}_fm{int(self.fastmath)}"
         )
 
     # ------------------------------------------------------------------
@@ -1456,7 +1458,9 @@ class BlackwellDeltaHBwd:
                     gk_rdy = pgk_rdy_P.acquire_and_advance()
                     for i in cutlass.range(4, unroll_full=True):
                         idx = gk_tid * 4 + i
-                        gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(gk_buf[(idx, gkh.index)])
+                        gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(
+                            gk_buf[(idx, gkh.index)], fastmath=self.fastmath
+                        )
                     gkh.release()
                     cute.arch.fence_proxy("async.shared", space="cta")
                     gk_rdy.commit()
@@ -2227,7 +2231,9 @@ def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
 
 
 @jit_cache
-def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout):
+def _compile_delta_h_bwd(
+    H, bv, io_type, use_int64_offsets, dynamic_state_layout, fastmath: bool = False
+):
     """Compile one dense BlackwellDeltaHBwd variant."""
     target = get_compile_target()
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
@@ -2240,6 +2246,7 @@ def _compile_delta_h_bwd(H, bv, io_type, use_int64_offsets, dynamic_state_layout
         io_type=io_type,
         use_int64_offsets=use_int64_offsets,
         dynamic_state_layout=dynamic_state_layout,
+        fastmath=fastmath,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     sa, sb, snt, sns, sn = (sym_int() for _ in range(5))
@@ -2295,6 +2302,7 @@ def _compile_delta_h_bwd_packed(
     use_int64_offsets: bool,
     bound_sequence_extent: bool,
     dynamic_state_layout: bool,
+    fastmath: bool = False,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
     target = get_compile_target()
@@ -2310,6 +2318,7 @@ def _compile_delta_h_bwd_packed(
         use_int64_offsets=use_int64_offsets,
         bound_sequence_extent=bound_sequence_extent,
         dynamic_state_layout=dynamic_state_layout,
+        fastmath=fastmath,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, chunks, sequences, metadata_entries = (sym_int() for _ in range(4))
@@ -2372,6 +2381,8 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
     dht: torch.Tensor | None = None,
     scale: float = 1.0,
     chunk_size: int = 64,
+    *,
+    fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run packed delta-H with fused intra-chunk dV.
 
@@ -2467,6 +2478,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
             h0 is not None,
         ),
         requires_dynamic_state_layout(final_state_kernel, initial_state_gradient_kernel),
+        fastmath,
     )
     compiled(
         *kernel_tensors,
@@ -2493,6 +2505,8 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     scale: float = 1.0,
     chunk_size: int = 64,
     bv: int = 16,
+    *,
+    fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the dense B=1 CuTeDSL SM100 delta-H backward leaf."""
     B, T, H, K = q.shape
@@ -2561,6 +2575,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         io_type,
         use_int64_offsets,
         requires_dynamic_state_layout(dht_k, dh0_k),
+        fastmath,
     )
     dummy_metadata = torch.empty(2, dtype=torch.int32, device=dev)
     fn(
@@ -2598,6 +2613,8 @@ def blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
     scale: float = 1.0,
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
+    *,
+    fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the dense or packed dv-fused kernel with automatic BV selection."""
     batch, _tokens, heads, _head_dim = q.shape
@@ -2618,6 +2635,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
             scale=scale,
             chunk_size=chunk_size,
             bv=bv,
+            fastmath=fastmath,
         )
     return blackwell_delta_h_bwd_dhu_dv_fused(
         q,
@@ -2631,6 +2649,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
         scale=scale,
         chunk_size=chunk_size,
         bv=bv,
+        fastmath=fastmath,
     )
 
 

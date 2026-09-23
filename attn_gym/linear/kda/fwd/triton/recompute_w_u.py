@@ -75,6 +75,7 @@ _AUTOTUNE_KEY = [
     "HAS_GK",
     "STORE_QG",
     "PRECISION",
+    "FASTMATH",
 ]
 _HEURISTICS = {
     "STORE_QG": lambda args: args["q"] is not None,
@@ -130,6 +131,7 @@ def _recompute_w_u_task(
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr,
 ):
     """Recompute one chunk's W/U (and optional QG/KG) with register-operand dots."""
     if USE_INT64_OFFSETS:
@@ -212,7 +214,7 @@ def _recompute_w_u_task(
                 mask=m_tk,
                 other=0.0,
             ).to(tl.float32)
-            b_kb = b_kb * exp2(b_gk)
+            b_kb = b_kb * exp2(b_gk, FASTMATH)
             if STORE_QG:
                 b_q = tl.load(
                     q + ptr_offset((token[:, None], i_hv, o_k[None, :]), (q_stride_t, K, 1)),
@@ -221,7 +223,7 @@ def _recompute_w_u_task(
                 )
                 tl.store(
                     qg + ptr_offset((token[:, None], i_hv, o_k[None, :]), (HV * K, K, 1)),
-                    (b_q * exp2(b_gk)).to(qg.dtype.element_ty),
+                    (b_q * exp2(b_gk, FASTMATH)).to(qg.dtype.element_ty),
                     mask=m_tk,
                 )
             last_idx = bos + min(i_t * BT + BT, T_local) - 1
@@ -230,7 +232,7 @@ def _recompute_w_u_task(
                 mask=m_k,
                 other=0.0,
             ).to(tl.float32)
-            b_kg = b_k * tl.where(m_t[:, None], exp2(b_gn[None, :] - b_gk), 0.0)
+            b_kg = b_k * tl.where(m_t[:, None], exp2(b_gn[None, :] - b_gk, FASTMATH), 0.0)
             tl.store(
                 kg + ptr_offset((token[:, None], i_hv, o_k[None, :]), (HV * K, K, 1)),
                 b_kg.to(kg.dtype.element_ty),
@@ -289,6 +291,7 @@ def recompute_w_u_fwd_kernel(
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Launch one CTA per chunk task; ragged capacity-only CTAs exit immediately."""
     i_c, i_hv = tl.program_id(0), tl.program_id(1)
@@ -329,6 +332,7 @@ def recompute_w_u_fwd_kernel(
         HAS_GK,
         IS_RAGGED,
         USE_INT64_OFFSETS,
+        FASTMATH,
     )
 
 
@@ -375,6 +379,7 @@ def recompute_w_u_fwd_kernel_persistent(
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Stride a bounded worker grid over active (chunk, value-head) tasks."""
     worker = tl.program_id(0)
@@ -415,6 +420,7 @@ def recompute_w_u_fwd_kernel_persistent(
             HAS_GK,
             IS_RAGGED,
             USE_INT64_OFFSETS,
+            FASTMATH,
         )
 
 
@@ -435,6 +441,7 @@ def recompute_w_u_fwd_triton(
     dot_precision: str = "bf16",
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch the register-operand recompute for packed B=1 inputs.
 
@@ -442,6 +449,7 @@ def recompute_w_u_fwd_triton(
         schedule: Ragged launch geometry, as ``chunk_kda``'s ``kernel_options['schedule']``.
             AUTO keeps the static grid; dense inputs always use
             their exact launch grid.
+        fastmath: Select fast or non-fast gating exponentials.
     """
     batch, tokens, key_heads, key_dim = k.shape
     value_heads, value_dim = v.shape[2], v.shape[3]
@@ -538,6 +546,8 @@ def recompute_w_u_fwd_triton(
         "BV": 64,
         "PRECISION": _PRECISION_MODES[dot_precision],
         "num_sequences": 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
+        "FASTMATH": fastmath,
+        "enable_reflect_ftz": fastmath,
     }
     kernel = recompute_w_u_fwd_kernel if autotune else _PINNED_W_U
     if chunks == 0:

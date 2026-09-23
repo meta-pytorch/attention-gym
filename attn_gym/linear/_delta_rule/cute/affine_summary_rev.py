@@ -158,6 +158,7 @@ class BlackwellDeltaAffineSummaryRev:
         io_type: type[cutlass.Numeric],
         use_int64_offsets: bool,
         whole_ranges: bool,
+        fastmath: bool = False,
     ):
         self.num_heads = num_heads
         self.io_type = io_type
@@ -165,6 +166,7 @@ class BlackwellDeltaAffineSummaryRev:
         self.BT = BT
         self.BK = KEY_DIM
         self.use_int64_offsets = use_int64_offsets
+        self.fastmath = fastmath
         # With ``whole_ranges`` the work table is ``bounds`` itself, ``[R, 2]`` token ranges,
         # and every row is one item: the ``budget == 1`` case needs no planner and no fold.
         self.whole_ranges = whole_ranges
@@ -201,6 +203,7 @@ class BlackwellDeltaAffineSummaryRev:
         return (
             f"delta_affine_summary_rev_h{self.num_heads}_bn{self.BN}_{dtype_name}"
             f"_i64{int(self.use_int64_offsets)}_whole{int(self.whole_ranges)}"
+            f"_fm{int(self.fastmath)}"
         )
 
     @cute.jit
@@ -879,7 +882,9 @@ class BlackwellDeltaAffineSummaryRev:
                 ready_handle = gate_ready_producer.acquire_and_advance()
                 for index in cutlass.range(4, unroll_full=True):
                     key = gate_tid * 4 + index
-                    gate_exp[(key, ready_handle.index)] = cute.exp2(gate[(key, gate_handle.index)])
+                    gate_exp[(key, ready_handle.index)] = cute.math.exp2(
+                        gate[(key, gate_handle.index)], fastmath=self.fastmath
+                    )
                 gate_handle.release()
                 cute.arch.fence_view_async_shared()
                 ready_handle.commit()
@@ -1417,6 +1422,7 @@ def _compile_affine_summary_rev(
     heads: int,
     use_int64_offsets: bool,
     whole_ranges: bool,
+    fastmath: bool,
 ):
     """Compile one reverse-summary dtype/head specialization."""
     target = get_compile_target()
@@ -1444,7 +1450,7 @@ def _compile_affine_summary_rev(
         assumed_align=DATA_ALIGN_BYTES,
     )
     return compile_tvm_ffi(
-        BlackwellDeltaAffineSummaryRev(heads, io_dtype, use_int64_offsets, whole_ranges),
+        BlackwellDeltaAffineSummaryRev(heads, io_dtype, use_int64_offsets, whole_ranges, fastmath),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
         factor(io_dtype, KEY_DIM),
@@ -1467,6 +1473,8 @@ def build_state_grad_summaries(
     cumulative_gate: torch.Tensor,
     scale: float,
     bounds: torch.Tensor,
+    *,
+    fastmath: bool | None = None,
 ) -> torch.Tensor:
     """Compute one packed reverse affine summary per token range of a stream.
 
@@ -1480,6 +1488,8 @@ def build_state_grad_summaries(
         scale: Query scaling factor used by the local backward recurrence.
         bounds: ``int32 [R, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
             same contract as ``build_state_summaries``.
+        fastmath: Select fast or non-fast per-chunk decay, matching the local backward.
+            ``None`` selects fast Triton or non-fast SM100 exponentials.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as local bias then reverse
@@ -1549,6 +1559,8 @@ def build_state_grad_summaries(
     if capability < (8, 0):
         raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
     portable = not is_sm100_kda_capability(capability)
+    if fastmath is None:
+        fastmath = portable
     if portable:
         if capability[0] in (10, 12):
             from attn_gym._backends.triton.utils import configure_triton_allocator
@@ -1587,11 +1599,16 @@ def build_state_grad_summaries(
             partials,
             capability,
             whole_ranges=range_ids is None,
+            fastmath=fastmath,
         )
     else:
         use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, partials)
         compiled = _compile_affine_summary_rev(
-            _IO_TYPE_NAMES[qg.dtype], heads, use_int64_offsets, whole_ranges=range_ids is None
+            _IO_TYPE_NAMES[qg.dtype],
+            heads,
+            use_int64_offsets,
+            whole_ranges=range_ids is None,
+            fastmath=fastmath,
         )
         compiled(
             qg.detach(),

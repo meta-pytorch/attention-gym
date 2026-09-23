@@ -605,14 +605,27 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
     module = importlib.import_module("attn_gym.linear.kda.impl.fused")
     routes = []
 
-    def dense_forward(q, _k, v, _gate, _beta, _state, _scale, _tune, _schedule):
+    def dense_forward(q, _k, v, _gate, _beta, _state, _scale, _tune, _schedule, _fastmath):
+        assert _fastmath is False
         routes.append("dense")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
 
     def ragged_forward(
-        q, _k, v, _gate, _beta, _state, _cu_seqlens, _chunk_offsets, _scale, _tune, _schedule
+        q,
+        _k,
+        v,
+        _gate,
+        _beta,
+        _state,
+        _cu_seqlens,
+        _chunk_offsets,
+        _scale,
+        _tune,
+        _schedule,
+        _fastmath,
     ):
+        assert _fastmath is False
         routes.append("ragged")
         factors = q.new_empty((*q.shape[:3], 64))
         return torch.empty_like(v), factors, factors
@@ -626,7 +639,7 @@ def test_chunk_kda_selects_direct_dense_or_ragged_route(
         else torch.tensor(explicit_offsets, device="cuda", dtype=torch.int32)
     )
 
-    output, state = chunk_kda(*inputs, cu_seqlens=cu_seqlens)
+    output, state = chunk_kda(*inputs, cu_seqlens=cu_seqlens, fastmath=False)
 
     assert output.shape == inputs[0].shape
     assert state is None

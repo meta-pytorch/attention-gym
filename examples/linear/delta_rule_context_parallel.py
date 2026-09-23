@@ -259,8 +259,12 @@ def main(
         ),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
-        bool, typer.Option(help="Use approximate exponentials in the fused gate and KDA core.")
-    ] = False,
+        bool,
+        typer.Option(
+            help="Permit approximate gating math (default); --no-fastmath requests non-fast "
+            "math and is unsupported by native cuDNN KDA."
+        ),
+    ] = True,
     batch_size: Annotated[
         int, typer.Option(min=1, help="Number of packed logical sequences.")
     ] = 4,

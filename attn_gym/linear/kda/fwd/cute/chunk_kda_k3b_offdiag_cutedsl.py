@@ -52,6 +52,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         chunk_workers: int = 0,
         use_int64_offsets: bool = False,
+        fastmath: bool = True,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK3bOffdiagCuteDSL only supports four subchunks, got {num_subchunks}"
@@ -69,6 +70,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         self.schedule_kind = schedule_kind
         self.chunk_workers = chunk_workers
         self.use_int64_offsets = use_int64_offsets
+        self.fastmath = fastmath
         self.BC = BC
         self.D = D
         self.chunk_schedule = chunk_schedule
@@ -155,6 +157,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             tiled_mma,
         )
 
+        self.kernel.set_name_prefix(f"kda_fwd_k3b_fm{int(self.fastmath)}")
         self.kernel(
             mQ,
             mK,
@@ -349,13 +352,13 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                     q_val = cutlass.Float32(mQ[ti_row + _r, h_col])
                     k_val_r = cutlass.Float32(mK[ti_row + _r, h_col])
                     g_val_r = mG[ti_row + _r, h_col]
-                    gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=True)
+                    gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=self.fastmath)
                     sQg[_r, col] = self._dtype(q_val * gate_r)
                     sKp[_r, col] = self._dtype(k_val_r * gate_r)
 
                     k_val_c = cutlass.Float32(mK[ti_col + _r, h_col])
                     g_val_c = mG[ti_col + _r, h_col]
-                    gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=True)
+                    gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=self.fastmath)
                     sKn[_r, col] = self._dtype(k_val_c * gate_c)
             else:
                 # ── Varlen tail: predicated constexpr-offset loads (R2P-style) ──
@@ -385,7 +388,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                         q_val = cutlass.Float32(mQ[ti_row + _r, h_col])
                         k_val_r = cutlass.Float32(mK[ti_row + _r, h_col])
                         g_val_r = mG[ti_row + _r, h_col]
-                    gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=True)
+                    gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=self.fastmath)
                     sQg[_r, col] = self._dtype(q_val * gate_r)
                     sKp[_r, col] = self._dtype(k_val_r * gate_r)
 
@@ -394,7 +397,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                     if _r < actual_col:
                         k_val_c = cutlass.Float32(mK[ti_col + _r, h_col])
                         g_val_c = mG[ti_col + _r, h_col]
-                    gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=True)
+                    gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=self.fastmath)
                     sKn[_r, col] = self._dtype(k_val_c * gate_c)
         else:
             # ── Non-varlen: constexpr-unrolled, zero guards ──
@@ -408,12 +411,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
                 q_val = cutlass.Float32(mQ[ti_row + _r, h_offset + col])
                 k_val_r = cutlass.Float32(mK[ti_row + _r, h_offset + col])
                 g_val_r = mG[ti_row + _r, h_offset + col]
-                gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=True)
+                gate_r = cute.math.exp2(g_val_r - g_ref_val, fastmath=self.fastmath)
                 sQg[_r, col] = self._dtype(q_val * gate_r)
                 sKp[_r, col] = self._dtype(k_val_r * gate_r)
                 k_val_c = cutlass.Float32(mK[ti_col + _r, h_offset + col])
                 g_val_c = mG[ti_col + _r, h_offset + col]
-                gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=True)
+                gate_c = cute.math.exp2(g_ref_val - g_val_c, fastmath=self.fastmath)
                 sKn[_r, col] = self._dtype(k_val_c * gate_c)
 
         cute.arch.barrier(barrier_id=1, number_of_threads=self.num_threads)

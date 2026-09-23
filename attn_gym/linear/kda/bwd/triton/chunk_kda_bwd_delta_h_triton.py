@@ -24,6 +24,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_sequence_work,
 )
+from attn_gym.linear.kda.utils import exp2
 
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
@@ -59,6 +60,7 @@ def chunk_kda_bwd_delta_h_triton_kernel(
     USE_FINAL_STATE: tl.constexpr,
     STORE_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
+    FASTMATH: tl.constexpr = True,
 ):
     """Traverse one sequence/head/value tile with an FP32 state cotangent."""
     sequence_head = tl.program_id(0)
@@ -187,8 +189,8 @@ def chunk_kda_bwd_delta_h_triton_kernel(
         gate_base = ptr_offset((last_token, head), (H * K, K))
         gate_1 = tl.load(gk + gate_base + key_1).to(tl.float32)
         gate_2 = tl.load(gk + gate_base + key_2).to(tl.float32)
-        d_state_1 *= tl.exp2(gate_1)[:, None]
-        d_state_2 *= tl.exp2(gate_2)[:, None]
+        d_state_1 *= exp2(gate_1, FASTMATH)[:, None]
+        d_state_2 *= exp2(gate_2, FASTMATH)[:, None]
 
         qg_tile_1 = tl.load(
             qg + key_base + key_1[None, :],
@@ -250,6 +252,7 @@ def chunk_kda_bwd_delta_h_triton(
     d_final_state: torch.Tensor | None,
     scale: float,
     metadata: RaggedChunkMetadata | None,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the Triton KDA reverse delta-H stage.
 
@@ -265,6 +268,7 @@ def chunk_kda_bwd_delta_h_triton(
         d_final_state: Optional FP32 final-state cotangent with the state shape.
         scale: Query/output contribution scale.
         metadata: Packed BT64 routing, or ``None`` for complete dense chunks.
+        fastmath: Use approximate state-decay exponentials instead of libdevice.
 
     Returns:
         ``(dh, d_initial_state, dv)`` where ``dh`` has shape
@@ -378,6 +382,8 @@ def chunk_kda_bwd_delta_h_triton(
         USE_FINAL_STATE=d_final_state is not None,
         STORE_INITIAL_STATE=initial_state is not None,
         USE_INT64_OFFSETS=use_int64_offsets,
+        FASTMATH=fastmath,
+        enable_reflect_ftz=fastmath,
         num_warps=4,
         num_stages=2,
     )

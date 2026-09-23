@@ -141,6 +141,7 @@ Either kind applies to per-head gates (`raw [B, T, H]`, `dt_bias [H]`, the GDN c
 per-channel gates (`raw [B, T, H, D]`, `dt_bias [H, D]`, the KDA convention). `kind` is
 required: a default could silently select the wrong recurrence convention. `bound_gate` is the
 KDA-specific spelling of `kind="bounded"` for per-channel gates with `lower_bound=-5.0`.
+Both producers default to `fastmath=True`; see [Fast math and precision](#fast-math-and-precision).
 
 `impl="fused"` has a portable and a fast route. Per-channel `D=128` gates on CUDA capability
 9.0+ use the CuTeDSL kernels for both kinds (near the bf16->fp32 cast roofline with
@@ -403,9 +404,9 @@ implementations, it returns `(output, final_state)`; request the latter with
 and partial tails take the packed path with synthesized boundaries; packed/stateful calls pass
 explicit contiguous int32 boundaries and FP32 `[N, H, V, K]` states. Q/K/V/gate/state accept
 TMA-compatible innermost modes with aligned dynamic outer strides; beta requires an element-aligned
-contiguous inner mode. By default the forward is exact and
-unsplit: one persistent work item per sequence and head, which leaves the GPU underused for a few
-long sequences at low head counts. FP16 and BF16 use exact backward execution by default; eligible
+contiguous inner mode. By default the forward uses the unsplit recurrence:
+one persistent work item per sequence and head, which leaves the GPU underused for a few
+long sequences at low head counts. FP16 and BF16 use unsplit backward execution by default; eligible
 packed no-state long contexts may use the cuDNN backward with one unsplit work item per sequence and
 head. Callers that guarantee normalized keys, post-sigmoid beta, and nonpositive decay increments may
 set `split_backward` and/or `split_forward` to `True` in a cuDNN `kernel_options` mapping to opt into
@@ -420,7 +421,7 @@ forward recurrence: unless `split_backward` is also enabled, backward computes t
 recurrence's gradient rather than the derivative of the split forward. The implementation chooses
 the split count from the input geometry; no public split-size knob is exposed. Split schedules
 currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "cudnn"})` uses the
-same exact unsplit forward while updating selected cache slots directly; paged execution never uses
+same unsplit forward while updating selected cache slots directly; paged execution never uses
 forgetting-horizon splitting. Install the `cudnn` extra to use this backend.
 
 `kernel_options={"schedule": "persistent"}` is for CUDA graphs whose replays can carry far fewer
@@ -430,6 +431,35 @@ strides over only the active work. Below roughly a quarter of capacity active, p
 (measured 0.1-0.7x the static time on GB200); at full capacity it loses (1.1-2.4x). Outputs are
 bitwise identical. Requires the fused backend and, for packed inputs, the TMA output path (Hopper or
 newer).
+
+### Fast math and precision
+
+`fastmath` controls gating exponentials in KDA's forward, backward, recomputation, and CP summaries.
+
+| Backend | `True` (default) | `False` |
+|---|---|---|
+| Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
+| `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
+| `kernel_options={"backend": "cudnn"}` | Native backend math | `ValueError`: unsupported |
+
+Use the same value for staged forward and backward preparation. Choose it before warmup and
+CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.
+
+`bound_gate` and `gate_transform` have separate flags, also defaulting to `True`.
+For non-fast math in both gate production and attention:
+
+```python
+from attn_gym.linear import chunk_kda
+from attn_gym.linear.kda import bound_gate
+
+gate = bound_gate(raw_gate, A_log, dt_bias, fastmath=False)
+output, final_state = chunk_kda(
+    q, k, v, gate, beta, fastmath=False, output_final_state=True
+)
+```
+
+The training and CP examples use `--fastmath` by default; `--no-fastmath` selects `False`.
+Paged chunk and replay execution use `True`.
 
 ::: attn_gym.linear.chunk_kda
 

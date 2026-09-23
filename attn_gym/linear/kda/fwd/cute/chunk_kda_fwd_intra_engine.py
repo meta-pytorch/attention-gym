@@ -160,6 +160,7 @@ class KdaIntraFwdEngine:
         head_dim: int = 128,
         varlen: bool = True,
         use_int64_offsets: bool = False,
+        fastmath: bool = False,
     ):
         assert chunk_size == 64 and head_dim == 128
         self.BT = chunk_size
@@ -172,6 +173,7 @@ class KdaIntraFwdEngine:
         self.num_heads = num_heads
         self.varlen = varlen
         self.use_int64_offsets = use_int64_offsets
+        self.fastmath = fastmath
         # tcgen05 uses the same physical and logical M64 row count for BT64.
         self.mma_rows = 64
         self.s_tile = (self.mma_rows, self.BT, self.BK)
@@ -191,7 +193,7 @@ class KdaIntraFwdEngine:
     def get_name(self) -> str:
         return (
             f"kda_intra_engine_fwd_vl{int(self.varlen)}_h{self.num_heads}"
-            f"_k{self.BK}_bt{self.BT}_i64{int(self.use_int64_offsets)}"
+            f"_k{self.BK}_bt{self.BT}_i64{int(self.use_int64_offsets)}_fm{int(self.fastmath)}"
         )
 
     @cute.jit
@@ -353,6 +355,7 @@ class KdaIntraFwdEngine:
             ]
 
         self.shared_type = SharedF
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             mma_s,
             mma16,
@@ -503,7 +506,7 @@ class KdaIntraFwdEngine:
                                 qg_v = Float32(0.0)
                                 kgq_v = Float32(0.0)
                                 if prow < valid and prow >= row0:
-                                    gq = cute.math.exp2(r_g[e] - grf[e], fastmath=True)
+                                    gq = cute.math.exp2(r_g[e] - grf[e], fastmath=self.fastmath)
                                     qg_v = Float32(r_q[e]) * gq
                                     kgq_v = Float32(r_k[e]) * gq
                                 r_qg[e] = self.io_type(qg_v)
@@ -521,7 +524,7 @@ class KdaIntraFwdEngine:
                             kgk_v = Float32(0.0)
                             if srow < valid:
                                 kgk_v = Float32(r_kb[e]) * cute.math.exp2(
-                                    grf[e] - r_gb[e], fastmath=True
+                                    grf[e] - r_gb[e], fastmath=self.fastmath
                                 )
                             r_kk[e] = self.io_type(kgk_v)
                         cute.copy(cp_bf16, r_kk, tkgk_p[(None, rb2, None)])
@@ -956,6 +959,7 @@ def _compile_intra_engine_fwd(
     head_dim: int,
     varlen: bool,
     use_int64_offsets: bool,
+    fastmath: bool = False,
 ):
     target = get_compile_target()
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
@@ -965,6 +969,7 @@ def _compile_intra_engine_fwd(
         num_heads=H,
         varlen=varlen,
         use_int64_offsets=use_int64_offsets,
+        fastmath=fastmath,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     st, sn = sym_int(), cute.sym_int()
@@ -1031,6 +1036,8 @@ def kda_intra_engine_fwd(
     beta: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata | None,
+    *,
+    fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Produce the BT64 Aqk and inverse factors."""
     batch, tokens, heads, head_dim = q.shape
@@ -1076,6 +1083,7 @@ def kda_intra_engine_fwd(
         head_dim,
         metadata is not None,
         use_int64_offsets,
+        fastmath,
     )
     compiled(
         q_flat,

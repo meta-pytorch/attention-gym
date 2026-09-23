@@ -14,10 +14,11 @@ import torch
 _CHUNK_SIZE = 64
 
 
-# Fixed-arity schema pairs avoid optional outputs on hot paths.
+# Fixed-arity schema pairs avoid optional outputs on hot paths. ``fastmath`` is the trailing
+# defaulted argument so positional callers of the original schema keep working.
 _CHUNK_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor? initial_state,"
-    " float scale, bool autotune, str schedule)"
+    " float scale, bool autotune, str schedule, bool fastmath=False)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd",
@@ -31,7 +32,7 @@ torch.library.define(
 _CHUNK_RAGGED_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, float scale, "
-    "bool autotune, str schedule)"
+    "bool autotune, str schedule, bool fastmath=False)"
 )
 torch.library.define(
     "attn_gym::kda_chunk_fwd_ragged",
@@ -139,7 +140,7 @@ torch.library.define(
 
 _DELTA_H_ARGS = (
     "(Tensor k, Tensor w, Tensor u, Tensor gk, Tensor? initial_state, "
-    "Tensor? cu_seqlens, Tensor? chunk_offsets, SymInt capacity)"
+    "Tensor? cu_seqlens, Tensor? chunk_offsets, SymInt capacity, bool fastmath=True)"
 )
 torch.library.define(
     "attn_gym::kda_delta_h",
@@ -154,7 +155,7 @@ torch.library.define(
     "(Tensor k, Tensor w, Tensor u, Tensor gk, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, "
     "Tensor? chunk_offsets, "
-    "SymInt capacity) -> (Tensor, Tensor)",
+    "SymInt capacity, bool fastmath=True) -> (Tensor, Tensor)",
 )
 
 
@@ -366,8 +367,9 @@ def _chunk_fwd_fake(
     scale: float,
     autotune: bool,
     schedule: str,
+    fastmath: bool = False,
 ):
-    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule
+    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule, fastmath
     return _chunk_fwd_fake_common(q, v)
 
 
@@ -382,8 +384,9 @@ def _chunk_fwd_with_state_fake(
     scale: float,
     autotune: bool,
     schedule: str,
+    fastmath: bool = False,
 ):
-    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule
+    del k, cumulative_gate, beta, initial_state, scale, autotune, schedule, fastmath
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (q.shape[0], q.shape[2], v.shape[-1], q.shape[3]),
@@ -405,6 +408,7 @@ def _chunk_fwd_ragged_fake(
     scale: float,
     autotune: bool,
     schedule: str,
+    fastmath: bool = False,
 ):
     del (
         k,
@@ -416,6 +420,7 @@ def _chunk_fwd_ragged_fake(
         scale,
         autotune,
         schedule,
+        fastmath,
     )
     return _chunk_fwd_fake_common(q, v)
 
@@ -433,8 +438,10 @@ def _chunk_fwd_ragged_with_state_fake(
     scale: float,
     autotune: bool,
     schedule: str,
+    fastmath: bool = False,
 ):
     del k, cumulative_gate, beta, initial_state, chunk_offsets, scale, autotune, schedule
+    del fastmath
     output, aqk, akk = _chunk_fwd_fake_common(q, v)
     state = q.new_empty(
         (cu_seqlens.shape[0] - 1, q.shape[2], v.shape[-1], q.shape[3]),
@@ -823,8 +830,9 @@ def _delta_h_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del w, gk, initial_state, cu_seqlens, chunk_offsets
+    del w, gk, initial_state, cu_seqlens, chunk_offsets, fastmath
     return _delta_h_fake_common(k, u, capacity)
 
 
@@ -838,8 +846,9 @@ def _delta_h_with_state_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del w, gk, initial_state, chunk_offsets
+    del w, gk, initial_state, chunk_offsets, fastmath
     h, v_new = _delta_h_fake_common(k, u, capacity)
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = k.new_empty(
@@ -860,8 +869,10 @@ def _delta_h_paged_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del w, gk, state_cache, state_indices, has_initial_state, cu_seqlens, chunk_offsets
+    del fastmath
     return _delta_h_fake_common(k, u, capacity)
 
 

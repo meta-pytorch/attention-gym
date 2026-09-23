@@ -933,6 +933,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     use_int64_offsets: Constexpr,
     use_packed_f32x2: Constexpr,
     use_stmatrix: Constexpr,
+    fastmath: Constexpr = True,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
@@ -1237,8 +1238,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     if group == 3:
                         kb0 = kb30
                         kb1 = kb31
-                    b0 = kb0 * cute.math.exp2(gref - gk0, fastmath=True)
-                    b1 = kb1 * cute.math.exp2(gref - gk1, fastmath=True)
+                    b0 = kb0 * cute.math.exp2(gref - gk0, fastmath=fastmath)
+                    b1 = kb1 * cute.math.exp2(gref - gk1, fastmath=fastmath)
                     b0 = b0 if key0 < valid else z
                     b1 = b1 if key1 < valid else z
                     _hmma_stage_b_group(sEpi_tile, b0, b1, tidx, use_stmatrix)
@@ -1358,8 +1359,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 if group == 3:
                     kb0 = kb30
                     kb1 = kb31
-                b0 = kb0 * cute.math.exp2(gref - gk0, fastmath=True)
-                b1 = kb1 * cute.math.exp2(gref - gk1, fastmath=True)
+                b0 = kb0 * cute.math.exp2(gref - gk0, fastmath=fastmath)
+                b1 = kb1 * cute.math.exp2(gref - gk1, fastmath=fastmath)
                 b0 = b0 if key0 < valid else z
                 b1 = b1 if key1 < valid else z
                 _hmma_stage_b_group(sEpi_tile, b0, b1, tidx, use_stmatrix)
@@ -1447,8 +1448,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                         qq1 = qq31
                         kk0 = kk30
                         kk1 = kk31
-                    e0 = cute.math.exp2(gq0 - gref, fastmath=True)
-                    e1 = cute.math.exp2(gq1 - gref, fastmath=True)
+                    e0 = cute.math.exp2(gq0 - gref, fastmath=fastmath)
+                    e1 = cute.math.exp2(gq1 - gref, fastmath=fastmath)
                     b0 = qq0 * e0
                     b1 = qq1 * e1
                     c0 = kk0 * bq0 * e0
@@ -1541,8 +1542,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                     qq1 = qq31
                     kk0 = kk30
                     kk1 = kk31
-                e0 = cute.math.exp2(gq0 - gref, fastmath=True)
-                e1 = cute.math.exp2(gq1 - gref, fastmath=True)
+                e0 = cute.math.exp2(gq0 - gref, fastmath=fastmath)
+                e1 = cute.math.exp2(gq1 - gref, fastmath=fastmath)
                 b0 = qq0 * e0
                 b1 = qq1 * e1
                 c0 = kk0 * bq0 * e0
@@ -1649,10 +1650,10 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             gref_qk1 = sG_tile[gref_qk_offset + 1]
             gref_t0 = sG_tile[gref_t_offset]
             gref_t1 = sG_tile[gref_t_offset + 1]
-            qk_from_prev0 = cute.math.exp2(gref_prev0 - gref_qk0, fastmath=True)
-            qk_from_prev1 = cute.math.exp2(gref_prev1 - gref_qk1, fastmath=True)
-            tref0 = cute.math.exp2(gref_t0 - gref_qk0, fastmath=True)
-            tref1 = cute.math.exp2(gref_t1 - gref_qk1, fastmath=True)
+            qk_from_prev0 = cute.math.exp2(gref_prev0 - gref_qk0, fastmath=fastmath)
+            qk_from_prev1 = cute.math.exp2(gref_prev1 - gref_qk1, fastmath=fastmath)
+            tref0 = cute.math.exp2(gref_t0 - gref_qk0, fastmath=fastmath)
+            tref1 = cute.math.exp2(gref_t1 - gref_qk1, fastmath=fastmath)
 
             for lane_row in cutlass.range_constexpr(2):
                 row = row0 if lane_row == 0 else row1
@@ -1718,12 +1719,12 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 grow0 = sG_tile[row_offset]
                 grow1 = sG_tile[row_offset + 1]
                 beta_row = sBeta_tile[row]
-                qscale_prev0 = cute.math.exp2(grow0 - gref_prev0, fastmath=True)
-                qscale_prev1 = cute.math.exp2(grow1 - gref_prev1, fastmath=True)
+                qscale_prev0 = cute.math.exp2(grow0 - gref_prev0, fastmath=fastmath)
+                qscale_prev1 = cute.math.exp2(grow1 - gref_prev1, fastmath=fastmath)
                 qscale_diag0 = qscale_prev0 * qk_from_prev0
                 qscale_diag1 = qscale_prev1 * qk_from_prev1
-                dscale0 = cute.math.exp2(gref_qk0 - grow0, fastmath=True)
-                dscale1 = cute.math.exp2(gref_qk1 - grow1, fastmath=True)
+                dscale0 = cute.math.exp2(gref_qk0 - grow0, fastmath=fastmath)
+                dscale1 = cute.math.exp2(gref_qk1 - grow1, fastmath=fastmath)
                 tscale0 = dscale0 * tref0
                 tscale1 = dscale1 * tref1
                 dq_in0, dq_in1 = _ld_global_f32x4_lo2_pred(
@@ -1948,11 +1949,13 @@ class ChunkKdaBwdIntraHmmaGrid:
         use_int64_offsets: bool,
         use_packed_f32x2: bool,
         use_stmatrix: bool,
+        fastmath: bool = True,
     ):
         self.ragged = ragged
         self.use_int64_offsets = use_int64_offsets
         self.use_packed_f32x2 = use_packed_f32x2
         self.use_stmatrix = use_stmatrix
+        self.fastmath = fastmath
 
     @cute.jit
     def __call__(
@@ -1975,7 +1978,9 @@ class ChunkKdaBwdIntraHmmaGrid:
         grid_chunks: Int32,
         stream: cuda.CUstream = None,
     ):
-        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix("cutlass_dsl_chunk_kda_bwd_intra")
+        _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix(
+            f"cutlass_dsl_chunk_kda_bwd_intra_fm{int(self.fastmath)}"
+        )
         _chunk_kda_bwd_intra_hmma_grid_kernel(
             mQ,
             mK,
@@ -1997,6 +2002,7 @@ class ChunkKdaBwdIntraHmmaGrid:
             self.use_int64_offsets,
             self.use_packed_f32x2,
             self.use_stmatrix,
+            self.fastmath,
         ).launch(
             grid=(KC_TOTAL, grid_chunks, cute.size(mQ.shape[2])),
             block=(32, 1, 1),
@@ -2016,6 +2022,7 @@ def _compile_chunk_kda_bwd_intra(
     ragged: bool,
     io_type: type[cutlass.Numeric],
     use_int64_offsets: bool = False,
+    fastmath: bool = True,
 ):
     """Compile one persistent intra-chunk backward specialization."""
     target = get_compile_target()
@@ -2027,6 +2034,7 @@ def _compile_chunk_kda_bwd_intra(
         use_int64_offsets=use_int64_offsets,
         use_packed_f32x2=is_sm100_kda_capability(capability),
         use_stmatrix=capability >= (9, 0),
+        fastmath=fastmath,
     )
     tokens, sequences = cute.sym_int(), cute.sym_int()
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
@@ -2095,7 +2103,7 @@ def _compile_chunk_kda_bwd_intra(
         Int32(1),
         name=(
             f"kda_bwd_intra_h{heads}_{_IO_TYPE_NAMES[io_type]}_rg{int(ragged)}"
-            f"_i64{int(use_int64_offsets)}"
+            f"_i64{int(use_int64_offsets)}_fm{int(fastmath)}"
         ),
     )
 
@@ -2123,6 +2131,7 @@ class ChunkKdaBwdIntraTunable:
         cu_seqlens: torch.Tensor | None
         chunk_offsets: torch.Tensor | None
         capacity: int
+        fastmath: bool = True
 
     @staticmethod
     def default_config(args: Args, *, target: CompileTarget) -> ChunkKdaBwdIntraConfig:
@@ -2139,7 +2148,7 @@ class ChunkKdaBwdIntraTunable:
 
     @staticmethod
     def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
-        """Keep capacity-specific tuning winners without specializing compilation."""
+        """Keep capacity-specific tuning winners."""
         if target.sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
         return (args.capacity,)
@@ -2164,7 +2173,7 @@ class ChunkKdaBwdIntraTunable:
     def compile_call(
         config: ChunkKdaBwdIntraConfig,
         args: Args,
-    ) -> tuple[int, bool, type[cutlass.Numeric], bool]:
+    ) -> tuple[int, bool, type[cutlass.Numeric], bool, bool]:
         if not 1 <= config.grid_chunks <= args.capacity:
             raise ValueError(
                 f"grid_chunks must be in [1, {args.capacity}], got {config.grid_chunks}"
@@ -2189,6 +2198,7 @@ class ChunkKdaBwdIntraTunable:
                 _column_token_head(args.dk2),
                 _column_token_head(args.dg2),
             ),
+            args.fastmath,
         )
 
     compile = staticmethod(_compile_chunk_kda_bwd_intra)
@@ -2248,6 +2258,7 @@ def chunk_kda_bwd_intra(
     config: ChunkKdaBwdIntraConfig | None = None,
     autotune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run or tune the final dense or fixed-capacity ragged backward stage.
 
@@ -2306,6 +2317,7 @@ def chunk_kda_bwd_intra(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         capacity=capacity,
+        fastmath=fastmath,
     )
     target = detect_compile_target(q.device.index)
     # An explicit config pins the schedule regardless of the plumbed flag.
