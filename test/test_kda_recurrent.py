@@ -23,6 +23,10 @@ from attn_gym.linear.kda.fwd.triton.recurrent import (
 )
 from attn_gym.linear.kda.naive import naive_recurrent_kda
 from attn_gym.testing import cumulative_sequence_offsets, strided_state_pool
+from attn_gym.testing.kda import (
+    assert_matches_low_precision_reference,
+    assert_rms_matches_low_precision_reference,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="recurrent_kda requires CUDA"
@@ -445,23 +449,45 @@ def test_recurrent_paged_fresh_slot_ignores_existing_state():
     torch.testing.assert_close(pool[slots.long()], expected_state, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("seed", [2, 11])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_recurrent_paged_decode_accumulates_in_place(state_dtype: torch.dtype):
+def test_recurrent_paged_decode_accumulates_in_place(state_dtype: torch.dtype, seed: int):
     """Successive single-token steps advance each slot without a round trip."""
+    torch.manual_seed(seed)
     _, pool = strided_state_pool(5, 2, 64, 64, dtype=state_dtype)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    state = pool[slots.long()].float()
 
     for step in range(3):
         q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=20 + step)
+        # Both oracles start from the stored state: independently rounded BF16
+        # trajectories can diverge even when each FP32 transition is accurate.
+        state = pool[slots.long()].float()
         output, _ = recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots)
-        expected, state = naive_recurrent_kda(
+        expected, expected_state = naive_recurrent_kda(
             q, k, v, gate * LOG2_E, beta, initial_state=state, output_final_state=True
         )
+        _, high_state = naive_recurrent_kda(
+            q.double(),
+            k.double(),
+            v.double(),
+            gate.double() * LOG2_E,
+            beta.double(),
+            initial_state=state.double(),
+            output_final_state=True,
+        )
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-        state = state.to(state_dtype)
-        torch.testing.assert_close(pool[slots.long()], state, rtol=1e-5, atol=1e-5)
-        state = state.float()
+        # FP32 roundoff can place correct results on opposite sides of a BF16 midpoint.
+        for check in (
+            assert_matches_low_precision_reference,
+            assert_rms_matches_low_precision_reference,
+        ):
+            check(
+                pool[slots.long()],
+                high_state,
+                expected_state.to(state_dtype),
+                "paged state",
+                source_dtype=state_dtype,
+            )
 
 
 @pytest.mark.parametrize("padding_slot", [0, -1])
