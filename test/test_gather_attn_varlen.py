@@ -333,3 +333,24 @@ def test_packed_triton_fullgraph_backward(gather_attn_single_config):
     actual_grads = torch.autograd.grad(actual[:, :, :17], tensors, grad)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_packed_backward_rejects_changed_query_boundaries(gather_attn_single_config):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, capacity=3)
+    q, local, sparse, sink = tensors
+    output = gather_attn(
+        q,
+        local,
+        sparse,
+        indices,
+        sink,
+        sliding_window_size=7,
+        cu_seqlens=cu_q,
+        cu_seqlens_k=cu_k,
+        kernel_options={"backend": "triton"},
+    )
+    cu_q[2] = 2
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        output.sum().backward()

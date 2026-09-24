@@ -47,7 +47,7 @@ def _packed_gather_attn(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor,
-    doc_ids: Tensor,
+    cu_seqlens: Tensor,
     sliding_window_size: int,
     *,
     scale: float,
@@ -58,7 +58,9 @@ def _packed_gather_attn(
     window = min(sliding_window_size, tokens)
     local_indices = positions[:, None] - window + 1 + torch.arange(window, device=query.device)
     local_valid = (local_indices >= 0).unsqueeze(0)
-    local_valid = local_valid & (doc_ids[:, local_indices.clamp_min(0)] == doc_ids[:, :, None])
+    documents = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+    starts = cu_seqlens[documents]
+    local_valid = local_valid & (local_indices >= starts[:, None])
     local_indices = local_indices.clamp_min(0).expand(batch, -1, -1)
     indices = torch.cat((local_indices, (kv_indices + tokens).clamp_min(0)), dim=-1).long()
     valid = torch.cat((local_valid, kv_indices >= 0), dim=-1)[:, None, :, :, None]
@@ -97,7 +99,7 @@ def gather_attn(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor,
-    doc_ids: Tensor | None,
+    cu_seqlens: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
     *,
@@ -108,7 +110,8 @@ def gather_attn(
         if share_kv:
             expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
         For each token, Q_i, in query:
-            first_token_of_document = torch.where(doc_ids == doc_ids[i])[0].min()
+            document = searchsorted(cu_seqlens[1:], i, right=True)
+            first_token_of_document = cu_seqlens[document]
             farthest_past_token_index = max(i - sliding_window, first_token_of_document)
             KV = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
             P = (Q @ KV.T) * scale
@@ -134,9 +137,8 @@ def gather_attn(
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
-        doc_ids: Internal document labels shaped (batch_size, sequence_length), derived
-            from cu_seqlens by the public API, or None for ordinary batched inputs.
-            They isolate the local window. Sparse selections have already been translated
+        cu_seqlens: Packed query offsets, or None for ordinary batched inputs.
+            They bound the local window. Sparse selections have already been translated
             to global pool positions and masked to their document by the public API.
 
         sliding_window_size: Integer, size of sliding window
@@ -152,14 +154,14 @@ def gather_attn(
     accumulation_dtype = torch.promote_types(dtype, torch.float32)
     b, h, s, _head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
-    if doc_ids is not None:
+    if cu_seqlens is not None:
         return _packed_gather_attn(
             query,
             local_kv,
             sparse_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
+            cu_seqlens,
             sliding_window_size,
             scale=scale,
         )

@@ -17,7 +17,7 @@ class _GatherAttnFunction(torch.autograd.Function):
         local_kv: torch.Tensor,
         kv_indices: torch.Tensor,
         attention_sink: torch.Tensor,
-        doc_ids: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
         sliding_window_size: int,
         share_kv: bool,
         scale: float,
@@ -32,7 +32,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             local_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
+            cu_seqlens,
             sliding_window_size,
             scale,
         )
@@ -48,8 +48,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             attention_sink,
             output,
             lse,
+            cu_seqlens,
         )
-        ctx.doc_ids = doc_ids
         ctx.sliding_window_size = sliding_window_size
         ctx.share_kv = share_kv
         ctx.scale = scale
@@ -68,6 +68,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             attention_sink,
             output,
             lse,
+            cu_seqlens,
         ) = ctx.saved_tensors
         grad_query, grad_sparse_kv, grad_local_kv, grad_sink = _launch_backward(
             query,
@@ -77,7 +78,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             selected_queries,
             block_offsets,
             attention_sink,
-            ctx.doc_ids,
+            cu_seqlens,
             output,
             lse,
             grad_output,
@@ -94,7 +95,7 @@ def gather_attn(
     sparse_kv: torch.Tensor,
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
-    doc_ids: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
     *,
@@ -108,7 +109,7 @@ def gather_attn(
         sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
         kv_indices: (batch, seq_len, topk) — which sparse_kv positions each query attends to.
         attention_sink: (heads,) — learned per-head sink weight.
-        doc_ids: (batch, seq_len) or None — document IDs for packing isolation.
+        cu_seqlens: (num_documents + 1,) or None — cumulative packed query lengths.
         sliding_window_size: size of the causal sliding window.
         share_kv: if True, broadcast single-head KV and return single-head gradients.
         scale: Multiplier for query-key logits; does not scale sink logits.
@@ -124,8 +125,8 @@ def gather_attn(
 
     query = query.contiguous()
     kv_indices = kv_indices.contiguous()
-    if doc_ids is not None:
-        doc_ids = doc_ids.contiguous()
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.contiguous()
 
     requires_grad = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (query, local_kv, sparse_kv, attention_sink)
@@ -137,7 +138,7 @@ def gather_attn(
             local_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
+            cu_seqlens,
             sliding_window_size,
             share_kv,
             scale,
@@ -147,5 +148,12 @@ def gather_attn(
         local_kv = local_kv.expand(-1, heads, -1, -1)
         sparse_kv = sparse_kv.expand(-1, heads, -1, -1)
     return _launch_forward(
-        query, sparse_kv, local_kv, kv_indices, attention_sink, doc_ids, sliding_window_size, scale
+        query,
+        sparse_kv,
+        local_kv,
+        kv_indices,
+        attention_sink,
+        cu_seqlens,
+        sliding_window_size,
+        scale,
     )

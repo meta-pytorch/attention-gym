@@ -5,14 +5,14 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset
+from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from .primitives import (
     TileConfig,
     can_use_shared_kv_schedule,
     causal_window_mask,
     load_bhsd,
-    load_bs,
+    load_document_bounds,
     online_softmax_update,
     select_tiles,
     store_bhsd,
@@ -25,7 +25,7 @@ def _gather_attn_fwd(
     sparse_kv_ptr,
     local_kv_ptr,
     kv_indices_ptr,
-    doc_ids_ptr,
+    cu_seqlens_ptr,
     attention_sink_ptr,
     output_ptr,
     lse_ptr,
@@ -33,7 +33,7 @@ def _gather_attn_fwd(
     SPARSE_KV_STRIDES: tl.constexpr,
     LOCAL_KV_STRIDES: tl.constexpr,
     KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
+    num_documents,
     LSE_STRIDES: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -42,7 +42,8 @@ def _gather_attn_fwd(
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     NUM_LOCAL_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -69,8 +70,8 @@ def _gather_attn_fwd(
         query_mask[:, None] & dimension_mask[None, :],
     )
 
-    if HAS_DOC_IDS:
-        query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
+    if HAS_CU_SEQLENS:
+        query_start, _ = load_document_bounds(cu_seqlens_ptr, offsets_m, num_documents, S, WIDE)
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
@@ -126,9 +127,8 @@ def _gather_attn_fwd(
         )
         logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, local_mask, WINDOW)
-        if HAS_DOC_IDS:
-            key_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, local_mask, -2)
-            valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
+        if HAS_CU_SEQLENS:
+            valid &= offsets_n[None, :] >= query_start[:, None]
 
         logits = tl.where(valid, logits, -float("inf"))
         accumulator, running_max, running_sum = online_softmax_update(
@@ -166,7 +166,7 @@ def prune_shared_forward_configs(configs, _named_args, D, **_):
         for block_n in (64, 128, 256)
         for num_warps in (4, 8)
     ],
-    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
     prune_configs_by={"early_config_prune": prune_shared_forward_configs},
     cache_results=True,
 )
@@ -176,7 +176,7 @@ def _gather_attn_fwd_shared(
     sparse_kv_ptr,
     local_kv_ptr,
     kv_indices_ptr,
-    doc_ids_ptr,
+    cu_seqlens_ptr,
     attention_sink_ptr,
     output_ptr,
     lse_ptr,
@@ -184,7 +184,7 @@ def _gather_attn_fwd_shared(
     SPARSE_KV_STRIDES: tl.constexpr,
     LOCAL_KV_STRIDES: tl.constexpr,
     KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
+    num_documents,
     LSE_STRIDES: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -194,7 +194,8 @@ def _gather_attn_fwd_shared(
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -254,8 +255,8 @@ def _gather_attn_fwd_shared(
                 accumulator, running_max, running_sum, logits, sparse_values
             )
 
-    if HAS_DOC_IDS:
-        query_doc_id = tl.load(doc_ids_ptr + ptr_offset((batch, sequence), DOC_IDS_STRIDES))
+    if HAS_CU_SEQLENS:
+        query_start, _ = load_document_bounds(cu_seqlens_ptr, sequence, num_documents, S, WIDE)
 
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
@@ -271,13 +272,8 @@ def _gather_attn_fwd_shared(
             mask=local_valid[:, None] & dimension_mask[None, :],
             other=0.0,
         )
-        if HAS_DOC_IDS:
-            key_doc_ids = tl.load(
-                doc_ids_ptr + ptr_offset((batch, offsets_n), DOC_IDS_STRIDES),
-                mask=local_valid,
-                other=-1,
-            )
-            local_valid &= key_doc_ids == query_doc_id
+        if HAS_CU_SEQLENS:
+            local_valid &= offsets_n >= query_start
 
         logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         logits = tl.where(head_mask[:, None] & local_valid[None, :], logits, -float("inf"))
@@ -307,7 +303,7 @@ def _gather_attn_fwd_shared(
         for num_warps in (4, 8)
         for num_stages in (1, 3)
     ],
-    key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
     cache_results=True,
 )
 @triton.jit
@@ -316,13 +312,13 @@ def _gather_attn_fwd_tma(
     sparse_kv_ptr,
     local_desc,
     kv_indices_ptr,
-    doc_ids_ptr,
+    cu_seqlens_ptr,
     attention_sink_ptr,
     output_desc,
     lse_ptr,
     SPARSE_KV_STRIDES: tl.constexpr,
     KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
+    num_documents,
     LSE_STRIDES: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -331,7 +327,8 @@ def _gather_attn_fwd_tma(
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     NUM_LOCAL_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -352,8 +349,8 @@ def _gather_attn_fwd_tma(
         (BLOCK_M, BLOCK_D),
     )
 
-    if HAS_DOC_IDS:
-        query_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_m, query_mask, -1)
+    if HAS_CU_SEQLENS:
+        query_start, _ = load_document_bounds(cu_seqlens_ptr, offsets_m, num_documents, S, WIDE)
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
@@ -401,9 +398,8 @@ def _gather_attn_fwd_tma(
         )
         logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         valid = causal_window_mask(offsets_m, offsets_n, query_mask, local_mask, WINDOW)
-        if HAS_DOC_IDS:
-            key_doc_ids = load_bs(doc_ids_ptr, DOC_IDS_STRIDES, batch, offsets_n, local_mask, -2)
-            valid &= query_doc_ids[:, None] == key_doc_ids[None, :]
+        if HAS_CU_SEQLENS:
+            valid &= offsets_n[None, :] >= query_start[:, None]
 
         logits = tl.where(valid, logits, -float("inf"))
         accumulator, running_max, running_sum = online_softmax_update(
@@ -438,7 +434,7 @@ def _launch_forward(
     local_kv: torch.Tensor,
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
-    doc_ids: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     sliding_window_size: int,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -449,8 +445,9 @@ def _launch_forward(
     block_d = max(16, triton.next_power_of_2(head_dim))
     output = torch.empty_like(query)
     lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
-    has_doc_ids = doc_ids is not None
-    doc_ids = query if doc_ids is None else doc_ids
+    has_cu_seqlens = cu_seqlens is not None
+    num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
+    wide = requires_int64_offsets(cu_seqlens)
 
     # This head-major schedule is tuned for shared KV on Blackwell.
     if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
@@ -466,7 +463,7 @@ def _launch_forward(
             sparse_kv,
             local_kv,
             kv_indices,
-            doc_ids,
+            cu_seqlens,
             attention_sink,
             output,
             lse,
@@ -474,7 +471,7 @@ def _launch_forward(
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             LOCAL_KV_STRIDES=local_kv.stride(),
             KV_INDICES_STRIDES=kv_indices.stride(),
-            DOC_IDS_STRIDES=doc_ids.stride(),
+            num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             B=batch,
             H=heads,
@@ -484,7 +481,8 @@ def _launch_forward(
             TOPK=topk,
             WINDOW=sliding_window_size,
             SCALE=scale,
-            HAS_DOC_IDS=has_doc_ids,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            WIDE=wide,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             BLOCK_D=block_d,
@@ -510,13 +508,13 @@ def _launch_forward(
             sparse_kv,
             local_desc,
             kv_indices,
-            doc_ids,
+            cu_seqlens,
             attention_sink,
             output_desc,
             lse,
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             KV_INDICES_STRIDES=kv_indices.stride(),
-            DOC_IDS_STRIDES=doc_ids.stride(),
+            num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             H=heads,
             S=seq_len,
@@ -525,7 +523,8 @@ def _launch_forward(
             TOPK=topk,
             WINDOW=sliding_window_size,
             SCALE=scale,
-            HAS_DOC_IDS=has_doc_ids,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            WIDE=wide,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -537,7 +536,7 @@ def _launch_forward(
             sparse_kv,
             local_kv,
             kv_indices,
-            doc_ids,
+            cu_seqlens,
             attention_sink,
             output,
             lse,
@@ -545,7 +544,7 @@ def _launch_forward(
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             LOCAL_KV_STRIDES=local_kv.stride(),
             KV_INDICES_STRIDES=kv_indices.stride(),
-            DOC_IDS_STRIDES=doc_ids.stride(),
+            num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             H=heads,
             S=seq_len,
@@ -554,7 +553,8 @@ def _launch_forward(
             TOPK=topk,
             WINDOW=sliding_window_size,
             SCALE=scale,
-            HAS_DOC_IDS=has_doc_ids,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            WIDE=wide,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,

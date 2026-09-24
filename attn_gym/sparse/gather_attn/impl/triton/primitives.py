@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import _document_ids, ptr_offset
 
 
 def can_use_shared_kv_schedule(
@@ -98,20 +98,24 @@ def load_bhsd(
 
 
 @triton.jit
-def load_bs(
-    tensor_ptr,
-    strides: tl.constexpr,
-    batch,
+def load_document_bounds(
+    cu_seqlens_ptr,
     positions,
-    mask,
-    other: tl.constexpr,
+    num_documents,
+    sequence_length: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
-    """Load positions from a gather-attention batch-sequence tensor."""
-    return tl.load(
-        tensor_ptr + ptr_offset((batch, positions), strides),
-        mask=mask,
-        other=other,
+    """Find packed bounds, treating inactive capacity as one isolated document."""
+    document = _document_ids(cu_seqlens_ptr, positions, num_documents, WIDE)
+    offset = document.to(tl.int64) if WIDE else document
+    # The right-sided search skips empty documents and returns N for tail/padded positions.
+    start = tl.load(cu_seqlens_ptr + offset)
+    end = tl.load(
+        cu_seqlens_ptr + offset + 1,
+        mask=document < num_documents,
+        other=sequence_length,
     )
+    return start, end
 
 
 @triton.jit

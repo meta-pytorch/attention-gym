@@ -334,14 +334,12 @@ def gather_attn(
         cu_seqlens,
         cu_seqlens_k,
     )
-    doc_ids = None
     if cu_seqlens is not None:
         positions = torch.arange(query.shape[2], device=query.device, dtype=torch.int32)
         # Right-sided lookup skips empty documents and maps capacity tails to the endpoint.
         documents = torch.searchsorted(cu_seqlens[1:], positions, right=True, out_int32=True)
         starts = cu_seqlens_k.index_select(0, documents)
         ends = cu_seqlens_k.index_select(0, (documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1))
-        doc_ids = documents.unsqueeze(0)
         valid = (kv_indices >= 0) & (kv_indices < (ends - starts)[None, :, None])
         # Validity is computed in local coordinates, before translating the pool address.
         kv_indices = torch.where(valid, kv_indices, 0) + starts[None, :, None]
@@ -381,7 +379,7 @@ def gather_attn(
         sparse_kv,
         kv_indices,
         attention_sink,
-        doc_ids,
+        cu_seqlens,
         sliding_window_size,
         share_kv,
         scale=scale,

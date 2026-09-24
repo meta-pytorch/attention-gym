@@ -10,7 +10,7 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
 
-from .primitives import prune_wide_backward_configs
+from .primitives import load_document_bounds, prune_wide_backward_configs
 
 
 def prune_shared_dq_configs(configs, named_args, D, **kwargs):
@@ -25,7 +25,7 @@ def prune_shared_dq_configs(configs, named_args, D, **kwargs):
         for block_n in (16, 64, 128)
         for num_warps in (4, 8)
     ],
-    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
     prune_configs_by={"early_config_prune": prune_shared_dq_configs},
     cache_results=True,
 )
@@ -35,7 +35,7 @@ def _gather_attn_bwd_dq_shared(
     sparse_kv_ptr,
     local_kv_ptr,
     kv_indices_ptr,
-    doc_ids_ptr,
+    cu_seqlens_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
@@ -46,7 +46,7 @@ def _gather_attn_bwd_dq_shared(
     SPARSE_KV_STRIDES: tl.constexpr,
     LOCAL_KV_STRIDES: tl.constexpr,
     KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
+    num_documents,
     LSE_STRIDES: tl.constexpr,
     GRAD_SINK_PARTIALS_STRIDES: tl.constexpr,
     B: tl.constexpr,
@@ -57,7 +57,8 @@ def _gather_attn_bwd_dq_shared(
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -142,8 +143,8 @@ def _gather_attn_bwd_dq_shared(
                 * SCALE
             )
 
-    if HAS_DOC_IDS:
-        query_doc_id = tl.load(doc_ids_ptr + ptr_offset((batch, sequence), DOC_IDS_STRIDES))
+    if HAS_CU_SEQLENS:
+        query_start, _ = load_document_bounds(cu_seqlens_ptr, sequence, num_documents, S, WIDE)
 
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
@@ -159,13 +160,8 @@ def _gather_attn_bwd_dq_shared(
             mask=local_valid[:, None] & dimension_mask[None, :],
             other=0.0,
         )
-        if HAS_DOC_IDS:
-            key_doc_ids = tl.load(
-                doc_ids_ptr + ptr_offset((batch, offsets_n), DOC_IDS_STRIDES),
-                mask=local_valid,
-                other=-1,
-            )
-            local_valid &= key_doc_ids == query_doc_id
+        if HAS_CU_SEQLENS:
+            local_valid &= offsets_n >= query_start
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         probabilities = tl.where(
