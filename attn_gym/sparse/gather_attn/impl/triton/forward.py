@@ -8,11 +8,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset
 
 from .primitives import (
+    TileConfig,
     can_use_shared_kv_schedule,
     causal_window_mask,
     load_bhsd,
     load_bs,
     online_softmax_update,
+    select_tiles,
     store_bhsd,
 )
 
@@ -417,6 +419,23 @@ def _gather_attn_fwd_tma(
     )
 
 
+# Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256).
+GENERIC_FORWARD_TILES = (
+    TileConfig(64, 128, 8, 3, shared_rows=256),
+    TileConfig(64, 64, 8, 3, shared_rows=192),
+    TileConfig(32, 32, 4, 1, shared_rows=96),
+)
+
+
+def generic_forward_tiles(head_dim: int, element_size: int, device: torch.device) -> TileConfig:
+    """Choose tiles for the head-parallel forward schedules."""
+    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
+    if head_dim == 512:
+        return TileConfig(16, 16, 4, 1)
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    return select_tiles(GENERIC_FORWARD_TILES, block_d, element_size, device)
+
+
 def _launch_forward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -476,9 +495,8 @@ def _launch_forward(
         )
         return output, lse
 
-    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
-    block_m, block_n, num_warps, num_stages = (
-        (16, 16, 4, 1) if head_dim == 512 else (64, 128, 8, 3)
+    block_m, block_n, num_warps, num_stages, _ = generic_forward_tiles(
+        head_dim, query.element_size(), query.device
     )
     num_local_tiles = (
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0

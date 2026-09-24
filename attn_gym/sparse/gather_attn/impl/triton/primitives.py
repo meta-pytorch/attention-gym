@@ -1,5 +1,8 @@
 """Triton primitives shared by gather-attention kernel schedules."""
 
+from collections.abc import Sequence
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +30,35 @@ def can_use_shared_kv_schedule(
         and head_dim % 16 == 0
         and (head_dim <= 128 or head_dim == 512)
         and sliding_window_size <= 2048
+    )
+
+
+class TileConfig(NamedTuple):
+    """Launch parameters of a fixed-config (not autotuned) kernel."""
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    # Shared memory in BLOCK_D-wide rows: the largest ``metadata.shared / (BLOCK_D *
+    # element_size)`` measured for SM86 at D in {64, 128, 256} with Triton 3.8.
+    shared_rows: int = 0
+
+
+def select_tiles(
+    candidates: Sequence[TileConfig],
+    block_d: int,
+    element_size: int,
+    device: torch.device,
+) -> TileConfig:
+    """Return the first candidate whose estimated shared memory fits one block on ``device``.
+
+    Candidates are ordered by preference; the last one is the fallback for tiny budgets.
+    """
+    budget = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return next(
+        (c for c in candidates if c.shared_rows * block_d * element_size <= budget),
+        candidates[-1],
     )
 
 
