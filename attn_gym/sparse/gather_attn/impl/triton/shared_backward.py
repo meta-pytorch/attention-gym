@@ -1,4 +1,4 @@
-"""Blackwell shared-KV schedules for selected-attention backward.
+"""Blackwell shared-KV schedules for gather-attention backward.
 
 The default sparse-dKV schedule forms query-owned top-k-by-dimension gradient tiles and
 atomically scatters them into one FP32 shared-KV gradient. Deterministic mode instead uses
@@ -30,7 +30,7 @@ def prune_shared_dq_configs(configs, named_args, D, **kwargs):
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_bwd_dq_shared(
+def _gather_attn_bwd_dq_shared(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
@@ -224,7 +224,7 @@ def _selected_attention_bwd_dq_shared(
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_bwd_dsparse_kv_shared_atomic(
+def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
     sparse_kv_ptr,
     kv_indices_ptr,
@@ -355,7 +355,7 @@ def _selected_attention_bwd_dsparse_kv_shared_atomic(
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_bwd_dsparse_kv_shared(
+def _gather_attn_bwd_dsparse_kv_shared(
     query_ptr,
     sparse_kv_ptr,
     selected_queries_ptr,

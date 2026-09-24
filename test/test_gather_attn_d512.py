@@ -5,19 +5,19 @@ from typing import NamedTuple
 
 import pytest
 import torch
-from test_selected_attention_triton import (
+from test_gather_attn_triton import (
     assert_matches_low_precision_eager,
     assert_sink_gradient_fp32,
 )
 
-from attn_gym.sparse.selected_attention import (
+from attn_gym.sparse.gather_attn import (
     AuxRequest,
+    GatherAttnAux,
     Impl,
-    SelectedAttentionAux,
-    selected_attention,
+    gather_attn,
 )
 
-pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
 
 
 class AttentionInputs(NamedTuple):
@@ -79,12 +79,12 @@ def make_inputs(
 def check_training(
     inputs: AttentionInputs,
     window: int,
-    operation: Callable[..., tuple[torch.Tensor, SelectedAttentionAux]] = selected_attention,
+    operation: Callable[..., tuple[torch.Tensor, GatherAttnAux]] = gather_attn,
     *,
     repeat_backward: bool = False,
     kernel_options: dict[str, str] | None,
 ) -> None:
-    from attn_gym.sparse.selected_attention.impl.triton.primitives import (
+    from attn_gym.sparse.gather_attn.impl.triton.primitives import (
         can_use_shared_kv_schedule,
     )
 
@@ -107,8 +107,8 @@ def check_training(
         sparse_kv=high_precision_tensors[2],
         attention_sink=high_precision_tensors[3],
     )
-    high_precision_output = selected_attention(*high_precision_inputs, window, impl=Impl.REFERENCE)
-    low_precision_output = selected_attention(*inputs, window, impl=Impl.REFERENCE)
+    high_precision_output = gather_attn(*high_precision_inputs, window, impl=Impl.REFERENCE)
+    low_precision_output = gather_attn(*inputs, window, impl=Impl.REFERENCE)
     actual, aux = operation(
         *inputs, window, kernel_options=kernel_options, return_aux=AuxRequest(lse=True)
     )
@@ -209,7 +209,7 @@ def test_d512_deterministic_backward(heads, share_kv):
 @pytest.mark.usefixtures("fresh_compile_cache")
 def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
     # Stride tuples are Triton constexpr arguments, so each shape specializes independently.
-    compiled = torch.compile(selected_attention, fullgraph=True, dynamic=False)
+    compiled = torch.compile(gather_attn, fullgraph=True, dynamic=False)
     for seq_len in (17, 33):
         inputs = make_inputs(heads, share_kv, torch.bfloat16, seq_len=seq_len)
         check_training(inputs, 19, operation=compiled, kernel_options=kernel_options)
@@ -217,8 +217,8 @@ def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
 
 @pytest.mark.usefixtures("fresh_compile_cache")
 def test_cute_eligible_auto_fullgraph_training():
-    from attn_gym.sparse.selected_attention.api import _select_backend
-    from attn_gym.sparse.selected_attention.impl.cute import (
+    from attn_gym.sparse.gather_attn.api import _select_backend
+    from attn_gym.sparse.gather_attn.impl.cute import (
         SUPPORTED_CAPABILITIES,
         _fa4_available,
     )
@@ -235,10 +235,8 @@ def test_cute_eligible_auto_fullgraph_training():
     assert _select_backend(inputs.query, None, True, num_keys=21) == "cute"
     # Omit the sink: both the metadata and installed FA4 permit CuTe outside compilation.
     args = inputs[:4]
-    expected = selected_attention(
-        *args, sliding_window_size=19, kernel_options={"backend": "triton"}
-    )
-    compiled = torch.compile(selected_attention, fullgraph=True, dynamic=False)
+    expected = gather_attn(*args, sliding_window_size=19, kernel_options={"backend": "triton"})
+    compiled = torch.compile(gather_attn, fullgraph=True, dynamic=False)
     actual = compiled(*args, sliding_window_size=19)
     assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
     # Query zero has no valid sparse selections and can attend only to local token zero.
@@ -256,7 +254,7 @@ def test_cute_eligible_auto_fullgraph_training():
 
 
 def test_d512_auto_fallback_training():
-    from attn_gym.sparse.selected_attention.api import _select_backend
+    from attn_gym.sparse.gather_attn.api import _select_backend
 
     inputs = make_inputs(2, False, torch.bfloat16)
     assert _select_backend(inputs.query, inputs.attention_sink, False, num_keys=38) == "triton"
@@ -266,7 +264,7 @@ def test_d512_auto_fallback_training():
 @pytest.mark.parametrize("head_dim", [16, 64, 128, 144, 256, 496, 512, 528])
 def test_shared_schedule_head_dimensions(monkeypatch, head_dim):
     pytest.importorskip("triton")
-    from attn_gym.sparse.selected_attention.impl.triton.primitives import (
+    from attn_gym.sparse.gather_attn.impl.triton.primitives import (
         can_use_shared_kv_schedule,
     )
 
@@ -280,12 +278,12 @@ def test_shared_schedule_head_dimensions(monkeypatch, head_dim):
 @pytest.mark.parametrize("kernel_name", ["dq_shared", "dsparse_shared_atomic", "dsparse_generic"])
 def test_d512_backward_config_pruning(kernel_name):
     pytest.importorskip("triton")
-    from attn_gym.sparse.selected_attention.impl.triton import backward, shared_backward
+    from attn_gym.sparse.gather_attn.impl.triton import backward, shared_backward
 
     kernels = {
-        "dq_shared": shared_backward._selected_attention_bwd_dq_shared,
-        "dsparse_shared_atomic": shared_backward._selected_attention_bwd_dsparse_kv_shared_atomic,
-        "dsparse_generic": backward._selected_attention_bwd_dsparse_kv,
+        "dq_shared": shared_backward._gather_attn_bwd_dq_shared,
+        "dsparse_shared_atomic": shared_backward._gather_attn_bwd_dsparse_kv_shared_atomic,
+        "dsparse_generic": backward._gather_attn_bwd_dsparse_kv,
     }
     kernel = kernels[kernel_name]
     wide_configs = kernel.early_config_prune(kernel.configs, {}, D=512)

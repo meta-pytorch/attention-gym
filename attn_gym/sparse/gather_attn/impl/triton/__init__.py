@@ -1,4 +1,4 @@
-"""Triton backend for selected attention."""
+"""Triton backend for gather attention."""
 
 import torch
 
@@ -6,7 +6,7 @@ from .backward import _build_index_query_map, _launch_backward
 from .forward import _launch_forward
 
 
-class _SelectedAttentionFunction(torch.autograd.Function):
+class _GatherAttnFunction(torch.autograd.Function):
     """Autograd wrapper around the Triton launchers."""
 
     @staticmethod
@@ -88,7 +88,7 @@ class _SelectedAttentionFunction(torch.autograd.Function):
         return grad_query, grad_sparse_kv, grad_local_kv, None, grad_sink, None, None, None, None
 
 
-def selected_attention(
+def gather_attn(
     query: torch.Tensor,
     local_kv: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -100,7 +100,7 @@ def selected_attention(
     *,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton implementation of selected attention.
+    """Triton implementation of gather attention.
 
     Args:
         query: (batch, heads, seq_len, head_dim) — queries.
@@ -120,7 +120,7 @@ def selected_attention(
     heads = query.shape[1]
 
     if query.device.type != "cuda":
-        raise ValueError("The Triton selected attention backend requires CUDA tensors.")
+        raise ValueError("The Triton gather attention backend requires CUDA tensors.")
 
     query = query.contiguous()
     kv_indices = kv_indices.contiguous()
@@ -131,7 +131,7 @@ def selected_attention(
         tensor.requires_grad for tensor in (query, local_kv, sparse_kv, attention_sink)
     )
     if requires_grad:
-        return _SelectedAttentionFunction.apply(
+        return _GatherAttnFunction.apply(
             query,
             sparse_kv,
             local_kv,

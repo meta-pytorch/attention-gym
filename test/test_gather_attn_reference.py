@@ -1,14 +1,14 @@
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import Impl, selected_attention
+from attn_gym.sparse.gather_attn import Impl, gather_attn
 
 
-def _run_selected_attention(
+def _run_gather_attn(
     query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids, sliding_window_size
 ):
-    """Helper that calls selected_attention and returns the output."""
-    output = selected_attention(
+    """Helper that calls gather_attn and returns the output."""
+    output = gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -48,13 +48,13 @@ def test_batch_invariance(share_kv, num_topk_blocks):
     sliding_window_size = 3
 
     # Run full batch
-    full_out = _run_selected_attention(
+    full_out = _run_gather_attn(
         query, local_kv, sparse_kv, kv_indices, attention_sink, None, sliding_window_size
     )
 
     # Run each batch element independently and compare
     for i in range(b):
-        single_out = _run_selected_attention(
+        single_out = _run_gather_attn(
             query[i : i + 1],
             local_kv[i : i + 1],
             sparse_kv[i : i + 1],
@@ -77,7 +77,7 @@ def test_batch_invariance(share_kv, num_topk_blocks):
 def test_doc_id_isolation(share_kv, num_topk_blocks):
     """Tokens in different documents must not attend to each other.
 
-    Strategy: pack two documents into one sequence, run selected_attention with
+    Strategy: pack two documents into one sequence, run gather_attn with
     doc_ids, then compare against running each document independently. The
     outputs for each document's tokens should match regardless of what occupies
     the other document's positions.
@@ -118,7 +118,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
         ]
     ).unsqueeze(0)  # shape (1, packed_len)
 
-    out_packed = _run_selected_attention(
+    out_packed = _run_gather_attn(
         query_packed,
         local_kv_packed,
         sparse_kv_packed,
@@ -140,7 +140,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
         1, kv_heads, doc2_len, head_dim, generator=generator
     )
 
-    out_perturbed = _run_selected_attention(
+    out_perturbed = _run_gather_attn(
         query_perturbed,
         local_kv_perturbed,
         sparse_kv_packed,
@@ -169,7 +169,7 @@ def test_doc_id_isolation(share_kv, num_topk_blocks):
         1, kv_heads, doc1_len, head_dim, generator=generator
     )
 
-    out_perturbed2 = _run_selected_attention(
+    out_perturbed2 = _run_gather_attn(
         query_perturbed2,
         local_kv_perturbed2,
         sparse_kv_packed,
@@ -231,7 +231,7 @@ def test_doc_id_matches_separate_execution(share_kv):
     attention_sink = torch.randn(h, generator=generator)
 
     # Run each document independently (no doc_ids needed — single doc)
-    out1 = _run_selected_attention(
+    out1 = _run_gather_attn(
         query1,
         local_kv1,
         sparse_kv1,
@@ -240,7 +240,7 @@ def test_doc_id_matches_separate_execution(share_kv):
         None,
         sliding_window_size,
     )
-    out2 = _run_selected_attention(
+    out2 = _run_gather_attn(
         query2,
         local_kv2,
         sparse_kv2,
@@ -277,7 +277,7 @@ def test_doc_id_matches_separate_execution(share_kv):
         ]
     ).unsqueeze(0)
 
-    out_packed = _run_selected_attention(
+    out_packed = _run_gather_attn(
         query_packed,
         local_kv_packed,
         sparse_kv_packed,

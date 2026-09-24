@@ -8,10 +8,10 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from attn_gym.sparse.selected_attention import Impl, selected_attention
-from attn_gym.sparse.selected_attention import impl as implementations
-from attn_gym.sparse.selected_attention.api import _select_backend
-from attn_gym.sparse.selected_attention.impl import cute
+from attn_gym.sparse.gather_attn import Impl, gather_attn
+from attn_gym.sparse.gather_attn import impl as implementations
+from attn_gym.sparse.gather_attn.api import _select_backend
+from attn_gym.sparse.gather_attn.impl import cute
 
 
 @pytest.fixture(autouse=True)
@@ -24,8 +24,8 @@ def clear_fa4_probe():
 
 @pytest.fixture
 def triton_backend(monkeypatch):
-    backend = SimpleNamespace(selected_attention=Mock())
-    monkeypatch.setitem(sys.modules, "attn_gym.sparse.selected_attention.impl.triton", backend)
+    backend = SimpleNamespace(gather_attn=Mock())
+    monkeypatch.setitem(sys.modules, "attn_gym.sparse.gather_attn.impl.triton", backend)
     monkeypatch.setattr(implementations, "triton", backend, raising=False)
     return backend
 
@@ -56,8 +56,8 @@ def test_default_prefers_cute(cuda_inputs, fa4_available, monkeypatch, heads):
     cuda_inputs["attention_sink"] = cuda_inputs["attention_sink"][:heads]
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(cute, "selected_attention", launch)
-    assert selected_attention(**cuda_inputs) is query
+    monkeypatch.setattr(cute, "gather_attn", launch)
+    assert gather_attn(**cuda_inputs) is query
     launch.assert_called_once()
     fa4_available.assert_called_once_with(True, padded_heads=heads != 128)
 
@@ -99,8 +99,8 @@ def test_auto_fallback_calls_triton(
         cuda_inputs["sliding_window_size"] = 0
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
-    triton_backend.selected_attention = launch
-    assert selected_attention(**cuda_inputs) is query
+    triton_backend.gather_attn = launch
+    assert gather_attn(**cuda_inputs) is query
     launch.assert_called_once()
     if constraint != "missing_fa4":
         fa4_available.assert_not_called()
@@ -112,13 +112,13 @@ def test_auto_fallback_calls_triton(
 def test_explicit_implementation_is_honored(
     cuda_inputs, fa4_available, triton_backend, monkeypatch, impl, kernel_options
 ):
-    from attn_gym.sparse.selected_attention.impl import reference
+    from attn_gym.sparse.gather_attn.impl import reference
 
     module = reference if impl is Impl.REFERENCE else triton_backend
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(module, "selected_attention", launch)
-    assert selected_attention(**cuda_inputs, impl=impl, kernel_options=kernel_options) is query
+    monkeypatch.setattr(module, "gather_attn", launch)
+    assert gather_attn(**cuda_inputs, impl=impl, kernel_options=kernel_options) is query
     launch.assert_called_once()
     fa4_available.assert_not_called()
 
@@ -131,8 +131,8 @@ def test_explicit_cute_bypasses_auto_policy(cuda_inputs, fa4_available, monkeypa
         monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(cute, "selected_attention", launch)
-    assert selected_attention(**cuda_inputs, kernel_options={"backend": "cute"}) is query
+    monkeypatch.setattr(cute, "gather_attn", launch)
+    assert gather_attn(**cuda_inputs, kernel_options={"backend": "cute"}) is query
     launch.assert_called_once()
     fa4_available.assert_not_called()
 
@@ -140,24 +140,22 @@ def test_explicit_cute_bypasses_auto_policy(cuda_inputs, fa4_available, monkeypa
 def test_selected_backend_failure_is_not_retried(
     cuda_inputs, fa4_available, triton_backend, monkeypatch
 ):
-    fallback = triton_backend.selected_attention
-    monkeypatch.setattr(
-        cute, "selected_attention", Mock(side_effect=RuntimeError("kernel failed"))
-    )
+    fallback = triton_backend.gather_attn
+    monkeypatch.setattr(cute, "gather_attn", Mock(side_effect=RuntimeError("kernel failed")))
     with pytest.raises(RuntimeError, match="kernel failed"):
-        selected_attention(**cuda_inputs)
+        gather_attn(**cuda_inputs)
     fallback.assert_not_called()
 
 
 def test_explicit_cute_does_not_fall_back(cuda_inputs, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
     with pytest.raises(ValueError, match="requires SM100"):
-        selected_attention(**cuda_inputs, kernel_options={"backend": "cute"})
+        gather_attn(**cuda_inputs, kernel_options={"backend": "cute"})
 
 
 def test_invalid_inputs_are_not_hidden(cuda_inputs, fa4_available):
     with pytest.raises(ValueError, match="sliding_window_size must be non-negative"):
-        selected_attention(**cuda_inputs, sliding_window_size=-1)
+        gather_attn(**cuda_inputs, sliding_window_size=-1)
     fa4_available.assert_not_called()
 
 

@@ -1,4 +1,4 @@
-"""Forward kernels and launcher for Triton selected attention."""
+"""Forward kernels and launcher for Triton gather attention."""
 
 import torch
 import triton
@@ -18,7 +18,7 @@ from .primitives import (
 
 
 @triton.jit
-def _selected_attention_fwd(
+def _gather_attn_fwd(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
@@ -168,7 +168,7 @@ def prune_shared_forward_configs(configs, _named_args, D, **_):
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_fwd_shared(
+def _gather_attn_fwd_shared(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
@@ -308,7 +308,7 @@ def _selected_attention_fwd_shared(
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_fwd_tma(
+def _gather_attn_fwd_tma(
     query_desc,
     sparse_kv_ptr,
     local_desc,
@@ -446,7 +446,7 @@ def _launch_forward(
             else min(32, triton.next_power_of_2(heads))
         )
         block_k = max(16, min(64, triton.next_power_of_2(topk)))
-        _selected_attention_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+        _gather_attn_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             local_kv,
@@ -488,7 +488,7 @@ def _launch_forward(
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
         local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
-        _selected_attention_fwd_tma[grid](
+        _gather_attn_fwd_tma[grid](
             query_desc,
             sparse_kv,
             local_desc,
@@ -515,7 +515,7 @@ def _launch_forward(
             BLOCK_D=block_d,
         )
     else:
-        _selected_attention_fwd[grid](
+        _gather_attn_fwd[grid](
             query,
             sparse_kv,
             local_kv,

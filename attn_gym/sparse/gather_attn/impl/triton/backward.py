@@ -1,4 +1,4 @@
-"""Backward kernels and launcher for Triton selected attention."""
+"""Backward kernels and launcher for Triton gather attention."""
 
 import torch
 import triton
@@ -16,14 +16,14 @@ from .primitives import (
     store_bhsd,
 )
 from .shared_backward import (
-    _selected_attention_bwd_dq_shared,
-    _selected_attention_bwd_dsparse_kv_shared,
-    _selected_attention_bwd_dsparse_kv_shared_atomic,
+    _gather_attn_bwd_dq_shared,
+    _gather_attn_bwd_dsparse_kv_shared,
+    _gather_attn_bwd_dsparse_kv_shared_atomic,
 )
 
 
 @triton.jit
-def _selected_attention_bwd_dq(
+def _gather_attn_bwd_dq(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
@@ -166,7 +166,7 @@ def _selected_attention_bwd_dq(
 
 
 @triton.jit
-def _selected_attention_bwd_dlocal_kv(
+def _gather_attn_bwd_dlocal_kv(
     query_ptr,
     local_kv_ptr,
     doc_ids_ptr,
@@ -282,7 +282,7 @@ def _selected_attention_bwd_dlocal_kv(
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_bwd_dlocal_kv_tma(
+def _gather_attn_bwd_dlocal_kv_tma(
     query_desc,
     local_desc,
     doc_ids_ptr,
@@ -390,7 +390,7 @@ def _selected_attention_bwd_dlocal_kv_tma(
     cache_results=True,
 )
 @triton.jit
-def _selected_attention_bwd_dsparse_kv(
+def _gather_attn_bwd_dsparse_kv(
     query_ptr,
     sparse_kv_ptr,
     selected_queries_ptr,
@@ -551,7 +551,7 @@ def _launch_backward(
     share_kv: bool,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Launch backward kernels for selected attention."""
+    """Launch backward kernels for gather attention."""
     batch, heads, seq_len, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     topk = kv_indices.shape[-1]
@@ -583,7 +583,7 @@ def _launch_backward(
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32
         )
-        _selected_attention_bwd_dq_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+        _gather_attn_bwd_dq_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             local_kv,
@@ -627,7 +627,7 @@ def _launch_backward(
             device=query.device,
             dtype=torch.float32,
         )
-        _selected_attention_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
+        _gather_attn_bwd_dq[(triton.cdiv(seq_len, block_m), batch * heads)](
             query,
             sparse_kv,
             local_kv,
@@ -669,7 +669,7 @@ def _launch_backward(
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
         grad_output_desc = TensorDescriptor.from_tensor(grad_output, [1, 1, block_m, block_d])
         grad_local_desc = TensorDescriptor.from_tensor(grad_local_kv, [1, 1, block_n, block_d])
-        _selected_attention_bwd_dlocal_kv_tma[local_grid](
+        _gather_attn_bwd_dlocal_kv_tma[local_grid](
             query_desc,
             local_desc,
             doc_ids,
@@ -691,7 +691,7 @@ def _launch_backward(
             BLOCK_D=block_d,
         )
     else:
-        _selected_attention_bwd_dlocal_kv[local_grid](
+        _gather_attn_bwd_dlocal_kv[local_grid](
             query,
             local_kv,
             doc_ids,
@@ -742,7 +742,7 @@ def _launch_backward(
             batch,
             triton.cdiv(heads, meta["BLOCK_H"]) * triton.cdiv(topk, meta["BLOCK_K"]),
         )
-        _selected_attention_bwd_dsparse_kv_shared_atomic[sparse_grid](
+        _gather_attn_bwd_dsparse_kv_shared_atomic[sparse_grid](
             query,
             sparse_kv,
             kv_indices,
@@ -774,7 +774,7 @@ def _launch_backward(
                 device=sparse_kv.device,
                 dtype=sparse_kv.dtype,
             )
-            sparse_kernel = _selected_attention_bwd_dsparse_kv_shared
+            sparse_kernel = _gather_attn_bwd_dsparse_kv_shared
             sparse_grid = lambda meta: (
                 sparse_seq_len,
                 batch,
@@ -786,7 +786,7 @@ def _launch_backward(
                 device=sparse_kv.device,
                 dtype=sparse_kv.dtype,
             )
-            sparse_kernel = _selected_attention_bwd_dsparse_kv
+            sparse_kernel = _gather_attn_bwd_dsparse_kv
             sparse_grid = (sparse_seq_len, batch * heads)
 
         sparse_kernel[sparse_grid](

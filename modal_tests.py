@@ -217,7 +217,7 @@ def run_pytest() -> tuple[int, str]:
     """Check FA4 sink support before running the ordinary repository suite."""
     with persistent_compile_cache("main"):
         return_code, preflight_summary = execute_pytest(
-            ["test/test_selected_attention_cute.py::test_cute_dependency_smoke[forced-sink]"],
+            ["test/test_gather_attn_cute.py::test_cute_dependency_smoke[forced-sink]"],
             Path("/tmp/pytest-preflight.xml"),
             "B200 FA4 dependency preflight",
             workers=0,

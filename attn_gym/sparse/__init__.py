@@ -1,6 +1,6 @@
 """Sparse attention primitives."""
 
+from .gather_attn import AuxRequest, GatherAttnAux, Impl, gather_attn
 from .indexer import lightning_indexer
-from .selected_attention import AuxRequest, Impl, SelectedAttentionAux, selected_attention
 
-__all__ = ["AuxRequest", "Impl", "SelectedAttentionAux", "lightning_indexer", "selected_attention"]
+__all__ = ["AuxRequest", "GatherAttnAux", "Impl", "gather_attn", "lightning_indexer"]

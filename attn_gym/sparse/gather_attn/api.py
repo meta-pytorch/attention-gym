@@ -11,7 +11,7 @@ from attn_gym.types import Impl, resolve_impl
 
 @dataclass(frozen=True, slots=True)
 class AuxRequest:
-    """Specifies which auxiliary outputs to return from selected_attention.
+    """Specifies which auxiliary outputs to return from gather_attn.
 
     Attributes:
         lse: If True, include the log-sum-exp tensor in the returned auxiliary data.
@@ -21,8 +21,8 @@ class AuxRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class SelectedAttentionAux:
-    """Auxiliary outputs returned by selected_attention when requested.
+class GatherAttnAux:
+    """Auxiliary outputs returned by gather_attn when requested.
 
     Attributes:
         lse: Log-sum-exp values with shape (batch_size, num_heads, sequence_length),
@@ -92,7 +92,7 @@ def _validate_inputs(
     if min(batch, heads, sequence_length, head_dim) <= 0:
         raise ValueError("query dimensions must all be positive.")
     if not query.is_floating_point():
-        raise TypeError("Selected attention inputs must have a floating-point dtype.")
+        raise TypeError("Gather attention inputs must have a floating-point dtype.")
 
     if sliding_window_size < 0:
         raise ValueError("sliding_window_size must be non-negative.")
@@ -192,7 +192,7 @@ def _select_backend(
 
 
 @overload
-def selected_attention(
+def gather_attn(
     query: Tensor,
     local_kv: Tensor,
     sparse_kv: Tensor,
@@ -209,7 +209,7 @@ def selected_attention(
 
 
 @overload
-def selected_attention(
+def gather_attn(
     query: Tensor,
     local_kv: Tensor,
     sparse_kv: Tensor,
@@ -222,10 +222,10 @@ def selected_attention(
     kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest,
-) -> tuple[Tensor, SelectedAttentionAux]: ...
+) -> tuple[Tensor, GatherAttnAux]: ...
 
 
-def selected_attention(
+def gather_attn(
     query: Tensor,
     local_kv: Tensor,
     sparse_kv: Tensor,
@@ -238,9 +238,9 @@ def selected_attention(
     kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest | None = None,
-) -> Tensor | tuple[Tensor, SelectedAttentionAux]:
+) -> Tensor | tuple[Tensor, GatherAttnAux]:
     """
-    Performs selected attention.
+    Performs gather attention.
         Each query attends to the previous sliding_window_size elements in the local_kv tensor
         as well as the positions in sparse_kv pointed to by kv_indices.
         Only one softmax is applied, covering both the sliding window and selected sparse positions.
@@ -292,13 +292,13 @@ def selected_attention(
             Attention sink logits are not scaled.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
-            instance, return a tuple of (output, SelectedAttentionAux) containing the
+            instance, return a tuple of (output, GatherAttnAux) containing the
             requested auxiliary outputs (e.g. LSE when return_aux.lse is True).
 
     Returns:
         If return_aux is None: output tensor with shape
             (batch_size, num_heads, sequence_length, head_dim).
-        If return_aux is an AuxRequest: tuple of (output, SelectedAttentionAux) where
+        If return_aux is an AuxRequest: tuple of (output, GatherAttnAux) where
             output has shape (batch_size, num_heads, sequence_length, head_dim) and
             aux.lse has shape (batch_size, num_heads, sequence_length) when requested.
     """
@@ -306,7 +306,7 @@ def selected_attention(
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
     if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
-        raise ValueError(f"unsupported selected_attention kernel options: {kernel_options}")
+        raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
 
     share_kv = isinstance(sparse_kv, Tensor) and sparse_kv.ndim == 4 and sparse_kv.shape[1] == 1
     _validate_inputs(
@@ -329,9 +329,7 @@ def selected_attention(
         from .impl import reference as implementation
     else:
         if query.device.type != "cuda":
-            raise ValueError(
-                "fused selected_attention requires CUDA tensors; use impl='reference'"
-            )
+            raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if backend is None:
             backend = _select_backend(
                 query,
@@ -348,7 +346,7 @@ def selected_attention(
         attention_sink = torch.full(
             (query.shape[1],), float("-inf"), dtype=query.dtype, device=query.device
         )
-    output, lse = implementation.selected_attention(
+    output, lse = implementation.gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -363,4 +361,4 @@ def selected_attention(
     if return_aux is None:
         return output
 
-    return output, SelectedAttentionAux(lse=lse if return_aux.lse else None)
+    return output, GatherAttnAux(lse=lse if return_aux.lse else None)

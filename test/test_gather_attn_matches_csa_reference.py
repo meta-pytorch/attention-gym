@@ -1,6 +1,6 @@
-"""Verify that composing CSA from selected_attention matches the standalone reference.
+"""Verify that composing CSA from gather_attn matches the standalone reference.
 
-The composition path (CSA built from selected_attention) is imported directly
+The composition path (CSA built from gather_attn) is imported directly
 from examples/sparse/compressed_sparse_attention.py. The standalone reference CSA is
 defined inline here for comparison.
 """
@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
+from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
 
 ATOL = 1e-8
 RTOL = 1e-5
@@ -25,11 +25,11 @@ INDEXER_LOSS_DEVICES = [
     ),
 ]
 
-pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
 
 
 # ---------------------------------------------------------------------------
-# Load the CSA example module (composition path via selected_attention).
+# Load the CSA example module (composition path via gather_attn).
 # ---------------------------------------------------------------------------
 
 
@@ -168,7 +168,7 @@ def make_block_mask(query_length, num_blocks, compression_rate, device, dtype):
 
 
 # ---------------------------------------------------------------------------
-# Standalone CSA reference (no dependency on selected_attention).
+# Standalone CSA reference (no dependency on gather_attn).
 # ---------------------------------------------------------------------------
 
 
@@ -367,7 +367,7 @@ def _make_inputs(
 
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk_blocks", [0, 1])
-def test_selected_attention_matches_csa_reference_fp64(share_kv, num_topk_blocks):
+def test_gather_attn_matches_csa_reference_fp64(share_kv, num_topk_blocks):
     inputs = _make_inputs(
         share_kv,
         num_topk_blocks,
@@ -386,7 +386,7 @@ def test_selected_attention_matches_csa_reference_fp64(share_kv, num_topk_blocks
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selected_attention_matches_csa_reference_cuda_fp64():
+def test_gather_attn_matches_csa_reference_cuda_fp64():
     inputs = _make_inputs(
         True,
         1,
@@ -417,11 +417,11 @@ def _indexer_loss_oracle(
 ) -> torch.Tensor:
     query = main_query.detach().to(torch.float32)
     keys = selected_compressed_kv.detach().to(torch.float32)
-    selected_attention_logits = torch.matmul(query.unsqueeze(-2), keys.transpose(-2, -1)).squeeze(
+    gather_attn_logits = torch.matmul(query.unsqueeze(-2), keys.transpose(-2, -1)).squeeze(
         -2
     ) / math.sqrt(query.shape[-1])
     teacher_mass = torch.exp(
-        selected_attention_logits - attention_lse.detach().to(torch.float32).unsqueeze(-1)
+        gather_attn_logits - attention_lse.detach().to(torch.float32).unsqueeze(-1)
     ).sum(dim=1)
     teacher_mass = torch.where(selected_is_valid, teacher_mass, 0.0)
     teacher_probs = teacher_mass / teacher_mass.sum(dim=-1, keepdim=True).clamp_min(
@@ -540,7 +540,7 @@ def test_indexer_loss_fullgraph_forward_backward(device):
 
 @pytest.mark.parametrize("device", INDEXER_LOSS_DEVICES)
 def test_end_to_end_indexer_loss(device):
-    """Run compress → index → selected_attention → indexer_loss end-to-end.
+    """Run compress → index → gather_attn → indexer_loss end-to-end.
 
     Uses share_kv=True with the standard _make_inputs config (num_heads=2,
     per-head compression biases).  compression_rate=2 with sequence_length=5
@@ -637,8 +637,8 @@ def test_end_to_end_indexer_loss(device):
 
     topk_blocks = torch.topk(scores, k=min(num_topk_blocks, num_total_blocks), dim=-1).indices
 
-    # selected_attention with causal blocks → (output, aux, selected_is_valid)
-    _attn_output, aux, selected_is_valid = csa_example._selected_attention_with_causal_blocks(
+    # gather_attn with causal blocks → (output, aux, selected_is_valid)
+    _attn_output, aux, selected_is_valid = csa_example._gather_attn_with_causal_blocks(
         Q_roped,
         KV,
         compressed_kv,
@@ -855,7 +855,7 @@ def test_lse_and_selected_key_probabilities_match_dense_qk_softmax_oracle(
 
     with torch.inference_mode():
         expected_lse, expected_selected_probabilities = _dense_qk_softmax_oracle(**inputs)
-        _, aux = selected_attention(
+        _, aux = gather_attn(
             **inputs,
             impl=impl,
             kernel_options=kernel_options,
