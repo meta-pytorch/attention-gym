@@ -227,8 +227,12 @@ class DeltaRuleAttention(nn.Module):
                 f"the fused backend requires lower_bound >= "
                 f"{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, got {lower_bound}"
             )
-        if backend == "fused" and head_dim != 128:
-            raise ValueError("the fused backend requires head_dim=128")
+        if backend == "fused" and (
+            (variant == "kda" and head_dim != 128)
+            or (variant == "gdn" and head_dim not in (64, 128))
+        ):
+            requirement = "128" if variant == "kda" else "64 or 128"
+            raise ValueError(f"the fused {variant} backend requires head_dim={requirement}")
         if backend == "reference" and kernel_options:
             raise ValueError("kernel_options apply only to backend='fused'")
 

@@ -99,11 +99,14 @@ def test_example_writes_fastmath_and_kernel_options_through_to_the_core(monkeypa
         assert seen["core"]["fastmath"] is True
 
 
-@pytest.mark.parametrize("variant", ["kda", "gdn"])
-def test_example_fused_backend_matches_reference_module(variant):
+@pytest.mark.parametrize(
+    ("variant", "head_dim"),
+    [("kda", 128), ("gdn", 128), ("gdn", 64)],
+)
+def test_example_fused_backend_matches_reference_module(variant, head_dim):
     """Same weights, dense input: the fused bf16 module must track the fp32 reference recipe."""
     torch.manual_seed(5)
-    options = {"hidden_size": 32, "num_heads": 2, "head_dim": 128, "variant": variant}
+    options = {"hidden_size": 32, "num_heads": 2, "head_dim": head_dim, "variant": variant}
     reference = DeltaRuleAttention(**options, backend="reference", device="cuda")
     with torch.no_grad():  # zero-initialized gate parameters would make the gate a constant
         reference.A_log.uniform_(-1.0, 1.0)

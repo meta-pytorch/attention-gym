@@ -92,8 +92,8 @@ def _assert_persistent(inputs, metadata) -> None:
 @pytest.mark.parametrize("scalar_gate", [False, True], ids=["kda", "gdn"])
 def test_persistent_reuses_backend_cache_across_independent_t_and_n(scalar_gate):
     kernels = (
-        chunk_delta_h.chunk_delta_h_kernel_k128_wsp,
-        chunk_delta_h.chunk_delta_h_kernel_k128_persistent,
+        chunk_delta_h.chunk_delta_h_kernel,
+        chunk_delta_h.chunk_delta_h_persistent_kernel,
     )
     for kernel in kernels:
         _cache(kernel).clear()

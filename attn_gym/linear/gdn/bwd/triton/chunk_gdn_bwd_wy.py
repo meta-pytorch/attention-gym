@@ -23,6 +23,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
+from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
 @triton.jit
@@ -57,6 +58,19 @@ def _load_last_gate(gate, valid_tokens, stride, BT: tl.constexpr):
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["T", "H", "HK", "K", "V", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, V, **_: [
+            config for config in configs if config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit
 def chunk_gdn_bwd_dqkwg_kernel(
     q,
@@ -167,8 +181,10 @@ def chunk_gdn_bwd_dqkwg_kernel(
         H,
         BT,
     ).to(tl.float32)
-    b_q = tl.load(q + q_offset, mask=token_mask[:, None], other=0.0)
-    b_k = tl.load(k + k_offset, mask=token_mask[:, None], other=0.0)
+    key_mask = keys < K
+    tile_mask = token_mask[:, None] & key_mask[None, :]
+    b_q = tl.load(q + q_offset, mask=tile_mask, other=0.0)
+    b_k = tl.load(k + k_offset, mask=tile_mask, other=0.0)
 
     b_dq *= tl.exp2(b_gate)[:, None] * SCALE
     b_dk *= tl.where(token_mask, tl.exp2(b_gate_last - b_gate), 0.0)[:, None]
@@ -187,12 +203,26 @@ def chunk_gdn_bwd_dqkwg_kernel(
 
     d_q_offset = ptr_offset((token[:, None], head, keys[None, :]), (H * K, K, 1))
     d_gate_offset = ptr_offset((key_tile, token, head), (T * H, H, 1))
-    tl.store(d_q + d_q_offset, b_dq, mask=token_mask[:, None])
-    tl.store(d_k + d_q_offset, b_dk, mask=token_mask[:, None])
-    tl.store(d_w + d_q_offset, b_dw, mask=token_mask[:, None])
+    tl.store(d_q + d_q_offset, b_dq, mask=tile_mask)
+    tl.store(d_k + d_q_offset, b_dk, mask=tile_mask)
+    tl.store(d_w + d_q_offset, b_dw, mask=tile_mask)
     tl.store(d_gate_direct + d_gate_offset, b_dg, mask=token_mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["H", "HK", "K", "V", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit
 def chunk_gdn_bwd_wy_kernel(
     k,
@@ -346,6 +376,7 @@ def chunk_gdn_bwd_gate_cumsum_kernel(
     T,
     num_sequences,
     H: tl.constexpr,
+    KEY_TILES: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -368,12 +399,13 @@ def chunk_gdn_bwd_gate_cumsum_kernel(
     token_mask = rows < valid_tokens
     scalar_offsets = ptr_offset((token, head), (H, 1))
     direct_stride = T * H
-    b_dgate = tl.load(d_gate_direct + scalar_offsets, mask=token_mask, other=0.0)
-    b_dgate += tl.load(
-        d_gate_direct + direct_stride + scalar_offsets,
-        mask=token_mask,
-        other=0.0,
-    )
+    b_dgate = tl.zeros((BT,), dtype=tl.float32)
+    for key_tile in range(KEY_TILES):
+        b_dgate += tl.load(
+            d_gate_direct + key_tile * direct_stride + scalar_offsets,
+            mask=token_mask,
+            other=0.0,
+        )
     b_dgate += tl.load(d_gate_wy + scalar_offsets, mask=token_mask, other=0.0)
     b_dgate = tl.where(token_mask, b_dgate, 0.0)
     b_dgate = tl.cumsum(b_dgate, axis=0, reverse=True)
@@ -406,11 +438,12 @@ def chunk_gdn_bwd_wy(
     callers own masking of inactive capacity.
     """
     bt = 64
-    key_dim = value_dim = 128
-    block_key = block_value = 64
+    block_key = 64
 
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [B, T, H, D]")
+    key_dim = q.shape[-1]
+    value_dim = v.shape[-1]
     batch, tokens, key_heads, qk_dim = q.shape
     value_heads = v.shape[2]
     if (
@@ -425,8 +458,9 @@ def chunk_gdn_bwd_wy(
         or cumulative_gate.shape != (batch, tokens, value_heads)
         or beta.shape != (batch, tokens, value_heads)
         or inverse.shape != (batch, tokens, value_heads, bt)
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
     ):
-        raise ValueError("scalar GDN requires B=1, BT=64, and K=V=128")
+        raise ValueError("scalar GDN requires B=1, BT=64, and K=V in {64, 128}")
     if value_heads % key_heads:
         raise ValueError("the number of value heads must be divisible by the number of q/k heads")
     if not all(
@@ -465,6 +499,7 @@ def chunk_gdn_bwd_wy(
         raise ValueError("h and dh must have layout [chunk, H, K, V] (optionally prefixed by B=1)")
 
     groups = value_heads // key_heads
+    key_tiles = triton.cdiv(key_dim, block_key)
     output_factory = torch.zeros if metadata is not None else torch.empty
     output_kwargs = {"device": q.device}
     d_q_expanded = output_factory(
@@ -479,7 +514,7 @@ def chunk_gdn_bwd_wy(
     d_w = output_factory(w.shape, dtype=w.dtype, **output_kwargs)
     d_value = output_factory(v.shape, dtype=v.dtype, **output_kwargs)
     d_gate_direct = output_factory(
-        (key_dim // block_key, batch, tokens, value_heads),
+        (key_tiles, batch, tokens, value_heads),
         dtype=cumulative_gate.dtype,
         **output_kwargs,
     )
@@ -498,7 +533,7 @@ def chunk_gdn_bwd_wy(
     )
 
     if chunk_slots:
-        direct_grid = (key_dim // block_key, chunk_slots, value_heads)
+        direct_grid = (key_tiles, chunk_slots, value_heads)
         chunk_gdn_bwd_dqkwg_kernel[direct_grid](
             q,
             k,
@@ -525,11 +560,8 @@ def chunk_gdn_bwd_wy(
             V=value_dim,
             BT=bt,
             BK=block_key,
-            BV=block_value,
             SCALE=scale,
             IS_VARLEN=metadata is not None,
-            num_warps=4,
-            num_stages=2,
         )
         chunk_gdn_bwd_wy_kernel[(chunk_slots, value_heads)](
             k,
@@ -554,11 +586,7 @@ def chunk_gdn_bwd_wy(
             K=key_dim,
             V=value_dim,
             BT=bt,
-            BK=block_key,
-            BV=block_value,
             IS_VARLEN=metadata is not None,
-            num_warps=4,
-            num_stages=2,
         )
         chunk_gdn_bwd_gate_cumsum_kernel[(chunk_slots, value_heads)](
             d_gate_direct,
@@ -569,6 +597,7 @@ def chunk_gdn_bwd_wy(
             tokens,
             0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
             H=value_heads,
+            KEY_TILES=key_tiles,
             BT=bt,
             IS_VARLEN=metadata is not None,
             num_warps=2,

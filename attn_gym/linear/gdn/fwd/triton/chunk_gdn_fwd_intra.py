@@ -333,6 +333,22 @@ def chunk_gdn_fwd_kkt_solve_kernel(
         "STORE_QG": lambda args: args["q"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
+    ],
+    key=["T", "H", "HV", "K", "V", "IS_VARLEN", "STORE_QG"],
+    prune_configs_by={
+        "early_config_prune": lambda configs, _named_args, K, V, **_: [
+            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
+        ]
+    },
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def scalar_recompute_w_u_kg_kernel(
     q,
@@ -456,12 +472,11 @@ def chunk_gdn_fwd_intra_dense(
     if (
         batch != 1
         or tokens % 64
-        or key_dim != 128
-        or value_dim != 128
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
         or v.shape[:2] != k.shape[:2]
         or value_heads % key_heads
     ):
-        raise ValueError("dense fused chunk GDN requires BT64, K=V=128, and H % HK == 0")
+        raise ValueError("dense fused chunk GDN requires BT64, K=V in {64, 128}, and H % HK == 0")
     if (
         cumulative_gate.shape != (batch, tokens, value_heads)
         or beta.shape != cumulative_gate.shape
@@ -512,10 +527,6 @@ def chunk_gdn_fwd_intra_dense(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
-        num_warps=4,
-        num_stages=4,
     )
     return w, u, restored_k, inverse
 
@@ -533,12 +544,11 @@ def chunk_gdn_fwd_intra_packed(
     value_heads, value_dim = v.shape[2:]
     if (
         batch != 1
-        or key_dim != 128
-        or value_dim != 128
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
         or v.shape[:2] != k.shape[:2]
         or value_heads % key_heads
     ):
-        raise ValueError("packed fused chunk GDN requires B=1, K=V=128, and H % HK == 0")
+        raise ValueError("packed fused chunk GDN requires B=1, K=V in {64, 128}, and H % HK == 0")
     if (
         cumulative_gate.shape != (batch, tokens, value_heads)
         or beta.shape != cumulative_gate.shape
@@ -591,10 +601,6 @@ def chunk_gdn_fwd_intra_packed(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
-        num_warps=4,
-        num_stages=4,
     )
     return w, u, restored_k, inverse
 
@@ -615,9 +621,9 @@ def chunk_gdn_recompute_w_u_qg_kg(
         k.shape != q.shape
         or v.shape[:2] != q.shape[:2]
         or value_heads % key_heads
-        or (key_dim, value_dim) != (128, 128)
+        or (key_dim, value_dim) not in ((64, 64), (128, 128))
     ):
-        raise ValueError("fused chunk GDN recompute requires K=V=128 and H % HK == 0")
+        raise ValueError("fused chunk GDN recompute requires K=V in {64, 128} and H % HK == 0")
     if metadata is not None:
         metadata.validate_chunk_size(64)
         if batch != 1:
@@ -656,10 +662,6 @@ def chunk_gdn_recompute_w_u_qg_kg(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK=64,
-        BV=64,
-        num_warps=4,
-        num_stages=4,
     )
     return w, u, qg, restored_k
 
