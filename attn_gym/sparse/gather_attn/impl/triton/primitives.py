@@ -76,9 +76,18 @@ def prune_wide_backward_configs(configs, _named_args, D, **_):
 
 
 @triton.jit
+def offset_strides(strides, WIDE: tl.constexpr):
+    """Select address width before multiplying runtime strides and indices."""
+    result = ()
+    for axis in tl.static_range(len(strides)):
+        result += (tl.cast(strides[axis], tl.int64 if WIDE else tl.int32),)
+    return result
+
+
+@triton.jit
 def load_bhsd(
     tensor_ptr,
-    strides: tl.constexpr,
+    strides,
     batch,
     head,
     positions,
@@ -100,12 +109,13 @@ def load_bhsd(
 @triton.jit
 def load_document_bounds(
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     positions,
     num_documents,
-    sequence_length: tl.constexpr,
+    sequence_length,
     WIDE: tl.constexpr,
 ):
-    """Find packed bounds, treating inactive capacity as one isolated document."""
+    """Find query and candidate bounds; inactive queries have no sparse candidates."""
     document = _document_ids(cu_seqlens_ptr, positions, num_documents, WIDE)
     offset = document.to(tl.int64) if WIDE else document
     # The right-sided search skips empty documents and returns N for tail/padded positions.
@@ -115,14 +125,16 @@ def load_document_bounds(
         mask=document < num_documents,
         other=sequence_length,
     )
-    return start, end
+    candidate_start = tl.load(cu_seqlens_k_ptr + offset)
+    candidate_end = tl.load(cu_seqlens_k_ptr + tl.minimum(offset + 1, num_documents))
+    return start, end, candidate_start, candidate_end
 
 
 @triton.jit
 def store_bhsd(
     tensor_ptr,
     value,
-    strides: tl.constexpr,
+    strides,
     batch,
     head,
     positions,

@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, requires_int64_offsets
+from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from .primitives import (
     TileConfig,
@@ -13,6 +13,7 @@ from .primitives import (
     causal_window_mask,
     load_bhsd,
     load_document_bounds,
+    offset_strides,
     prune_wide_backward_configs,
     select_tiles,
     store_bhsd,
@@ -31,22 +32,23 @@ def _gather_attn_bwd_dq(
     local_kv_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
     attention_sink_ptr,
     grad_query_ptr,
     grad_sink_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    LOCAL_KV_STRIDES: tl.constexpr,
-    KV_INDICES_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    LOCAL_KV_STRIDES,
+    KV_INDICES_STRIDES,
     num_documents,
-    LSE_STRIDES: tl.constexpr,
+    LSE_STRIDES,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
+    SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
@@ -58,8 +60,19 @@ def _gather_attn_bwd_dq(
     BLOCK_D: tl.constexpr,
 ):
     """Accumulate query and sink gradients over both attention branches."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+
     query_block = tl.program_id(0)
     batch_head = tl.program_id(1)
+    if WIDE:
+        query_block = query_block.to(tl.int64)
+        batch_head = batch_head.to(tl.int64)
     head = batch_head % H
     batch = batch_head // H
 
@@ -83,8 +96,12 @@ def _gather_attn_bwd_dq(
     delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_query = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
-        query_start, _ = load_document_bounds(cu_seqlens_ptr, offsets_m, num_documents, S, WIDE)
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+        )
 
     for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
@@ -95,7 +112,9 @@ def _gather_attn_bwd_dq(
             mask=query_mask,
             other=0,
         )
-        valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+        valid = query_mask & (selected_idx >= 0) & (selected_idx < candidate_end - candidate_start)
+        # Mask local coordinates before adding the document base, including int64 sentinels.
+        selected_idx = tl.where(valid, selected_idx, 0) + candidate_start
         sparse_value = load_bhsd(
             sparse_kv_ptr,
             SPARSE_KV_STRIDES,
@@ -172,17 +191,18 @@ def _gather_attn_bwd_dlocal_kv(
     query_ptr,
     local_kv_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
     grad_local_kv_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    LOCAL_KV_STRIDES: tl.constexpr,
-    GRAD_LOCAL_KV_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    LOCAL_KV_STRIDES,
+    GRAD_LOCAL_KV_STRIDES,
     num_documents,
-    LSE_STRIDES: tl.constexpr,
+    LSE_STRIDES,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
@@ -194,8 +214,17 @@ def _gather_attn_bwd_dlocal_kv(
     BLOCK_D: tl.constexpr,
 ):
     """Backward for dKV (local sliding window)."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
+    GRAD_LOCAL_KV_STRIDES = offset_strides(GRAD_LOCAL_KV_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
+    if WIDE:
+        key_block = key_block.to(tl.int64)
+        batch_head = batch_head.to(tl.int64)
     head = batch_head % H
     batch = batch_head // H
 
@@ -215,7 +244,9 @@ def _gather_attn_bwd_dlocal_kv(
     )
 
     if HAS_CU_SEQLENS:
-        _, key_end = load_document_bounds(cu_seqlens_ptr, offsets_n, num_documents, S, WIDE)
+        _, key_end, _, _ = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, WIDE
+        )
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
     first_query = key_block * BLOCK_N
@@ -280,7 +311,7 @@ def _gather_attn_bwd_dlocal_kv(
         for num_warps in (4, 8)
         for num_stages in (1, 3)
     ],
-    key=["H", "S", "D", "WINDOW", "HAS_CU_SEQLENS"],
+    key=["H", "D", "WINDOW", "HAS_CU_SEQLENS"],
     cache_results=True,
 )
 @triton.jit
@@ -288,14 +319,15 @@ def _gather_attn_bwd_dlocal_kv_tma(
     query_desc,
     local_desc,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_desc,
     grad_output_desc,
     lse_ptr,
     grad_local_desc,
     num_documents,
-    LSE_STRIDES: tl.constexpr,
+    LSE_STRIDES,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
@@ -307,6 +339,9 @@ def _gather_attn_bwd_dlocal_kv_tma(
     BLOCK_D: tl.constexpr,
 ):
     """TMA backward for local-KV gradients."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
     head = batch_head % H
@@ -320,7 +355,9 @@ def _gather_attn_bwd_dlocal_kv_tma(
     )
 
     if HAS_CU_SEQLENS:
-        _, key_end = load_document_bounds(cu_seqlens_ptr, offsets_n, num_documents, S, WIDE)
+        _, key_end, _, _ = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, WIDE
+        )
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
     first_query = key_block * BLOCK_N
@@ -387,7 +424,7 @@ def _gather_attn_bwd_dlocal_kv_tma(
         for num_warps in (4, 8)
         for num_stages in (1, 3)
     ],
-    key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    key=["H", "D", "TOPK"],
     prune_configs_by={"early_config_prune": prune_wide_backward_configs},
     cache_results=True,
 )
@@ -401,22 +438,31 @@ def _gather_attn_bwd_dsparse_kv(
     grad_output_ptr,
     lse_ptr,
     grad_sparse_kv_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    SELECTED_QUERIES_STRIDES: tl.constexpr,
-    BLOCK_OFFSETS_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    GRAD_SPARSE_KV_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    SELECTED_QUERIES_STRIDES,
+    BLOCK_OFFSETS_STRIDES,
+    LSE_STRIDES,
+    GRAD_SPARSE_KV_STRIDES,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
+    SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Compute sparse-KV gradients from an inverted index of selecting queries."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
+    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, WIDE)
+    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+
     sparse_index = tl.program_id(0)
     batch_head = tl.program_id(1)
     head = batch_head % H
@@ -514,25 +560,84 @@ def _gather_attn_bwd_dsparse_kv(
     )
 
 
+@triton.jit
+def _index_query_map_keys(
+    kv_indices_ptr,
+    sort_keys_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
+    num_documents,
+    stride_b,
+    stride_s,
+    stride_k,
+    S,
+    TOPK: tl.constexpr,
+    WIDE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Form packed global sort keys without changing attention's document-local indices."""
+    strides = offset_strides((stride_b, stride_s, stride_k), WIDE)
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    if WIDE:
+        row = row.to(tl.int64)
+        tile = tile.to(tl.int64)
+    batch = row // S
+    query_position = row % S
+    slots = tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    _, _, candidate_start, candidate_end = load_document_bounds(
+        cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
+    )
+    indices = tl.load(
+        kv_indices_ptr + ptr_offset((batch, query_position, slots), strides),
+        mask=slots < TOPK,
+        other=-1,
+    )
+    valid = (indices >= 0) & (indices < candidate_end - candidate_start)
+    indices = tl.where(valid, indices, 0) + candidate_start
+    tl.store(sort_keys_ptr + row * TOPK + slots, tl.where(valid, indices, -1), slots < TOPK)
+
+
 def _build_index_query_map(
     kv_indices: torch.Tensor,
     sparse_seq_len: int,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Invert query-major indices into block-major query lists (CSR format)."""
-    batch, _seq_len, topk = kv_indices.shape
-    if topk == 0:
+    """Invert raw query-major selections into global block-major query lists (CSR format)."""
+    batch, seq_len, topk = kv_indices.shape
+    if seq_len == 0 or topk == 0:
         selected_queries = torch.empty(batch, 0, device=kv_indices.device, dtype=torch.int32)
         block_offsets = torch.zeros(
             batch, sparse_seq_len + 1, device=kv_indices.device, dtype=torch.int32
         )
         return selected_queries, block_offsets
 
-    sorted_indices, sorted_entries = torch.sort(kv_indices.flatten(1), dim=-1)
+    if cu_seqlens is not None:
+        # This workspace belongs only to the reverse map, not the attention inputs or tape.
+        sort_keys = kv_indices.new_empty((batch, seq_len * topk))
+        _index_query_map_keys[(batch * seq_len, triton.cdiv(topk, 256))](
+            kv_indices,
+            sort_keys,
+            cu_seqlens,
+            cu_seqlens_k,
+            cu_seqlens.numel() - 1,
+            *kv_indices.stride(),
+            S=seq_len,
+            TOPK=topk,
+            WIDE=requires_int64_offsets(kv_indices, sort_keys, cu_seqlens, cu_seqlens_k),
+            BLOCK_K=256,
+            num_warps=4,
+        )
+    else:
+        sort_keys = kv_indices.flatten(1)
+    sorted_indices, sorted_entries = torch.sort(sort_keys, dim=-1)
     selected_queries = torch.div(sorted_entries, topk, rounding_mode="floor").to(torch.int32)
     block_ids = torch.arange(
         sparse_seq_len + 1, device=kv_indices.device, dtype=sorted_indices.dtype
     )
     block_ids = block_ids.unsqueeze(0).expand(batch, -1).contiguous()
+    # Searching [0, sparse_seq_len] excludes negative and out-of-pool entries in either mode.
     block_offsets = torch.searchsorted(sorted_indices, block_ids).to(torch.int32)
     return selected_queries.contiguous(), block_offsets.contiguous()
 
@@ -562,6 +667,7 @@ def _launch_backward(
     block_offsets: torch.Tensor,
     attention_sink: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     output: torch.Tensor,
     lse: torch.Tensor,
     grad_output: torch.Tensor,
@@ -591,7 +697,20 @@ def _launch_backward(
 
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
-    wide = requires_int64_offsets(cu_seqlens)
+    wide = requires_int64_offsets(
+        query,
+        sparse_kv,
+        local_kv,
+        kv_indices,
+        selected_queries,
+        block_offsets,
+        output,
+        grad_output,
+        lse,
+        grad_local_kv,
+        cu_seqlens,
+        cu_seqlens_k,
+    )
     use_tma = can_use_tma(query) and can_use_tma(local_kv) and can_use_tma(grad_output)
 
     num_local_query_tiles = (
@@ -616,6 +735,7 @@ def _launch_backward(
             local_kv,
             kv_indices,
             cu_seqlens,
+            cu_seqlens_k,
             output,
             grad_output,
             lse,
@@ -662,6 +782,7 @@ def _launch_backward(
             local_kv,
             kv_indices,
             cu_seqlens,
+            cu_seqlens_k,
             output,
             grad_output,
             lse,
@@ -704,6 +825,7 @@ def _launch_backward(
             query_desc,
             local_desc,
             cu_seqlens,
+            cu_seqlens_k,
             output_desc,
             grad_output_desc,
             lse,
@@ -727,6 +849,7 @@ def _launch_backward(
             query,
             local_kv,
             cu_seqlens,
+            cu_seqlens_k,
             output,
             grad_output,
             lse,
@@ -779,6 +902,8 @@ def _launch_backward(
             query,
             sparse_kv,
             kv_indices,
+            cu_seqlens,
+            cu_seqlens_k,
             output,
             grad_output,
             lse,
@@ -786,6 +911,7 @@ def _launch_backward(
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             KV_INDICES_STRIDES=kv_indices.stride(),
+            num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             GRAD_SPARSE_KV_STRIDES=grad_sparse_kv_fp32.stride(),
             B=batch,
@@ -795,6 +921,8 @@ def _launch_backward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            WIDE=wide,
             BLOCK_D=block_d,
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
@@ -843,6 +971,7 @@ def _launch_backward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             SCALE=scale,
+            WIDE=wide or requires_int64_offsets(grad_sparse_kv_partials),
             BLOCK_D=block_d,
         )
         grad_sparse_kv = (

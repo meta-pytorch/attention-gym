@@ -32,8 +32,10 @@ import torch
 def _build_gather_indices(
     kv_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     local_kv_len: int,
+    sparse_kv_len: int,
 ) -> torch.Tensor:
     """Build FA4's (batch, seq_len, padded_topk) int32 gather indices over [local_kv; sparse_kv].
 
@@ -42,7 +44,9 @@ def _build_gather_indices(
     """
     from .indices import build_gather_indices
 
-    return build_gather_indices(kv_indices, cu_seqlens, sliding_window_size, local_kv_len)
+    return build_gather_indices(
+        kv_indices, cu_seqlens, cu_seqlens_k, sliding_window_size, local_kv_len, sparse_kv_len
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +136,7 @@ def gather_attn(
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool = True,
     *,
@@ -151,7 +156,12 @@ def gather_attn(
     from flash_attn.cute.interface import flash_attn_func
 
     gather_indices = _build_gather_indices(
-        kv_indices, cu_seqlens, sliding_window_size, local_kv_len=local_kv.shape[2]
+        kv_indices,
+        cu_seqlens,
+        cu_seqlens_k,
+        sliding_window_size,
+        local_kv_len=local_kv.shape[2],
+        sparse_kv_len=sparse_kv.shape[2],
     )
     # FA4 takes BSHD. Passing k=v (the same object) with hdim=512 selects MLA mode:
     # FA4 moves q into qv and routes to the sparse MLA kernels.

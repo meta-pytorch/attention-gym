@@ -48,6 +48,7 @@ def _packed_gather_attn(
     kv_indices: Tensor,
     attention_sink: Tensor,
     cu_seqlens: Tensor,
+    cu_seqlens_k: Tensor,
     sliding_window_size: int,
     *,
     scale: float,
@@ -62,8 +63,13 @@ def _packed_gather_attn(
     starts = cu_seqlens[documents]
     local_valid = local_valid & (local_indices >= starts[:, None])
     local_indices = local_indices.clamp_min(0).expand(batch, -1, -1)
-    indices = torch.cat((local_indices, (kv_indices + tokens).clamp_min(0)), dim=-1).long()
-    valid = torch.cat((local_valid, kv_indices >= 0), dim=-1)[:, None, :, :, None]
+    sparse_starts = cu_seqlens_k[documents][None, :, None]
+    sparse_ends = cu_seqlens_k[(documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1)][None, :, None]
+    sparse_valid = (kv_indices >= 0) & (kv_indices < sparse_ends - sparse_starts)
+    sparse_indices = torch.where(sparse_valid, kv_indices, 0) + sparse_starts + tokens
+    sparse_indices = torch.where(sparse_valid, sparse_indices, 0)
+    indices = torch.cat((local_indices, sparse_indices), dim=-1).long()
+    valid = torch.cat((local_valid, sparse_valid), dim=-1)[:, None, :, :, None]
     kv = torch.cat((local_kv, sparse_kv), dim=2)
     kv_heads = kv.shape[1]
     # Index the original pool rather than an expanded [B, H, T, pool, D] view:
@@ -100,6 +106,7 @@ def gather_attn(
     kv_indices: Tensor,
     attention_sink: Tensor,
     cu_seqlens: Tensor | None,
+    cu_seqlens_k: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
     *,
@@ -138,8 +145,10 @@ def gather_attn(
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
         cu_seqlens: Packed query offsets, or None for ordinary batched inputs.
-            They bound the local window. Sparse selections have already been translated
-            to global pool positions and masked to their document by the public API.
+            They bound the local window.
+
+        cu_seqlens_k: Packed sparse-pool offsets. Selected indices are document-local
+            when offsets are present, and global otherwise.
 
         sliding_window_size: Integer, size of sliding window
 
@@ -162,6 +171,7 @@ def gather_attn(
             kv_indices,
             attention_sink,
             cu_seqlens,
+            cu_seqlens_k,
             sliding_window_size,
             scale=scale,
         )
@@ -175,8 +185,8 @@ def gather_attn(
         # Repeated indices get extra weight (equivalent to multiple copies in the attention set).
         # This is specifically for edge case handling,
         # since most uses of this will have indices pass through torch.topk
-        valid_mask = kv_indices >= 0
-        safe_indices = kv_indices.clamp(min=0).long()
+        valid_mask = (kv_indices >= 0) & (kv_indices < sparse_seq_len)
+        safe_indices = torch.where(valid_mask, kv_indices, 0).long()
         # Count how many times each position is selected per query (ignoring sentinels)
         counts.scatter_add_(
             dim=-1,
