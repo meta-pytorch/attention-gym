@@ -44,6 +44,21 @@ def _seed_global_rng() -> None:
     torch.manual_seed(0)
 
 
+@pytest.fixture(autouse=True)
+def _reset_shared_compile_wrapper() -> Iterator[None]:
+    """Give each test its own recompile budget for compiled partials and op objects.
+
+    `torch.compile` wraps callables without a Python frame in `wrap_inline`, whose `inner` code
+    object is shared process-wide, so unrelated tests on one xdist worker otherwise exhaust its
+    recompile limit together and fail depending on test distribution.
+    """
+    yield
+    from torch._C._dynamo.eval_frame import reset_code
+    from torch._dynamo.external_utils import wrap_inline
+
+    reset_code(wrap_inline(len).__code__)
+
+
 @pytest.fixture
 def fresh_compile_cache() -> Iterator[None]:
     """Keep independent compile tests from sharing a function's recompilation budget."""
