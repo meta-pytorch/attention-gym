@@ -4,6 +4,7 @@ Each CTA owns one query and retains only its running Top-K while streaming key
 tiles. The tensor-core product is candidate-by-head so the head reduction leaves
 candidate indices distributed across warps, rather than replicating selection
 across head warps. No scores or partial selections are stored in global memory.
+This module also prepares packed candidate bounds for the CuTe indexer backend.
 """
 
 import torch
@@ -12,7 +13,7 @@ import triton.language as tl
 from torch import Tensor
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
 
 # Measured shared memory is (2 * BN + BH) * BD * elem_size: Triton double-buffers the TMA key
 # tile even at num_stages=1, plus one Q tile. Hopper/Blackwell allow 227 KiB per block; 192 KiB
@@ -26,6 +27,9 @@ def _index_kernel(
     K,
     W,
     Out,
+    CuQ,
+    CuK,
+    num_documents,
     T: tl.constexpr,
     S: tl.constexpr,
     H: tl.constexpr,
@@ -41,6 +45,7 @@ def _index_kernel(
     BN: tl.constexpr,
     KEEP: tl.constexpr,
     WIDE: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     """Stream TMA key tiles through tensor cores and a register-resident Top-K."""
     batch = tl.program_id(1)
@@ -58,8 +63,17 @@ def _index_kernel(
     q = Q.load([batch.to(tl.int32), query.to(tl.int32), 0, 0]).reshape(BH, BD)
     best = tl.full((KEEP,), -9223372036854775808, tl.int64)
     rank = tl.arange(0, KEEP)
+    begin = 0
     end = (query + 1) // RATIO if CAUSAL else S
-    for start in tl.range(0, end, BN):
+    if PACKED:
+        document = _document_ids(CuQ, query, num_documents, WIDE)
+        offset = document.to(tl.int64) if WIDE else document
+        begin = tl.load(CuK + offset)
+        end = tl.load(CuK + tl.minimum(offset + 1, num_documents))
+        if CAUSAL:
+            local_position = query - tl.load(CuQ + offset)
+            end = tl.minimum(end, begin + (local_position + 1) // RATIO)
+    for start in tl.range(begin, end, BN):
         k = K.load([batch.to(tl.int32), start.to(tl.int32), 0]).reshape(BN, BD)
         dots = tl.dot(k, tl.trans(q))
         scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], axis=1)
@@ -72,17 +86,24 @@ def _index_kernel(
         packed = tl.where((rank < BN) & (candidate < end), packed, -9223372036854775808)
         best = tl.topk(tl.join(best, packed).reshape(2 * KEEP), KEEP)
     indices = (0xFFFFFFFF - (best & 0xFFFFFFFF)).to(tl.int32)
-    indices = tl.where(best == -9223372036854775808, -1, indices)
+    indices = tl.where(best == -9223372036854775808, -1, indices - begin)
     tl.store(Out + ptr_offset((batch, query, rank), (T * TOPK, TOPK, 1)), indices, rank < TOPK)
 
 
 def launch(
-    q: Tensor, k: Tensor, weights: Tensor, topk: int, causal: bool, compress_ratio: int
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk: int,
+    causal: bool,
+    compress_ratio: int,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
 ) -> Tensor:
     """Return nondifferentiable INT32 indices without a quadratic workspace.
 
     Q/K require contiguous last dimensions and 16-byte-aligned bases/outer
-    strides. FP16/BF16, H/D <= 256, T <= 2**20, and any Top-K <= S are supported; the
+    strides. FP16/BF16, H/D <= 256, T <= 2**20, and non-negative Top-K are supported; the
     register-resident selection makes each key tile cost grow with Top-K.
     Gradient-requiring inputs are allowed: selection returns indices, not trainable scores.
     The public registered operator keeps host descriptors outside graph tracing.
@@ -99,11 +120,13 @@ def launch(
         )
     if compress_ratio < 1:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}.")
-    if candidates != tokens // compress_ratio:
+    if cu_seqlens is None and candidates != tokens // compress_ratio:
         raise ValueError(
             f"k must hold T // compress_ratio candidates, got T={tokens}, S={candidates}, "
             f"compress_ratio={compress_ratio}."
         )
+    if candidates == 0:
+        return torch.full((batch, tokens, topk), -1, dtype=torch.int32, device=q.device)
     for tensor in (q, k):
         if tensor.stride(-1) != 1 or any(s % 8 for s in tensor.stride()[:-1]):
             raise ValueError("TMA requires a contiguous last dimension and 16-byte outer strides.")
@@ -127,6 +150,9 @@ def launch(
             k_desc,
             weights,
             output,
+            cu_seqlens,
+            cu_seqlens_k,
+            0 if cu_seqlens is None else cu_seqlens.numel() - 1,
             tokens,
             candidates,
             heads,
@@ -139,8 +165,62 @@ def launch(
             bd,
             bn,
             keep,
-            requires_int64_offsets(q, k, weights, output),
+            requires_int64_offsets(q, k, weights, output, cu_seqlens, cu_seqlens_k),
+            cu_seqlens is not None,
             num_warps=8,
             num_stages=1,
         )
     return output
+
+
+@triton.jit
+def _candidate_bounds_kernel(
+    CuQ,
+    CuK,
+    Bounds,
+    num_documents,
+    tokens,
+    CAUSAL: tl.constexpr,
+    RATIO: tl.constexpr,
+    WIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    block = tl.program_id(0)
+    if WIDE:
+        block = block.to(tl.int64)
+    query = block * BLOCK + tl.arange(0, BLOCK)
+    document = _document_ids(CuQ, query, num_documents, WIDE)
+    offset = document.to(tl.int64) if WIDE else document
+    start = tl.load(CuK + offset)
+    end = tl.load(CuK + tl.minimum(offset + 1, num_documents))
+    if CAUSAL:
+        local_position = query - tl.load(CuQ + offset)
+        end = tl.minimum(end, start + (local_position + 1) // RATIO)
+    tl.store(Bounds + query * 2, start, query < tokens)
+    tl.store(Bounds + query * 2 + 1, end, query < tokens)
+
+
+def prepare_candidate_bounds(
+    cu_seqlens: Tensor,
+    cu_seqlens_k: Tensor,
+    tokens: int,
+    causal: bool,
+    compress_ratio: int,
+) -> Tensor:
+    bounds = cu_seqlens.new_empty((tokens, 2))
+    if tokens == 0:
+        return bounds
+    with torch.cuda.device(cu_seqlens.device):
+        _candidate_bounds_kernel[(triton.cdiv(tokens, 256),)](
+            cu_seqlens,
+            cu_seqlens_k,
+            bounds,
+            cu_seqlens.numel() - 1,
+            tokens,
+            causal,
+            compress_ratio,
+            requires_int64_offsets(cu_seqlens, cu_seqlens_k, bounds),
+            256,
+            num_warps=4,
+        )
+    return bounds

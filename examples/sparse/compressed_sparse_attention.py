@@ -203,8 +203,7 @@ def _gather_attn_with_causal_blocks(
         sparse_kv,
         causal_topk_blocks,
         attention_sink,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         impl=Impl.FUSED if query.is_cuda else Impl.REFERENCE,
         return_aux=return_aux,
     )

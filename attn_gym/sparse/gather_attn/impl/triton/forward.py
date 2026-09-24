@@ -99,8 +99,9 @@ def _gather_attn_fwd(
         logit = tl.sum(query.to(tl.float32) * sparse_value.to(tl.float32), axis=1) * SCALE
         logit = tl.where(valid, logit, -float("inf"))
         new_max = tl.maximum(running_max, logit)
-        alpha = tl.exp(running_max - new_max)
-        probability = tl.exp(logit - new_max)
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        alpha = tl.exp(running_max - safe_max)
+        probability = tl.exp(logit - safe_max)
         accumulator = accumulator * alpha[:, None] + probability[:, None] * sparse_value
         running_sum = running_sum * alpha + probability
         running_max = new_max
@@ -132,7 +133,7 @@ def _gather_attn_fwd(
             accumulator, running_max, running_sum, logits, local_values
         )
 
-    output = accumulator / running_sum[:, None]
+    output = accumulator / tl.where(running_sum > 0, running_sum, 1.0)[:, None]
     store_bhsd(
         output_ptr,
         output,
@@ -288,7 +289,7 @@ def _gather_attn_fwd_shared(
             (batch, offsets_h[:, None], sequence, offsets_d[None, :]),
             QUERY_STRIDES,
         ),
-        accumulator / running_sum[:, None],
+        accumulator / tl.where(running_sum > 0, running_sum, 1.0)[:, None],
         mask=head_mask[:, None] & dimension_mask[None, :],
     )
     tl.store(
@@ -379,8 +380,9 @@ def _gather_attn_fwd_tma(
         logit = tl.sum(query.to(tl.float32) * sparse_value.to(tl.float32), axis=1) * SCALE
         logit = tl.where(valid, logit, -float("inf"))
         new_max = tl.maximum(running_max, logit)
-        alpha = tl.exp(running_max - new_max)
-        probability = tl.exp(logit - new_max)
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        alpha = tl.exp(running_max - safe_max)
+        probability = tl.exp(logit - safe_max)
         accumulator = accumulator * alpha[:, None] + probability[:, None] * sparse_value
         running_sum = running_sum * alpha + probability
         running_max = new_max
@@ -408,7 +410,10 @@ def _gather_attn_fwd_tma(
 
     output_desc.store(
         [batch, head, query_block * BLOCK_M, 0],
-        tl.reshape(accumulator / running_sum[:, None], (1, 1, BLOCK_M, BLOCK_D)),
+        tl.reshape(
+            accumulator / tl.where(running_sum > 0, running_sum, 1.0)[:, None],
+            (1, 1, BLOCK_M, BLOCK_D),
+        ),
     )
     tl.store(
         lse_ptr + batch * LSE_STRIDES[0] + head * LSE_STRIDES[1] + offsets_m * LSE_STRIDES[2],

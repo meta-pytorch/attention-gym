@@ -743,8 +743,9 @@ def _dense_qk_softmax_oracle(
     sparse_kv,
     kv_indices,
     attention_sink,
-    doc_ids,
     sliding_window_size,
+    cu_seqlens=None,
+    cu_seqlens_k=None,
 ):
     batch, heads, sequence_length, head_dim = query.shape
     accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
@@ -762,7 +763,14 @@ def _dense_qk_softmax_oracle(
         key_positions >= query_positions - sliding_window_size + 1
     )
     local_is_valid = local_is_valid[None, None]
-    if doc_ids is not None:
+    if cu_seqlens is not None:
+        doc_ids = torch.empty((1, sequence_length), dtype=torch.int64, device=query.device)
+        kv_indices = kv_indices.clone()
+        for doc in range(cu_seqlens.numel() - 1):
+            start, end = cu_seqlens[doc : doc + 2].tolist()
+            doc_ids[:, start:end] = doc
+            selected = kv_indices[:, start:end]
+            kv_indices[:, start:end] = torch.where(selected >= 0, selected + cu_seqlens_k[doc], -1)
         same_document = doc_ids[:, None, :, None] == doc_ids[:, None, None, :]
         local_is_valid = local_is_valid & same_document
     local_logits = local_logits.masked_fill(~local_is_valid, float("-inf"))
@@ -784,11 +792,12 @@ def _dense_qk_softmax_oracle(
     return torch.logsumexp(logits, dim=-1), probabilities[..., : kv_indices.shape[-1]]
 
 
-def _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink):
+def _make_lse_inputs(impl, share_kv, packed, with_attention_sink):
     device = torch.device("cuda" if impl is Impl.FUSED else "cpu")
     dtype = torch.float32 if impl is Impl.FUSED else torch.float64
     generator = torch.Generator(device=device).manual_seed(9384)
-    batch, heads, sequence_length, head_dim = 2, 3, 9, 32
+    batch = 1 if packed else 2
+    heads, sequence_length, head_dim = 3, 9, 32
     sparse_sequence_length, num_topk_blocks = 7, 4
     kv_heads = 1 if share_kv else heads
 
@@ -813,10 +822,24 @@ def _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink):
         device=device,
         generator=generator,
     )
-    selection_scores = torch.randn(
-        batch, sequence_length, sparse_sequence_length, device=device, generator=generator
+    cu_seqlens = cu_seqlens_k = None
+    if packed:
+        q_offsets, k_offsets = [0, 3, 6, 9], [0, 2, 4, 7]
+        cu_seqlens = torch.tensor(q_offsets, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(k_offsets, dtype=torch.int32, device=device)
+    else:
+        q_offsets, k_offsets = [0, sequence_length], [0, sparse_sequence_length]
+    kv_indices = torch.full(
+        (batch, sequence_length, num_topk_blocks), -1, dtype=torch.int64, device=device
     )
-    kv_indices = selection_scores.topk(num_topk_blocks, dim=-1).indices
+    for doc in range(len(q_offsets) - 1):
+        start, end = q_offsets[doc : doc + 2]
+        pool_length = k_offsets[doc + 1] - k_offsets[doc]
+        selection_scores = torch.randn(
+            batch, end - start, pool_length, device=device, generator=generator
+        )
+        selected = selection_scores.topk(min(num_topk_blocks, pool_length), dim=-1).indices
+        kv_indices[:, start:end, : selected.shape[-1]] = selected
     kv_indices[:, ::3, -1] = -1
     kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
 
@@ -824,34 +847,27 @@ def _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink):
     if with_attention_sink:
         attention_sink = torch.randn(heads, dtype=dtype, device=device, generator=generator)
 
-    doc_ids = None
-    if with_doc_ids:
-        doc_ids = torch.tensor(
-            [[0, 0, 0, 0, 1, 1, 1, 1, 1], [0, 0, 0, 1, 1, 1, 2, 2, 2]],
-            dtype=torch.int32,
-            device=device,
-        )
-
     return {
         "query": query,
         "local_kv": local_kv,
         "sparse_kv": sparse_kv,
         "kv_indices": kv_indices,
         "attention_sink": attention_sink,
-        "doc_ids": doc_ids,
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_k": cu_seqlens_k,
         "sliding_window_size": 4,
     }
 
 
 @pytest.mark.parametrize("impl,kernel_options", LSE_IMPLEMENTATIONS)
 @pytest.mark.parametrize(
-    ("share_kv", "with_doc_ids", "with_attention_sink"),
+    ("share_kv", "packed", "with_attention_sink"),
     [(False, False, True), (True, True, True), (True, False, False)],
 )
 def test_lse_and_selected_key_probabilities_match_dense_qk_softmax_oracle(
-    impl, kernel_options, share_kv, with_doc_ids, with_attention_sink
+    impl, kernel_options, share_kv, packed, with_attention_sink
 ):
-    inputs = _make_lse_inputs(impl, share_kv, with_doc_ids, with_attention_sink)
+    inputs = _make_lse_inputs(impl, share_kv, packed, with_attention_sink)
 
     with torch.inference_mode():
         expected_lse, expected_selected_probabilities = _dense_qk_softmax_oracle(**inputs)
@@ -872,9 +888,15 @@ def test_lse_and_selected_key_probabilities_match_dense_qk_softmax_oracle(
         inputs["sparse_kv"].to(expected_lse.dtype).expand(query.shape[0], query.shape[1], -1, -1)
     )
     sparse_logits = torch.matmul(query, sparse_kv.transpose(-2, -1)) / math.sqrt(query.shape[-1])
-    selected_indices = (
-        inputs["kv_indices"].clamp_min(0)[:, None].expand(-1, query.shape[1], -1, -1)
-    )
+    packed_indices = inputs["kv_indices"]
+    if packed:
+        sparse_starts = torch.repeat_interleave(
+            inputs["cu_seqlens_k"][:-1], inputs["cu_seqlens"].diff()
+        )
+        packed_indices = torch.where(
+            packed_indices >= 0, packed_indices + sparse_starts[None, :, None], -1
+        )
+    selected_indices = packed_indices.clamp_min(0)[:, None].expand(-1, query.shape[1], -1, -1)
     selected_logits = sparse_logits.gather(dim=-1, index=selected_indices)
     actual_selected_probabilities = torch.exp(selected_logits - aux.lse[..., None])
     actual_selected_probabilities = actual_selected_probabilities.masked_fill(

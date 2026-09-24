@@ -18,8 +18,10 @@ commutative ``atomic_or`` and compacted in index order. Its rows over 65536
 candidates emit through the counter, then sort through bitmap windows and
 overwrite their score row as staging.
 
-Only valid causal scores are read. Rows with at most K candidates require no
-score reads at all. The monotonic key supports signed finite FP32 scores.
+Only valid causal scores are read. Packed calls restrict selection to each
+query's candidate interval and return indices relative to its start. Rows with
+at most K candidates require no score reads at all. The monotonic key supports
+signed finite FP32 scores.
 """
 
 import cutlass
@@ -354,6 +356,7 @@ class IndexerTopKKernel:
         scores: cute.Tensor,
         output: cute.Tensor,
         pair_start: Int32 | Int64,
+        candidate_bounds: cute.Tensor | None,
     ):
         """Run the four-pass selection with CTA-uniform row and short-row guards."""
         tidx = cute.arch.thread_idx()[0]
@@ -391,8 +394,12 @@ class IndexerTopKKernel:
 
         if batch < output.shape[0] and q < num_queries:
             row_output = output[batch, q, None]
+            candidate_start = self.upcast_offset(Int32(0))
             seg_len = Int32(num_candidates)
-            if cutlass.const_expr(self.causal):
+            if cutlass.const_expr(candidate_bounds is not None):
+                candidate_start = self.upcast_offset(candidate_bounds[q, 0])
+                seg_len = candidate_bounds[q, 1] - candidate_bounds[q, 0]
+            elif cutlass.const_expr(self.causal):
                 seg_len = Int32(self.visible_candidates(q))
 
             if seg_len <= self.topk:
@@ -400,6 +407,8 @@ class IndexerTopKKernel:
                     row_output[slot] = Int32(slot) if slot < seg_len else Int32(-1)
             else:
                 row = scores[slab_pair, qi, None]
+                if cutlass.const_expr(candidate_bounds is not None):
+                    row = cute.domain_offset((candidate_start,), row)
                 if tidx == 0:
                     counters[0] = Int32(0)
                     counters[1] = Int32(0)
@@ -611,7 +620,24 @@ class IndexerTopKKernel:
     ):
         """Launch one 512-thread CTA per physical query row in the score slab."""
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(scores, output, pair_start).launch(
+        self.kernel(scores, output, pair_start, None).launch(
+            grid=(scores.shape[0] * 2, 1, 1),
+            block=(self.block_threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def with_candidate_bounds(
+        self,
+        scores: cute.Tensor,
+        output: cute.Tensor,
+        pair_start: Int32 | Int64,
+        candidate_bounds: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        """Packed TVM-FFI entrypoint, retaining the existing dense-call ABI."""
+        self.kernel.set_name_prefix(f"{self.get_name()}_packed")
+        self.kernel(scores, output, pair_start, candidate_bounds).launch(
             grid=(scores.shape[0] * 2, 1, 1),
             block=(self.block_threads, 1, 1),
             stream=stream,

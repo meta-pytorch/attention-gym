@@ -155,7 +155,7 @@ def _gather_attn_bwd_dq(
 
     # Sink gradient
     sink = tl.load(attention_sink_ptr + head)
-    sink_probability = tl.exp(sink - lse)
+    sink_probability = tl.where(lse == -float("inf"), 0.0, tl.exp(sink - lse))
     sink_gradient = tl.where(query_mask, -sink_probability * delta, 0.0)
     # Output-owned per-block partials, reduced in a fixed order on the host, keep the
     # sink gradient deterministic; atomics across query blocks would not be.
@@ -718,7 +718,7 @@ def _launch_backward(
             num_stages=num_stages,
         )
 
-    if topk == 0:
+    if topk == 0 or sparse_seq_len == 0:
         kv_heads = 1 if share_kv else heads
         grad_sparse_kv = torch.zeros(
             batch,

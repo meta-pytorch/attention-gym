@@ -19,9 +19,11 @@ indices = lightning_indexer(q, k_compressed, weights, topk=128, causal=True, com
 
 The score for a query/candidate pair is
 `sum_h(weights[h] * relu(dot(q[h], k))) / sqrt(H * D)`.
-Weights may be negative. `k` holds `S = T // compress_ratio` candidates, each summarizing
-`compress_ratio` consecutive tokens (a trailing partial window forms no candidate). With
-causal selection, query `t` considers only candidates `s < (t + 1) // compress_ratio`, those
+Weights may be negative. Without packed offsets, `k` holds `S = T // compress_ratio`
+candidates, each summarizing `compress_ratio` consecutive tokens (a trailing partial window
+forms no candidate). For packed documents, pass paired `cu_seqlens` and `cu_seqlens_k`:
+compression and causal positions restart per document, and output indices are document-local.
+With causal selection, query `t` considers only candidates `s < (t + 1) // compress_ratio`, those
 whose tokens all lie at positions `<= t` (candidates `0..t` with the default ratio of 1);
 rows with fewer than `topk` candidates contain `-1` padding. `compress_ratio != 1` requires
 `causal=True`. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
@@ -52,8 +54,11 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 | Heads `H` | Positive and even | `1..256` |
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
 | Sequence length `T` | `1..2**20` | `1..2**20` |
-| `topk` | `0..S` | `0..S`; per-tile cost grows with `topk` |
+| `topk` | Non-negative; missing candidates pad with `-1` | Non-negative; missing candidates pad with `-1`; per-tile cost grows with `topk` |
 | Layout | Q/K last stride 1, bases and non-singleton outer strides 16-byte aligned; weights may be strided | Q/K last stride 1, bases and outer strides 16-byte aligned; weights may be strided |
+
+For nonzero `topk`, CuTe limits candidate capacity `S` to `2**22` so at least one query
+pair's FP32 scores fit its 32 MiB workspace. This includes inactive packed capacity.
 
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
 materializing contiguous copies. Weights need only element alignment, not TMA alignment.

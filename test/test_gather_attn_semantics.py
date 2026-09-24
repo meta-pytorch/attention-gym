@@ -35,11 +35,12 @@ def attention(impl, kernel_options):
     return partial(gather_attn, impl=impl, kernel_options=kernel_options)
 
 
-@pytest.fixture
-def shared_kv_blackwell_inputs():
-    """Create a batched, partial-head-tile shared-KV case with a float32 sink."""
+@pytest.fixture(params=["batched", "packed"])
+def shared_kv_blackwell_inputs(request):
+    """Create dense-batched or packed partial-head-tile inputs with a float32 sink."""
     torch.manual_seed(123)
-    batch, heads, seq_len, head_dim = 2, 17, 33, 32
+    batch = 1 if request.param == "packed" else 2
+    heads, seq_len, head_dim = 17, 33, 32
     sparse_seq_len, topk = 79, 73
     query = torch.randn(
         batch,
@@ -69,13 +70,20 @@ def shared_kv_blackwell_inputs():
         requires_grad=True,
     )
     kv_indices = torch.randint(0, sparse_seq_len, (batch, seq_len, topk), device="cuda")
+    cu_seqlens = cu_seqlens_k = None
+    if request.param == "packed":
+        q_offsets, k_offsets = [0, 11, 20, 33], [0, 23, 44, 79]
+        cu_seqlens = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+        cu_seqlens_k = torch.tensor(k_offsets, device="cuda", dtype=torch.int32)
+        for doc in range(3):
+            start, end = q_offsets[doc : doc + 2]
+            kv_indices[:, start:end] = torch.randint(
+                k_offsets[doc + 1] - k_offsets[doc], (1, end - start, topk), device="cuda"
+            )
     kv_indices[:, ::3, -1] = -1
     kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
     attention_sink = torch.randn(heads, device="cuda", dtype=torch.float32, requires_grad=True)
-    doc_ids = torch.tensor(
-        [[0] * 11 + [1] * 9 + [2] * 13], device="cuda", dtype=torch.int32
-    ).expand(batch, -1)
-    return query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids
+    return query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k
 
 
 def _device_for_impl(impl):
@@ -123,7 +131,7 @@ def test_local_only_matches_manual_computation(impl, attention):
     kv_indices = torch.zeros(b, s, 0, dtype=torch.long, device=device)
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=window)
 
     # Manual: build causal sliding window mask, compute attention
     scale = d**0.5
@@ -143,7 +151,7 @@ def test_local_only_matches_manual_computation(impl, attention):
     expected = probs @ local_kv
 
     sparse_kv2 = torch.randn_like(sparse_kv)
-    out2 = attention(query, local_kv, sparse_kv2, kv_indices, sink, None, window)
+    out2 = attention(query, local_kv, sparse_kv2, kv_indices, sink, sliding_window_size=window)
 
     atol = 1e-5 if impl is Impl.FUSED else 1e-10
     assert out.shape == (b, h, s, d)
@@ -173,7 +181,7 @@ def test_selected_block_only_manual(impl, attention):
 
     sink = torch.zeros(h, device=device, dtype=dtype)
 
-    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, 0)
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=0)
 
     # Manual computation: for each query, gather the selected sparse_kv positions
     scale = d**0.5
@@ -193,7 +201,7 @@ def test_selected_block_only_manual(impl, attention):
     expected = torch.bmm(probs.unsqueeze(1), gathered).squeeze(1)  # (4, 8)
 
     local_kv2 = torch.randn_like(local_kv)
-    out2 = attention(query, local_kv2, sparse_kv, kv_indices, sink, None, 0)
+    out2 = attention(query, local_kv2, sparse_kv, kv_indices, sink, sliding_window_size=0)
 
     atol = 1e-4 if impl is Impl.FUSED else 1e-10
     assert out.shape == (b, h, s, d)
@@ -227,7 +235,9 @@ def test_joint_normalization(impl, attention, scale):
 
     kv_indices = torch.tensor([[[0, 1], [1, 2], [0, 2], [1, 0]]], device=device)
 
-    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window, scale=scale)
+    out = attention(
+        query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=window, scale=scale
+    )
 
     # --- Manual: single softmax over gathered sparse + local window + sink ---
     resolved_scale = d**-0.5 if scale is None else scale
@@ -288,7 +298,7 @@ def test_sink_large_absorbs_probability(impl, attention):
     # Very large positive sink
     sink = torch.full((h,), 50.0, device=device, dtype=dtype)
 
-    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=window)
 
     # Output should be near zero (sink absorbs essentially all probability)
     assert out.abs().max().item() < 0.01, (
@@ -316,7 +326,7 @@ def test_sink_very_negative_has_no_effect(impl, attention):
     # Very negative sink (contributes nothing)
     sink = torch.full((h,), -100.0, device=device, dtype=dtype)
 
-    out = attention(query, local_kv, sparse_kv, kv_indices, sink, None, window)
+    out = attention(query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=window)
 
     # Manual standard softmax (no sink in denominator)
     scale = d**0.5
@@ -350,14 +360,21 @@ def test_float32_attention_sink(impl, attention):
         sparse_kv.double(),
         kv_indices,
         attention_sink.double(),
-        None,
-        2,
+        sliding_window_size=2,
         impl=Impl.REFERENCE,
     )
     low_precision_expected = gather_attn(
-        query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2, impl=Impl.REFERENCE
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        attention_sink,
+        sliding_window_size=2,
+        impl=Impl.REFERENCE,
     )
-    actual = attention(query, local_kv, sparse_kv, kv_indices, attention_sink, None, 2)
+    actual = attention(
+        query, local_kv, sparse_kv, kv_indices, attention_sink, sliding_window_size=2
+    )
 
     assert actual.dtype == torch.bfloat16
     assert_matches_low_precision_eager(
@@ -421,8 +438,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
         sparse_kv,
         kv_indices,
         attention_sink,
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
     )
     actual_float32_sink = gather_attn(
@@ -431,8 +447,7 @@ def test_eager_bfloat16_mixed_precision_schedule():
         sparse_kv,
         kv_indices,
         attention_sink.float(),
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
     )
 
@@ -477,8 +492,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
         sparse_kv,
         kv_indices,
         sink,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
     )
     grad_output = torch.randn_like(out_eager)
@@ -499,8 +513,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
         sparse_kv,
         kv_indices,
         sink,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         kernel_options={"backend": "triton"},
     )
     out_triton.backward(grad_output)
@@ -534,10 +547,16 @@ def test_mixed_repeated_and_unique_indices_backends_match():
     )
 
     out_eager = gather_attn(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 3, impl=Impl.REFERENCE
+        query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=3, impl=Impl.REFERENCE
     )
     out_triton = gather_attn(
-        query, local_kv, sparse_kv, kv_indices, sink, None, 3, kernel_options={"backend": "triton"}
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        sink,
+        sliding_window_size=3,
+        kernel_options={"backend": "triton"},
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
@@ -552,7 +571,9 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 @pytest.mark.full_autotune
 def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
     """The default atomic shared-KV path matches eager forward and gradients."""
-    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
+        shared_kv_blackwell_inputs
+    )
     kv_indices = kv_indices.to(torch.int32)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
     high_precision_inputs = tuple(
@@ -565,8 +586,9 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         high_precision_inputs[2],
         kv_indices,
         high_precision_inputs[3],
-        doc_ids,
-        19,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=19,
         impl=Impl.REFERENCE,
     )
     expected = gather_attn(
@@ -575,8 +597,9 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         sparse_kv,
         kv_indices,
         attention_sink,
-        doc_ids,
-        19,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=19,
         impl=Impl.REFERENCE,
     )
     actual = gather_attn(
@@ -585,8 +608,9 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
         sparse_kv,
         kv_indices,
         attention_sink,
-        doc_ids,
-        19,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=19,
         kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
@@ -622,7 +646,9 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
 @pytest.mark.full_autotune
 def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
     """Deterministic mode retains the output-owned shared-KV backward schedule."""
-    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
+        shared_kv_blackwell_inputs
+    )
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
     was_enabled = torch.are_deterministic_algorithms_enabled()
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -634,8 +660,9 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
             sparse_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
-            19,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            sliding_window_size=19,
             impl=Impl.REFERENCE,
         )
         actual = gather_attn(
@@ -644,8 +671,9 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
             sparse_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
-            19,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            sliding_window_size=19,
             kernel_options={"backend": "triton"},
         )
         grad_output = torch.randn_like(expected)
@@ -701,8 +729,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         sparse_kv,
         kv_indices,
         attention_sink,
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
     )
     actual = gather_attn(
@@ -711,8 +738,7 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         sparse_kv,
         kv_indices,
         attention_sink,
-        None,
-        window,
+        sliding_window_size=window,
         kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
@@ -772,8 +798,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         high_precision_inputs[2],
         kv_indices,
         high_precision_inputs[3],
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
     )
     expected = gather_attn(
@@ -782,8 +807,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         sparse_kv,
         kv_indices,
         attention_sink,
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
     )
     actual = gather_attn(
@@ -792,8 +816,7 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         sparse_kv,
         kv_indices,
         attention_sink,
-        None,
-        window,
+        sliding_window_size=window,
         kernel_options={"backend": "triton"},
     )
     grad_output = torch.randn_like(expected)
@@ -841,8 +864,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             sparse_kv.double(),
             kv_indices,
             attention_sink.double(),
-            None,
-            window,
+            sliding_window_size=window,
             impl=Impl.REFERENCE,
         )
         low_precision_expected = gather_attn(
@@ -851,8 +873,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             sparse_kv,
             kv_indices,
             attention_sink,
-            None,
-            window,
+            sliding_window_size=window,
             impl=Impl.REFERENCE,
         )
         actual = gather_attn(
@@ -861,8 +882,7 @@ def test_shared_kv_blackwell_dsv4_forward():
             sparse_kv,
             kv_indices,
             attention_sink,
-            None,
-            window,
+            sliding_window_size=window,
             kernel_options={"backend": "triton"},
         )
 
@@ -882,18 +902,21 @@ def test_shared_kv_blackwell_dsv4_forward():
 @pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
 def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs):
     """The shared-KV Triton forward and backward compile without graph breaks."""
-    query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids = shared_kv_blackwell_inputs
+    query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
+        shared_kv_blackwell_inputs
+    )
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
-    def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids):
+    def fn(query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k):
         return gather_attn(
             query,
             local_kv,
             sparse_kv,
             kv_indices,
             attention_sink,
-            doc_ids,
-            19,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            sliding_window_size=19,
             kernel_options={"backend": "triton"},
         )
 
@@ -902,14 +925,15 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
         tensor.detach().clone().requires_grad_(True) for tensor in differentiable_inputs
     )
     compiled_query, compiled_local_kv, compiled_sparse_kv, compiled_sink = compiled_inputs
-    expected = fn(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
+    expected = fn(query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k)
     actual = compiled_fn(
         compiled_query,
         compiled_local_kv,
         compiled_sparse_kv,
         kv_indices,
         compiled_sink,
-        doc_ids,
+        cu_seqlens,
+        cu_seqlens_k,
     )
     grad_output = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, differentiable_inputs, grad_output)
@@ -951,8 +975,7 @@ def test_torch_compile_fullgraph_forward(scale):
             sparse_kv,
             kv_indices,
             sink,
-            None,
-            window,
+            sliding_window_size=window,
             impl=impl,
             kernel_options=kernel_options,
             scale=scale,
@@ -983,7 +1006,9 @@ def test_torch_compile_fullgraph_backward(impl, attention, scale):
     _, kv_indices = torch.topk(scores, k=topk, dim=-1)
 
     def fn(query, local_kv, sparse_kv, sink):
-        return attention(query, local_kv, sparse_kv, kv_indices, sink, None, window, scale=scale)
+        return attention(
+            query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=window, scale=scale
+        )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
@@ -1039,7 +1064,9 @@ def test_repeated_indices_manual_forward_and_backward():
     #             query 2 selects [1,3,3] (pos 1 once, pos 3 twice)
     kv_indices = torch.tensor([[[0, 0, 1], [2, 2, 2], [1, 3, 3]]])
 
-    out = gather_attn(query, local_kv, sparse_kv, kv_indices, sink, None, 0, impl=Impl.REFERENCE)
+    out = gather_attn(
+        query, local_kv, sparse_kv, kv_indices, sink, sliding_window_size=0, impl=Impl.REFERENCE
+    )
 
     # --- Manual forward ---
     scale = d**0.5

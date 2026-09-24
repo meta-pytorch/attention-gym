@@ -80,7 +80,7 @@ def check_cute_precision(
     *,
     batch: int,
     num_topk: int,
-    test_docids: bool,
+    packed: bool,
     seq_len: int,
     sparse_seq_len: int,
     sliding_window_size: int,
@@ -101,23 +101,13 @@ def check_cute_precision(
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    if num_topk > sparse_seq_len:
-        pytest.skip("num_topk exceeds sparse_seq_len")
-
-    if test_docids:
-        doc_ids = (
-            torch.cat(
-                [
-                    torch.zeros(seq_len // 2, dtype=torch.long),
-                    torch.ones(seq_len // 2, dtype=torch.long),
-                ]
-            )
-            .unsqueeze(0)
-            .expand(batch, -1)
-            .to(device)
+    cu_seqlens = cu_seqlens_k = None
+    if packed:
+        assert batch == 1
+        cu_seqlens = torch.tensor([0, seq_len // 2, seq_len], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(
+            [0, sparse_seq_len // 2, sparse_seq_len], dtype=torch.int32, device=device
         )
-    else:
-        doc_ids = None
 
     # --- Generate inputs in bf16 (the "quantized" source) ---
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -129,8 +119,21 @@ def check_cute_precision(
     local_kv_lp = randn_lp(batch, 1, seq_len, head_dim)
     sparse_kv_lp = randn_lp(batch, 1, sparse_seq_len, head_dim)
 
-    scores = torch.randn(batch, seq_len, sparse_seq_len, dtype=dtype, device=device, generator=gen)
-    _, kv_indices = torch.topk(scores, k=min(num_topk, sparse_seq_len), dim=-1)
+    kv_indices = torch.full((batch, seq_len, num_topk), -1, dtype=torch.int64, device=device)
+    segments = (
+        [
+            (0, seq_len // 2, sparse_seq_len // 2),
+            (seq_len // 2, seq_len, sparse_seq_len - sparse_seq_len // 2),
+        ]
+        if packed
+        else [(0, seq_len, sparse_seq_len)]
+    )
+    for start, end, pool_length in segments:
+        scores = torch.randn(
+            batch, end - start, pool_length, dtype=dtype, device=device, generator=gen
+        )
+        selected = scores.topk(min(num_topk, pool_length), dim=-1).indices
+        kv_indices[:, start:end, : selected.shape[-1]] = selected
 
     sink = (
         torch.linspace(-2, 8, heads * 2, device=device, dtype=sink_dtype)[::2]
@@ -163,8 +166,9 @@ def check_cute_precision(
         sparse_kv_64,
         kv_indices,
         sink_64,
-        doc_ids,
-        sliding_window_size,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
         scale=scale,
     )
@@ -174,8 +178,9 @@ def check_cute_precision(
         sparse_kv_lp_ref,
         kv_indices,
         sink_ref,
-        doc_ids,
-        sliding_window_size,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
         scale=scale,
     )
@@ -185,8 +190,9 @@ def check_cute_precision(
         sparse_kv_lp_cute,
         kv_indices,
         sink_cute,
-        doc_ids,
-        sliding_window_size,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        sliding_window_size=sliding_window_size,
         kernel_options=kernel_options,
         scale=scale,
     )
@@ -283,7 +289,7 @@ def test_cute_dependency_smoke(heads, kernel_options, sink_dtype):
     check_cute_precision(
         batch=1,
         num_topk=2,
-        test_docids=True,
+        packed=True,
         seq_len=8,
         sparse_seq_len=8,
         sliding_window_size=4,
@@ -361,18 +367,18 @@ def test_cute_determinism_enabled_after_forward(kernel_options, warn_only):
         pytest.param(128, 256, 128, None, 0.125, id="s128-sp256-k128-no-sink-large"),
     ],
 )
-@pytest.mark.parametrize("test_docids", [False, True], ids=["no_docids", "with_docids"])
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
 @pytest.mark.parametrize("sliding_window_size", [64, 128])
 def test_cute_precision_vs_fp64(
-    num_topk, test_docids, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
+    num_topk, packed, seq_len, sparse_seq_len, sliding_window_size, sink_dtype, scale
 ):
     """Cover the original shape grid with representative sink/scale forward and gradients."""
     _skip_no_sm100()
     pytest.importorskip("flash_attn.cute", reason="gather-attention CuTe tests require FA4")
     check_cute_precision(
-        batch=2,
+        batch=1 if packed else 2,
         num_topk=num_topk,
-        test_docids=test_docids,
+        packed=packed,
         seq_len=seq_len,
         sparse_seq_len=sparse_seq_len,
         sliding_window_size=sliding_window_size,
@@ -428,8 +434,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
         sparse_kv,
         kv_indices,
         sink,
-        None,
-        window,
+        sliding_window_size=window,
         kernel_options={"backend": "cute"},
         scale=scale,
         return_aux=AuxRequest(lse=True),
@@ -443,8 +448,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
         sparse_kv.double(),
         kv_indices,
         sink.double() if sink is not None else None,
-        None,
-        window,
+        sliding_window_size=window,
         impl=Impl.REFERENCE,
         scale=scale,
         return_aux=AuxRequest(lse=True),

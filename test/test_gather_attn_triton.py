@@ -94,7 +94,8 @@ def _make_inputs(
     num_topk: int = 3,
     sliding_window_size: int = 8,
     share_kv: bool = True,
-    doc_ids: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
     dtype: torch.dtype = torch.float32,
     requires_grad: bool = False,
     seed: int = 42,
@@ -122,8 +123,14 @@ def _make_inputs(
         heads, device=device, dtype=dtype, generator=generator, requires_grad=requires_grad
     )
 
-    if doc_ids is not None:
-        doc_ids = doc_ids.to(device)
+    if cu_seqlens is not None:
+        for doc in range(cu_seqlens.numel() - 1):
+            start, end = cu_seqlens[doc : doc + 2].tolist()
+            pool_length = int(cu_seqlens_k[doc + 1] - cu_seqlens_k[doc])
+            scores = torch.randn(1, end - start, pool_length, device=device, generator=generator)
+            kv_indices[:, start:end] = scores.topk(num_topk, dim=-1).indices
+        cu_seqlens = cu_seqlens.to(device)
+        cu_seqlens_k = cu_seqlens_k.to(device)
 
     return {
         "query": query,
@@ -131,7 +138,8 @@ def _make_inputs(
         "sparse_kv": sparse_kv,
         "kv_indices": kv_indices,
         "attention_sink": attention_sink,
-        "doc_ids": doc_ids,
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_k": cu_seqlens_k,
         "sliding_window_size": sliding_window_size,
     }
 
@@ -162,22 +170,21 @@ def test_triton_forward_matches_reference(share_kv, num_topk, head_dim, scale):
 
 @pytest.mark.parametrize("share_kv", [False, True])
 @pytest.mark.parametrize("num_topk", [0, 2])
-def test_triton_forward_with_doc_ids(share_kv, num_topk):
-    """Triton forward with doc_ids matches the eager reference."""
+def test_triton_forward_with_cu_seqlens(share_kv, num_topk):
+    """Triton forward with packed offsets matches the eager reference."""
     _skip_no_cuda()
     seq_len = 32
-    doc_ids = (
-        torch.cat(
-            [
-                torch.zeros(seq_len // 2, dtype=torch.long),
-                torch.ones(seq_len // 2, dtype=torch.long),
-            ]
-        )
-        .unsqueeze(0)
-        .expand(2, -1)
-    )
+    cu_seqlens = torch.tensor([0, seq_len // 2, seq_len], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 8, 16], dtype=torch.int32)
 
-    inputs = _make_inputs(share_kv=share_kv, num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids)
+    inputs = _make_inputs(
+        batch=1,
+        share_kv=share_kv,
+        num_topk=num_topk,
+        seq_len=seq_len,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+    )
 
     with torch.inference_mode():
         expected = gather_attn(**inputs, impl=Impl.REFERENCE)
@@ -234,26 +241,30 @@ def test_triton_backward(share_kv, num_topk, sliding_window_size, scale):
 
 
 @pytest.mark.parametrize("num_topk", [0, 2])
-def test_triton_backward_with_doc_ids(num_topk):
-    """Triton backward with doc_ids matches the reference."""
+def test_triton_backward_with_cu_seqlens(num_topk):
+    """Triton backward with packed offsets matches the reference."""
     _skip_no_cuda()
     seq_len = 32
-    doc_ids = (
-        torch.cat(
-            [
-                torch.zeros(seq_len // 2, dtype=torch.long),
-                torch.ones(seq_len // 2, dtype=torch.long),
-            ]
-        )
-        .unsqueeze(0)
-        .expand(2, -1)
-    )
+    cu_seqlens = torch.tensor([0, seq_len // 2, seq_len], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 8, 16], dtype=torch.int32)
 
     inputs_ref = _make_inputs(
-        num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
+        batch=1,
+        num_topk=num_topk,
+        seq_len=seq_len,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        requires_grad=True,
+        seed=999,
     )
     inputs_tri = _make_inputs(
-        num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
+        batch=1,
+        num_topk=num_topk,
+        seq_len=seq_len,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        requires_grad=True,
+        seed=999,
     )
 
     out_ref = gather_attn(**inputs_ref, impl=Impl.REFERENCE)
@@ -296,8 +307,7 @@ def test_empty_sliding_window(sliding_window_size):
         sparse_kv,
         kv_indices,
         sink,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
     )
     out_triton = gather_attn(
@@ -306,8 +316,7 @@ def test_empty_sliding_window(sliding_window_size):
         sparse_kv,
         kv_indices,
         sink,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         kernel_options={"backend": "triton"},
     )
 
@@ -426,8 +435,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         sparse_kv_64,
         kv_indices,
         sink_64,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
         scale=scale,
     )
@@ -437,8 +445,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         sparse_kv_lp_ref,
         kv_indices,
         sink_lp_ref,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         impl=Impl.REFERENCE,
         scale=scale,
     )
@@ -448,8 +455,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         sparse_kv_lp_tri,
         kv_indices,
         sink_lp_tri,
-        None,
-        sliding_window_size,
+        sliding_window_size=sliding_window_size,
         kernel_options={"backend": "triton"},
         scale=scale,
     )
