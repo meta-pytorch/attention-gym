@@ -161,7 +161,8 @@ def gather_attn(
 
         kv, cu_q, cu_kv = pack_kv(local_kv, sparse_kv, cu_seqlens, cu_seqlens_k)
         out, lse = flash_attn_varlen_func(
-            q=query[0].transpose(0, 1),
+            # Use squeeze: indexing query[0] would copy a full query gradient in backward.
+            q=query.squeeze(0).transpose(0, 1),
             k=kv,
             v=kv,
             cu_seqlens_q=cu_q,

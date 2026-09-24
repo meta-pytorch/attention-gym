@@ -494,3 +494,37 @@ def test_packed_cute_native_varlen_replays_offsets_and_gradients(monkeypatch):
         expected = run()
         for result, reference in zip(actual, expected):
             torch.testing.assert_close(result, reference)
+
+
+def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
+    """Dropping the singleton batch must not allocate and copy a full query gradient."""
+    _device("cute")
+    from flash_attn.cute import interface
+
+    native = interface.flash_attn_varlen_func
+    native_queries = []
+
+    def capture_query(*args, **kwargs):
+        native_queries.append(kwargs["q"])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "flash_attn_varlen_func", capture_query)
+    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512)
+    query, local, sparse, sink = tensors
+    gather_attn(
+        query,
+        local,
+        sparse,
+        indices,
+        sink,
+        sliding_window_size=7,
+        cu_seqlens=cu_q,
+        cu_seqlens_k=cu_k,
+        kernel_options={"backend": "cute"},
+    )
+    incoming = torch.randn_like(native_queries[0])
+    (grad_query,) = torch.autograd.grad(native_queries[0], query, incoming)
+    torch.testing.assert_close(grad_query, incoming.transpose(0, 1).unsqueeze(0))
+    grad_storage = grad_query.untyped_storage().data_ptr()
+    incoming_storage = incoming.untyped_storage().data_ptr()
+    assert grad_storage == incoming_storage
