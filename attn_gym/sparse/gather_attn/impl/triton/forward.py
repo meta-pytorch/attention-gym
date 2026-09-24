@@ -427,15 +427,6 @@ GENERIC_FORWARD_TILES = (
 )
 
 
-def generic_forward_tiles(head_dim: int, element_size: int, device: torch.device) -> TileConfig:
-    """Choose tiles for the head-parallel forward schedules."""
-    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
-    if head_dim == 512:
-        return TileConfig(16, 16, 4, 1)
-    block_d = max(16, triton.next_power_of_2(head_dim))
-    return select_tiles(GENERIC_FORWARD_TILES, block_d, element_size, device)
-
-
 def _launch_forward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -495,8 +486,11 @@ def _launch_forward(
         )
         return output, lse
 
-    block_m, block_n, num_warps, num_stages, _ = generic_forward_tiles(
-        head_dim, query.element_size(), query.device
+    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
+    block_m, block_n, num_warps, num_stages, _ = (
+        TileConfig(16, 16, 4, 1)
+        if head_dim == 512
+        else select_tiles(GENERIC_FORWARD_TILES, block_d, query.element_size(), query.device)
     )
     num_local_tiles = (
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0

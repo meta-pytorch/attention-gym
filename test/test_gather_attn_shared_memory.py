@@ -8,10 +8,9 @@ small-budget tiles on the local GPU against the eager reference.
 
 import pytest
 import torch
-import triton
 
 from attn_gym.sparse.gather_attn import Impl, gather_attn
-from attn_gym.testing.triton_budget import EmulatedDeviceProperties, compile_only_for_target
+from attn_gym.testing.triton_budget import compile_only_for_target, emulate_device_dispatch
 
 SM86_CAPABILITY = (8, 6)
 SM86_MAX_SHARED_MEMORY = 101376
@@ -76,9 +75,9 @@ def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk):
     assert {"_gather_attn_fwd", "_gather_attn_bwd_dq", "_gather_attn_bwd_dlocal_kv"} <= kernels
     assert ("_gather_attn_bwd_dsparse_kv" in kernels) == (topk > 0)
     too_large = {
-        launch.kernel: launch.min_shared
+        launch.kernel: min(launch.shared)
         for launch in launches
-        if launch.min_shared > SM86_MAX_SHARED_MEMORY
+        if min(launch.shared) > SM86_MAX_SHARED_MEMORY
     }
     assert not too_large
 
@@ -87,36 +86,25 @@ def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk):
     "head_dim,window,dtype",
     [(256, 64, torch.bfloat16), (128, 64, torch.bfloat16), (256, 64, torch.float32)],
 )
-def test_sm86_tiles_match_reference(monkeypatch, head_dim, window, dtype):
+def test_sm86_tiles_match_reference(head_dim, window, dtype):
     """The tiles selected for a 99 KiB budget compute the same forward and gradients."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for Triton")
-    real_get_device_properties = torch.cuda.get_device_properties
-    # Take the SM86 host path (no TMA, no Blackwell schedule) but compile for the local GPU;
-    # Triton derives its target from torch.cuda.get_device_capability, so pin it first.
-    local_target = triton.runtime.driver.active.get_current_target()
-    monkeypatch.setattr(triton.runtime.driver.active, "get_current_target", lambda: local_target)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: SM86_CAPABILITY)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device=None: EmulatedDeviceProperties(
-            real_get_device_properties(device), SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY
-        ),
-    )
     inputs = make_inputs(4, head_dim, topk=8, dtype=dtype)
     reference_inputs = {
         name: value.detach().double().requires_grad_() if value.is_floating_point() else value
         for name, value in inputs.items()
     }
-
-    output = gather_attn(
-        **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}
-    )
     expected = gather_attn(**reference_inputs, sliding_window_size=window, impl=Impl.REFERENCE)
     grad_output = torch.randn_like(expected)
-    output.backward(grad_output.to(output.dtype))
     expected.backward(grad_output)
+
+    # Take the SM86 host path (no TMA, no Blackwell schedule) on the local GPU.
+    with emulate_device_dispatch(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY):
+        output = gather_attn(
+            **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}
+        )
+        output.backward(grad_output.to(output.dtype))
 
     tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)

@@ -553,20 +553,6 @@ GENERIC_DLOCAL_KV_TILES = (
 )
 
 
-def generic_backward_tiles(
-    head_dim: int, element_size: int, device: torch.device
-) -> tuple[TileConfig, TileConfig]:
-    """Choose tiles for the query-gradient and local-KV-gradient kernels."""
-    # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
-    if head_dim == 512:
-        return TileConfig(16, 16, 4, 1), TileConfig(16, 16, 4, 1)
-    block_d = max(16, triton.next_power_of_2(head_dim))
-    return (
-        select_tiles(GENERIC_DQ_TILES, block_d, element_size, device),
-        select_tiles(GENERIC_DLOCAL_KV_TILES, block_d, element_size, device),
-    )
-
-
 def _launch_backward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -587,8 +573,15 @@ def _launch_backward(
     batch, heads, seq_len, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     topk = kv_indices.shape[-1]
-    dq_tiles, dlocal_tiles = generic_backward_tiles(head_dim, query.element_size(), query.device)
     block_d = max(16, triton.next_power_of_2(head_dim))
+    # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
+    if head_dim == 512:
+        dq_tiles = dlocal_tiles = TileConfig(16, 16, 4, 1)
+    else:
+        dq_tiles = select_tiles(GENERIC_DQ_TILES, block_d, query.element_size(), query.device)
+        dlocal_tiles = select_tiles(
+            GENERIC_DLOCAL_KV_TILES, block_d, query.element_size(), query.device
+        )
     grad_output = grad_output.contiguous()
 
     grad_query = torch.empty_like(query)

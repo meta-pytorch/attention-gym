@@ -1,7 +1,8 @@
-"""Compile Triton launches for another GPU target and report their shared-memory needs.
+"""Check which Triton launches another GPU would select, and their shared-memory needs.
 
-Kernels are compiled for the requested target but never launched, so a GB300 host can check
-which configurations an A10G (SM86) would select and whether they fit its per-block limit.
+``compile_only_for_target`` compiles launches for the emulated target without running them, so
+a GB300 host can check which configurations an A10G (SM86) would select and whether they fit
+its per-block limit.
 """
 
 from collections import defaultdict
@@ -17,25 +18,12 @@ from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
 
-@dataclass(frozen=True)
-class CompiledConfig:
-    """Resources of one compiled kernel specialization."""
-
-    num_warps: int
-    num_stages: int
-    shared: int
-
-
 @dataclass
 class Launch:
     """One host launch: a fixed config, or every config its autotuner may benchmark."""
 
     kernel: str
-    configs: list[CompiledConfig] = field(default_factory=list)
-
-    @property
-    def min_shared(self) -> int:
-        return min(config.shared for config in self.configs)
+    shared: list[int] = field(default_factory=list)
 
 
 class EmulatedDeviceProperties:
@@ -51,22 +39,14 @@ class EmulatedDeviceProperties:
 
 
 @contextmanager
-def compile_only_for_target(
-    capability: tuple[int, int], max_shared_mem: int
-) -> Iterator[list[Launch]]:
-    """Record Triton launches as compile-only builds for ``capability``.
+def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) -> Iterator[None]:
+    """Make host dispatch see ``capability`` and ``max_shared_mem`` while compiling locally.
 
-    Within the context, ``torch.cuda.get_device_capability`` and ``get_device_properties``
-    report the emulated capability and opt-in shared memory per block, so host dispatch takes
-    that device's path. Patched launches never run: their outputs stay unwritten and only the
-    recorded compile metadata is meaningful. Autotuned launches record every config left after
-    pruning, since the autotuner may pick any of them that fits.
+    ``torch.cuda.get_device_capability`` and ``get_device_properties`` report the emulated
+    device. Triton derives its compile target from the capability, so it is pinned to the
+    local GPU; kernels still run here.
     """
-    target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
-    launches: list[Launch] = []
-    active_autotune: list[Launch] = []
-    replaced_caches: dict[JITFunction, dict] = {}
-    original_jit_run = JITFunction.run
+    local_target = triton.runtime.driver.active.get_current_target()
     real_get_device_properties = torch.cuda.get_device_properties
 
     def device_properties(device=None):
@@ -74,19 +54,43 @@ def compile_only_for_target(
             real_get_device_properties(device), capability, max_shared_mem
         )
 
+    with (
+        mock.patch.object(
+            triton.runtime.driver.active, "get_current_target", return_value=local_target
+        ),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
+        mock.patch.object(torch.cuda, "get_device_properties", device_properties),
+    ):
+        yield
+
+
+@contextmanager
+def compile_only_for_target(
+    capability: tuple[int, int], max_shared_mem: int
+) -> Iterator[list[Launch]]:
+    """Record Triton launches as compile-only builds for ``capability``.
+
+    Host dispatch is emulated as in ``emulate_device_dispatch``, but kernels compile for the
+    emulated target and never run: outputs stay unwritten and only the recorded shared memory
+    is meaningful. Autotuned launches record every config left after pruning, since the
+    autotuner may pick any of them that fits.
+    """
+    target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
+    launches: list[Launch] = []
+    active_autotune: list[Launch] = []
+    replaced_caches: dict[JITFunction, dict] = {}
+    original_jit_run = JITFunction.run
+
     def jit_run(self, *args, grid, warmup, **kwargs):
         # Compiled kernels and the target are cached per device; keep emulated builds apart.
         if self not in replaced_caches:
             replaced_caches[self] = self.device_caches
             self.device_caches = defaultdict(self.create_binder)
         kernel = original_jit_run(self, *args, grid=grid, warmup=True, **kwargs)
-        compiled = CompiledConfig(
-            kernel.metadata.num_warps, kernel.metadata.num_stages, kernel.metadata.shared
-        )
         if active_autotune:
-            active_autotune[0].configs.append(compiled)
+            active_autotune[0].shared.append(kernel.metadata.shared)
         else:
-            launches.append(Launch(self.__name__, [compiled]))
+            launches.append(Launch(self.__name__, [kernel.metadata.shared]))
         return kernel
 
     def autotune_run(self, *args, **kwargs):
@@ -103,13 +107,12 @@ def compile_only_for_target(
 
     try:
         with (
+            emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
             mock.patch.object(Autotuner, "run", autotune_run),
             mock.patch.object(
                 triton.runtime.driver.active, "get_current_target", return_value=target
             ),
-            mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
-            mock.patch.object(torch.cuda, "get_device_properties", device_properties),
         ):
             yield launches
     finally:
