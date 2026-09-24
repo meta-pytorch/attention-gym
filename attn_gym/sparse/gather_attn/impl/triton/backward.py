@@ -8,11 +8,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from attn_gym._backends.triton.utils import can_use_tma
 
 from .primitives import (
+    TileConfig,
     can_use_shared_kv_schedule,
     causal_window_mask,
     load_bhsd,
     load_bs,
     prune_wide_backward_configs,
+    select_tiles,
     store_bhsd,
 )
 from .shared_backward import (
@@ -535,6 +537,22 @@ def _build_index_query_map(
     return selected_queries.contiguous(), block_offsets.contiguous()
 
 
+# Preferred first; later entries fit smaller shared memory (e.g. SM80, or SM86 at D=256).
+# Software-pipelined query tiles make the local-KV gradient the largest consumer.
+GENERIC_DQ_TILES = (
+    TileConfig(64, 32, 8, 3, shared_rows=208),
+    TileConfig(64, 32, 8, 2, shared_rows=192),
+    TileConfig(32, 32, 4, 2, shared_rows=112),
+    TileConfig(16, 16, 4, 1, shared_rows=64),
+)
+GENERIC_DLOCAL_KV_TILES = (
+    TileConfig(64, 32, 8, 3, shared_rows=484),
+    TileConfig(64, 32, 8, 2, shared_rows=290),
+    TileConfig(32, 32, 4, 2, shared_rows=177),
+    TileConfig(16, 16, 4, 1, shared_rows=68),
+)
+
+
 def _launch_backward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -555,9 +573,15 @@ def _launch_backward(
     batch, heads, seq_len, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
     topk = kv_indices.shape[-1]
-    # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
-    block_m, block_n, num_warps, num_stages = (16, 16, 4, 1) if head_dim == 512 else (64, 32, 8, 3)
     block_d = max(16, triton.next_power_of_2(head_dim))
+    # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
+    if head_dim == 512:
+        dq_tiles = dlocal_tiles = TileConfig(16, 16, 4, 1)
+    else:
+        dq_tiles = select_tiles(GENERIC_DQ_TILES, block_d, query.element_size(), query.device)
+        dlocal_tiles = select_tiles(
+            GENERIC_DLOCAL_KV_TILES, block_d, query.element_size(), query.device
+        )
     grad_output = grad_output.contiguous()
 
     grad_query = torch.empty_like(query)
@@ -570,7 +594,9 @@ def _launch_backward(
     use_tma = can_use_tma(query) and can_use_tma(local_kv) and can_use_tma(grad_output)
 
     num_local_query_tiles = (
-        triton.cdiv(sliding_window_size + block_n - 1, block_m) if sliding_window_size else 0
+        triton.cdiv(sliding_window_size + dlocal_tiles.block_n - 1, dlocal_tiles.block_m)
+        if sliding_window_size
+        else 0
     )
 
     # Zero head strides share values; share_kv also guarantees autograd will sum dKV heads.
@@ -617,6 +643,7 @@ def _launch_backward(
         )
         grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
     else:
+        block_m, block_n, num_warps, num_stages, _ = dq_tiles
         num_local_key_tiles = (
             triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
         )
@@ -662,6 +689,7 @@ def _launch_backward(
         )
         grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
 
+    block_m, block_n, num_warps, num_stages, _ = dlocal_tiles
     local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
     if use_tma:
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
