@@ -1,4 +1,4 @@
-"""Triton primitives shared by selected-attention kernel schedules."""
+"""Triton primitives shared by gather-attention kernel schedules."""
 
 import torch
 import triton
@@ -53,7 +53,7 @@ def load_bhsd(
     offsets_d,
     mask,
 ):
-    """Load a tile from selected attention's BHSD tensors."""
+    """Load a tile from gather attention's BHSD tensors."""
     return tl.load(
         tensor_ptr
         + ptr_offset(
@@ -74,7 +74,7 @@ def load_bs(
     mask,
     other: tl.constexpr,
 ):
-    """Load positions from a selected-attention batch-sequence tensor."""
+    """Load positions from a gather-attention batch-sequence tensor."""
     return tl.load(
         tensor_ptr + ptr_offset((batch, positions), strides),
         mask=mask,
@@ -93,7 +93,7 @@ def store_bhsd(
     offsets_d,
     mask,
 ):
-    """Store a tile to selected attention's BHSD tensors."""
+    """Store a tile to gather attention's BHSD tensors."""
     tl.store(
         tensor_ptr
         + ptr_offset(
@@ -113,7 +113,7 @@ def causal_window_mask(
     key_mask,
     window: tl.constexpr,
 ):
-    """Mask valid selected-attention pairs to the causal local window."""
+    """Mask valid gather-attention pairs to the causal local window."""
     return (
         query_mask[:, None]
         & key_mask[None, :]
@@ -124,7 +124,7 @@ def causal_window_mask(
 
 @triton.jit
 def online_softmax_update(accumulator, running_max, running_sum, logits, values):
-    """Merge one selected-attention tile into FP32 online-softmax state."""
+    """Merge one gather-attention tile into FP32 online-softmax state."""
     tile_max = tl.max(logits, axis=1)
     new_max = tl.maximum(running_max, tile_max)
     # An empty prefix with no sink has max=-inf. Keep that state for later tiles,

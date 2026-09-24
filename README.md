@@ -63,7 +63,7 @@ Attention Gym supports three complementary workflows:
    [`mask_mod`](attn_gym/masks) and [`score_mod`](attn_gym/mods) functions and pass them directly
    to PyTorch's FlexAttention APIs.
 2. **Use sparse and linear-attention APIs and kernels.** Build with
-   [`selected_attention`](attn_gym/sparse/selected_attention), GDN and KDA chunk, recurrent, and
+   [`gather_attn`](attn_gym/sparse/gather_attn), GDN and KDA chunk, recurrent, and
    decode paths, and short-convolution primitives. See the
    [compressed sparse attention](examples/sparse/compressed_sparse_attention.py) and
    [delta-rule (KDA/GDN) training](examples/linear/delta_rule_training.py) for working examples.

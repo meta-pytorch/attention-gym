@@ -101,7 +101,7 @@ def test_dependency_preflight_gates_full_suite(
     assert "preflight" in summary
     first_call = execute.call_args_list[0]
     assert first_call.args[0] == [
-        "test/test_selected_attention_cute.py::test_cute_dependency_smoke[forced-sink]"
+        "test/test_gather_attn_cute.py::test_cute_dependency_smoke[forced-sink]"
     ]
     assert first_call.kwargs == {"workers": 0}
     assert execute.call_count == (1 if preflight_code else 2)

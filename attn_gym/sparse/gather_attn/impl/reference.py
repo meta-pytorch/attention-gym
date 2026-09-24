@@ -1,4 +1,4 @@
-"""Torch-only selected attention reference implementation."""
+"""Torch-only gather attention reference implementation."""
 
 import torch
 from torch import Tensor
@@ -63,7 +63,7 @@ def make_packed_mask(
     return mask[:, None, :, :]
 
 
-def selected_attention(
+def gather_attn(
     query: Tensor,
     local_kv: Tensor,
     sparse_kv: Tensor,
@@ -76,7 +76,7 @@ def selected_attention(
     scale: float,
 ) -> tuple[Tensor, Tensor]:
     """
-    Performs selected attention as follows:
+    Performs gather attention as follows:
         if share_kv:
             expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
         For each token, Q_i, in query:

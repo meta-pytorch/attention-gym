@@ -1,6 +1,6 @@
 """
 To check reference bf16 vs triton bf16 diffs, run:
-python -m pytest test/test_selected_attention_triton.py::test_precision_vs_fp64 -v -s
+python -m pytest test/test_gather_attn_triton.py::test_precision_vs_fp64 -v -s
 
 Inputs are generated in the target dtype first, then promoted to FP64 via .double()
 so that eager, Triton, and FP64 all see the same quantized values. This isolates
@@ -12,14 +12,14 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
+from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
 
 ATOL_FWD = 1e-2
 RTOL_FWD = 1e-2
 ATOL_BWD = 1e-2
 RTOL_BWD = 1e-2
 
-pytestmark = pytest.mark.usefixtures("selected_attention_single_config")
+pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
 
 
 def _skip_no_cuda():
@@ -154,8 +154,8 @@ def test_triton_forward_matches_reference(share_kv, num_topk, head_dim, scale):
     )
 
     with torch.inference_mode():
-        expected = selected_attention(**inputs, impl=Impl.REFERENCE, scale=scale)
-        actual = selected_attention(**inputs, kernel_options={"backend": "triton"}, scale=scale)
+        expected = gather_attn(**inputs, impl=Impl.REFERENCE, scale=scale)
+        actual = gather_attn(**inputs, kernel_options={"backend": "triton"}, scale=scale)
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -180,8 +180,8 @@ def test_triton_forward_with_doc_ids(share_kv, num_topk):
     inputs = _make_inputs(share_kv=share_kv, num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids)
 
     with torch.inference_mode():
-        expected = selected_attention(**inputs, impl=Impl.REFERENCE)
-        actual = selected_attention(**inputs, kernel_options={"backend": "triton"})
+        expected = gather_attn(**inputs, impl=Impl.REFERENCE)
+        actual = gather_attn(**inputs, kernel_options={"backend": "triton"})
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -216,8 +216,8 @@ def test_triton_backward(share_kv, num_topk, sliding_window_size, scale):
         seed=42,
     )
 
-    out_ref = selected_attention(**inputs_ref, impl=Impl.REFERENCE, scale=scale)
-    out_tri = selected_attention(**inputs_tri, kernel_options={"backend": "triton"}, scale=scale)
+    out_ref = gather_attn(**inputs_ref, impl=Impl.REFERENCE, scale=scale)
+    out_tri = gather_attn(**inputs_tri, kernel_options={"backend": "triton"}, scale=scale)
 
     grad_gen = torch.Generator(device=out_ref.device).manual_seed(7777)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
@@ -256,8 +256,8 @@ def test_triton_backward_with_doc_ids(num_topk):
         num_topk=num_topk, seq_len=seq_len, doc_ids=doc_ids, requires_grad=True, seed=999
     )
 
-    out_ref = selected_attention(**inputs_ref, impl=Impl.REFERENCE)
-    out_tri = selected_attention(**inputs_tri, kernel_options={"backend": "triton"})
+    out_ref = gather_attn(**inputs_ref, impl=Impl.REFERENCE)
+    out_tri = gather_attn(**inputs_tri, kernel_options={"backend": "triton"})
 
     grad_gen = torch.Generator(device=out_ref.device).manual_seed(4444)
     grad_output = torch.randn(out_ref.shape, device=out_ref.device, generator=grad_gen)
@@ -290,7 +290,7 @@ def test_empty_sliding_window(sliding_window_size):
     # All slots repeat position 2
     kv_indices = torch.full((b, s, 1), 2, dtype=torch.long, device=device)
 
-    out_eager = selected_attention(
+    out_eager = gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -300,7 +300,7 @@ def test_empty_sliding_window(sliding_window_size):
         sliding_window_size,
         impl=Impl.REFERENCE,
     )
-    out_triton = selected_attention(
+    out_triton = gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -321,8 +321,8 @@ def test_triton_forward_half_precision(dtype):
     inputs = _make_inputs(dtype=dtype, num_topk=2)
 
     with torch.inference_mode():
-        expected = selected_attention(**inputs, impl=Impl.REFERENCE)
-        actual = selected_attention(**inputs, kernel_options={"backend": "triton"})
+        expected = gather_attn(**inputs, impl=Impl.REFERENCE)
+        actual = gather_attn(**inputs, kernel_options={"backend": "triton"})
 
     # Wider tolerance for half precision
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
@@ -342,8 +342,8 @@ def test_triton_larger_sequence():
     )
 
     with torch.inference_mode():
-        expected = selected_attention(**inputs, impl=Impl.REFERENCE)
-        actual = selected_attention(**inputs, kernel_options={"backend": "triton"})
+        expected = gather_attn(**inputs, impl=Impl.REFERENCE)
+        actual = gather_attn(**inputs, kernel_options={"backend": "triton"})
 
     torch.testing.assert_close(actual, expected, atol=ATOL_FWD, rtol=RTOL_FWD)
 
@@ -420,7 +420,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
     sink_lp_tri = sink_lp.clone().requires_grad_(True)
 
     # --- Forward (fp64 reference as ground truth) ---
-    out_64 = selected_attention(
+    out_64 = gather_attn(
         query_64,
         local_kv_64,
         sparse_kv_64,
@@ -431,7 +431,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         impl=Impl.REFERENCE,
         scale=scale,
     )
-    out_lp_ref = selected_attention(
+    out_lp_ref = gather_attn(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
@@ -442,7 +442,7 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
         impl=Impl.REFERENCE,
         scale=scale,
     )
-    out_lp_tri = selected_attention(
+    out_lp_tri = gather_attn(
         query_lp_tri,
         local_kv_lp_tri,
         sparse_kv_lp_tri,
@@ -586,10 +586,10 @@ def test_triton_fp32_row_reductions(heads, head_dim, share_kv):
         else value
         for name, value in inputs.items()
     }
-    _, reference_aux = selected_attention(
+    _, reference_aux = gather_attn(
         **reference_inputs, impl=Impl.REFERENCE, scale=0.25, return_aux=AuxRequest(lse=True)
     )
-    output, aux = selected_attention(
+    output, aux = gather_attn(
         **inputs, kernel_options={"backend": "triton"}, scale=0.25, return_aux=AuxRequest(lse=True)
     )
     # FP32 dot/reduction/exp/log error, with no BF16 intermediate in the LSE path.
@@ -635,7 +635,7 @@ def test_triton_deterministic_sink_gradient():
     try:
         grads = []
         for _ in range(5):
-            output = selected_attention(**inputs, kernel_options={"backend": "triton"})
+            output = gather_attn(**inputs, kernel_options={"backend": "triton"})
             grads.append(torch.autograd.grad(output, differentiable, grad_output))
     finally:
         torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)

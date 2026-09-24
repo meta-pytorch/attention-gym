@@ -76,7 +76,7 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 ```
 
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
-has no gradient function. Selected attention can train its own Q/K/V computation with
+has no gradient function. Gather attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
 into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
 or indexer-training loss.

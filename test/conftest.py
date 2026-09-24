@@ -92,7 +92,7 @@ def paged_short_conv_inputs() -> Callable[..., tuple[torch.Tensor, ...]]:
 
 
 @pytest.fixture
-def selected_attention_single_config(
+def gather_attn_single_config(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
@@ -106,7 +106,7 @@ def selected_attention_single_config(
 
     from triton.runtime.autotuner import Autotuner
 
-    from attn_gym.sparse.selected_attention.impl.triton import backward, forward, shared_backward
+    from attn_gym.sparse.gather_attn.impl.triton import backward, forward, shared_backward
 
     tuners = tuple(
         {

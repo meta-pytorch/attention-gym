@@ -1,5 +1,5 @@
 """
-Compose compressed sparse attention from the selected-attention primitive.
+Compose compressed sparse attention from the gather-attention primitive.
 Implementation of compressed sparse attention from here: https://arxiv.org/html/2606.19348v1
 """
 
@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from attn_gym.sparse.selected_attention import Impl, selected_attention
+from attn_gym.sparse.gather_attn import Impl, gather_attn
 
 
 def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
@@ -175,7 +175,7 @@ def apply_rope(
     return torch.view_as_real(x_complex * frequencies_complex).flatten(-2)
 
 
-def _selected_attention_with_causal_blocks(
+def _gather_attn_with_causal_blocks(
     query,
     local_kv,
     sparse_kv,
@@ -186,7 +186,7 @@ def _selected_attention_with_causal_blocks(
     *,
     return_aux=None,
 ):
-    """Call selected_attention while preserving the completed-block constraint.
+    """Call gather_attn while preserving the completed-block constraint.
 
     Invalid (causally unavailable) selections are replaced with -1 sentinels.
     """
@@ -197,7 +197,7 @@ def _selected_attention_with_causal_blocks(
     # Replace causally invalid selections with -1 sentinel
     causal_topk_blocks = torch.where(selected_is_valid, topk_blocks, -1)
 
-    attn_result = selected_attention(
+    attn_result = gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -354,7 +354,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output, _selected_is_valid = _selected_attention_with_causal_blocks(
+    attention_output, _selected_is_valid = _gather_attn_with_causal_blocks(
         Q,
         KV,
         compressed_kv,
@@ -386,7 +386,7 @@ def indexer_loss(
         main_query: (B, H, S, D) — main attention queries (detached).
         selected_compressed_kv: (B, H, S, K, D) — the K compressed keys selected
             by the indexer for each query position (detached).
-        attention_lse: (B, H, S) — log-sum-exp returned by selected_attention.
+        attention_lse: (B, H, S) — log-sum-exp returned by gather_attn.
             This includes the sliding window, sparse, AND sink contributions.
         selected_indexer_logits: (B, S, K) — raw logits the indexer produced for
             the K selected keys.

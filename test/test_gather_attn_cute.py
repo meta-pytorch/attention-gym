@@ -1,5 +1,5 @@
 """
-Tests for the CuTe DSL (SM100/SM103) backend of selected attention.
+Tests for the CuTe DSL (SM100/SM103) backend of gather attention.
 
 Validates forward and backward precision against an FP64 eager baseline.
 CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
@@ -14,8 +14,8 @@ import math
 import pytest
 import torch
 
-from attn_gym.sparse.selected_attention import AuxRequest, Impl, selected_attention
-from attn_gym.sparse.selected_attention.impl.cute import SUPPORTED_CAPABILITIES
+from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
+from attn_gym.sparse.gather_attn.impl.cute import SUPPORTED_CAPABILITIES
 from attn_gym.testing.kda import assert_relative_rms_within
 
 
@@ -65,7 +65,7 @@ def assert_matches_low_precision_eager(
     assert_relative_rms_within(
         actual,
         high_precision_expected,
-        "selected_attention",
+        "gather_attn",
         max_eps=2,
         source_dtype=computation_dtype or actual.dtype,
     )
@@ -157,7 +157,7 @@ def check_cute_precision(
     sink_cute = sink.detach().requires_grad_(True) if sink is not None else None
 
     # --- Forward ---
-    out_64 = selected_attention(
+    out_64 = gather_attn(
         query_64,
         local_kv_64,
         sparse_kv_64,
@@ -168,7 +168,7 @@ def check_cute_precision(
         impl=Impl.REFERENCE,
         scale=scale,
     )
-    out_lp_ref = selected_attention(
+    out_lp_ref = gather_attn(
         query_lp_ref,
         local_kv_lp_ref,
         sparse_kv_lp_ref,
@@ -179,7 +179,7 @@ def check_cute_precision(
         impl=Impl.REFERENCE,
         scale=scale,
     )
-    out_lp_cute = selected_attention(
+    out_lp_cute = gather_attn(
         query_lp_cute,
         local_kv_lp_cute,
         sparse_kv_lp_cute,
@@ -265,8 +265,8 @@ def check_cute_precision(
 )
 def test_cute_dependency_smoke(heads, kernel_options, sink_dtype):
     """Exercise auto dispatch through the real FA4 forward and backward, when supported."""
-    from attn_gym.sparse.selected_attention.api import _select_backend
-    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
+    from attn_gym.sparse.gather_attn.api import _select_backend
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
 
     _skip_no_sm100()
     if not _fa4_available(with_sink=sink_dtype is not None, padded_heads=heads != 128):
@@ -297,8 +297,8 @@ def test_cute_dependency_smoke(heads, kernel_options, sink_dtype):
 @pytest.mark.parametrize("kernel_options", [None, {"backend": "cute"}], ids=["auto", "forced"])
 @pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn-only"])
 def test_cute_determinism_enabled_after_forward(kernel_options, warn_only):
-    from attn_gym.sparse.selected_attention.api import _select_backend
-    from attn_gym.sparse.selected_attention.impl.cute import _fa4_available
+    from attn_gym.sparse.gather_attn.api import _select_backend
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
 
     _skip_no_sm100()
     if not _fa4_available(with_sink=False):
@@ -311,7 +311,7 @@ def test_cute_determinism_enabled_after_forward(kernel_options, warn_only):
     try:
         torch.use_deterministic_algorithms(False)
         assert _select_backend(query, None, True, num_keys=6) == "cute"
-        out, aux = selected_attention(
+        out, aux = gather_attn(
             query,
             kv,
             kv,
@@ -368,7 +368,7 @@ def test_cute_precision_vs_fp64(
 ):
     """Cover the original shape grid with representative sink/scale forward and gradients."""
     _skip_no_sm100()
-    pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
+    pytest.importorskip("flash_attn.cute", reason="gather-attention CuTe tests require FA4")
     check_cute_precision(
         batch=2,
         num_topk=num_topk,
@@ -402,7 +402,7 @@ def test_cute_precision_vs_fp64(
 def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     """Returned LSE from CuTe backend matches manual logsumexp over all logits."""
     _skip_no_sm100()
-    pytest.importorskip("flash_attn.cute", reason="selected-attention CuTe tests require FA4")
+    pytest.importorskip("flash_attn.cute", reason="gather-attention CuTe tests require FA4")
     skip_unsupported_cute_sink(sink_dtype)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -422,7 +422,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
         else None
     )
 
-    _, aux_cute = selected_attention(
+    _, aux_cute = gather_attn(
         query,
         local_kv,
         sparse_kv,
@@ -437,7 +437,7 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     lse_cute = aux_cute.lse
 
     # Use the eager backend on the same inputs (promoted to fp64) as ground truth.
-    _, aux_eager = selected_attention(
+    _, aux_eager = gather_attn(
         query.double(),
         local_kv.double(),
         sparse_kv.double(),

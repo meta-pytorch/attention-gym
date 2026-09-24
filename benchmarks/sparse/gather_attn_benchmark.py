@@ -1,9 +1,9 @@
-"""Benchmark selected_attention forward and backward across backends and shapes.
+"""Benchmark gather_attn forward and backward across backends and shapes.
 
 Usage:
-    python benchmarks/sparse/selected_attention_benchmark.py
-    python benchmarks/sparse/selected_attention_benchmark.py --impl fused --backend triton
-    python benchmarks/sparse/selected_attention_benchmark.py --impl reference --batch 4
+    python benchmarks/sparse/gather_attn_benchmark.py
+    python benchmarks/sparse/gather_attn_benchmark.py --impl fused --backend triton
+    python benchmarks/sparse/gather_attn_benchmark.py --impl reference --batch 4
 """
 
 from functools import partial
@@ -13,7 +13,7 @@ import torch
 import triton
 import typer
 
-from attn_gym.sparse.selected_attention import Impl, selected_attention
+from attn_gym.sparse.gather_attn import Impl, gather_attn
 
 DTYPES = {
     "float32": torch.float32,
@@ -85,7 +85,7 @@ def main(
     for name in backend or [None]:
         label = f"fused/{name or 'auto'}" if impl is Impl.FUSED else "reference"
         attention = partial(
-            selected_attention,
+            gather_attn,
             sliding_window_size=window,
             impl=impl,
             kernel_options={"backend": name} if name is not None else None,

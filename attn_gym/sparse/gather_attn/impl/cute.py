@@ -1,4 +1,4 @@
-"""CuTe DSL (SM100/SM103) backend for selected attention.
+"""CuTe DSL (SM100/SM103) backend for gather attention.
 
 Delegates to FlashAttention-4's public ``flash_attn_func`` with
 ``gather_kv_indices`` for index-gather mode.  FA4 owns autograd,
@@ -124,7 +124,7 @@ def is_supported(query, attention_sink, share_kv) -> bool:
 def _check_backward_mode(grad: torch.Tensor) -> torch.Tensor:
     if torch.are_deterministic_algorithms_enabled():
         message = (
-            "CuTe selected attention does not support deterministic backward; "
+            "CuTe gather attention does not support deterministic backward; "
             "use kernel_options={'backend': 'triton'} for the forward call."
         )
         if torch.is_deterministic_algorithms_warn_only_enabled():
@@ -139,7 +139,7 @@ def _check_backward_mode(grad: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def selected_attention(
+def gather_attn(
     query: torch.Tensor,
     local_kv: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -151,7 +151,7 @@ def selected_attention(
     *,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """CuTe DSL (SM100/SM103) forward+backward for selected attention.
+    """CuTe DSL (SM100/SM103) forward+backward for gather attention.
 
     Eager-only — torch.compile is not supported for this backend.
     Optional per-head attention sinks are forwarded to FA4, which owns their gradients.
@@ -163,7 +163,7 @@ def selected_attention(
     if (error := _constraint_violation(query, share_kv)) is not None:
         raise error
     if sliding_window_size + kv_indices.shape[-1] == 0:
-        raise ValueError("CuTe selected attention requires at least one window or selected slot.")
+        raise ValueError("CuTe gather attention requires at least one window or selected slot.")
     from flash_attn.cute.interface import flash_attn_func
 
     gather_indices = _build_gather_indices(
