@@ -8,7 +8,9 @@ One CTA owns one query in the caller's [P, 2, S] FP32 score slab. Candidate,
 head, and reduction tiles bound shared-memory and TMEM usage independently of
 H and D. Separate head/query/batch TMA modes zero-fill tails without reading
 another query or batch. This module allocates no global workspace and performs
-no selection; masked and inactive slab entries remain untouched.
+no selection; masked and inactive slab entries remain untouched. The packed
+entrypoint visits only the absolute M128 tiles covering each query's
+``candidate_bounds[T, 2]`` interval.
 """
 
 import cutlass
@@ -115,6 +117,36 @@ class IndexerGenericScoreKernel:
         score_scale: Float32,
         stream: cuda.CUstream,
     ):
+        """Dense entrypoint: score each query's full or causal candidate prefix."""
+        self.launch(q, k, weights, scores, pair_start, score_scale, None, stream)
+
+    @cute.jit
+    def with_candidate_bounds(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        weights: cute.Tensor,
+        scores: cute.Tensor,
+        pair_start,
+        score_scale: Float32,
+        candidate_bounds: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        """Packed entrypoint: score only each query's ``candidate_bounds`` interval."""
+        self.launch(q, k, weights, scores, pair_start, score_scale, candidate_bounds, stream)
+
+    @cute.jit
+    def launch(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        weights: cute.Tensor,
+        scores: cute.Tensor,
+        pair_start,
+        score_scale: Float32,
+        candidate_bounds: cute.Tensor | None,
+        stream: cuda.CUstream,
+    ):
         """Build boundary-preserving TMA descriptors and launch two CTAs per pair."""
         assert q.element_type in (cutlass.Float16, cutlass.BFloat16)
         assert k.element_type == q.element_type and weights.element_type == q.element_type
@@ -153,7 +185,8 @@ class IndexerGenericScoreKernel:
             self.mma_tile,
             tiled_mma,
         )
-        self.kernel.set_name_prefix(f"{self.get_name()}_{q.element_type.__name__.lower()}")
+        packed = "_packed" if cutlass.const_expr(candidate_bounds is not None) else ""
+        self.kernel.set_name_prefix(f"{self.get_name()}_{q.element_type.__name__.lower()}{packed}")
         self.kernel(
             tiled_mma,
             tma_atom_k,
@@ -167,6 +200,7 @@ class IndexerGenericScoreKernel:
             q_layout,
             self.upcast_offset(pair_start),
             score_scale,
+            candidate_bounds,
         ).launch(
             grid=(self.upcast_offset(scores.shape[0]) * 2, 1, 1),
             block=(self.threads, 1, 1),
@@ -188,6 +222,7 @@ class IndexerGenericScoreKernel:
         q_layout: cute.ComposedLayout,
         pair_start,
         score_scale: Float32,
+        candidate_bounds: cute.Tensor | None,
     ):
         """Guard the whole CTA, initialize pipelines, dispatch roles, and retire TMEM."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -205,7 +240,17 @@ class IndexerGenericScoreKernel:
 
         if active:
             candidate_end = self.visible_candidates(query) if self.causal else num_candidates
-            candidate_tiles = cute.ceil_div(candidate_end, self.tile_candidates)
+            first_tile = self.upcast_offset(0)
+            tile_end = self.upcast_offset(cute.ceil_div(candidate_end, self.tile_candidates))
+            interval = None
+            if cutlass.const_expr(candidate_bounds is not None):
+                start = candidate_bounds[query, 0]
+                end = candidate_bounds[query, 1]
+                interval = (start, end)
+                first_tile = self.upcast_offset(start // self.tile_candidates)
+                tile_end = first_tile
+                if end > start:
+                    tile_end = self.upcast_offset(cute.ceil_div(end, self.tile_candidates))
             smem = SmemAllocator()
             storage = smem.allocate(self.SharedStorage)
             sK = smem.allocate_tensor(
@@ -263,7 +308,9 @@ class IndexerGenericScoreKernel:
                     tidx,
                     query,
                     num_candidates,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
+                    interval,
                     score_scale,
                 )
             elif warp_idx == self.mma_warp:
@@ -272,7 +319,8 @@ class IndexerGenericScoreKernel:
                     accumulator,
                     sK,
                     sQ,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
                     ab_consumer,
                     acc_producer,
                 )
@@ -285,7 +333,8 @@ class IndexerGenericScoreKernel:
                     q[None, None, query, batch],
                     sK,
                     sQ,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
                     ab_producer,
                 )
 
@@ -303,14 +352,15 @@ class IndexerGenericScoreKernel:
         q: cute.Tensor,
         sK: cute.Tensor,
         sQ: cute.Tensor,
-        candidate_tiles,
+        first_tile,
+        tile_end,
         ab_producer,
     ):
         """Stream paired K/Q boxes, including zero-filled head and reduction tails."""
         cpasync.prefetch_descriptor(tma_atom_k)
         cpasync.prefetch_descriptor(tma_atom_q)
         mma_zero = tiled_mma.get_slice(0)
-        for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             for head_tile in cutlass.range(self.head_tiles, unroll=0):
                 tile_coord = (
                     self.upcast_offset(candidate_tile),
@@ -356,14 +406,15 @@ class IndexerGenericScoreKernel:
         accumulator: cute.Tensor,
         sK: cute.Tensor,
         sQ: cute.Tensor,
-        candidate_tiles,
+        first_tile,
+        tile_end,
         ab_consumer,
         acc_producer,
     ):
         """Complete D before publishing each [128, 64] FP32 accumulator tile."""
         fragment_k = tiled_mma.make_fragment_A(sK)
         fragment_q = tiled_mma.make_fragment_B(sQ)
-        for _candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for _candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             for _head_tile in cutlass.range(self.head_tiles, unroll=0):
                 acc_empty = acc_producer.acquire_and_advance()
                 for d_tile in cutlass.range(self.d_tiles, unroll=0):
@@ -398,10 +449,15 @@ class IndexerGenericScoreKernel:
         tidx: Int32,
         query,
         num_candidates,
-        candidate_tiles,
+        first_tile,
+        tile_end,
+        interval,
         score_scale: Float32,
     ):
-        """Keep one candidate's FP32 head sum in registers until its final slab store."""
+        """Keep one candidate's FP32 head sum in registers until its final slab store.
+
+        ``interval`` is the packed query's ``(start, end)`` candidate range, else None.
+        """
         acc_tile = accumulator[(None, None, None, 0)]
         tmem_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tile_heads // 4)),
@@ -418,12 +474,14 @@ class IndexerGenericScoreKernel:
         assert cute.size(logits) == self.tile_heads
         rW = cute.make_rmem_tensor((self.tile_heads,), Float32)
 
-        for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             candidate = (
                 self.upcast_offset(candidate_tile) * self.tile_candidates + coordinates[0][0]
             )
             valid = candidate < num_candidates
-            if cutlass.const_expr(self.causal):
+            if cutlass.const_expr(interval is not None):
+                valid = valid and candidate >= interval[0] and candidate < interval[1]
+            elif cutlass.const_expr(self.causal):
                 valid = valid and candidate < self.visible_candidates(query)
             sum0 = Float32(0.0)
             sum1 = Float32(0.0)

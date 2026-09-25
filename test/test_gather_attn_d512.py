@@ -26,7 +26,8 @@ class AttentionInputs(NamedTuple):
     sparse_kv: torch.Tensor
     kv_indices: torch.Tensor
     attention_sink: torch.Tensor
-    doc_ids: torch.Tensor | None
+    cu_seqlens: torch.Tensor | None
+    cu_seqlens_k: torch.Tensor | None
 
 
 def make_inputs(
@@ -45,7 +46,8 @@ def make_inputs(
 
     generator = torch.Generator(device="cuda").manual_seed(2026)
     kv_heads = 1 if share_kv else heads
-    sparse_seq_len = max(23, topk)
+    doc_starts = list(range(0, seq_len, 11)) if with_docs else [0]
+    sparse_seq_len = max(23, topk, len(doc_starts))
 
     def randn(*shape: int) -> torch.Tensor:
         return torch.randn(
@@ -58,6 +60,21 @@ def make_inputs(
     kv_indices = torch.randint(
         sparse_seq_len, (batch, seq_len, topk), device="cuda", generator=generator
     )
+    cu_seqlens = cu_seqlens_k = None
+    if with_docs:
+        assert batch == 1
+        q_offsets = [*doc_starts, seq_len]
+        k_offsets = [i * sparse_seq_len // len(doc_starts) for i in range(len(doc_starts) + 1)]
+        cu_seqlens = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+        cu_seqlens_k = torch.tensor(k_offsets, device="cuda", dtype=torch.int32)
+        for doc, start in enumerate(doc_starts):
+            end = q_offsets[doc + 1]
+            kv_indices[:, start:end] = torch.randint(
+                k_offsets[doc + 1] - k_offsets[doc],
+                (batch, end - start, topk),
+                device="cuda",
+                generator=generator,
+            )
     if topk:
         kv_indices[:, :, 1] = kv_indices[:, :, 0]
         kv_indices[:, ::3, -1] = -1
@@ -66,14 +83,9 @@ def make_inputs(
     attention_sink = torch.randn(
         heads, device="cuda", dtype=torch.float32, generator=generator, requires_grad=True
     )
-    doc_ids = (
-        (torch.arange(seq_len, device="cuda", dtype=torch.int32) // 11)
-        .unsqueeze(0)
-        .expand(batch, -1)
-        if with_docs
-        else None
+    return AttentionInputs(
+        query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k
     )
-    return AttentionInputs(query, local_kv, sparse_kv, kv_indices, attention_sink, doc_ids)
 
 
 def check_training(
@@ -88,7 +100,7 @@ def check_training(
         can_use_shared_kv_schedule,
     )
 
-    query, local_kv, sparse_kv, kv_indices, sink, _ = inputs
+    query, local_kv, sparse_kv, kv_indices, sink, _, _ = inputs
     heads, seq_len, head_dim = query.shape[1:]
     shared = local_kv.shape[1] == 1
     assert can_use_shared_kv_schedule(
@@ -107,10 +119,17 @@ def check_training(
         sparse_kv=high_precision_tensors[2],
         attention_sink=high_precision_tensors[3],
     )
-    high_precision_output = gather_attn(*high_precision_inputs, window, impl=Impl.REFERENCE)
-    low_precision_output = gather_attn(*inputs, window, impl=Impl.REFERENCE)
+    high_precision_output = gather_attn(
+        **high_precision_inputs._asdict(), sliding_window_size=window, impl=Impl.REFERENCE
+    )
+    low_precision_output = gather_attn(
+        **inputs._asdict(), sliding_window_size=window, impl=Impl.REFERENCE
+    )
     actual, aux = operation(
-        *inputs, window, kernel_options=kernel_options, return_aux=AuxRequest(lse=True)
+        **inputs._asdict(),
+        sliding_window_size=window,
+        kernel_options=kernel_options,
+        return_aux=AuxRequest(lse=True),
     )
     generator = torch.Generator(device="cuda").manual_seed(1234)
     grad_output = torch.randn(
@@ -199,8 +218,9 @@ def test_d512_training(heads, share_kv, dtype, seq_len, topk, window, with_docs)
 
 
 @pytest.mark.parametrize("heads,share_kv", [(2, False), (17, True)], ids=["generic", "shared"])
-def test_d512_deterministic_backward(heads, share_kv):
-    inputs = make_inputs(heads, share_kv, torch.bfloat16, batch=2)
+@pytest.mark.parametrize("batch,with_docs", [(2, False), (1, True)], ids=["batched", "packed"])
+def test_d512_deterministic_backward(heads, share_kv, batch, with_docs):
+    inputs = make_inputs(heads, share_kv, torch.bfloat16, batch=batch, with_docs=with_docs)
     check_training(inputs, 19, repeat_backward=True, kernel_options={"backend": "triton"})
 
 

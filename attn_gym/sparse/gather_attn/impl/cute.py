@@ -56,7 +56,8 @@ def _build_gather_indices(
     sparse_idxs = torch.where(kv_indices >= 0, (kv_indices + local_kv_len).int(), -1)
     unified = torch.cat([window_idxs, sparse_idxs], dim=-1)
     num_slots = unified.shape[-1]
-    return F.pad(unified, (0, round_up(num_slots, 128) - num_slots), value=-1)
+    # FA4's gather prologue needs a physical tile even when the attention set is empty.
+    return F.pad(unified, (0, round_up(max(num_slots, 1), 128) - num_slots), value=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +163,6 @@ def gather_attn(
     """
     if (error := _constraint_violation(query, share_kv)) is not None:
         raise error
-    if sliding_window_size + kv_indices.shape[-1] == 0:
-        raise ValueError("CuTe gather attention requires at least one window or selected slot.")
     from flash_attn.cute.interface import flash_attn_func
 
     gather_indices = _build_gather_indices(

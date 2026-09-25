@@ -76,8 +76,8 @@ def test_backend_dispatch_uses_input_device(
         assert exc.value is failure
     else:
         assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
-    flag = (deterministic,) if expected == "cute" else ()
-    launch.assert_called_once_with(q, k, weights, 1, True, 1, *flag)
+    metadata = (deterministic, None) if expected == "cute" else (None, None)
+    launch.assert_called_once_with(q, k, weights, 1, True, 1, *metadata)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)

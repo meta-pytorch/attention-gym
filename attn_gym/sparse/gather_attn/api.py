@@ -38,9 +38,10 @@ def _validate_inputs(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor | None,
-    doc_ids: Tensor | None,
     sliding_window_size: int,
     share_kv: bool,
+    cu_seqlens: Tensor | None,
+    cu_seqlens_k: Tensor | None,
 ) -> None:
     """Validate tensor metadata without reading values or skipping compiled callers."""
     if type(sliding_window_size) is not int:
@@ -57,8 +58,6 @@ def _validate_inputs(
 
     if attention_sink is not None:
         tensors["attention_sink"] = attention_sink
-    if doc_ids is not None:
-        tensors["doc_ids"] = doc_ids
 
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
@@ -80,10 +79,6 @@ def _validate_inputs(
     if sparse_kv.device != query.device:
         raise ValueError(
             f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
-        )
-    if doc_ids is not None and doc_ids.device != query.device:
-        raise ValueError(
-            f"doc_ids must be on the same device as query, but got {doc_ids.device} and {query.device}."
         )
 
     if query.ndim != 4:
@@ -137,13 +132,6 @@ def _validate_inputs(
         )
     if kv_indices.device != query.device:
         raise ValueError(f"kv_indices must be on {query.device}, got {kv_indices.device}.")
-    sparse_seq_len = sparse_kv.shape[2]
-    num_topk = kv_indices.shape[2]
-    if num_topk > sparse_seq_len:
-        raise ValueError(
-            f"kv_indices num_topk ({num_topk}) must not exceed "
-            f"sparse_kv sequence length ({sparse_seq_len})."
-        )
 
     if attention_sink is not None:
         if attention_sink.dtype not in (query.dtype, torch.float32):
@@ -160,13 +148,26 @@ def _validate_inputs(
                 f"attention_sink must have shape [{heads}], got {list(attention_sink.shape)}."
             )
 
-    # --- doc_ids (optional) ---
-    if doc_ids is not None and (
-        doc_ids.ndim != 2 or doc_ids.shape[0] != batch or doc_ids.shape[1] != sequence_length
-    ):
-        raise ValueError(
-            f"doc_ids must have shape [batch, sequence_length], got {list(doc_ids.shape)}."
-        )
+    if (cu_seqlens is None) != (cu_seqlens_k is None):
+        raise ValueError("cu_seqlens and cu_seqlens_k must be supplied together")
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed cu_seqlens require q to have batch size one")
+        for name, offsets in (("cu_seqlens", cu_seqlens), ("cu_seqlens_k", cu_seqlens_k)):
+            if not isinstance(offsets, Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if offsets.ndim != 1 or offsets.shape[0] < 2:
+                raise ValueError(f"{name} must have shape [num_sequences + 1]")
+            if (
+                offsets.dtype != torch.int32
+                or not offsets.is_contiguous()
+                or offsets.device != query.device
+            ):
+                raise ValueError(f"{name} must be contiguous int32 on q.device")
+        if cu_seqlens.shape != cu_seqlens_k.shape:
+            raise ValueError(
+                "cu_seqlens and cu_seqlens_k must describe the same number of sequences"
+            )
 
 
 def _select_backend(
@@ -198,9 +199,10 @@ def gather_attn(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor | None = ...,
-    doc_ids: Tensor | None = ...,
-    sliding_window_size: int = ...,
     *,
+    sliding_window_size: int = ...,
+    cu_seqlens: Tensor | None = ...,
+    cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
@@ -215,9 +217,10 @@ def gather_attn(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor | None = ...,
-    doc_ids: Tensor | None = ...,
-    sliding_window_size: int = ...,
     *,
+    sliding_window_size: int = ...,
+    cu_seqlens: Tensor | None = ...,
+    cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
@@ -231,9 +234,10 @@ def gather_attn(
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor | None = None,
-    doc_ids: Tensor | None = None,
-    sliding_window_size: int = 512,
     *,
+    sliding_window_size: int = 512,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
     scale: float | None = None,
@@ -256,24 +260,32 @@ def gather_attn(
             Or shaped as (batch_size, num_heads, X, head_dim)
             where X is any integer
 
-        kv_indices: Which entries to select from sparse_kv.
-            Shape of (batch, sequence_length, num_topk_blocks), integer tensor
-            query[i, j] will attend to all sparse_kv[i, kv_indices[k]] for all k < num_topk_blocks
+        kv_indices: Integer selections shaped (batch, sequence_length, num_topk_blocks),
+            shared across heads. Without packed offsets these index the batch's sparse_kv
+            pool. With packed offsets they are zero-based within the query's document:
+            local index j selects sparse_kv at cu_seqlens_k[document] + j.
+            Negative or out-of-pool indices are ignored. Repeated indices retain their
+            multiplicity. The slot count may exceed the pool length; -1 pads unused slots.
+            Sparse causality is the caller's responsibility.
 
         attention_sink: tensor in shape of (num_heads, ), learnable per-head weight that occupies
             the denominator of softmax. It may use the query dtype or torch.float32.
             If None, no attention sink will be applied
 
-        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
-            Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where tokens with the same id
-            can causally attend to each other.
-            If doc_ids[i, j] = doc_ids[i, j-y], then query[i, j] can causally attend to
-            local_kv[i, j-y].
-            Should be monotonically increasing on the sequence axis.
-            If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the
-            same document.
-            Only applies to the sliding window branch.
-            It's the caller's responsibility to make sure kv_indices don't cross document boundaries.
+        cu_seqlens: Packed offsets shaped [N + 1] for batch-one inputs, as contiguous
+            int32 on query.device. They partition both queries and local_kv; the local
+            window never crosses a document boundary. Offsets start at zero, never
+            decrease, may repeat for empty sequences, and may end before sequence_length.
+            Output values and token-input gradients beyond that endpoint are undefined;
+            fixed-capacity callers must mask them. Offset values are a caller contract
+            and are not inspected on the host. Supply both offset tensors or neither.
+
+        cu_seqlens_k: Packed offsets shaped [N + 1] for sparse_kv, as contiguous int32
+            on query.device. They describe the same documents as cu_seqlens, start at zero,
+            never decrease, and end at or before the sparse pool length. Empty sparse
+            documents have repeated offsets. These offsets need not match query offsets:
+            for compressed KV, each document contributes only its complete compressed blocks.
+            Without offsets, each batch element is a single document.
 
         sliding_window_size: Integer, size of sliding window
 
@@ -301,6 +313,8 @@ def gather_attn(
         If return_aux is an AuxRequest: tuple of (output, GatherAttnAux) where
             output has shape (batch_size, num_heads, sequence_length, head_dim) and
             aux.lse has shape (batch_size, num_heads, sequence_length) when requested.
+        A row with no selected or local keys returns zero output, with LSE equal to its
+        sink logit, or -inf when there is no sink. Its output-loss gradients are zero.
     """
     selected_impl = resolve_impl(impl)
     if selected_impl is Impl.REFERENCE and kernel_options:
@@ -315,10 +329,25 @@ def gather_attn(
         sparse_kv,
         kv_indices,
         attention_sink,
-        doc_ids,
         sliding_window_size,
         share_kv,
+        cu_seqlens,
+        cu_seqlens_k,
     )
+    doc_ids = None
+    if cu_seqlens is not None:
+        positions = torch.arange(query.shape[2], device=query.device, dtype=torch.int32)
+        # Right-sided lookup skips empty documents and maps capacity tails to the endpoint.
+        documents = torch.searchsorted(cu_seqlens[1:], positions, right=True, out_int32=True)
+        starts = cu_seqlens_k.index_select(0, documents)
+        ends = cu_seqlens_k.index_select(0, (documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1))
+        doc_ids = documents.unsqueeze(0)
+        valid = (kv_indices >= 0) & (kv_indices < (ends - starts)[None, :, None])
+        # Validity is computed in local coordinates, before translating the pool address.
+        kv_indices = torch.where(valid, kv_indices, 0) + starts[None, :, None]
+    else:
+        valid = (kv_indices >= 0) & (kv_indices < sparse_kv.shape[2])
+    kv_indices = torch.where(valid, kv_indices, -1)
 
     if scale is not None and not scale > 0:
         raise ValueError("scale must be greater than 0.")

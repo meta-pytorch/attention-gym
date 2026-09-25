@@ -192,7 +192,8 @@ def _gather_attn_bwd_dq_shared(
     )
 
     sink = tl.load(attention_sink_ptr + offsets_h, mask=head_mask, other=0.0)
-    sink_gradient = -tl.exp(sink - lse) * delta
+    sink_probability = tl.where(lse == -float("inf"), 0.0, tl.exp(sink - lse))
+    sink_gradient = -sink_probability * delta
     tl.store(
         grad_sink_partials_ptr
         + ptr_offset((batch, offsets_h, sequence), GRAD_SINK_PARTIALS_STRIDES),

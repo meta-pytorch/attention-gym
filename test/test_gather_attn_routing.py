@@ -33,7 +33,7 @@ def triton_backend(monkeypatch):
 @pytest.fixture
 def cuda_inputs():
     with FakeTensorMode():
-        return {
+        yield {
             "query": torch.empty(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16),
             "local_kv": torch.empty(1, 1, 8, 512, device="cuda", dtype=torch.bfloat16),
             "sparse_kv": torch.empty(1, 1, 4, 512, device="cuda", dtype=torch.bfloat16),

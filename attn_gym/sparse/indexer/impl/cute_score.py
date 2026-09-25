@@ -12,7 +12,9 @@ of the caller's [P, 2, S] FP32 slab.
 
 Head, query, and batch remain separate TMA modes despite the logical packing,
 so their physical strides are independent and odd query tails are zero-filled.
-Only valid rows/candidates are written.
+Only valid rows/candidates are written. The packed entrypoint reads each query's
+candidate interval from ``candidate_bounds[T, 2]`` in the prologue and visits only the
+absolute M128 tiles covering the union of the pair's nonempty intervals.
 """
 
 import cutlass
@@ -107,6 +109,38 @@ class IndexerScoreKernel:
         return (query + 1) // self.compress_ratio
 
     @cute.jit
+    def pair_tiles(self, candidate_bounds, query0, num_queries):
+        """Return absolute M128 tiles covering the pair's nonempty candidate intervals.
+
+        An odd tail, inactive capacity, or empty document contributes no interval.
+        Pairs crossing a boundary visit the contiguous union of both documents' ranges.
+        """
+        start0 = candidate_bounds[query0, 0]
+        end0 = candidate_bounds[query0, 1]
+        start1 = start0
+        end1 = start0
+        if query0 + 1 < num_queries:
+            start1 = candidate_bounds[query0 + 1, 0]
+            end1 = candidate_bounds[query0 + 1, 1]
+        low = start0
+        high = end0
+        if end0 <= start0:
+            low = start1
+            high = end1
+        elif end1 > start1:
+            low = cutlass.min(start0, start1)
+            high = cutlass.max(end0, end1)
+        first_tile = low // self.tile_candidates
+        tile_end = first_tile
+        if high > low:
+            tile_end = cute.ceil_div(high, self.tile_candidates)
+        return (
+            self.upcast_offset(first_tile),
+            self.upcast_offset(tile_end),
+            ((start0, end0), (start1, end1)),
+        )
+
+    @cute.jit
     def __call__(
         self,
         q: cute.Tensor,
@@ -115,6 +149,36 @@ class IndexerScoreKernel:
         scores: cute.Tensor,
         pair_start,
         score_scale: Float32,
+        stream: cuda.CUstream,
+    ):
+        """Dense entrypoint: score each query's full or causal candidate prefix."""
+        self.launch(q, k, weights, scores, pair_start, score_scale, None, stream)
+
+    @cute.jit
+    def with_candidate_bounds(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        weights: cute.Tensor,
+        scores: cute.Tensor,
+        pair_start,
+        score_scale: Float32,
+        candidate_bounds: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        """Packed entrypoint: score only each query's ``candidate_bounds`` interval."""
+        self.launch(q, k, weights, scores, pair_start, score_scale, candidate_bounds, stream)
+
+    @cute.jit
+    def launch(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        weights: cute.Tensor,
+        scores: cute.Tensor,
+        pair_start,
+        score_scale: Float32,
+        candidate_bounds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         """Build TMA descriptors and launch one CTA per output-slab query pair."""
@@ -157,7 +221,8 @@ class IndexerScoreKernel:
             self.mma_tile,
             tiled_mma,
         )
-        self.kernel.set_name_prefix(f"{self.get_name()}_{q.element_type.__name__.lower()}")
+        packed = "_packed" if cutlass.const_expr(candidate_bounds is not None) else ""
+        self.kernel.set_name_prefix(f"{self.get_name()}_{q.element_type.__name__.lower()}{packed}")
         self.kernel(
             tiled_mma,
             tma_atom_k,
@@ -171,6 +236,7 @@ class IndexerScoreKernel:
             q_layout,
             self.upcast_offset(pair_start),
             score_scale,
+            candidate_bounds,
         ).launch(grid=(scores.shape[0], 1, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
@@ -188,6 +254,7 @@ class IndexerScoreKernel:
         q_layout: cute.ComposedLayout,
         pair_start,
         score_scale: Float32,
+        candidate_bounds: cute.Tensor | None,
     ):
         """Initialize stage ownership, dispatch warp roles, and retire TMEM."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -202,11 +269,17 @@ class IndexerScoreKernel:
         query0 = batch_pair * 2
         active = global_pair < self.upcast_offset(weights.shape[0]) * pairs_per_batch
         query_last = query0 + 1 if query0 + 1 < num_queries else query0
-        candidate_tiles = (
+        first_tile = self.upcast_offset(0)
+        tile_end = self.upcast_offset(
             cute.ceil_div(self.visible_candidates(query_last), self.tile_candidates)
             if self.causal
             else cute.ceil_div(num_candidates, self.tile_candidates)
         )
+        intervals = None
+        if cutlass.const_expr(candidate_bounds is not None):
+            first_tile, tile_end, intervals = self.pair_tiles(
+                candidate_bounds, query0, num_queries
+            )
 
         smem = SmemAllocator()
         storage = smem.allocate(self.SharedStorage)
@@ -277,7 +350,9 @@ class IndexerScoreKernel:
                     query0,
                     num_queries,
                     num_candidates,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
+                    intervals,
                     score_scale,
                 )
             elif warp_idx == self.mma_warp:
@@ -286,7 +361,8 @@ class IndexerScoreKernel:
                     accumulator,
                     sK,
                     sQ,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
                     k_consumer,
                     q_consumer,
                     acc_producer,
@@ -301,7 +377,8 @@ class IndexerScoreKernel:
                     sK,
                     sQ,
                     batch_pair,
-                    candidate_tiles,
+                    first_tile,
+                    tile_end,
                     k_producer,
                     q_producer,
                 )
@@ -321,7 +398,8 @@ class IndexerScoreKernel:
         sK: cute.Tensor,
         sQ: cute.Tensor,
         batch_pair,
-        candidate_tiles,
+        first_tile,
+        tile_end,
         k_producer,
         q_producer,
     ):
@@ -340,7 +418,7 @@ class IndexerScoreKernel:
         q_empty = q_producer.acquire_and_advance()
         cute.copy(tma_atom_q, g_q, s_q[(None, q_empty.index)], tma_bar_ptr=q_empty.barrier)
 
-        for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             gK = cute.local_tile(k, self.mma_tile, (candidate_tile, 0, 0), proj=(1, None, 1))
             s_k, g_k = cpasync.tma_partition(
                 tma_atom_k,
@@ -361,7 +439,8 @@ class IndexerScoreKernel:
         accumulator: cute.Tensor,
         sK: cute.Tensor,
         sQ: cute.Tensor,
-        candidate_tiles,
+        first_tile,
+        tile_end,
         k_consumer,
         q_consumer,
         acc_producer,
@@ -370,7 +449,7 @@ class IndexerScoreKernel:
         fragment_k = tiled_mma.make_fragment_A(sK)
         fragment_q = tiled_mma.make_fragment_B(sQ)
         q_full = q_consumer.wait_and_advance()
-        for _candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for _candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             acc_empty = acc_producer.acquire_and_advance()
             k_full = k_consumer.wait_and_advance()
             for d_block in cutlass.range_constexpr(cute.size(fragment_k, mode=[2])):
@@ -401,10 +480,15 @@ class IndexerScoreKernel:
         query0,
         num_queries,
         num_candidates,
-        candidate_tiles,
+        first_tile,
+        tile_end,
+        intervals,
         score_scale: Float32,
     ):
-        """Load one full head row per thread, independently reduce each packed query."""
+        """Load one full head row per thread, independently reduce each packed query.
+
+        ``intervals`` holds packed ``(start, end)`` pairs for both queries, else None.
+        """
         acc_tile = accumulator[(None, None, None, 0)]
         tmem_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.packed_heads // 4)),
@@ -422,7 +506,7 @@ class IndexerScoreKernel:
         rW = cute.make_rmem_tensor((self.packed_heads,), Float32)
         cute.autovec_copy(sW, rW)
 
-        for candidate_tile in cutlass.range(candidate_tiles, unroll=0):
+        for candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
             acc_full = acc_consumer.wait_and_advance()
             cute.copy(
                 tmem_copy,
@@ -437,7 +521,10 @@ class IndexerScoreKernel:
             for qi in cutlass.range_constexpr(2):
                 query = query0 + qi
                 valid = query < num_queries and candidate < num_candidates
-                if cutlass.const_expr(self.causal):
+                if cutlass.const_expr(intervals is not None):
+                    start, end = intervals[qi]
+                    valid = valid and candidate >= start and candidate < end
+                elif cutlass.const_expr(self.causal):
                     valid = valid and candidate < self.visible_candidates(query)
                 if valid:
                     # Four independent FP32 chains keep head reduction latency

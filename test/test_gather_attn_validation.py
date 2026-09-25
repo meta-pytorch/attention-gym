@@ -14,14 +14,24 @@ def inputs() -> dict[str, torch.Tensor]:
         "query": torch.randn(1, 2, 4, 3, generator=generator),
         "local_kv": torch.randn(1, 1, 4, 3, generator=generator),
         "sparse_kv": torch.randn(1, 1, 2, 3, generator=generator),
-        "kv_indices": torch.tensor([[[0], [1], [-1], [0]]]),
+        "kv_indices": torch.tensor([[[0], [0], [-1], [0]]]),
         "attention_sink": torch.randn(2, generator=generator),
-        "doc_ids": torch.tensor([[0, 0, 1, 1]]),
+        "cu_seqlens": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "cu_seqlens_k": torch.tensor([0, 1, 2], dtype=torch.int32),
     }
 
 
 @pytest.mark.parametrize(
-    "name", ["query", "local_kv", "sparse_kv", "kv_indices", "attention_sink", "doc_ids"]
+    "name",
+    [
+        "query",
+        "local_kv",
+        "sparse_kv",
+        "kv_indices",
+        "attention_sink",
+        "cu_seqlens",
+        "cu_seqlens_k",
+    ],
 )
 def test_non_tensor_input(inputs, name):
     """Malformed inputs report their own name rather than incidental attribute errors."""
@@ -31,7 +41,16 @@ def test_non_tensor_input(inputs, name):
 
 
 @pytest.mark.parametrize(
-    "name", ["query", "local_kv", "sparse_kv", "kv_indices", "attention_sink", "doc_ids"]
+    "name",
+    [
+        "query",
+        "local_kv",
+        "sparse_kv",
+        "kv_indices",
+        "attention_sink",
+        "cu_seqlens",
+        "cu_seqlens_k",
+    ],
 )
 @pytest.mark.parametrize("rank", [0, 1, 5])
 def test_invalid_rank(inputs, name, rank):

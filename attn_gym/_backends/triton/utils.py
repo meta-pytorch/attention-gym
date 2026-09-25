@@ -63,6 +63,25 @@ def ptr_offset(indices, strides):
     return offset
 
 
+@triton.jit
+def _document_ids(CuQ, query, num_documents, WIDE: tl.constexpr):
+    low = tl.full(query.shape, 0, tl.int32)
+    high = tl.full(query.shape, num_documents, tl.int32)
+    remaining = num_documents
+    # A runtime logarithmic loop works for both scalar queries and vectorized bounds.
+    # Right-sided search skips empty documents and returns N for inactive capacity.
+    while remaining > 0:
+        middle = low + (high - low) // 2
+        offset = middle.to(tl.int64) if WIDE else middle
+        boundary = tl.load(CuQ + offset + 1, middle < num_documents, 0)
+        right = query >= boundary
+        active = low < high
+        low = tl.where(active & right, middle + 1, low)
+        high = tl.where(active & ~right, middle, high)
+        remaining = remaining // 2
+    return low
+
+
 def storage_cosize(shape: Sequence[int], strides: Sequence[int]) -> int:
     """Return the storage extent of a nonnegative-strided logical layout.
 

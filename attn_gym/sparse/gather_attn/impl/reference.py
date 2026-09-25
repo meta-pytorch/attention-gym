@@ -29,38 +29,66 @@ def make_sliding_window_mask(
     ).masked_fill(~valid, float("-inf"))
 
 
-def make_packed_mask(
-    doc_ids: torch.Tensor,
+def _softmax_with_sink(logits: Tensor, attention_sink: Tensor) -> tuple[Tensor, Tensor]:
+    """Return real-key probabilities and sink-inclusive LSE, including empty rows."""
+    sink = attention_sink.to(logits.dtype)[None, :, None, None]
+    logits = torch.cat((logits, sink.expand(*logits.shape[:-1], 1)), dim=-1)
+    empty = torch.isneginf(logits).all(dim=-1, keepdim=True)
+    # Avoid the undefined derivative of logsumexp(all -inf), even with zero dLSE.
+    safe_logits = torch.where(empty, 0, logits)
+    probabilities = torch.where(empty, 0, torch.softmax(safe_logits, dim=-1)[..., :-1])
+    lse = torch.where(empty.squeeze(-1), float("-inf"), torch.logsumexp(safe_logits, dim=-1))
+    return probabilities, lse
+
+
+def _packed_gather_attn(
+    query: Tensor,
+    local_kv: Tensor,
+    sparse_kv: Tensor,
+    kv_indices: Tensor,
+    attention_sink: Tensor,
+    doc_ids: Tensor,
+    sliding_window_size: int,
     *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Creates an attention mask that prevents documents from attending across boundaries
-
-    Args:
-        doc_ids: Has shape (batch, sequence) and integer dtype.
-            Tokens in the same document have the same ID and will be allowed to attend to each other.
-
-    Returns:
-        Additive attention mask of shape (batch, 1, sequence, sequence)
-        Tokens from different documents receive -inf for the attention mask, and tokens from the same document receive 0
-    """
-    batch_size, seq_len = doc_ids.shape
-    device = doc_ids.device
-
-    # [B, S, 1] == [B, 1, S] -> [B, S_query, S_key]
-    same_document = doc_ids[:, :, None] == doc_ids[:, None, :]
-
-    mask = torch.full(
-        (batch_size, seq_len, seq_len),
-        float("-inf"),
-        dtype=dtype,
-        device=device,
-    )
-    mask.masked_fill_(same_document, 0.0)
-
-    # Head-broadcasting dimension.
-    return mask[:, None, :, :]
+    scale: float,
+) -> tuple[Tensor, Tensor]:
+    """Gather actual slots so masked KV (including NaNs) cannot contaminate other documents."""
+    batch, heads, tokens, dim = query.shape
+    positions = torch.arange(tokens, device=query.device)
+    window = min(sliding_window_size, tokens)
+    local_indices = positions[:, None] - window + 1 + torch.arange(window, device=query.device)
+    local_valid = (local_indices >= 0).unsqueeze(0)
+    local_valid = local_valid & (doc_ids[:, local_indices.clamp_min(0)] == doc_ids[:, :, None])
+    local_indices = local_indices.clamp_min(0).expand(batch, -1, -1)
+    indices = torch.cat((local_indices, (kv_indices + tokens).clamp_min(0)), dim=-1).long()
+    valid = torch.cat((local_valid, kv_indices >= 0), dim=-1)[:, None, :, :, None]
+    kv = torch.cat((local_kv, sparse_kv), dim=2)
+    kv_heads = kv.shape[1]
+    # Index the original pool rather than an expanded [B, H, T, pool, D] view:
+    # gather's backward would otherwise allocate a gradient for that entire view.
+    slots = kv[
+        torch.arange(batch, device=query.device)[:, None, None, None],
+        torch.arange(kv_heads, device=query.device)[None, :, None, None],
+        indices[:, None],
+    ]
+    # Multiplication by a zero probability does not neutralize NaN values or gradients.
+    slots = torch.where(valid, slots, 0)
+    accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
+    slots_acc = slots.to(accumulation_dtype)
+    # Share the gathered slots across query heads, including for the two matmuls.
+    grouped_query = query.reshape(batch, kv_heads, heads // kv_heads, tokens, dim)
+    grouped_query = grouped_query.permute(0, 1, 3, 2, 4).to(accumulation_dtype)
+    logits = torch.matmul(grouped_query, slots_acc.transpose(-2, -1)) * scale
+    logits = logits.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, indices.shape[-1])
+    logits = logits.masked_fill(~valid.squeeze(-1), float("-inf"))
+    probabilities, lse = _softmax_with_sink(logits, attention_sink)
+    probabilities = probabilities.to(query.dtype)
+    grouped_probabilities = probabilities.reshape(
+        batch, kv_heads, heads // kv_heads, tokens, indices.shape[-1]
+    ).permute(0, 1, 3, 2, 4)
+    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), slots_acc)
+    output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
+    return output.to(query.dtype), lse
 
 
 def gather_attn(
@@ -91,12 +119,12 @@ def gather_attn(
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
         local_kv: Key and Value for the sliding window branch,
-            represented as a shared tensor, (batch_size, 1, sequence_length, head_dim) if share_kv = False
-            Otherwise represented as (batch_size, num_heads, sequence_length, head_dim)
+            represented as (batch_size, 1, sequence_length, head_dim) if share_kv is True.
+            Otherwise represented as (batch_size, num_heads, sequence_length, head_dim).
 
         sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
-            if share_kv = False
-            Otherwise represented as (batch_size, num_heads, X, head_dim), where X can be any nonzero integer
+            if share_kv is True.
+            Otherwise represented as (batch_size, num_heads, X, head_dim), where X may be zero.
 
         kv_indices: Which entries to select from sparse_kv.
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
@@ -106,13 +134,10 @@ def gather_attn(
 
         attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
 
-        doc_ids: Integer tensor in shape of (batch_size, sequence_length) or None.
-            Looks something like [0, 0, 0, 1, 1, 2, 2, 2, 2], where all tokens with the same id can causally attend to each other
-            If doc_ids[i, j] = doc_ids[i, j-y], then query[i, j] can causally attend to local_kv[i, j-y]
-            Should be monotonically increasing on the sequence axis
-            Only applies to the sliding window branch.
-            It's the caller's responsibility to make sure kv_indices don't cross document boundaries
-            If doc_ids is None, all tokens on the same sequence axis will be assumed to be in the same document.
+        doc_ids: Internal document labels shaped (batch_size, sequence_length), derived
+            from cu_seqlens by the public API, or None for ordinary batched inputs.
+            They isolate the local window. Sparse selections have already been translated
+            to global pool positions and masked to their document by the public API.
 
         sliding_window_size: Integer, size of sliding window
 
@@ -127,38 +152,42 @@ def gather_attn(
     accumulation_dtype = torch.promote_types(dtype, torch.float32)
     b, h, s, _head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
+    if doc_ids is not None:
+        return _packed_gather_attn(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            doc_ids,
+            sliding_window_size,
+            scale=scale,
+        )
     if share_kv:
         local_kv = local_kv.expand(-1, h, -1, -1)
         sparse_kv = sparse_kv.expand(-1, h, -1, -1)
-    if kv_indices is not None:
+    counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=accumulation_dtype)
+    if sparse_seq_len > 0:
         # We have s queries that each potentially attend to sparse_seq_len elements.
         # Indices of -1 are sentinel values meaning "no selection for this slot".
         # Repeated indices get extra weight (equivalent to multiple copies in the attention set).
         # This is specifically for edge case handling,
         # since most uses of this will have indices pass through torch.topk
         valid_mask = kv_indices >= 0
-        safe_indices = kv_indices.clamp(min=0)
+        safe_indices = kv_indices.clamp(min=0).long()
         # Count how many times each position is selected per query (ignoring sentinels)
-        counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=accumulation_dtype)
         counts.scatter_add_(
             dim=-1,
             index=safe_indices,
             src=valid_mask.to(accumulation_dtype),
         )
-        # Convert counts to additive log-mask: 0 selections → -inf, k selections → log(k)
-        topk_mask = torch.where(
-            counts > 0, torch.log(counts), torch.full_like(counts, float("-inf"))
-        )
+    # Convert counts to additive log-mask: 0 selections → -inf, k selections → log(k).
+    topk_mask = torch.where(counts > 0, torch.log(counts), float("-inf"))
 
     SWA_mask = make_sliding_window_mask(
         s, sliding_window_size, device, accumulation_dtype
     ).unsqueeze(0)
     SWA_mask = SWA_mask.expand(b, -1, -1)
-
-    if doc_ids is not None:
-        packing_mask = make_packed_mask(doc_ids, dtype=accumulation_dtype)
-        # packing_mask is [B, 1, S, S], SWA_mask is [B, S, S]
-        SWA_mask = SWA_mask + packing_mask.squeeze(1)
 
     attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
     attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
@@ -172,14 +201,8 @@ def gather_attn(
         + attention_mask
     )
 
-    # Concatenate sink as an extra column, apply standard softmax, then drop it.
-    sink_logit = attention_sink.to(accumulation_dtype)[None, :, None, None].expand(b, -1, s, 1)
-    logits_with_sink = torch.cat([logits, sink_logit], dim=-1)
-    probs_with_sink = torch.softmax(logits_with_sink, dim=-1)
-    probs = probs_with_sink[..., :-1].to(dtype)
-
-    # Compute log-sum-exp over the full logits (including sink).
-    lse = torch.logsumexp(logits_with_sink, dim=-1)  # (b, h, s)
+    probs, lse = _softmax_with_sink(logits, attention_sink)
+    probs = probs.to(dtype)
 
     # The low-precision P and KV operands accumulate in FP32 before the output
     # is stored in the input dtype, as in a tensor-core dot.

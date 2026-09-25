@@ -10,7 +10,7 @@ from torch import Tensor
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
-    "str backend) -> Tensor",
+    "str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None) -> Tensor",
 )
 
 
@@ -22,6 +22,8 @@ def _indexer_cuda(
     causal: bool,
     compress_ratio: int,
     backend: str,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries.
 
@@ -34,14 +36,21 @@ def _indexer_cuda(
     match backend:
         case "cute":
             from .impl.cute import launch
-
-            deterministic = torch.are_deterministic_algorithms_enabled()
-            return launch(q, k, weights, topk, causal, compress_ratio, deterministic)
         case "triton":
             from .impl.triton import launch
         case _:
             raise ValueError(f"unknown indexer backend {backend!r}")
-    return launch(q, k, weights, topk, causal, compress_ratio)
+    if backend == "triton":
+        return launch(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
+    candidate_bounds = None
+    if cu_seqlens is not None:
+        from .impl.triton import prepare_candidate_bounds
+
+        candidate_bounds = prepare_candidate_bounds(
+            cu_seqlens, cu_seqlens_k, q.shape[1], causal, compress_ratio
+        )
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    return launch(q, k, weights, topk, causal, compress_ratio, deterministic, candidate_bounds)
 
 
 torch.library.impl("attn_gym::_indexer", "CUDA", _indexer_cuda)
@@ -56,6 +65,8 @@ def _indexer_fake(
     causal: bool,
     compress_ratio: int,
     backend: str,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)
