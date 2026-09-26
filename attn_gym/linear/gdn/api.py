@@ -18,8 +18,8 @@ from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_for
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
-from attn_gym.linear.types import BackendOptions as KernelOptions
 from attn_gym.linear.types import Impl, resolve_impl
+from attn_gym.linear.types import SplitOptions as KernelOptions
 
 
 def chunk_gdn(
@@ -64,18 +64,21 @@ def chunk_gdn(
             ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
             default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
+            ``split_forward`` and ``split_backward`` opt into its approximate
+            forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
+            for calls without ``initial_state`` or ``output_final_state``.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    backend = resolve_kernel_options(kernel_options)
+    options = resolve_kernel_options(kernel_options)
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if backend == "cudnn":
+        if options.backend == "cudnn":
             return cudnn_chunk_forward(
                 q,
                 k,
@@ -86,6 +89,8 @@ def chunk_gdn(
                 cu_seqlens=cu_seqlens,
                 scale=scale,
                 output_final_state=output_final_state,
+                split_backward=options.split_backward,
+                split_forward=options.split_forward,
             )
         return fused_chunk_forward(
             q,
@@ -151,12 +156,15 @@ def paged_chunk_gdn(
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
             ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
-            requires 16-byte-aligned pool bases and slot origins.
+            requires 16-byte-aligned pool bases and slot origins. Split schedules are not
+            supported.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
-    backend = resolve_kernel_options(kernel_options)
+    options = resolve_kernel_options(kernel_options)
+    if options.split_backward or options.split_forward:
+        raise ValueError("split schedules are not supported by paged_chunk_gdn")
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     validate_paged_state(
         q,
@@ -167,7 +175,7 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     paged_chunk_forward = (
-        cudnn_paged_chunk_forward if backend == "cudnn" else fused_paged_chunk_forward
+        cudnn_paged_chunk_forward if options.backend == "cudnn" else fused_paged_chunk_forward
     )
     return paged_chunk_forward(
         q,

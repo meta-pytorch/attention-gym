@@ -3,29 +3,43 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
-_KERNEL_OPTION_NAMES = frozenset({"backend"})
+
+class ResolvedKernelOptions(NamedTuple):
+    """Validated ``chunk_gdn`` backend selection and cuDNN split switches."""
+
+    backend: Literal["fused", "cudnn"]
+    split_backward: bool
+    split_forward: bool
 
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
-) -> Literal["fused", "cudnn"]:
+) -> ResolvedKernelOptions:
     """Validate chunk backend options while keeping the repo-local path as default."""
     if kernel_options is None:
-        return "fused"
-    unknown = kernel_options.keys() - _KERNEL_OPTION_NAMES
+        return ResolvedKernelOptions("fused", False, False)
+    unknown = kernel_options.keys() - ResolvedKernelOptions._fields
     if unknown:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported chunk_gdn kernel options: {names}")
     backend = kernel_options.get("backend", "fused")
     if backend not in ("fused", "cudnn"):
         raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
-    return backend
+    splits = []
+    for name in ("split_backward", "split_forward"):
+        value = kernel_options.get(name, False)
+        if not isinstance(value, bool):
+            raise TypeError(f"kernel_options['{name}'] must be a bool")
+        if value and backend != "cudnn":
+            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
+        splits.append(value)
+    return ResolvedKernelOptions(backend, *splits)
 
 
 def validate_gdn_inputs(
@@ -65,4 +79,4 @@ def validate_gdn_inputs(
         )
 
 
-__all__ = ["resolve_kernel_options", "validate_gdn_inputs"]
+__all__ = ["ResolvedKernelOptions", "resolve_kernel_options", "validate_gdn_inputs"]

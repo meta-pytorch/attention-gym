@@ -20,7 +20,7 @@ from attn_gym.linear._delta_rule.paged_state import PagedState
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "float scale) -> Tensor",
+    "bool split, float scale) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd_with_initial_state",
@@ -40,7 +40,7 @@ torch.library.define(
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_bwd",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor cu_seqlens, float scale) -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    "Tensor cu_seqlens, bool split, float scale) -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_bwd_with_state",
@@ -135,6 +135,7 @@ def _packed_fwd_cuda(
     gate: Tensor,
     beta: Tensor,
     cu_seqlens: Tensor,
+    split: bool,
     scale: float,
 ) -> Tensor:
     """Validate packed boundaries and run the fixed-arity forward launcher."""
@@ -153,6 +154,7 @@ def _packed_fwd_cuda(
         None,
         scale=scale,
         output_final_state=False,
+        split=split,
     )
     return _copy_to_layout(output, value_template)
 
@@ -275,6 +277,7 @@ def _packed_bwd_cuda(
     beta: Tensor,
     d_output: Tensor,
     cu_seqlens: Tensor,
+    split: bool,
     scale: float,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     templates = (q, k, value, gate, beta)
@@ -290,6 +293,7 @@ def _packed_bwd_cuda(
         d_output,
         cu_seqlens,
         scale=scale,
+        split=split,
     )
     assert d_initial_state is None
     return tuple(
@@ -367,6 +371,7 @@ def _packed_fwd_fake(
     gate: Tensor,
     beta: Tensor,
     cu_seqlens: Tensor,
+    split: bool,
     scale: float,
 ) -> Tensor:
     """Describe the output allocation made by the no-state forward launcher."""
@@ -434,6 +439,7 @@ def _packed_bwd_fake(
     beta: Tensor,
     d_output: Tensor,
     cu_seqlens: Tensor,
+    split: bool,
     scale: float,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Describe the five no-state backward gradients."""

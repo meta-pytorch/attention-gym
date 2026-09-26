@@ -62,11 +62,16 @@ class ChunkGdnCudnnPacked(torch.autograd.Function):
         cu_seqlens: Tensor,
         scale: float,
         output_final_state: bool,
+        split_backward: bool,
+        split_forward: bool,
     ) -> Tensor | tuple[Tensor, Tensor]:
         ctx.has_initial_state = initial_state is not None
         ctx.scale = scale
+        ctx.split_backward = split_backward
         if initial_state is None:
-            output = chunk_gdn_cudnn_packed_fwd_op(q, k, value, gate, beta, cu_seqlens, scale)
+            output = chunk_gdn_cudnn_packed_fwd_op(
+                q, k, value, gate, beta, cu_seqlens, split_forward, scale
+            )
             ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
         elif output_final_state:
             output, final_state = chunk_gdn_cudnn_packed_fwd_with_state_op(
@@ -115,9 +120,10 @@ class ChunkGdnCudnnPacked(torch.autograd.Function):
                 beta,
                 torch.zeros_like(value) if d_output is None else d_output,
                 cu_seqlens,
+                ctx.split_backward,
                 ctx.scale,
             )
-            return *gradients, None, None, None, None
+            return *gradients, None, None, None, None, None, None
 
         q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         return (
@@ -136,6 +142,8 @@ class ChunkGdnCudnnPacked(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -150,10 +158,15 @@ def chunk_forward(
     cu_seqlens: Tensor | None = None,
     scale: float,
     output_final_state: bool = False,
+    split_backward: bool = False,
+    split_forward: bool = False,
 ) -> tuple[Tensor, Tensor | None]:
     """Run scalar GDN through the cuDNN backend behind the shared chunk contract."""
     if not q.is_cuda:
         raise ValueError("the cuDNN GDN backend requires CUDA tensors")
+    for name, enabled in (("split_backward", split_backward), ("split_forward", split_forward)):
+        if enabled and (initial_state is not None or output_final_state):
+            raise ValueError(f"{name} currently requires a no-state call")
     if not torch.compiler.is_compiling():
         validate_cudnn_available(q)
 
@@ -192,6 +205,8 @@ def chunk_forward(
         cu_seqlens,
         scale,
         output_final_state,
+        split_backward,
+        split_forward,
     )
     if output_final_state:
         output, final_state = result

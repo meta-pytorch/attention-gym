@@ -44,9 +44,11 @@ def test_raw_forward_rejects_metadata_before_device_reads(op, invalid: str, monk
         case "cpu":
             offsets = torch.tensor([0, 8], dtype=torch.int32)
     args = (q, q, q, gate, gate)
+    trailing = (False, 128**-0.5)
     if op is not cudnn_ops.chunk_gdn_cudnn_packed_fwd_op:
         args = (*args, torch.zeros(1, 1, 128, 128, device="cuda"))
+        trailing = (128**-0.5,)
     with pytest.raises(TypeError, match="int32 vector on q.device"):
-        op(*args, offsets, 128**-0.5)
+        op(*args, offsets, *trailing)
     scheduler.assert_not_called()
     backend.assert_not_called()

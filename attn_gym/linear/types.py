@@ -35,14 +35,22 @@ class BackendOptions(TypedDict, total=False):
     """Select the repo-local fused backend or the optional cuDNN backend."""
 
 
-class KernelOptions(BackendOptions, total=False):
-    """KDA backend controls and experimental scheduling options."""
+class SplitOptions(BackendOptions, total=False):
+    """Approximate cuDNN forgetting-horizon split schedules for chunk KDA and chunk GDN.
+
+    Both default to ``False``, require ``backend="cudnn"``, and reject calls with recurrent
+    state. They help only when ``B * H`` does not fill the GPU and every head forgets quickly.
+    """
 
     split_backward: bool
-    """Allow KDA cuDNN to use its approximate split-backward schedule."""
+    """Split the backward recurrence."""
 
     split_forward: bool
-    """Allow KDA cuDNN to use its approximate forgetting-horizon split forward schedule."""
+    """Split the forward recurrence."""
+
+
+class KernelOptions(SplitOptions, total=False):
+    """KDA backend controls and experimental scheduling options."""
 
     schedule: Literal["auto", "static", "persistent"]
     """Set ``"persistent"`` for CUDA graphs whose replays can carry far fewer tokens than the
@@ -80,6 +88,7 @@ __all__ = [
     "Impl",
     "KernelOptions",
     "ReplayState",
+    "SplitOptions",
     "resolve_gate_transform",
     "resolve_impl",
 ]
