@@ -97,11 +97,16 @@ def _finish_chunk_gdn_fwd(
     k: torch.Tensor,
     factors: ChunkGDNFactors,
     cumulative_gate: torch.Tensor,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the state recurrence and output composition from prepared factors."""
+    store_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the state recurrence and output composition from prepared factors.
+
+    The packed path accepts ``initial_state=None`` and ``store_final_state=False``; the dense
+    path always takes and returns a state.
+    """
     if metadata is None:
         h, v_new, final_state = chunk_gdn_fwd_recurrence_dense(
             factors.kg, factors.w, factors.u, cumulative_gate, initial_state
@@ -109,7 +114,13 @@ def _finish_chunk_gdn_fwd(
         output = chunk_gdn_fwd_output_dense(q, k, v_new, h, cumulative_gate, scale)
     else:
         h, v_new, final_state = chunk_gdn_fwd_recurrence_packed(
-            factors.kg, factors.w, factors.u, cumulative_gate, initial_state, metadata
+            factors.kg,
+            factors.w,
+            factors.u,
+            cumulative_gate,
+            initial_state,
+            metadata,
+            store_final_state=store_final_state,
         )
         output = chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
     return output, final_state
@@ -189,8 +200,13 @@ def chunk_gdn_fwd_packed(
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fixed-capacity packed scalar forward and return output, state, and inverse tape."""
+    store_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Run fixed-capacity packed scalar forward and return output, state, and inverse tape.
+
+    A missing ``initial_state`` is a zero state that is never materialized; the final state is
+    ``None`` when ``store_final_state`` is false.
+    """
     validate_supported_device(q)
     batch, _tokens, key_heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
@@ -198,17 +214,17 @@ def chunk_gdn_fwd_packed(
         raise ValueError("packed fused chunk GDN requires B=1 and K=V in {64, 128}")
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("packed fused chunk GDN requires matching Q/K and H % HK == 0")
-    if initial_state is None:
-        initial_state = zero_state(q, v, metadata)
     reject_int64_offsets(q, k, v, cumulative_gate, beta, initial_state)
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
-    cumulative_gate, beta, initial_state = (
-        normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta, initial_state)
+    cumulative_gate, beta = (
+        normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta)
     )
+    if initial_state is not None:
+        initial_state = normalize_compact_tensor(initial_state)
 
     factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata)
     output, final_state = _finish_chunk_gdn_fwd(
-        q, k, factors, cumulative_gate, initial_state, metadata, scale
+        q, k, factors, cumulative_gate, initial_state, metadata, scale, store_final_state
     )
     return output, final_state, factors.inverse
 
@@ -228,7 +244,7 @@ def _gdn_chunk_fwd_packed_cuda(
     """Registered packed forward without a public final-state output."""
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     output, _state, inverse = chunk_gdn_fwd_packed(
-        q, k, v, cumulative_gate, beta, initial_state, metadata, scale
+        q, k, v, cumulative_gate, beta, initial_state, metadata, scale, store_final_state=False
     )
     return output, inverse
 
@@ -333,15 +349,15 @@ def _prepare_chunk_gdn_bwd(
     metadata: RaggedChunkMetadata | None,
 ) -> ChunkGDNBwdPrepared:
     """Recompute local factors and forward state on normalized inputs before communication."""
-    recurrence_state = zero_state(q, v, metadata) if initial_state is None else initial_state
     w, u, qg, kg = chunk_gdn_recompute_w_u_qg_kg(q, k, v, cumulative_gate, beta, inverse, metadata)
     if metadata is None:
+        recurrence_state = zero_state(q, v, None) if initial_state is None else initial_state
         h, v_new, _final_state = chunk_gdn_fwd_recurrence_dense(
             kg, w, u, cumulative_gate, recurrence_state
         )
     else:
         h, v_new, _final_state = chunk_gdn_fwd_recurrence_packed(
-            kg, w, u, cumulative_gate, recurrence_state, metadata
+            kg, w, u, cumulative_gate, initial_state, metadata, store_final_state=False
         )
     return ChunkGDNBwdPrepared(w, qg, kg, h, v_new)
 
