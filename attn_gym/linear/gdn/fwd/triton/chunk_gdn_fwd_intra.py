@@ -13,13 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
+from attn_gym.linear.kda.utils import exp2
 
 # Match FLA's fused GDN solve: the block-inverse merge multiplies FP32 intermediates,
 # so TF32 preserves more precision than narrowing them to BF16 while retaining tensor-core MMAs.
@@ -40,16 +41,6 @@ def _solve_diagonal_block(matrix, row, valid_rows, BC: tl.constexpr):
     return inverse
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": block_key}, num_warps=num_warps)
-        for block_key in (32, 64)
-        for num_warps in (1, 2, 4)
-    ],
-    key=["H", "HV", "K", "BC"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_fwd_kkt_solve_kernel(
     k,
@@ -327,28 +318,6 @@ def chunk_gdn_fwd_kkt_solve_kernel(
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), mask=m_A33)
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "STORE_QG": lambda args: args["q"] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=4),
-        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
-    ],
-    key=["T", "H", "HV", "K", "V", "IS_VARLEN", "STORE_QG"],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, K, V, **_: [
-            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def scalar_recompute_w_u_kg_kernel(
     q,
@@ -460,6 +429,34 @@ def scalar_recompute_w_u_kg_kernel(
             )
 
 
+_kkt_solve = TritonTuner(
+    chunk_gdn_fwd_kkt_solve_kernel,
+    [
+        triton.Config({"BK": block_key}, num_warps=num_warps)
+        for block_key in (32, 64)
+        for num_warps in (1, 2, 4)
+    ],
+    key=lambda a: (a["H"], a["HV"], a["K"], a["BC"], a["k"].dtype, a["IS_VARLEN"]),
+)
+
+# Unlike the triton.autotune key this replaces, T is not keyed: packed training sees a new T
+# nearly every step, which re-benchmarked each time.
+_recompute_w_u_kg = TritonTuner(
+    scalar_recompute_w_u_kg_kernel,
+    [
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
+    ],
+    key=lambda a: (a["H"], a["HV"], a["K"], a["V"], a["k"].dtype, a["IS_VARLEN"], a["STORE_QG"]),
+    prune=lambda configs, a: [
+        c for c in configs if c.kwargs["BK"] <= a["K"] and c.kwargs["BV"] <= a["V"]
+    ],
+)
+
+
 def chunk_gdn_fwd_intra_dense(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -484,7 +481,7 @@ def chunk_gdn_fwd_intra_dense(
         raise ValueError("cumulative_gate and beta must follow value heads")
     chunks = tokens // 64
     inverse = torch.zeros(batch, tokens, value_heads, 64, dtype=k.dtype, device=k.device)
-    chunk_gdn_fwd_kkt_solve_kernel[(chunks, batch * value_heads)](
+    _kkt_solve[(chunks, batch * value_heads)](
         k=k,
         k_stride_t=k.stride(1),
         g=cumulative_gate,
@@ -492,6 +489,7 @@ def chunk_gdn_fwd_intra_dense(
         A=inverse,
         cu_seqlens=None,
         chunk_offsets=None,
+        IS_VARLEN=False,
         T=tokens,
         num_sequences=0,
         H=key_heads,
@@ -504,7 +502,7 @@ def chunk_gdn_fwd_intra_dense(
     w = k.new_empty(batch, tokens, value_heads, key_dim)
     u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     restored_k = torch.empty_like(w)
-    scalar_recompute_w_u_kg_kernel[(chunks, batch * value_heads)](
+    _recompute_w_u_kg[(chunks, batch * value_heads)](
         q=None,
         k=k,
         v=v,
@@ -518,8 +516,10 @@ def chunk_gdn_fwd_intra_dense(
         u=u,
         restored_k=restored_k,
         qg=None,
+        STORE_QG=False,
         cu_seqlens=None,
         chunk_offsets=None,
+        IS_VARLEN=False,
         T=tokens,
         num_sequences=0,
         H=key_heads,
@@ -556,7 +556,7 @@ def chunk_gdn_fwd_intra_packed(
         raise ValueError("cumulative_gate and beta must follow value heads")
 
     inverse = torch.zeros(batch, tokens, value_heads, 64, dtype=k.dtype, device=k.device)
-    chunk_gdn_fwd_kkt_solve_kernel[(metadata.capacity, value_heads)](
+    _kkt_solve[(metadata.capacity, value_heads)](
         k=k,
         k_stride_t=k.stride(1),
         g=cumulative_gate,
@@ -564,6 +564,7 @@ def chunk_gdn_fwd_intra_packed(
         A=inverse,
         cu_seqlens=metadata.cu_seqlens,
         chunk_offsets=metadata.chunk_offsets,
+        IS_VARLEN=True,
         T=tokens,
         num_sequences=metadata.cu_seqlens.shape[0] - 1,
         H=key_heads,
@@ -578,7 +579,7 @@ def chunk_gdn_fwd_intra_packed(
     w = k.new_empty(batch, tokens, value_heads, key_dim)
     u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     restored_k = torch.empty_like(w)
-    scalar_recompute_w_u_kg_kernel[(metadata.capacity, value_heads)](
+    _recompute_w_u_kg[(metadata.capacity, value_heads)](
         q=None,
         k=k,
         v=v,
@@ -592,8 +593,10 @@ def chunk_gdn_fwd_intra_packed(
         u=u,
         restored_k=restored_k,
         qg=None,
+        STORE_QG=False,
         cu_seqlens=metadata.cu_seqlens,
         chunk_offsets=metadata.chunk_offsets,
+        IS_VARLEN=True,
         T=tokens,
         num_sequences=metadata.cu_seqlens.shape[0] - 1,
         H=key_heads,
@@ -639,7 +642,7 @@ def chunk_gdn_recompute_w_u_qg_kg(
     cu_seqlens = None if metadata is None else metadata.cu_seqlens
     chunk_offsets = None if metadata is None else metadata.chunk_offsets
     num_sequences = 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1
-    scalar_recompute_w_u_kg_kernel[(chunks, batch * value_heads)](
+    _recompute_w_u_kg[(chunks, batch * value_heads)](
         q=q,
         k=k,
         v=v,
@@ -653,8 +656,10 @@ def chunk_gdn_recompute_w_u_qg_kg(
         u=u,
         restored_k=restored_k,
         qg=qg,
+        STORE_QG=True,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        IS_VARLEN=metadata is not None,
         T=tokens,
         num_sequences=num_sequences,
         H=key_heads,
