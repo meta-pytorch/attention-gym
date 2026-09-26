@@ -439,8 +439,6 @@ _kkt_solve = TritonTuner(
     key=lambda a: (a["H"], a["HV"], a["K"], a["BC"], a["k"].dtype, a["IS_VARLEN"]),
 )
 
-# Unlike the triton.autotune key this replaces, T is not keyed: packed training sees a new T
-# nearly every step, which re-benchmarked each time.
 _recompute_w_u_kg = TritonTuner(
     scalar_recompute_w_u_kg_kernel,
     [
