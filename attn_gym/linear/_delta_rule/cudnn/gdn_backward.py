@@ -96,7 +96,14 @@ def chunk_gdn_bwd_cudnn_packed(
             dtype=torch.int64,
             device=q.device,
         )
-        d_initial_state = torch.empty_like(initial_state) if initial_state is not None else None
+        d_initial_state = None
+        if initial_state is not None:
+            # Empty sequences emit no work item; their state cotangent passes through unchanged.
+            d_initial_state = (
+                torch.zeros_like(initial_state)
+                if d_final_state is None
+                else d_final_state.clone(memory_format=torch.contiguous_format)
+            )
         # The kernel reads grouped q/k directly but writes dq/dk per value head.
         dq = torch.empty(tokens, heads, key_dim, dtype=q.dtype, device=q.device)
         dk = torch.empty_like(dq)

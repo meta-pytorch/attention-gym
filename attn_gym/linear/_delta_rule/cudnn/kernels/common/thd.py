@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by Attention Gym in 2026: descriptor builds skip empty sequences.
 
 """Shared THD / varlen (packed ``[T,H,D]`` + ``cu_seqlens``) device helpers.
 
@@ -50,29 +52,31 @@ def emit_seq_load_descs(
         cu_b = cutlass.Int32(cu[b])
         cu_next = cutlass.Int32(cu[b + cutlass.Int32(1)])
         s_b = cu_next - cu_b
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        if cu_next == packed_tokens:
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_DIM,
-                dptr,
-                new_value=packed_tokens,
-                ord=seq_ord,
-            )
-        else:
-            addr = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_ADDRESS,
-                dptr,
-                new_value=addr.toint(cutlass.Int64),
-            )
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_DIM,
-                dptr,
-                new_value=s_b,
-                ord=seq_ord,
-            )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_b > 0:
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            if cu_next == packed_tokens:
+                nvvm.tensormap_replace(
+                    nvvm.TensormapField.GLOBAL_DIM,
+                    dptr,
+                    new_value=packed_tokens,
+                    ord=seq_ord,
+                )
+            else:
+                addr = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
+                nvvm.tensormap_replace(
+                    nvvm.TensormapField.GLOBAL_ADDRESS,
+                    dptr,
+                    new_value=addr.toint(cutlass.Int64),
+                )
+                nvvm.tensormap_replace(
+                    nvvm.TensormapField.GLOBAL_DIM,
+                    dptr,
+                    new_value=s_b,
+                    ord=seq_ord,
+                )
 
 
 @cute.jit
@@ -102,21 +106,23 @@ def emit_seq_descs(
     for b in cutlass.range(0, n_batch, 1, unroll=1):
         cu_b = cutlass.Int32(cu[b])
         s_b = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cu_b
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        addr = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_ADDRESS,
-            dptr,
-            new_value=addr.toint(cutlass.Int64),
-        )
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_DIM,
-            dptr,
-            new_value=s_b,
-            ord=seq_ord,
-        )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_b > 0:
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            addr = base + cutlass.Int64(cu_b) * cutlass.Int64(row_stride)
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=addr.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=s_b,
+                ord=seq_ord,
+            )
 
 
 @cute.jit
@@ -145,22 +151,23 @@ def emit_checkpoint_seq_descs(
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
         s_tok = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cutlass.Int32(cu[b])
-        cnt = (s_tok - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
-        cnt = cnt if s_tok > 0 else cutlass.Int32(0)
-        checkpoint_base = run
-        run = run + cnt
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(row_stride)
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_ADDRESS,
-            dptr,
-            new_value=addr.toint(cutlass.Int64),
-        )
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_DIM,
-            dptr,
-            new_value=cnt,
-            ord=seq_ord,
-        )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_tok > 0:
+            cnt = (s_tok - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
+            checkpoint_base = run
+            run = run + cnt
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(row_stride)
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=addr.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=cnt,
+                ord=seq_ord,
+            )

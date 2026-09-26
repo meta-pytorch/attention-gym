@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: imports were relocated and empty sequences were changed to
-# emit no work item, preventing invalid persistent-kernel TMEM lifecycle transitions.
+# emit no work item, preventing invalid persistent-kernel TMEM lifecycle transitions. The unsplit
+# (``gen``) table also compacts sequences that need no work out of the LPT sort (see
+# ``compact_sequences``).
 
 """Split-K sequence partitioning for ALL chunked linear-attention kernels:
 GDN (scalar ``gate (T, HO)``, b_t=64) and KDA / GDN-2 (per-key-channel
@@ -91,6 +93,7 @@ from attn_gym._backends.cute import make_fake_strided_tensor
 from attn_gym._backends.cute.utils import get_device_properties
 
 from .elementwise import softplus
+from .paged_state import resolve_paged_state
 from .host import get_dtype
 from .tvm_ffi import (
     WORK_ITEM_FIELDS,
@@ -640,6 +643,53 @@ def write_item(
 
 
 @cute.jit
+def compact_sequences(
+    n_threads: cutlass.Constexpr[int],
+    tidx,
+    n_batch: cutlass.Int32,
+    mCuSeqlens: cute.Tensor,
+    mStateIndices: cute.Tensor | None,
+    mHasInitialState: cute.Tensor | None,
+    sIdx,
+    sWarp,
+):
+    """Attention Gym addition: write, in sequence order, the ids of sequences that need a work
+    item into ``sIdx[0, M)`` and return ``M``.  A sequence needs one when it has tokens, or when
+    it is an empty paged route whose fresh slot the main kernel must still clear (the same
+    ``clear_empty`` rule the main kernel applies).  A warp ballot ranks each round of
+    ``n_threads`` sequences, so the table is deterministic.  ``sWarp`` holds
+    ``n_threads // 32`` Int32 cells."""
+    lane = cute.arch.lane_idx()
+    warp = tidx // cutlass.Int32(32)
+    base = cutlass.Int32(0)
+    start = cutlass.Int32(0)
+    while start < n_batch:
+        b = start + tidx
+        keep = cutlass.Boolean(False)
+        if b < n_batch:
+            _, _, _, clear_empty = resolve_paged_state(b, mStateIndices, mHasInitialState)
+            keep = mCuSeqlens[b + 1] > mCuSeqlens[b] or clear_empty
+        ballot = cute.arch.vote_ballot_sync(keep)
+        rank = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot) & cute.arch.lanemask_lt()))
+        if lane == 0:
+            sWarp[warp] = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot)))
+        nvvm.barrier_cta_sync()
+        offset = base
+        total = cutlass.Int32(0)
+        for w in cutlass.range_constexpr(n_threads // 32):
+            count = sWarp[w]
+            total = total + count
+            if cutlass.Int32(w) < warp:
+                offset = offset + count
+        if keep:
+            sIdx[offset + rank] = b
+        base = base + total
+        nvvm.barrier_cta_sync()
+        start = start + cutlass.Int32(n_threads)
+    return base
+
+
+@cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
     has_sched: cutlass.Constexpr[bool],
@@ -657,6 +707,8 @@ def order_body(
     sKey,
     sIdx,
     sSpread,
+    mStateIndices: cute.Tensor | None = None,
+    mHasInitialState: cute.Tensor | None = None,
 ):
     """LPT ordering body over ``n_threads`` CTA threads and caller-owned SMEM
     staging (``sKey``/``sIdx`` of ``n_threads * order_elems`` Int32 cells +
@@ -675,18 +727,44 @@ def order_body(
             while si < mSched.shape[0]:
                 mSched[si] = cutlass.Int32(0)
                 si = si + cutlass.Int32(1)
+    # Attention Gym modification: with ``gen``, sequences that need no work (see
+    # ``compact_sequences``) emit no item, so padded ``cu_seqlens`` cost neither sort slots nor
+    # main-kernel tiles. Compacted item ``i`` maps back to the original
+    # ``sequence * n_heads_out + head`` index that ``write_item`` expects. Batches of more than
+    # ``capacity`` sequences keep the uncompacted table, whose zero-chunk items issue no TMA.
+    compact = False
     if cutlass.const_expr(gen):
+        n_batch = n_tiles // n_heads_out
+        compact = n_batch <= cutlass.Int32(capacity)
         n = n_tiles
+        if compact:
+            kept = compact_sequences(
+                n_threads, tidx, n_batch, mCuSeqlens, mStateIndices, mHasInitialState, sIdx, sKey
+            )
+            n = kept * n_heads_out
         if tidx == 0:
-            mCount[0] = n_tiles
+            mCount[0] = n
     else:
         n = mCount[0]
     if n > cutlass.Int32(capacity):
         i = tidx
         while i < n:
-            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i)
+            src = i
+            if compact:
+                src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
+            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src)
             i = i + cutlass.Int32(n_threads)
     else:
+        # Resolve compacted sources before sIdx is reused as the sort permutation. Here gen
+        # implies compact: an uncompacted gen table has more than ``capacity`` items.
+        sources = []
+        for e in cutlass.range_constexpr(order_elems):
+            i = tidx + cutlass.Int32(e * n_threads)
+            src = i
+            if cutlass.const_expr(gen):
+                if i < n:
+                    src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
+            sources.append(src)
         if tidx == 0:
             sSpread[0] = cutlass.Int32(2147483647)
             sSpread[1] = cutlass.Int32(-2147483648)
@@ -700,12 +778,12 @@ def order_body(
             i = tidx + cutlass.Int32(e * n_threads)
             if i < n:
                 if cutlass.const_expr(gen):
-                    batch_idx, head_idx, batch_start, batch_end, num_chunks_b = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i)
+                    batch_idx, head_idx, batch_start, batch_end, num_chunks_b = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, sources[e])
                     key = num_chunks_b
                 else:
                     key = mStaging[i, 5] - mStaging[i, 4]
                 sKey[i] = key
-                sIdx[i] = i
+                sIdx[i] = sources[e]
                 kmin = kmin if kmin < key else key
                 kmax = kmax if kmax > key else key
             elif i < b_pad:
@@ -719,7 +797,7 @@ def order_body(
             # every key equal (uniform batches): copy through
             i2 = tidx
             while i2 < n:
-                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2)
+                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, sIdx[i2])
                 i2 = i2 + cutlass.Int32(n_threads)
         else:
             k = cutlass.Int32(2)

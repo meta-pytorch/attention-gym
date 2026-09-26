@@ -131,11 +131,14 @@ def chunk_delta_rule_bwd_cudnn_packed(
             device=q.device,
         )
         gradients = tuple(torch.empty_like(t[0]) for t in (q, k, value, gate, beta))
-        d_initial_state = (
-            None
-            if initial_state is None
-            else torch.empty(state_shape, dtype=torch.float32, device=q.device)
-        )
+        d_initial_state = None
+        if initial_state is not None:
+            # Empty sequences emit no work item; their state cotangent passes through unchanged.
+            d_initial_state = (
+                torch.zeros(state_shape, dtype=torch.float32, device=q.device)
+                if d_final_state is None
+                else d_final_state.clone(memory_format=torch.contiguous_format)
+            )
 
         kda_recompute_f16.chunk_kda_recompute_sm100(
             k[0],
