@@ -999,8 +999,7 @@ def tmastg_warp(
             cend,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
 
-        head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
-        head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
+        # dQ/dK are stored per output head; the host sums grouped heads.
         head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
         slot = batch_idx * desc_qwords
         desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
@@ -1026,7 +1025,7 @@ def tmastg_warp(
             dq_idx = dq_index.idx
             bars.mb_dq_tmastg_ready[dq_idx].wait(dq_index.phase)
             dq_index = advance(dq_index, cfg.smem_dq_stages)
-            dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_q, tok_coord)
+            dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_idx, tok_coord)
             if chunk_idx < wend:
                 tma_store_tile(sdQ_tma[dq_idx], dq_slice)
                 tma_store_commit()
@@ -1034,7 +1033,7 @@ def tmastg_warp(
             dk_idx = dk_index.idx
             bars.mb_dk_tmastg_ready[dk_idx].wait(dk_index.phase)
             dk_index = advance(dk_index, cfg.smem_dk_stages)
-            dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_k, tok_coord)
+            dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_idx, tok_coord)
             if chunk_idx < wend:
                 tma_store_tile(sdK_tma[dk_idx], dk_slice)
                 tma_store_commit()
@@ -4412,10 +4411,12 @@ def prologue(
         cute.make_layout((d_v, heads_out, seqlen), stride=(1, do.stride[1], do.stride[0])),
     )
     dq_headed = cute.make_tensor(
-        dq.iterator, cute.make_layout((d_k, h_q, seqlen), stride=(1, dq.stride[1], dq.stride[0]))
+        dq.iterator,
+        cute.make_layout((d_k, heads_out, seqlen), stride=(1, dq.stride[1], dq.stride[0])),
     )
     dk_headed = cute.make_tensor(
-        dk.iterator, cute.make_layout((d_k, h_k, seqlen), stride=(1, dk.stride[1], dk.stride[0]))
+        dk.iterator,
+        cute.make_layout((d_k, heads_out, seqlen), stride=(1, dk.stride[1], dk.stride[0])),
     )
     dv_headed = cute.make_tensor(
         dv.iterator, cute.make_layout((d_v, h_v, seqlen), stride=(1, dv.stride[1], dv.stride[0]))
@@ -5543,8 +5544,8 @@ def _compile_gdn_bprop_prologue(
         tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
         tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
         tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_V)),
-        tma_tensor(io_dtype, (tokens_sym, h_q, CFG.D_K)),
-        tma_tensor(io_dtype, (tokens_sym, h_k, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_K)),
+        tma_tensor(io_dtype, (tokens_sym, h_out, CFG.D_K)),
         tma_tensor(io_dtype, (tokens_sym, h_v, CFG.D_V)),
         tma_tensor(io_dtype, (checkpoint_rows, h_out, CFG.D_V, CFG.D_K)),
         make_cu_seqlens_signature(sequence_entries),
@@ -5593,7 +5594,9 @@ def chunk_gdn_bwd_sm100(
     ``gate``, ``beta``, ``dgate``, and ``dbeta`` are scalar ``[T, H]`` float32
     tensors. ``gate`` is the natural logarithm of the decay. Checkpoints and
     optional initial/final-state gradients use ``[rows, H, V, K]`` and
-    ``[B, H, V, K]`` layouts, respectively.
+    ``[B, H, V, K]`` layouts, respectively. ``q`` and ``k`` may have fewer heads
+    than ``H``; ``dq`` and ``dk`` always hold one gradient per output head,
+    ``[T, H, 128]``, and grouped callers sum them over each head group.
     """
     tma_tensors = (
         ("q", q),
@@ -5637,11 +5640,9 @@ def chunk_gdn_bwd_sm100(
         raise ValueError("do must have shape (T, H, 128) at the output head count")
     if do.dtype != q.dtype:
         raise TypeError(f"do must use q.dtype ({q.dtype}), got {do.dtype}")
-    if h_q != h_out or h_k != h_out:
-        raise ValueError("chunk_gdn_bwd_sm100 requires q and k head ratios of one")
     for name, tensor, expected_shape in (
-        ("dq", dq, q.shape),
-        ("dk", dk, k.shape),
+        ("dq", dq, (tokens, h_out, CFG.D_K)),
+        ("dk", dk, (tokens, h_out, CFG.D_K)),
         ("dv", dv, v.shape),
     ):
         if tensor.shape != expected_shape:
