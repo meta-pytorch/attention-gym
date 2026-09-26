@@ -416,7 +416,7 @@ def _finish_chunk_gdn_bwd(
 ) -> tuple[torch.Tensor, ...]:
     """Finish the local gradients from recomputed factors and the exit-state cotangent.
 
-    ``aqk`` is the expanded-head intra-chunk Q/K factor when the caller already holds it (the
+    ``aqk`` is the per-value-head intra-chunk Q/K factor when the caller already holds it (the
     staged reverse summary computes it first); the Blackwell path recomputes it otherwise.
 
     The Blackwell path releases every recomputed tensor at its last use (``prepared`` fields
@@ -466,20 +466,16 @@ def _finish_chunk_gdn_bwd(
         metadata=metadata,
     )
 
-    # Reuse the proven vector-gate KDA gradient stages only after the scalar
-    # recompute; forward and backward preparation remain expansion-free.
+    # Reuse the proven vector-gate KDA gradient stages only after the scalar recompute. Every
+    # stage reads grouped q/k directly and returns dQ/dK per value head, summed below.
     groups = v.shape[2] // q.shape[2]
-    expanded_q, expanded_k = q, k
-    if groups > 1:
-        expanded_q, expanded_k = (tensor.repeat_interleave(groups, dim=2) for tensor in (q, k))
-    vector_gate = cumulative_gate.unsqueeze(-1).expand_as(expanded_q).contiguous()
+    vector_gate = cumulative_gate.unsqueeze(-1).expand(*cumulative_gate.shape, q.shape[3])
+    vector_gate = vector_gate.contiguous()
     if aqk is None:
         aqk = (
-            chunk_gdn_recompute_aqk_dense(expanded_q, expanded_k, cumulative_gate, scale)
+            chunk_gdn_recompute_aqk_dense(q, k, cumulative_gate, scale)
             if metadata is None
-            else chunk_gdn_recompute_aqk_packed(
-                expanded_q, expanded_k, cumulative_gate, scale, metadata
-            )
+            else chunk_gdn_recompute_aqk_packed(q, k, cumulative_gate, scale, metadata)
         )
     dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
         qg,
@@ -497,8 +493,8 @@ def _finish_chunk_gdn_bwd(
     prepared.w = prepared.qg = prepared.kg = None
     del w, qg, kg, aqk
     dq, dk, dv, dg_raw, db, d_raw_akk = chunk_kda_bwd_wy_dqkg(
-        expanded_q,
-        expanded_k,
+        q,
+        k,
         v,
         v_new,
         vector_gate,
@@ -518,8 +514,8 @@ def _finish_chunk_gdn_bwd(
     del h, v_new, dh, vector_gate
     intra = (
         chunk_gdn_bwd_intra_dense(
-            expanded_q,
-            expanded_k,
+            q,
+            k,
             cumulative_gate,
             beta,
             d_aqk,
@@ -528,8 +524,8 @@ def _finish_chunk_gdn_bwd(
         )
         if metadata is None
         else chunk_gdn_bwd_intra_packed(
-            expanded_q,
-            expanded_k,
+            q,
+            k,
             cumulative_gate,
             beta,
             d_aqk,

@@ -164,6 +164,7 @@ def force_portable_backward(monkeypatch) -> None:
         (1, 64, 1, 1, 128, torch.bfloat16, "unbounded", None, True),
         (1, 64, 1, 64, 128, torch.bfloat16, "mild", None, True),
         (1, 192, 1, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], True),
+        (1, 192, 2, 6, 128, torch.bfloat16, "spikes", [65, 0, 127], False),
         (1, 64, 1, 2, 64, torch.bfloat16, "mild", None, True),
         (1, 64, 1, 2, 64, torch.float16, "mild", None, True),
         (1, 16, 1, 2, 64, torch.bfloat16, "mild", [7, 9], True),
