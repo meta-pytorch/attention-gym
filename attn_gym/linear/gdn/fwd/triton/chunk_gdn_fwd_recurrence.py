@@ -125,10 +125,17 @@ def chunk_gdn_fwd_recurrence_packed(
     w: torch.Tensor,
     u: torch.Tensor,
     cumulative_gate: torch.Tensor,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fixed-capacity packed recurrence with empty-sequence state identity."""
+    *,
+    store_final_state: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Run fixed-capacity packed recurrence with empty-sequence state identity.
+
+    ``initial_state=None`` starts every sequence from zero without materializing a state, and
+    ``store_final_state=False`` skips the final state, so zero-length padding intervals cost
+    nothing in the recurrence.
+    """
     metadata.validate_chunk_size(64)
     batch, tokens, heads, key_dim = restored_k.shape
     value_dim = u.shape[-1]
@@ -138,13 +145,15 @@ def chunk_gdn_fwd_recurrence_packed(
             "packed fused chunk GDN recurrence requires B=1, T>0, and K=V in {64, 128}"
         )
     expected_state = (num_sequences, heads, value_dim, key_dim)
-    if initial_state.shape != expected_state:
+    if initial_state is not None and initial_state.shape != expected_state:
         raise ValueError(f"initial_state must have shape {expected_state}")
 
     # The KDA recurrence kernel owns the scalar-gate specialization: on SM100 its warp-specialized
     # TMA schedule steps a chunk in about half the time of a plain Triton loop, and it falls back
     # to ordinary pipelining for FP32 inputs and other architectures.
-    final_state = torch.empty_like(initial_state)
+    final_state = (
+        restored_k.new_empty(expected_state, dtype=torch.float32) if store_final_state else None
+    )
     h, v_new = _delta_h_launch(
         restored_k,
         w,

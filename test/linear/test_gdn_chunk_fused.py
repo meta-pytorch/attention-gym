@@ -1231,3 +1231,29 @@ def test_packed_cuda_graph_replays_boundaries():
     torch.cuda.synchronize()
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def test_packed_no_state_forward_ignores_empty_padding_intervals():
+    """Zero-length cu_seqlens padding must not change output or allocate per-interval states.
+
+    Serving stacks pad cu_seqlens to a fixed capacity. A no-state call used to materialize an FP32
+    [N, H, V, K] zero state and final state for every interval (64 KiB per head per interval).
+    """
+    q, k, v, gate, beta, _state = make_inputs(tokens=512, key_heads=2, value_heads=4)
+    lengths = [300, 212]
+    padding = 1024
+    compact = cumulative_sequence_offsets(lengths)
+    padded = torch.cat([compact, compact[-1:].expand(padding)]).contiguous()
+
+    with torch.no_grad():
+        expected, _ = chunk_gdn(q, k, v, gate, beta, cu_seqlens=compact)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_allocated()
+        actual, _ = chunk_gdn(q, k, v, gate, beta, cu_seqlens=padded)
+        torch.cuda.synchronize()
+        peak_growth = torch.cuda.max_memory_allocated() - baseline
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    per_interval_state = 4 * v.shape[2] * v.shape[3] * q.shape[3]
+    assert peak_growth < padding * per_interval_state
