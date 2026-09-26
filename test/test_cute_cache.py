@@ -704,6 +704,19 @@ def test_runtime_cache_preserves_scalar_representation(isolated_cache, first, se
     assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=2, misses=2, currsize=2)
 
 
+def test_runtime_cache_keeps_nan_payloads_distinct(isolated_cache):
+    first_nan = struct.unpack("!d", bytes.fromhex("7ff8000000000001"))[0]
+    second_nan = struct.unpack("!d", bytes.fromhex("7ff8000000000002"))[0]
+
+    @cute_cache.jit_cache
+    def compile_kernel(value: float) -> FakeCompiled:
+        return FakeCompiled(struct.pack("!d", value).hex())
+
+    assert compile_kernel(first_nan)() == "7ff8000000000001"
+    assert compile_kernel(second_nan)() == "7ff8000000000002"
+    assert compile_kernel.cache_info().currsize == 2
+
+
 def test_explicit_cache_key_is_shared_by_memory_and_disk(isolated_cache):
     compile_count = 0
 
