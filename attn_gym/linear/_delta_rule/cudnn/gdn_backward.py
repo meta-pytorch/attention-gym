@@ -11,6 +11,7 @@ from attn_gym.linear._delta_rule.cudnn.kernels.common.host import (
     checkpoint_capacity_bound,
     tensormap_workspace_bytes,
 )
+from attn_gym.linear._delta_rule.triton.group_sum import group_sum
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
 
@@ -54,12 +55,6 @@ def chunk_gdn_bwd_cudnn_packed(
         if k.shape != q.shape or heads % key_heads:
             raise ValueError("k must match q and value heads must be divisible by query heads")
         groups = heads // key_heads
-        if groups > 1:
-            # Temporary bridge until the kernel supports grouped-head reduction natively.
-            q_kernel = q.repeat_interleave(groups, dim=2).contiguous()
-            k_kernel = k.repeat_interleave(groups, dim=2).contiguous()
-        else:
-            q_kernel, k_kernel = q, k
         num_sequences = cu_seqlens.shape[0] - 1
         stream = torch.cuda.current_stream(q.device).cuda_stream
         schedule = prepare_cudnn_schedule(
@@ -95,14 +90,15 @@ def chunk_gdn_bwd_cudnn_packed(
             device=q.device,
         )
         d_initial_state = torch.empty_like(initial_state) if initial_state is not None else None
-        dq = torch.empty_like(q_kernel[0])
-        dk = torch.empty_like(k_kernel[0])
+        # The kernel reads grouped q/k directly but writes dq/dk per value head.
+        dq = torch.empty(tokens, heads, key_dim, dtype=q.dtype, device=q.device)
+        dk = torch.empty_like(dq)
         dv = torch.empty_like(value[0])
         dgate = torch.empty_like(gate[0])
         dbeta = torch.empty_like(beta[0])
 
         gdn_recompute_f16.chunk_gdn_recompute_sm100(
-            k_kernel[0],
+            k[0],
             value[0],
             gate[0],
             beta[0],
@@ -123,8 +119,8 @@ def chunk_gdn_bwd_cudnn_packed(
             schedule.counters[2:] if num_sequences * heads <= schedule.num_sms else None
         )
         gdn_bprop_f16.chunk_gdn_bwd_sm100(
-            q_kernel[0],
-            k_kernel[0],
+            q[0],
+            k[0],
             value[0],
             gate[0],
             beta[0],
@@ -146,10 +142,8 @@ def chunk_gdn_bwd_cudnn_packed(
             tensormap_workspace=backward_workspace,
         )
         if groups > 1:
-            reduced_dq = dq.reshape(tokens, key_heads, groups, key_dim).sum(2)
-            reduced_dk = dk.reshape(tokens, key_heads, groups, key_dim).sum(2)
-            dq = torch.empty_like(q[0]).copy_(reduced_dq)
-            dk = torch.empty_like(k[0]).copy_(reduced_dk)
+            dq = group_sum(dq, groups, out_dtype=q.dtype)
+            dk = group_sum(dk, groups, out_dtype=k.dtype)
         return (
             dq.unsqueeze(0),
             dk.unsqueeze(0),

@@ -15,6 +15,7 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
+from attn_gym.linear._delta_rule.triton.group_sum import group_sum
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
@@ -542,14 +543,14 @@ def _finish_chunk_gdn_bwd(
     # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk`` (allocated like the FP32 vector
     # gate), so accumulating in place is the same FP32 add without a third full-size buffer.
     assert dq.dtype == torch.float32 and dk.dtype == torch.float32
-    dq.add_(intra_dq)
-    dk.add_(intra_dk)
-    del intra_dq, intra_dk
     if groups > 1:
-        dq = dq.view(*q.shape[:2], q.shape[2], groups, q.shape[3]).sum(3)
-        dk = dk.view(*k.shape[:2], k.shape[2], groups, k.shape[3]).sum(3)
-    dq = dq.to(q.dtype)
-    dk = dk.to(k.dtype)
+        # One deterministic pass adds the two FP32 parts, sums each head group, and casts.
+        dq = group_sum(dq, groups, out_dtype=q.dtype, addend=intra_dq)
+        dk = group_sum(dk, groups, out_dtype=k.dtype, addend=intra_dk)
+    else:
+        dq = dq.add_(intra_dq).to(q.dtype)
+        dk = dk.add_(intra_dk).to(k.dtype)
+    del intra_dq, intra_dk
     db = db + intra_db
     return dq, dk, dv, d_gate, db, d_initial_state
 
