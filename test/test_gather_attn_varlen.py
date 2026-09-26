@@ -26,10 +26,12 @@ def _backend_kwargs(backend):
     )
 
 
-def _inputs(device="cpu", dtype=torch.float64, *, share_kv=True, head_dim=16, capacity=0):
+def _inputs(
+    device="cpu", dtype=torch.float64, *, share_kv=True, head_dim=16, capacity=0, heads=None
+):
     cu_q = torch.tensor([0, 0, 3, 12, 12, 17, 17], device=device, dtype=torch.int32)
     cu_k = torch.tensor([0, 0, 0, 2, 2, 3, 3], device=device, dtype=torch.int32)
-    heads = 16 if device == "cuda" else 2
+    heads = (16 if device == "cuda" else 2) if heads is None else heads
     kv_heads = 1 if share_kv else heads
     tensors = [
         torch.randn(1, heads, 17 + capacity, head_dim, device=device, dtype=dtype) * 0.2,
@@ -222,16 +224,21 @@ def test_unused_sparse_storage_cannot_poison_another_document(
     torch.testing.assert_close(actual[:, :, :checked_tokens], expected[:, :, :checked_tokens])
 
 
-@pytest.mark.parametrize("backend,share_kv", [("triton", True), ("triton", False), ("cute", True)])
+@pytest.mark.parametrize(
+    "backend,share_kv,heads",
+    [("triton", True, 16), ("triton", False, 16), ("cute", True, 16), ("cute", True, 128)],
+)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_packed_gpu_matches_per_document_forward_backward(
-    backend, share_kv, index_dtype, gather_attn_single_config
+    backend, share_kv, heads, index_dtype, gather_attn_single_config
 ):
     _device(backend)
     from test_gather_attn_triton import assert_matches_low_precision_eager
 
     dim = 512 if backend == "cute" else 64
-    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, share_kv=share_kv, head_dim=dim)
+    tensors, indices, cu_q, cu_k = _inputs(
+        "cuda", torch.bfloat16, share_kv=share_kv, head_dim=dim, heads=heads
+    )
     if index_dtype == torch.int64:
         indices = indices.to(index_dtype)
         indices[..., -2] = 2**32 + 1  # Would become a valid local index if narrowed too early.
@@ -366,10 +373,14 @@ def test_packed_triton_fullgraph_dynamic_capacities(gather_attn_single_config, s
 
 
 @pytest.mark.parametrize("changed_offsets", ["query", "sparse"])
-def test_packed_backward_rejects_changed_boundaries(gather_attn_single_config, changed_offsets):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, capacity=3)
+@pytest.mark.parametrize("backend", ["triton", "cute"])
+def test_packed_backward_rejects_changed_boundaries(
+    gather_attn_single_config, changed_offsets, backend
+):
+    _device(backend)
+    tensors, indices, cu_q, cu_k = _inputs(
+        "cuda", torch.bfloat16, capacity=3, head_dim=512 if backend == "cute" else 16
+    )
     q, local, sparse, sink = tensors
     output = gather_attn(
         q,
@@ -380,7 +391,7 @@ def test_packed_backward_rejects_changed_boundaries(gather_attn_single_config, c
         sliding_window_size=7,
         cu_seqlens=cu_q,
         cu_seqlens_k=cu_k,
-        kernel_options={"backend": "triton"},
+        kernel_options={"backend": backend},
     )
     if changed_offsets == "query":
         cu_q[2] = 2
@@ -421,3 +432,99 @@ def test_reverse_map_preserves_local_selection_multiplicity(packed, dtype):
         for key, selected in enumerate(expected):
             actual = queries[0, bounds[0, key] : bounds[0, key + 1]].sort().values.tolist()
             assert actual == selected
+
+
+def test_packed_cute_native_varlen_replays_offsets_and_gradients(monkeypatch):
+    """Packed calls must use FA4's native document-relative entry point, including replay."""
+    _device("cute")
+    from flash_attn.cute import interface
+
+    native = interface.flash_attn_varlen_func
+    called = False
+
+    def check_native(*args, **kwargs):
+        nonlocal called
+        called = True
+        assert kwargs["q"].ndim == 3
+        assert kwargs["gather_kv_indices"].ndim == 2
+        assert kwargs["k"] is kwargs["v"]
+        return native(*args, **kwargs)
+
+    def reject_flat(*args, **kwargs):
+        raise AssertionError("Packed attention must not flatten away document boundaries")
+
+    monkeypatch.setattr(interface, "flash_attn_varlen_func", check_native)
+    monkeypatch.setattr(interface, "flash_attn_func", reject_flat)
+    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512, capacity=3)
+    q, local, sparse, sink = tensors
+    grad = torch.randn_like(q) * 0.2
+
+    def run():
+        output = gather_attn(
+            q,
+            local,
+            sparse,
+            indices,
+            sink,
+            sliding_window_size=7,
+            cu_seqlens=cu_q,
+            cu_seqlens_k=cu_k,
+            kernel_options={"backend": "cute"},
+        )
+        return output, *torch.autograd.grad(output, tensors, grad)
+
+    for _ in range(3):
+        run()
+    assert called
+    graph = torch.cuda.CUDAGraph()
+    previous_override = torch._C._override_stale_capture_stream()
+    torch.autograd.graph.set_override_stale_capture_stream(True)
+    try:
+        with torch.cuda.graph(graph):
+            actual = run()
+    finally:
+        torch.autograd.graph.set_override_stale_capture_stream(previous_override)
+    for q_offsets, k_offsets in (
+        ([0, 2, 3, 10, 10, 16, 17], [0, 0, 0, 1, 1, 2, 2]),
+        ([0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0]),
+    ):
+        cu_q.copy_(torch.tensor(q_offsets, device="cuda", dtype=torch.int32))
+        cu_k.copy_(torch.tensor(k_offsets, device="cuda", dtype=torch.int32))
+        graph.replay()
+        expected = run()
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference)
+
+
+def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
+    """Dropping the singleton batch must not allocate and copy a full query gradient."""
+    _device("cute")
+    from flash_attn.cute import interface
+
+    native = interface.flash_attn_varlen_func
+    native_queries = []
+
+    def capture_query(*args, **kwargs):
+        native_queries.append(kwargs["q"])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "flash_attn_varlen_func", capture_query)
+    tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512)
+    query, local, sparse, sink = tensors
+    gather_attn(
+        query,
+        local,
+        sparse,
+        indices,
+        sink,
+        sliding_window_size=7,
+        cu_seqlens=cu_q,
+        cu_seqlens_k=cu_k,
+        kernel_options={"backend": "cute"},
+    )
+    incoming = torch.randn_like(native_queries[0])
+    (grad_query,) = torch.autograd.grad(native_queries[0], query, incoming)
+    torch.testing.assert_close(grad_query, incoming.transpose(0, 1).unsqueeze(0))
+    grad_storage = grad_query.untyped_storage().data_ptr()
+    incoming_storage = incoming.untyped_storage().data_ptr()
+    assert grad_storage == incoming_storage

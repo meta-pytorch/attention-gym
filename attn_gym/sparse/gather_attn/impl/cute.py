@@ -1,7 +1,7 @@
 """CuTe DSL (SM100/SM103) backend for gather attention.
 
-Delegates to FlashAttention-4's public ``flash_attn_func`` with
-``gather_kv_indices`` for index-gather mode.  FA4 owns autograd,
+Delegates to FlashAttention-4's public dense/varlen entry points with
+``gather_kv_indices`` for index-gather mode. FA4 owns attention autograd,
 compilation caching, workspace allocation, and backward orchestration.
 
 This backend is **eager-only** — ``torch.compile`` is not supported until
@@ -23,31 +23,6 @@ import warnings
 from functools import cache
 
 import torch
-
-# ---------------------------------------------------------------------------
-# Index building
-# ---------------------------------------------------------------------------
-
-
-def _build_gather_indices(
-    kv_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    cu_seqlens_k: torch.Tensor | None,
-    sliding_window_size: int,
-    local_kv_len: int,
-    sparse_kv_len: int,
-) -> torch.Tensor:
-    """Build FA4's (batch, seq_len, padded_topk) int32 gather indices over [local_kv; sparse_kv].
-
-    Each row lists the query's sliding-window positions (masked to its document) followed by
-    its sparse selections offset past the local KV, padded to a multiple of 128 with -1.
-    """
-    from .indices import build_gather_indices
-
-    return build_gather_indices(
-        kv_indices, cu_seqlens, cu_seqlens_k, sliding_window_size, local_kv_len, sparse_kv_len
-    )
-
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -153,30 +128,49 @@ def gather_attn(
     """
     if (error := _constraint_violation(query, share_kv)) is not None:
         raise error
-    from flash_attn.cute.interface import flash_attn_func
+    from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
-    gather_indices = _build_gather_indices(
+    from .indices import build_gather_indices
+
+    gather_indices = build_gather_indices(
         kv_indices,
         cu_seqlens,
         cu_seqlens_k,
         sliding_window_size,
-        local_kv_len=local_kv.shape[2],
         sparse_kv_len=sparse_kv.shape[2],
     )
-    # FA4 takes BSHD. Passing k=v (the same object) with hdim=512 selects MLA mode:
-    # FA4 moves q into qv and routes to the sparse MLA kernels.
-    kv_bshd = torch.cat([local_kv, sparse_kv], dim=2).permute(0, 2, 1, 3)
-    out, lse = flash_attn_func(
-        q=query.permute(0, 2, 1, 3),
-        k=kv_bshd,
-        v=kv_bshd,
-        gather_kv_indices=gather_indices,
-        softmax_scale=scale,
-        learnable_sink=attention_sink,
-        causal=False,
-        pack_gqa=True,
-        return_lse=True,
-    )
+    options = {
+        "softmax_scale": scale,
+        "learnable_sink": attention_sink,
+        "causal": False,
+        "pack_gqa": True,
+        "return_lse": True,
+    }
+    # Passing k=v (the same object) with hdim=512 selects FA4's sparse MLA path.
+    if cu_seqlens is None:
+        kv = torch.cat([local_kv, sparse_kv], dim=2).permute(0, 2, 1, 3)
+        out, lse = flash_attn_func(
+            q=query.permute(0, 2, 1, 3),
+            k=kv,
+            v=kv,
+            gather_kv_indices=gather_indices,
+            **options,
+        )
+    else:
+        from .packed_kv import pack_kv
+
+        kv, cu_q, cu_kv = pack_kv(local_kv, sparse_kv, cu_seqlens, cu_seqlens_k)
+        out, lse = flash_attn_varlen_func(
+            # Use squeeze: indexing query[0] would copy a full query gradient in backward.
+            q=query.squeeze(0).transpose(0, 1),
+            k=kv,
+            v=kv,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_kv,
+            gather_kv_indices=gather_indices[0],
+            **options,
+        )
+        out, lse = out.unsqueeze(0), lse.unsqueeze(0)
 
     # Determinism can be enabled after forward; honor its strict/warn-only setting.
     if out.requires_grad:

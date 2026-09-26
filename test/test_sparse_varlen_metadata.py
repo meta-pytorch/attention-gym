@@ -60,7 +60,7 @@ def test_fa4_indices_match_local_index_contract(
     cu_k = None if k_offsets is None else torch.tensor(k_offsets, device="cuda", dtype=torch.int32)
     from attn_gym.sparse.gather_attn.impl.indices import build_gather_indices
 
-    actual = build_gather_indices(indices, cu_q, cu_k, window, tokens, candidates)
+    actual = build_gather_indices(indices, cu_q, cu_k, window, candidates)
     expected = _fa4_indices_oracle(indices, candidates, q_offsets, k_offsets, window)
     assert actual.is_contiguous()
     torch.testing.assert_close(actual.cpu(), expected)
@@ -101,7 +101,7 @@ def test_fa4_index_builder_fullgraph_dynamic():
         indices = _indices(1, tokens, 7, torch.int64, "strided", device)
         cu_q = torch.tensor(offsets, device=device, dtype=torch.int32)
         cu_k = torch.tensor([0, 0, 3], device=device, dtype=torch.int32)
-        actual = compiled(indices, cu_q, cu_k, 31, tokens, candidates)
+        actual = compiled(indices, cu_q, cu_k, 31, candidates)
         expected = _fa4_indices_oracle(indices, candidates, offsets, [0, 0, 3], 31)
         torch.testing.assert_close(actual.cpu(), expected)
 
@@ -117,7 +117,7 @@ def test_preparation_cuda_graph_replays_changed_offsets_and_indices():
 
     def run():
         return (
-            build_gather_indices(indices, cu_q, cu_k, 31, 19, 9),
+            build_gather_indices(indices, cu_q, cu_k, 31, 9),
             prepare_candidate_bounds(cu_q, cu_k, 19, True, 4),
         )
 
@@ -154,12 +154,12 @@ def test_preparation_forced_int64_offsets(monkeypatch):
     cu_k = torch.tensor([0, 0, 2, 3], device="cuda", dtype=torch.int32)
     assert not indexer_triton.requires_int64_offsets(indices, cu_q, cu_k)
     expected_bounds = indexer_triton.prepare_candidate_bounds(cu_q, cu_k, 19, True, 4)
-    expected_fa4 = gather_indices.build_gather_indices(indices, cu_q, cu_k, 31, 19, 9)
+    expected_fa4 = gather_indices.build_gather_indices(indices, cu_q, cu_k, 31, 9)
     monkeypatch.setattr(indexer_triton, "requires_int64_offsets", lambda *tensors: True)
     monkeypatch.setattr(gather_indices, "requires_int64_offsets", lambda *tensors: True)
     actual_bounds = indexer_triton.prepare_candidate_bounds(cu_q, cu_k, 19, True, 4)
     torch.testing.assert_close(actual_bounds, expected_bounds)
-    actual_fa4 = gather_indices.build_gather_indices(indices, cu_q, cu_k, 31, 19, 9)
+    actual_fa4 = gather_indices.build_gather_indices(indices, cu_q, cu_k, 31, 9)
     torch.testing.assert_close(actual_fa4, expected_fa4)
 
 
@@ -173,8 +173,8 @@ def test_fa4_indices_active_offset_beyond_int32():
     compact = torch.tensor([[[0, -1, 1], [2, 0, 2**31 - 1]]], device=device, dtype=torch.int32)
     indices.copy_(compact)
     cu = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
-    actual = build_gather_indices(indices, cu, cu, 1, 2, 2)
-    expected = build_gather_indices(compact, cu, cu, 1, 2, 2)
+    actual = build_gather_indices(indices, cu, cu, 1, 2)
+    expected = build_gather_indices(compact, cu, cu, 1, 2)
     torch.testing.assert_close(actual, expected)
 
 
@@ -191,11 +191,11 @@ def _fa4_indices_oracle(indices, candidates, q_offsets, k_offsets, window):
     for qs, qe, ks, ke in zip(q_offsets, q_offsets[1:], k_offsets, k_offsets[1:]):
         for row in range(qs, qe):
             for slot in range(window):
-                key = row - window + 1 + slot
-                if key >= qs:
+                key = row - qs - window + 1 + slot
+                if key >= 0:
                     expected[:, row, slot] = key
         local = indices[:, qs:qe]
         valid = (local >= 0) & (local < ke - ks)
-        safe = torch.where(valid, local, 0) + ks + tokens
+        safe = torch.where(valid, local, 0) + qe - qs
         expected[:, qs:qe, window : window + topk] = torch.where(valid, safe, -1)
     return expected
