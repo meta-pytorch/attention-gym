@@ -13,30 +13,16 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
+from attn_gym.linear.kda.utils import exp2
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
-    ],
-    key=["H", "HV", "K", "V", "BT"],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, K, V, **_: [
-            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_fwd_kernel_o(
     q,
@@ -138,6 +124,20 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+_chunk_fwd_o = TritonTuner(
+    chunk_fwd_kernel_o,
+    [
+        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
+    ],
+    key=lambda a: (a["H"], a["HV"], a["K"], a["V"], a["q"].dtype, a["IS_VARLEN"]),
+    prune=lambda configs, a: [
+        c for c in configs if c.kwargs["BK"] <= a["K"] and c.kwargs["BV"] <= a["V"]
+    ],
+)
+
+
 def chunk_gdn_fwd_output_dense(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -164,7 +164,7 @@ def chunk_gdn_fwd_output_dense(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * value_heads)
 
-    chunk_fwd_kernel_o[grid](
+    _chunk_fwd_o[grid](
         q=q,
         k=k,
         v=v,
@@ -176,6 +176,7 @@ def chunk_gdn_fwd_output_dense(
         o=output,
         cu_seqlens=None,
         chunk_offsets=None,
+        IS_VARLEN=False,
         scale=scale,
         T=tokens,
         num_sequences=0,
@@ -213,7 +214,7 @@ def chunk_gdn_fwd_output_packed(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), metadata.capacity, value_heads)
 
-    chunk_fwd_kernel_o[grid](
+    _chunk_fwd_o[grid](
         q=q,
         k=k,
         v=v,
@@ -225,6 +226,7 @@ def chunk_gdn_fwd_output_packed(
         o=output,
         cu_seqlens=metadata.cu_seqlens,
         chunk_offsets=metadata.chunk_offsets,
+        IS_VARLEN=True,
         scale=scale,
         T=tokens,
         num_sequences=metadata.cu_seqlens.shape[0] - 1,

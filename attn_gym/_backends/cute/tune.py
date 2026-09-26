@@ -128,10 +128,9 @@ def tune(
     process, loads every requested artifact, and benchmarks again.
     Candidates are benchmarked in iteration order. ``benchmark`` may replace
     the default timing policy; it receives a zero-arg callable for one candidate
-    launch. Destructive or stateful kernels must restore state in that callback.
-    Since this function only returns a config, callers can restore state again
-    before launching the winner; do not use :func:`run_tunable` for such kernels
-    because its winner launch is unconditional.
+    launch. Destructive or stateful kernels must restore state in that callback,
+    or use :func:`run_tunable` with a ``benchmark_reset`` hook. Compile functions
+    without ``precompile`` (Triton kernels compile on first launch) run sequentially.
 
     Use ``compile_call`` when the compile function needs additional static
     arguments::
@@ -148,15 +147,15 @@ def tune(
         raise ValueError("tune() requires at least one config")
     if workers is not None and workers < 1:
         raise ValueError(f"workers must be positive, got {workers}")
-    if not callable(getattr(compile_fn, "precompile", None)):
+    can_precompile = callable(getattr(compile_fn, "precompile", None))
+    if not can_precompile and not callable(getattr(compile_fn, "cache_namespace", None)):
         raise TypeError("tune() requires a compile function decorated with jit_cache")
-
     if compile_call is None:
         calls = [(config,) for config in candidates]
     else:
         calls = _materialize_calls(compile_call(config) for config in candidates)
 
-    if parallel_compile and len(calls) > 1:
+    if parallel_compile and len(calls) > 1 and can_precompile:
         compiled_candidates = compile_many(
             compile_fn,
             calls,
@@ -281,9 +280,12 @@ def run_tunable(
     values or synchronize; return ``()`` only when compile identities already distinguish
     every tuning decision and generated candidate set. Passing a custom
     ``benchmark=`` bypasses winner reuse so that timing policy always runs.
-    Therefore this convenience API requires repeatable, non-destructive
-    launches. An explicit ``target`` is installed process-wide before candidate
-    generation and remains active after this function returns.
+    Kernels that mutate their inputs define ``benchmark_reset(*runtime_args)``, which
+    snapshots the mutable state and returns a zero-argument restore callable. When a
+    decision is benchmarked, restore runs before every candidate launch and before the
+    final winner launch, so the caller observes exactly one launch. An explicit
+    ``target`` is installed process-wide before candidate generation and remains active
+    after this function returns.
     """
     if autotune and config is not None:
         raise ValueError("pass either config= or autotune=True, not both")
@@ -291,8 +293,11 @@ def run_tunable(
         raise ValueError("configs= requires autotune=True")
 
     compile_fn = kernel.compile
-    if not callable(getattr(compile_fn, "precompile", None)):
-        raise TypeError("run_tunable() requires kernel.compile decorated with jit_cache")
+    if not callable(getattr(compile_fn, "cache_namespace", None)):
+        raise TypeError(
+            "run_tunable() requires kernel.compile decorated with jit_cache or TritonTuner"
+        )
+    restore = None
     if target is not None:
         set_compile_target(target)
     resolved_target = get_compile_target()
@@ -329,8 +334,12 @@ def run_tunable(
             selected = None if winner_key is None else _load_winner(winner_key)
             # A cached winner outside the candidate set is stale (config space changed).
             if selected is None or selected not in candidates:
+                if reset := getattr(kernel, "benchmark_reset", None):
+                    restore = reset(*runtime_args)
 
                 def launch(compiled: CompiledT, candidate: ConfigT) -> Any:
+                    if restore is not None:
+                        restore()
                     return kernel.launch(compiled, candidate, *runtime_args)
 
                 selected = tune(
@@ -357,6 +366,8 @@ def run_tunable(
 
     call_args = _materialize_calls((kernel.compile_call(selected, *runtime_args),))[0]
     compiled = compile_fn(*call_args)
+    if restore is not None:
+        restore()
     return kernel.launch(compiled, selected, *runtime_args), selected
 
 
