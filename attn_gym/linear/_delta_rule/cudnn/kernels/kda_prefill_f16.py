@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # This kernel is derived from cuDNN, NVIDIA Corporation.
-# Modified by Attention Gym in 2026: imports were relocated into this package.
+# Modified by Attention Gym in 2026: imports were relocated into this package, and the
+# prologue takes the optional paged route and fresh-slot mask for work-table compaction.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -2692,6 +2693,8 @@ def prologue_kernel(
     v_token_stride: cutlass.Int64,
     gate_token_stride: cutlass.Int64,
     o_token_stride: cutlass.Int64,
+    state_indices: cute.Tensor | None,
+    has_initial_state: cute.Tensor | None,
 ) -> None:
     """Single-CTA prologue: LPT-order the work-item table and zero the sched
     rings via :func:`order_body`, then build the per-batch TMA-descriptor
@@ -2721,6 +2724,8 @@ def prologue_kernel(
         sKey,
         sIdx,
         sSpread,
+        mStateIndices=state_indices,
+        mHasInitialState=has_initial_state,
     )
     build_descs_body(
         widx,
@@ -2762,9 +2767,13 @@ def prologue(
     work_items: cute.Tensor,
     sched_ctr: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
+    state_indices: cute.Tensor | None,
+    has_initial_state: cute.Tensor | None,
     stream: cuda_driver.CUstream,
 ):
-    """Order work items and build per-sequence Q/K/V/gate/O descriptors."""
+    """Order work items and build per-sequence Q/K/V/gate/O descriptors.  The optional
+    paged route and fresh-slot mask keep empty fresh routes in the table so the main
+    kernel clears their slots."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -2815,6 +2824,8 @@ def prologue(
         cutlass.Int64(v.stride[0]),
         cutlass.Int64(gate.stride[0]),
         cutlass.Int64(o.stride[0]),
+        state_indices,
+        has_initial_state,
     ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
 
 
@@ -2938,11 +2949,17 @@ def _compile_kda_prefill_prologue(
     has_sched: bool,
     dyn_sched: bool,
     use_int64_offsets: bool,
+    keep_empty_fresh_routes: bool,
 ):
     """JIT-compile the prologue from static specialization arguments."""
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, sequence_entries, work_rows, sched_entries, workspace_words = (
         sym_int() for _ in range(5)
+    )
+    route_signatures = (
+        make_paged_route_signatures(cute.sym_int(), has_initial_state=True)
+        if keep_empty_fresh_routes
+        else (None, None)
     )
 
     tma_tensor = partial(
@@ -2968,10 +2985,12 @@ def _compile_kda_prefill_prologue(
         work_items_signature,
         make_counter_signature(sched_entries) if has_sched else None,
         make_workspace_signature(workspace_words),
+        *route_signatures,
         name=(
             f"kda_cudnn_prefill_prologue_{io_dtype.__name__.lower()}"
             f"_hq{HQ}_hk{HK}_hv{HV}_ho{HO}"
             f"_o{int(order_gen)}d{int(dyn_sched)}_i64{int(use_int64_offsets)}"
+            f"_f{int(keep_empty_fresh_routes)}"
         ),
     )
 
@@ -3068,6 +3087,8 @@ def chunk_kda_sm100(
     store_final_state = output_state is not None
     paged_state = state_indices is not None
     has_initial_state_mask = has_initial_state is not None
+    # The prologue keeps empty fresh routes in the work table so the main kernel clears them.
+    keep_empty_fresh_routes = paged_state and has_initial_state_mask
     if paged_state and (initial_state is None or initial_state is not output_state):
         raise ValueError("paged mode requires one aliased input/output state pool")
     if work_items is None or work_count is None:
@@ -3156,6 +3177,7 @@ def chunk_kda_sm100(
         has_sched,
         dyn_sched,
         use_int64_offsets,
+        keep_empty_fresh_routes=keep_empty_fresh_routes,
     )
     compiled_prologue(
         q,
@@ -3169,6 +3191,8 @@ def chunk_kda_sm100(
         work_items,
         sched_ctr,
         tensormap_workspace,
+        state_indices if keep_empty_fresh_routes else None,
+        has_initial_state if keep_empty_fresh_routes else None,
     )
     compiled(
         q,

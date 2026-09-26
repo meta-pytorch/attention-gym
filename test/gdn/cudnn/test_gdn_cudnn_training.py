@@ -740,3 +740,39 @@ def test_gdn_cudnn_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch)
     assert work_counts == [exact[0].shape[2]] * 2
     for actual, expected in zip(split, exact, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> None:
+    """Empty cu_seqlens intervals change neither gradients nor the number of work items."""
+    from attn_gym.linear._delta_rule.cudnn import gdn_backward, gdn_forward, schedule
+
+    q, k, value, gate, beta, _, compact = make_gdn_test_inputs(
+        (65, 63), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=433
+    )
+    # Leading, interior, and trailing empty intervals. The long interior pad moves the second
+    # sequence to id 1061 (scan round 1, warp 1), so kept ids are neither the identity nor in one
+    # warp.
+    padded = torch.cat(
+        [compact[:1], compact[:2], compact[1:2].expand(1058), compact[1:], compact[-1:].expand(5)]
+    ).contiguous()
+    d_output = torch.randn_like(value)
+    work_counts = []
+
+    def recording_schedule(*args, **kwargs):
+        prepared = schedule.prepare_cudnn_schedule(*args, **kwargs)
+        work_counts.append(prepared.work_count)
+        return prepared
+
+    for module in (gdn_forward, gdn_backward):
+        monkeypatch.setattr(module, "prepare_cudnn_schedule", recording_schedule)
+    results = []
+    for cu_seqlens in (compact, padded):
+        inputs = tuple(t.detach().clone().requires_grad_() for t in (q, k, value, gate, beta))
+        output, _ = public_chunk_gdn(
+            *inputs, cu_seqlens=cu_seqlens, kernel_options=_CUDNN_KERNEL_OPTIONS
+        )
+        results.append((output, *torch.autograd.grad(output, inputs, d_output)))
+    for actual, expected in zip(results[1], results[0], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    real_items = 2 * value.shape[2]
+    assert [int(count.item()) for count in work_counts] == [real_items] * 4
