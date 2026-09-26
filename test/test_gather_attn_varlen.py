@@ -223,14 +223,19 @@ def test_unused_sparse_storage_cannot_poison_another_document(
 
 
 @pytest.mark.parametrize("backend,share_kv", [("triton", True), ("triton", False), ("cute", True)])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_packed_gpu_matches_per_document_forward_backward(
-    backend, share_kv, gather_attn_single_config
+    backend, share_kv, index_dtype, gather_attn_single_config
 ):
     _device(backend)
     from test_gather_attn_triton import assert_matches_low_precision_eager
 
     dim = 512 if backend == "cute" else 64
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, share_kv=share_kv, head_dim=dim)
+    if index_dtype == torch.int64:
+        indices = indices.to(index_dtype)
+        indices[..., -2] = 2**32 + 1  # Would become a valid local index if narrowed too early.
+        indices[..., -1] = torch.iinfo(index_dtype).max
     high_inputs = [tensor.detach().double().requires_grad_() for tensor in tensors]
     low_inputs = [tensor.detach().clone().requires_grad_() for tensor in tensors]
     high, high_lse = _per_document(high_inputs, indices, cu_q, cu_k, window=7)
@@ -309,27 +314,110 @@ def test_packed_triton_fullgraph_and_graph_replay(gather_attn_single_config):
     with torch.cuda.graph(graph):
         actual = run()
     cu_q.copy_(torch.tensor([0, 2, 3, 10, 10, 16, 17], device="cuda", dtype=torch.int32))
+    cu_k.copy_(torch.tensor([0, 0, 0, 1, 1, 2, 2], device="cuda", dtype=torch.int32))
     graph.replay()
     torch.testing.assert_close(actual, run())
 
 
-def test_packed_triton_fullgraph_backward(gather_attn_single_config):
+@pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
+def test_packed_triton_fullgraph_dynamic_capacities(gather_attn_single_config, strided):
+    """Reuse dynamic training/inference graphs across capacities and padded KV strides."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(gather_attn, fullgraph=True, dynamic=True, backend=counter)
+    for step, capacity in enumerate((6, 15), start=2):
+        tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, capacity=capacity)
+        if strided:
+            tensors[0] = (
+                tensors[0].transpose(1, 2).contiguous().transpose(1, 2).detach().requires_grad_()
+            )
+            # Keep the last dimension contiguous while exercising strided local/sparse KV.
+            for i in (1, 2):
+                tensors[i] = (
+                    tensors[i]
+                    .detach()
+                    .repeat_interleave(step, dim=2)[:, :, ::step]
+                    .requires_grad_()
+                )
+        q, local, sparse, sink = tensors
+        kwargs = {
+            "sliding_window_size": 7,
+            "cu_seqlens": cu_q,
+            "cu_seqlens_k": cu_k,
+            "kernel_options": {"backend": "triton"},
+        }
+        expected = gather_attn(q, local, sparse, indices, sink, **kwargs)
+        actual = compiled(q, local, sparse, indices, sink, **kwargs)
+        torch.testing.assert_close(actual, expected)
+        grad = torch.randn_like(actual[:, :, :17])
+        expected_grads = torch.autograd.grad(expected[:, :, :17], tensors, grad)
+        actual_grads = torch.autograd.grad(actual[:, :, :17], tensors, grad)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
+        with torch.no_grad():
+            torch.testing.assert_close(
+                compiled(q, local, sparse, indices, sink, **kwargs), expected
+            )
+    # Grad mode requires separate graphs; changing capacities/strides must not add any.
+    assert counter.frame_count == 2
+
+
+@pytest.mark.parametrize("changed_offsets", ["query", "sparse"])
+def test_packed_backward_rejects_changed_boundaries(gather_attn_single_config, changed_offsets):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, capacity=3)
     q, local, sparse, sink = tensors
-    compiled = torch.compile(gather_attn, fullgraph=True)
-    kwargs = {
-        "sliding_window_size": 7,
-        "cu_seqlens": cu_q,
-        "cu_seqlens_k": cu_k,
-        "kernel_options": {"backend": "triton"},
-    }
-    expected = gather_attn(q, local, sparse, indices, sink, **kwargs)
-    actual = compiled(q, local, sparse, indices, sink, **kwargs)
-    torch.testing.assert_close(actual, expected)
-    grad = torch.randn_like(actual[:, :, :17])
-    expected_grads = torch.autograd.grad(expected[:, :, :17], tensors, grad)
-    actual_grads = torch.autograd.grad(actual[:, :, :17], tensors, grad)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(actual_grad, expected_grad)
+    output = gather_attn(
+        q,
+        local,
+        sparse,
+        indices,
+        sink,
+        sliding_window_size=7,
+        cu_seqlens=cu_q,
+        cu_seqlens_k=cu_k,
+        kernel_options={"backend": "triton"},
+    )
+    if changed_offsets == "query":
+        cu_q[2] = 2
+    else:
+        cu_k[3] = 1
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        output.sum().backward()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_reverse_map_preserves_local_selection_multiplicity(packed, dtype):
+    """Only valid selections enter each global key's query list, including duplicates."""
+    from attn_gym.sparse.gather_attn.impl.triton.backward import _build_index_query_map
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    q_offsets, k_offsets = [0, 0, 2, 5, 5, 7], [0, 0, 1, 3, 3, 4]
+    cu_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32) if packed else None
+    cu_k = torch.tensor(k_offsets, device="cuda", dtype=torch.int32) if packed else None
+    values = [-3, -1, 0, 0, 1, 2, 9, torch.iinfo(dtype).max]
+    for tokens in (9, 11):
+        indices = torch.tensor(values, device="cuda", dtype=dtype).repeat(1, tokens, 1)
+        indices = indices.transpose(1, 2).contiguous().transpose(1, 2)
+        queries, bounds = _build_index_query_map(indices, 6, cu_q, cu_k)
+        expected = [[] for _ in range(6)]
+        intervals = (
+            zip(q_offsets, q_offsets[1:], k_offsets, k_offsets[1:])
+            if packed
+            else [(0, tokens, 0, 6)]
+        )
+        for qs, qe, ks, ke in intervals:
+            for query in range(qs, qe):
+                for index in values:
+                    if 0 <= index < ke - ks:
+                        expected[ks + index].append(query)
+        queries, bounds = queries.cpu(), bounds.cpu()
+        for key, selected in enumerate(expected):
+            actual = queries[0, bounds[0, key] : bounds[0, key + 1]].sort().values.tolist()
+            assert actual == selected

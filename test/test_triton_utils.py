@@ -52,6 +52,30 @@ def test_requires_int64_offsets_uses_relative_storage_cosize():
     assert requires_int64_offsets(at_limit, None, over_limit)
 
 
+def test_requires_int64_offsets_in_compiled_backward():
+    """Metadata stride inspection must survive Dynamo's backward tracing retries."""
+
+    class OffsetCheckedIdentity(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, metadata):
+            ctx.save_for_backward(metadata)
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            (metadata,) = ctx.saved_tensors
+            assert not requires_int64_offsets(metadata)
+            return grad, None
+
+    x = torch.arange(4.0, requires_grad=True)
+    metadata = torch.tensor([0, 4], dtype=torch.int32)
+    compiled = torch.compile(OffsetCheckedIdentity.apply, fullgraph=True, backend="eager")
+    output = compiled(x, metadata)
+    (grad,) = torch.autograd.grad(output.sum(), (x,))
+    torch.testing.assert_close(output, x)
+    torch.testing.assert_close(grad, torch.ones_like(x))
+
+
 @pytest.mark.parametrize("index", [700_001, -700_001])
 def test_ptr_offset_preserves_caller_selected_integer_width(index):
     """Let callers retain int32 offsets or conditionally promote them to int64."""

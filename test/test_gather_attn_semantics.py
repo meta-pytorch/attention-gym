@@ -82,6 +82,8 @@ def shared_kv_blackwell_inputs(request):
             )
     kv_indices[:, ::3, -1] = -1
     kv_indices[:, 1::4, 1] = kv_indices[:, 1::4, 0]
+    kv_indices[:, ::5, -2] = sparse_seq_len
+    kv_indices[:, 1::5, -2] = 2**31 - 1
     attention_sink = torch.randn(heads, device="cuda", dtype=torch.float32, requires_grad=True)
     return query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k
 
@@ -527,7 +529,7 @@ def test_repeated_indices_backends_match(num_repeats, sliding_window_size):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for triton")
 def test_mixed_repeated_and_unique_indices_backends_match():
-    """Mix of repeated and unique indices should match between backends."""
+    """Repeated, unique, and invalid dense selections agree in forward and all gradients."""
     device = torch.device("cuda")
     dtype = torch.float32
     b, h, s, d = 1, 2, 8, 16
@@ -539,9 +541,12 @@ def test_mixed_repeated_and_unique_indices_backends_match():
     sparse_kv = torch.randn(b, h, sparse_seq_len, d, device=device, dtype=dtype)
     sink = torch.randn(h, device=device, dtype=dtype)
 
-    # Mix: some rows have repeats, some are unique, some have -1 sentinels
+    inputs = query, local_kv, sparse_kv, sink
+    for tensor in inputs:
+        tensor.requires_grad_()
+    # Invalid values include a pool-end index and values unsafe to narrow before masking.
     kv_indices = torch.tensor(
-        [[[0, 0], [1, 1], [0, 1], [2, -1], [-1, -1], [3, 3], [1, 2], [0, -1]]],
+        [[[0, 0], [1, 1], [0, 1], [2, 4], [2**32 + 1, 2**63 - 1], [3, 3], [1, 2], [0, -1]]],
         dtype=torch.long,
         device=device,
     )
@@ -560,6 +565,11 @@ def test_mixed_repeated_and_unique_indices_backends_match():
     )
 
     torch.testing.assert_close(out_eager, out_triton, atol=1e-4, rtol=1e-4)
+    grad_output = torch.randn_like(out_eager)
+    expected_grads = torch.autograd.grad(out_eager, inputs, grad_output)
+    actual_grads = torch.autograd.grad(out_triton, inputs, grad_output)
+    for actual, expected in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------

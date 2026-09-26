@@ -23,9 +23,6 @@ import warnings
 from functools import cache
 
 import torch
-import torch.nn.functional as F
-
-from attn_gym.utils import round_up
 
 # ---------------------------------------------------------------------------
 # Index building
@@ -34,30 +31,22 @@ from attn_gym.utils import round_up
 
 def _build_gather_indices(
     kv_indices: torch.Tensor,
-    doc_ids: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     local_kv_len: int,
+    sparse_kv_len: int,
 ) -> torch.Tensor:
     """Build FA4's (batch, seq_len, padded_topk) int32 gather indices over [local_kv; sparse_kv].
 
     Each row lists the query's sliding-window positions (masked to its document) followed by
     its sparse selections offset past the local KV, padded to a multiple of 128 with -1.
     """
-    batch, seq_len, _ = kv_indices.shape
-    device = kv_indices.device
-    q_pos = torch.arange(seq_len, device=device, dtype=torch.int32).unsqueeze(1)
-    w_off = torch.arange(sliding_window_size, device=device, dtype=torch.int32)
-    window_kv_pos = q_pos - sliding_window_size + 1 + w_off
-    keep = window_kv_pos >= 0
-    if doc_ids is not None:
-        keep = keep & (doc_ids[:, window_kv_pos.clamp(min=0)] == doc_ids[:, :, None])
-    window_idxs = torch.where(keep, window_kv_pos, -1).expand(batch, -1, -1)
+    from .indices import build_gather_indices
 
-    sparse_idxs = torch.where(kv_indices >= 0, (kv_indices + local_kv_len).int(), -1)
-    unified = torch.cat([window_idxs, sparse_idxs], dim=-1)
-    num_slots = unified.shape[-1]
-    # FA4's gather prologue needs a physical tile even when the attention set is empty.
-    return F.pad(unified, (0, round_up(max(num_slots, 1), 128) - num_slots), value=-1)
+    return build_gather_indices(
+        kv_indices, cu_seqlens, cu_seqlens_k, sliding_window_size, local_kv_len, sparse_kv_len
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +135,8 @@ def gather_attn(
     sparse_kv: torch.Tensor,
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor | None,
-    doc_ids: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     share_kv: bool = True,
     *,
@@ -166,7 +156,12 @@ def gather_attn(
     from flash_attn.cute.interface import flash_attn_func
 
     gather_indices = _build_gather_indices(
-        kv_indices, doc_ids, sliding_window_size, local_kv_len=local_kv.shape[2]
+        kv_indices,
+        cu_seqlens,
+        cu_seqlens_k,
+        sliding_window_size,
+        local_kv_len=local_kv.shape[2],
+        sparse_kv_len=sparse_kv.shape[2],
     )
     # FA4 takes BSHD. Passing k=v (the same object) with hdim=512 selects MLA mode:
     # FA4 moves q into qv and routes to the sparse MLA kernels.

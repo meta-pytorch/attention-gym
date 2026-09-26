@@ -10,7 +10,7 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset
 
-from .primitives import prune_wide_backward_configs
+from .primitives import load_document_bounds, offset_strides, prune_wide_backward_configs
 
 
 def prune_shared_dq_configs(configs, named_args, D, **kwargs):
@@ -25,7 +25,7 @@ def prune_shared_dq_configs(configs, named_args, D, **kwargs):
         for block_n in (16, 64, 128)
         for num_warps in (4, 8)
     ],
-    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "WINDOW", "HAS_DOC_IDS"],
+    key=["B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
     prune_configs_by={"early_config_prune": prune_shared_dq_configs},
     cache_results=True,
 )
@@ -35,35 +35,46 @@ def _gather_attn_bwd_dq_shared(
     sparse_kv_ptr,
     local_kv_ptr,
     kv_indices_ptr,
-    doc_ids_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
     attention_sink_ptr,
     grad_query_ptr,
     grad_sink_partials_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    LOCAL_KV_STRIDES: tl.constexpr,
-    KV_INDICES_STRIDES: tl.constexpr,
-    DOC_IDS_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    GRAD_SINK_PARTIALS_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    LOCAL_KV_STRIDES,
+    KV_INDICES_STRIDES,
+    num_documents,
+    LSE_STRIDES,
+    GRAD_SINK_PARTIALS_STRIDES,
     B: tl.constexpr,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
+    SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
-    HAS_DOC_IDS: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Compute query gradients across heads while reusing shared KV tiles."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    GRAD_SINK_PARTIALS_STRIDES = offset_strides(GRAD_SINK_PARTIALS_STRIDES, WIDE)
+
     sequence = tl.program_id(0)
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
@@ -100,6 +111,13 @@ def _gather_attn_bwd_dq_shared(
     delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_query = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, WIDE
+        )
+
     if TOPK:
         offsets_k = tl.arange(0, BLOCK_K)
         for selected_start in tl.range(0, TOPK, BLOCK_K, num_stages=2):
@@ -111,9 +129,11 @@ def _gather_attn_bwd_dq_shared(
                 other=-1,
             )
             selected_valid = (
-                (selected_offsets < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+                (selected_offsets < TOPK)
+                & (selected_idx >= 0)
+                & (selected_idx < candidate_end - candidate_start)
             )
-            selected_idx = tl.where(selected_valid, selected_idx, 0)
+            selected_idx = tl.where(selected_valid, selected_idx, 0) + candidate_start
             sparse_values = tl.load(
                 sparse_kv_ptr
                 + ptr_offset(
@@ -142,9 +162,6 @@ def _gather_attn_bwd_dq_shared(
                 * SCALE
             )
 
-    if HAS_DOC_IDS:
-        query_doc_id = tl.load(doc_ids_ptr + ptr_offset((batch, sequence), DOC_IDS_STRIDES))
-
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
     for local_start in tl.range(0, WINDOW, BLOCK_N, num_stages=2):
@@ -159,13 +176,8 @@ def _gather_attn_bwd_dq_shared(
             mask=local_valid[:, None] & dimension_mask[None, :],
             other=0.0,
         )
-        if HAS_DOC_IDS:
-            key_doc_ids = tl.load(
-                doc_ids_ptr + ptr_offset((batch, offsets_n), DOC_IDS_STRIDES),
-                mask=local_valid,
-                other=-1,
-            )
-            local_valid &= key_doc_ids == query_doc_id
+        if HAS_CU_SEQLENS:
+            local_valid &= offsets_n >= query_start
 
         scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         probabilities = tl.where(
@@ -219,7 +231,7 @@ def _gather_attn_bwd_dq_shared(
             (32, 64, 8),
         )
     ],
-    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    key=["B", "H", "D", "TOPK", "HAS_CU_SEQLENS"],
     reset_to_zero=["grad_sparse_kv_ptr"],
     prune_configs_by={"early_config_prune": prune_wide_backward_configs},
     cache_results=True,
@@ -229,27 +241,40 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
     sparse_kv_ptr,
     kv_indices_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
     grad_sparse_kv_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    KV_INDICES_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    GRAD_SPARSE_KV_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    KV_INDICES_STRIDES,
+    num_documents,
+    LSE_STRIDES,
+    GRAD_SPARSE_KV_STRIDES,
     B: tl.constexpr,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
+    SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Atomically scatter one query's sparse-KV gradient tile into shared dKV."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+
     query_position = tl.program_id(0)
     batch = tl.program_id(1)
     tile = tl.program_id(2)
@@ -269,8 +294,18 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
         mask=selected_mask,
         other=-1,
     )
-    selected_valid = selected_mask & (selected_indices >= 0) & (selected_indices < SPARSE_SEQ_LEN)
-    selected_indices = tl.where(selected_valid, selected_indices, 0)
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        _, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
+        )
+    selected_valid = (
+        selected_mask
+        & (selected_indices >= 0)
+        & (selected_indices < candidate_end - candidate_start)
+    )
+    selected_indices = tl.where(selected_valid, selected_indices, 0) + candidate_start
 
     head_dimension_mask = head_mask[:, None] & dimension_mask[None, :]
     query_offsets = ptr_offset(
@@ -351,7 +386,7 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
             (8, 16, 8),
         )
     ],
-    key=["H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    key=["H", "D", "TOPK"],
     reset_to_zero=["grad_sparse_kv_ptr"],
     cache_results=True,
 )
@@ -365,23 +400,32 @@ def _gather_attn_bwd_dsparse_kv_shared(
     grad_output_ptr,
     lse_ptr,
     grad_sparse_kv_ptr,
-    QUERY_STRIDES: tl.constexpr,
-    SPARSE_KV_STRIDES: tl.constexpr,
-    SELECTED_QUERIES_STRIDES: tl.constexpr,
-    BLOCK_OFFSETS_STRIDES: tl.constexpr,
-    LSE_STRIDES: tl.constexpr,
-    GRAD_SPARSE_KV_STRIDES: tl.constexpr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    SELECTED_QUERIES_STRIDES,
+    BLOCK_OFFSETS_STRIDES,
+    LSE_STRIDES,
+    GRAD_SPARSE_KV_STRIDES,
     H: tl.constexpr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
-    SPARSE_SEQ_LEN: tl.constexpr,
+    SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Accumulate a head tile into one partial shared sparse-KV gradient."""
+    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
+    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, WIDE)
+    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, WIDE)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+
     sparse_index = tl.program_id(0)
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
