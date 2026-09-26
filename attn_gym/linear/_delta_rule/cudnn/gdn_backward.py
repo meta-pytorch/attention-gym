@@ -35,6 +35,7 @@ def chunk_gdn_bwd_cudnn_packed(
     d_final_state: torch.Tensor | None = None,
     *,
     scale: float | None = None,
+    split: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -43,7 +44,13 @@ def chunk_gdn_bwd_cudnn_packed(
     torch.Tensor,
     torch.Tensor | None,
 ]:
-    """Run exact BT64 checkpoint recompute followed by scalar-GDN backward."""
+    """Run BT64 checkpoint recompute followed by scalar-GDN backward.
+
+    ``split`` enables the approximate forgetting-horizon work table for both kernels and
+    requires a no-state call.
+    """
+    if split and (initial_state is not None or d_final_state is not None):
+        raise ValueError("the split backward schedule requires a no-state call")
     scale = resolve_scale(scale, q.shape[-1])
     if d_output.dtype != q.dtype:
         raise TypeError(f"d_output must use q.dtype ({q.dtype}), got {d_output.dtype}")
@@ -62,7 +69,7 @@ def chunk_gdn_bwd_cudnn_packed(
             cu_seqlens,
             tile_tokens=_KERNEL_CHUNK_SIZE,
             counter_count=_SCHEDULER_COUNTERS,
-            split=False,
+            split=split,
             stream=stream,
         )
         checkpoints = torch.empty(
@@ -111,6 +118,7 @@ def chunk_gdn_bwd_cudnn_packed(
             work_count=schedule.work_count,
             sched_ctr=schedule.counters[:2],
             sched_all=schedule.counters,
+            work_item_scratch=schedule.item_scratch,
             order_in_prologue=True,
             log_gate=True,
             tensormap_workspace=recompute_workspace,

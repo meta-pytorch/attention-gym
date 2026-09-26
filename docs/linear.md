@@ -32,8 +32,11 @@ slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and pre
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. Like
 `chunk_kda`, `chunk_gdn` defaults to the repo-local fused chunk pipeline (`impl="fused"`);
 `impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "cudnn"}` to select the
-optional cuDNN CuTeDSL backend. `recurrent_gdn(..., impl="fused")` selects the inference-only
-Triton scan.
+optional cuDNN CuTeDSL backend; it accepts the same approximate `split_forward` and
+`split_backward` forgetting-horizon options as cuDNN KDA (see
+[Kimi Delta Attention](#kimi-delta-attention)), with the same no-state restriction. They help only
+when few sequences leave the GPU idle and every head forgets quickly; heads that never forget stay
+uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -93,8 +96,7 @@ Triton on every architecture.
 
 The cuDNN chunk backend requires the optional `cudnn` dependencies and SM100/SM103,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
-gate without a lower bound and uses exact execution without an approximate forgetting-horizon
-split.
+gate without a lower bound and uses exact execution by default.
 
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token

@@ -232,9 +232,15 @@ def test_gdn_cudnn_raw_operator_registration() -> None:
     d_state = torch.randn_like(state)
     scale = 128**-0.5
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
+    # The split flag does not change schemas or fake layouts; True also routes the split scheduler.
     torch.library.opcheck(
         chunk_gdn_cudnn_packed_fwd_op,
-        (q, k, value, gate, beta, cu_seqlens, scale),
+        (q, k, value, gate, beta, cu_seqlens, True, scale),
+        test_utils=test_utils,
+    )
+    torch.library.opcheck(
+        chunk_gdn_cudnn_packed_bwd_op,
+        (q, k, value, gate, beta, d_output, cu_seqlens, True, scale),
         test_utils=test_utils,
     )
     torch.library.opcheck(
@@ -245,11 +251,6 @@ def test_gdn_cudnn_raw_operator_registration() -> None:
     torch.library.opcheck(
         chunk_gdn_cudnn_packed_fwd_with_state_op,
         (q, k, value, gate, beta, state, cu_seqlens, scale),
-        test_utils=test_utils,
-    )
-    torch.library.opcheck(
-        chunk_gdn_cudnn_packed_bwd_op,
-        (q, k, value, gate, beta, d_output, cu_seqlens, scale),
         test_utils=test_utils,
     )
     for state_cotangent in (None, d_state):
@@ -288,10 +289,10 @@ def test_gdn_cudnn_backward_fake_preserves_leading_strides() -> None:
     )
     d_output = torch.randn_like(value)
     arguments = (*inputs, d_output, cu_seqlens)
-    actual = chunk_gdn_cudnn_packed_bwd_op(*arguments, 128**-0.5)
+    actual = chunk_gdn_cudnn_packed_bwd_op(*arguments, False, 128**-0.5)
     with FakeTensorMode() as mode:
         fake_arguments = tuple(mode.from_tensor(tensor) for tensor in arguments)
-        fake = chunk_gdn_cudnn_packed_bwd_op(*fake_arguments, 128**-0.5)
+        fake = chunk_gdn_cudnn_packed_bwd_op(*fake_arguments, False, 128**-0.5)
 
     expected_strides = tuple(tensor.stride() for tensor in inputs)
     assert tuple(tensor.stride() for tensor in actual) == expected_strides
@@ -679,3 +680,63 @@ def test_public_gdn_cudnn_cuda_graph_replay() -> None:
     torch.cuda.synchronize()
     for actual_gradient, expected_gradient in zip(captured, expected, strict=True):
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("option", ["split_backward", "split_forward"])
+def test_gdn_cudnn_split_schedules_reject_stateful_calls(option: str) -> None:
+    q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs((65,), seed=331)
+    with pytest.raises(ValueError, match=f"{option} currently requires a no-state call"):
+        public_chunk_gdn(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options={"backend": "cudnn", option: True},
+        )
+
+
+def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]:
+    """Run exact and split cuDNN GDN fwd+bwd on one long stream; record split work items."""
+    from attn_gym.linear._delta_rule.cudnn import gdn_backward, gdn_forward, schedule
+
+    q, k, value, gate, beta, _state, _ = make_gdn_test_inputs(
+        8192, gate_pattern=gate_pattern, seed=337
+    )
+    inputs = tuple(tensor.requires_grad_() for tensor in (q, k, value, gate, beta))
+    d_output = torch.randn_like(value)
+    work_counts = []
+
+    def recording_schedule(*args, **kwargs):
+        prepared = schedule.prepare_cudnn_schedule(*args, **kwargs)
+        work_counts.append(prepared.work_count)
+        return prepared
+
+    def run(options):
+        output, _ = public_chunk_gdn(*inputs, kernel_options=options)
+        return (output, *torch.autograd.grad(output, inputs, d_output))
+
+    exact = run({"backend": "cudnn"})
+    for module in (gdn_forward, gdn_backward):
+        monkeypatch.setattr(module, "prepare_cudnn_schedule", recording_schedule)
+    split = run({"backend": "cudnn", "split_forward": True, "split_backward": True})
+    return (exact, split), [int(count.item()) for count in work_counts]
+
+
+def test_gdn_cudnn_split_cuts_a_forgetting_stream_and_matches_exact(monkeypatch) -> None:
+    """A fast-decaying gate is cut in both passes and stays within bf16 tolerance of exact."""
+    (exact, split), work_counts = _split_work_items(monkeypatch, "softplus")
+    heads = exact[0].shape[2]
+    assert len(work_counts) == 2 and all(count > heads for count in work_counts)
+    for actual, expected in zip(split, exact, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_gdn_cudnn_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
+    (exact, split), work_counts = _split_work_items(monkeypatch, "near_zero")
+    assert work_counts == [exact[0].shape[2]] * 2
+    for actual, expected in zip(split, exact, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

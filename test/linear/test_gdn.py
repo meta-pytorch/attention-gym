@@ -6,7 +6,7 @@ from attn_gym.linear import Impl
 from attn_gym.linear import chunk_gdn as _chunk_gdn
 from attn_gym.linear import recurrent_gdn as _recurrent_gdn
 from attn_gym.linear._delta_rule.validation import validate_paged_state
-from attn_gym.linear.gdn.validation import resolve_kernel_options
+from attn_gym.linear.gdn.validation import ResolvedKernelOptions, resolve_kernel_options
 from attn_gym.testing import cumulative_sequence_offsets
 
 
@@ -323,8 +323,20 @@ def test_impl_accepts_enum_and_string(function):
 
 def test_chunk_kernel_options_are_strict():
     """Keep the repo-local path as default and validate the cuDNN opt-in selector."""
-    assert resolve_kernel_options(None) == "fused"
-    assert resolve_kernel_options({}) == "fused"
+    fused = ResolvedKernelOptions("fused", split_backward=False, split_forward=False)
+    assert resolve_kernel_options(None) == fused
+    assert resolve_kernel_options({}) == fused
+    assert resolve_kernel_options({"backend": "cudnn", "split_forward": True}) == (
+        ResolvedKernelOptions("cudnn", split_backward=False, split_forward=True)
+    )
+    assert resolve_kernel_options({"backend": "cudnn", "split_backward": True}) == (
+        ResolvedKernelOptions("cudnn", split_backward=True, split_forward=False)
+    )
+    for name in ("split_backward", "split_forward"):
+        with pytest.raises(TypeError, match="must be a bool"):
+            resolve_kernel_options({"backend": "cudnn", name: 1})
+        with pytest.raises(ValueError, match="requires.*cudnn"):
+            resolve_kernel_options({name: True})
     inputs = make_inputs(sequence=2)
     with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})
