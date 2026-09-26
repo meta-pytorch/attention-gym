@@ -165,15 +165,12 @@ class ChunkGDNBackward:
         """Intra-chunk Q/K factor for the reverse summary; the scalar backward does not otherwise
         materialize it on pre-Blackwell targets, so it is computed once on first use."""
         saved = self.saved
-        groups = saved.v.shape[2] // saved.q.shape[2]
-        q, k = (
-            tensor.repeat_interleave(groups, dim=2) if groups > 1 else tensor
-            for tensor in (saved.q, saved.k)
-        )
         if self.metadata is None:
-            return chunk_gdn_recompute_aqk_dense(q, k, saved.cumulative_gate, self.scale)
+            return chunk_gdn_recompute_aqk_dense(
+                saved.q, saved.k, saved.cumulative_gate, self.scale
+            )
         return chunk_gdn_recompute_aqk_packed(
-            q, k, saved.cumulative_gate, self.scale, self.metadata
+            saved.q, saved.k, saved.cumulative_gate, self.scale, self.metadata
         )
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:

@@ -3367,8 +3367,14 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     grid_waves: int,
     ragged: bool,
     use_int64_offsets: bool = False,
+    key_heads: int | None = None,
 ):
-    """Compile one persistent dense or ragged WY/dQKG specialization."""
+    """Compile one persistent dense or ragged WY/dQKG specialization.
+
+    ``key_heads`` defaults to ``heads``; fewer q/k heads share each q/k head across
+    ``heads // key_heads`` consecutive value heads, and dQ/dK stay per value head.
+    """
+    key_heads = heads if key_heads is None else key_heads
     cutlass_io_dtype = _torch_to_cutlass_dtype[io_dtype]
     op = ChunkKdaBwdWyDqkgFused(
         chunk_size=chunk_size,
@@ -3399,8 +3405,8 @@ def _compile_chunk_kda_bwd_wy_dqkg(
             assumed_align=_MIN_ALIGN_BYTES,
         )
 
-    q = strided_io_tensor((1, tokens, heads, head_dim))
-    k = strided_io_tensor((1, tokens, heads, head_dim))
+    q = strided_io_tensor((1, tokens, key_heads, head_dim))
+    k = strided_io_tensor((1, tokens, key_heads, head_dim))
     v = strided_io_tensor((1, tokens, heads, head_dim))
     v_new = tensor(cutlass_io_dtype, (1, tokens, heads, head_dim))
     g = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
@@ -3439,10 +3445,10 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         dA,
         cu_seqlens,
         chunk_offsets,
-        (Int32(1), Int32(1), Int32(heads), Int32(heads), Int32(head_dim), Int32(head_dim)),
+        (Int32(1), Int32(1), Int32(key_heads), Int32(heads), Int32(head_dim), Int32(head_dim)),
         Int32(1),
         name=(
-            f"kda_bwd_wy_dqkg_h{heads}_d{head_dim}_c{chunk_size}_"
+            f"kda_bwd_wy_dqkg_hk{key_heads}_h{heads}_d{head_dim}_c{chunk_size}_"
             f"{str(io_dtype).removeprefix('torch.')}_fm{int(fastmath)}_"
             f"gw{grid_waves}_rg{int(ragged)}_i64{int(use_int64_offsets)}"
         ),
@@ -3490,7 +3496,7 @@ class ChunkKdaBwdWyDqkgTunable:
         """Key winners by the static persistent-grid work envelope."""
         if target.sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        return (args.h.shape[1] * args.q.shape[2],)
+        return (args.h.shape[1] * args.v.shape[2],)
 
     @staticmethod
     def configs(
@@ -3503,9 +3509,9 @@ class ChunkKdaBwdWyDqkgTunable:
     def compile_call(
         config: ChunkKdaBwdWyDqkgConfig,
         args: Args,
-    ) -> tuple[int, int, int, torch.dtype, float, bool, int, bool, bool]:
+    ) -> tuple[int, int, int, torch.dtype, float, bool, int, bool, bool, int]:
         return (
-            args.q.shape[2],
+            args.v.shape[2],
             args.q.shape[3],
             args.chunk_size,
             args.q.dtype,
@@ -3532,6 +3538,7 @@ class ChunkKdaBwdWyDqkgTunable:
                 args.db,
                 args.dA,
             ),
+            args.q.shape[2],
         )
 
     compile = staticmethod(_compile_chunk_kda_bwd_wy_dqkg)
@@ -3550,7 +3557,8 @@ class ChunkKdaBwdWyDqkgTunable:
         torch.Tensor,
     ]:
         del config
-        _batch, tokens, heads, head_dim = args.q.shape
+        _batch, tokens, key_heads, head_dim = args.q.shape
+        heads = args.v.shape[2]
         sequences = 1 if args.cu_seqlens is None else args.cu_seqlens.shape[0] - 1
         compiled(
             args.q,
@@ -3575,7 +3583,7 @@ class ChunkKdaBwdWyDqkgTunable:
             (
                 Int32(sequences),
                 Int32(tokens),
-                Int32(heads),
+                Int32(key_heads),
                 Int32(heads),
                 Int32(head_dim),
                 Int32(head_dim),
@@ -3613,10 +3621,17 @@ def chunk_kda_bwd_wy_dqkg(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run or tune the direct dense or ragged fused WY/dQKG backward stage."""
-    batch, tokens, heads, head_dim = q.shape
+    """Run or tune the direct dense or ragged fused WY/dQKG backward stage.
+
+    ``q`` and ``k`` may have fewer heads than ``v``; each q/k head is shared by
+    ``H // HK`` consecutive value heads and the returned dQ/dK are per value head.
+    """
+    batch, tokens, key_heads, head_dim = q.shape
+    heads = v.shape[2]
     if batch != 1 or head_dim != 128 or v.shape[-1] != 128:
         raise ValueError("the fused WY backward requires B=1 and K=V=128")
+    if k.shape != q.shape or heads % key_heads:
+        raise ValueError("k must match q and value heads must be a multiple of q/k heads")
     if chunk_size != 64:
         raise ValueError(f"the fused WY backward requires chunk_size=64, got {chunk_size}")
     if q.dtype not in (torch.bfloat16, torch.float16):

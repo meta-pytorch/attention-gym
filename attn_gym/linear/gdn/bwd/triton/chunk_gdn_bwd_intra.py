@@ -35,14 +35,19 @@ def chunk_gdn_bwd_intra_kernel(
     T,
     num_sequences,
     H: tl.constexpr,
+    G: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    """Differentiate scalar-decayed QK/KK factors for one chunk and head."""
+    """Differentiate scalar-decayed QK/KK factors for one chunk and value head.
+
+    Q/K are read from head ``head // G``; the Q/K gradients stay per value head.
+    """
     chunk = tl.program_id(0)
     head = tl.program_id(1)
+    qk_head = head // G
     row = tl.arange(0, BT)
     column = tl.arange(0, BT)
     if IS_VARLEN:
@@ -83,8 +88,8 @@ def chunk_gdn_bwd_intra_kernel(
     raw_gate_grad = tl.zeros((BT,), dtype=tl.float32)
     for key_block in range(0, K, BK):
         feature = key_block + tl.arange(0, BK)
-        q_offset = ptr_offset((token[:, None], head, feature[None, :]), (q_stride_t, K, 1))
-        k_offset = ptr_offset((token[:, None], head, feature[None, :]), (k_stride_t, K, 1))
+        q_offset = ptr_offset((token[:, None], qk_head, feature[None, :]), (q_stride_t, K, 1))
+        k_offset = ptr_offset((token[:, None], qk_head, feature[None, :]), (k_stride_t, K, 1))
         output_offset = ptr_offset((token[:, None], head, feature[None, :]), (H * K, K, 1))
         q_tile = tl.load(
             q + q_offset,
@@ -135,21 +140,23 @@ def chunk_gdn_bwd_intra_dense(
     d_gate_raw: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense B=1 BT64 scalar-GDN intra-factor gradients."""
-    batch, tokens, heads, key_dim = q.shape
+    batch, tokens, key_heads, key_dim = q.shape
+    heads = cumulative_gate.shape[2]
     if batch != 1 or tokens % 64 or key_dim not in (64, 128):
         raise ValueError(
             "dense fused chunk GDN backward requires B=1, complete BT64 chunks, and K in {64, 128}"
         )
-    if k.shape != q.shape or cumulative_gate.shape != q.shape[:3]:
+    if k.shape != q.shape or cumulative_gate.shape[:2] != q.shape[:2] or heads % key_heads:
         raise ValueError("k must match q and cumulative_gate must have shape [B,T,H]")
     expected_factor_shape = (batch, tokens, heads, 64)
     if d_aqk.shape != expected_factor_shape or d_akk.shape != expected_factor_shape:
         raise ValueError(f"factor gradients must have shape {expected_factor_shape}")
-    if d_gate_raw.shape != q.shape:
-        raise ValueError("d_gate_raw must match expanded q")
+    value_head_shape = (batch, tokens, heads, key_dim)
+    if d_gate_raw.shape != value_head_shape:
+        raise ValueError(f"d_gate_raw must have shape {value_head_shape}")
 
-    d_q = torch.empty(q.shape, dtype=torch.float32, device=q.device)
-    d_k = torch.empty(k.shape, dtype=torch.float32, device=k.device)
+    d_q = torch.empty(value_head_shape, dtype=torch.float32, device=q.device)
+    d_k = torch.empty(value_head_shape, dtype=torch.float32, device=k.device)
     d_beta = torch.empty_like(beta, dtype=torch.float32)
     d_gate = torch.empty_like(cumulative_gate, dtype=torch.float32)
     chunk_gdn_bwd_intra_kernel[(tokens // 64, heads)](
@@ -171,6 +178,7 @@ def chunk_gdn_bwd_intra_dense(
         tokens,
         0,
         H=heads,
+        G=heads // key_heads,
         K=key_dim,
         BT=64,
         BK=64,
@@ -192,17 +200,19 @@ def chunk_gdn_bwd_intra_packed(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run fixed-capacity packed scalar-GDN intra-factor gradients."""
     metadata.validate_chunk_size(64)
-    batch, tokens, heads, key_dim = q.shape
-    if batch != 1 or key_dim not in (64, 128) or k.shape != q.shape:
+    batch, tokens, key_heads, key_dim = q.shape
+    heads = cumulative_gate.shape[2]
+    if batch != 1 or key_dim not in (64, 128) or k.shape != q.shape or heads % key_heads:
         raise ValueError("packed fused chunk GDN backward requires B=1 and K in {64, 128}")
     expected_factor_shape = (batch, tokens, heads, 64)
     if d_aqk.shape != expected_factor_shape or d_akk.shape != expected_factor_shape:
         raise ValueError(f"factor gradients must have shape {expected_factor_shape}")
-    if d_gate_raw.shape != q.shape:
-        raise ValueError("d_gate_raw must match expanded q")
+    value_head_shape = (batch, tokens, heads, key_dim)
+    if d_gate_raw.shape != value_head_shape:
+        raise ValueError(f"d_gate_raw must have shape {value_head_shape}")
 
-    d_q = torch.empty(q.shape, dtype=torch.float32, device=q.device)
-    d_k = torch.empty(k.shape, dtype=torch.float32, device=k.device)
+    d_q = torch.empty(value_head_shape, dtype=torch.float32, device=q.device)
+    d_k = torch.empty(value_head_shape, dtype=torch.float32, device=k.device)
     d_beta = torch.empty_like(beta, dtype=torch.float32)
     # Returned as the gate cotangent without a reverse scan behind it, so inactive rows
     # must be zero (docs/linear.md); the other outputs leave their suffix unspecified.
@@ -226,6 +236,7 @@ def chunk_gdn_bwd_intra_packed(
         tokens,
         metadata.cu_seqlens.shape[0] - 1,
         H=heads,
+        G=heads // key_heads,
         K=key_dim,
         BT=64,
         BK=64,

@@ -29,6 +29,7 @@ def chunk_gdn_recompute_aqk_kernel(
     T,
     num_sequences,
     H: tl.constexpr,
+    G: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
@@ -37,6 +38,7 @@ def chunk_gdn_recompute_aqk_kernel(
     """Recompute causal scalar-decayed QK without reciprocal gate factors."""
     chunk = tl.program_id(0)
     head = tl.program_id(1)
+    qk_head = head // G
     row = tl.arange(0, BT)
     column = tl.arange(0, BT)
     if IS_VARLEN:
@@ -55,8 +57,8 @@ def chunk_gdn_recompute_aqk_kernel(
     qk = tl.zeros((BT, BT), dtype=tl.float32)
     for key_block in range(0, K, BK):
         feature = key_block + tl.arange(0, BK)
-        q_offset = ptr_offset((token[:, None], head, feature[None, :]), (q_stride_t, K, 1))
-        k_offset = ptr_offset((token[:, None], head, feature[None, :]), (k_stride_t, K, 1))
+        q_offset = ptr_offset((token[:, None], qk_head, feature[None, :]), (q_stride_t, K, 1))
+        k_offset = ptr_offset((token[:, None], qk_head, feature[None, :]), (k_stride_t, K, 1))
         q_tile = tl.load(
             q + q_offset,
             mask=token_mask[:, None],
@@ -96,7 +98,8 @@ def chunk_gdn_recompute_aqk_dense(
     scale: float,
 ) -> torch.Tensor:
     """Run dense B=1 BT64 Aqk recomputation for the reused delta-H backward."""
-    batch, tokens, heads, key_dim = q.shape
+    batch, tokens, key_heads, key_dim = q.shape
+    heads = cumulative_gate.shape[2]
     if batch != 1 or tokens % 64 or key_dim not in (64, 128) or k.shape != q.shape:
         raise ValueError(
             "dense fused chunk GDN Aqk recompute requires B=1, BT64, and K in {64, 128}"
@@ -115,6 +118,7 @@ def chunk_gdn_recompute_aqk_dense(
         tokens,
         0,
         H=heads,
+        G=heads // key_heads,
         K=key_dim,
         BT=64,
         BK=32,
@@ -133,7 +137,8 @@ def chunk_gdn_recompute_aqk_packed(
 ) -> torch.Tensor:
     """Run fixed-capacity packed Aqk recomputation for reused delta-H backward."""
     metadata.validate_chunk_size(64)
-    batch, tokens, heads, key_dim = q.shape
+    batch, tokens, key_heads, key_dim = q.shape
+    heads = cumulative_gate.shape[2]
     if batch != 1 or key_dim not in (64, 128) or k.shape != q.shape:
         raise ValueError("packed fused chunk GDN Aqk recompute requires B=1 and K in {64, 128}")
     aqk = torch.empty(batch, tokens, heads, 64, dtype=q.dtype, device=q.device)
@@ -150,6 +155,7 @@ def chunk_gdn_recompute_aqk_packed(
         tokens,
         metadata.cu_seqlens.shape[0] - 1,
         H=heads,
+        G=heads // key_heads,
         K=key_dim,
         BT=64,
         BK=32,
