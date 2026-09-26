@@ -41,6 +41,7 @@ def _run(
         gk,
         initial_state,
         metadata=metadata,
+        fastmath=True,
     )
 
 
@@ -107,10 +108,12 @@ def test_recurrence_normalizes_misaligned_compact_gate():
     gk.copy_(-torch.rand(shape, device="cuda"))
     assert gk.is_contiguous() and not can_use_tma(gk)
 
-    expected = chunk_gated_delta_rule_fwd_h(k, w, u, gk.clone(), None)
+    expected = chunk_gated_delta_rule_fwd_h(k, w, u, gk.clone(), None, fastmath=True)
     results = (
-        chunk_gated_delta_rule_fwd_h(k, w, u, gk, None),
-        torch.compile(chunk_gated_delta_rule_fwd_h, fullgraph=True)(k, w, u, gk, None),
+        chunk_gated_delta_rule_fwd_h(k, w, u, gk, None, fastmath=True),
+        torch.compile(chunk_gated_delta_rule_fwd_h, fullgraph=True)(
+            k, w, u, gk, None, fastmath=True
+        ),
     )
     for actual in results:
         for result, reference in zip(actual, expected, strict=True):
@@ -151,6 +154,7 @@ def _run_persistent_overflow_case(
         metadata.capacity,
         final_state,
         schedule,
+        fastmath=True,
     )
     return h, v_new, final_state
 
@@ -255,6 +259,7 @@ def test_ragged_recurrence_rejects_mismatched_metadata_chunk_size():
             *inputs,
             torch.zeros(1, 1, 128, 128, device="cuda"),
             metadata=metadata,
+            fastmath=True,
         )
 
 
@@ -274,7 +279,14 @@ def test_ragged_recurrence_fullgraph(output_final_state: bool):
     def operation(k, w, u, gk, initial_state, cu_seqlens):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
         return chunk_gated_delta_rule_fwd_h(
-            k, w, u, gk, initial_state, metadata=metadata, output_final_state=output_final_state
+            k,
+            w,
+            u,
+            gk,
+            initial_state,
+            metadata=metadata,
+            output_final_state=output_final_state,
+            fastmath=True,
         )
 
     expected = operation(k, w, u, gk, initial_state, cu_seqlens)
@@ -296,7 +308,7 @@ def test_ragged_recurrence_replays_aligned_to_ragged():
     cu_seqlens = cumulative_sequence_offsets([64, 64])
 
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-    chunk_gated_delta_rule_fwd_h(k, w, u, gk, initial_state, metadata=warm_metadata)
+    chunk_gated_delta_rule_fwd_h(k, w, u, gk, initial_state, metadata=warm_metadata, fastmath=True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -309,6 +321,7 @@ def test_ragged_recurrence_replays_aligned_to_ragged():
             gk,
             initial_state,
             metadata=metadata,
+            fastmath=True,
         )
 
     cu_seqlens.copy_(cumulative_sequence_offsets([65, 63]))
@@ -360,7 +373,7 @@ def test_ragged_recurrence_persistent_cuda_graph_replays_active_sequences(
         )
         > 0
     )
-    chunk_gated_delta_rule_fwd_h(k, w, u, gk, initial_state, metadata=warm_metadata)
+    chunk_gated_delta_rule_fwd_h(k, w, u, gk, initial_state, metadata=warm_metadata, fastmath=True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -374,6 +387,7 @@ def test_ragged_recurrence_persistent_cuda_graph_replays_active_sequences(
             initial_state,
             metadata=metadata,
             output_final_state=output_final_state,
+            fastmath=True,
         )
     assert (final_state is not None) is output_final_state
 
@@ -411,6 +425,7 @@ def test_ragged_recurrence_persistent_cuda_graph_replays_active_sequences(
         expected_metadata.capacity,
         expected_final,
         ScheduleRequest.STATIC,
+        fastmath=True,
     )
     active_chunks = expected_metadata.chunk_offsets[-1].item()
     torch.testing.assert_close(h[:, :active_chunks], expected_h[:, :active_chunks], rtol=0, atol=0)
@@ -445,8 +460,8 @@ def test_delta_h_opcheck():
         metadata.chunk_offsets,
         metadata.capacity,
     )
-    torch.library.opcheck(delta_h_op, ragged_args)
-    torch.library.opcheck(delta_h_with_state_op, ragged_args)
+    torch.library.opcheck(delta_h_op, ragged_args, {"fastmath": True})
+    torch.library.opcheck(delta_h_with_state_op, ragged_args, {"fastmath": True})
     dense_args = (k, w, u, gk, None, None, None, tokens // 64)
-    torch.library.opcheck(delta_h_op, dense_args)
-    torch.library.opcheck(delta_h_with_state_op, dense_args)
+    torch.library.opcheck(delta_h_op, dense_args, {"fastmath": True})
+    torch.library.opcheck(delta_h_with_state_op, dense_args, {"fastmath": True})

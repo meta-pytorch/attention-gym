@@ -74,7 +74,7 @@ def _inputs(tokens: int, sequences: int, scalar_gate: bool, dtype: torch.dtype):
 def _recurrence(inputs, metadata, scalar_gate: bool):
     if scalar_gate:
         return chunk_gdn_fwd_recurrence_packed(*inputs, metadata)
-    return chunk_gated_delta_rule_fwd_h(*inputs, metadata=metadata)
+    return chunk_gated_delta_rule_fwd_h(*inputs, metadata=metadata, fastmath=True)
 
 
 def _assert_persistent(inputs, metadata) -> None:

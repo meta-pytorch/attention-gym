@@ -60,7 +60,7 @@ def chunk_kda_bwd_delta_h_triton_kernel(
     USE_FINAL_STATE: tl.constexpr,
     STORE_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Traverse one sequence/head/value tile with an FP32 state cotangent."""
     sequence_head = tl.program_id(0)
@@ -252,7 +252,7 @@ def chunk_kda_bwd_delta_h_triton(
     d_final_state: torch.Tensor | None,
     scale: float,
     metadata: RaggedChunkMetadata | None,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run the Triton KDA reverse delta-H stage.
 

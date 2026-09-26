@@ -160,7 +160,8 @@ class KdaIntraFwdEngine:
         head_dim: int = 128,
         varlen: bool = True,
         use_int64_offsets: bool = False,
-        fastmath: bool = False,
+        *,
+        fastmath: bool,
     ):
         assert chunk_size == 64 and head_dim == 128
         self.BT = chunk_size
@@ -959,7 +960,7 @@ def _compile_intra_engine_fwd(
     head_dim: int,
     varlen: bool,
     use_int64_offsets: bool,
-    fastmath: bool = False,
+    fastmath: bool,
 ):
     target = get_compile_target()
     if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
@@ -1037,7 +1038,7 @@ def kda_intra_engine_fwd(
     scale: float,
     metadata: RaggedChunkMetadata | None,
     *,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Produce the BT64 Aqk and inverse factors."""
     batch, tokens, heads, head_dim = q.shape

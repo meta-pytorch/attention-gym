@@ -60,7 +60,7 @@ def metadata_for(tokens: int, lengths: list[int] | None):
 def diagonal(inputs, metadata, *, fixed: bool):
     q, k, g, beta = inputs[:4]
     if not fixed:
-        return chunk_kda_fwd_intra_diagonal(q, k, g, beta, 128**-0.5, metadata)
+        return chunk_kda_fwd_intra_diagonal(q, k, g, beta, 128**-0.5, metadata, fastmath=True)
     tokens = q.shape[1]
     capacity = tokens // 64 if metadata is None else metadata.capacity
     aq = torch.empty(1, tokens, 1, 64, device="cuda", dtype=q.dtype)
@@ -89,6 +89,7 @@ def diagonal(inputs, metadata, *, fixed: bool):
         USE_GATHER=IS_GATHER_SUPPORTED,
         GRID_NT=1,
         MAX_NT=capacity,
+        FASTMATH=True,
     )
     return aq, ak
 
@@ -183,7 +184,10 @@ def test_intra_backend_cache_reuse(stage, fixed, packed):
             assert len(cache) == 1, "diagonal compiled again for runtime T/N/capacity/grid"
         else:
             outputs = chunk_kda_bwd_intra(
-                *inputs, metadata, config=ChunkKdaBwdIntraConfig(1) if fixed else None
+                *inputs,
+                metadata,
+                config=ChunkKdaBwdIntraConfig(1) if fixed else None,
+                fastmath=True,
             )
             check_backward(inputs, outputs, lengths or [tokens])
             info = _compile_chunk_kda_bwd_intra.cache_info()
@@ -215,7 +219,7 @@ def test_intra_graph_replay_changed_metadata(dtype, poison):
     def operation():
         metadata = prepare_ragged_chunk_metadata(cu, 193, 64)
         return diagonal(inputs, metadata, fixed=True), chunk_kda_bwd_intra(
-            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1)
+            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1), fastmath=True
         )
 
     for _ in range(3):

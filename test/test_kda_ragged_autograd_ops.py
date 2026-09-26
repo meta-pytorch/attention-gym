@@ -46,6 +46,7 @@ def test_ragged_custom_op_registrations():
     torch.library.opcheck(
         _chunk_kda_fwd_ragged_with_state_op,
         forward_args,
+        {"fastmath": False},
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
         atol=2e-3,
@@ -54,13 +55,16 @@ def test_ragged_custom_op_registrations():
     torch.library.opcheck(
         _chunk_kda_fwd_ragged_op,
         forward_args,
+        {"fastmath": False},
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
         atol=2e-3,
     )
 
     with torch.no_grad():
-        output, state, Aqk, Akk = _chunk_kda_fwd_ragged_with_state_op(*forward_args)
+        output, state, Aqk, Akk = _chunk_kda_fwd_ragged_with_state_op(
+            *forward_args, fastmath=False
+        )
     torch.library.opcheck(
         _chunk_kda_bwd_with_state_grad_op,
         (
@@ -92,7 +96,7 @@ def test_ragged_custom_op_registrations():
         "auto",
     )
     with torch.no_grad():
-        output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args)
+        output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args, fastmath=False)
     torch.library.opcheck(
         _chunk_kda_bwd_op,
         (

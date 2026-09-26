@@ -46,7 +46,7 @@ def chunk_kda_fwd_factors(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     profile_ranges: bool = False,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce the BT64 Aqk/Akk factors used by forward and backward recompute."""
     assert chunk_size == 64, "chunk_kda_fwd_factors requires chunk_size=64"
@@ -123,7 +123,8 @@ def chunk_kda_fwd_intra(
     profile_ranges: bool = False,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-    fastmath: bool = False,
+    *,
+    fastmath: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,

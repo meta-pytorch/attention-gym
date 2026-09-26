@@ -317,6 +317,7 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         output_final_state=False,
         metadata=metadata,
         autotune=False,
+        fastmath=True,
     )
     assert final_state is None
     return chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
@@ -505,6 +506,7 @@ def _finish_chunk_gdn_bwd(
         scale=scale,
         chunk_size=64,
         metadata=metadata,
+        fastmath=False,
     )
     prepared.w = prepared.qg = prepared.kg = None
     del w, qg, kg, aqk

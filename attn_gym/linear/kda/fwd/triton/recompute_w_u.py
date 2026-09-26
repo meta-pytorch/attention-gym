@@ -291,7 +291,7 @@ def recompute_w_u_fwd_kernel(
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Launch one CTA per chunk task; ragged capacity-only CTAs exit immediately."""
     i_c, i_hv = tl.program_id(0), tl.program_id(1)
@@ -379,7 +379,7 @@ def recompute_w_u_fwd_kernel_persistent(
     HAS_GK: tl.constexpr,
     IS_RAGGED: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Stride a bounded worker grid over active (chunk, value-head) tasks."""
     worker = tl.program_id(0)
@@ -441,7 +441,7 @@ def recompute_w_u_fwd_triton(
     dot_precision: str = "bf16",
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Launch the register-operand recompute for packed B=1 inputs.
 

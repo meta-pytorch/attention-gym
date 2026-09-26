@@ -82,11 +82,11 @@ def test_portable_ragged_backward_fully_overwrites_active_outputs():
         "metadata": metadata,
     }
     expected_dh, expected_initial, expected_dv = chunk_kda_bwd_delta_h_triton(
-        *delta_args, **delta_kwargs
+        *delta_args, **delta_kwargs, fastmath=True
     )
     with _poison_uninitialized_memory():
         actual_dh, actual_initial, actual_dv = chunk_kda_bwd_delta_h_triton(
-            *delta_args, **delta_kwargs
+            *delta_args, **delta_kwargs, fastmath=True
         )
     assert expected_initial is actual_initial is None
     torch.testing.assert_close(
@@ -110,9 +110,9 @@ def test_portable_ragged_backward_fully_overwrites_active_outputs():
         incoming_dv,
         metadata,
     )
-    expected = chunk_kda_bwd_wy_triton(*wy_args, scale=128**-0.5)
+    expected = chunk_kda_bwd_wy_triton(*wy_args, scale=128**-0.5, fastmath=False)
     with _poison_uninitialized_memory():
-        actual = chunk_kda_bwd_wy_triton(*wy_args, scale=128**-0.5)
+        actual = chunk_kda_bwd_wy_triton(*wy_args, scale=128**-0.5, fastmath=False)
     for actual_output, expected_output in zip(actual, expected, strict=True):
         active_actual = actual_output[:, :active_tokens]
         active_expected = expected_output[:, :active_tokens]

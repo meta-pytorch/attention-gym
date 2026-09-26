@@ -52,7 +52,8 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         schedule_kind: ScheduleKind = ScheduleKind.STATIC,
         chunk_workers: int = 0,
         use_int64_offsets: bool = False,
-        fastmath: bool = True,
+        *,
+        fastmath: bool,
     ):
         assert num_subchunks == 4, (
             f"ChunkKDAFwdK3bOffdiagCuteDSL only supports four subchunks, got {num_subchunks}"

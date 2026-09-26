@@ -205,7 +205,7 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     scale: float,
     output_final_state: bool = False,
-    fastmath: bool = True,
+    fastmath: bool,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:

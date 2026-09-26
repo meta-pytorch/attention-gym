@@ -43,7 +43,7 @@ def test_recomputed_factors_backward_matches_saved_factors(lengths):
     from attn_gym.linear.kda.ops import chunk_bwd_op, chunk_bwd_recompute_factors_op
 
     q, k, v, gate, beta, metadata = inputs(lengths)
-    Aqk, Akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata)
+    Aqk, Akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata, fastmath=False)
     d_output = torch.randn_like(v)
     cu_seqlens = None if metadata is None else metadata.cu_seqlens
     chunk_offsets = None if metadata is None else metadata.chunk_offsets
@@ -90,7 +90,7 @@ def test_ragged_backward_ignores_akk_capacity_slack():
         cu_seqlens=cu_seqlens,
     )
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, physical_tokens, 64)
-    aqk, akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata)
+    aqk, akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata, fastmath=False)
     clean_akk = akk.clone()
     clean_akk[:, active_tokens:] = 0
     poisoned_akk = akk.clone()
@@ -127,7 +127,7 @@ def test_recomputed_factors_backward_with_state_matches_saved_factors():
 
     q, k, v, gate, beta, metadata = inputs([65, 0, 63])
     assert metadata is not None
-    aqk, akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata)
+    aqk, akk = chunk_kda_fwd_factors(q, k, gate, beta, D**-0.5, metadata, fastmath=False)
     initial_state = torch.randn(3, q.shape[2], D, D, device="cuda") / 8
     d_final_state = torch.randn_like(initial_state)
     common = (

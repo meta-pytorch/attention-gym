@@ -29,13 +29,15 @@ def whole_stream(like: torch.Tensor) -> torch.Tensor:
 
 def build_state_summary(kg, w, u, cumulative_gate):
     """The single whole-stream summary: ``R = 1`` of ``build_state_summaries``."""
-    return build_state_summaries(kg, w, u, cumulative_gate, whole_stream(kg))[0]
+    return build_state_summaries(kg, w, u, cumulative_gate, whole_stream(kg), fastmath=True)[0]
 
 
 def build_state_grad_summary(qg, kg, w, dout, aqk, cumulative_gate, scale):
     """The single whole-stream reverse summary: ``R = 1`` of ``build_state_grad_summaries``."""
     bounds = whole_stream(qg)
-    return build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)[0]
+    return build_state_grad_summaries(
+        qg, kg, w, dout, aqk, cumulative_gate, scale, bounds, fastmath=True
+    )[0]
 
 
 pytestmark = pytest.mark.skipif(
@@ -483,13 +485,13 @@ def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch
     monkeypatch.setattr(native_fwd, "_compile_affine_summary", compile_summary)
     expected_bn = 32 if tokens == 8128 else 64
     for _ in range(2):
-        native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+        native_fwd.build_state_summaries(kg, w, u, gate, bounds, fastmath=True)
     assert compile_summary.call_args.args[2] == expected_bn
     assert compile_summary.call_args.kwargs["whole_ranges"] == (expected_bn == 32)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+        actual = native_fwd.build_state_summaries(kg, w, u, gate, bounds, fastmath=True)
     for start, stop in ((0, tokens), (0, 0), ((tokens // 64 - 1) * 64, tokens)):
         bounds.copy_(torch.tensor([[start, stop]], device=kg.device, dtype=torch.int32))
         graph.replay()
@@ -754,8 +756,10 @@ def test_range_summaries_match_per_range_launches(dtype):
     bounds = torch.tensor(RANGE_BOUNDS, dtype=torch.int32, device="cuda")
     scale = 128**-0.5
 
-    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
-    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds, fastmath=True)
+    reverse = build_state_grad_summaries(
+        qg, kg, w, dout, aqk, cumulative_gate, scale, bounds, fastmath=True
+    )
     assert forward.shape == reverse.shape == (len(RANGE_BOUNDS), 2, 256, 128)
 
     identity = torch.cat((torch.zeros(2, 128, 128), torch.eye(128).expand(2, -1, -1)), dim=1)
@@ -816,8 +820,10 @@ def test_range_tails_ignore_the_tokens_that_follow(dtype, corrupt):
     bounds = torch.tensor([[0, 300], [172, 300], [364, 640]], dtype=torch.int32, device="cuda")
     scale = 128**-0.5
 
-    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
-    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds)
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds, fastmath=True)
+    reverse = build_state_grad_summaries(
+        qg, kg, w, dout, aqk, cumulative_gate, scale, bounds, fastmath=True
+    )
     for index, (start, stop) in enumerate(bounds.tolist()):
         sliced = [t[:, start:stop] for t in tensors]
         expected_forward = build_state_summary(sliced[1], sliced[2], sliced[3], sliced[6])
@@ -854,8 +860,10 @@ def test_range_summaries_survive_a_tiny_work_budget(dtype, monkeypatch):
     ranges = [*RANGE_BOUNDS, (500, 501), (0, 65)]
     bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
 
-    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds)
-    reverse = build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5, bounds)
+    forward = build_state_summaries(kg, w, u, cumulative_gate, bounds, fastmath=True)
+    reverse = build_state_grad_summaries(
+        qg, kg, w, dout, aqk, cumulative_gate, 128**-0.5, bounds, fastmath=True
+    )
     assert plan_budget.call_count == 2
     for index, (start, stop) in enumerate(ranges):
         for name, actual, expected in zip(
@@ -889,8 +897,10 @@ def test_range_summaries_replay_across_layouts_in_one_cuda_graph(budget, monkeyp
 
     def launch():
         return (
-            build_state_summaries(kg, w, u, cumulative_gate, bounds),
-            build_state_grad_summaries(qg, kg, w, dout, aqk, cumulative_gate, scale, bounds),
+            build_state_summaries(kg, w, u, cumulative_gate, bounds, fastmath=True),
+            build_state_grad_summaries(
+                qg, kg, w, dout, aqk, cumulative_gate, scale, bounds, fastmath=True
+            ),
         )
 
     launch()

@@ -154,7 +154,7 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
-    fastmath: bool = True,
+    fastmath: bool,
     autotune: bool = True,
     split_backward: bool = False,
     split_forward: bool = False,

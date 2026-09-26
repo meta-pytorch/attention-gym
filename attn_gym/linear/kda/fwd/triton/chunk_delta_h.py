@@ -269,7 +269,7 @@ def chunk_delta_h_kernel(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Primary inter-chunk recurrence launcher."""
     _run_chunk_delta_h_sequence(
@@ -357,7 +357,7 @@ def chunk_delta_h_persistent_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
     NUM_SEQUENCES,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Stride persistent workers over sequence recurrences after the first wave."""
     worker = tl.program_id(0)
@@ -457,7 +457,8 @@ def _delta_h_launch(
     capacity: int,
     final_state: torch.Tensor | None,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-    fastmath: bool = True,
+    *,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
     batch, tokens, heads, key_dim = k.shape
@@ -590,7 +591,7 @@ def _delta_h_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
         k,
@@ -617,7 +618,7 @@ def _delta_h_with_state_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = torch.empty(
@@ -651,7 +652,7 @@ def _delta_h_paged_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     capacity: int,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
         k,
@@ -682,7 +683,7 @@ def chunk_gated_delta_rule_fwd_h(
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
