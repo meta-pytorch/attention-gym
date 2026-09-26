@@ -92,6 +92,9 @@ def detect_compile_target(device: int | None = None) -> CompileTarget:
 def get_compile_target() -> CompileTarget:
     """Return explicitly supplied target metadata, discovering it if necessary."""
     global _target
+    target = _target
+    if target is not None:
+        return target
     with _lock():
         if _target is None:
             _target = detect_compile_target()

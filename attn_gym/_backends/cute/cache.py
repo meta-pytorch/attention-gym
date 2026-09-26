@@ -13,10 +13,13 @@ upstream ``CUTE_DSL_NO_CACHE`` switch is still respected.
 from __future__ import annotations
 
 import ctypes
+import enum
 import errno
 import functools
 import logging
+import math
 import os
+import pickle
 import tempfile
 import threading
 import time
@@ -25,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
+import torch
 from typing_extensions import Self
 
 from ._key import make_key as _make_key
@@ -213,6 +217,36 @@ def _publish_compiled(compiled: Any, destination: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+_PLAIN_TYPES = frozenset({int, bool, str, bytes, type(None), torch.dtype, torch.device})
+
+
+@functools.cache
+def _target_key(target: CompileTarget) -> bytes:
+    """Encode a target once; it is fixed for the process, but keys every launch."""
+    return pickle.dumps(target, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _fast_key(item: Any) -> tuple[Any, ...] | None:
+    """Key a plain static value without pickling, or return None to use the pickled key.
+
+    Tagging each value with its type keeps values that compare equal across types
+    (``True == 1``) apart, as the pickled key does. Floats key on ``float.hex`` so ``0.0`` and
+    ``-0.0`` differ; NaN payloads all hex to ``'nan'``, so NaN takes the pickled key.
+    """
+    item_type = type(item)
+    # One set lookup, not a chain of isinstance class patterns: this runs per value per launch.
+    match item:
+        case _ if item_type in _PLAIN_TYPES or isinstance(item, (type, enum.Enum)):
+            return (item_type, item)
+        case float() if not math.isnan(item):
+            return (item_type, item.hex())
+        case tuple() if item_type is tuple:  # NamedTuples keep their type via the pickled key.
+            parts = tuple(map(_fast_key, item))
+            return None if None in parts else (tuple, *parts)
+        case _:
+            return None
+
+
 def _artifact_exists(path: Path) -> bool:
     try:
         return path.stat().st_size > 0
@@ -252,7 +286,7 @@ def jit_cache(
         raise ValueError(f"lock_timeout must be positive, got {lock_timeout}")
     source_paths = tuple(os.fspath(Path(path).expanduser().resolve()) for path in extra_sources)
     memory_cache: dict[str, T] = {}
-    runtime_cache: dict[bytes, T] = {}
+    runtime_cache: dict[Any, T] = {}
     key_locks: dict[str, threading.Lock] = {}
     state_lock = threading.RLock()
     cache_pid = os.getpid()
@@ -276,7 +310,7 @@ def jit_cache(
         key: str,
         compiled: T,
         *,
-        runtime_key: bytes,
+        runtime_key: Any,
         hit: bool,
     ) -> T:
         nonlocal hits, misses
@@ -338,7 +372,11 @@ def jit_cache(
         reset_after_fork()
         target = get_compile_target()
         key_args, key_kwargs = key_arguments(args, kwargs)
-        runtime_key = _make_runtime_key(key_args, key_kwargs, target)
+        runtime_key = _fast_key((key_args, tuple(key_kwargs.items())))
+        if runtime_key is None:
+            runtime_key = _make_runtime_key(key_args, key_kwargs, target)
+        else:
+            runtime_key = (_target_key(target), runtime_key)
         with state_lock:
             if runtime_key in runtime_cache:
                 hits += 1
