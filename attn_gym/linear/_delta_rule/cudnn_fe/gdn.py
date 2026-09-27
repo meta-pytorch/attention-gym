@@ -341,7 +341,6 @@ def gdn_backward(
             "heads_out": heads_out,
             "num_seqs": num_seqs,
             "b_t": B_T,
-            "compact_qdo": False,
             "fused_h_m": True,
             "series": True,
             "coarse": False,
@@ -350,7 +349,6 @@ def gdn_backward(
             "scale": scale,
         }
         launch = build_chain_backward(
-            bprop_module=gdn_bprop_f16,
             **buffers,
             **schedule,
             unit_chunks=plan.unit_chunks,
@@ -389,12 +387,10 @@ def gdn_backward(
             "recompute_orders": True,
             "coarse": False,
             "bwd_orders": False,
-            "compact_qdo": False,
             "seed_span_tokens": 0,
             "seed_every_n_tokens": 0,
         }
         warmup = build_warmup_backward(
-            bprop_module=gdn_bprop_f16,
             **buffers,
             **stages,
             split=split,

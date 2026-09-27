@@ -29,8 +29,8 @@ their prologue), so the call sequence is two crossings into the DSL instead of s
 its host and the tensor placeholder each host was compiled with are the standalone modules' own; a
 buffer two hosts read through different placeholder types is passed twice (the table's 4-byte
 compact views of work_items, work_count and item_scratch; the bprop prologue's 4-byte cu_seqlens).
-The bprop module is a constexpr argument; only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64
-fork is not)."""
+Only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64 fork and its ``compact_qdo`` operands are
+not), so the host compiles ``compact_qdo`` off."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -496,7 +496,6 @@ def _validate_launch(
 
 def build_warmup_backward(
     *,
-    bprop_module,
     q,
     k,
     v,
@@ -537,7 +536,6 @@ def build_warmup_backward(
     recompute_orders,
     coarse,
     bwd_orders,
-    compact_qdo,
     seed_span_tokens,
     seed_every_n_tokens,
     log_gate,
@@ -569,10 +567,6 @@ def build_warmup_backward(
         gate_lower_bound=None,
         expand_num=expand_num,
     )
-    if bprop_module is not gdn_bprop_f16 or compact_qdo:
-        raise ValueError(
-            "the GDN warmup backward supports only the gdn_bprop_f16 bprop without compact_qdo"
-        )
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
         q=q,
@@ -635,7 +629,7 @@ def build_warmup_backward(
         facts.num_sms,
         io_dtype,
         None,  # the bprop module
-        bool(compact_qdo),
+        False,  # compact_qdo
         bool(tinv_pass),
         bool(recompute),
         bool(recompute_orders),
@@ -770,7 +764,6 @@ def run_warmup_backward(
     recompute_orders,
     coarse,
     bwd_orders,
-    compact_qdo,
     seed_span_tokens,
     seed_every_n_tokens,
 ) -> None:

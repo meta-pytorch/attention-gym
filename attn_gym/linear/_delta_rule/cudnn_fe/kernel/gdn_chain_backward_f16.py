@@ -27,11 +27,12 @@ back) and the seeded series recompute; the tail (``--opt-level 2``, the option o
 and the bprop) runs the G summary, the reverse state chain and the bprop.  The series recompute
 moves ahead of the G summary (it depends only on the forward chain); the reverse chain is the one
 GDN kernel compiled at 2 while GDN's standalone level is 3 (same instruction count, one runtime
-division per CTA folded differently).  The bprop module is a constexpr argument; only gdn_bprop_f16
-is vendored (upstream's GDP d_v = 64 fork is not).  Every kernel, its host and the tensor
-placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
-through different placeholder types is passed twice, once per type (H, M and X: the summary's and
-recompute's mode-3 compact views against the state chain's ``(1, HO, V, K)`` device views)."""
+division per CTA folded differently).  Only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64 fork
+and its ``compact_qdo`` operands are not), so the hosts compile ``compact_qdo`` off.  Every
+kernel, its host and the tensor placeholder each host was compiled with are the standalone modules'
+own; a buffer two hosts read through different placeholder types is passed twice, once per type (H,
+M and X: the summary's and recompute's mode-3 compact views against the state chain's ``(1, HO, V,
+K)`` device views)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -830,7 +831,6 @@ def _validate_launch(
 
 def build_chain_backward(
     *,
-    bprop_module,
     q,
     k,
     v,
@@ -890,7 +890,6 @@ def build_chain_backward(
     b_t,
     expand_num,
     length_rule,
-    compact_qdo,
     summary_q_step,
     fused_h_m,
     series,
@@ -915,10 +914,6 @@ def build_chain_backward(
     if not safe_gate:
         a_log = None
         dt_bias = None
-    if bprop_module is not gdn_bprop_f16 or compact_qdo:
-        raise ValueError(
-            "the GDN chain backward supports only the gdn_bprop_f16 bprop without compact_qdo"
-        )
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
         q=q,
@@ -1021,7 +1016,7 @@ def build_chain_backward(
         int(b_t),
         int(expand_num),
         bool(length_rule),
-        bool(compact_qdo),
+        False,  # compact_qdo
         int(summary_q_step),
         bool(fused_h_m),
         bool(series),
@@ -1149,7 +1144,7 @@ def build_chain_backward(
     )
     head = _compile_chain_backward_head(head_constexprs, cfg_args, head_specs, use_int64_offsets)
     tail = _compile_chain_backward_tail(
-        (bool(compact_qdo), DV, DK, int(chain_rows), has_dseed),
+        (False, DV, DK, int(chain_rows), has_dseed),  # compact_qdo off
         cfg_args,
         tail_specs,
         use_int64_offsets,
@@ -1216,7 +1211,6 @@ def run_chain_backward(
     heads_out,
     num_seqs,
     b_t,
-    compact_qdo,
     fused_h_m,
     series,
     coarse,
