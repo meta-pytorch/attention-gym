@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 23 modification rows below are generated from
+The 24 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 23 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 24 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -174,6 +174,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | R7 | Reject misaligned per-channel gate rows before the vectorized split scan | `test/kda/cudnn/test_kda_cudnn_forward.py::test_cudnn_split_table_rejects_misaligned_vector_gate_rows` |
 | B2 | Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary`; `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary`; cutracer random_delay (hardening; tests pass without the fix) |
 | S14 | int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path` |
+| R10 | Delete the legacy 085d50b kernel copy, schedule.py, kda_plain_gate_bwd | `test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies` |
 | B3 | Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream) | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items` |
 | R8 | Sharded KDA dbeta bounded by the operand-pack budget | `test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op` |
 <!-- END GENERATED FIX LEDGER -->

@@ -1201,16 +1201,6 @@ def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
-def test_cudnn_plain_gate_backward_forced_int64_matches_int32(monkeypatch) -> None:
-    from attn_gym.linear._delta_rule.cudnn.kernels import kda_plain_gate_bwd
-
-    d_cumulative = torch.randn(1, 64, 1, D, device="cuda")
-    expected = kda_plain_gate_bwd.plain_gate_cumsum_dense_bwd_cute(d_cumulative)
-    monkeypatch.setattr(kda_plain_gate_bwd, "requires_int64_abi", lambda *_: True)
-    actual = kda_plain_gate_bwd.plain_gate_cumsum_dense_bwd_cute(d_cumulative)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 def test_cudnn_fullgraph_cuda_graph_replay() -> None:
     inputs = _make_inputs(requires_grad=False)
     compiled = torch.compile(_candidate, fullgraph=True)

@@ -20,7 +20,7 @@ assert "attn_gym.linear._delta_rule.cudnn.forward" not in sys.modules
 assert "attn_gym.linear._delta_rule.cudnn.backward" not in sys.modules
 assert "attn_gym.linear._delta_rule.cudnn.gdn_forward" not in sys.modules
 assert "attn_gym.linear._delta_rule.cudnn.gdn_backward" not in sys.modules
-assert not any(name.startswith("attn_gym.linear._delta_rule.cudnn.kernels") for name in sys.modules)
+assert not any(name.startswith("attn_gym.linear._delta_rule.cudnn_fe") for name in sys.modules)
 assert not any(name.startswith("cutlass.experimental") for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True)

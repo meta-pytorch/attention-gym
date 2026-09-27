@@ -18,5 +18,9 @@ Changes made for Attention Gym:
   compilation uses module-level `jit_cache` functions and fake TVM-FFI tensor signatures from
   `common/tvm_ffi.py`, without allocating live placeholder tensors or importing cuDNN host shims.
 
+Attention Gym previously vendored older copies of the KDA and paged scalar-GDN kernels from
+cudnn-frontend commit `085d50b33691f06e2309f8e6724741a021985649` under `_delta_rule/cudnn/kernels/`;
+this package replaces them, and every cuDNN route now launches the v1.30 kernels.
+
 Modified upstream files carry an explicit modification notice and keep their original SPDX
 identifiers.

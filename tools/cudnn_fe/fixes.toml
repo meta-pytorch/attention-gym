@@ -322,6 +322,15 @@ guarding_tests = [
 ]
 upstream_status = "ag-specific"
 
+# --------------------------------------------------------------------------- pruning / docs
+[[fix]]
+id = "R10"
+title = "Delete the legacy 085d50b kernel copy, schedule.py, kda_plain_gate_bwd"
+kind = "pruning"
+ag_subject = "Delete the legacy cuDNN kernel copy and its unused schedule helper"
+guarding_tests = ["test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies"]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"

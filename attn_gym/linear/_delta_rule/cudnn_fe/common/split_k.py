@@ -119,6 +119,9 @@ ORDER_CAPACITY = (
     ORDER_THREADS * ORDER_ELEMENTS
 )  # sort capacity (32 KB SMEM); past this the device-side branch copies through unsorted
 
+# The threshold is a margin of bits past the output dtype's relative half-ulp, not an underflow:
+# a rounding can flip only where |H_window| < 2^-margin * |H_before| elementwise. e^-10 = 2^-14.4,
+# so bf16 (half-ulp 2^-8) keeps a 6.4-bit margin and fp16 (half-ulp 2^-11) a 3.4-bit margin.
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
 

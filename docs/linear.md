@@ -418,8 +418,8 @@ crossed the kernel's threshold, and each cut item rebuilds its entry state from 
 warmup window. Gates that never forget produce no cuts and reproduce the unsplit result exactly; when
 cuts are accepted the result stays within the low-precision error budget while exposing several
 times the parallel work. The threshold is a margin of bits past the output dtype's half-ulp, not an
-underflow; see `NOTE [Forgetting Horizon]` in
-`attn_gym/linear/_delta_rule/cudnn/kernels/common/split_k.py`. `split_forward` affects only the
+underflow; see the module docstring and `DEFAULT_LOG2_THRESHOLD` in
+`attn_gym/linear/_delta_rule/cudnn_fe/common/split_k.py`. `split_forward` affects only the
 forward recurrence: unless `split_backward` is also enabled, backward computes the exact unsplit
 recurrence's gradient rather than the derivative of the split forward. The implementation chooses
 the split count from the input geometry; no public split-size knob is exposed. Split schedules
