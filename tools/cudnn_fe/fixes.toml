@@ -181,6 +181,7 @@ ag_subjects_extra = [
   "Restyle KDA summary kernel storage and swizzle offsets",
   "Restyle the v1.30 GDN recompute and bprop summary kernel storage",
   "Restyle KDA recompute, bprop and bprop summary kernel storage",
+  "Test the v1.30 shared-memory swizzle helpers",
 ]
 guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts"]
 gate = "sass (identical or offset-only noise)"

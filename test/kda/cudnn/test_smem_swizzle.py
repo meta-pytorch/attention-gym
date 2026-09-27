@@ -10,7 +10,7 @@ cute = pytest.importorskip("cutlass.cute")
 
 from attn_gym._backends.cute import compile_tvm_ffi
 from attn_gym._backends.cute.cache import jit_cache
-from attn_gym.linear._delta_rule.cudnn.kernels.tile_dsl.swizzle import (
+from attn_gym.linear._delta_rule.cudnn_fe.tile_dsl.swizzle import (
     swizzle_box_offset_32b,
     swizzle_box_offset_128b,
 )
