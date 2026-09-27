@@ -217,6 +217,16 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   writing the fake signatures; "Give the warmup forward state signatures independent extents". No
   dedicated test.
 
+### R4 / S14 — Forced-int64 coverage went vacuous
+- **Found by:** R13's dead-code deletion removed code the forced-int64 test relied on; the test kept
+  passing without exercising the wide variant.
+- **Fix:** module-level `requires_int64_abi` selectors, the wide-extent GDN forward variant, tests
+  that assert the selector ran; restore kda_recompute's selector; stop forcing selectors on GDN
+  modules that no longer launch. Subjects in `fixes.toml` (S14, R4).
+- **Tests:** GL::test_gdn_cudnn_forced_int64_forward_backward_matches_int32,
+  KT::test_cudnn_forced_int64_forward_backward_matches_int32,
+  GL::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path. Fails without = YES.
+
 ### B9 — A non-vacuity check was vacuous (test)
 - **Found by:** mutation audit: ignoring `split` did not fail the contracting-gate test, because
   under the automatic plan the d_v split alone made `work_items > 1`.
@@ -310,6 +320,9 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
    symbolic stride; `leading_dim=None` still infers 1 from a compact first call.
 3. **Match upstream's opt level (R2).** The compiler default is not upstream's `--opt-level 2`;
    without an explicit level SASS differs and perf comparisons are meaningless.
+4. **A work-item count is not proof of non-vacuity (B9).** Counts grow from orthogonal tiling; pin
+   the plan before asserting on them. Likewise, after deleting code, re-check that forced-path tests
+   still reach the path (R4/S14).
 6. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
    and one (B14) targets an ABI upstream lacks; the repros and `verify_fixes.py` classification keep
    hardening drafts from being filed as bug fixes.

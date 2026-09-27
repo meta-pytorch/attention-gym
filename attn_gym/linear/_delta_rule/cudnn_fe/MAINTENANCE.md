@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 33 modification rows below are generated from
+The 34 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 33 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 34 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -164,6 +164,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | B16 | Copy 4-byte-aligned gate/beta to 16-byte bases | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta` |
 | R15 | Composed KDA stateful bwd gets a compact 128-byte-aligned beta; traceable under Dynamo | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_stateful_backward_accepts_forward_beta_layouts`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_training_fullgraph_and_six_gradients` |
 | R3 | Warmup forward state_in/state_out get independent fake extents | none (no dedicated test; covered indirectly by GDN warmup split tests) |
+| R4 | Restore kda_recompute int64 selector; stop forcing selectors on GDN modules that no longer launch | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32` |
 | F1/F2/F4/F6/F9 | GDN/KDA drivers (uncut, d_v split, prep, chain, warmup split, staged stateful bwd, AG plan floors) | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference` |
 | F7/F8 | Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds | `test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds` |
 | F5 | Grouped q/k GDN backward through deterministic AG group_sum | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward` |
