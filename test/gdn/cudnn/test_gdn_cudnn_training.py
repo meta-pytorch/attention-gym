@@ -809,3 +809,38 @@ def test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default(split: bo
             results.append((output, *torch.autograd.grad(output, inputs, d_output)))
         for actual, expected in zip(results[1], results[0], strict=True):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_gdn_cudnn_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
+    """A long stream on few tiles runs as an exact piece chain in both directions; it must agree
+    with the uncut plan on output, final state, and every gradient, including the state ones."""
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+
+    q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
+        24576, key_heads=16, value_heads=48, seed=449
+    )
+    tokens, heads = q.shape[1], value.shape[2]
+    if not fe_gdn.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
+        pytest.skip("this device has too many (sequence, head) tiles per SM to chain")
+    assert fe_gdn.BackwardPlan.build(tokens, 1, heads, q.device).chain
+    inputs = (q, k, value, gate, beta, state)
+    cotangents = (torch.randn_like(value), torch.randn_like(state))
+
+    def run() -> tuple[torch.Tensor, ...]:
+        leaves = tuple(t.detach().clone().requires_grad_() for t in inputs)
+        output = public_chunk_gdn(
+            *leaves,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options=_CUDNN_KERNEL_OPTIONS,
+        )
+        return (*output, *torch.autograd.grad(output, leaves, cotangents))
+
+    chain = run()
+    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 1 << 40)
+    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
+    uncut = run()
+    for actual, expected in zip(chain, uncut, strict=True):
+        assert actual.isfinite().all()
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2
