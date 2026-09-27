@@ -375,6 +375,15 @@ guarding_tests = []
 gate = "vendor.py applies the GDP fork cut automatically; import test"
 upstream_status = "nv-surface-removed"
 
+[[fix]]
+id = "R13"
+title = "Delete unreached/test-only upstream code (gate_bwd, head_reduce, l2norm, standalone hosts, ...)"
+kind = "pruning"
+ag_subject = "Delete unreached and test-only upstream code from the vendored cuDNN v1.30 kernels"
+guarding_tests = []
+gate = "reachability (package import + full suite)"
+upstream_status = "nv-surface-removed"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"

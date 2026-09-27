@@ -6,13 +6,7 @@ import torch
 pytest.importorskip("cutlass.cute")
 
 from attn_gym.linear._delta_rule.cudnn_fe import gdn, kda, plan
-from attn_gym.linear._delta_rule.cudnn_fe.common import (
-    gate_bwd,
-    head_reduce,
-    l2norm,
-    piece_chain,
-    split_k,
-)
+from attn_gym.linear._delta_rule.cudnn_fe.common import split_k
 from attn_gym.linear._delta_rule.cudnn_fe.common.launch import (
     validate_named_barriers,
     validate_warp_roles,
@@ -36,51 +30,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 def reached_compiler(*args, **kwargs):
     raise RuntimeError("reached the compiler")
-
-
-def test_head_reduction_rejects_nondividing_heads(monkeypatch):
-    monkeypatch.setattr(head_reduce, "_compile_head_reduce", reached_compiler)
-    source = torch.empty(8, 4, 64, dtype=torch.bfloat16, device="cuda")
-    output = torch.empty(8, 3, 64, dtype=source.dtype, device="cuda")
-    with pytest.raises(ValueError, match="head count must divide"):
-        head_reduce.head_group_reduce(source, output, stream=0)
-
-
-def test_l2norm_rejects_partial_vector_rows(monkeypatch):
-    monkeypatch.setattr(l2norm, "_compile_l2norm_qk", reached_compiler)
-    source = torch.empty(8, 2, 63, dtype=torch.bfloat16, device="cuda")
-    norm = torch.empty(8, 2, device="cuda")
-    with pytest.raises(ValueError, match="head dimension must be 64 or 128"):
-        l2norm.build_l2norm_qk(source, source, source, source, norm, norm, stream=0)
-
-
-def test_channel_gate_rejects_short_partial_workspace(monkeypatch):
-    monkeypatch.setattr(gate_bwd, "_compile_gate_bwd", reached_compiler)
-    source = torch.empty(8, 2, 64, device="cuda")
-    parameter = torch.empty(2, device="cuda")
-    partial = torch.empty(1, device="cuda")
-    with pytest.raises(ValueError, match="part_a requires at least"):
-        gate_bwd.channel_gate_bwd(
-            source, source, parameter, None, parameter, None, partial, None, -1.0, stream=0
-        )
-
-
-def test_state_chain_rejects_empty_row_tiles(monkeypatch):
-    monkeypatch.setattr(piece_chain, "_compile_state_chain", reached_compiler)
-    with pytest.raises(ValueError, match="rows_per_cta"):
-        piece_chain.build_state_chain(
-            heads_out=2,
-            dim_v=64,
-            dim_k=64,
-            pieces=2,
-            rows_per_cta=0,
-            transpose=False,
-            has_seed=False,
-            has_tail=True,
-            emit_summary=False,
-            device=0,
-            opt_level=2,
-        )
 
 
 @pytest.mark.parametrize("invalid", ["tiles", "chunks"])
@@ -207,68 +156,6 @@ def test_gdn_bprop_host_rejects_invalid_launch_metadata(monkeypatch, invalid):
     error = RuntimeError if invalid is None else ValueError
     with pytest.raises(error):
         gdn_bprop_f16.chunk_gdn_bwd(*positional.values(), DIM**-0.5, **keywords)
-
-
-@pytest.mark.parametrize("invalid", [None, "interval", "checkpoint_rows", "tinv_rows"])
-def test_gdn_recompute_host_rejects_invalid_launch_metadata(monkeypatch, invalid):
-    monkeypatch.setattr(gdn_recompute_f16, "_compile_gdn_recompute", reached_compiler)
-    k, v = packed(TOKENS, HEADS, DIM), packed(TOKENS, HEADS, DIM)
-    gate = packed(TOKENS, HEADS, dtype=torch.float32)
-    cu = torch.tensor([0, TOKENS], dtype=torch.int32, device="cuda")
-    output_state = packed(1, HEADS, DIM, DIM, dtype=torch.float32)
-    checkpoints = packed(TOKENS // B_T + 1, HEADS, DIM, DIM)
-    tinv = packed(TOKENS // B_T + 1, HEADS, B_T, B_T)
-    every_n = B_T // 2 if invalid == "interval" else B_T
-    if invalid == "checkpoint_rows":
-        checkpoints = checkpoints[:1]
-    if invalid == "tinv_rows":
-        tinv = tinv[:1]
-    error = RuntimeError if invalid is None else ValueError
-    with pytest.raises(error):
-        gdn_recompute_f16.chunk_gdn_recompute(
-            k,
-            v,
-            gate,
-            cu,
-            None,
-            output_state,
-            every_n,
-            checkpoints,
-            **work_table(),
-            tinv=tinv,
-            workspace=workspace(gdn_recompute_f16),
-            device=0,
-            num_sm=148,
-            stream=0,
-        )
-
-
-@pytest.mark.parametrize("invalid", [None, "state_shape"])
-def test_gdn_bprop_summary_host_rejects_invalid_launch_metadata(monkeypatch, invalid):
-    monkeypatch.setattr(gdn_bprop_summary_f16, "_compile_gdn_bprop_summary", reached_compiler)
-    q, k, do = (packed(TOKENS, HEADS, DIM) for _ in range(3))
-    gate = packed(TOKENS, HEADS, dtype=torch.float32)
-    width = DIM // 2 if invalid == "state_shape" else DIM
-    d_initial_state = packed(1, HEADS, DIM, width, dtype=torch.float32)
-    cu = torch.tensor([0, TOKENS], dtype=torch.int32, device="cuda")
-    tinv = packed(TOKENS // B_T + 1, HEADS, B_T, B_T)
-    error = RuntimeError if invalid is None else ValueError
-    with pytest.raises(error):
-        gdn_bprop_summary_f16.chunk_gdn_bwd_summary(
-            q,
-            k,
-            gate,
-            do,
-            d_initial_state,
-            cu,
-            DIM**-0.5,
-            **work_table(),
-            tinv=tinv,
-            workspace=workspace(gdn_bprop_summary_f16),
-            device=0,
-            num_sm=148,
-            stream=0,
-        )
 
 
 def run_gdn_backward(tokens):

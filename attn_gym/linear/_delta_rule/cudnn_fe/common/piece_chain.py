@@ -32,11 +32,7 @@ from typing import NamedTuple
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.experimental.primitives as nvvm
-import torch
 from cutlass import cute
-
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
@@ -54,8 +50,6 @@ from ..tile_dsl.tma import (
     st_shared_v2,
     st_shared_v4,
 )
-from .host import get_dtype, validate_cuda_tensors
-from .tvm_ffi import make_counter_signature, make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -153,22 +147,6 @@ def choose_pieces(
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
     return 0, unit_chunks
-
-
-def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
-    """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
-    ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
-    is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
-    budget = piece_budget(
-        num_seqs=num_seqs,
-        heads_out=heads_out,
-        num_sm=num_sm,
-        total_tokens=total_tokens,
-        b_t=b_t,
-        expand_num=expand_num,
-        unit_chunks=unit_chunks,
-    )
-    return budget == DV_SPLIT_TILES and int(dim_v) == 128
 
 
 # ---- piece table ----------------------------------------------------------------------------------
@@ -1147,95 +1125,6 @@ def launch_state_chain(
     )
 
 
-@jit_cache
-def _compile_state_chain(
-    dim_v,
-    dim_k,
-    rows,
-    transpose,
-    has_seed,
-    has_tail,
-    emit_summary,
-    filled_only,
-    seed_dtype,
-    tail_dtype,
-    summary_dtype,
-    opt_level,
-    has_seed_indices,
-    use_int64_offsets,
-):
-    sym_int = cute.sym_int
-
-    def state(dtype, align):
-        return make_strided_signature_tensor(
-            get_dtype(dtype),
-            tuple(sym_int() for _ in range(4)),
-            assumed_align=align,
-            use_int64_offsets=use_int64_offsets,
-            stride_divisibility=1,
-        )
-
-    walk_state = has_seed or has_tail or not emit_summary
-    flags = (
-        dim_v,
-        dim_k,
-        rows,
-        transpose,
-        has_seed,
-        has_tail,
-        emit_summary,
-        filled_only,
-        opt_level,
-        has_seed_indices,
-        use_int64_offsets,
-    )
-    suffix = "_".join(str(int(flag)) for flag in flags)
-    return compile_tvm_ffi(
-        launch_state_chain,
-        cutlass.Int32(0),
-        dim_v,
-        dim_k,
-        rows,
-        cutlass.Int32(0),
-        transpose,
-        has_seed,
-        has_tail,
-        emit_summary,
-        cutlass.Int32(0),
-        state("float32", 16) if walk_state else None,
-        state("float32", 16),
-        state("float32", 16) if walk_state else None,
-        state(seed_dtype, 4) if has_seed else None,
-        state(tail_dtype, 4) if has_tail else None,
-        state(summary_dtype, 16) if emit_summary else None,
-        make_counter_signature(sym_int()) if filled_only else None,
-        make_counter_signature(sym_int()) if has_seed_indices else None,
-        name=f"state_chain_{suffix}_{seed_dtype}_{tail_dtype}_{summary_dtype}",
-        opt_level=opt_level,
-    )
-
-
-class CompiledStateChain(NamedTuple):
-    """Build-time facts of one state-chain launch, produced by :func:`build_state_chain`."""
-
-    compiled: object
-    heads_out: int
-    dim_v: int
-    dim_k: int
-    pieces: int
-    rows_per_cta: int
-    transpose: bool
-    has_seed: bool
-    has_tail: bool
-    emit_summary: bool
-    filled_only: bool
-    seed_dtype: str
-    tail_dtype: str
-    summary_dtype: str
-    device: int
-    has_seed_indices: bool
-
-
 def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
     """Rows of the state per chain CTA: ``dim_v // 16`` (16 CTAs per (sequence, head)) when that grid still fits
     the SMs and every warp keeps a whole row of the state and of the M product, else ``dim_v // 8``."""
@@ -1247,159 +1136,6 @@ def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
     ):
         return rows
     return dim_v // 8
-
-
-def build_state_chain(
-    *,
-    heads_out,
-    dim_v,
-    dim_k,
-    pieces,
-    rows_per_cta=None,
-    transpose,
-    has_seed,
-    has_tail,
-    emit_summary,
-    filled_only=False,
-    seed_dtype="float32",
-    tail_dtype="float32",
-    summary_dtype="float32",
-    device,
-    opt_level,
-    has_seed_indices=False,
-) -> CompiledStateChain:
-    """Compile (cached per state geometry, flags, dtypes, device and ``opt_level``, the family's main-kernel level so the
-    standalone chain is the one its hosts nest; ``heads_out`` and ``pieces`` are launch arguments and
-    every tensor's layout is dynamic) the chain over ``pieces`` slots per sequence, ``rows_per_cta``
-    state rows per CTA (default ``dim_v // 8``).  ``filled_only`` binds the piece table's ``main_rows``; without ``has_tail``
-    and ``emit_summary`` one-slot sequences receive the seed copy and only multi-piece sequences are summarized, with
-    either every filled slot carries a summary and the tail / product come out of the one-slot walk too.
-    ``summary_dtype`` is the dtype of ``summary_m`` (fp32 or bf16, round to nearest even); ``has_seed_indices`` binds an int32
-    ``[num_seqs]`` table naming the row of ``seed`` each sequence reads."""
-    HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
-    rows = V // 8 if rows_per_cta is None else int(rows_per_cta)
-    if HO <= 0 or P <= 0 or K not in (64, 128) or V <= 0:
-        raise ValueError("state chain requires positive heads/pieces/rows and K in {64, 128}")
-    if rows < CHAIN_WARPS or V % rows or rows % CHAIN_WARPS:
-        raise ValueError("rows_per_cta must divide V and contain whole chain warp groups")
-    if emit_summary and (K * rows % V or (K * rows // V) % CHAIN_WARPS):
-        raise ValueError("rows_per_cta must also tile the transition product warp groups")
-    if torch.cuda.current_device() != int(device):
-        raise ValueError("the active CUDA device must match the state-chain compile device")
-    seed_name = dtype_name(seed_dtype) if has_seed else "float32"
-    tail_name = dtype_name(tail_dtype) if has_tail else "float32"
-    summary_name = dtype_name(summary_dtype) if emit_summary else "float32"
-    compiled = _compile_state_chain(
-        V,
-        K,
-        rows,
-        bool(transpose),
-        bool(has_seed),
-        bool(has_tail),
-        bool(emit_summary),
-        bool(filled_only),
-        seed_name,
-        tail_name,
-        summary_name,
-        int(opt_level),
-        bool(has_seed_indices),
-        True,
-    )
-    return CompiledStateChain(
-        compiled,
-        HO,
-        V,
-        K,
-        P,
-        rows,
-        bool(transpose),
-        bool(has_seed),
-        bool(has_tail),
-        bool(emit_summary),
-        bool(filled_only),
-        seed_name,
-        tail_name,
-        summary_name,
-        int(device),
-        bool(has_seed_indices),
-    )
-
-
-def run_state_chain(
-    compiled: CompiledStateChain,
-    num_seqs,
-    H,
-    M,
-    X,
-    seed,
-    tail,
-    summary_m,
-    stream,
-    main_rows=None,
-    seed_indices=None,
-) -> None:
-    """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
-    (None for a product-only chain), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``, ``seed`` / ``tail`` ``[num_seqs, HO, V, K]``
-    and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when not built), the piece table's ``main_rows``
-    int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in sequence order), ``seed_indices`` int32 ``[num_seqs]`` when
-    built with ``has_seed_indices``."""
-    walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
-    validate_cuda_tensors(
-        M,
-        H=H,
-        X=X,
-        seed=seed,
-        tail=tail,
-        summary_m=summary_m,
-        main_rows=main_rows,
-        seed_indices=seed_indices,
-    )
-    heads, v, k = compiled.heads_out, compiled.dim_v, compiled.dim_k
-    for name, tensor, enabled, shape, dtype, alignment in (
-        ("M", M, True, (heads, k, k), "float32", 16),
-        ("H", H, walk_state, (heads, v, k), "float32", 16),
-        ("X", X, walk_state, (heads, v, k), "float32", 16),
-        ("seed", seed, compiled.has_seed, (heads, v, k), compiled.seed_dtype, 4),
-        ("tail", tail, compiled.has_tail, (heads, v, k), compiled.tail_dtype, 4),
-        ("summary_m", summary_m, compiled.emit_summary, (heads, k, k), compiled.summary_dtype, 16),
-    ):
-        if not enabled:
-            continue
-        if tensor is None or tensor.ndim != 4 or tuple(tensor.shape[1:]) != shape:
-            raise ValueError(f"{name} must have trailing state shape {shape}")
-        if get_dtype(tensor.dtype) != get_dtype(dtype):
-            raise ValueError(f"{name} must have dtype {dtype}")
-        if not tensor_supports_contiguous_dim(tensor, alignment_bytes=alignment):
-            raise ValueError(f"{name} requires aligned contiguous state rows")
-        needed = num_seqs * compiled.pieces if name in ("M", "H", "X") else num_seqs
-        if name == "seed" and compiled.has_seed_indices:
-            needed = 0  # Device routes index the caller's state pool, not sequence rows.
-        if tensor.shape[0] < needed:
-            raise ValueError(f"{name} requires at least {needed} rows")
-    for name, tensor, enabled, entries in (
-        ("main_rows", main_rows, compiled.filled_only, num_seqs + 1),
-        ("seed_indices", seed_indices, compiled.has_seed_indices, num_seqs),
-    ):
-        if enabled and (
-            tensor is None
-            or tuple(tensor.shape) != (entries,)
-            or str(tensor.dtype) != "torch.int32"
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"{name} must be a compact int32 vector with {entries} entries")
-    compiled.compiled(
-        int(compiled.heads_out),
-        int(compiled.pieces),
-        int(num_seqs),
-        H if walk_state else None,
-        M,
-        X if walk_state else None,
-        seed if compiled.has_seed else None,
-        tail if compiled.has_tail else None,
-        summary_m if compiled.emit_summary else None,
-        main_rows if compiled.filled_only else None,
-        seed_indices if compiled.has_seed_indices else None,
-    )
 
 
 frost_state_chain.set_name_prefix("cudnn", remove_cutlass_symbol=False)

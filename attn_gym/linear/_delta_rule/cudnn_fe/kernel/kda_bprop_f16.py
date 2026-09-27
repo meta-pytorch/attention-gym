@@ -101,7 +101,6 @@ Warp assignments (16 warps = 512 threads):
 """
 
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
@@ -110,7 +109,6 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 from cutlass.experimental import cuda
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.utils import (
     requires_int64_abi,  # noqa: F401  (module-level ABI selector)
@@ -126,11 +124,6 @@ from ..common.split_k import (
     order_body,
 )
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
-from ..common.tvm_ffi import (
-    WORK_ITEM_FIELDS,
-    make_compact_signature_tensor,
-    make_dynamic_signature_tensor,
-)
 from ..tile_dsl.barrier import (
     MBarrier,
     PipelineState,
@@ -5577,205 +5570,3 @@ TENSORMAP_DESC_ARRAYS = 10
 
 frost_kda_bprop_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 frost_kda_bprop.set_name_prefix("cudnn", remove_cutlass_symbol=False)
-
-
-# ---- Attention Gym: persisted fake-tensor TVM-FFI compiles ---------------------------------
-
-
-class KdaBpropOp:
-    """Standalone bprop launch over ``host`` for one static config."""
-
-    def __init__(self, cfg: KdaBpropCfg, use_int64_offsets: bool = False, dtypes: str = ""):
-        self.cfg = cfg
-        self.use_int64_offsets = use_int64_offsets
-        self.dtypes = dtypes
-
-    def get_name(self) -> str:
-        cfg = self.cfg
-        flags = "".join(
-            str(int(flag))
-            for flag in (
-                cfg.use_dstate_in,
-                cfg.use_dstate0,
-                cfg.use_initial_state,
-                cfg.l2norm,
-                cfg.safe_gate,
-                cfg.log_gate,
-                cfg.beta_sigmoid,
-                cfg.allow_neg_eigval,
-            )
-        )
-        gate_scale = str(cfg.gate_scale_log2).replace(".", "p").replace("-", "m")
-        return (
-            f"kda_cudnn_bprop_{cfg.io_dtype.__name__.lower()}_{cfg.gate_dtype.__name__.lower()}"
-            f"_k{cfg.d_k}_v{cfg.d_v}_f{flags}_g{gate_scale}_{self.dtypes}"
-            f"_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}"
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        q_ratio: cutlass.Int32,
-        k_ratio: cutlass.Int32,
-        v_ratio: cutlass.Int32,
-        a_log: cute.Tensor | None,
-        dt_bias: cute.Tensor | None,
-        beta: cute.Tensor,
-        gate_main: cute.Tensor | None,
-        state_checkpoints: cute.Tensor,
-        dgate: cute.Tensor,
-        dbeta: cute.Tensor,
-        cu_seqlens: cute.Tensor,
-        d_initial_state: cute.Tensor | None,
-        d_final_state: cute.Tensor | None,
-        work_items: cute.Tensor | None,
-        work_count: cute.Tensor | None,
-        scheduler_counter: cute.Tensor,
-        tensormap_workspace: cute.Tensor,
-        scale: cutlass.Float32,
-        stream,
-    ) -> None:
-        host(
-            self.cfg,
-            q_ratio,
-            k_ratio,
-            v_ratio,
-            a_log,
-            dt_bias,
-            beta,
-            gate_main,
-            state_checkpoints,
-            dgate,
-            dbeta,
-            cu_seqlens,
-            d_initial_state,
-            d_final_state,
-            work_items,
-            work_count,
-            scheduler_counter,
-            tensormap_workspace,
-            scale,
-            stream,
-        )
-
-
-@jit_cache
-def _compile_kda_bprop(
-    io_dtype,
-    gate_dtype,
-    a_log_dtype,
-    dt_bias_spec,
-    beta_dtype,
-    cu_seqlens_dtype,
-    use_dstate_in: bool,
-    use_dstate0: bool,
-    use_initial_state: bool,
-    l2norm: bool,
-    safe_gate: bool,
-    gate_scale_log2: float,
-    log_gate: bool,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
-    d_k: int,
-    d_v: int,
-    num_sm: int,
-    use_int64_offsets: bool,
-):
-    """Compile the standalone bprop launch over the upstream dynamic-layout tensor ABI."""
-    cfg = build_cfg(
-        io_dtype,
-        gate_dtype,
-        use_dstate_in=use_dstate_in,
-        use_dstate0=use_dstate0,
-        l2norm=l2norm,
-        safe_gate=safe_gate,
-        gate_scale_log2=gate_scale_log2,
-        log_gate=log_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        use_initial_state=use_initial_state,
-        max_active_clusters=num_sm,
-        d_k=d_k,
-        d_v=d_v,
-    )
-    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
-    dtypes = "_".join(
-        "none" if dtype is None else dtype.__name__.lower()
-        for dtype in (
-            a_log_dtype,
-            None if dt_bias_spec is None else dt_bias_spec[0],
-            beta_dtype,
-            cu_seqlens_dtype,
-        )
-    )
-    gate_main = not log_gate and not safe_gate
-    return compile_tvm_ffi(
-        KdaBpropOp(cfg, use_int64_offsets, dtypes),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        dyn(a_log_dtype, 1, assumed_align=4) if a_log_dtype is not None else None,
-        dyn(dt_bias_spec[0], dt_bias_spec[1], assumed_align=16)
-        if dt_bias_spec is not None
-        else None,
-        dyn(beta_dtype, 2, assumed_align=4),
-        dyn(gate_dtype, 3, assumed_align=4) if gate_main else None,
-        dyn(io_dtype, 4, assumed_align=16),
-        dyn(gate_dtype, 3, assumed_align=16),
-        dyn(beta_dtype, 2, assumed_align=4),
-        dyn(cu_seqlens_dtype, 1, assumed_align=8 if cu_seqlens_dtype is cutlass.Int64 else 4),
-        dyn(cutlass.Float32, 4, assumed_align=16) if use_dstate0 else None,
-        dyn(cutlass.Float32, 4, assumed_align=16) if use_dstate_in else None,
-        make_compact_signature_tensor(
-            cutlass.Int32, (cute.sym_int(), WORK_ITEM_FIELDS), assumed_align=16
-        ),
-        dyn(cutlass.Int32, 1, assumed_align=4),
-        dyn(cutlass.Int32, 1, assumed_align=4),
-        dyn(cutlass.Int64, 1, assumed_align=128),
-        cutlass.Float32(1.0),
-        opt_level=2,
-    )
-
-
-@jit_cache
-def _compile_kda_bprop_prologue(
-    io_dtype,
-    gate_dtype,
-    cu_seqlens_dtype,
-    run_order: bool,
-    order_gen: bool,
-    has_sched: bool,
-    use_int64_offsets: bool,
-):
-    """Compile the standalone bprop descriptor (and optional ordering) prologue."""
-    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
-    items = partial(make_compact_signature_tensor, cutlass.Int32, assumed_align=16)
-    flags = "".join(str(int(flag)) for flag in (run_order, order_gen, has_sched))
-    return compile_tvm_ffi(
-        prologue,
-        io_dtype,
-        CFG.B_T,
-        run_order,
-        order_gen,
-        dyn(io_dtype, 3, assumed_align=16),  # q
-        dyn(io_dtype, 3, assumed_align=16),  # k
-        dyn(io_dtype, 3, assumed_align=16),  # v
-        dyn(gate_dtype, 3, assumed_align=16),  # gate
-        dyn(io_dtype, 3, assumed_align=16),  # do
-        dyn(io_dtype, 3, assumed_align=16),  # dq
-        dyn(io_dtype, 3, assumed_align=16),  # dk
-        dyn(io_dtype, 3, assumed_align=16),  # dv
-        dyn(gate_dtype, 3, assumed_align=16),  # dgate
-        dyn(io_dtype, 4, assumed_align=16),  # state_checkpoints
-        dyn(cu_seqlens_dtype, 1, assumed_align=8 if cu_seqlens_dtype is cutlass.Int64 else 4),
-        items((cute.sym_int(), WORK_ITEM_FIELDS)) if run_order and not order_gen else None,
-        dyn(cutlass.Int32, 1, assumed_align=4),
-        items((cute.sym_int(), WORK_ITEM_FIELDS)),
-        dyn(cutlass.Int32, 1, assumed_align=4) if has_sched else None,
-        dyn(cutlass.Int64, 1, assumed_align=128),
-        name=(
-            f"kda_cudnn_bprop_prologue_{io_dtype.__name__.lower()}_{gate_dtype.__name__.lower()}"
-            f"_{cu_seqlens_dtype.__name__.lower()}_f{flags}_i64{int(use_int64_offsets)}"
-        ),
-        opt_level=2,
-    )
