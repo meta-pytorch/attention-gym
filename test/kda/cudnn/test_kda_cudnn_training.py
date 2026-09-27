@@ -929,9 +929,16 @@ def test_cudnn_stateful_backward_accepts_forward_beta_layouts(layout: str, state
     os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
     reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
 )
-def test_cudnn_repeated_backward_with_empty_sequences() -> None:
-    """Empty work items must not advance the dstate handshake phase."""
+@pytest.mark.parametrize("path", ["composed", "native"])
+def test_cudnn_repeated_stateful_backward_with_empty_sequences_stress(path: str) -> None:
+    """500 stateful backward launches over alternating empty sequences must all complete.
+
+    ``composed`` is what public ``chunk_kda`` with an entry state runs (the fused stateful
+    backward); ``native`` drives the cuDNN BT16 stateful backward op directly, where empty work
+    items must not advance the dstate handshake phase.
+    """
     from attn_gym.linear import chunk_kda
+    from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_bwd_with_state_op
 
     lengths = tuple(0 if index % 2 == 0 else 128 for index in range(29))
     q, k, value, gate, beta = make_kda_test_inputs(
@@ -939,31 +946,37 @@ def test_cudnn_repeated_backward_with_empty_sequences() -> None:
         heads=16,
         seed=421,
         normalize_qk=True,
-        requires_grad=True,
+        requires_grad=path == "composed",
     )
-    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_()
+    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_(path == "composed")
     cu_seqlens = cumulative_sequence_offsets(lengths)
     d_output = torch.randn_like(value)
     d_state = torch.randn_like(state)
     for _ in range(500):
-        output, final_state = chunk_kda(
-            q,
-            k,
-            value,
-            gate,
-            beta,
-            state,
-            cu_seqlens=cu_seqlens,
-            output_final_state=True,
-            kernel_options={"backend": "cudnn"},
-        )
-        assert final_state is not None
-        torch.autograd.grad(
-            (output, final_state),
-            (q, k, value, gate, beta, state),
-            (d_output, d_state),
-        )
+        if path == "native":
+            grads = chunk_cudnn_packed_bwd_with_state_op(
+                q, k, value, gate, beta, d_output, cu_seqlens, state, d_state, D**-0.5
+            )
+        else:
+            output, final_state = chunk_kda(
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                state,
+                cu_seqlens=cu_seqlens,
+                output_final_state=True,
+                kernel_options={"backend": "cudnn"},
+            )
+            assert final_state is not None
+            grads = torch.autograd.grad(
+                (output, final_state),
+                (q, k, value, gate, beta, state),
+                (d_output, d_state),
+            )
         torch.cuda.synchronize()
+    assert all(torch.isfinite(grad).all() for grad in grads)
 
 
 def test_cudnn_backward_past_sort_capacity_runs_empty_work_items() -> None:

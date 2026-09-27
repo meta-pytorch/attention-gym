@@ -81,11 +81,22 @@ def test_v130_plans_match_reference(monkeypatch, scheme):
 
 
 def test_v130_changing_shapes_reuses_only_static_configuration():
-    """A prior launch must not freeze the next call's sequence/head geometry or scratch size."""
+    """A prior launch must not freeze the next call's sequence/head geometry or scratch size,
+    and repeating a shape must relaunch the compiled hosts instead of compiling again."""
     from attn_gym.linear import chunk_kda
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
+        kda_warmup_backward_f16,
+        kda_warmup_forward_f16,
+    )
 
+    compile_fns = (
+        kda_warmup_forward_f16._compile_warmup_forward,
+        kda_warmup_backward_f16._compile_warmup_backward,
+    )
+    sizes = []
     # A head count/sequence-count change shares some kernel configs but changes work-table sizes.
     for lengths, heads in (([65, 0, 63], 2), ([17, 31, 48, 0], 3), ([65, 0, 63], 2)):
+        before = [fn.cache_info() for fn in compile_fns]
         inputs = make_kda_test_inputs(
             sum(lengths),
             heads=heads,
@@ -108,6 +119,11 @@ def test_v130_changing_shapes_reuses_only_static_configuration():
         )
         grads = torch.autograd.grad(actual, inputs, torch.randn_like(actual))
         assert all(torch.isfinite(g).all() for g in grads)
+        after = [fn.cache_info() for fn in compile_fns]
+        assert [b.hits + b.misses + 1 for b in before] == [a.hits + a.misses for a in after]
+        sizes.append([info.currsize for info in after])
+    # The third shape repeats the first, so it adds no forward or backward specialization.
+    assert sizes[2] == sizes[1]
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))

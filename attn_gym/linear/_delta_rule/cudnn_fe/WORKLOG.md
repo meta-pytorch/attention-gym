@@ -241,6 +241,8 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   dispatch (the old dV last-write-wins store is gone in v1.30; the domain guard stays).
 - **R8** — test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op:
   sharded KDA dbeta bounded by an operand-pack budget (see Decisions).
+- **R9** — tighter assertions (`cache_info` reuse, `match=` on raises, stress renamed to
+  KT::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress).
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
   wait, B5 KDA FP32 factors, B11 terminal TMA overfetch (upstream bit-21 descriptor fix, NVIDIA
   #1013/#1015), B12 checkpoint `[V,K]` descriptors, S11 V-major state. Inherited from main: B4 dO

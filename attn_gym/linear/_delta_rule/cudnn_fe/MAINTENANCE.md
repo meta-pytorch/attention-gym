@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 34 modification rows below are generated from
+The 35 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 34 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 35 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -187,6 +187,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | B9 | Test: contracting-gate split test pins the uncut plan so an ignored split fails | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate` |
 | B17 | Test: GDN backward rejects HQ > HV before dispatch | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads` |
 | R8 | Sharded KDA dbeta bounded by the operand-pack budget | `test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op` |
+| R9 | Tighten tests: cache_info reuse, match= on raises, stress rename | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress` |
 <!-- END GENERATED FIX LEDGER -->
 
 Superseded by v1.30 (no AG commit; tests kept): B1 seeded-state wait, B5 KDA FP32 factors,

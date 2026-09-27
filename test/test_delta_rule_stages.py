@@ -260,7 +260,7 @@ def test_summary_algebra_ignores_the_float32_matmul_mode():
         composed = compose_summaries(first, then)
         assert torch.backends.cuda.matmul.fp32_precision == matmul_precision
         for operation, operand in ((merge_state, state), (compose_summaries, first)):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError, match="Expected size"):
                 operation(operand, then[..., :-1, :])
             assert torch.backends.cuda.matmul.fp32_precision == matmul_precision
     finally:

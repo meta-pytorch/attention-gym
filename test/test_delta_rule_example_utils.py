@@ -41,7 +41,7 @@ def test_reference_checks_reject_mismatches(monkeypatch, mismatch):
     expected = actual + 1.0
     pairs = [(actual, expected)] if mismatch == "output" else [(actual, actual)]
     gradients = [(actual, expected)] if mismatch == "parameter" else [(actual, actual)]
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
         delta_rule.assert_context_parallel_matches_reference(pairs, gradients, torch.bfloat16)
 
 

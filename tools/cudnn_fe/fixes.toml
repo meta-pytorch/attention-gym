@@ -453,6 +453,15 @@ ag_subject = "Bound the sharded KDA dbeta error by the kernels' operand-pack bud
 guarding_tests = ["test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op"]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R9"
+title = "Tighten tests: cache_info reuse, match= on raises, stress rename"
+kind = "test"
+ag_subject = "Tighten the KDA cuDNN and delta-rule test assertions"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress"]
+env = { ATTN_GYM_RUN_STRESS_TESTS = "1" }
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.
 [[superseded]]
