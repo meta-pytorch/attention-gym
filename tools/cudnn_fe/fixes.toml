@@ -232,6 +232,7 @@ ag_subjects_extra = [
   "Compile the v1.30 GDN forward hosts from persisted fake tensor signatures",
   "Compile the v1.30 GDN backward kernels and hosts through jit_cache fake signatures",
   "Compile the KDA forward kernels and hosts from persisted fake tensor signatures",
+  "Compile the v1.30 KDA backward kernels and hosts from persisted fake tensor signatures",
   "Use native cached summary compilers and retire temporary shims",
 ]
 guarding_tests = [
