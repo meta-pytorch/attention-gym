@@ -16,7 +16,8 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe. Register arrays use cute.make_rmem_tensor, operand SMEM
+# buffers share one SharedStorage struct, and raw SMEM pointers go through smem_data_ptr.
 
 """
 Chunked Gated Delta Net (GDN) bprop state-summary kernel for SM100 / SM103 / SM107 (Cutlass primitives): the reverse
@@ -86,6 +87,8 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.runtime import from_dlpack
 
+from attn_gym._backends.cute.compat import SmemAllocator
+
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
@@ -99,7 +102,7 @@ from ..tile_dsl.barrier import (
     launch_dependent_grids,
     wait_on_dependent_grids,
 )
-from ..tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
+from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import mma_ss, mma_ts_step
 from ..tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, opaque_f32_zero, softplus2
 from ..tile_dsl.swizzle import swizzle_xor_128b
@@ -1446,7 +1449,7 @@ def compute2_warp_group(
                 bars.mb_dstate_input_done[dstate_input_idx].wait(dstate_input_index.phase)
                 dstate_input_index = advance(dstate_input_index, cfg.tmem_dstate_input_stages)
                 for i in cutlass.range_constexpr(cfg.d_k // 16):
-                    seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
+                    seed_block = cute.make_rmem_tensor((16,), cutlass.Float32)
                     for t in cutlass.range_constexpr(16):
                         seed_block[t] = cutlass.Float32(0.0)
                     if seed_from_dstate_in:
@@ -1454,21 +1457,21 @@ def compute2_warp_group(
                             seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
                             for t in cutlass.range_constexpr(seed_vw):
                                 seed_block[g * seed_vw + t] = seed_chunk[t].to(cutlass.Float32)
-                    seed_pack = cutlass.Array(cutlass.Int32, 8, alignment=16)
+                    seed_pack = cute.make_rmem_tensor((8,), cutlass.Int32)
                     for pc in cutlass.range_constexpr(8):
                         seed_pack[pc] = fp32_to_fp16(seed_block[2 * pc], seed_block[2 * pc + 1], dtype=cfg.io_dtype)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + tmem_dstate_input_col + i * 8, cutlass.Int32),
-                        seed_pack[0:8],
+                        seed_pack.load(),
                     )
-                    seed_scaled = cutlass.Array(cutlass.Float32, 16, alignment=16)
+                    seed_scaled = cute.make_rmem_tensor((16,), cutlass.Float32)
                     for pc in cutlass.range_constexpr(8):
                         seed_scaled[2 * pc], seed_scaled[2 * pc + 1] = fmul2(seed_block[2 * pc], seed_block[2 * pc + 1], cumprod_top, cumprod_top)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + tmem_dstate_acc_col + i * 16, cutlass.Float32),
-                        seed_scaled[0:16],
+                        seed_scaled.load(),
                     )
                 nvvm.tcgen05_wait("store")
                 bars.mb_dstate_input_ready[dstate_input_idx].arrive()
@@ -1814,8 +1817,17 @@ def host(
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
 
+    @cute.struct
+    class SharedStorage:
+        q: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.q_cosize], cfg.buffer_align_bytes]
+        k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_cosize], cfg.buffer_align_bytes]
+        do: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.do_cosize], cfg.buffer_align_bytes]
+        t_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.t_inv_cosize], cfg.buffer_align_bytes]
+        a: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.a_cosize], cfg.buffer_align_bytes]
+
     frost_gdn_bprop_summary(
         cfg,
+        SharedStorage,
         q_ratio,
         k_ratio,
         gate,
@@ -1848,6 +1860,7 @@ def host(
 @cute.kernel
 def frost_gdn_bprop_summary(
     cfg: cutlass.Constexpr,
+    shared_type: cutlass.Constexpr,
     q_ratio: cute.FastDivmodDivisorV2,
     k_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
@@ -1917,44 +1930,35 @@ def frost_gdn_bprop_summary(
         tok_cumsum_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
         tok_cumprod_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
         sTokSlot = cute.make_tensor(
-            cute.make_ptr(cutlass.Int32, tok_slot_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128), cumsumlog_smem_layout_staged
+            cute.make_ptr(cutlass.Int32, smem_data_ptr(tok_slot_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128), cumsumlog_smem_layout_staged
         )
         sTokCumsum = cute.make_tensor(
-            cute.make_ptr(cutlass.Float32, tok_cumsum_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+            cute.make_ptr(cutlass.Float32, smem_data_ptr(tok_cumsum_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
             cumsumlog_smem_layout_staged,
         )
         sTokCumprod = cute.make_tensor(
-            cute.make_ptr(cutlass.Float32, tok_cumprod_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+            cute.make_ptr(cutlass.Float32, smem_data_ptr(tok_cumprod_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
             cumsumlog_smem_layout_staged,
         )
+    storage = SmemAllocator().allocate(shared_type)
 
     SWZ = 2
     LEAD = 16
     STRIDE = 8 * 128
     KT_LEAD = cfg.b_t * 128
     V_LEAD = cfg.b_t * 128
-    sQ_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.q_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sQ_raw = storage.q.get_tensor(cute.make_layout((cfg.q_cosize,)))
     sQ = SmemTile(
-        base=sQ_raw.data_ptr(),
+        base=smem_data_ptr(sQ_raw),
         elems_per_stage=(cfg.q_cosize // cfg.smem_q_stages),
         stages=cfg.smem_q_stages,
         leading_byte_offset=LEAD,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sK_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.k_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
     sK = SmemTile(
-        base=sK_raw.data_ptr(),
+        base=smem_data_ptr(sK_raw),
         elems_per_stage=(cfg.k_cosize // cfg.smem_k_stages),
         stages=cfg.smem_k_stages,
         leading_byte_offset=LEAD,
@@ -1962,7 +1966,7 @@ def frost_gdn_bprop_summary(
         layout=SWZ,
     )
     sK_trans = SmemTile(
-        base=sK_raw.data_ptr(),
+        base=smem_data_ptr(sK_raw),
         elems_per_stage=(cfg.k_cosize // cfg.smem_k_stages),
         stages=cfg.smem_k_stages,
         leading_byte_offset=KT_LEAD,
@@ -1970,21 +1974,16 @@ def frost_gdn_bprop_summary(
         layout=SWZ,
     )
     sQ_trans = SmemTile(
-        base=sQ_raw.data_ptr(),
+        base=smem_data_ptr(sQ_raw),
         elems_per_stage=(cfg.q_cosize // cfg.smem_q_stages),
         stages=cfg.smem_q_stages,
         leading_byte_offset=KT_LEAD,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sdO_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.do_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sdO_raw = storage.do.get_tensor(cute.make_layout((cfg.do_cosize,)))
     sdO_trans = SmemTile(
-        base=sdO_raw.data_ptr(),
+        base=smem_data_ptr(sdO_raw),
         elems_per_stage=(cfg.do_cosize // cfg.smem_do_stages),
         stages=cfg.smem_do_stages,
         leading_byte_offset=V_LEAD,
@@ -1992,35 +1991,25 @@ def frost_gdn_bprop_summary(
         layout=SWZ,
     )
     sdO = SmemTile(
-        base=sdO_raw.data_ptr(),
+        base=smem_data_ptr(sdO_raw),
         elems_per_stage=(cfg.do_cosize // cfg.smem_do_stages),
         stages=cfg.smem_do_stages,
         leading_byte_offset=LEAD,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sTinv_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.t_inv_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sTinv_raw = storage.t_inv.get_tensor(cute.make_layout((cfg.t_inv_cosize,)))
     sTinv_trans = SmemTile(
-        base=sTinv_raw.data_ptr(),
+        base=smem_data_ptr(sTinv_raw),
         elems_per_stage=(cfg.t_inv_cosize // cfg.smem_t_inv_stages),
         stages=cfg.smem_t_inv_stages,
         leading_byte_offset=(cfg.b_t // 2) * 128,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sA_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.a_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sA_raw = storage.a.get_tensor(cute.make_layout((cfg.a_cosize,)))
     sA = SmemTile(
-        base=sA_raw.data_ptr(),
+        base=smem_data_ptr(sA_raw),
         elems_per_stage=(cfg.a_cosize // cfg.smem_a_stages),
         stages=cfg.smem_a_stages,
         leading_byte_offset=LEAD,
@@ -2028,7 +2017,7 @@ def frost_gdn_bprop_summary(
         layout=SWZ,
     )
     sA_trans = SmemTile(
-        base=sA_raw.data_ptr(),
+        base=smem_data_ptr(sA_raw),
         elems_per_stage=(cfg.a_cosize // cfg.smem_a_stages),
         stages=cfg.smem_a_stages,
         leading_byte_offset=(cfg.b_t // 2) * 128,
@@ -2036,11 +2025,11 @@ def frost_gdn_bprop_summary(
         layout=SWZ,
     )
     sCumsumlog = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, cumsumlog_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(cumsumlog_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
     sCumprod = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, cumprod_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(cumprod_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
 
