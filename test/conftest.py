@@ -104,36 +104,30 @@ def gather_attn_single_config(
         yield
         return
 
-    from triton.runtime.autotuner import Autotuner
+    import importlib
 
+    from attn_gym._backends.triton.tune import TritonTuner
     from attn_gym.sparse.gather_attn.impl.triton import backward, forward, shared_backward
 
-    tuners = tuple(
-        {
-            id(value): value
-            for module in (forward, backward, shared_backward)
-            for value in vars(module).values()
-            if isinstance(value, Autotuner)
-        }.values()
-    )
-    original_caches = {id(tuner): tuner.cache.copy() for tuner in tuners}
+    tuners = {
+        id(value): value
+        for module in (forward, backward, shared_backward)
+        for value in vars(module).values()
+        if isinstance(value, TritonTuner)
+    }.values()
     for tuner in tuners:
-        original_pruner = tuner.early_config_prune
+        original_pruner = tuner._prune
 
-        def first_valid_config(configs, named_args, _pruner=original_pruner, **kwargs):
-            valid_configs = _pruner(configs, named_args, **kwargs) if _pruner else configs
-            return valid_configs[:1]
+        def first_valid_config(configs, args, _pruner=original_pruner):
+            return (_pruner(configs, args) if _pruner else configs)[:1]
 
-        monkeypatch.setattr(tuner, "early_config_prune", first_valid_config)
-
-    try:
-        yield
-    finally:
-        # A single pruned config is inserted into Autotuner.cache without disk caching.
-        # Restore genuine entries so reduced test choices cannot affect later callers.
-        for tuner in tuners:
-            tuner.cache.clear()
-            tuner.cache.update(original_caches[id(tuner)])
+        monkeypatch.setattr(tuner, "_prune", first_valid_config)
+    # The single-candidate winner would otherwise stay in the in-process memo, which is not
+    # keyed by the candidate set, and skip tuning for later callers.
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    monkeypatch.setattr(tune_module, "_WINNERS", dict(tune_module._WINNERS))
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", dict(tune_module._WINNERS_FAST))
+    yield
 
 
 @pytest.fixture

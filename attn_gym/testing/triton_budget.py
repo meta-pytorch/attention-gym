@@ -1,8 +1,8 @@
-"""Check which Triton launches another GPU would select, and their shared-memory needs.
+"""Check which Triton launches another GPU would select, and their on-chip memory needs.
 
 ``compile_only_for_target`` compiles launches for the emulated target without running them, so
 a GB300 host can check which configurations an A10G (SM86) would select and whether they fit
-its per-block limit.
+its per-block limit, or whether Blackwell launches fit its shared and tensor memory.
 """
 
 from collections import defaultdict
@@ -17,13 +17,28 @@ from triton.backends.compiler import GPUTarget
 from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
+from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.triton.tune import TritonTuner
+
 
 @dataclass
 class Launch:
-    """One host launch: a fixed config, or every config its autotuner may benchmark."""
+    """One host launch: a fixed config, or every config its autotuner may benchmark.
+
+    ``shared`` (bytes) and ``tmem`` (tensor-memory columns, 0 without tcgen05) list each
+    config's needs in the same order.
+    """
 
     kernel: str
     shared: list[int] = field(default_factory=list)
+    tmem: list[int] = field(default_factory=list)
+
+    def fits(self, max_shared: int, max_tmem: float = float("inf")) -> bool:
+        """Whether some config fits both limits, so tuning (or the fixed config) can run."""
+        return any(
+            shared <= max_shared and tmem <= max_tmem
+            for shared, tmem in zip(self.shared, self.tmem)
+        )
 
 
 class EmulatedDeviceProperties:
@@ -47,6 +62,9 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
     local GPU; kernels still run here.
     """
     local_target = triton.runtime.driver.active.get_current_target()
+    # TritonTuner keys winners by the process-wide compile target, discovered once from the
+    # device properties; resolve it from the real device before they are emulated.
+    get_compile_target()
     real_get_device_properties = torch.cuda.get_device_properties
 
     def device_properties(device=None):
@@ -72,8 +90,8 @@ def compile_only_for_target(
 
     Host dispatch is emulated as in ``emulate_device_dispatch``, but kernels compile for the
     emulated target and never run: outputs stay unwritten and only the recorded shared memory
-    is meaningful. Autotuned launches record every config left after pruning, since the
-    autotuner may pick any of them that fits.
+    is meaningful. Autotuned and ``TritonTuner`` launches record every config left after
+    pruning, since the tuner may pick any of them that fits.
     """
     target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
     launches: list[Launch] = []
@@ -87,10 +105,11 @@ def compile_only_for_target(
             replaced_caches[self] = self.device_caches
             self.device_caches = defaultdict(self.create_binder)
         kernel = original_jit_run(self, *args, grid=grid, warmup=True, **kwargs)
-        if active_autotune:
-            active_autotune[0].shared.append(kernel.metadata.shared)
-        else:
-            launches.append(Launch(self.__name__, [kernel.metadata.shared]))
+        launch = active_autotune[0] if active_autotune else Launch(self.__name__)
+        launch.shared.append(kernel.metadata.shared)
+        launch.tmem.append(getattr(kernel.metadata, "tmem_size", None) or 0)
+        if not active_autotune:
+            launches.append(launch)
         return kernel
 
     def autotune_run(self, *args, **kwargs):
@@ -105,11 +124,27 @@ def compile_only_for_target(
             self.nargs = None
         launches.append(launch)
 
+    def tuner_getitem(self, grid):
+        def launch_candidates(*args, **kwargs):
+            bound = self.bind(args, kwargs)
+            kernel = self.compile()
+            launch = Launch(kernel.__name__)
+            active_autotune.append(launch)
+            try:
+                for candidate in self.configs(grid, bound):
+                    self.launch(kernel, candidate, grid, bound)
+            finally:
+                active_autotune.clear()
+            launches.append(launch)
+
+        return launch_candidates
+
     try:
         with (
             emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
             mock.patch.object(Autotuner, "run", autotune_run),
+            mock.patch.object(TritonTuner, "__getitem__", tuner_getitem),
             mock.patch.object(
                 triton.runtime.driver.active, "get_current_target", return_value=target
             ),

@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from .primitives import (
@@ -17,6 +18,7 @@ from .primitives import (
     online_softmax_update,
     select_tiles,
     store_bhsd,
+    tuning_key,
 )
 
 
@@ -171,23 +173,6 @@ def _gather_attn_fwd(
     )
 
 
-def prune_shared_forward_configs(configs, _named_args, D, **_):
-    """Avoid local tiles that exceed shared memory for wide head dimensions."""
-    if D <= 128:
-        return configs
-    return [config for config in configs if config.kwargs["BLOCK_N"] == 64]
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-        for block_n in (64, 128, 256)
-        for num_warps in (4, 8)
-    ],
-    key=["B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
-    prune_configs_by={"early_config_prune": prune_shared_forward_configs},
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_fwd_shared(
     query_ptr,
@@ -332,15 +317,6 @@ def _gather_attn_fwd_shared(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in (4, 8)
-        for num_stages in (1, 3)
-    ],
-    key=["H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_fwd_tma(
     query_desc,
@@ -471,10 +447,41 @@ def _gather_attn_fwd_tma(
     )
 
 
-# Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256).
+def prune_shared_forward_configs(configs, args):
+    """Avoid local tiles that exceed shared memory for wide head dimensions."""
+    if args["D"] <= 128:
+        return configs
+    return [config for config in configs if config.kwargs["BLOCK_N"] == 64]
+
+
+_FWD_SHARED = TritonTuner(
+    _gather_attn_fwd_shared,
+    [
+        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
+        for block_n in (64, 128, 256)
+        for num_warps in (4, 8)
+    ],
+    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    prune=prune_shared_forward_configs,
+)
+_FWD_TMA = TritonTuner(
+    _gather_attn_fwd_tma,
+    [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in (4, 8)
+        for num_stages in (1, 3)
+    ],
+    # The fixed tile changes the winner, so it is part of the key.
+    key=tuning_key(
+        "query_desc", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS", "BLOCK_M", "BLOCK_N"
+    ),
+)
+
+# Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256). On Blackwell,
+# FP32 D=256 skips the middle tile: it fits shared memory but needs 576 tensor-memory columns.
 GENERIC_FORWARD_TILES = (
-    TileConfig(64, 128, 8, 3, shared_rows=256),
-    TileConfig(64, 64, 8, 3, shared_rows=192),
+    TileConfig(64, 128, 8, 3, shared_rows=256, tmem_cols=512),
+    TileConfig(64, 64, 8, 3, shared_rows=192, tmem_cols=576),
     TileConfig(32, 32, 4, 1, shared_rows=96),
 )
 
@@ -512,7 +519,7 @@ def _launch_forward(
             else min(32, triton.next_power_of_2(heads))
         )
         block_k = max(16, min(64, triton.next_power_of_2(topk)))
-        _gather_attn_fwd_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+        _FWD_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             local_kv,
@@ -545,7 +552,7 @@ def _launch_forward(
         return output, lse
 
     # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
-    block_m, block_n, num_warps, num_stages, _ = (
+    block_m, block_n, num_warps, num_stages, *_ = (
         TileConfig(16, 16, 4, 1)
         if head_dim == 512
         else select_tiles(GENERIC_FORWARD_TILES, block_d, query.element_size(), query.device)
@@ -558,7 +565,7 @@ def _launch_forward(
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
         local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
-        _gather_attn_fwd_tma[grid](
+        _FWD_TMA[grid](
             query_desc,
             sparse_kv,
             local_desc,

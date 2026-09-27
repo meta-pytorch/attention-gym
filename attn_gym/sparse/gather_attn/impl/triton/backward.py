@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from .primitives import (
@@ -17,11 +18,12 @@ from .primitives import (
     prune_wide_backward_configs,
     select_tiles,
     store_bhsd,
+    tuning_key,
 )
 from .shared_backward import (
-    _gather_attn_bwd_dq_shared,
-    _gather_attn_bwd_dsparse_kv_shared,
-    _gather_attn_bwd_dsparse_kv_shared_atomic,
+    BWD_DQ_SHARED,
+    BWD_DSPARSE_KV_SHARED,
+    BWD_DSPARSE_KV_SHARED_ATOMIC,
 )
 
 
@@ -305,15 +307,6 @@ def _gather_attn_bwd_dlocal_kv(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in (4, 8)
-        for num_stages in (1, 3)
-    ],
-    key=["H", "D", "WINDOW", "HAS_CU_SEQLENS"],
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_bwd_dlocal_kv_tma(
     query_desc,
@@ -413,21 +406,6 @@ def _gather_attn_bwd_dlocal_kv_tma(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": block_m},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for block_m in (16, 32, 64)
-        for num_warps in (4, 8)
-        for num_stages in (1, 3)
-    ],
-    key=["H", "D", "TOPK"],
-    prune_configs_by={"early_config_prune": prune_wide_backward_configs},
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_bwd_dsparse_kv(
     query_ptr,
@@ -560,6 +538,29 @@ def _gather_attn_bwd_dsparse_kv(
     )
 
 
+_BWD_DLOCAL_KV_TMA = TritonTuner(
+    _gather_attn_bwd_dlocal_kv_tma,
+    [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in (4, 8)
+        for num_stages in (1, 3)
+    ],
+    # The fixed tile changes the winner, so it is part of the key.
+    key=tuning_key("query_desc", "H", "D", "WINDOW", "HAS_CU_SEQLENS", "BLOCK_M", "BLOCK_N"),
+)
+_BWD_DSPARSE_KV = TritonTuner(
+    _gather_attn_bwd_dsparse_kv,
+    [
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
+        for block_m in (16, 32, 64)
+        for num_warps in (4, 8)
+        for num_stages in (1, 3)
+    ],
+    key=tuning_key("query_ptr", "H", "D", "TOPK"),
+    prune=prune_wide_backward_configs,
+)
+
+
 @triton.jit
 def _index_query_map_keys(
     kv_indices_ptr,
@@ -645,14 +646,14 @@ def _build_index_query_map(
 # Preferred first; later entries fit smaller shared memory (e.g. SM80, or SM86 at D=256).
 # Software-pipelined query tiles make the local-KV gradient the largest consumer.
 GENERIC_DQ_TILES = (
-    TileConfig(64, 32, 8, 3, shared_rows=208),
-    TileConfig(64, 32, 8, 2, shared_rows=192),
+    TileConfig(64, 32, 8, 3, shared_rows=208, tmem_cols=512),
+    TileConfig(64, 32, 8, 2, shared_rows=192, tmem_cols=512),
     TileConfig(32, 32, 4, 2, shared_rows=112),
     TileConfig(16, 16, 4, 1, shared_rows=64),
 )
 GENERIC_DLOCAL_KV_TILES = (
-    TileConfig(64, 32, 8, 3, shared_rows=484),
-    TileConfig(64, 32, 8, 2, shared_rows=290),
+    TileConfig(64, 32, 8, 3, shared_rows=484, tmem_cols=512),
+    TileConfig(64, 32, 8, 2, shared_rows=290, tmem_cols=512),
     TileConfig(32, 32, 4, 2, shared_rows=177),
     TileConfig(16, 16, 4, 1, shared_rows=68),
 )
@@ -729,7 +730,7 @@ def _launch_backward(
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32
         )
-        _gather_attn_bwd_dq_shared[(seq_len, batch, triton.cdiv(heads, block_h))](
+        BWD_DQ_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             local_kv,
@@ -765,7 +766,7 @@ def _launch_backward(
         )
         grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
     else:
-        block_m, block_n, num_warps, num_stages, _ = dq_tiles
+        block_m, block_n, num_warps, num_stages, *_ = dq_tiles
         num_local_key_tiles = (
             triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
         )
@@ -813,7 +814,7 @@ def _launch_backward(
         )
         grad_sink_fp32 = grad_sink_partials.sum(dim=(0, 2))
 
-    block_m, block_n, num_warps, num_stages, _ = dlocal_tiles
+    block_m, block_n, num_warps, num_stages, *_ = dlocal_tiles
     local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
     if use_tma:
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
@@ -821,7 +822,7 @@ def _launch_backward(
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
         grad_output_desc = TensorDescriptor.from_tensor(grad_output, [1, 1, block_m, block_d])
         grad_local_desc = TensorDescriptor.from_tensor(grad_local_kv, [1, 1, block_n, block_d])
-        _gather_attn_bwd_dlocal_kv_tma[local_grid](
+        _BWD_DLOCAL_KV_TMA[local_grid](
             query_desc,
             local_desc,
             cu_seqlens,
@@ -898,7 +899,7 @@ def _launch_backward(
             batch,
             triton.cdiv(heads, meta["BLOCK_H"]) * triton.cdiv(topk, meta["BLOCK_K"]),
         )
-        _gather_attn_bwd_dsparse_kv_shared_atomic[sparse_grid](
+        BWD_DSPARSE_KV_SHARED_ATOMIC[sparse_grid](
             query,
             sparse_kv,
             kv_indices,
@@ -935,7 +936,7 @@ def _launch_backward(
                 device=sparse_kv.device,
                 dtype=sparse_kv.dtype,
             )
-            sparse_kernel = _gather_attn_bwd_dsparse_kv_shared
+            sparse_kernel = BWD_DSPARSE_KV_SHARED
             sparse_grid = lambda meta: (
                 sparse_seq_len,
                 batch,
@@ -947,7 +948,7 @@ def _launch_backward(
                 device=sparse_kv.device,
                 dtype=sparse_kv.dtype,
             )
-            sparse_kernel = _gather_attn_bwd_dsparse_kv
+            sparse_kernel = _BWD_DSPARSE_KV
             sparse_grid = (sparse_seq_len, batch * heads)
 
         sparse_kernel[sparse_grid](

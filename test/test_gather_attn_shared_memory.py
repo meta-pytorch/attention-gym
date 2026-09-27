@@ -1,9 +1,13 @@
-"""Triton gather attention on GPUs with 99 KiB of shared memory per block (SM86/SM89).
+"""Triton gather attention within per-GPU on-chip memory: SM86 shared memory, Blackwell TMEM.
 
 A10G CI failed with ``OutOfResources: shared memory, Required: 131072, Hardware limit: 101376``
-because the head-parallel kernels used fixed tiles sized for Hopper/Blackwell. These tests run on
-any CUDA GPU: one compiles every launch for SM86 without running it, the other runs the
+because the head-parallel kernels used fixed tiles sized for Hopper/Blackwell. The SM86 tests run
+on any CUDA GPU: one compiles every launch for SM86 without running it, the other runs the
 small-budget tiles on the local GPU against the eager reference.
+
+On Blackwell, FP32 D=256 selected a forward tile that fit shared memory but not tensor memory
+(``Required: 576, Hardware limit: 512``). The SM100 compile-only test checks both budgets for
+every launch; the Blackwell reference test runs every production tuning candidate.
 """
 
 import pytest
@@ -14,6 +18,9 @@ from attn_gym.testing.triton_budget import compile_only_for_target, emulate_devi
 
 SM86_CAPABILITY = (8, 6)
 SM86_MAX_SHARED_MEMORY = 101376
+SM100_CAPABILITY = (10, 0)
+SM100_MAX_SHARED_MEMORY = 232448
+SM100_TENSOR_MEMORY_COLUMNS = 512
 
 
 def make_inputs(
@@ -105,6 +112,60 @@ def test_sm86_tiles_match_reference(head_dim, window, dtype):
             **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}
         )
         output.backward(grad_output.to(output.dtype))
+
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)
+    for name in ("query", "local_kv", "sparse_kv", "attention_sink"):
+        torch.testing.assert_close(
+            inputs[name].grad.double(),
+            reference_inputs[name].grad,
+            atol=tolerance * reference_inputs[name].grad.abs().max().item(),
+            rtol=tolerance,
+            msg=lambda message, name=name: f"{name} gradient: {message}",
+        )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_sm100_launches_fit_shared_and_tensor_memory(dtype, head_dim):
+    """Every generic-schedule launch has a config within SM100 shared and tensor memory."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton")
+    # Four query heads take the generic (TMA when D <= 256) schedule, not the shared-KV one.
+    inputs = make_inputs(4, head_dim, topk=8, dtype=dtype)
+    with compile_only_for_target(SM100_CAPABILITY, SM100_MAX_SHARED_MEMORY) as launches:
+        output = gather_attn(
+            **inputs, sliding_window_size=64, kernel_options={"backend": "triton"}
+        )
+        output.sum().backward()
+
+    kernels = {launch.kernel for launch in launches}
+    assert {"_gather_attn_bwd_dq", "_gather_attn_bwd_dsparse_kv"} <= kernels
+    too_large = {
+        launch.kernel: list(zip(launch.shared, launch.tmem))
+        for launch in launches
+        if not launch.fits(SM100_MAX_SHARED_MEMORY, SM100_TENSOR_MEMORY_COLUMNS)
+    }
+    assert not too_large
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_blackwell_tiles_match_reference(dtype, head_dim):
+    """Tiles and tuned configs selected on Blackwell compute the reference forward and grads."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
+        pytest.skip("Blackwell (SM10x/SM11x) GPU required")
+    inputs = make_inputs(4, head_dim, topk=8, dtype=dtype, seq_len=128)
+    reference_inputs = {
+        name: value.detach().double().requires_grad_() if value.is_floating_point() else value
+        for name, value in inputs.items()
+    }
+    expected = gather_attn(**reference_inputs, sliding_window_size=64, impl=Impl.REFERENCE)
+    grad_output = torch.randn_like(expected)
+    expected.backward(grad_output)
+
+    output = gather_attn(**inputs, sliding_window_size=64, kernel_options={"backend": "triton"})
+    output.backward(grad_output.to(output.dtype))
 
     tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)
