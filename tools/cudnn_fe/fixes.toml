@@ -267,6 +267,7 @@ kind = "validation"
 ag_subject = "Route oversized GDN forward tensors to the wide-extent compile variant"
 ag_subjects_extra = [
   "Restore non-vacuous forced-int64 GDN forward and backward coverage",
+  "Enable non-vacuous forced-int64 KDA forward and backward coverage",
 ]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32",

@@ -1118,12 +1118,12 @@ def test_cudnn_tma_validation_routes_oversized_singleton_stride_to_int64() -> No
     assert requires_int64_abi(tensor)
 
 
-@pytest.mark.xfail(strict=True, reason="S14: v1.30 kernels have no int64 ABI selector yet")
 def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
     from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
         kda_bprop_f16,
-        kda_prefill_f16,
+        kda_chain_forward_f16,
         kda_recompute_f16,
+        kda_warmup_forward_f16,
     )
 
     expected_inputs = _make_inputs(requires_grad=True, dtype=torch.float16)
@@ -1132,10 +1132,24 @@ def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
 
     expected = _candidate_no_state(*expected_inputs)
     expected_grads = torch.autograd.grad(expected, expected_inputs[:5], d_output)
-    for module in (kda_prefill_f16, kda_recompute_f16, kda_bprop_f16):
-        monkeypatch.setattr(module, "requires_int64_abi", lambda *_: True)
+    forced_calls = []
+    for module in (
+        kda_warmup_forward_f16,
+        kda_chain_forward_f16,
+        kda_recompute_f16,
+        kda_bprop_f16,
+    ):
+
+        def force_wide(*tensors, name=module.__name__):
+            forced_calls.append(name)
+            return True
+
+        monkeypatch.setattr(module, "requires_int64_abi", force_wide)
     actual = _candidate_no_state(*actual_inputs)
+    assert forced_calls, "forward did not invoke a forced int64 selector"
+    forced_calls.clear()
     actual_grads = torch.autograd.grad(actual, actual_inputs[:5], d_output)
+    assert forced_calls, "backward did not invoke a forced int64 selector"
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
