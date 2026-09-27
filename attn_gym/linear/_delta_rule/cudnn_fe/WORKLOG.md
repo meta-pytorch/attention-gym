@@ -177,6 +177,9 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   dedicated test.
 
 ### Other tests encoding decisions
+- **B3** — KT::test_cudnn_backward_past_sort_capacity_runs_empty_work_items: native KDA stateful
+  backward over ORDER_CAPACITY+3 sequences (5,464/8,198 zero-chunk items). The fix (an empty item
+  must not consume a dstate handshake phase, C03) is upstream in v1.30; reverting it historically hung.
 - **R8** — test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op:
   sharded KDA dbeta bounded by an operand-pack budget (see Decisions).
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state

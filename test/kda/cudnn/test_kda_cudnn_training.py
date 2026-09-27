@@ -916,6 +916,51 @@ def test_cudnn_repeated_backward_with_empty_sequences() -> None:
         torch.cuda.synchronize()
 
 
+def test_cudnn_backward_past_sort_capacity_runs_empty_work_items() -> None:
+    """Zero-chunk work items must leave the dstate handshake and every neighbour intact.
+
+    Batches within the sort capacity compact empty sequences out of the work table, so the
+    29-sequence stress never hands the kernels an empty item. Past ``ORDER_CAPACITY`` sequences
+    the table copies through uncompacted and every empty (sequence, head) reaches the recompute
+    and bprop kernels as a zero-chunk item, which must neither consume a dstate handshake phase
+    nor touch its neighbours: the native stateful backward equals the compacted run over the
+    nonempty sequences and empty sequences pass their state cotangent straight through.
+    """
+    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import ORDER_CAPACITY
+    from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_bwd_with_state_op
+
+    heads = 2
+    num_seqs = ORDER_CAPACITY + 3
+    lengths = tuple(0 if index % 3 else 16 for index in range(num_seqs))
+    q, k, value, gate, beta = make_kda_test_inputs(
+        sum(lengths), heads=heads, seed=433, normalize_qk=True
+    )
+    state = torch.randn(num_seqs, heads, D, D, device="cuda") / 100
+    d_output = torch.randn_like(value)
+    d_state = torch.randn(num_seqs, heads, D, D, device="cuda")
+    nonempty = torch.tensor([length > 0 for length in lengths], device="cuda")
+    assert nonempty.sum().item() < ORDER_CAPACITY < num_seqs
+
+    def run(cu_seqlens, initial_state, exit_cotangent):
+        return chunk_cudnn_packed_bwd_with_state_op(
+            q, k, value, gate, beta, d_output, cu_seqlens, initial_state, exit_cotangent, 1.0
+        )
+
+    expected = run(
+        cumulative_sequence_offsets(tuple(n for n in lengths if n)),
+        state[nonempty].contiguous(),
+        d_state[nonempty].contiguous(),
+    )
+    actual = run(cumulative_sequence_offsets(lengths), state, d_state)
+    torch.cuda.synchronize()
+    for name, got, want in zip(
+        ("dq", "dk", "dv", "dgate", "dbeta"), actual, expected, strict=False
+    ):
+        assert torch.equal(got, want), name
+    assert torch.equal(actual[5][nonempty], expected[5])
+    assert torch.equal(actual[5][~nonempty], d_state[~nonempty])
+
+
 def test_cudnn_packed_h64_exact_tail_with_trailing_empty_is_finite() -> None:
     from attn_gym.linear import chunk_kda
     from attn_gym.linear.kda import bound_gate, l2norm

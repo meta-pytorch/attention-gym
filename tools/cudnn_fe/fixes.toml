@@ -284,6 +284,14 @@ upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
+id = "B3"
+title = "Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream)"
+kind = "test"
+ag_subject = "Cover KDA zero-chunk backward work items and tiny write gates"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items"]
+upstream_status = "superseded-by-v1.30"
+
+[[fix]]
 id = "R8"
 title = "Sharded KDA dbeta bounded by the operand-pack budget"
 kind = "test"
