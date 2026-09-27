@@ -305,6 +305,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+| KDA bwd swizzle left inline (S4 skipped there) | `swizzle_box_offset_*` changed kda_recompute/bprop SASS by ±16/24 instructions; S1–S3 applied, and S15 converted only forms whose SASS stays byte-identical. | Helper codegen changes. |
 | Keep upstream's 4 KQ SMEM stages (F11) | Old AG reduced to 3 for budget; v1.30 fits 4 by putting the small staging in the alignment gap. | SMEM layout changes. |
 | CP dbeta pack-budget criterion (R8) | The partial-chunk KDA-cuDNN CP case exceeded the old dbeta tolerance (2.9×) with both new and legacy summaries, i.e. rounding of the unsharded realization, not a bug. New bound: magnitude-weighted BF16 operand-pack budget; fail-closed (no-dstate penultimate chunk and a 1.01× terminal chunk both fail). | CP numerics change. |
 | Drop the replay-ABI upstream draft (B14) | Upstream has no optional-scheduler ABI; it would be a feature request. | Upstream makes the scheduler optional. |

@@ -1856,13 +1856,8 @@ def compute0_warp_group(
                                 for b in cutlass.range_constexpr(dk_halves):
                                     for word_group in cutlass.range_constexpr(4):
                                         dk = b * 32 + word_group * 8
-                                        row_addr = (
-                                            checkpoint_row_addr
-                                            + (dk // 64) * (cfg.d_v * 64)
-                                            + checkpoint_row_dim * 64
-                                            + swizzle_xor_128b(
-                                                checkpoint_row_dim, dk % 64, elem_bytes=2
-                                            )
+                                        row_addr = checkpoint_row_addr + swizzle_box_offset_128b(
+                                            checkpoint_row_dim, dk, box_rows=cfg.d_v
                                         )
                                         (sCheckpoint_ptr + row_addr).store(
                                             cutlass.Vector.from_elements(
@@ -2158,10 +2153,8 @@ def compute1_warp_group(
                                             dk = i * 16 + word_group * 8
                                             seed_row_addr = (
                                                 seed_stage_base
-                                                + (dk // 64) * (cfg.d_v * 64)
-                                                + value_dim * 64
-                                                + swizzle_xor_128b(
-                                                    value_dim, dk % 64, elem_bytes=2
+                                                + swizzle_box_offset_128b(
+                                                    value_dim, dk, box_rows=cfg.d_v
                                                 )
                                             )
                                             (sCheckpoint_ptr + seed_row_addr).store(
@@ -2194,11 +2187,8 @@ def compute1_warp_group(
                         for i in cutlass.range_constexpr(cfg.d_k // 16):
                             for g in cutlass.range_constexpr(2):
                                 dk = i * 16 + g * 8
-                                checkpoint_addr = (
-                                    checkpoint_stage_base
-                                    + (dk // 64) * (cfg.d_v * 64)
-                                    + value_dim * 64
-                                    + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                checkpoint_addr = checkpoint_stage_base + swizzle_box_offset_128b(
+                                    value_dim, dk, box_rows=cfg.d_v
                                 )
                                 (sCheckpoint_ptr + checkpoint_addr).store(
                                     cutlass.Vector.from_elements(
@@ -2529,11 +2519,8 @@ def compute1_warp_group(
                             for i in cutlass.range_constexpr(state_blocks_per_half, cfg.d_k // 16):
                                 for word_group in cutlass.range_constexpr(2):
                                     dk = i * 16 + word_group * 8
-                                    row_addr = (
-                                        checkpoint_row_addr
-                                        + (dk // 64) * (cfg.d_v * 64)
-                                        + value_dim * 64
-                                        + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                    row_addr = checkpoint_row_addr + swizzle_box_offset_128b(
+                                        value_dim, dk, box_rows=cfg.d_v
                                     )
                                     (sCheckpoint_ptr + row_addr).store(
                                         cutlass.Vector.from_elements(

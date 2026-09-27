@@ -3,8 +3,9 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0 with imports relocated
 # into attn_gym.linear._delta_rule.cudnn_fe, the standalone state-chain host
-# (build/run_state_chain, is_dv_split) removed, and the upstream-only GDP expand_num knob
-# resolved to 1.
+# (build/run_state_chain, is_dv_split) removed, the upstream-only GDP expand_num knob
+# resolved to 1, and the state-chain registers (cute.make_rmem_tensor) and SMEM tiles (a
+# host-defined SharedStorage struct in the v1.30 order) restyled.
 
 """Exact piece chain for the chunked linear-attention kernels: the piece rule (``choose_pieces``), the piece table
 (piece-wise ``cu_pieces`` and the piece work-item tables, built by ``kernel/*_chain_prologue_f16.py``) and the fp32 state
@@ -35,7 +36,10 @@ import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
+from attn_gym._backends.cute.compat import SmemAllocator
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from ..tile_dsl.handles import smem_data_ptr
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from ..tile_dsl.tma import (
     cp_async_commit,
@@ -426,6 +430,7 @@ def frost_state_chain(
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
+    shared_type: cutlass.Constexpr,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -476,26 +481,26 @@ def frost_state_chain(
         filled = (cutlass.Int32(mMainRows[seq + 1]) - row_base) // cutlass.Int32(HO)
         count = filled if filled > cutlass.Int32(0) else cutlass.Int32(1)
 
-    sWalk = cutlass.Array(cutlass.Float32, rows * K, space=cutlass.AddressSpace.smem, alignment=16)
+    storage = SmemAllocator().allocate(shared_type)
+    sWalk_ptr = smem_data_ptr(storage.walk.get_tensor(cute.make_layout((rows * K,))))
     if cutlass.const_expr(emit_summary):
-        sProduct = cutlass.Array(
-            cutlass.Float32, product_rows * K, space=cutlass.AddressSpace.smem, alignment=16
+        sProduct_ptr = smem_data_ptr(
+            storage.product.get_tensor(cute.make_layout((product_rows * K,)))
         )
-    sPart = cutlass.Array(
-        cutlass.Float32,
-        CHAIN_K_WARPS * part_rows * K,
-        space=cutlass.AddressSpace.smem,
-        alignment=16,
+    sPart_ptr = smem_data_ptr(
+        storage.part.get_tensor(cute.make_layout((CHAIN_K_WARPS * part_rows * K,)))
     )
-    sM = cutlass.Array(
-        cutlass.Float32, CHAIN_M_BUFFERS * m_words, space=cutlass.AddressSpace.smem, alignment=128
+    sM_ptr = smem_data_ptr(storage.m.get_tensor(cute.make_layout((CHAIN_M_BUFFERS * m_words,))))
+    acc = cute.make_rmem_tensor((walk_group_rows * cols_per_lane,), cutlass.Float32)
+    acc_product = cute.make_rmem_tensor(
+        (max(1, product_group_rows) * cols_per_lane,), cutlass.Float32
     )
-    acc = cutlass.Array(cutlass.Float32, walk_group_rows * cols_per_lane)
-    acc_product = cutlass.Array(cutlass.Float32, max(1, product_group_rows) * cols_per_lane)
-    m_tile = cutlass.Array(cutlass.Float32, CHAIN_K_TILE * cols_per_lane)
-    cur = cutlass.Array(cutlass.Float32, walk_own_rows * cols_per_lane)
-    cur_product = cutlass.Array(cutlass.Float32, max(1, product_own_rows) * cols_per_lane)
-    piece_h = cutlass.Array(cutlass.Float32, walk_own_rows * cols_per_lane)
+    m_tile = cute.make_rmem_tensor((CHAIN_K_TILE * cols_per_lane,), cutlass.Float32)
+    cur = cute.make_rmem_tensor((walk_own_rows * cols_per_lane,), cutlass.Float32)
+    cur_product = cute.make_rmem_tensor(
+        (max(1, product_own_rows) * cols_per_lane,), cutlass.Float32
+    )
+    piece_h = cute.make_rmem_tensor((walk_own_rows * cols_per_lane,), cutlass.Float32)
 
     one_piece = seq < cutlass.Int32(0)
     if cutlass.const_expr(mMainRows is not None and not (has_tail or emit_summary)):
@@ -625,7 +630,7 @@ def frost_state_chain(
                 seed_vals = [cutlass.Float32(0.0)] * cols_per_lane
             for c in cutlass.range_constexpr(cols_per_lane):
                 cur[rr * cols_per_lane + c] = seed_vals[c]
-            seed_walk_ptr = sWalk.data_ptr(seed_row * K + col0)
+            seed_walk_ptr = sWalk_ptr + (seed_row * K + col0)
             seed_walk_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
             if cutlass.const_expr(cols_per_lane == 2):
                 st_shared_v2(seed_walk_ptr, seed_walk_vals, cutlass.Float32)
@@ -647,7 +652,7 @@ def frost_state_chain(
                         if product_row0 + seed_row == col0 + cutlass.Int32(c)
                         else cutlass.Float32(0.0)
                     )
-                seed_product_ptr = sProduct.data_ptr(seed_row * K + col0)
+                seed_product_ptr = sProduct_ptr + (seed_row * K + col0)
                 seed_product_vals = [
                     cur_product[rr * cols_per_lane + c] for c in range(cols_per_lane)
                 ]
@@ -670,7 +675,8 @@ def frost_state_chain(
             first_m_row = first_chunk_id // cutlass.Int32(K // 4)
             first_m_chunk = first_chunk_id % cutlass.Int32(K // 4)
             nvvm.cp_async_shared_global(
-                sM.data_ptr(
+                sM_ptr
+                + (
                     first_buf_words
                     + (
                         first_m_row * K
@@ -755,7 +761,8 @@ def frost_state_chain(
                     next_m_row = next_chunk_id // cutlass.Int32(K // 4)
                     next_m_chunk = next_chunk_id % cutlass.Int32(K // 4)
                     nvvm.cp_async_shared_global(
-                        sM.data_ptr(
+                        sM_ptr
+                        + (
                             next_buf_words
                             + (
                                 next_m_row * K
@@ -800,7 +807,7 @@ def frost_state_chain(
                         for v in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                             m_col = k0 + cutlass.Int32(4 * v)
                             m_chunk = m_col // cutlass.Int32(4)
-                            m_ptr = sM.data_ptr(
+                            m_ptr = sM_ptr + (
                                 buf_words
                                 + (
                                     m_row * K
@@ -819,7 +826,7 @@ def frost_state_chain(
                         for v in cutlass.range_constexpr(cols_per_lane // min(4, cols_per_lane)):
                             m_col = col0 + cutlass.Int32(min(4, cols_per_lane) * v)
                             m_chunk = m_col // cutlass.Int32(4)
-                            m_ptr = sM.data_ptr(
+                            m_ptr = sM_ptr + (
                                 buf_words
                                 + (
                                     m_row * K
@@ -839,7 +846,7 @@ def frost_state_chain(
                         op_row = row_group * cutlass.Int32(walk_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                             x4 = ld_shared_v4(
-                                sWalk.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)),
+                                sWalk_ptr + (op_row * K + k0 + cutlass.Int32(4 * kq)),
                                 cutlass.Float32,
                             )
                             for e in cutlass.range_constexpr(4):
@@ -854,7 +861,7 @@ def frost_state_chain(
                         op_row = row_group * cutlass.Int32(product_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                             x4 = ld_shared_v4(
-                                sProduct.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)),
+                                sProduct_ptr + (op_row * K + k0 + cutlass.Int32(4 * kq)),
                                 cutlass.Float32,
                             )
                             for e in cutlass.range_constexpr(4):
@@ -869,7 +876,7 @@ def frost_state_chain(
             if cutlass.const_expr(walk_state):
                 for r in cutlass.range_constexpr(walk_group_rows):
                     op_row = row_group * cutlass.Int32(walk_group_rows) + cutlass.Int32(r)
-                    part_ptr = sPart.data_ptr(
+                    part_ptr = sPart_ptr + (
                         (k_warp * cutlass.Int32(part_rows) + op_row) * K + col0
                     )
                     part_vals = [acc[r * cols_per_lane + c] for c in range(cols_per_lane)]
@@ -883,7 +890,7 @@ def frost_state_chain(
             if cutlass.const_expr(emit_summary):
                 for r in cutlass.range_constexpr(product_group_rows):
                     op_row = row_group * cutlass.Int32(product_group_rows) + cutlass.Int32(r)
-                    part_ptr = sPart.data_ptr(
+                    part_ptr = sPart_ptr + (
                         (k_warp * cutlass.Int32(part_rows) + cutlass.Int32(rows) + op_row) * K
                         + col0
                     )
@@ -907,7 +914,7 @@ def frost_state_chain(
                     )
                     total = [piece_h[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                     for w2 in cutlass.range_constexpr(CHAIN_K_WARPS):
-                        part_ptr = sPart.data_ptr(
+                        part_ptr = sPart_ptr + (
                             (cutlass.Int32(w2 * part_rows) + op_row) * K + col0
                         )
                         if cutlass.const_expr(cols_per_lane == 2):
@@ -922,7 +929,7 @@ def frost_state_chain(
                             total[c] = total[c] + part[c]
                     for c in cutlass.range_constexpr(cols_per_lane):
                         cur[rr * cols_per_lane + c] = total[c]
-                    walk_ptr = sWalk.data_ptr(op_row * K + col0)
+                    walk_ptr = sWalk_ptr + (op_row * K + col0)
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_shared_v2(walk_ptr, total, cutlass.Float32)
                     else:
@@ -939,7 +946,7 @@ def frost_state_chain(
                     )
                     total = [cutlass.Float32(0.0) for c in range(cols_per_lane)]
                     for w2 in cutlass.range_constexpr(CHAIN_K_WARPS):
-                        part_ptr = sPart.data_ptr(
+                        part_ptr = sPart_ptr + (
                             (cutlass.Int32(w2 * part_rows) + cutlass.Int32(rows) + op_row) * K
                             + col0
                         )
@@ -955,7 +962,7 @@ def frost_state_chain(
                             total[c] = total[c] + part[c]
                     for c in cutlass.range_constexpr(cols_per_lane):
                         cur_product[rr * cols_per_lane + c] = total[c]
-                    product_ptr = sProduct.data_ptr(op_row * K + col0)
+                    product_ptr = sProduct_ptr + (op_row * K + col0)
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_shared_v2(product_ptr, total, cutlass.Float32)
                     else:
@@ -1066,6 +1073,26 @@ def frost_state_chain(
         launch_dependent_grids()
 
 
+def state_chain_storage(dim_v: int, dim_k: int, rows: int, emit_summary: bool):
+    """SMEM of one state-chain CTA in the v1.30 order: walk rows, product rows (empty without
+    ``emit_summary``), the per-k-slice partials of both, then the double-buffered ``M_j``."""
+    product_rows = dim_k * rows // dim_v if emit_summary else 0
+    part_rows = rows + product_rows
+
+    @cute.struct
+    class SharedStorage:
+        walk: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, rows * dim_k], 16]
+        product: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, product_rows * dim_k], 16]
+        part: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, CHAIN_K_WARPS * part_rows * dim_k], 16
+        ]
+        m: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, CHAIN_M_BUFFERS * dim_k * dim_k], 128
+        ]
+
+    return SharedStorage
+
+
 @cute.jit
 def launch_state_chain(
     heads_out: cutlass.Int32,
@@ -1108,6 +1135,7 @@ def launch_state_chain(
         mSummaryM,
         mMainRows,
         mSeedIndices,
+        state_chain_storage(dim_v, dim_k, rows, emit_summary),
     ).launch(
         grid=(num_seqs, heads_out, slices),
         block=(CHAIN_THREADS, 1, 1),

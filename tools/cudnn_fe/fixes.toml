@@ -305,6 +305,15 @@ gate = "sass (byte-identical per family)"
 upstream_status = "ag-specific"
 
 [[fix]]
+id = "S15"
+title = "Remaining exact KDA prefill swizzle forms; common-helper rmem tensors; state-chain SharedStorage"
+kind = "restyle"
+ag_subject = "Restyle the remaining cuDNN swizzle forms and common-helper arrays"
+guarding_tests = []
+gate = "sass (55/55 byte-identical SASS and resources)"
+upstream_status = "ag-specific"
+
+[[fix]]
 id = "R5"
 title = "Driver simplification: shared plan.py, no device/stream args, shared allocators, _GATE_FLAGS"
 kind = "restyle"

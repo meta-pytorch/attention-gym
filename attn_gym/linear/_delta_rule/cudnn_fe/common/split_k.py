@@ -7,7 +7,7 @@
 # gate head stride; hosts validate launch contracts (16-byte aligned channel-gate rows), compile
 # through jit_cache and keep the absent-scheduler ABI on replay; upstream-only knobs (GDP
 # expand_num, safe_gate with A_log/dt_bias/gate_lower_bound, log2_threshold overrides) are
-# resolved away.
+# resolved away; the channel-scan accumulator is a cute.make_rmem_tensor.
 
 """Split-K sequence partitioning for the chunked linear-attention kernels:
 GDN (scalar ``gate (T, HO)``, b_t=64) and KDA (per-key-channel
@@ -716,7 +716,7 @@ def frost_split_k_scan_channel(
                             gate_elem_bytes
                         )
                         gate_ptr = mGate.iterator + lane_base
-                        ch_acc = cutlass.Array(cutlass.Float32, cpl, alignment=16)
+                        ch_acc = cute.make_rmem_tensor((cpl,), cutlass.Float32)
                         for q in cutlass.range_constexpr(cpl):
                             ch_acc[q] = cutlass.Float32(0.0)
                         oob = (

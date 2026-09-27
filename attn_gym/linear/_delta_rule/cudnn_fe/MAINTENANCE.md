@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 39 modification rows below are generated from
+The 40 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 39 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 40 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -175,6 +175,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
 | S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
 | S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration`; `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
+| S15 | Remaining exact KDA prefill swizzle forms; common-helper rmem tensors; state-chain SharedStorage | sass (55/55 byte-identical SASS and resources) |
 | R5 | Driver simplification: shared plan.py, no device/stream args, shared allocators, _GATE_FLAGS | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference`; sass + existing suites bitwise unchanged |
 | S10 | Ruff lint/format the vendored kernels | sass (42/42 identical) |
 | R16 | Rename sdq_reduction to v_term_scratch; dedupe residual_f16x2; host docstring | sass |
