@@ -29,20 +29,30 @@ import functools
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
-from ..tile_dsl.pointwise import fadd2, ffma2, fmul2, lane_group_sum, opaque_f32_zero, sigmoid, sigmoid2, softplus
-from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from ..tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
-
-from .host import get_dtype
 from .._compat import current_device
+from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from ..tile_dsl.pointwise import (
+    fadd2,
+    ffma2,
+    fmul2,
+    lane_group_sum,
+    opaque_f32_zero,
+    sigmoid,
+    sigmoid2,
+    softplus,
+)
+from ..tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
+from .host import get_dtype
 
 USE_PDL = True
 
-GATE_BWD_BLOCKS = 128  # channel-gate token stripes (partials carve = GATE_BWD_BLOCKS * HO * d_k fp32)
+GATE_BWD_BLOCKS = (
+    128  # channel-gate token stripes (partials carve = GATE_BWD_BLOCKS * HO * d_k fp32)
+)
 CHANNEL_BLOCK = 128  # channel-gate partial-kernel CTA threads
 SCALAR_BLOCK_CAP = 8192  # scalar-gate stripe ceiling
 SCALAR_SLICE_TOKENS = 16  # scalar-gate target tokens per stripe
@@ -214,8 +224,12 @@ def frost_channel_gate_bwd_partial(
     h = cutlass.Int32(bid[1])
     phase_id = tidx // cutlass.Int32(lanes_per_row)
     d0 = (tidx % cutlass.Int32(lanes_per_row)) * cutlass.Int32(4)
-    sA = cutlass.Array(cutlass.Float32, phases * d_k, space=cutlass.AddressSpace.smem, alignment=16)
-    sDt = cutlass.Array(cutlass.Float32, phases * d_k, space=cutlass.AddressSpace.smem, alignment=16)
+    sA = cutlass.Array(
+        cutlass.Float32, phases * d_k, space=cutlass.AddressSpace.smem, alignment=16
+    )
+    sDt = cutlass.Array(
+        cutlass.Float32, phases * d_k, space=cutlass.AddressSpace.smem, alignment=16
+    )
     if tidx < cutlass.Int32(active):
         if cutlass.const_expr(mALog is not None):
             exp_a = cute.math.exp(mALog[h].to(cutlass.Float32), fastmath=True)
@@ -245,16 +259,28 @@ def frost_channel_gate_bwd_partial(
         if t_end > n_tokens:
             t_end = n_tokens
         while t < t_end:
-            dg_addr = dg_base + (cutlass.Int64(t) * dg_s0 + cutlass.Int64(h) * dg_s1 + cutlass.Int64(d0)) * cutlass.Int64(gate_elem_bytes)
-            g_addr = g_base + (cutlass.Int64(t) * g_s0 + cutlass.Int64(h) * g_s1 + cutlass.Int64(d0)) * cutlass.Int64(gate_elem_bytes)
+            dg_addr = dg_base + (
+                cutlass.Int64(t) * dg_s0 + cutlass.Int64(h) * dg_s1 + cutlass.Int64(d0)
+            ) * cutlass.Int64(gate_elem_bytes)
+            g_addr = g_base + (
+                cutlass.Int64(t) * g_s0 + cutlass.Int64(h) * g_s1 + cutlass.Int64(d0)
+            ) * cutlass.Int64(gate_elem_bytes)
             if cutlass.const_expr(mG.element_type == cutlass.Float32):
                 dgv = ld_global_v4(dg_addr, cutlass.Float32)
                 gvv = ld_global_v4(g_addr, cutlass.Float32)
             else:
                 dw0, dw1 = ld_global_v2(dg_addr, cutlass.Int32)
                 gw0, gw1 = ld_global_v2(g_addr, cutlass.Int32)
-                dfrag = cutlass.Vector.from_elements((dw0, dw1), cutlass.Int32).bitcast(mG.element_type).to(cutlass.Float32)
-                gfrag = cutlass.Vector.from_elements((gw0, gw1), cutlass.Int32).bitcast(mG.element_type).to(cutlass.Float32)
+                dfrag = (
+                    cutlass.Vector.from_elements((dw0, dw1), cutlass.Int32)
+                    .bitcast(mG.element_type)
+                    .to(cutlass.Float32)
+                )
+                gfrag = (
+                    cutlass.Vector.from_elements((gw0, gw1), cutlass.Int32)
+                    .bitcast(mG.element_type)
+                    .to(cutlass.Float32)
+                )
                 dgv = (dfrag[0], dfrag[1], dfrag[2], dfrag[3])
                 gvv = (gfrag[0], gfrag[1], gfrag[2], gfrag[3])
             for p in cutlass.range_constexpr(2):
@@ -278,7 +304,11 @@ def frost_channel_gate_bwd_partial(
             if cutlass.const_expr(mG.element_type == cutlass.Float32):
                 st_global_v4(dg_addr, out, cutlass.Float32)
             else:
-                words = cutlass.Vector.from_elements((out[0], out[1], out[2], out[3]), cutlass.Float32).to(mG.element_type).bitcast(cutlass.Int32)
+                words = (
+                    cutlass.Vector.from_elements((out[0], out[1], out[2], out[3]), cutlass.Float32)
+                    .to(mG.element_type)
+                    .bitcast(cutlass.Int32)
+                )
                 st_global_v2(dg_addr, words, cutlass.Int32)
             t += cutlass.Int32(phases)
         for q in cutlass.range_constexpr(4):
@@ -340,7 +370,9 @@ def frost_channel_gate_bwd_finish(
         c = cutlass.Int32(0)
         while c < cutlass.Int32(GATE_BWD_BLOCKS // 8):
             for j in cutlass.range_constexpr(8):
-                idx = ((c * cutlass.Int32(8) + cutlass.Int32(j)) * h_o + h) * cutlass.Int32(d_k) + d
+                idx = ((c * cutlass.Int32(8) + cutlass.Int32(j)) * h_o + h) * cutlass.Int32(
+                    d_k
+                ) + d
                 if cutlass.const_expr(mPartA is not None):
                     a8[j] = a8[j] + mPartA[idx]
                 if cutlass.const_expr(mPartDt is not None):
@@ -352,7 +384,9 @@ def frost_channel_gate_bwd_finish(
             mDDt[h, d] = col_dt.to(mDDt.element_type)
     if cutlass.const_expr(mDA is not None):
         col_a = ((a8[0] + a8[1]) + (a8[2] + a8[3])) + ((a8[4] + a8[5]) + (a8[6] + a8[7]))
-        sWa = cutlass.Array(cutlass.Float32, n_warps, space=cutlass.AddressSpace.smem, alignment=16)
+        sWa = cutlass.Array(
+            cutlass.Float32, n_warps, space=cutlass.AddressSpace.smem, alignment=16
+        )
         va = lane_group_sum(col_a, 32)
         if lane_idx == 0:
             sWa[warp_id] = va
@@ -383,8 +417,13 @@ def scalar_gate_bwd_launch(
     head_tiles: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    frost_scalar_gate_bwd_partial(d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len).launch(
-        grid=(n_blocks, head_tiles, 1), block=(SCALAR_HEAD_TILE, 1, 1), stream=stream, use_pdl=USE_PDL
+    frost_scalar_gate_bwd_partial(
+        d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len
+    ).launch(
+        grid=(n_blocks, head_tiles, 1),
+        block=(SCALAR_HEAD_TILE, 1, 1),
+        stream=stream,
+        use_pdl=USE_PDL,
     )
     if cutlass.const_expr(d_a_log is not None or d_dt_bias is not None):
         frost_scalar_gate_bwd_finish(part_a, part_dt, d_a_log, d_dt_bias, h_o, n_blocks).launch(
@@ -409,7 +448,9 @@ def channel_gate_bwd_launch(
     lower_bound: cutlass.Float32,
     stream: cuda.CUstream,
 ):
-    frost_channel_gate_bwd_partial(d_k, d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len, lower_bound).launch(
+    frost_channel_gate_bwd_partial(
+        d_k, d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len, lower_bound
+    ).launch(
         grid=(GATE_BWD_BLOCKS, h_o, 1), block=(CHANNEL_BLOCK, 1, 1), stream=stream, use_pdl=USE_PDL
     )
     if cutlass.const_expr(d_a_log is not None or d_dt_bias is not None):
@@ -451,7 +492,12 @@ def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, p
     if "compiled" not in cache:
         traced = [from_dlpack(t, assumed_align=4) for t in tensors[:2]]
         traced = [tr.mark_layout_dynamic(leading_dim=1) for tr in traced]
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None for t in tensors[2:]]
+        traced += [
+            from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if t is not None
+            else None
+            for t in tensors[2:]
+        ]
         cache["compiled"] = cute.compile(
             scalar_gate_bwd_launch,
             *traced,
@@ -466,7 +512,9 @@ def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, p
     cache["compiled"](*tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles, cu_stream)
 
 
-def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, gate_lower_bound, *, stream):
+def channel_gate_bwd(
+    d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, gate_lower_bound, *, stream
+):
     """Per-channel-gate backward: rewrite d_gate [total, HO, d_k] (gate dtype) in
     place and fill d_a_log/d_dt_bias at their parameter shapes ((HO,) params
     get the channel axis folded in the finisher).  a_log/dt_bias may be None
@@ -493,8 +541,16 @@ def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, 
     tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
     args = (n_tokens, h_o, slice_len)
     if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=g_vector_bytes).mark_layout_dynamic(leading_dim=2) for t in (d_gate, g_raw)]
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=len(t.shape) - 1) if t is not None else None for t in tensors[2:]]
+        traced = [
+            from_dlpack(t, assumed_align=g_vector_bytes).mark_layout_dynamic(leading_dim=2)
+            for t in (d_gate, g_raw)
+        ]
+        traced += [
+            from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=len(t.shape) - 1)
+            if t is not None
+            else None
+            for t in tensors[2:]
+        ]
         cache["compiled"] = cute.compile(
             channel_gate_bwd_launch,
             d_k,

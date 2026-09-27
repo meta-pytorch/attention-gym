@@ -723,11 +723,11 @@ def tmaldg_warp(
                 bars.mb_raw_ready[raw_index.idx].arrive(n_bytes=cfg.tma_k_bytes + cfg.tma_gate_bytes + cfg.tma_v_bytes)
             raw_ready_ptr = bars.mb_raw_ready[raw_index.idx].smem_ptr
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, chunk_start)
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr)
             gate_slice = tma_slice_runtime_desc(desc_gate_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr)
             v_slice = tma_slice_runtime_desc(desc_v_slot, cutlass.Int32(0), head_v, chunk_start)
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr)
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)

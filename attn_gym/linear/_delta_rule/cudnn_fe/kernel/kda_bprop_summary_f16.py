@@ -102,6 +102,7 @@ from ..tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from ..tile_dsl.tma import tma_load_tile, tma_tensormap_acquire
 from ..tile_dsl.pointwise import (
     sigmoid,
+    fadd2,
     ffma2,
     fmul2,
     fp32_to_fp16,
@@ -844,18 +845,18 @@ def tmaldg_warp(
                 bars.mb_raw_ready[raw_index.idx].arrive(n_bytes=cfg.tma_q_bytes + cfg.tma_k_bytes + cfg.tma_gate_bytes)
             raw_ready_ptr = bars.mb_raw_ready[raw_index.idx].smem_ptr
             q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, chunk_start)
-            tma_load_tile(sQ_tma[raw_index.idx], q_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sQ_tma[raw_index.idx], q_slice, raw_ready_ptr)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, chunk_start)
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr)
             gate_slice = tma_slice_runtime_desc(desc_gate_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr)
 
             # ---- dO load -------------------------------------------------------------
             bars.mb_do_done[raw_index.idx].wait(raw_index.phase)
             if elect_one:
                 bars.mb_do_ready[raw_index.idx].arrive(n_bytes=cfg.tma_do_bytes)
             do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile
@@ -1004,13 +1005,7 @@ def compute0_warp_group(
                             gate1 = gate_scale(cfg, gate1)
                         else:
                             gate1 = cutlass.Float32(0.0)
-                    pair_vec = nvvm.add_packed_f32x2(
-                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                        ftz=False,
-                        rnd="rn",
-                    )
-                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix0, row_pair_sum = fadd2(prefix_acc, gate0, gate0, gate1)
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
@@ -1062,13 +1057,7 @@ def compute0_warp_group(
                     prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     gate0 = gate_raw[row0]
                     gate1 = gate_raw[row1]
-                    pair_vec = nvvm.add_packed_f32x2(
-                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                        ftz=False,
-                        rnd="rn",
-                    )
-                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix0, row_pair_sum = fadd2(prefix_acc, gate0, gate0, gate1)
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)

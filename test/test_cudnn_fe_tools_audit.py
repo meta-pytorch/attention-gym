@@ -26,6 +26,12 @@ def rules(text: str) -> list[str]:
     return [f.rule for f in audit.audit_source(text, "kernel/x.py")]
 
 
+@pytest.fixture(scope="module")
+def house():
+    """The current tree's tile_dsl helpers (house-style tma, swizzle and pointwise)."""
+    return restyle.tile_helpers(audit.default_root())
+
+
 @pytest.mark.parametrize(
     ("rule", "body"),
     [
@@ -304,6 +310,24 @@ IMPORT_FIXES = {
 }
 
 
+@pytest.mark.parametrize("case", sorted(CODEMOD_CASES))
+def test_codemod_rewrites_fixture_and_is_idempotent(case, house):
+    before, after = (src(text) for text in CODEMOD_CASES[case])
+    new_line, swizzle_names = IMPORT_FIXES.get(case, ("", ""))
+    after = after.replace("from cutlass.experimental", new_line + "from cutlass.experimental")
+    if swizzle_names:
+        after = after.replace("import swizzle_xor_128b", f"import {swizzle_names}")
+    if case == "fadd2_fold":
+        before = before.replace(HEADER, HEADER + "from ..tile_dsl.pointwise import fmul2\n")
+        after = after.replace(HEADER, HEADER + "from ..tile_dsl.pointwise import fadd2, fmul2\n")
+
+    result = restyle.restyle_source(before, "kernel/x.py", helpers=house)
+    assert result.text == after
+    again = restyle.restyle_source(result.text, "kernel/x.py", helpers=house)
+    assert again.text == result.text
+    assert not again.applied
+
+
 V130_POINTWISE = '''\
 import cutlass
 import cutlass.cute as cute
@@ -347,6 +371,89 @@ def test_codemod_leaves_other_fadd2_bodies_manual(old, new):
     before = V130_POINTWISE.replace(old, new)
     assert before != V130_POINTWISE
     assert restyle.restyle_source(before, "tile_dsl/pointwise.py").text == before
+
+
+SWIZZLE_MUTATED = """\
+from ..tile_dsl.swizzle import swizzle_xor_128b
+
+
+def f(r, c, rows):
+    seg = c // 64
+    seg_col = c % 64
+    c += 64
+    return seg * (rows * 64) + r * 64 + swizzle_xor_128b(r, seg_col)
+"""
+
+
+@pytest.mark.parametrize(
+    "between",
+    ["    c += 64\n", "    if r:\n        c = 0\n", "    seg_col = 3\n", "    (seg := 1)\n"],
+)
+def test_codemod_keeps_swizzle_when_bindings_are_not_straight_line(between, house):
+    """A write to ``c``/``seg``/``seg_col`` or control flow before the chain keeps it manual."""
+    before = SWIZZLE_MUTATED.replace("    c += 64\n", between)
+    assert restyle.restyle_source(before, "kernel/x.py", helpers=house).text == before
+
+
+def test_codemod_swizzle_rewrite_preserves_offsets(house):
+    before = SWIZZLE_MUTATED.replace("    c += 64\n", "    unrelated = 1\n")
+    after = restyle.restyle_source(before, "kernel/x.py", helpers=house).text
+    assert "swizzle_box_offset_128b(r, c, box_rows=rows)" in after
+
+    def swizzle_xor_128b(r, c, elem_bytes=2):
+        return c ^ ((r & 7) * (16 // elem_bytes))
+
+    def swizzle_box_offset_128b(r, c, *, box_rows):
+        return (c // 64) * (box_rows * 64) + r * 64 + swizzle_xor_128b(r, c % 64)
+
+    results = []
+    for text in (before, after):
+        ns = {
+            "swizzle_xor_128b": swizzle_xor_128b,
+            "swizzle_box_offset_128b": swizzle_box_offset_128b,
+        }
+        exec(text.split("\n", 1)[1], ns)  # noqa: S102 -- fixture minus its import
+        results.append([ns["f"](r, c, 16) for r in range(9) for c in range(0, 256, 7)])
+    assert results[0] == results[1]
+
+
+def test_codemod_needs_the_helper_in_the_target_tree(house):
+    """Without swizzle_box_offset_* in tile_dsl/swizzle.py the swizzle rewrite stays pending."""
+    before = src(CODEMOD_CASES["swizzle"][0])
+    assert restyle.restyle_source(before, "kernel/x.py").text == before
+    helpers = dict(house, swizzle=audit.analyze("def swizzle_xor_128b(r, c): pass\n", "s.py"))
+    assert restyle.restyle_source(before, "kernel/x.py", helpers=helpers).text == before
+    unimported = before.replace("from ..tile_dsl.swizzle import swizzle_xor_128b\n", "")
+    unimported = "def swizzle_xor_128b(r, c, elem_bytes=2):\n    pass\n" + unimported
+    assert restyle.restyle_source(unimported, "kernel/x.py", helpers=house).text == unimported
+
+
+V130_TMA = """\
+def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group=1, mcast_mask=None, acquire=True):
+    pass
+"""
+
+
+@pytest.mark.parametrize(
+    ("call", "helpers_tma", "rewritten"),
+    [
+        ("tma_load_tile(t, s, mb, acquire=False)", "house", True),
+        ("tma_load_tile(t, s, mb, acquire=False)", V130_TMA, False),  # helper still fences
+        ("tma_load_tile(t, s, mb, acquire=True)", "house", False),
+        ("tma_load_tile(t, s, mb, cta_group=2)", "house", False),
+        ("tma_load_tile(t, s, mb, mcast_mask=3)", "house", False),
+        ("tma_load_tile(t, s, mb, cta_group=1)", "house", True),
+    ],
+)
+def test_codemod_drops_only_tma_args_the_helper_hardcodes(call, helpers_tma, rewritten, house):
+    before = f"from ..tile_dsl.tma import tma_load_tile\n\n\ndef f(t, s, mb):\n    {call}\n"
+    helpers = dict(house)
+    if helpers_tma != "house":
+        helpers["tma"] = audit.analyze(helpers_tma, "tile_dsl/tma.py")
+    after = restyle.restyle_source(before, "kernel/x.py", helpers=helpers).text
+    assert (after != before) == rewritten
+    if rewritten:
+        assert "tma_load_tile(t, s, mb)\n" in after
 
 
 def _defined_names(tree: ast.Module) -> set[str]:

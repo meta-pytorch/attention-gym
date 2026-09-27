@@ -231,19 +231,16 @@ def compute_warp_group(
                     sQ_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
                 tma_load_tile(
                     sK_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
                 tma_load_tile(
                     sGate_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_gate, zero, load_head, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
         if warp_local == 1:
             if lane_idx == 0:
@@ -539,19 +536,16 @@ def compute_warp_group(
                     sQ_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_q, zero, load_head_q, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
                 tma_load_tile(
                     sK_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_k, zero, load_head_k, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
                 tma_load_tile(
                     sGate_tma[load_stage],
                     tma_slice_runtime_desc(load_desc_gate, zero, load_head, load_token),
                     bars.mb_raw_ready[load_stage].smem_ptr,
-                    acquire=False,
                 )
 
         # ---- phase 2, warp 0: KK = K decay @ K inv^T, L, T^-1, inverse_beta ----------------
@@ -719,17 +713,14 @@ def compute_warp_group(
                 tma_store_tile(
                     sK_decay_tma[rec_slot],
                     tma_slice_runtime_desc((desc_k_decay_base + store_batch).tospace(cutlass.AddressSpace.generic), zero, zero, store_head, store_chunk),
-                    acquire=False,
                 )
                 tma_store_tile(
                     sQ_decay_tma[rec_slot],
                     tma_slice_runtime_desc((desc_q_decay_base + store_batch).tospace(cutlass.AddressSpace.generic), zero, zero, store_head, store_chunk),
-                    acquire=False,
                 )
                 tma_store_tile(
                     sW_tma[rec_slot],
                     tma_slice_runtime_desc((desc_t_base + store_batch).tospace(cutlass.AddressSpace.generic), zero, zero, store_head, store_chunk),
-                    acquire=False,
                 )
                 tma_store_commit()
     if warp_local == 1:

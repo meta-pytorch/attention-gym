@@ -30,7 +30,15 @@ vendored_tag = "v1.30.0"
 upstream_commit = "42286a6fb8792055f3db80403350e80114ea086c"
 stack_prs = [606, 607, 608, 609]
 
-fix = []
+# --------------------------------------------------------------------------- restyle / infra
+[[fix]]
+id = "S8/S6/S3"
+title = "Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases"
+kind = "restyle"
+ag_subject = "Prune and restyle the vendored v1.30 tile_dsl and common helpers"
+guarding_tests = []
+gate = "sass (74/74 identical)"
+upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.

@@ -274,7 +274,7 @@ def epilogue_warp(
                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
                 checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                 checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, cutlass.Int32(0), head_o)
-                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                 tma_store_commit()
                 tma_store_wait(0)
                 if nvvm.elect_sync():
@@ -301,7 +301,7 @@ def epilogue_warp(
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                         checkpoint_entry = checkpoint_quotient
                         checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, checkpoint_entry, head_o)
-                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                         tma_store_commit()
                         did_checkpoint = cutlass.Int32(1)
                     checkpoint_remainder = checkpoint_remainder + cutlass.Int32(1)
@@ -312,7 +312,7 @@ def epilogue_warp(
                 o_slice = tma_slice_runtime_desc(desc_o_slot, v_offset, head_o, output_chunk_start)
                 did_o = cutlass.Int32(0)
                 if output_chunk >= write_start:
-                    tma_store_tile(sO_tma[o_stage], o_slice, acquire=False)
+                    tma_store_tile(sO_tma[o_stage], o_slice)
                     tma_store_commit()
                     did_o = cutlass.Int32(1)
                 if cutlass.const_expr(cfg.enable_checkpoints):
@@ -346,7 +346,7 @@ def epilogue_warp(
             o_stage = last_cum_chunk % cfg.smem_o_stages
             bars.mb_o_tmastg_ready[o_stage].wait((last_cum_chunk // cfg.smem_o_stages) % 2)
             o_slice = tma_slice_runtime_desc(desc_o_slot, v_offset, head_o, output_chunk_start)
-            tma_store_tile(sO_tma[o_stage], o_slice, acquire=False)
+            tma_store_tile(sO_tma[o_stage], o_slice)
             tma_store_commit()
             tma_store_wait(0)
             if nvvm.elect_sync():
@@ -713,7 +713,7 @@ def tmaldg_warp(
                 bars.mb_raw_ready[raw_bar_index.idx].arrive(n_bytes=cfg.tma_v_bytes + cfg.tma_gate_bytes)
             raw_ready_ptr = bars.mb_raw_ready[raw_bar_index.idx].smem_ptr
             v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, chunk_start)
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr)
 
             chunk_count = cutlass.Uint32(cum_chunk_base + (chunk_idx - compute_start))
             decay_stage = cutlass.Int32(chunk_count % cfg.smem_decay_stages)
@@ -723,7 +723,7 @@ def tmaldg_warp(
 
             # ---- diag record into the gate stage -------------------------------------
             diag_slice = tma_slice_runtime_desc(desc_diag_slot, cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sGate_tma[raw_index.idx], diag_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], diag_slice, raw_ready_ptr)
 
             # ---- k_decay, q_decay, T, A records on the decay stage's one barrier -------------
             bars.mb_decay_tcgen05_done[decay_stage].wait(decay_free_parity)
@@ -732,13 +732,13 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive(n_bytes=3 * cfg.tma_k_bytes + cfg.b_t * cfg.b_t * bytes_per_element)
             k_decay_slice = tma_slice_runtime_desc(desc_k_decay_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sK_decay_tma[decay_stage], k_decay_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr, acquire=False)
+            tma_load_tile(sK_decay_tma[decay_stage], k_decay_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr)
             q_decay_slice = tma_slice_runtime_desc(desc_q_decay_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sQ_decay_tma[decay_stage], q_decay_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr, acquire=False)
+            tma_load_tile(sQ_decay_tma[decay_stage], q_decay_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr)
             t_slice = tma_slice_runtime_desc(desc_t_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sK_restore_tma[decay_stage], t_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr, acquire=False)
+            tma_load_tile(sK_restore_tma[decay_stage], t_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr)
             a_slice = tma_slice_runtime_desc(desc_a_slot, cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sA_tma[intermediate_stage], a_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr, acquire=False)
+            tma_load_tile(sA_tma[intermediate_stage], a_slice, bars.mb_k_decay_inv_cg0_ready[decay_stage].smem_ptr)
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
             raw_bar_index = advance(raw_bar_index, cfg.smem_raw_bar_stages)

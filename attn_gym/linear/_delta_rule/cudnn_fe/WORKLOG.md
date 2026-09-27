@@ -48,6 +48,26 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   #1013/#1015), B12 checkpoint `[V,K]` descriptors, S11 V-major state. Inherited from main: B4 dO
   dtype check.
 
+## 4. Restyle, pruning and infra (gated by SASS, not behavior)
+
+S1–S4, S8/S6/S3, S15 (restyle), S5/S13 (frozen cfgs, `@jit_cache` over fake TVM-FFI signatures,
+compile target in the key), R5 (driver simplification, −95 lines), S10 (ruff), R16 (renames), R10,
+R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the ledger. Replay notes:
+
+- One commit per kernel family; SASS gate each; then the bench gate (R1).
+- Upstream-only knobs and helpers come back verbatim with every drop; re-prune after the behavior
+  rows. `python -m tools.cudnn_fe.audit --root <candidate> --strict` lists what is back.
+- Run S10 (ruff) last so upstream diffs stay readable during replay.
+- Append to, never replace, per-file notices (R12).
+
+
+## Decisions
+
+| Decision | Rationale / evidence | Revisit when |
+|---|---|---|
+| Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
+| `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+
 ## Known limitations and pre-existing issues (not fixed)
 
 - Fails-without evidence predates the final commit order (see "Reading an entry").

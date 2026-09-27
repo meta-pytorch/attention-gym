@@ -475,7 +475,7 @@ def tmastg_warp(
             dv_index = advance(dv_index, cfg.smem_dv_stages)
             dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, tok_coord)
             if chunk_idx < write_end:
-                tma_store_tile(sdV_tma[dv_idx], dv_slice, acquire=False)
+                tma_store_tile(sdV_tma[dv_idx], dv_slice)
                 tma_store_commit()
 
             dk_idx = dk_index.idx
@@ -483,7 +483,7 @@ def tmastg_warp(
             dk_index = advance(dk_index, cfg.smem_dk_stages)
             dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, tok_coord)
             if chunk_idx < write_end:
-                tma_store_tile(sdK_tma[dk_idx], dk_slice, acquire=False)
+                tma_store_tile(sdK_tma[dk_idx], dk_slice)
                 tma_store_commit()
 
             tma_store_wait(1)
@@ -497,7 +497,7 @@ def tmastg_warp(
                 dq_index = advance(dq_index, cfg.smem_dq_stages)
                 dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_o, dq_tok_coord)
                 if dq_owned:
-                    tma_store_tile(sdQ_tma[dq_idx], dq_slice, acquire=False)
+                    tma_store_tile(sdQ_tma[dq_idx], dq_slice)
                     tma_store_commit()
                 tma_store_wait(0)
                 bars.mb_dq_tmastg_done[dq_idx].arrive()
@@ -1683,7 +1683,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
             # ---- Q load --------------------------------------------------------------
             if block_head:
@@ -1694,7 +1694,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_q_ready[q_idx].arrive(n_bytes=cfg.tma_q_bytes)
                 q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, block_token_coord)
-                tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr, acquire=False)
+                tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr)
 
             # ---- V load --------------------------------------------------------------
             v_idx = v_index.idx
@@ -1703,7 +1703,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
             v_slice = tma_slice_runtime_desc(desc_v_slot, cutlass.Int32(0), head_v, tok_coord)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
 
             # ---- dO load -------------------------------------------------------------
             if block_head:
@@ -1713,7 +1713,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_do_ready[do_idx].arrive(n_bytes=cfg.tma_do_bytes)
                 do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, block_token_coord)
-                tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr, acquire=False)
+                tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr)
 
             # ---- entering state ------------------------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -1723,7 +1723,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
                 checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
-                tma_load_tile(sCheckpoint_tma[state_idx], checkpoint_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
+                tma_load_tile(sCheckpoint_tma[state_idx], checkpoint_slice, bars.mb_state_ready[state_idx].smem_ptr)
 
         next_tile, scheduler_state = scheduler_publish_next(
             cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one

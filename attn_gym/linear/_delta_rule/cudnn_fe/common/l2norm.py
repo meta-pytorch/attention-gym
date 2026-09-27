@@ -16,12 +16,12 @@ from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
 from .._compat import current_device
-from ..tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from ..tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from ..tile_dsl.tma import ld_global_v4, st_global, st_global_v4
 
 USE_PDL = True
@@ -61,7 +61,9 @@ def frost_l2norm_qk(
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     grp = tidx // cutlass.Int32(FWD_LANES)
     lane_idx = tidx % cutlass.Int32(FWD_LANES)
-    row0 = (cutlass.Int32(bid[0]) * cutlass.Int32(THREADS_PER_CTA // FWD_LANES) + grp) * cutlass.Int32(FWD_ROWS_PER_GROUP)
+    row0 = (
+        cutlass.Int32(bid[0]) * cutlass.Int32(THREADS_PER_CTA // FWD_LANES) + grp
+    ) * cutlass.Int32(FWD_ROWS_PER_GROUP)
     rows = []
     workspace_addrs = []
     nrm_addrs = []
@@ -78,13 +80,17 @@ def frost_l2norm_qk(
                 expanded_row = row_r // h_q
                 h = row_r % h_q
                 t = expanded_row // cutlass.Int32(expand_num)
-                on_phase = expanded_row - t * cutlass.Int32(expand_num) == cutlass.Int32(expand_phase)
+                on_phase = expanded_row - t * cutlass.Int32(expand_num) == cutlass.Int32(
+                    expand_phase
+                )
                 out_row = cutlass.Int64(row_r)
             else:
                 t = row_r // h_q
                 h = row_r % h_q
                 if cutlass.const_expr(expand_num > 1):
-                    out_row = (t * cutlass.Int64(expand_num) + cutlass.Int64(expand_phase)) * cutlass.Int64(h_q) + cutlass.Int64(h)
+                    out_row = (
+                        t * cutlass.Int64(expand_num) + cutlass.Int64(expand_phase)
+                    ) * cutlass.Int64(h_q) + cutlass.Int64(h)
                 else:
                     out_row = cutlass.Int64(row_r)
             src_elements = t * cutlass.Int64(mQ.stride[0]) + h * cutlass.Int64(mQ.stride[1])
@@ -97,7 +103,9 @@ def frost_l2norm_qk(
             h = k_row % h_k
             src_elements = t * cutlass.Int64(mK.stride[0]) + h * cutlass.Int64(mK.stride[1])
             src_addr = mK.iterator.toint() + src_elements * cutlass.Int64(2)
-            workspace_addr = mKn.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(d) * cutlass.Int64(2)
+            workspace_addr = mKn.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(
+                d
+            ) * cutlass.Int64(2)
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         chunks = []
         for c in cutlass.range_constexpr(vec_chunks):
@@ -115,7 +123,10 @@ def frost_l2norm_qk(
         acc = cutlass.Float32(0.0)
         for c in cutlass.range_constexpr(vec_chunks):
             v = vals[r][c]
-            acc = acc + (((v[0] * v[0] + v[1] * v[1]) + (v[2] * v[2] + v[3] * v[3])) + ((v[4] * v[4] + v[5] * v[5]) + (v[6] * v[6] + v[7] * v[7])))
+            acc = acc + (
+                ((v[0] * v[0] + v[1] * v[1]) + (v[2] * v[2] + v[3] * v[3]))
+                + ((v[4] * v[4] + v[5] * v[5]) + (v[6] * v[6] + v[7] * v[7]))
+            )
         inv = l2norm_inv(lane_group_sum(acc, FWD_LANES))
         if rows[r] < n_rows:
             for c in cutlass.range_constexpr(vec_chunks):
@@ -149,9 +160,22 @@ def l2norm_qk_launch(
     expand_fill: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, d, expand_num, expand_phase, expand_fill).launch(
-        grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
-    )
+    frost_l2norm_qk(
+        q,
+        k,
+        q_n,
+        k_n,
+        inv_q,
+        inv_k,
+        n_q_rows,
+        n_rows,
+        h_q,
+        h_k,
+        d,
+        expand_num,
+        expand_phase,
+        expand_fill,
+    ).launch(grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 compiled_cache = {}
@@ -171,10 +195,36 @@ class L2NormQkRecipe(NamedTuple):
 
 def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     """The lowered normalize launch: no validation, no key build."""
-    r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
+    r.compiled(
+        q,
+        k,
+        q_n,
+        k_n,
+        inv_q,
+        inv_k,
+        r.n_q_rows,
+        r.n_rows,
+        r.h_q,
+        r.h_k,
+        r.n_blocks,
+        cuda.CUstream(int(stream)),
+    )
 
 
-def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, stream) -> L2NormQkRecipe:
+def build_l2norm_qk(
+    q,
+    k,
+    q_n,
+    k_n,
+    inv_q,
+    inv_k,
+    *,
+    expand_num=1,
+    expand_phase=0,
+    expand_fill=False,
+    skip_q=False,
+    stream,
+) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
     compact io workspace copies, fp32 inverse norms to their slots.  Sources
     are read through their own strides; ``expand_num > 1`` writes the q rows
@@ -185,18 +235,29 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     alone (the state summaries take no q); q, q_n and inv_q are then never
     read and may alias the k buffers."""
     total, h_q, d = (int(s_) for s_ in q.shape)
-    total_k, h_k, d_k = (int(s_) for s_ in k.shape)
+    total_k, h_k, _d_k = (int(s_) for s_ in k.shape)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
     n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), d, current_device())
+    key = (
+        "fwd",
+        str(q.dtype),
+        int(expand_num),
+        int(expand_phase),
+        bool(expand_fill),
+        d,
+        current_device(),
+    )
     if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
         compiled_cache[key] = cute.compile(
             l2norm_qk_launch,
-            *(from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))),
+            *(
+                from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead)
+                for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))
+            ),
             *(cutlass.Int32(a) for a in args),
             d,
             int(expand_num),

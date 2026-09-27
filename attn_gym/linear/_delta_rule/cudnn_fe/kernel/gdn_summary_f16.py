@@ -640,7 +640,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
             # ---- chunk-factor tile load ----------------------------------------------
             tinv_idx = tinv_index.idx
@@ -649,7 +649,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_tinv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
             tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_tinv_ready[tinv_idx].smem_ptr, acquire=False)
+            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_tinv_ready[tinv_idx].smem_ptr)
 
             # ---- V load --------------------------------------------------------------
             v_idx = v_index.idx
@@ -658,7 +658,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
             v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, tok_coord)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
 
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
 

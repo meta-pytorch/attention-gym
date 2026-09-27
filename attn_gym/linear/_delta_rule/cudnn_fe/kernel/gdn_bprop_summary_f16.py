@@ -940,7 +940,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
             # ---- Q load: the block's 64 compact tokens -------------------------------
             if block_head:
@@ -950,7 +950,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_q_ready[q_idx].arrive(n_bytes=cfg.tma_q_bytes)
                 q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, block_token_coord)
-                tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr, acquire=False)
+                tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr)
 
             # ---- dO load: the block's 64 compact tokens ------------------------------
             if block_head:
@@ -961,7 +961,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_do_ready[do_idx].arrive(n_bytes=cfg.tma_do_bytes)
                 do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, block_token_coord)
-                tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr, acquire=False)
+                tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr)
 
             # ---- chunk-factor tile load ----------------------------------------------
             tinv_idx = tinv_index.idx
@@ -971,7 +971,7 @@ def tmaldg_warp(
                 bars.mb_t_inv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
             tinv_row = chunk_idx
             tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_idx, tinv_row)
-            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr, acquire=False)
+            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr)
 
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile

@@ -300,7 +300,7 @@ def epilogue_warp(
                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
                 checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                 checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), write_start, head_o)
-                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                 tma_store_commit()
                 tma_store_wait(0)
                 if nvvm.elect_sync():
@@ -317,7 +317,7 @@ def epilogue_warp(
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                         checkpoint_entry = checkpoint_quotient
                         checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), checkpoint_entry, head_o)
-                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                        tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                         tma_store_commit()
                         tma_store_wait(0)
                         if nvvm.elect_sync():
@@ -733,12 +733,12 @@ def tmaldg_warp(
                 bars.mb_raw_ready[raw_index.idx].arrive(n_bytes=cfg.tma_k_bytes + cfg.tma_gate_bytes + (0 if cfg.v_is_zero else cfg.tma_v_bytes))
             raw_ready_ptr = bars.mb_raw_ready[raw_index.idx].smem_ptr
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, chunk_start)
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr)
             gate_slice = tma_slice_runtime_desc(desc_gate_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr)
             if cutlass.const_expr(not cfg.v_is_zero):
                 v_slice = tma_slice_runtime_desc(desc_v_slot, cutlass.Int32(0), head_v, chunk_start)
-                tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr, acquire=False)
+                tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr)
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)

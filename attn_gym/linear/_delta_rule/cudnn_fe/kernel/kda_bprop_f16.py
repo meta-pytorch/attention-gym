@@ -588,25 +588,25 @@ def epilogue_warp(
                 if pend_writes:
                     desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
                     dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDq_tma[dq_index.idx], dq_slice, acquire=False)
+                    tma_store_tile(sDq_tma[dq_index.idx], dq_slice)
                     tma_store_commit()
                 bars.mb_dk_tmastg_ready[dk_index.idx].wait(dk_index.phase)
                 if pend_writes:
                     desc_dk_slot = (desc_dk_base + slot).tospace(cutlass.AddressSpace.generic)
                     dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDk_tma[dk_index.idx], dk_slice, acquire=False)
+                    tma_store_tile(sDk_tma[dk_index.idx], dk_slice)
                     tma_store_commit()
                 bars.mb_dgate_tmastg_ready[dgate_index.idx].wait(dgate_index.phase)
                 if pend_writes:
                     desc_dgate_slot = (desc_dgate_base + slot).tospace(cutlass.AddressSpace.generic)
                     dgate_slice = tma_slice_runtime_desc(desc_dgate_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice, acquire=False)
+                    tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice)
                     tma_store_commit()
                 bars.mb_dv_tmastg_ready[dv_index.idx].wait(dv_index.phase)
                 if pend_writes:
                     desc_dv_slot = (desc_dv_base + slot).tospace(cutlass.AddressSpace.generic)
                     dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDv_tma[dv_index.idx], dv_slice, acquire=False)
+                    tma_store_tile(sDv_tma[dv_index.idx], dv_slice)
                     tma_store_commit()
                 tma_store_wait(3)
                 bars.mb_dq_tmastg_done[dq_index.idx].arrive()
@@ -1551,20 +1551,20 @@ def tmaldg_warp(
                 bars.mb_raw_ready[raw_index.idx].arrive(n_bytes=cfg.tma_q_bytes + cfg.tma_k_bytes + cfg.tma_gate_bytes + cfg.tma_v_bytes)
             raw_ready_ptr = bars.mb_raw_ready[raw_index.idx].smem_ptr
             q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, chunk_start)
-            tma_load_tile(sQ_tma[raw_index.idx], q_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sQ_tma[raw_index.idx], q_slice, raw_ready_ptr)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, chunk_start)
-            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sK_tma[raw_index.idx], k_slice, raw_ready_ptr)
             gate_slice = tma_slice_runtime_desc(desc_gate_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sGate_tma[raw_index.idx], gate_slice, raw_ready_ptr)
             v_slice = tma_slice_runtime_desc(desc_v_slot, cutlass.Int32(0), head_v, chunk_start)
-            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr, acquire=False)
+            tma_load_tile(sV_tma[raw_index.idx], v_slice, raw_ready_ptr)
 
             # ---- dO load -------------------------------------------------------------
             bars.mb_do_done[raw_index.idx].wait(raw_index.phase)
             if elect_one:
                 bars.mb_do_ready[raw_index.idx].arrive(n_bytes=cfg.tma_do_bytes)
             do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, chunk_start)
-            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr, acquire=False)
+            tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr)
 
             # ---- entering state ------------------------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -1575,7 +1575,7 @@ def tmaldg_warp(
                 if elect_one:
                     bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
                 state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
-                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
+                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile
@@ -1736,13 +1736,7 @@ def compute0_warp_group(
                             gate1 = gate_scale(cfg, gate1)
                         else:
                             gate1 = cutlass.Float32(0.0)
-                    pair_vec = nvvm.add_packed_f32x2(
-                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                        ftz=False,
-                        rnd="rn",
-                    )
-                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix0, row_pair_sum = fadd2(prefix_acc, gate0, gate0, gate1)
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
@@ -1794,13 +1788,7 @@ def compute0_warp_group(
                     prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1 ^ f32_segment, f32_segment_dim, elem_bytes=4)
                     gate0 = gate_raw[row0]
                     gate1 = gate_raw[row1]
-                    pair_vec = nvvm.add_packed_f32x2(
-                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                        ftz=False,
-                        rnd="rn",
-                    )
-                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix0, row_pair_sum = fadd2(prefix_acc, gate0, gate0, gate1)
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)

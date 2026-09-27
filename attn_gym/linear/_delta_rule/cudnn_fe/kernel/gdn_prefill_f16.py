@@ -384,7 +384,7 @@ def tmastg_warp(
                     checkpoint_phase = (checkpoint_store_cnt // cfg.smem_checkpoint_stages) & cutlass.Int32(1)
                     bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_phase)
                     checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, checkpoint_coord, head_o)
-                    tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                    tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                     tma_store_commit()
                     tma_store_wait(0)
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].arrive()
@@ -408,7 +408,7 @@ def tmastg_warp(
                     if cutlass.const_expr(cfg.expand_num > 1):
                         tok_coord = (chunk_idx // cutlass.Int32(cfg.expand_num)) * cutlass.Int32(cfg.b_t)
                     o_slice = tma_slice_runtime_desc(desc_o_slot, v_offset, head_o, tok_coord)
-                    tma_store_tile(sO_tma[o_idx], o_slice, acquire=False)
+                    tma_store_tile(sO_tma[o_idx], o_slice)
                     tma_store_commit()
                     did_o = cutlass.Int32(1)
 
@@ -420,7 +420,7 @@ def tmastg_warp(
                         if checkpoint_mod == 0:
                             bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_phase)
                             checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, checkpoint_coord, head_o)
-                            tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                            tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice)
                             tma_store_commit()
                             checkpoint_coord += 1
                             did_checkpoint = cutlass.Int32(1)
@@ -1122,9 +1122,9 @@ def tmaldg_warp(
             q_coord = tok_coord if cutlass.const_expr(cfg.expand_num == 1) else (compute_start // cutlass.Int32(cfg.expand_num)) * cutlass.Int32(cfg.b_t)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
             kq_tile = sKQ_lo_tma[kq_idx]
-            tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
+            tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
             q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, q_coord)
-            tma_load_tile(kq_tile.shifted(kq_box_elements), q_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
+            tma_load_tile(kq_tile.shifted(kq_box_elements), q_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
             for chunk_idx in cutlass.range(compute_start + 1, write_end):
                 tok_coord = chunk_idx * cutlass.Int32(cfg.b_t)
 
@@ -1140,11 +1140,11 @@ def tmaldg_warp(
                 q_coord = tok_coord if cutlass.const_expr(cfg.expand_num == 1) else (chunk_idx // cutlass.Int32(cfg.expand_num)) * cutlass.Int32(cfg.b_t)
                 q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, q_coord)
                 if member == 0:
-                    tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
-                    tma_load_tile(kq_tile.shifted(kq_box_elements), q_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
+                    tma_load_tile(kq_tile, k_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
+                    tma_load_tile(kq_tile.shifted(kq_box_elements), q_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
                 else:
-                    tma_load_tile(kq_tile, q_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
-                    tma_load_tile(kq_tile.shifted(kq_box_elements), k_slice, bars.mb_kq_ready[kq_idx].smem_ptr, acquire=False)
+                    tma_load_tile(kq_tile, q_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
+                    tma_load_tile(kq_tile.shifted(kq_box_elements), k_slice, bars.mb_kq_ready[kq_idx].smem_ptr)
 
                 # ---- V load ----------------------------------------------------------
                 v_idx = v_index.idx
@@ -1154,7 +1154,7 @@ def tmaldg_warp(
                     bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
                 v_tok = (chunk_idx - 1) * cutlass.Int32(cfg.b_t)
                 v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, v_tok)
-                tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+                tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
 
                 # ---- chunk-factor tile load ------------------------------------------
                 if cutlass.const_expr(cfg.tinv_source == "gmem"):
@@ -1165,7 +1165,7 @@ def tmaldg_warp(
                         bars.mb_t_inv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
                     tinv_row = chunk_idx - cutlass.Int32(1)
                     tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, tinv_row)
-                    tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr, acquire=False)
+                    tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr)
 
             v_idx = v_index.idx
             bars.mb_v_done[v_idx].wait(v_index.phase)
@@ -1174,7 +1174,7 @@ def tmaldg_warp(
                 bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
             v_tok = (write_end - cutlass.Int32(1)) * cutlass.Int32(cfg.b_t)
             v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, v_tok)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
             if cutlass.const_expr(cfg.tinv_source == "gmem"):
                 tinv_idx = tinv_index.idx
                 bars.mb_t_inv_done[tinv_idx].wait(tinv_index.phase)
@@ -1183,7 +1183,7 @@ def tmaldg_warp(
                     bars.mb_t_inv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
                 tinv_row = write_end - cutlass.Int32(1)
                 tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, tinv_row)
-                tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr, acquire=False)
+                tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr)
 
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
 

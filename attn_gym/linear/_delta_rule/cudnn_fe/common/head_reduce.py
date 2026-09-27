@@ -22,16 +22,15 @@ Serves the f16/bf16 ``[total, HO, D]`` tensor grads (dQ/dK for GVA, dK/dV for
 GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
 """
 
-import cutlass
-import cutlass.cute as cute
 import cuda.bindings.driver as cuda
-
+import cutlass
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
-from .host import get_dtype
 from .._compat import current_device
-from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from .host import get_dtype
 
 USE_PDL = True
 
@@ -54,13 +53,17 @@ def frost_head_reduce(
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
-    gw = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
+    gw = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(
+        cutlass.Int32(tidx)
+    )
     if gw < total_words:
         seg = gw // cutlass.Int64(inner_words)
         w_off = gw - seg * cutlass.Int64(inner_words)
         base = seg * (cutlass.Int64(r) * cutlass.Int64(inner_words)) + w_off
         t_idx, h_idx = divmod(seg.to(cutlass.Int32), h_count)
-        out_off = cutlass.Int64(t_idx) * out_row_words + cutlass.Int64(h_idx) * out_head_words + w_off
+        out_off = (
+            cutlass.Int64(t_idx) * out_row_words + cutlass.Int64(h_idx) * out_head_words + w_off
+        )
         if cutlass.const_expr(io_dtype == cutlass.Float32):
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Float32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Float32)
@@ -75,7 +78,10 @@ def frost_head_reduce(
             acc_lo = cutlass.Float32(0.0)
             acc_hi = cutlass.Float32(0.0)
             for i in cutlass.range(r):
-                lo, hi = f16x2_to_f32((in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load(), dtype=io_dtype)
+                lo, hi = f16x2_to_f32(
+                    (in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load(),
+                    dtype=io_dtype,
+                )
                 acc_lo = lo if i == 0 else acc_lo + lo
                 acc_hi = hi if i == 0 else acc_hi + hi
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
@@ -97,7 +103,17 @@ def launch(
     io_dtype: cutlass.Constexpr,
     stream: cuda.CUstream,
 ) -> None:
-    frost_head_reduce(mIn, mOut, total_words, out_row_words, out_head_words, cute.FastDivmodDivisorV2(h_count), r, inner_words, io_dtype).launch(
+    frost_head_reduce(
+        mIn,
+        mOut,
+        total_words,
+        out_row_words,
+        out_head_words,
+        cute.FastDivmodDivisorV2(h_count),
+        r,
+        inner_words,
+        io_dtype,
+    ).launch(
         grid=(grid_x, 1, 1),
         block=(BLOCK, 1, 1),
         stream=stream,
@@ -135,12 +151,15 @@ def head_group_reduce(src, dst, *, stream) -> None:
 
     dst_strides = tuple(dst.stride())
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
-    out_head_words = (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
+    out_head_words = (
+        (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
+    )
 
     key = (str(src.dtype).split(".")[-1], len(src.shape), D, current_device())
     if key not in compiled_cache:
-
-        src_c = from_dlpack(src, assumed_align=4).mark_layout_dynamic(leading_dim=len(src.shape) - 1)
+        src_c = from_dlpack(src, assumed_align=4).mark_layout_dynamic(
+            leading_dim=len(src.shape) - 1
+        )
         compiled_cache[key] = cute.compile(
             launch,
             src_c,
@@ -156,7 +175,9 @@ def head_group_reduce(src, dst, *, stream) -> None:
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    compiled_cache[key](src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream)
+    compiled_cache[key](
+        src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream
+    )
 
 
 frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=False)
