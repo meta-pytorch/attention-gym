@@ -40,6 +40,11 @@ def _int32(n: int, device) -> torch.Tensor:
     return torch.empty(n, dtype=torch.int32, device=device)
 
 
+def _aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy a tensor whose base is not 16-byte aligned; the kernels assume 16-byte bases."""
+    return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
+
+
 def _work_count(device) -> torch.Tensor:
     """The uncut/split work-item count cell the prologue fills (tests record it here)."""
     return _int32(1, device)
@@ -96,7 +101,9 @@ def gdn_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``."""
     # DLPack refuses tensors that require grad; the kernels never differentiate.
-    q, k, v, gate, beta, cu_seqlens = (t.detach() for t in (q, k, v, gate, beta, cu_seqlens))
+    q, k, v, gate, beta, cu_seqlens = (
+        _aligned(t.detach()) for t in (q, k, v, gate, beta, cu_seqlens)
+    )
     initial_state = None if initial_state is None else initial_state.detach()
     tokens, _, dim_k = q.shape
     dim_v = v.shape[-1]
@@ -337,7 +344,7 @@ def gdn_backward(
     from attn_gym.linear._delta_rule.triton.group_sum import group_sum
 
     q, k, v, gate, beta, d_output, cu_seqlens = (
-        t.detach() for t in (q, k, v, gate, beta, d_output, cu_seqlens)
+        _aligned(t.detach()) for t in (q, k, v, gate, beta, d_output, cu_seqlens)
     )
     initial_state = None if initial_state is None else initial_state.detach()
     d_final_state = None if d_final_state is None else d_final_state.detach()
