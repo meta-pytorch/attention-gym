@@ -183,6 +183,7 @@ title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile 
 kind = "restyle"
 ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
 ag_subjects_extra = [
+  "Share exact legacy dynamic-layout fake signatures",
   "Compile common v1.30 hosts from persisted fake tensor signatures",
 ]
 guarding_tests = [

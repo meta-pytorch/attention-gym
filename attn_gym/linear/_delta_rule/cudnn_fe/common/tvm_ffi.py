@@ -5,6 +5,7 @@
 from typing import Any
 
 import cutlass
+from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import make_fake_strided_tensor
@@ -52,6 +53,28 @@ def make_strided_signature_tensor(
         ),
         assumed_align=assumed_align,
         use_int64_strides=use_int64_offsets,
+    )
+
+
+def make_dynamic_signature_tensor(
+    dtype: Any,
+    rank: int,
+    *,
+    assumed_align: int,
+    use_int64_offsets: bool = False,
+):
+    """Match upstream ``mark_layout_dynamic(leading_dim=rank - 1)`` exactly.
+
+    Legacy outer strides are always int64 with no divisibility promise. The
+    optional wide ABI also widens shapes; the default retains int32 shapes.
+    """
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    return make_strided_signature_tensor(
+        dtype,
+        tuple(sym_int() for _ in range(rank)),
+        assumed_align=assumed_align,
+        use_int64_offsets=True,
+        stride_divisibility=1,
     )
 
 
