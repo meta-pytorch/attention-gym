@@ -5,7 +5,7 @@ import torch
 
 pytest.importorskip("cutlass.cute")
 
-from attn_gym.linear._delta_rule.cudnn_fe import gdn, kda
+from attn_gym.linear._delta_rule.cudnn_fe import gdn, kda, plan
 from attn_gym.linear._delta_rule.cudnn_fe.common import (
     gate_bwd,
     head_reduce,
@@ -13,7 +13,6 @@ from attn_gym.linear._delta_rule.cudnn_fe.common import (
     piece_chain,
     split_k,
 )
-from attn_gym.linear._delta_rule.cudnn_fe.common.host import tensormap_workspace_bytes
 from attn_gym.linear._delta_rule.cudnn_fe.common.launch import (
     validate_named_barriers,
     validate_warp_roles,
@@ -35,12 +34,12 @@ from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
 
 
-def unexpected_compile(*args, **kwargs):
-    raise AssertionError("invalid metadata reached the compiler")
+def reached_compiler(*args, **kwargs):
+    raise RuntimeError("reached the compiler")
 
 
 def test_head_reduction_rejects_nondividing_heads(monkeypatch):
-    monkeypatch.setattr(head_reduce, "_compile_head_reduce", unexpected_compile)
+    monkeypatch.setattr(head_reduce, "_compile_head_reduce", reached_compiler)
     source = torch.empty(8, 4, 64, dtype=torch.bfloat16, device="cuda")
     output = torch.empty(8, 3, 64, dtype=source.dtype, device="cuda")
     with pytest.raises(ValueError, match="head count must divide"):
@@ -48,7 +47,7 @@ def test_head_reduction_rejects_nondividing_heads(monkeypatch):
 
 
 def test_l2norm_rejects_partial_vector_rows(monkeypatch):
-    monkeypatch.setattr(l2norm, "_compile_l2norm_qk", unexpected_compile)
+    monkeypatch.setattr(l2norm, "_compile_l2norm_qk", reached_compiler)
     source = torch.empty(8, 2, 63, dtype=torch.bfloat16, device="cuda")
     norm = torch.empty(8, 2, device="cuda")
     with pytest.raises(ValueError, match="head dimension must be 64 or 128"):
@@ -56,7 +55,7 @@ def test_l2norm_rejects_partial_vector_rows(monkeypatch):
 
 
 def test_channel_gate_rejects_short_partial_workspace(monkeypatch):
-    monkeypatch.setattr(gate_bwd, "_compile_gate_bwd", unexpected_compile)
+    monkeypatch.setattr(gate_bwd, "_compile_gate_bwd", reached_compiler)
     source = torch.empty(8, 2, 64, device="cuda")
     parameter = torch.empty(2, device="cuda")
     partial = torch.empty(1, device="cuda")
@@ -67,7 +66,7 @@ def test_channel_gate_rejects_short_partial_workspace(monkeypatch):
 
 
 def test_state_chain_rejects_empty_row_tiles(monkeypatch):
-    monkeypatch.setattr(piece_chain, "_compile_state_chain", unexpected_compile)
+    monkeypatch.setattr(piece_chain, "_compile_state_chain", reached_compiler)
     with pytest.raises(ValueError, match="rows_per_cta"):
         piece_chain.build_state_chain(
             heads_out=2,
@@ -86,7 +85,7 @@ def test_state_chain_rejects_empty_row_tiles(monkeypatch):
 
 @pytest.mark.parametrize("invalid", ["tiles", "chunks"])
 def test_split_table_rejects_invalid_launch_geometry(monkeypatch, invalid):
-    monkeypatch.setattr(split_k, "_compile_split_table", unexpected_compile)
+    monkeypatch.setattr(split_k, "_compile_split_table", reached_compiler)
     gate = torch.empty(32, 2, device="cuda")
     cu = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
     items = torch.empty(64, 10, dtype=torch.int32, device="cuda")
@@ -118,10 +117,6 @@ def test_split_table_rejects_invalid_launch_geometry(monkeypatch, invalid):
 TOKENS, HEADS, DIM, B_T = 128, 2, 128, 64
 
 
-def reached_compiler(*args, **kwargs):
-    raise RuntimeError("reached the compiler")
-
-
 def test_warp_role_and_named_barrier_tables_reject_conflicts():
     groups = ((0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11))
     assert validate_warp_roles(groups, (12, 13, 14, 15)) == 16
@@ -150,10 +145,8 @@ def test_gdn_backward_cfgs_reject_unsupported_geometry(module, invalid):
         module.build_cfg(*args, **kwargs)
 
 
-def workspace(module, batch=1):
-    return torch.empty(
-        tensormap_workspace_bytes(module, batch) // 8, dtype=torch.int64, device="cuda"
-    )
+def workspace(module):
+    return plan.workspace(module, 1, "cuda")
 
 
 def misaligned(tensor):
