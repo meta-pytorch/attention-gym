@@ -25,15 +25,13 @@ a partial pass over token stripes (the same pass rewrites dGate -> dg_raw),
 then a finisher that folds the stripe partials.
 """
 
-import functools
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import (
     fadd2,
@@ -47,6 +45,7 @@ from ..tile_dsl.pointwise import (
 )
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
 from .host import get_dtype
+from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -459,9 +458,44 @@ def channel_gate_bwd_launch(
         )
 
 
-@functools.cache
-def gate_bwd_cache(key):
-    return {}
+@jit_cache
+def _compile_gate_bwd(specs, d_k, use_int64_offsets):
+    sym_int = cute.sym_int
+    tensors = []
+    for index, spec in enumerate(specs):
+        if spec is None:
+            tensors.append(None)
+        else:
+            dtype, rank = spec
+            align = 4 * (dtype.width // 8) if d_k and index < 2 else 4
+            tensors.append(
+                make_strided_signature_tensor(
+                    dtype,
+                    tuple(sym_int() for _ in range(rank)),
+                    assumed_align=align,
+                    use_int64_offsets=use_int64_offsets,
+                    stride_divisibility=1,
+                )
+            )
+    suffix = "_".join(
+        "none" if spec is None else f"{spec[0].__name__.lower()}r{spec[1]}" for spec in specs
+    )
+    name = f"gate_bwd_d{d_k}_{suffix}_i64{int(use_int64_offsets)}"
+    if d_k:
+        return compile_tvm_ffi(
+            channel_gate_bwd_launch,
+            d_k,
+            *tensors,
+            *(cutlass.Int32(0) for _ in range(3)),
+            cutlass.Float32(0),
+            name=name,
+        )
+    return compile_tvm_ffi(
+        scalar_gate_bwd_launch,
+        *tensors,
+        *(cutlass.Int32(0) for _ in range(5)),
+        name=name,
+    )
 
 
 def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, *, stream):
@@ -474,42 +508,10 @@ def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, p
     n_blocks = scalar_gate_blocks(n_tokens)
     head_tiles = -(-h_o // SCALAR_HEAD_TILE)
     slice_len = (n_tokens + n_blocks - 1) // n_blocks
-    cache = gate_bwd_cache(
-        (
-            "gdn",
-            str(g_raw.dtype),
-            str(a_log.dtype) if a_log is not None else "none",
-            str(dt_bias.dtype) if dt_bias is not None else "none",
-            d_a_log is not None,
-            d_dt_bias is not None,
-            part_a is not None,
-            part_dt is not None,
-            current_device(),
-        )
-    )
-    cu_stream = cuda.CUstream(int(stream))
     tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
-    if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=4) for t in tensors[:2]]
-        traced = [tr.mark_layout_dynamic(leading_dim=1) for tr in traced]
-        traced += [
-            from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-            if t is not None
-            else None
-            for t in tensors[2:]
-        ]
-        cache["compiled"] = cute.compile(
-            scalar_gate_bwd_launch,
-            *traced,
-            cutlass.Int32(n_tokens),
-            cutlass.Int32(h_o),
-            cutlass.Int32(slice_len),
-            cutlass.Int32(n_blocks),
-            cutlass.Int32(head_tiles),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles, cu_stream)
+    specs = tuple(None if t is None else (get_dtype(t.dtype), t.ndim) for t in tensors)
+    compiled = _compile_gate_bwd(specs, 0, True)
+    compiled(*tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles)
 
 
 def channel_gate_bwd(
@@ -521,46 +523,11 @@ def channel_gate_bwd(
     (unit amplitude / zero bias); the matching d_*/part_* are then None and
     that gradient is not produced."""
     n_tokens, h_o, d_k = (int(dim) for dim in d_gate.shape)
-    g_vector_bytes = 4 * (get_dtype(g_raw.dtype).width // 8)
     slice_len = (n_tokens + GATE_BWD_BLOCKS - 1) // GATE_BWD_BLOCKS
-    cache = gate_bwd_cache(
-        (
-            "channel",
-            str(g_raw.dtype),
-            str(a_log.dtype) if a_log is not None else "none",
-            str(dt_bias.dtype) if dt_bias is not None else "none",
-            d_a_log is not None,
-            d_dt_bias is not None,
-            part_a is not None,
-            part_dt is not None,
-            d_k,
-            current_device(),
-        )
-    )
-    cu_stream = cuda.CUstream(int(stream))
     tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
-    args = (n_tokens, h_o, slice_len)
-    if "compiled" not in cache:
-        traced = [
-            from_dlpack(t, assumed_align=g_vector_bytes).mark_layout_dynamic(leading_dim=2)
-            for t in (d_gate, g_raw)
-        ]
-        traced += [
-            from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=len(t.shape) - 1)
-            if t is not None
-            else None
-            for t in tensors[2:]
-        ]
-        cache["compiled"] = cute.compile(
-            channel_gate_bwd_launch,
-            d_k,
-            *traced,
-            *(cutlass.Int32(a) for a in args),
-            cutlass.Float32(gate_lower_bound),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, *args, float(gate_lower_bound), cu_stream)
+    specs = tuple(None if t is None else (get_dtype(t.dtype), t.ndim) for t in tensors)
+    compiled = _compile_gate_bwd(specs, d_k, True)
+    compiled(*tensors, n_tokens, h_o, slice_len, float(gate_lower_bound))
 
 
 frost_scalar_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=False)

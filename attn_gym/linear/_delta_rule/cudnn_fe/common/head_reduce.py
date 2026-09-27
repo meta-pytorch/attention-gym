@@ -25,12 +25,13 @@ GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
 import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from .host import get_dtype
+from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -121,7 +122,29 @@ def launch(
     )
 
 
-compiled_cache = {}
+@jit_cache
+def _compile_head_reduce(io_dtype, rank, dim, use_int64_offsets):
+    sym_int = cute.sym_int
+    tensors = [
+        make_strided_signature_tensor(
+            io_dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=4,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+        for _ in range(2)
+    ]
+    inner_words = dim if io_dtype == cutlass.Float32 else dim // 2
+    return compile_tvm_ffi(
+        launch,
+        *tensors,
+        *(cutlass.Int64(0) for _ in range(3)),
+        *(cutlass.Int32(0) for _ in range(3)),
+        inner_words,
+        io_dtype,
+        name=f"head_reduce_{io_dtype.__name__.lower()}_r{rank}_d{dim}_i64{int(use_int64_offsets)}",
+    )
 
 
 def head_group_reduce(src, dst, *, stream) -> None:
@@ -147,37 +170,14 @@ def head_group_reduce(src, dst, *, stream) -> None:
     inner_words = D if is_fp32 else D // 2
     total_words = total * H * inner_words
     grid_x = -(-total_words // BLOCK)
-    cu_stream = cuda.CUstream(int(stream))
-
     dst_strides = tuple(dst.stride())
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
     out_head_words = (
         (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
     )
 
-    key = (str(src.dtype).split(".")[-1], len(src.shape), D, current_device())
-    if key not in compiled_cache:
-        src_c = from_dlpack(src, assumed_align=4).mark_layout_dynamic(
-            leading_dim=len(src.shape) - 1
-        )
-        compiled_cache[key] = cute.compile(
-            launch,
-            src_c,
-            from_dlpack(dst, assumed_align=4).mark_layout_dynamic(leading_dim=len(dst.shape) - 1),
-            cutlass.Int64(total_words),
-            cutlass.Int64(out_row_words),
-            cutlass.Int64(out_head_words),
-            cutlass.Int32(grid_x),
-            cutlass.Int32(H),
-            cutlass.Int32(r),
-            inner_words,
-            io_dtype,
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    compiled_cache[key](
-        src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream
-    )
+    compiled = _compile_head_reduce(io_dtype, src.ndim, D, True)
+    compiled(src, dst, total_words, out_row_words, out_head_words, grid_x, H, r)
 
 
 frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=False)

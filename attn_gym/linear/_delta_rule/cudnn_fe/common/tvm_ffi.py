@@ -34,15 +34,22 @@ def make_strided_signature_tensor(
     *,
     assumed_align: int,
     use_int64_offsets: bool,
+    stride_divisibility: int | None = None,
 ):
-    """Create a last-dimension-contiguous tensor with aligned dynamic outer strides."""
+    """Create a last-dimension-contiguous tensor with dynamic outer strides.
+
+    Use ``stride_divisibility=1`` to retain the upstream dynamic-layout ABI;
+    by default every outer row promises the same alignment as the base pointer.
+    """
     element_bytes = dtype.width // 8
     if assumed_align % element_bytes:
         raise ValueError("assumed alignment must be a multiple of the element width")
     return make_fake_strided_tensor(
         dtype,
         shape,
-        stride_divisibility=assumed_align // element_bytes,
+        stride_divisibility=(
+            assumed_align // element_bytes if stride_divisibility is None else stride_divisibility
+        ),
         assumed_align=assumed_align,
         use_int64_strides=use_int64_offsets,
     )

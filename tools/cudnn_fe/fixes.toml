@@ -131,6 +131,9 @@ id = "S5/S13"
 title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target"
 kind = "restyle"
 ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
+ag_subjects_extra = [
+  "Compile common v1.30 hosts from persisted fake tensor signatures",
+]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
   "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",

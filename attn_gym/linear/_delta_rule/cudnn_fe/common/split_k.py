@@ -66,13 +66,19 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4
 from .host import get_dtype
+from .tvm_ffi import (
+    make_counter_signature,
+    make_cu_seqlens_signature,
+    make_strided_signature_tensor,
+    make_work_items_signature,
+)
 
 USE_PDL = True
 
@@ -1766,7 +1772,96 @@ def launch(
         )
 
 
-compiled_cache = {}
+@jit_cache
+def _compile_split_table(
+    split,
+    b_t,
+    scan_rows,
+    log_gate,
+    safe_gate,
+    gate_channels,
+    overhead_chunks,
+    expand_num,
+    warmup_cap,
+    full_scan,
+    num_sms,
+    gate_dtype,
+    a_dtype,
+    bias_spec,
+    has_sched,
+    use_int64_offsets,
+    opt_level,
+):
+    sym_int = cute.sym_int
+
+    def tensor(dtype, rank, align=4):
+        return make_strided_signature_tensor(
+            dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=align,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+
+    gate = (
+        tensor(gate_dtype, 3 if gate_channels else 2, 8 if gate_dtype.width == 16 else 4)
+        if split
+        else None
+    )
+    a_log = tensor(a_dtype, 1) if a_dtype is not None else None
+    dt_bias = tensor(*bias_spec) if bias_spec is not None else None
+    flags = (
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        num_sms,
+        has_sched,
+        use_int64_offsets,
+        opt_level,
+    )
+    suffix = "_".join(str(int(flag)) for flag in flags)
+    dtype_names = "_".join(
+        "none" if dtype is None else dtype.__name__.lower()
+        for dtype in (gate_dtype, a_dtype, None if bias_spec is None else bias_spec[0])
+    )
+    bias_rank = 0 if bias_spec is None else bias_spec[1]
+    return compile_tvm_ffi(
+        launch,
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        cutlass.Int32(0),
+        num_sms,
+        *(cutlass.Int32(0) for _ in range(3)),
+        cutlass.Float32(0),
+        cutlass.Float32(0),
+        gate,
+        a_log,
+        dt_bias,
+        make_cu_seqlens_signature(sym_int(), assumed_align=4),
+        tensor(cutlass.Float32, 2) if split else None,
+        make_work_items_signature(sym_int()) if split else None,
+        make_work_items_signature(sym_int()),
+        make_counter_signature(sym_int()),
+        make_counter_signature(sym_int()) if has_sched else None,
+        *(cutlass.Int32(0) for _ in range(3)),
+        name=f"split_table_{suffix}_{dtype_names}_biasrank{bias_rank}",
+        opt_level=opt_level,
+    )
 
 
 class SplitTableFacts(NamedTuple):
@@ -1869,6 +1964,7 @@ class TableRecipe(NamedTuple):
     n_scan_blocks: int
     n_walk_ctas: int
     expand_num: int
+    has_sched: bool
 
 
 def run_table(
@@ -1908,7 +2004,6 @@ def run_table(
         r.n_scan_ctas,
         r.n_scan_blocks,
         r.n_walk_ctas,
-        cuda.CUstream(int(stream)),
     )
 
 
@@ -1977,115 +2072,36 @@ def build_split_table(
         gate_lower_bound=gate_lower_bound,
         expand_num=expand_num,
     )
-    scan_rows, gate_channels, n_heads_out, batch_size, gate_elem_bytes = (
+    scan_rows, gate_channels, n_heads_out, batch_size = (
         f.scan_rows,
         f.gate_channels,
         f.n_heads_out,
         f.batch_size,
-        f.gate_elem_bytes,
     )
     log2_threshold, gate_scale_log2 = f.log2_threshold, f.gate_scale_log2
     n_scan_ctas, n_scan_blocks, n_walk_ctas = f.n_scan_ctas, f.n_scan_blocks, f.n_walk_ctas
     overhead_chunks, warmup_cap, full_scan = f.overhead_chunks, f.warmup_cap, f.full_scan
-    cu_stream = cuda.CUstream(int(stream))
-
-    key = (
+    compiled = _compile_split_table(
         bool(split),
         b_t,
-        scan_rows,
-        num_sms,
+        int(scan_rows),
         bool(log_gate),
         bool(safe_gate),
         gate_channels,
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
+        overhead_chunks,
         int(expand_num),
-        current_device(),
+        warmup_cap,
+        full_scan,
+        int(num_sms),
+        get_dtype(gate.dtype),
+        get_dtype(a_log.dtype) if a_log is not None else None,
+        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
+        scheduler_counter is not None,
+        True,
         int(opt_level),
     )
-    if key not in compiled_cache:
-        dt_bias_c = None
-        if dt_bias is not None:
-            dt_bias_c = from_dlpack(dt_bias, assumed_align=4)
-            dt_bias_c.mark_compact_shape_dynamic(
-                mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1
-            )
-        chunk_scratch_c = None
-        item_scratch_c = None
-        if split:
-            chunk_scratch_c = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_c.mark_layout_dynamic(leading_dim=1)
-            item_scratch_c = from_dlpack(item_scratch, assumed_align=4)
-            item_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_c = from_dlpack(work_items, assumed_align=4)
-        work_items_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_c = from_dlpack(work_count, assumed_align=4)
-        work_count_c.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        compiled_cache[key] = cute.compile(
-            launch,
-            bool(split),
-            b_t,
-            int(scan_rows),
-            bool(log_gate),
-            bool(safe_gate),
-            gate_channels,
-            overhead_chunks,
-            int(expand_num),
-            warmup_cap,
-            full_scan,
-            cutlass.Int32(n_heads_out),
-            int(num_sms),
-            cutlass.Int32(n_tiles),
-            cutlass.Int32(ideal_chunks),
-            cutlass.Int32(batch_size),
-            cutlass.Float32(log2_threshold),
-            cutlass.Float32(gate_scale_log2),
-            from_dlpack(
-                gate, assumed_align=(8 if gate_elem_bytes == 2 else 4)
-            ).mark_layout_dynamic(leading_dim=len(gate.shape) - 1)
-            if split
-            else None,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic()
-            if a_log is not None
-            else None,
-            dt_bias_c,
-            from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
-            chunk_scratch_c,
-            item_scratch_c,
-            work_items_c,
-            work_count_c,
-            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic(),
-            cutlass.Int32(n_scan_ctas),
-            cutlass.Int32(n_scan_blocks),
-            cutlass.Int32(n_walk_ctas),
-            cu_stream,
-            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
-        )
-    compiled_cache[key](
-        n_heads_out,
-        n_tiles,
-        ideal_chunks,
-        batch_size,
-        float(log2_threshold),
-        float(gate_scale_log2),
-        gate,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        chunk_scratch,
-        item_scratch,
-        work_items,
-        work_count,
-        scheduler_counter,
-        n_scan_ctas,
-        n_scan_blocks,
-        n_walk_ctas,
-        cu_stream,
-    )
-    return TableRecipe(
-        compiled_cache[key],
+    recipe = TableRecipe(
+        compiled,
         bool(split),
         bool(safe_gate),
         n_heads_out,
@@ -2099,7 +2115,22 @@ def build_split_table(
         n_scan_blocks,
         n_walk_ctas,
         int(expand_num),
+        scheduler_counter is not None,
     )
+    run_table(
+        recipe,
+        gate,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        chunk_scratch,
+        item_scratch,
+        work_items,
+        work_count,
+        scheduler_counter,
+        stream,
+    )
+    return recipe
 
 
 frost_split_k_plan.set_name_prefix("cudnn", remove_cutlass_symbol=False)
