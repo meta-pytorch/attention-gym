@@ -5,7 +5,7 @@
 # attn_gym.linear._delta_rule.cudnn_fe. TMEM reduction loads, register-tile and vector helpers,
 # FP8/FP4/MX conversions, and the exp2 emulation unused by the vendored kernels were removed;
 # fadd2 uses the cute.arch packed wrapper; beta_residual_f16x2 stages the KDA delta residual in
-# FP32.
+# FP32 (optionally without beta).
 
 
 import cutlass
@@ -161,11 +161,14 @@ def beta_residual_f16x2(
     accumulator; ``state_k`` may be omitted when no state is carried in.  The
     subtraction and beta scaling run in fp32 so the only rounding is the
     final pack into the b16 MMA operand.  Also returns the fp32 residual for
-    consumers such as the dBeta v-term.
+    consumers such as the dBeta v-term.  ``beta_lo=None`` skips the scaling
+    (callers that apply beta later, e.g. through the KDA prep factors).
     """
     v_lo, v_hi = f16x2_to_f32(v_pair, dtype=dtype)
     if cutlass.const_expr(state_k_lo is not None):
         v_lo, v_hi = fadd2(v_lo, v_hi, -state_k_lo, -state_k_hi)
+    if cutlass.const_expr(beta_lo is None):
+        return fp32_to_fp16(v_lo, v_hi, dtype=dtype), v_lo, v_hi
     y_lo, y_hi = fmul2(beta_lo, beta_hi, v_lo, v_hi)
     return fp32_to_fp16(y_lo, y_hi, dtype=dtype), v_lo, v_hi
 

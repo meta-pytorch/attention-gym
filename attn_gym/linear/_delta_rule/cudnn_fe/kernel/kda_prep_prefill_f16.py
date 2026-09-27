@@ -114,8 +114,7 @@ from ..tile_dsl.barrier import (
 from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import desc_opaque, mma_ts_step
 from ..tile_dsl.pointwise import (
-    f16x2_to_f32,
-    fadd2,
+    beta_residual_f16x2,
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
@@ -137,15 +136,6 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-
-
-@cute.jit
-def residual_f16x2(v_pair, state_k_lo, state_k_hi, dtype: cutlass.Constexpr):
-    """Attention Gym modification (B6): ``v - state_k`` for one packed pair, formed in FP32 and
-    rounded once into the b16 MMA operand (beta is applied later, through the prep factors)."""
-    v_lo, v_hi = f16x2_to_f32(v_pair, dtype=dtype)
-    d_lo, d_hi = fadd2(v_lo, v_hi, -state_k_lo, -state_k_hi)
-    return fp32_to_fp16(d_lo, d_hi, dtype=dtype)
 
 
 class KdaPrefillBars(NamedTuple):
@@ -1768,12 +1758,14 @@ def compute2_warp_group(
                     )
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
-                        y_lo[reg_idx] = residual_f16x2(
+                        y_lo[reg_idx] = beta_residual_f16x2(
                             raw_v_frag_lo[reg_idx],
+                            None,
+                            None,
                             state_k_vec_lo[frag_pair],
                             state_k_vec_lo[frag_pair + 1],
-                            cfg.io_dtype,
-                        )
+                            dtype=cfg.io_dtype,
+                        )[0]
                     if cutlass.const_expr(cfg.d_v == 128):
                         state_k_vec_hi = nvvm.tcgen05_ld(
                             "16x256b",
@@ -1782,12 +1774,14 @@ def compute2_warp_group(
                         )
                         for reg_idx in cutlass.range_constexpr(4):
                             frag_pair = reg_idx * 2
-                            y_hi[reg_idx] = residual_f16x2(
+                            y_hi[reg_idx] = beta_residual_f16x2(
                                 raw_v_frag_hi[reg_idx],
+                                None,
+                                None,
                                 state_k_vec_hi[frag_pair],
                                 state_k_vec_hi[frag_pair + 1],
-                                cfg.io_dtype,
-                            )
+                                dtype=cfg.io_dtype,
+                            )[0]
                 else:
                     for reg_idx in cutlass.range_constexpr(4):
                         y_lo[reg_idx] = raw_v_frag_lo[reg_idx]
@@ -2048,23 +2042,27 @@ def compute2_warp_group(
             y_input_pack_lo = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 frag_pair = reg_idx * 2
-                y_input_pack_lo[reg_idx] = residual_f16x2(
+                y_input_pack_lo[reg_idx] = beta_residual_f16x2(
                     raw_v_frag_lo[reg_idx],
+                    None,
+                    None,
                     state_k_vec_lo[frag_pair],
                     state_k_vec_lo[frag_pair + 1],
-                    cfg.io_dtype,
-                )
+                    dtype=cfg.io_dtype,
+                )[0]
 
             y_input_pack_hi = cute.make_rmem_tensor((4,), cutlass.Int32)
             if cutlass.const_expr(cfg.d_v == 128):
                 for reg_idx in cutlass.range_constexpr(4):
                     frag_pair = reg_idx * 2
-                    y_input_pack_hi[reg_idx] = residual_f16x2(
+                    y_input_pack_hi[reg_idx] = beta_residual_f16x2(
                         raw_v_frag_hi[reg_idx],
+                        None,
+                        None,
                         state_k_vec_hi[frag_pair],
                         state_k_vec_hi[frag_pair + 1],
-                        cfg.io_dtype,
-                    )
+                        dtype=cfg.io_dtype,
+                    )[0]
 
             nvvm.tcgen05_st(
                 "16x128b",

@@ -16,8 +16,8 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; upstream GDP (expand_num) and safe_gate/A_log/dt_bias
-# constexpr paths pruned.
+# attn_gym.linear._delta_rule.cudnn_fe; mbarriers initialized by one thread; upstream GDP
+# (expand_num) and safe_gate/A_log/dt_bias constexpr paths pruned.
 
 """
 Chunked Gated Delta Net (GDN) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass
@@ -1702,39 +1702,41 @@ def frost_gdn_summary(
         cumsumlog_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.smem_k_stages):
-        bars.mb_k_ready[s].init()
-        bars.mb_k_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_tinv_ready[s].init()
-        bars.mb_tinv_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.tmem_state_input_stages):
-        bars.mb_state_input_h_ready[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_h_ready[s].init()
-    bars.mb_k_state_acc_h_ready[0].init()
-    bars.mb_y_input_h_ready[0].init()
-    bars.mb_u_acc_h_ready[0].init()
-    bars.mb_decay_u_input_h_ready[0].init()
-    for s in range(cfg.tmem_state_input_stages):
-        bars.mb_state_input_m_ready[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_m_ready[s].init()
-    bars.mb_k_state_acc_m_ready[0].init()
-    bars.mb_y_input_m_ready[0].init()
-    bars.mb_u_acc_m_ready[0].init()
-    bars.mb_decay_u_input_m_ready[0].init()
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init (one thread; every thread fences and syncs below) ----------------
+    # Attention Gym modification: a single initializer instead of a racy all-thread init.
+    if tidx == 0:
+        for s in range(cfg.smem_k_stages):
+            bars.mb_k_ready[s].init()
+            bars.mb_k_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_tinv_ready[s].init()
+            bars.mb_tinv_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.tmem_state_input_stages):
+            bars.mb_state_input_h_ready[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_h_ready[s].init()
+        bars.mb_k_state_acc_h_ready[0].init()
+        bars.mb_y_input_h_ready[0].init()
+        bars.mb_u_acc_h_ready[0].init()
+        bars.mb_decay_u_input_h_ready[0].init()
+        for s in range(cfg.tmem_state_input_stages):
+            bars.mb_state_input_m_ready[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_m_ready[s].init()
+        bars.mb_k_state_acc_m_ready[0].init()
+        bars.mb_y_input_m_ready[0].init()
+        bars.mb_u_acc_m_ready[0].init()
+        bars.mb_decay_u_input_m_ready[0].init()
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()

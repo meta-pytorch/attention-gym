@@ -54,6 +54,7 @@ ag_subject = "Keep the KDA forward delta residual in FP32 before the MMA pack"
 ag_subjects_extra = [
   "Add an FP32 KDA delta-residual staging helper",
   "Keep the KDA backward delta residual in FP32 through subtraction and beta scaling",
+  "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names",
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32",
@@ -318,6 +319,15 @@ guarding_tests = []
 gate = "sass (42/42 identical)"
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R16"
+title = "Rename sdq_reduction to v_term_scratch; dedupe residual_f16x2; host docstring"
+kind = "restyle"
+ag_subject = "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names"
+guarding_tests = []
+gate = "sass"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- validation / hardening
 [[fix]]
 id = "S12"
@@ -366,6 +376,7 @@ kind = "validation"
 ag_subject = "Initialize the GDN prefill mbarriers from one thread"
 ag_subjects_extra = [
   "Initialize the GDN backward mbarriers from one thread",
+  "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names",
 ]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",

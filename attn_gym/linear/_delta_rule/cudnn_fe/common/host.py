@@ -4,7 +4,7 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. get_dtype matches exact dtype names.
 
-"""Host-side helpers shared by the FROST LA kernel modules (engine-invoked)."""
+"""Host-side helpers shared by the vendored GDN and KDA kernel modules."""
 
 import cutlass
 import torch

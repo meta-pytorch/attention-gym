@@ -3372,7 +3372,7 @@ def compute1_warp_group(
 
             bars.mb_dk_tmastg_done[cg1_dk_index.idx].wait(cg1_dk_index.phase)
             cg1_dk_index = advance(cg1_dk_index, cfg.smem_dk_stages)
-            sdq_reduction = sdk_reduction + V_TERM_SCRATCH_OFF
+            v_term_scratch = sdk_reduction + V_TERM_SCRATCH_OFF
 
             # ---- dBeta V-term rowsum(Z * Y); dGate state term Beta * rowsum(Z * g k state)
             gsum = cutlass.Float32(0.0)
@@ -3430,39 +3430,39 @@ def compute1_warp_group(
                                 part_g[part_e0 + 1],
                             )
                 pg_lo, pg_hi = warp_reduce_scatter_sum_16_elements(part_g, lane_idx)
-                (sdq_reduction + cg1_warp_id * 64 + vt_tok0).store(py_lo)
-                (sdq_reduction + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
-                (sdq_reduction + 256 + cg1_warp_id * 64 + vt_tok0).store(pg_lo)
-                (sdq_reduction + 256 + cg1_warp_id * 64 + vt_tok0 + 1).store(pg_hi)
+                (v_term_scratch + cg1_warp_id * 64 + vt_tok0).store(py_lo)
+                (v_term_scratch + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
+                (v_term_scratch + 256 + cg1_warp_id * 64 + vt_tok0).store(pg_lo)
+                (v_term_scratch + 256 + cg1_warp_id * 64 + vt_tok0 + 1).store(pg_hi)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads
                 )
                 if cg1_tidx < 64:
                     ysum = (
-                        (sdq_reduction + cg1_tidx).load()
-                        + (sdq_reduction + 64 + cg1_tidx).load()
-                        + (sdq_reduction + 128 + cg1_tidx).load()
-                        + (sdq_reduction + 192 + cg1_tidx).load()
+                        (v_term_scratch + cg1_tidx).load()
+                        + (v_term_scratch + 64 + cg1_tidx).load()
+                        + (v_term_scratch + 128 + cg1_tidx).load()
+                        + (v_term_scratch + 192 + cg1_tidx).load()
                     )
                     gsum = sBeta[cg1_tidx, 0, beta_idx] * (
-                        (sdq_reduction + 256 + cg1_tidx).load()
-                        + (sdq_reduction + 320 + cg1_tidx).load()
-                        + (sdq_reduction + 384 + cg1_tidx).load()
-                        + (sdq_reduction + 448 + cg1_tidx).load()
+                        (v_term_scratch + 256 + cg1_tidx).load()
+                        + (v_term_scratch + 320 + cg1_tidx).load()
+                        + (v_term_scratch + 384 + cg1_tidx).load()
+                        + (v_term_scratch + 448 + cg1_tidx).load()
                     )
                     sBeta[cg1_tidx, 0, beta_idx] = ysum
             if chunk_idx < FIRST_STATE_CHUNK:
-                (sdq_reduction + cg1_warp_id * 64 + vt_tok0).store(py_lo)
-                (sdq_reduction + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
+                (v_term_scratch + cg1_warp_id * 64 + vt_tok0).store(py_lo)
+                (v_term_scratch + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads
                 )
                 if cg1_tidx < 64:
                     ysum = (
-                        (sdq_reduction + cg1_tidx).load()
-                        + (sdq_reduction + 64 + cg1_tidx).load()
-                        + (sdq_reduction + 128 + cg1_tidx).load()
-                        + (sdq_reduction + 192 + cg1_tidx).load()
+                        (v_term_scratch + cg1_tidx).load()
+                        + (v_term_scratch + 64 + cg1_tidx).load()
+                        + (v_term_scratch + 128 + cg1_tidx).load()
+                        + (v_term_scratch + 192 + cg1_tidx).load()
                     )
                     sBeta[cg1_tidx, 0, beta_idx] = ysum
             bars.mb_beta_done[beta_idx].arrive()
