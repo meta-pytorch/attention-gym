@@ -49,6 +49,17 @@ guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets
 gate = "sass (identical or offset-only noise)"
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "S5/S13"
+title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target"
+kind = "restyle"
+ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
+guarding_tests = [
+  "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",
+]
+gate = "sass (byte-identical per family)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.
 [[superseded]]

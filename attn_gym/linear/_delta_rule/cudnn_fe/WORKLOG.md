@@ -70,4 +70,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 ## Known limitations and pre-existing issues (not fixed)
 
+- **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
+  target process-wide, so a process that switches to a GPU of different compute capability keeps a
+  stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
 - Fails-without evidence predates the final commit order (see "Reading an entry").
