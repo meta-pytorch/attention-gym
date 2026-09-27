@@ -89,7 +89,9 @@ from .._compat import multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from ..tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
-from ..tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
+from attn_gym._backends.cute.compat import SmemAllocator
+
+from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import mma_ss
 from ..tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, opaque_f32_zero, sigmoid, softplus2
 from ..tile_dsl.swizzle import swizzle_xor_128b
@@ -525,8 +527,8 @@ def compute_warp_group(
         tile_seq1 = tile_seq0 + cutlass.Int32(1)
         tile_slot0 = cutlass.Int32(group * TS) + tile_seq0 % cutlass.Int32(TS)
         tile_slot1 = cutlass.Int32(group * TS) + tile_seq1 % cutlass.Int32(TS)
-        tinv0_base = sTinv[tile_slot0].base
-        tinv1_base = sTinv[tile_slot1].base
+        tinv0_base = smem_data_ptr(sTinv[tile_slot0].base)
+        tinv1_base = smem_data_ptr(sTinv[tile_slot1].base)
 
         # ---- the pair's Gate cumsum / Beta stage, filled by the gate warp ------------
         bars.mb_gate_ready[gate_slot].wait((j // cutlass.Int32(GS)) & cutlass.Int32(1))
@@ -795,15 +797,12 @@ def host(
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
     num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm), cutlass.Int32(tinv.shape[0]) * heads_out)
 
-    # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
-    bytes_per_element = cfg.io_dtype.width // 8
-    k_stage_elements = 2 * cfg.b_t * cfg.d_k
-    tile_elements = cfg.b_t * cfg.b_t
-    cfg.k_cosize = k_stage_elements * cfg.smem_k_stages
-    cfg.tile_cosize = tile_elements * len(cfg.compute_group_warp_ids) * cfg.smem_tile_stages
+    @cute.struct
+    class SharedStorage:
+        k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_cosize], cfg.buffer_align_bytes]
+        tile: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.tile_cosize], cfg.buffer_align_bytes]
 
-    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * bytes_per_element
-    cfg.tile_bytes = tile_elements * bytes_per_element
+    bytes_per_element = cfg.io_dtype.width // 8
 
     # ---- base K and tinv maps (the prologue emits their per-batch arrays) ------------
     box_elems = 128 // bytes_per_element
@@ -823,6 +822,7 @@ def host(
         )
     frost_gdn_tinv(
         cfg,
+        SharedStorage,
         cute.FastDivmodDivisorV2(heads_out),
         k_ratio,
         cute.FastDivmodDivisorV2(num_ctas),
@@ -847,6 +847,7 @@ def host(
 @cute.kernel
 def frost_gdn_tinv(
     cfg: cutlass.Constexpr,
+    shared_type: cutlass.Constexpr,
     heads_out: cute.FastDivmodDivisorV2,
     k_ratio: cute.FastDivmodDivisorV2,
     num_ctas: cute.FastDivmodDivisorV2,
@@ -883,14 +884,17 @@ def frost_gdn_tinv(
     SWZ = 2
     LEAD = 16
     STRIDE = 8 * 128
-    sK_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.k_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    # Barrier and gate/beta staging arrays keep stable raw pointers; the 1024-aligned tile
+    # buffers share one SharedStorage allocation placed after them.
+    bars = make_bars(cfg)
+    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
+    cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, 2, NG * GS))
+    cumsumlog_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
+    beta_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
+    storage = SmemAllocator().allocate(shared_type)
+    sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
     sK = SmemTile(
-        base=sK_raw.data_ptr(),
+        base=sK_raw,
         elems_per_stage=(cfg.k_cosize // cfg.smem_k_stages),
         stages=cfg.smem_k_stages,
         leading_byte_offset=LEAD,
@@ -908,14 +912,9 @@ def frost_gdn_tinv(
         tma_granu_elems=64,
         tma_subtile_stride_elems=2 * cfg.b_t * 64,
     )
-    sTinv_raw = cutlass.Array(
-        cfg.io_dtype,
-        cfg.tile_cosize,
-        space=cutlass.AddressSpace.smem,
-        alignment=cfg.buffer_align_bytes,
-    )
+    sTinv_raw = storage.tile.get_tensor(cute.make_layout((cfg.tile_cosize,)))
     sTinv = SmemTile(
-        base=sTinv_raw.data_ptr(),
+        base=sTinv_raw,
         elems_per_stage=(cfg.tile_cosize // (NG * cfg.smem_tile_stages)),
         stages=NG * cfg.smem_tile_stages,
         leading_byte_offset=LEAD,
@@ -933,17 +932,12 @@ def frost_gdn_tinv(
         tma_granu_elems=cfg.b_t,
         tma_subtile_stride_elems=cfg.b_t * cfg.b_t,
     )
-    bars = make_bars(cfg)
-    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
-    cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, 2, NG * GS))
-    cumsumlog_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
-    beta_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
     sCumsumlog = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, cumsumlog_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(cumsumlog_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
     sBeta = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, beta_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(beta_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
 
@@ -1038,7 +1032,7 @@ def frost_gdn_tinv(
                     sCumsumlog=cute.make_tensor(
                         cute.make_ptr(
                             cutlass.Float32,
-                            cumsumlog_raw.data_ptr().toint() + group * GS * 2 * cfg.b_t * 4,
+                            smem_data_ptr(cumsumlog_raw).toint() + group * GS * 2 * cfg.b_t * 4,
                             mem_space=cute.AddressSpace.smem,
                             assumed_align=128,
                         ),
@@ -1046,7 +1040,7 @@ def frost_gdn_tinv(
                     ),
                     sBeta=cute.make_tensor(
                         cute.make_ptr(
-                            cutlass.Float32, beta_raw.data_ptr().toint() + group * GS * 2 * cfg.b_t * 4, mem_space=cute.AddressSpace.smem, assumed_align=128
+                            cutlass.Float32, smem_data_ptr(beta_raw).toint() + group * GS * 2 * cfg.b_t * 4, mem_space=cute.AddressSpace.smem, assumed_align=128
                         ),
                         cute.make_layout((cfg.b_t, 1, 2, GS)),
                     ),
@@ -1063,7 +1057,7 @@ def frost_gdn_tinv(
 @dataclass
 class GdnTinvCfg:
     """Per-compile chunk-factor kernel knob (``build_cfg``): the dtype / head-count / gate-flag fields are the ``cute.compile``
-    cache keys, the rest derives from ``CFG``; ``host`` stamps the shape-derived fields at trace time.
+    cache keys, the rest derives from ``CFG``.
     """
 
     io_dtype: Type[cutlass.Numeric]
@@ -1100,7 +1094,7 @@ class GdnTinvCfg:
     tmem_columns: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time (shape-derived) -------------------------------
+    # ---- derived by build_cfg (SMEM cosizes, TMA transaction bytes) --------------------
     k_cosize: int = 0
     tile_cosize: int = 0
     tma_k_bytes: int = 0
@@ -1140,6 +1134,14 @@ def build_cfg(
     cfg.num_regs_compute = min(256, (cfg.threads_per_cta * CFG.LAUNCH_REGS - other_threads * cfg.num_regs_other) // compute_threads // 8 * 8)
     cfg.inverse_barrier_threads = cfg.threads_per_warp * n_group_warps
     cfg.tmem_columns = cfg.tmem_acc_stages * 2 * cfg.b_t
+    # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
+    bytes_per_element = io_dtype.width // 8
+    k_stage_elements = 2 * cfg.b_t * cfg.d_k
+    tile_elements = cfg.b_t * cfg.b_t
+    cfg.k_cosize = k_stage_elements * cfg.smem_k_stages
+    cfg.tile_cosize = tile_elements * n_groups * cfg.smem_tile_stages
+    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * bytes_per_element
+    cfg.tile_bytes = tile_elements * bytes_per_element
     return cfg
 
 

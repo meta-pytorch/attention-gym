@@ -40,6 +40,15 @@ guarding_tests = []
 gate = "sass (74/74 identical)"
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "S1-S4"
+title = "Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes"
+kind = "restyle"
+ag_subject = "Restyle the v1.30 GDN prefill, tinv and summary kernel storage"
+guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts"]
+gate = "sass (identical or offset-only noise)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.
 [[superseded]]
