@@ -123,12 +123,28 @@ def kda_forward(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     split: bool = False,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K]."""
+    """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
+
+    With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
+    place through the routes (non-positive routes are null; the optional uint8
+    ``has_initial_state`` marks resumed slots, zero marks fresh ones) and no final state is
+    returned. Paged calls use the unchunked plans (uncut or value-dimension split).
+    """
+    paged = state_indices is not None
     q, k, v, gate, beta, cu_seqlens = (
         _aligned(t.detach()) for t in (q, k, v, gate, beta, cu_seqlens)
     )
-    initial_state = None if initial_state is None else _aligned(initial_state.detach())
+    if paged:
+        if initial_state is None or output_final_state or split:
+            raise ValueError("paged KDA needs a state pool and no final state or split schedule")
+        if initial_state.data_ptr() % 16:
+            raise ValueError("the paged state pool must be 16-byte aligned")
+        initial_state = initial_state.detach()
+    else:
+        initial_state = None if initial_state is None else _aligned(initial_state.detach())
     tokens, heads_out, dim_k = q.shape
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
@@ -136,6 +152,9 @@ def kda_forward(
     plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0, tiles_per_head=1)
+    if paged:
+        # The piece chain has no paged routing; seed and store through the prefill instead.
+        plan = replace(plan, pieces=0)
     o = torch.empty_like(v)
     final_state = None
     if output_final_state:
@@ -218,7 +237,9 @@ def kda_forward(
     buffers = dict(
         common,
         state_in=initial_state,
-        state_out=final_state,
+        state_out=initial_state if paged else final_state,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
         work_items=torch.empty(rows, WORK_ITEM_FIELDS, dtype=torch.int32, device=device),
         work_count=_work_count(device),
         item_scratch=item_scratch,

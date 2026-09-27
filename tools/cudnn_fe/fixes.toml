@@ -175,10 +175,12 @@ kind = "feature"
 ag_subject = "Serve paged GDN state from the v1.30 prefill"
 ag_subjects_extra = [
   "Preserve fresh-empty paged routes during work compaction",
+  "Route KDA paged recurrent state through the v1.30 prefill kernels",
 ]
 guarding_tests = [
   "test/test_cudnn_fe_paged_order.py::test_paged_order_keeps_only_nonempty_and_fresh_empty_routes",
   "test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_are_null",
+  "test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_never_touch_the_pool",
 ]
 upstream_status = "ag-specific"
 

@@ -187,6 +187,8 @@ def chain_forward_host(
         final_state,
         None,
         final_indices,
+        None,
+        None,
         work_items,
         main_count,
         scheduler_prefill,

@@ -18,7 +18,8 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. Register arrays are rmem tensors, SMEM data buffers share one
 # SharedStorage struct, and segment-major swizzle offsets use swizzle_box_offset_{128b,32b}. The frozen
-# cfg launches through KdaSummaryOp, compiled from persisted fake TVM-FFI signatures.
+# cfg launches through KdaSummaryOp, compiled from persisted fake TVM-FFI signatures. The delta residual
+# stays FP32 until the MMA pack.
 
 """
 Chunked Kimi Delta Attention (KDA) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass primitives): the BT = 16

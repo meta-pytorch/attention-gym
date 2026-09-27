@@ -180,3 +180,154 @@ def test_cudnn_paged_fullgraph_and_cuda_graph_replay() -> None:
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         torch.testing.assert_close(graph_pool, eager_pool, rtol=0, atol=0)
+
+
+def _dense_reference(q, k, value, gate, beta, cu_seqlens, pool, routes, fresh):
+    """Ordinary cuDNN execution over the gathered seeds, scattered back like the paged contract."""
+    active = [route > 0 for route in routes]
+    initial_state = torch.zeros(len(routes), *pool.shape[1:], device="cuda")
+    for b, route in enumerate(routes):
+        if active[b] and not fresh[b]:
+            initial_state[b] = pool[route]
+    output, final_state = chunk_kda(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        kernel_options=_CUDNN,
+    )
+    assert final_state is not None
+    expected_pool = pool.clone()
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    output = output.clone()
+    for b, route in enumerate(routes):
+        start, end = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
+        if not active[b]:
+            output[:, start:end] = 0
+        elif lengths[b] > 0 or fresh[b]:
+            expected_pool[route] = final_state[b]
+    return output, expected_pool
+
+
+@pytest.mark.parametrize(
+    "extra_empty",
+    (0, 40),
+    ids=("value-split-plan", "uncut-plan"),
+)
+def test_cudnn_paged_negative_and_zero_routes_never_touch_the_pool(extra_empty: int) -> None:
+    """Negative and zero routes emit zeros and never read or write any slot, in both plans.
+
+    Slot 0 and the unused slot hold NaN: any read would poison an output or state, any write
+    would clear the NaN. Forty trailing null empties push ``sequences * heads`` past the
+    value-split threshold so the uncut plan runs too.
+    """
+    lengths = (33, 0, 70, 0, 17, 0) + (0,) * extra_empty
+    routes = [3, 4, -2, 2, 0, 1] + [0] * extra_empty
+    fresh = [False, True, False, False, False, True] + [False] * extra_empty
+    q, k, value, gate, beta = make_kda_test_inputs(sum(lengths), heads=2, seed=31)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    q[:, 33:103] = torch.nan  # the negative route's tokens
+    pool = torch.randn(6, 2, 128, 128, device="cuda") * 0.1
+    pool[0] = torch.nan
+    pool[5] = torch.nan
+    expected_output, expected_pool = _dense_reference(
+        q, k, value, gate, beta, cu_seqlens, pool, routes, fresh
+    )
+    has_initial_state = torch.tensor([not f for f in fresh], device="cuda")
+    state_indices = torch.tensor(routes, device="cuda", dtype=torch.int32)
+
+    with torch.no_grad():
+        output = paged_chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            pool,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            kernel_options=_CUDNN,
+        )
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0, equal_nan=True)
+
+
+def test_cudnn_paged_empty_routes_past_compaction_capacity() -> None:
+    """Fresh empties clear and resumed empties persist on the uncompacted fallback table."""
+    num_sequences = 4200  # more sequences than the order pass can compact
+    lengths = [64, 48] + [0] * (num_sequences - 2)
+    routes = [0] * num_sequences
+    fresh = [False] * num_sequences
+    routes[:2] = [1, 2]
+    routes[2100], routes[-1] = 3, 4
+    fresh[-1] = True
+    q, k, value, gate, beta = make_kda_test_inputs(sum(lengths), heads=1, seed=37)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    pool = torch.randn(5, 1, 128, 128, device="cuda")
+    pool[0] = torch.nan
+    expected_output, expected_pool = _dense_reference(
+        q, k, value, gate, beta, cu_seqlens, pool, routes, fresh
+    )
+    assert expected_pool[4].abs().sum() == 0 and expected_pool[3].equal(pool[3])
+
+    with torch.no_grad():
+        output = paged_chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            pool,
+            torch.tensor(routes, device="cuda", dtype=torch.int32),
+            cu_seqlens=cu_seqlens,
+            has_initial_state=torch.tensor([not f for f in fresh], device="cuda"),
+            kernel_options=_CUDNN,
+        )
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0, equal_nan=True)
+
+
+def test_cudnn_paged_runs_the_native_driver(monkeypatch) -> None:
+    """Paged calls launch the v1.30 driver in place and reject final-state and split requests."""
+    from attn_gym.linear._delta_rule.cudnn import forward
+    from attn_gym.linear._delta_rule.cudnn_fe import kda
+
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("state_indices"))
+        return kda.kda_forward(*args, **kwargs)
+
+    monkeypatch.setattr(forward, "kda_forward", spy)
+    q, k, value, gate, beta = make_kda_test_inputs(96, heads=2, seed=41)
+    cu_seqlens = cumulative_sequence_offsets((64, 32))
+    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    state_indices = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
+    with torch.no_grad():
+        paged_chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            pool,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            kernel_options=_CUDNN,
+        )
+    assert len(calls) == 1 and calls[0] is state_indices
+    assert pool[1:].abs().sum() > 0 and pool[0].abs().sum() == 0
+
+    packed = (q[0], k[0], value[0], gate[0], beta[0], cu_seqlens)
+    for options in ({"output_final_state": True}, {"split": True}):
+        with pytest.raises(ValueError, match="paged KDA"):
+            kda.kda_forward(
+                *packed, scale=1.0, initial_state=pool, state_indices=state_indices, **options
+            )

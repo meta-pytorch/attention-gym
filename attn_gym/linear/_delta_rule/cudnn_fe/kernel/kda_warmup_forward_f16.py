@@ -18,7 +18,8 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. The host nests the prep / prefill Ops, compiles through a
 # persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor needs it),
-# and launches with live tensors on the current Torch stream.
+# and launches with live tensors on the current Torch stream. Optional paged routes reach the
+# prologue's compaction and the prefill.
 
 """One compiled launch for the KDA warmup and uncut forwards: the split-K table (plan, scan and walk, warmup only), the
 prefill prologue and the prefill issued from a single host.  Every kernel, its host and the tensor placeholder each host
@@ -44,6 +45,7 @@ from ..common.tvm_ffi import (
     WORK_ITEM_FIELDS,
     make_compact_signature_tensor,
     make_dynamic_signature_tensor,
+    make_paged_route_signatures,
 )
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
 
@@ -93,6 +95,8 @@ def warmup_forward_host(
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
+    state_indices: Optional[cute.Tensor],
+    has_initial_state: Optional[cute.Tensor],
     checkpoints: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
@@ -178,6 +182,8 @@ def warmup_forward_host(
             prep_words,
             prep_rows,
             prep_row_count,
+            state_indices,
+            has_initial_state,
         )
         prep_op(
             q,
@@ -218,6 +224,8 @@ def warmup_forward_host(
             checkpoint_every_n,
             stream,
             tiles_per_head,
+            state_indices,
+            has_initial_state,
         )
     prefill_op(
         q,
@@ -233,6 +241,8 @@ def warmup_forward_host(
         state_out,
         seed_indices,
         final_indices,
+        state_indices,
+        has_initial_state,
         work_items,
         work_count,
         scheduler,
@@ -277,11 +287,13 @@ def _compile_warmup_forward(
     allow_neg_eigval: bool,
     prep: bool,
     use_int64_offsets: bool,
+    paged_state: int = 0,
 ):
     """Compile the warmup / uncut forward host for one static config over fake tensors that repeat the standalone
     builds' placeholders.  ``facts_static`` is the split table's constexpr facts (split, b_t, scan_rows, log_gate,
     safe_gate, gate_channels, overhead_chunks, expand_num, warmup_cap, full_scan, num_sms); absent tensors have a None
-    dtype; ``dt_bias_spec`` is ``(dtype, trailing shape)`` or None."""
+    dtype; ``dt_bias_spec`` is ``(dtype, trailing shape)`` or None.  ``paged_state`` is 0 without paged routing, 1 with
+    per-sequence routes and 2 with routes plus the fresh-slot byte mask."""
     (
         split,
         b_t,
@@ -321,6 +333,7 @@ def _compile_warmup_forward(
         max_active_clusters=num_sms,
         d_v=d_v // tiles_per_head,
         tiles_per_head=tiles_per_head,
+        paged_state=paged_state,
         **flags,
     )
     prefill_op_type = kda_prep_prefill_f16.KdaPrepPrefillOp if prep else kda_prefill_f16.KdaPrefillOp
@@ -361,6 +374,7 @@ def _compile_warmup_forward(
         allow_neg_eigval,
         prep,
         i64,
+        paged_state,
     )
     dtype_names = "_".join(
         "none" if dtype is None else dtype.__name__.lower()
@@ -422,6 +436,11 @@ def _compile_warmup_forward(
         _dynamic(state_out_dtype, 4, 16, i64) if state_out_dtype is not None else None,
         _dynamic(cutlass.Int32, 1, 4, i64) if has_seed_indices else None,
         _dynamic(cutlass.Int32, 1, 4, i64) if has_final_indices else None,
+        *(
+            make_paged_route_signatures(cute.sym_int(), has_initial_state=paged_state == 2)
+            if paged_state
+            else (None, None)
+        ),
         _dynamic(checkpoint_dtype, 4, 16, i64) if checkpoint_dtype is not None else None,
         _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 16, i64),  # work_items
         _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 4, i64),  # work_items_table
@@ -491,12 +510,15 @@ def build_warmup_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_indices=None,
+    has_initial_state=None,
 ):
     """Compile (persisted per static config: dtypes, dims, gate flags and bound, the split-K geometry, the d_v split,
     state and checkpoint presence, the int64 ABI) the warmup or uncut forward launch over the buffers of one plan.  The
     fake signatures repeat the marks of the standalone split-table and prefill builds so every kernel compiles as it
     does there.  ``device`` and ``stream`` are unused: the compile is keyed on ``num_sm`` and launches on the current
-    Torch stream."""
+    Torch stream.  ``state_indices`` (int32 per sequence) and the optional uint8 ``has_initial_state`` select paged
+    state: ``state_in`` and ``state_out`` are then one pool routed per sequence (null, fresh and resumed slots)."""
     del device, stream
     if not safe_gate:
         a_log = None
@@ -527,8 +549,18 @@ def build_warmup_forward(
         q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, state_in, state_out, seed_indices,
         final_indices, checkpoints, work_items, work_count, item_scratch, chunk_scratch, scheduler,
         workspace, prep_k_decay, prep_q_decay, prep_t, prep_a, prep_diag, prep_words, prep_rows,
-        prep_row_count,
+        prep_row_count, state_indices, has_initial_state,
     )
+    if state_indices is not None:
+        if state_in is None or state_in is not state_out or seed_indices is not None or final_indices is not None:
+            raise ValueError("paged state routes one aliased state pool without seed/final indices")
+        if state_indices.dtype != torch.int32 or not state_indices.is_contiguous():
+            raise ValueError("state_indices must be contiguous int32")
+        if has_initial_state is not None and (has_initial_state.dtype != torch.uint8 or not has_initial_state.is_contiguous()):
+            raise ValueError("has_initial_state must be a contiguous uint8 mask")
+    elif has_initial_state is not None:
+        raise ValueError("has_initial_state requires state_indices")
+    paged_state = 0 if state_indices is None else 1 + (has_initial_state is not None)
     use_int64_offsets = requires_int64_abi(*tensors)
     compiled = _compile_warmup_forward(
         (
@@ -564,6 +596,7 @@ def build_warmup_forward(
         bool(allow_neg_eigval),
         bool(prep),
         use_int64_offsets,
+        paged_state,
     )
     return compiled, facts
 
@@ -603,6 +636,8 @@ def run_warmup_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_indices=None,
+    has_initial_state=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches, on the
     current Torch stream (``stream`` is unused).  The plan validated the contract at build, so nothing here raises."""
@@ -636,6 +671,8 @@ def run_warmup_forward(
         state_out,
         seed_indices,
         final_indices,
+        state_indices,
+        has_initial_state,
         checkpoints if int(checkpoint_every_n_tokens) > 0 else None,
         work_items,
         work_items,
