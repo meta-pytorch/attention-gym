@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.host import get_dtype
 from ..common.piece_chain import launch_state_chain
@@ -244,10 +245,13 @@ def _compile_chain_forward(
     has_seed_indices,
     has_final_indices,
     chain_rows,
+    use_int64_offsets,
 ):
     """Compile the chain forward launch for one static configuration (dtypes, heads-independent
-    gate and state flags, dims, chain rows, device target); every extent is symbolic."""
-    sym_int = cute.sym_int
+    gate and state flags, dims, chain rows, device target); every extent is symbolic.
+    ``use_int64_offsets`` widens the extents for tensors past the int32 ABI (strides are always
+    int64, as upstream traced them)."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def tensor(dtype, rank, align):
         return make_strided_signature_tensor(
@@ -326,6 +330,7 @@ def _compile_chain_forward(
         has_seed_indices,
         has_final_indices,
         chain_rows,
+        use_int64_offsets,
     )
     dtypes = (
         io_dtype,
@@ -455,6 +460,10 @@ def build_chain_forward(
         dt_bias = None
     if state_h.dtype != state_x.dtype or state_h.dtype != state_m.dtype:
         raise TypeError("the chain states must share one dtype")
+    # Every tensor the launch addresses; bounded int32 tables and counters excepted.
+    use_int64_offsets = requires_int64_abi(
+        q, k, v, gate, beta, a_log, dt_bias, o, tinv, state_h, state_m, state_x, seed, final_state, checkpoints
+    )
     return _compile_chain_forward(
         get_dtype(q.dtype),
         get_dtype(state_x.dtype),
@@ -479,6 +488,7 @@ def build_chain_forward(
         seed_indices is not None,
         final_indices is not None,
         int(chain_rows),
+        use_int64_offsets,
     )
 
 

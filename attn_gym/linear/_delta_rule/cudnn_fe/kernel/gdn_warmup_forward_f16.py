@@ -35,6 +35,7 @@ import cutlass
 import cutlass.cute as cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common import split_k
 from ..common.host import get_dtype
@@ -223,10 +224,13 @@ def _compile_warmup_forward(
     d_k,
     d_v,
     tiles_per_head,
+    use_int64_offsets,
 ):
     """Compile the warmup or uncut forward launch for one static configuration (dtypes, gate and
-    state flags, split-table geometry, d_v split, device target); every extent is symbolic."""
-    sym_int = cute.sym_int
+    state flags, split-table geometry, d_v split, device target); every extent is symbolic.
+    ``use_int64_offsets`` widens the extents for tensors past the int32 ABI (strides are always
+    int64, as upstream traced them)."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def tensor(dtype, rank, align):
         return make_strided_signature_tensor(
@@ -282,6 +286,7 @@ def _compile_warmup_forward(
         d_k,
         d_v,
         tiles_per_head,
+        use_int64_offsets,
     )
     dtypes = (io_dtype, state_dtype, gate_dtype, a_log_dtype, None if bias_spec is None else bias_spec[0], beta_dtype)
     name = "gdn_warmup_forward_" + "_".join(str(int(flag)) for flag in flags)
@@ -405,6 +410,10 @@ def build_warmup_forward(
     )
     state_src = state_in if state_in is not None else state_out
     state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
+    # Every tensor the launch addresses; bounded int32 routing arrays and counters excepted.
+    use_int64_offsets = requires_int64_abi(
+        q, k, v, gate, beta, a_log, dt_bias, o, state_in, state_out, checkpoints, chunk_scratch
+    )
     compiled = _compile_warmup_forward(
         get_dtype(q.dtype),
         state_dtype,
@@ -435,6 +444,7 @@ def build_warmup_forward(
         int(DK),
         int(DV),
         int(tiles_per_head),
+        use_int64_offsets,
     )
     return compiled, facts
 
