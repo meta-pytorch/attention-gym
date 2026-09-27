@@ -73,6 +73,7 @@ from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4
 from .host import get_dtype
+from .paged_state import resolve_paged_state
 from .tvm_ffi import (
     make_counter_signature,
     make_cu_seqlens_signature,
@@ -1412,8 +1413,11 @@ def compact_sequences(
     mCuSeqlens: cute.Tensor,
     sIdx,
     sWarp,
+    *,
+    mStateIndices: cute.Tensor | None = None,
+    mHasInitialState: cute.Tensor | None = None,
 ):
-    """Attention Gym addition: write, in sequence order, the ids of sequences with tokens into
+    """Write, in sequence order, ids with tokens or a fresh paged slot to clear into
     ``sIdx[0, M)`` and return ``M``.  A warp ballot ranks each round of ``n_threads`` sequences, so
     the table is deterministic.  ``sWarp`` holds ``n_threads // 32`` Int32 cells."""
     lane = cute.arch.lane_idx()
@@ -1425,6 +1429,9 @@ def compact_sequences(
         keep = cutlass.Boolean(False)
         if b < n_batch:
             keep = mCuSeqlens[b + 1] > mCuSeqlens[b]
+            if cutlass.const_expr(mStateIndices is not None):
+                _, _, _, clear_empty = resolve_paged_state(b, mStateIndices, mHasInitialState)
+                keep = keep or clear_empty
         ballot = cute.arch.vote_ballot_sync(keep)
         rank = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot) & cute.arch.lanemask_lt()))
         if lane == 0:
@@ -1468,6 +1475,8 @@ def order_body(
     chain: cutlass.Constexpr[bool] = False,
     mRowBase: cute.Tensor | None = None,
     mSlotRows: cute.Tensor | None = None,
+    mStateIndices: cute.Tensor | None = None,
+    mHasInitialState: cute.Tensor | None = None,
 ):
     """Bitonic-sort the staged items by ``compute_end - compute_start``,
     longest first, into ``work_items``; with ``gen`` synthesize the uncut item
@@ -1499,7 +1508,19 @@ def order_body(
         compact = n_batch <= cutlass.Int32(capacity)
         n = n_tiles
         if compact:
-            n = compact_sequences(n_threads, tidx, n_batch, mCuSeqlens, sIdx, sKey) * n_heads_out
+            n = (
+                compact_sequences(
+                    n_threads,
+                    tidx,
+                    n_batch,
+                    mCuSeqlens,
+                    sIdx,
+                    sKey,
+                    mStateIndices=mStateIndices,
+                    mHasInitialState=mHasInitialState,
+                )
+                * n_heads_out
+            )
         if tidx == 0:
             mCount[0] = n
     elif cutlass.const_expr(gen):
