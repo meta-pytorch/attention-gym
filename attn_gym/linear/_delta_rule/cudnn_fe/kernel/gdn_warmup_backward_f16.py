@@ -16,10 +16,12 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; persistent jit_cache compile on fake-tensor TVM-FFI
-# signatures (legacy placeholder ABI) with an int64-shape variant; and the upstream-only
-# expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue, and compact_qdo host
-# paths removed at their pinned values.
+# attn_gym.linear._delta_rule.cudnn_fe; the launch compiles through jit_cache on fake-tensor
+# TVM-FFI signatures (legacy placeholder ABI) with an int64-shape variant, after launch-contract
+# validation; the unused device/stream and bprop_module arguments and the GDP d_v=64 bprop fork
+# dropped; the upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid,
+# negative-eigenvalue, log2_threshold-override, and compact_qdo host paths removed at their pinned
+# values; Ruff formatting.
 
 """One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the
 T pass (with its own descriptor prologue), the split-K table (warmup only), the recompute prologue

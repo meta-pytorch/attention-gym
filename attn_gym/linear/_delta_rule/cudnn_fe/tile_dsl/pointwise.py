@@ -3,8 +3,9 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. TMEM reduction loads, register-tile and vector helpers,
-# FP8/FP4/MX conversions, and the exp2 emulation unused by the vendored kernels were removed;
-# fadd2 uses the cute.arch packed wrapper; beta_residual_f16x2 stages the KDA delta residual in
+# FP8/FP4/MX conversions, the exp2 emulation, and the packed mul/sigmoid, lane_group_sum,
+# l2norm_inv, and sigmoid2 helpers unused by the vendored kernels were removed; fadd2 uses the
+# cute.arch packed wrapper; beta_residual_f16x2 was added to stage the KDA delta residual in
 # FP32 (optionally without beta).
 
 

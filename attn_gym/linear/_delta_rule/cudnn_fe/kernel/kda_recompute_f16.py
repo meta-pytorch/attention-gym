@@ -16,11 +16,14 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
-# Register arrays are cute rmem tensors, SMEM data buffers live in a SharedStorage struct, and raw
-# SMEM pointers go through smem_data_ptr (S1-S3). Its host and prologue launch nested inside the
-# chain/warmup backward host compiles. The always-pinned safe_gate, a_log, dt_bias, beta_sigmoid,
-# allow_neg_eigval, and l2norm knobs are removed.
+# attn_gym.linear._delta_rule.cudnn_fe; restyled register tensors (cute.make_rmem_tensor), one
+# SharedStorage struct, smem_data_ptr, and call sites of the pruned tile_dsl helpers; upstream
+# standalone host (get_compiled_cache, compile, chunk_kda_recompute, run_recompute) removed; host
+# and prologue now compile only inside the warmup/chain backward hosts; frozen cfg whose build_cfg
+# validates warp roles and named barriers and derives the scheduler arrival count; FP32 delta
+# residual through subtraction and beta scaling; module-level requires_int64_abi re-export;
+# upstream-only constexpr knobs pruned (safe_gate, A_log/dt_bias, beta sigmoid, allow_neg_eigval,
+# Q/K L2 norm); Ruff formatting.
 
 """
 Chunked Kimi Delta Attention (KDA) recompute (state/checkpoint-only) kernel for SM100 / SM103 /

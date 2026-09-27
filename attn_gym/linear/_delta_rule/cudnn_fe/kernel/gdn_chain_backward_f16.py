@@ -16,10 +16,12 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; persistent jit_cache compiles on fake-tensor TVM-FFI
-# signatures (legacy placeholder ABI) with an int64-shape variant; and the upstream-only GDP
-# expand_num/summary_q_step, safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue,
-# fused-l2norm (inv_q/inv_k), and compact_qdo host paths removed at their pinned values.
+# attn_gym.linear._delta_rule.cudnn_fe; the head and tail launches compile through jit_cache on
+# fake-tensor TVM-FFI signatures (legacy placeholder ABI) with an int64-shape variant, after
+# launch-contract validation; the unused device/stream and bprop_module arguments and the GDP
+# d_v=64 bprop fork dropped; the upstream-only GDP expand_num/summary_q_step,
+# safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue, fused-l2norm (inv_q/inv_k), and
+# compact_qdo host paths removed at their pinned values; Ruff formatting.
 
 """Two compiled launches for the GDN chain backward.  The head (``--opt-level 2``, the option of
 the T pass, the summary and the recompute) runs the chain prologue, the T pass, the fused H and M

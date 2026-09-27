@@ -16,11 +16,13 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. Register arrays use cute.make_rmem_tensor, operand SMEM
-# buffers share one SharedStorage struct, and raw SMEM pointers go through smem_data_ptr. A frozen
-# cfg (build_cfg derives the SMEM cosizes and TMA byte counts) is compiled through the warmup/chain
-# bundle hosts, and the upstream-only GDP expand_num, safe_gate, A_log, and dt_bias knobs are
-# removed at their pinned values.
+# attn_gym.linear._delta_rule.cudnn_fe; register arrays as rmem tensors and operand SMEM in a
+# SharedStorage struct read through smem_data_ptr; mbarriers initialized by one thread; a frozen
+# cfg whose build_cfg derives the SMEM cosizes and TMA byte counts, validates the launch contract,
+# and derives scheduler arrivals from warp counts; the standalone
+# Op/compile/chunk_gdn_bwd_summary/run host and own-prologue path removed (the kernel compiles only
+# inside the warmup/chain backward bundles); the upstream-only expand_num and
+# safe_gate/A_log/dt_bias knobs removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) bprop state-summary kernel for SM100 / SM103 / SM107 (Cutlass

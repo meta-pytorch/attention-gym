@@ -17,9 +17,11 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
-# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream; and the
-# upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and negative-eigenvalue host
-# paths are removed at their pinned values.
+# jit_cache over fake TVM-FFI tensor signatures (independent state_in/state_out extents), with an
+# int64-extent variant for oversized tensors, and runs on the environment stream; the paged-state
+# prefill flag is threaded through; the upstream-only expand_num, safe_gate/A_log/dt_bias,
+# beta-sigmoid, negative-eigenvalue, and log2_threshold-override host paths removed at their pinned
+# values; Ruff formatting.
 
 """One compiled launch for the GDN warmup, uncut and dv_split forwards: the split-K table (plan,
 scan and walk, warmup only), the prefill prologue and the prefill issued from a single host, the

@@ -16,7 +16,8 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; Ruff formatting (typing.Tuple -> tuple) and docstring
+# rewrap.
 
 """KDA fused state-summary kernel config: fixed compile-time constants of the BT=16 schedule (H and
 M recurrences in lockstep on one 16-warp CTA per (piece, head)).  Derived SMEM / TMEM sizes and

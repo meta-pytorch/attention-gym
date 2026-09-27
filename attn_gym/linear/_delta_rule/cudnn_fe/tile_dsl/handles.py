@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. Block-scale, multi-CTA, static-descriptor, and
+# attn_gym.linear._delta_rule.cudnn_fe. Block-scale, multi-CTA, static-descriptor, linear, and
 # extended-descriptor handles unused by the vendored kernels were removed; SmemTile accepts
 # CuTe tensor storage and smem_data_ptr returns the raw pointer of an Array or Tensor.
 

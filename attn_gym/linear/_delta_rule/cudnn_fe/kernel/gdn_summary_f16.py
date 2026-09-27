@@ -16,8 +16,11 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; mbarriers initialized by one thread; upstream GDP
-# (expand_num) and safe_gate/A_log/dt_bias constexpr paths pruned.
+# attn_gym.linear._delta_rule.cudnn_fe; operand SMEM in a SharedStorage struct read through
+# smem_data_ptr; mbarriers initialized by one thread; a frozen cfg whose build_cfg derives the SMEM
+# cosizes and TMA byte counts; the standalone compile/chunk_gdn_summary/run host and own-prologue
+# path removed (the kernel compiles only inside the warmup/chain forward bundles); the
+# upstream-only expand_num and safe_gate/A_log/dt_bias knobs removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass

@@ -16,13 +16,15 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. Register arrays use cute.make_rmem_tensor, SMEM data
-# buffers share one SharedStorage struct, raw SMEM pointers go through smem_data_ptr, and
-# segment-major swizzle offsets use swizzle_box_offset_128b. The frozen cfg launches through
-# KdaPrefillOp, whose name encodes every static flag. The delta residual stays FP32 until the MMA
-# pack, and optional paged routes (resolve_paged_state) seed, store, clear, or skip pool slots. The
-# safe-gate, a_log/dt_bias, beta-sigmoid, allow_neg_eigval, and in-kernel Q/K L2-norm paths are
-# removed (the name keeps their flag slots as 0).
+# attn_gym.linear._delta_rule.cudnn_fe; restyled register tensors (cute.make_rmem_tensor), one
+# SharedStorage struct, smem_data_ptr, swizzle_box_offset_128b swizzle offsets, and call sites of
+# the pruned tile_dsl helpers; the @cute.jit host became KdaPrefillOp (frozen cfg, name encodes
+# every static flag, optional int64 offsets), compiled inside the warmup/chain hosts;
+# launch-contract, warp-role, named-barrier, and TMEM/SMEM validation plus forward
+# operand/state/checkpoint validators; FP32 delta residual until the MMA pack; optional paged state
+# (resolve_paged_state seeds, stores, clears, or skips pool slots); upstream-only constexpr knobs
+# pruned (safe_gate, A_log/dt_bias, beta sigmoid, allow_neg_eigval, Q/K L2 norm; the Op name keeps
+# their flag slots as 0); Ruff formatting.
 
 """
 Chunked Kimi Delta Attention (KDA) prefill kernel for SM100 / SM103 / SM107 (Cutlass primitives):

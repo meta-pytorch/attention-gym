@@ -15,13 +15,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0 with imports relocated
-# into attn_gym.linear._delta_rule.cudnn_fe; register arrays as rmem tensors, operand SMEM in a
+# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
+# attn_gym.linear._delta_rule.cudnn_fe; register arrays as rmem tensors, operand SMEM in a
 # SharedStorage struct read through smem_data_ptr, and named swizzle-box offsets; beta-free dBeta
-# (T = I - T_b L staged in sDm, Z in sdQ, dV = beta Z); frozen cfg, GdnBpropOp, and persistent
-# jit_cache compiles on fake-tensor TVM-FFI signatures with an int64-shape variant; and the
-# upstream-only expand_num, safe_gate/a_log/dt_bias, beta-sigmoid, negative-eigenvalue,
-# fused-l2norm, and chunk_gdn_bwd-owned prologue paths removed.
+# (T = I - T_b L staged in sDm, Z in sdQ, dV = beta Z); mbarriers initialized by one thread;
+# build_cfg and chunk_gdn_bwd validate the launch contract, and scheduler arrivals derive from warp
+# counts; frozen cfg, GdnBpropOp, and persistent jit_cache compiles on fake-tensor TVM-FFI
+# signatures with an int64-shape variant; the upstream-only expand_num, safe_gate/A_log/dt_bias,
+# beta-sigmoid, negative-eigenvalue, fused-l2norm, and own-prologue paths removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) BPROP kernel for SM100 / SM103 / SM107 (Cutlass primitives).
@@ -5896,7 +5897,7 @@ def chunk_gdn_bwd(
             backward and writes gradients only for ``[write_start, write_end)``.
         work_count: ``(1,)`` int32 device-side item count (REQUIRED)
         tinv: ``(tinv_rows, HO, B_T, B_T)`` io dtype, the chunk-factor tiles of
-            ``gdn_tinv_f16.chunk_gdn_tinv`` (same k / gate / beta / cu_seqlens),
+            the GDN tinv kernel (same k / gate / beta / cu_seqlens),
             or None to invert the chunk factor in-kernel
         workspace: ``(>= tensormap_workspace_bytes(module, B) // 8,)`` int64,
             128-byte aligned; holds the per-(b,h) TMA descriptors

@@ -16,10 +16,11 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host nests the summary / prefill Ops, compiles through
-# a persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor
-# needs it), and launches with live tensors on the current Torch stream. The always-pinned
-# safe_gate, a_log, dt_bias, beta-sigmoid, allow_neg_eigval and Q/K L2-norm knobs are removed.
+# attn_gym.linear._delta_rule.cudnn_fe; the host nests the chain prologue and the summary/prefill
+# Ops and compiles through a @jit_cache function over fake TVM-FFI signatures (+int64 variants),
+# launching live tensors on the current Torch stream (unused device/stream arguments dropped);
+# launch-contract validation of the plan buffers; upstream-only constexpr knobs pruned (safe_gate,
+# A_log/dt_bias, beta sigmoid, allow_neg_eigval, Q/K L2 norm); Ruff formatting.
 
 """One compiled launch for the KDA chain forward: chain prologue, fused summary, fp32 state chain
 and prefill issued from a single host, the way ``split_k.run_table`` launches plan, scan and walk.

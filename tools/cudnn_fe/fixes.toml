@@ -443,6 +443,19 @@ guarding_tests = []
 gate = "sass (51/51 identical)"
 upstream_status = "nv-surface-removed"
 
+[[fix]]
+id = "R12"
+title = "Accurate NOTICE.md and per-file modification notices"
+kind = "pruning"
+ag_subject = "Make the vendored cuDNN v1.30 notices describe the final modification set"
+ag_subjects_extra = [
+  "Describe the final Attention Gym changes in the v1.30 cuDNN notice",
+  "Wrap the v1.30 cuDNN notice at 99 columns",
+]
+guarding_tests = []
+gate = "review (notices list every ledger row touching the file)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"

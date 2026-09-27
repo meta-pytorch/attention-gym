@@ -16,10 +16,11 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host compiles through a persisted ``jit_cache``
-# function over fake TVM-FFI signatures and launches on the current Torch stream. The
-# always-pinned safe_gate, a_log, dt_bias, expand_num, beta-sigmoid, allow_neg_eigval and Q/K
-# L2-norm knobs are removed.
+# attn_gym.linear._delta_rule.cudnn_fe; the host nests the recompute/bprop prologues and hosts and
+# compiles through a @jit_cache function over fake TVM-FFI signatures (int64 ABI from the kernel
+# modules' selectors), launching on the current Torch stream (unused device/stream arguments
+# dropped); upstream-only constexpr knobs pruned (safe_gate, A_log/dt_bias, beta sigmoid,
+# allow_neg_eigval, Q/K L2 norm, expand_num, the log2_threshold override); Ruff formatting.
 
 """One compiled launch for the KDA warmup and uncut backward: the split-K table (warmup only), the
 recompute prologue and the checkpoint-series recompute (unless the forward's per-chunk series is

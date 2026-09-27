@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0 with imports relocated
-# into attn_gym.linear._delta_rule.cudnn_fe, the standalone state-chain host (build/run_state_chain,
-# is_dv_split) removed, and the upstream-only GDP expand_num knob resolved to 1.
+# into attn_gym.linear._delta_rule.cudnn_fe, the standalone state-chain host
+# (build/run_state_chain, is_dv_split) removed, and the upstream-only GDP expand_num knob
+# resolved to 1.
 
 """Exact piece chain for the chunked linear-attention kernels: the piece rule (``choose_pieces``), the piece table
 (piece-wise ``cu_pieces`` and the piece work-item tables, built by ``kernel/*_chain_prologue_f16.py``) and the fp32 state

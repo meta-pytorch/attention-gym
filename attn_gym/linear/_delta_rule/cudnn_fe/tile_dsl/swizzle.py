@@ -3,7 +3,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. The generic, 64-byte, and linear swizzles unused by the
-# vendored kernels were removed; swizzle_box_offset_{128b,32b} name the segment-major layouts.
+# vendored kernels were removed; swizzle_box_offset_{128b,32b} were added for the segment-major
+# layouts.
 
 
 import cutlass

@@ -16,11 +16,13 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The T_inv and V rings live in a SharedStorage struct, raw
-# SMEM pointers go through smem_data_ptr, and the checkpoint staging offset uses
-# swizzle_box_offset_128b. A frozen cfg (build_cfg derives the SMEM cosizes and TMA byte counts)
-# is compiled through the warmup/chain bundle hosts, and the upstream-only GDP expand_num,
-# safe_gate, A_log, and dt_bias knobs are removed at their pinned values.
+# attn_gym.linear._delta_rule.cudnn_fe; the T_inv and V rings in a SharedStorage struct read
+# through smem_data_ptr and the checkpoint staging offset via swizzle_box_offset_128b; mbarriers
+# initialized by one thread; a frozen cfg whose build_cfg derives the SMEM cosizes and TMA byte
+# counts and validates the launch contract; the standalone Op/compile/chunk_gdn_recompute/run host
+# and own-prologue path removed (the kernel compiles only inside the warmup/chain backward
+# bundles); the upstream-only expand_num and safe_gate/A_log/dt_bias knobs removed; Ruff
+# formatting.
 
 """
 Chunked Gated Delta Net (GDN) recompute (state/checkpoint-only) kernel for SM100 / SM103 / SM107

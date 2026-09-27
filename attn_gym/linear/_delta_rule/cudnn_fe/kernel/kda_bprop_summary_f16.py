@@ -16,10 +16,13 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; removed safe_gate, a_log/dt_bias, beta_sigmoid,
-# allow_neg_eigval and l2norm knobs.
-# Restyled register tensors, shared storage, and shared-memory pointer access. Fake-tensor TVM-FFI
-# compilation is persisted through jit_cache.
+# attn_gym.linear._delta_rule.cudnn_fe; restyled register tensors (cute.make_rmem_tensor), one
+# SharedStorage struct, smem_data_ptr, and call sites of the pruned tile_dsl helpers; upstream
+# standalone host (get_compiled_cache, compile, chunk_kda_bwd_summary, run_bwd_summary) replaced by
+# KdaBpropSummaryOp and @jit_cache fake-tensor TVM-FFI compiles of the kernel and prologue (+int64
+# variants); frozen cfg whose build_cfg validates warp roles and named barriers and derives the
+# scheduler arrival count; upstream-only constexpr knobs pruned (safe_gate, A_log/dt_bias, beta
+# sigmoid, allow_neg_eigval, Q/K L2 norm); Ruff formatting.
 
 """
 Chunked Kimi Delta Attention (KDA) bprop state-summary kernel for SM100 / SM103 / SM107 (Cutlass

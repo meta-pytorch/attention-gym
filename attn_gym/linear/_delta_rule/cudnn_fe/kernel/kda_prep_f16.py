@@ -16,11 +16,13 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; register arrays are rmem tensors, the SMEM data buffers
-# share one SharedStorage, and segment-major swizzle offsets use swizzle_box_offset_128b. The
-# frozen cfg launches through KdaPrepOp, whose name encodes every static flag. The safe-gate,
-# a_log/dt_bias, beta-sigmoid, allow_neg_eigval, and in-kernel Q/K L2-norm paths are removed (the
-# name keeps their flag slots as 0).
+# attn_gym.linear._delta_rule.cudnn_fe; restyled register tensors (cute.make_rmem_tensor), one
+# SharedStorage struct, smem_data_ptr, swizzle_box_offset_128b swizzle offsets, and call sites of
+# the pruned tile_dsl helpers; the @cute.jit host became KdaPrepOp (frozen cfg, name encodes every
+# static flag, optional int64 offsets), compiled inside the warmup host; launch-contract and
+# named-barrier validation; upstream-only constexpr knobs pruned (safe_gate, A_log/dt_bias, beta
+# sigmoid, allow_neg_eigval, Q/K L2 norm; the Op name keeps their flag slots as 0); Ruff
+# formatting.
 
 """
 KDA prep for SM100 / SM103 / SM107 (Cutlass primitives): the per-(chunk, head) prep records of the

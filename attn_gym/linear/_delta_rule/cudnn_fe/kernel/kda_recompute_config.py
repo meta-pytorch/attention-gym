@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; Ruff formatting (typing.Tuple -> tuple).
 
 """Kimi Delta Attention (KDA) Cutlass DSL recompute (state/H-only) kernel
 config (fixed compile-time constants).  The BT=16 KDA schedule uses a 16-warp

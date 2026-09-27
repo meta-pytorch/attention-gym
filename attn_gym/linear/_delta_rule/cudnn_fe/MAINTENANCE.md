@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 37 modification rows below are generated from
+The 38 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 37 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 38 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -185,6 +185,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | R11 | Drop the GDP d_v=64 bprop fork from the GDN chain prologue | vendor.py applies the GDP fork cut automatically; import test |
 | R13 | Delete unreached/test-only upstream code (gate_bwd, head_reduce, l2norm, standalone hosts, ...) | reachability (package import + full suite) |
 | R14 | Prune upstream-only constexpr knobs AG never sets | sass (51/51 identical) |
+| R12 | Accurate NOTICE.md and per-file modification notices | review (notices list every ledger row touching the file) |
 | B3 | Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream) | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items` |
 | B9 | Test: contracting-gate split test pins the uncut plan so an ignored split fails | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate` |
 | B17 | Test: GDN backward rejects HQ > HV before dispatch | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads` |

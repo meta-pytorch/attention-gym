@@ -16,8 +16,11 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; upstream GDP (expand_num), safe_gate/A_log/dt_bias and
-# beta-sigmoid/allow_neg_eigval constexpr paths pruned.
+# attn_gym.linear._delta_rule.cudnn_fe; operand SMEM in a SharedStorage struct read through
+# smem_data_ptr; a frozen cfg whose build_cfg derives the SMEM cosizes and TMA byte counts; the
+# standalone compile/chunk_gdn_tinv/run_tinv host removed (the kernel compiles only inside the
+# warmup/chain bundles); the upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and
+# allow_neg_eigval knobs removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) chunk-factor pass (the T pass) for SM100 / SM103 / SM107 (Cutlass

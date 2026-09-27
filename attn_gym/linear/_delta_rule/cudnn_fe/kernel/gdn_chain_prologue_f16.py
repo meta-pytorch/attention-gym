@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; the upstream-only GDP expand_num, compact_qdo, and
-# summary_q_step paths are removed at their pinned values.
+# attn_gym.linear._delta_rule.cudnn_fe; the unused GDP d_v=64 bprop fork and the standalone
+# run_chain_prologue host removed; the upstream-only GDP expand_num, compact_qdo, and
+# summary_q_step paths removed at their pinned values; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass
