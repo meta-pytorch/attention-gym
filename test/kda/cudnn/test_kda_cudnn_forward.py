@@ -13,7 +13,7 @@ from attn_gym.linear._delta_rule.cudnn.forward import (
     chunk_delta_rule_fwd_cudnn,
     chunk_delta_rule_fwd_cudnn_unsplit_with_state,
 )
-from attn_gym.linear._delta_rule.cudnn.kernels.common.split_k import (
+from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
     WORK_ITEM_FIELDS,
     build_split_table,
     chunk_scratch_rows,
@@ -153,7 +153,9 @@ def test_cudnn_split_table_rejects_misaligned_vector_gate_rows() -> None:
             chunk_scratch=chunk_scratch,
             item_scratch=item_scratch,
             log_gate=True,
+            scheduler_counter=None,
             split=True,
+            opt_level=2,
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
@@ -174,7 +176,9 @@ def test_cudnn_split_table_rejects_invalid_geometry_and_capacity() -> None:
             n_tiles=heads - 1,
             num_sms=1,
             b_t=16,
+            scheduler_counter=None,
             split=False,
+            opt_level=2,
             stream=stream,
         )
 
@@ -194,7 +198,9 @@ def test_cudnn_split_table_rejects_invalid_geometry_and_capacity() -> None:
             ),
             item_scratch=torch.empty_like(work_items),
             log_gate=True,
+            scheduler_counter=None,
             split=True,
+            opt_level=2,
             stream=stream,
         )
 

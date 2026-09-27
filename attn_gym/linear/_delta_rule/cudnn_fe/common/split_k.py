@@ -1939,6 +1939,18 @@ def split_table_facts(
     if log2_threshold is None:
         log2_threshold = DEFAULT_LOG2_THRESHOLD
     gate_channels = gate.shape[2] if len(gate.shape) == 3 else 0
+    # The channel scan reads four channels per lane with one vector load (16 B fp32, 8 B 16-bit).
+    vector_bytes = 4 * gate.element_size()
+    if (
+        split
+        and gate_channels
+        and gate_channels % 128 == 0
+        and (gate.data_ptr() % vector_bytes or gate.stride(0) % 4 or gate.stride(1) % 4)
+    ):
+        raise ValueError(
+            f"per-channel gate rows and head slices must be {vector_bytes}-byte aligned "
+            "for vectorized scan loads"
+        )
     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1

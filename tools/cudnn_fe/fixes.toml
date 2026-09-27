@@ -275,6 +275,18 @@ upstream_expect = "smoke"
 upstream_status = "hardening-draft"
 
 [[fix]]
+id = "R7"
+title = "Reject misaligned per-channel gate rows before the vectorized split scan"
+kind = "validation"
+ag_subject = "Reject misaligned per-channel gate rows before the vectorized split scan"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_forward.py::test_cudnn_split_table_rejects_misaligned_vector_gate_rows"]
+upstream_patch = "upstream/06-validate-channel-scan-alignment.patch"
+upstream_repro = "upstream/repro_06_channel_alignment.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
 id = "B2"
 title = "Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary"
 kind = "validation"

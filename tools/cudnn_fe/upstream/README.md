@@ -23,6 +23,7 @@ every optional specialization was tested.
 | 1 | `01-gdn-beta-free-dbeta.patch` | B7 | **Yes:** dBeta=0 instead of 1 at beta=0, BF16/FP16, both inverse-factor routes | All five gradients exact vs FP64 in 16 dtype × beta × factor-route cases |
 | 2 | `02-kda-fp32-delta-residual.patch` | B6 | **Yes:** output 2 instead of 1.5; dBeta 0 instead of −256; later dQ 128 instead of 96 | 16 forward plan cases and four uncut backward cases |
 | 3 | `03-compact-empty-unsplit-work.patch` | B8 | **Yes:** padded empty intervals stay in the work table; 8/20 work-count checks fail | 20/20 checks, incl. exact empty final-state/cotangent preservation |
+| 4 | `06-validate-channel-scan-alignment.patch` | R7 | **Yes, missing validation:** misaligned rows accepted (no device-fault claim) | FP32/FP16/BF16 × misaligned base/head/row rejected; aligned controls accepted |
 | 5 | `05-scalar-scan-head-stride.patch` | B13 | **Yes:** raw scan wrong in 256/516 entries, max abs error 4.6166; host rejects stride-2 replay | Raw scan and compact→strided host replay match exactly |
 | 6 | `04-omit-zero-chunk-split-work.patch` | B10 | **Yes:** 8 items instead of 4 (not a reproduced TMEM hang) | Opted-in table has 4 items, all-empty 0; stateful default unchanged |
 | 7 | `07-single-thread-gdn-mbarrier-init.patch` | B2 | **No isolated failure:** all-thread init pattern exists | Stock and patched 32-iteration multi-wave GDN fwd/bwd stress both pass |
@@ -37,6 +38,7 @@ every optional specialization was tested.
 | `repro_03_empty_unsplit.py` | optional export dir holding `python/cudnn` (defaults to the installed package) | 8/20 fail | 20/20 |
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
 | `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
+| `repro_06_channel_alignment.py` | none; pre-dispatch contract checks | fails (accepts) | pass |
 | `repro_07_mbarrier_stress.py` | `--iterations 32` | pass | pass |
 | `repro_08_scheduler_counts.py` | `--iterations 32` | pass | pass |
 | `repro_09_replay_abi_scope.py` | none; scope check for excluded B14 | pass (`None` fails at build) | n/a |
@@ -55,6 +57,8 @@ dependencies**:
 - 04 (B10): "Omit zero-chunk split work items"; adds an upstream-specific safe opt-in.
 - 05 (B13): "Respect scalar-gate head strides in split scans"; uses upstream CuTeDSL's
   `make_fake_tensor` instead of the AG fake-tensor helper.
+- 06 (R7): "Reject misaligned per-channel gate rows before the vectorized split scan"; uses
+  upstream tensor-like buffers.
 - 07 (B2): "Initialize the GDN prefill mbarriers from one thread", "Initialize the GDN backward
   mbarriers from one thread", summary part of "Initialize GDN summary mbarriers from one thread and
   tidy vendored kernel names".
@@ -158,6 +162,17 @@ stock compact→strided replay raises a TVM-FFI stride mismatch; patched passes.
 **Fix.** Widen before multiplying by the actual head stride; explicit symbolic-stride fake signature
 for scalar gates. `mark_layout_dynamic(leading_dim=None)` is not enough: it infers stride 1 from a
 compact first call.
+
+## Draft issue 06 — Reject misaligned channel-gate rows before vectorized scan loads
+
+**Symptom.** `split_table_facts` accepts per-channel gates whose base, token stride or head stride
+violate the scan's vector-load alignment (acceptance reproduced, not a device fault).
+
+**Root cause.** For channel counts divisible by 128 a lane loads four adjacent channels: 16-byte
+alignment for FP32, 8-byte for FP16/BF16. Contiguous channels do not imply aligned row/head starts.
+
+**Fix.** Validate base pointer and token/head strides before compiling/launching the vectorized path,
+via upstream `cudnn.frost.buffers.data_ptr` and tensor-like `stride()`. Metadata-only checks.
 
 ## Draft issue 07 — Initialize each GDN CTA mbarrier from one thread
 

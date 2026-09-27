@@ -129,6 +129,16 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Replay:** keep the dynamic-stride fake ABI; `mark_layout_dynamic(leading_dim=None)` still infers
   stride 1 from a compact first call, and the test then only exercises the host rejection.
 
+### R7 — Misaligned per-channel gate rows reach the vectorized scan · validation
+- **Problem:** `ld_global_v4/v2` in the channel-gate scan need 16 B (FP32) / 8 B (FP16/BF16) aligned
+  rows; v1.30 accepted misaligned base pointers and token/head strides.
+- **Found by:** diffing v1.30 against the legacy AG split_k, which had this check.
+- **Fix:** validate base and strides in `split_table_facts`. "Reject misaligned per-channel gate rows
+  before the vectorized split scan".
+- **Tests:** KF::test_cudnn_split_table_rejects_misaligned_vector_gate_rows (DID NOT RAISE before).
+- **Upstream:** draft `06-validate-channel-scan-alignment.patch` (missing validation; no device
+  fault claimed).
+
 ### B2 — All-thread mbarrier init in GDN kernels (C02) · hardening
 - **Problem:** upstream initializes every barrier from every thread; one sync object should have one
   initializer.
