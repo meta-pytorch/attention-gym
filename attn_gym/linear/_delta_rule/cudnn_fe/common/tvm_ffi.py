@@ -127,6 +127,8 @@ def make_workspace_signature(words: Any):
 
 def validate_cu_seqlens(cu_seqlens: Any, *, assumed_align: int) -> None:
     """Validate the cumulative-sequence-length ABI before cache selection."""
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 1 or not cu_seqlens.is_contiguous():
+        raise ValueError("cu_seqlens must be a nonempty compact vector")
     if str(cu_seqlens.dtype) != "torch.int32":
         raise ValueError(f"cu_seqlens must have dtype torch.int32, got {cu_seqlens.dtype}")
     if cu_seqlens.data_ptr() % assumed_align:

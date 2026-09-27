@@ -7,6 +7,7 @@
 """Host-side helpers shared by the FROST LA kernel modules (engine-invoked)."""
 
 import cutlass
+import torch
 
 from .thd import TENSOR_MAP_QWORDS
 
@@ -27,6 +28,17 @@ def get_dtype(dtype):
         raise ValueError(
             f"Unsupported dtype {dtype}, expected bfloat16, float16, half, or float32"
         ) from None
+
+
+def validate_cuda_tensors(reference: torch.Tensor, **tensors: torch.Tensor | None) -> None:
+    """Reject cross-device or inactive-device launches before selecting a compiled ABI."""
+    if not reference.is_cuda:
+        raise ValueError("common cuDNN helpers require CUDA tensors")
+    if torch.cuda.current_device() != reference.get_device():
+        raise ValueError("the active CUDA device must match the input device")
+    for name, tensor in tensors.items():
+        if tensor is not None and tensor.device != reference.device:
+            raise ValueError(f"{name} must be on {reference.device}")
 
 
 def tensormap_workspace_bytes(mod, B: int) -> int:

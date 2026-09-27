@@ -27,10 +27,11 @@ import cutlass
 from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
-from .host import get_dtype
+from .host import get_dtype, validate_cuda_tensors
 from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
@@ -157,6 +158,19 @@ def head_group_reduce(src, dst, *, stream) -> None:
     must be even, word-pair stores). Same-dtype (f16/bf16, or fp32),
     DLPack-compatible CUDA tensors; the f16/bf16 inner extent ``D`` must be
     even.  Compile-cache-and-replay per ``(dtype, rank, D)``; head counts are runtime."""
+    validate_cuda_tensors(src, dst=dst)
+    if src.ndim not in (2, 3) or dst.ndim != src.ndim:
+        raise ValueError("head reduction requires matching rank-2 or rank-3 tensors")
+    if src.shape[0] != dst.shape[0] or src.shape[2:] != dst.shape[2:]:
+        raise ValueError("head reduction input and output must agree outside the head mode")
+    if dst.shape[1] <= 0 or src.shape[1] % dst.shape[1]:
+        raise ValueError("output head count must divide the input head count")
+    if src.dtype != dst.dtype:
+        raise ValueError("head reduction requires matching input and output dtypes")
+    if not src.is_contiguous() or src.data_ptr() % 4:
+        raise ValueError("head reduction source must be compact and 4-byte aligned")
+    if not tensor_supports_contiguous_dim(dst, alignment_bytes=4):
+        raise ValueError("head reduction output requires aligned, contiguous inner words")
     if len(src.shape) == 2:
         total, HO = src.shape
         D = 1
@@ -166,6 +180,10 @@ def head_group_reduce(src, dst, *, stream) -> None:
         H = dst.shape[1]
     io_dtype = get_dtype(src.dtype)
     is_fp32 = io_dtype == cutlass.Float32
+    if not is_fp32 and (src.ndim != 3 or D % 2):
+        raise ValueError("16-bit head reduction requires an even rank-3 inner dimension")
+    if src.numel() == 0:
+        return
     r = HO // H
     inner_words = D if is_fp32 else D // 2
     total_words = total * H * inner_words

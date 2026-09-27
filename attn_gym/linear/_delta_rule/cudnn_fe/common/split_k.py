@@ -72,13 +72,14 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, make_fake_stride
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4
-from .host import get_dtype
+from .host import get_dtype, validate_cuda_tensors
 from .paged_state import resolve_paged_state
 from .tvm_ffi import (
     make_counter_signature,
     make_cu_seqlens_signature,
     make_strided_signature_tensor,
     make_work_items_signature,
+    validate_cu_seqlens,
 )
 
 USE_PDL = True
@@ -164,7 +165,7 @@ def max_work_items(
 ) -> int:
     """Provable upper bound on the emitted item count: spans are capped at
     ``ideal_chunks`` (at most ``ceil(nc / ideal) + 1`` pieces per (b, h)),
-    zero-length sequences emit one item each, and the fill-regime search
+    capacity for zero-length sequences is conservative, and the fill-regime search
     can widen any tile by up to ``P_WINDOW - 1`` extra pieces."""
     total_chunks = -(-total_tokens // b_t)
     window = P_WINDOW - 1 if batch_size * n_heads_out < 2 * num_sms else 0
@@ -2084,6 +2085,66 @@ def build_split_table(
     in ``cu * expand_num`` units without materializing that array (1 = off).
     Runs entirely on device, no host synchronization.  ``opt_level`` is the family's main-kernel level, so the
     standalone table is the one the family's warmup hosts nest."""
+    validate_cuda_tensors(
+        gate,
+        cu_seqlens=cu_seqlens,
+        work_items=work_items,
+        work_count=work_count,
+        chunk_scratch=chunk_scratch,
+        item_scratch=item_scratch,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        scheduler_counter=scheduler_counter,
+    )
+    if gate.ndim not in (2, 3) or gate.shape[1] <= 0:
+        raise ValueError("gate must have rank 2 or 3 with a positive head count")
+    validate_cu_seqlens(cu_seqlens, assumed_align=4)
+    batch_size, heads = cu_seqlens.numel() - 1, gate.shape[1]
+    if batch_size <= 0:
+        raise ValueError("cu_seqlens must describe at least one sequence")
+    if n_tiles != batch_size * heads:
+        raise ValueError("n_tiles must equal the number of sequences times output heads")
+    if b_t <= 0 or num_sms <= 0 or expand_num < 1:
+        raise ValueError("b_t, num_sms and expand_num must be positive")
+    ideal_chunks = 0 if ideal_chunks is None else int(ideal_chunks)
+    if ideal_chunks < 0:
+        raise ValueError("ideal_chunks must be nonnegative")
+    if safe_gate and gate.ndim == 3 and gate_lower_bound is None:
+        raise ValueError("safe channel gates require gate_lower_bound")
+    alignment = 8 if gate.element_size() == 2 else 4
+    if gate.data_ptr() % alignment or (gate.ndim == 3 and gate.stride(-1) != 1):
+        raise ValueError("gate does not satisfy the aligned scan layout")
+    for name, tensor in (("work_count", work_count), ("scheduler_counter", scheduler_counter)):
+        if tensor is not None and (
+            tensor.ndim != 1
+            or tensor.numel() < 1
+            or str(tensor.dtype) != "torch.int32"
+            or not tensor.is_contiguous()
+            or tensor.data_ptr() % 4
+        ):
+            raise ValueError(f"{name} must be a nonempty compact int32 vector")
+    required_items = n_tiles
+    if split and ideal_chunks:
+        required_items = max_work_items(
+            gate.shape[0] * expand_num, batch_size, heads, ideal_chunks, b_t, num_sms
+        )
+    for name, tensor in (("work_items", work_items), ("item_scratch", item_scratch)):
+        if name == "item_scratch" and not split:
+            continue
+        if tensor is None or tensor.ndim != 2 or tensor.shape[1] != WORK_ITEM_FIELDS:
+            raise ValueError(f"{name} must have shape (rows, {WORK_ITEM_FIELDS})")
+        if str(tensor.dtype) != "torch.int32" or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be a compact int32 table")
+        if tensor.shape[0] < required_items:
+            raise ValueError(f"{name} requires at least {required_items} rows")
+    if split:
+        rows = chunk_scratch_rows(gate.shape[0] * expand_num, batch_size, b_t)
+        if chunk_scratch is None or chunk_scratch.ndim != 2 or chunk_scratch.shape[0] < rows:
+            raise ValueError(f"chunk_scratch requires at least {rows} rows")
+        if chunk_scratch.shape[1] != heads or str(chunk_scratch.dtype) != "torch.float32":
+            raise ValueError("chunk_scratch must be float32 with one column per head")
+        if chunk_scratch.stride(1) != 1 or chunk_scratch.data_ptr() % 4:
+            raise ValueError("chunk_scratch must have aligned contiguous head rows")
     if not safe_gate:
         a_log = None
         dt_bias = None

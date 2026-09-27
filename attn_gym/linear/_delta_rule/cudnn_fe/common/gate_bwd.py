@@ -31,6 +31,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import (
@@ -44,7 +45,7 @@ from ..tile_dsl.pointwise import (
     softplus,
 )
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
-from .host import get_dtype
+from .host import get_dtype, validate_cuda_tensors
 from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
@@ -498,12 +499,60 @@ def _compile_gate_bwd(specs, d_k, use_int64_offsets):
     )
 
 
+def _validate_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt):
+    validate_cuda_tensors(
+        d_gate,
+        g_raw=g_raw,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        d_a_log=d_a_log,
+        d_dt_bias=d_dt_bias,
+        part_a=part_a,
+        part_dt=part_dt,
+    )
+    if d_gate.shape != g_raw.shape or d_gate.dtype != g_raw.dtype:
+        raise ValueError("d_gate and g_raw must have matching shapes and dtypes")
+    if d_gate.ndim not in (2, 3) or d_gate.shape[1] <= 0:
+        raise ValueError("gate tensors must have rank 2 or 3 with a positive head count")
+    channel = d_gate.ndim == 3
+    if channel and d_gate.shape[2] not in (64, 128):
+        raise ValueError("channel gate head dimension must be 64 or 128")
+    alignment = 4 * d_gate.element_size() if channel else 4
+    for name, tensor in (("d_gate", d_gate), ("g_raw", g_raw)):
+        if not tensor_supports_contiguous_dim(tensor, alignment_bytes=alignment):
+            raise ValueError(f"{name} requires aligned contiguous inner rows")
+    blocks = GATE_BWD_BLOCKS if channel else scalar_gate_blocks(d_gate.shape[0])
+    needed = blocks * d_gate.shape[1] * (d_gate.shape[2] if channel else 1)
+    for name, parameter, gradient, partial in (
+        ("a", a_log, d_a_log, part_a),
+        ("dt", dt_bias, d_dt_bias, part_dt),
+    ):
+        if parameter is None and (gradient is not None or partial is not None):
+            raise ValueError(f"{name} gradients require the corresponding parameter")
+        if parameter is not None:
+            allowed = ((d_gate.shape[1],), tuple(d_gate.shape[1:]))
+            if tuple(parameter.shape) not in allowed or not parameter.is_contiguous():
+                raise ValueError(f"{name} parameter has an incompatible shape or layout")
+        if gradient is not None:
+            if partial is None or gradient.shape != parameter.shape:
+                raise ValueError(f"{name} gradient requires matching shape and partial workspace")
+        if partial is not None:
+            if partial.ndim != 1 or partial.numel() < needed:
+                raise ValueError(f"part_{name} requires at least {needed} entries")
+            if get_dtype(partial.dtype) != cutlass.Float32:
+                raise ValueError(f"part_{name} must have dtype float32")
+        for tensor in (parameter, gradient, partial):
+            if tensor is not None and (not tensor.is_contiguous() or tensor.data_ptr() % 4):
+                raise ValueError(f"{name} buffers must be compact and 4-byte aligned")
+
+
 def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, *, stream):
     """Scalar-gate backward: rewrite d_gate [total, HO] (gate dtype) in place from
     transformed-space to raw-logit space and fill d_a_log/d_dt_bias (HO,).
     part_a/part_dt are (scalar_gate_blocks(total) * HO,) fp32 workspace carves.
     a_log/dt_bias may be None (unit amplitude / zero bias); the matching
     d_*/part_* are then None and that gradient is not produced."""
+    _validate_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt)
     n_tokens, h_o = (int(dim) for dim in d_gate.shape)
     n_blocks = scalar_gate_blocks(n_tokens)
     head_tiles = -(-h_o // SCALAR_HEAD_TILE)
@@ -522,6 +571,7 @@ def channel_gate_bwd(
     get the channel axis folded in the finisher).  a_log/dt_bias may be None
     (unit amplitude / zero bias); the matching d_*/part_* are then None and
     that gradient is not produced."""
+    _validate_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt)
     n_tokens, h_o, d_k = (int(dim) for dim in d_gate.shape)
     slice_len = (n_tokens + GATE_BWD_BLOCKS - 1) // GATE_BWD_BLOCKS
     tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
