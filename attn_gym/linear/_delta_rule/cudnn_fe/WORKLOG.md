@@ -15,7 +15,7 @@ and the v1.30 verification baseline. It does not repeat the ledger table.
 
 Vendored tag **v1.30.0** (`42286a6f`): a 49-file closure (GDN + KDA scalar linear-attention kernels,
 `common/`, `tile_dsl/`) replacing the 085d50b copy vendored by #368 (KDA) / #427 (GDN). Stack:
-#606 vendor → #607 restyle → #608 integration → #609 cleanup → #610/#611 tooling.
+the tooling base PR → #606 vendor → #607 restyle → #608 integration → #609 cleanup → #611 gates.
 
 **Reading an entry.** Entries are keyed on ledger IDs; old catalog IDs (C01–C13, E1–E12) are given
 where a change descends from an earlier AG fix. **Where** names files (relative to this package
@@ -38,7 +38,8 @@ Evidence environment: GB200 (SM100), torch 2.15.0.dev20260926+cu132, CuTeDSL 4.8
 plus the mandatory prune cut of the chain prologue's `gdp_bprop_v64` import under `compact_qdo`
 (R11). Subjects: "Vendor the cudnn-frontend v1.30 GDN and KDA kernels verbatim", "Keep the vendored
 cuDNN license texts verbatim under pre-commit". Replay: prove the tool against this drop first
-(`vendor.py --rev v1.30.0 --verify <A commit>`), then vendor the new tag.
+(`vendor.py --rev v1.30.0 --verify auto`, which finds the drop commit by the first subject), then
+vendor the new tag.
 
 ## 1. Bugs in upstream v1.30 (upstream draft exists or is possible)
 

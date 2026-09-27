@@ -1,14 +1,11 @@
 """CPU-only tests for the cuDNN vendoring audit (tools/cudnn_fe/audit.py) and codemod (restyle.py)."""
 
 import ast
-import subprocess
 import textwrap
 
 import pytest
 
-from tools.cudnn_fe import audit, closure, restyle
-
-PR_A = "88eb5ce"  # the verbatim v1.30 drop
+from tools.cudnn_fe import audit, restyle, vendor
 
 HEADER = """\
 import cutlass
@@ -485,15 +482,11 @@ def _defined_names(tree: ast.Module) -> set[str]:
 
 
 def test_codemod_on_the_verbatim_drop_only_calls_existing_helpers(tmp_path):
-    """Every ``from ..tile_dsl.X import name`` in the restyled 88eb5ce drop resolves."""
-    has = subprocess.run(
-        ["git", "-C", str(closure.repo_root()), "cat-file", "-e", f"{PR_A}^{{commit}}"],
-        capture_output=True,
-        check=False,
-    )
-    if has.returncode:
-        pytest.skip(f"{PR_A} is not in this clone")
-    root = audit.extract_rev(PR_A, tmp_path)
+    """Every ``from ..tile_dsl.X import name`` in the restyled verbatim v1.30 drop resolves."""
+    drop = vendor.find_drop_commit()
+    if drop is None:
+        pytest.skip(f"no {vendor.DROP_SUBJECT!r} commit in this history")
+    root = audit.extract_rev(drop, tmp_path)
     results = restyle.restyle_tree(root, [], write=True)
     assert any(r.applied for r in results)
     missing = []

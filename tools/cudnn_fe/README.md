@@ -8,7 +8,7 @@ and the ledger of every Attention Gym modification are in
 | Step | Tool | Role |
 |---|---|---|
 | 1 churn | `vendor.py --diff-upstream OLD NEW` | per-file upstream churn of the kernel closure between two tags |
-| 2 vendor | `vendor.py --rev TAG` (`closure.py`) | verbatim closure, import relocation, notices, licenses; `--verify COMMIT` checks it against a past drop |
+| 2 vendor | `vendor.py --rev TAG` (`closure.py`) | verbatim closure, import relocation, notices, licenses; `--verify COMMIT` checks it against a past drop (`auto`: the v1.30 drop, found by subject) |
 | 3 restyle | `restyle.py --check/--write --root <candidate> --files <changed...>`, `audit.py --strict --root <candidate>` | apply the mechanical restyle; list upstream patterns still to restyle; `audit_allowlist.txt` holds the documented exceptions |
 | 4 SASS gate | [`sass/`](sass/README.md) (`python -m tools.cudnn_fe.sass snapshot/diff`) | snapshot cubins through the AG drivers and diff SASS/resources per commit |
 | 7 races | [`cutracer/`](cutracer/README.md) (`python -m tools.cudnn_fe.cutracer.oracle`, `python -m tools.cudnn_fe.cutracer.stress`) | CUTracer race and delay stress for the pipelined kernels |
@@ -20,7 +20,7 @@ The vendor/closure tools read upstream from a cudnn-frontend clone (`--upstream`
 unless `--dest` is given; it never writes into `attn_gym/` by default.
 
 ```bash
-python -m tools.cudnn_fe.vendor --rev v1.30.0 --upstream ~/cudnn-frontend --verify 88eb5ce
+python -m tools.cudnn_fe.vendor --rev v1.30.0 --upstream ~/cudnn-frontend --verify auto
 python -m pytest -n 6 test/test_cudnn_fe_tools_*.py   # CPU-only; --verify needs $CUDNN_FE_UPSTREAM
 ```
 
