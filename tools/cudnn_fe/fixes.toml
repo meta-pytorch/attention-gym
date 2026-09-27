@@ -255,6 +255,7 @@ ag_subjects_extra = [
   "Validate common cuDNN host launch contracts before compiling",
   "Preserve strided gate parameter layouts in host validation",
   "Validate the KDA backward warp-role maps and derive the scheduler arrival count",
+  "Validate KDA forward launch contracts and derive scheduler arrivals from warp counts",
 ]
 guarding_tests = [
   "test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry",
@@ -263,6 +264,9 @@ guarding_tests = [
   "test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata",
   "test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers",
   "test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_forward_cfgs_reject_unsupported_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_warmup_forward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_chain_forward_rejects_invalid_plan_buffers",
 ]
 upstream_patch = "upstream/08-derive-scheduler-arrival-counts.patch"
 upstream_repro = "upstream/repro_08_scheduler_counts.py"

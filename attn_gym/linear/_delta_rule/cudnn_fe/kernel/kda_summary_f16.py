@@ -93,6 +93,7 @@ from attn_gym._backends.cute.compat import SmemAllocator
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs
+from ..common.launch import validate_kernel_domain, validate_named_barriers, validate_warp_roles
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from .kda_summary_config import CFG
 
@@ -206,7 +207,13 @@ def make_bars(cfg) -> KdaSummaryBars:
         mb_k_restore_done=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), spin=True, stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            spin=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
         mb_state_k_acc_h_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=1, producer=Producer.MMA_COMMIT),
         mb_u_acc_h_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=1, producer=Producer.MMA_COMMIT),
         mb_state_input_h_cg1_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
@@ -2411,6 +2418,7 @@ def build_cfg(
 ) -> KdaSummaryCfg:
     """Build the per-compile ``KdaSummaryCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
+    validate_kernel_domain("KDA summary", io_dtype, (d_k, d_v), max_active_clusters=max_active_clusters)
     cfg = KdaSummaryCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -2431,6 +2439,13 @@ def build_cfg(
         raise ValueError("smem_raw_stages must be even: the CG0 ping-pong groups alias parity waits on odd rings")
     if cfg.cg0_warps_per_group != len(cfg.compute_group_1_warp_ids):
         raise ValueError("the state halves are packed by one CG0 group and by CG1: their warp counts must match")
+    cg0, per_group = cfg.compute_group_0_warp_ids, cfg.cg0_warps_per_group
+    if len(cg0) != cfg.cg0_group_count * per_group:
+        raise ValueError("compute group 0 must hold cg0_group_count groups of cg0_warps_per_group warps")
+    n_warps = validate_warp_roles(
+        (*(cg0[g * per_group : (g + 1) * per_group] for g in range(cfg.cg0_group_count)), cfg.compute_group_1_warp_ids),
+        (cfg.register_mma_warp_id, cfg.tcgen05_mma_warp_id, cfg.tma_warp_id, cfg.register_mma_twin_warp_id),
+    )
     b_t, d_k, d_v, raw = cfg.b_t, cfg.d_k, cfg.d_v, cfg.smem_raw_stages
     io_bytes, gate_bytes = cfg.io_dtype.width // 8, cfg.gate_dtype.width // 8
     offsets = {}
@@ -2448,9 +2463,9 @@ def build_cfg(
     # A Float32 gate exchanges in place (empty exchange buffer over the raw gate stages).
     gate_exchange_stages = raw if gate_dtype == cutlass.Float32 else 4
     gate_exchange_cosize = 0 if gate_dtype == cutlass.Float32 else gate_exchange_stages * d_k * b_t
-    return replace(
+    cfg = replace(
         cfg,
-        threads_per_cta=16 * cfg.threads_per_warp,
+        threads_per_cta=n_warps * cfg.threads_per_warp,
         cg0_threads_per_group=cfg.cg0_warps_per_group * cfg.threads_per_warp,
         tmem_user_threads=(1 + len(cfg.compute_group_1_warp_ids) + len(cfg.compute_group_0_warp_ids)) * cfg.threads_per_warp,
         **offsets,
@@ -2469,6 +2484,16 @@ def build_cfg(
         tma_v_bytes=d_v * b_t * io_bytes,
         tma_gate_bytes=d_k * b_t * gate_bytes,
     )
+    validate_named_barriers(
+        cfg.threads_per_cta,
+        **{
+            f"cg0_group_{g}": (cfg.cg0_group_sync_barrier_base_id + g, cfg.cg0_threads_per_group)
+            for g in range(cfg.cg0_group_count)
+        },
+        cg0_tile_entry=(cfg.cg0_tile_entry_barrier_id, cfg.cg0_group_count * cfg.cg0_threads_per_group),
+        tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads),
+    )
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, Gate

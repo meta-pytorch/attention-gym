@@ -40,7 +40,8 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common import split_k
-from ..common.host import get_dtype
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import validate_tensor, validate_workspace
 from ..common.tvm_ffi import (
     WORK_ITEM_FIELDS,
     make_compact_signature_tensor,
@@ -463,6 +464,66 @@ def _dtype_or_none(tensor):
     return None if tensor is None else get_dtype(tensor.dtype)
 
 
+def _validate_launch(
+    *, q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, state_in, state_out, seed_indices, final_indices, checkpoints,
+    work_items, work_count, item_scratch, chunk_scratch, scheduler, workspace, split, n_tiles, ideal_chunks, num_sm, b_t,
+    checkpoint_every_n_tokens, tiles_per_head, prep, prep_k_decay, prep_q_decay, prep_t, prep_a, prep_diag, prep_words,
+    prep_rows, prep_row_count, state_indices,
+):
+    """Check the warmup / uncut forward buffers of one plan (``n_tiles`` = sequences x heads x value tiles)."""
+    tokens, heads_out, num_seqs = kda_prefill_f16.validate_forward_operands(
+        q, k, v, gate, beta, o, cu_seqlens, a_log=a_log, dt_bias=dt_bias, b_t=b_t
+    )
+    kda_prefill_f16.validate_forward_states(
+        q, v, heads_out, num_seqs,
+        state_in=(state_in, state_indices is not None or seed_indices is not None),
+        state_out=(state_out, state_indices is not None or final_indices is not None),
+    )
+    kda_prefill_f16.validate_checkpoints(checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v)
+    validate_cuda_tensors(
+        q, work_items=work_items, work_count=work_count, item_scratch=item_scratch, chunk_scratch=chunk_scratch,
+        scheduler=scheduler, workspace=workspace, seed_indices=seed_indices, final_indices=final_indices,
+        state_indices=state_indices,
+    )
+    dim_v = v.shape[2]
+    if num_sm < 1 or tiles_per_head < 1 or dim_v % tiles_per_head or (split and tiles_per_head != 1):
+        raise ValueError("num_sm must be positive and tiles_per_head must divide d_v (1 under the split table)")
+    if n_tiles != num_seqs * heads_out * tiles_per_head:
+        raise ValueError("n_tiles must equal sequences x output heads x tiles_per_head")
+    for name, table in (("seed_indices", seed_indices), ("final_indices", final_indices), ("state_indices", state_indices)):
+        if table is not None:
+            validate_tensor(name, table, (num_seqs,), ("int32",), align=4, compact=True)
+    table_rows = n_tiles
+    if split:
+        if ideal_chunks:
+            table_rows = split_k.max_work_items(tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm)
+        validate_tensor(
+            "item_scratch", item_scratch, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows
+        )
+        validate_tensor(
+            "chunk_scratch", chunk_scratch, (None, heads_out), ("float32",), align=4,
+            min_rows=split_k.chunk_scratch_rows(tokens, num_seqs, b_t),
+        )
+    validate_tensor("work_items", work_items, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows)
+    validate_tensor("work_count", work_count, (None,), ("int32",), align=4, min_rows=1)
+    validate_tensor("scheduler", scheduler, (None,), ("int32",), align=4, min_rows=1)
+    prefill = kda_prep_prefill_f16 if prep else kda_prefill_f16
+    validate_workspace("workspace", workspace, prefill.TENSORMAP_DESC_ARRAYS, num_seqs)
+    if prep:
+        validate_cuda_tensors(
+            q, prep_k_decay=prep_k_decay, prep_q_decay=prep_q_decay, prep_t=prep_t, prep_a=prep_a, prep_diag=prep_diag,
+            prep_words=prep_words, prep_rows=prep_rows, prep_row_count=prep_row_count,
+        )
+        rows, dim_k, io = tokens // b_t + num_seqs, q.shape[2], (str(q.dtype).removeprefix("torch."),)
+        for name, tensor in (("prep_k_decay", prep_k_decay), ("prep_q_decay", prep_q_decay), ("prep_t", prep_t)):
+            validate_tensor(name, tensor, (None, heads_out, b_t, dim_k), io, tma=True, min_rows=rows)
+        validate_tensor("prep_a", prep_a, (None, heads_out, b_t * b_t // 2), ("int32",), tma=True, min_rows=rows)
+        validate_tensor("prep_diag", prep_diag, (None, heads_out, dim_k), ("float32",), tma=True, min_rows=rows)
+        validate_tensor("prep_rows", prep_rows, (None, 4), ("int32",), compact=True, min_rows=rows)
+        validate_tensor("prep_row_count", prep_row_count, (None,), ("int32",), align=4, min_rows=1)
+        validate_workspace("prep_words", prep_words, kda_prep_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
+
+
 def build_warmup_forward(
     *,
     q,
@@ -523,6 +584,17 @@ def build_warmup_forward(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    _validate_launch(
+        q=q, k=k, v=v, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, o=o, cu_seqlens=cu_seqlens,
+        state_in=state_in, state_out=state_out, seed_indices=seed_indices, final_indices=final_indices,
+        checkpoints=checkpoints, work_items=work_items, work_count=work_count, item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch, scheduler=scheduler, workspace=workspace, split=split, n_tiles=n_tiles,
+        ideal_chunks=ideal_chunks, num_sm=num_sm, b_t=b_t, checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        tiles_per_head=tiles_per_head, prep=prep, prep_k_decay=prep_k_decay, prep_q_decay=prep_q_decay, prep_t=prep_t,
+        prep_a=prep_a, prep_diag=prep_diag, prep_words=prep_words, prep_rows=prep_rows, prep_row_count=prep_row_count,
+        state_indices=state_indices,
+    )
     facts = split_k.split_table_facts(
         gate,
         cu_seqlens,

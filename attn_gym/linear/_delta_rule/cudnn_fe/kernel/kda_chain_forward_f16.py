@@ -39,8 +39,9 @@ import torch
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
-from ..common.host import get_dtype
-from ..common.piece_chain import launch_state_chain
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
+from ..common.piece_chain import CHAIN_WARPS, launch_state_chain
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
 
@@ -361,6 +362,53 @@ def _dtype_or_none(tensor):
     return None if tensor is None else get_dtype(tensor.dtype)
 
 
+def _validate_launch(
+    *, q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, cu_pieces, main_rows, summary_rows, main_count, summary_count,
+    work_items, work_items_summary, scheduler_all, scheduler_summary, scheduler_prefill, summary_words, prefill_words,
+    state_h, state_m, state_x, seed, seed_indices, final_state, final_indices, checkpoints, pieces, heads_out, num_seqs,
+    unit_chunks, b_t, checkpoint_every_n_tokens, chain_rows, num_sm,
+):
+    """Check the chain forward buffers of one plan: ``num_seqs * pieces`` piece states and the piece tables."""
+    if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 3 or gate.shape[1] != heads_out:
+        raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
+    if min(pieces, unit_chunks, num_sm) < 1:
+        raise ValueError("pieces, unit_chunks and num_sm must be positive")
+    tokens, _, _ = kda_prefill_f16.validate_forward_operands(
+        q, k, v, gate, beta, o, cu_seqlens, a_log=a_log, dt_bias=dt_bias, b_t=b_t
+    )
+    kda_prefill_f16.validate_forward_states(
+        q, v, heads_out, num_seqs, seed=(seed, seed_indices is not None), final_state=(final_state, final_indices is not None)
+    )
+    kda_prefill_f16.validate_checkpoints(checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v)
+    num_pieces, dim_v, dim_k = num_seqs * pieces, v.shape[2], q.shape[2]
+    tables = dict(
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        scheduler_all=scheduler_all, scheduler_summary=scheduler_summary, scheduler_prefill=scheduler_prefill,
+        seed_indices=seed_indices, final_indices=final_indices,
+    )
+    states = dict(state_h=state_h, state_m=state_m, state_x=state_x)
+    validate_cuda_tensors(q, **tables, **states, summary_words=summary_words, prefill_words=prefill_words)
+    if chain_rows < CHAIN_WARPS or dim_v % chain_rows or chain_rows % CHAIN_WARPS:
+        raise ValueError("chain_rows must divide d_v and contain whole chain warp groups")
+    for name, entries in (("cu_pieces", num_pieces + 1), ("main_rows", num_seqs + 1), ("summary_rows", num_seqs + 1)):
+        validate_tensor(name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16)
+    for name in ("main_count", "summary_count", "scheduler_all", "scheduler_summary", "scheduler_prefill"):
+        validate_tensor(name, tables[name], (None,), ("int32",), align=4, min_rows=1)
+    for name in ("seed_indices", "final_indices"):
+        if tables[name] is not None:
+            validate_tensor(name, tables[name], (num_seqs,), ("int32",), align=4, compact=True)
+    for name in ("work_items", "work_items_summary"):
+        validate_tensor(
+            name, tables[name], (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=num_pieces * heads_out
+        )
+    for name, tensor in states.items():
+        width = dim_k if name == "state_m" else dim_v
+        validate_tensor(name, tensor, (None, heads_out, width, dim_k), ("float32",), min_rows=num_pieces)
+    validate_workspace("summary_words", summary_words, kda_summary_f16.TENSORMAP_DESC_ARRAYS, num_pieces)
+    validate_workspace("prefill_words", prefill_words, kda_prefill_f16.TENSORMAP_DESC_ARRAYS, num_pieces)
+
+
 def build_chain_forward(
     *,
     q,
@@ -416,10 +464,21 @@ def build_chain_forward(
     ``heads_out`` and ``num_seqs`` are launch arguments.  The fake signatures repeat the marks of the standalone modules'
     builds so every kernel compiles as it does there.  ``device`` and ``stream`` are unused: the launch runs on the
     current Torch stream."""
-    del pieces, heads_out, num_seqs, scale, device, stream
     if not safe_gate:
         a_log = None
         dt_bias = None
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    _validate_launch(
+        q=q, k=k, v=v, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, o=o, cu_seqlens=cu_seqlens,
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        scheduler_all=scheduler_all, scheduler_summary=scheduler_summary, scheduler_prefill=scheduler_prefill,
+        summary_words=summary_words, prefill_words=prefill_words, state_h=state_h, state_m=state_m, state_x=state_x,
+        seed=seed, seed_indices=seed_indices, final_state=final_state, final_indices=final_indices,
+        checkpoints=checkpoints, pieces=pieces, heads_out=heads_out, num_seqs=num_seqs, unit_chunks=unit_chunks, b_t=b_t,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens, chain_rows=chain_rows, num_sm=num_sm,
+    )
+    del pieces, heads_out, num_seqs, scale, device, stream
     if int(checkpoint_every_n_tokens) <= 0:
         checkpoints = None
     for name, tensor in (("state_h", state_h), ("state_m", state_m), ("state_x", state_x)):

@@ -79,6 +79,7 @@ from attn_gym._backends.cute.compat import SmemAllocator
 from ..common.paged_state import resolve_paged_state
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs
+from ..common.launch import validate_kernel_domain, validate_named_barriers, validate_tmem_columns, validate_warp_roles
 from . import kda_prep_f16
 from .gdn_tinv_f16 import emit_tinv_rows
 from .kda_prefill_config import CFG
@@ -187,7 +188,13 @@ def make_bars(cfg) -> KdaPrefillBars:
             alloc(cfg.smem_checkpoint_stages), spin=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
         ),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            spin=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -2465,6 +2472,9 @@ def build_cfg(
     """Build the per-compile ``KdaPrepPrefillCfg`` (io_dtype in {Float16, BFloat16}); fills the derived TMEM column
     offsets and SMEM buffer cosizes.  ``tiles_per_head`` > 1 runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value
     columns each (the d_v split)."""
+    validate_kernel_domain(
+        "KDA prep prefill", io_dtype, (d_k, d_v), max_active_clusters=max_active_clusters, tiles_per_head=tiles_per_head
+    )
     cfg = KdaPrepPrefillCfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2486,22 +2496,26 @@ def build_cfg(
     )
     if len(cfg.compute_group_0_warp_ids) != len(cfg.compute_group_2_warp_ids):
         raise ValueError("the state halves are packed by CG0 and by CG2: their warp counts must match")
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids),
+        (cfg.scheduler_warp_id, cfg.tcgen05_mma_warp_id, cfg.tma_warp_id, cfg.epilogue_warp_id),
+    )
     raw, b_t, d_k, d_v = cfg.smem_raw_stages, cfg.b_t, cfg.d_k, cfg.d_v
     io_bytes = cfg.io_dtype.width // 8
     tmem_state_input_offset = cfg.tmem_state_acc_offset + d_k
     tmem_q_state_acc_offset = tmem_state_input_offset + (d_k // 2)
     tmem_state_k_acc_offset = tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * b_t
     tmem_u_input_offset = tmem_state_k_acc_offset + b_t
-    assert (tmem_u_input_offset + (b_t // 2)) <= 512
+    validate_tmem_columns("KDA prep prefill", tmem_u_input_offset + b_t // 2)
     # The prep records replace the raw gate tile with its per-chunk diag row (fp32, d_k per stage), and
     # the decay / intermediate rings run 4 deep.
     decay_stages = 4
     intermediate_stages = 4
-    return replace(
+    cfg = replace(
         cfg,
         smem_checkpoint_stages=2 if enable_checkpoints else cfg.smem_checkpoint_stages,
         smem_raw_bar_stages=raw + (raw % 2),
-        threads_per_cta=16 * cfg.threads_per_warp,
+        threads_per_cta=n_warps * cfg.threads_per_warp,
         tmem_user_threads=(
             1 + len(cfg.compute_group_2_warp_ids) + len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids)
         )
@@ -2524,6 +2538,8 @@ def build_cfg(
         tma_v_bytes=d_v * b_t * io_bytes,
         tma_gate_bytes=d_k * 4,
     )
+    validate_named_barriers(cfg.threads_per_cta, tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads))
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 11  # per-batch runtime TMA descriptors: Q, K, V, Gate, O, state_checkpoints, k_decay, q_decay, t, a, diag

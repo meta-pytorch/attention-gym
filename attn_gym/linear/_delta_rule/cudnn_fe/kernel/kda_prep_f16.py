@@ -64,6 +64,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 from attn_gym._backends.cute.compat import SmemAllocator
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.launch import validate_kernel_domain, validate_named_barriers
 from ..tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.handles import SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import mma_step
@@ -1133,6 +1134,9 @@ def build_cfg(
     d_k: int,
 ) -> KdaPrepCfg:
     """Build the per-compile ``KdaPrepCfg`` (io_dtype in {Float16, BFloat16}; gate fp32 or the io dtype)."""
+    validate_kernel_domain("KDA prep", io_dtype, (d_k,), num_sm=num_sm)
+    if gate_dtype not in (cutlass.Float32, io_dtype):
+        raise ValueError(f"KDA prep reads a Float32 or io-dtype gate, got {gate_dtype}")
     cfg = KdaPrepCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -1151,8 +1155,9 @@ def build_cfg(
     fixed_bytes = 2 * tile * bytes_per_element + cfg.b_t * cfg.b_t * bytes_per_element + 4 * cfg.b_t + (0 if gate_dtype == cutlass.Float32 else 4 * tile)
     record_bytes = 3 * cfg.smem_record_stages * tile * bytes_per_element
     smem_bytes = cfg.smem_raw_stages * stage_bytes + fixed_bytes + record_bytes + CFG.SMEM_CTA_RESERVED_BYTES
-    assert cfg.ctas_per_sm * smem_bytes <= CFG.SMEM_PER_SM_BYTES, f"{cfg.ctas_per_sm} CTAs of {smem_bytes} B do not fit the SM ({CFG.SMEM_PER_SM_BYTES} B)"
-    return replace(
+    if cfg.ctas_per_sm * smem_bytes > CFG.SMEM_PER_SM_BYTES:
+        raise ValueError(f"{cfg.ctas_per_sm} CTAs of {smem_bytes} B do not fit the SM ({CFG.SMEM_PER_SM_BYTES} B)")
+    cfg = replace(
         cfg,
         threads_per_cta=cfg.threads_per_warp * cfg.compute_warps,
         gate_stage_elems=tile,
@@ -1161,6 +1166,8 @@ def build_cfg(
         tma_k_bytes=tile * bytes_per_element,
         tma_gate_bytes=tile * (gate_dtype.width // 8),
     )
+    validate_named_barriers(cfg.threads_per_cta, compute=(cfg.barrier_id, cfg.threads_per_cta))
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: Q, K, Gate, k_decay, q_decay, t

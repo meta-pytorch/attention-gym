@@ -98,6 +98,16 @@ from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.paged_state import resolve_paged_state
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
+from ..common.host import validate_cuda_tensors
+from ..common.launch import (
+    checkpoint_capacity_bound,
+    validate_kernel_domain,
+    validate_named_barriers,
+    validate_seqlens,
+    validate_tensor,
+    validate_tmem_columns,
+    validate_warp_roles,
+)
 from .kda_prefill_config import CFG
 
 from ..tile_dsl.barrier import (
@@ -236,7 +246,13 @@ def make_bars(cfg) -> KdaPrefillBars:
             alloc(cfg.smem_checkpoint_stages), spin=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
         ),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            spin=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -2965,6 +2981,9 @@ def build_cfg(
     """Build the per-compile ``KdaPrefillCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes.  ``tiles_per_head`` > 1 runs every gate head as
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split)."""
+    validate_kernel_domain(
+        "KDA prefill", io_dtype, (d_k, d_v), max_active_clusters=max_active_clusters, tiles_per_head=tiles_per_head
+    )
     cfg = KdaPrefillCfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2988,6 +3007,7 @@ def build_cfg(
         cfg = replace(cfg, smem_raw_stages=5, smem_checkpoint_stages=2)
     if cfg.cg0_warps_per_group != len(cfg.compute_group_1_warp_ids):
         raise ValueError("the state halves are packed by one CG0 group and by CG1: their warp counts must match")
+    n_warps = _validate_roles(cfg)
     raw, b_t, d_k, d_v = cfg.smem_raw_stages, cfg.b_t, cfg.d_k, cfg.d_v
     io_bytes, gate_bytes = cfg.io_dtype.width // 8, cfg.gate_dtype.width // 8
     tmem_state_input_offset = cfg.tmem_state_acc_offset + d_k
@@ -2996,14 +3016,14 @@ def build_cfg(
     tmem_u_acc_offset = tmem_state_k_acc_offset + b_t
     tmem_y_input_offset = tmem_u_acc_offset + b_t
     tmem_u_input_offset = tmem_y_input_offset + (b_t // 2)
-    assert (tmem_u_input_offset + (b_t // 2)) <= 512
+    validate_tmem_columns("KDA prefill", tmem_u_input_offset + b_t // 2)
     # A Float32 gate exchanges in place (empty exchange buffer over the raw gate stages).
     gate_exchange_stages = raw if gate_dtype == cutlass.Float32 else 4
     gate_exchange_cosize = 0 if gate_dtype == cutlass.Float32 else gate_exchange_stages * d_k * b_t
-    return replace(
+    cfg = replace(
         cfg,
         smem_raw_bar_stages=raw + (raw % 2),
-        threads_per_cta=16 * cfg.threads_per_warp,
+        threads_per_cta=n_warps * cfg.threads_per_warp,
         cg0_threads_per_group=cfg.cg0_warps_per_group * cfg.threads_per_warp,
         tmem_user_threads=(1 + len(cfg.compute_group_1_warp_ids) + len(cfg.compute_group_0_warp_ids)) * cfg.threads_per_warp,
         tmem_state_input_offset=tmem_state_input_offset,
@@ -3031,9 +3051,100 @@ def build_cfg(
         tma_v_bytes=d_v * b_t * io_bytes,
         tma_gate_bytes=d_k * b_t * gate_bytes,
     )
+    _validate_barriers(cfg)
+    return cfg
+
+
+def _validate_roles(cfg) -> int:
+    """Check the warp-role table (CG0 is ``cg0_group_count`` ping-pong warpgroups); return the warp count."""
+    cg0, per_group = cfg.compute_group_0_warp_ids, cfg.cg0_warps_per_group
+    if len(cg0) != cfg.cg0_group_count * per_group:
+        raise ValueError("compute group 0 must hold cg0_group_count groups of cg0_warps_per_group warps")
+    groups = (*(cg0[g * per_group : (g + 1) * per_group] for g in range(cfg.cg0_group_count)), cfg.compute_group_1_warp_ids)
+    return validate_warp_roles(
+        groups, (cfg.register_mma_warp_id, cfg.tcgen05_mma_warp_id, cfg.tma_warp_id, cfg.epilogue_warp_id)
+    )
+
+
+def _validate_barriers(cfg) -> None:
+    """Check the named barriers: one per CG0 group, the CG0 tile entry and the TMEM lifecycle."""
+    validate_named_barriers(
+        cfg.threads_per_cta,
+        **{
+            f"cg0_group_{g}": (cfg.cg0_group_sync_barrier_base_id + g, cfg.cg0_threads_per_group)
+            for g in range(cfg.cg0_group_count)
+        },
+        cg0_tile_entry=(cfg.cg0_tile_entry_barrier_id, cfg.cg0_group_count * cfg.cg0_threads_per_group),
+        tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads),
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: Q, K, V, Gate, O, state_checkpoints
+
+
+# ---------------------------------------------------------------------------
+# Attention Gym modification: host launch-contract checks shared by the warmup and chain forward bundles.
+
+IO_DTYPES = ("bfloat16", "float16")
+STATE_DTYPES = ("float32", "bfloat16")
+
+
+def validate_forward_operands(q, k, v, gate, beta, o, cu_seqlens, *, a_log=None, dt_bias=None, b_t=CFG.B_T):
+    """Check the packed KDA forward operands: ``[T, H, D]`` q/k/v, ``[T, HO, DV]`` output, the ``[T, HO, DK]`` channel gate
+    and ``[T, HO]`` beta (fp32 or the io dtype), per-head a_log / dt_bias; return ``(tokens, heads_out, num_seqs)``."""
+    validate_cuda_tensors(q, k=k, v=v, gate=gate, beta=beta, o=o, cu_seqlens=cu_seqlens, a_log=a_log, dt_bias=dt_bias)
+    num_seqs = validate_seqlens(cu_seqlens)
+    if b_t != CFG.B_T:
+        raise ValueError(f"the KDA forward runs B_T={CFG.B_T} chunks, got b_t={b_t}")
+    if q.ndim != 3 or v.ndim != 3 or gate.ndim != 3:
+        raise ValueError("q, k, v and o must be packed [T, H, D] and gate [T, HO, DK]")
+    tokens, dim_k, dim_v, heads_out = q.shape[0], q.shape[2], v.shape[2], gate.shape[1]
+    io = (str(q.dtype).removeprefix("torch."),)
+    if io[0] not in IO_DTYPES:
+        raise ValueError(f"q must have dtype in {IO_DTYPES}, got {q.dtype}")
+    for name, tensor, shape in (
+        ("q", q, (tokens, None, dim_k)),
+        ("k", k, (tokens, None, dim_k)),
+        ("v", v, (tokens, None, dim_v)),
+        ("o", o, (tokens, heads_out, dim_v)),
+    ):
+        validate_tensor(name, tensor, shape, io, tma=True)
+    for name, heads in (("q", q.shape[1]), ("k", k.shape[1]), ("v", v.shape[1])):
+        if heads <= 0 or heads_out % heads:
+            raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
+    validate_tensor("gate", gate, (tokens, heads_out, dim_k), ("float32", *io), tma=True)
+    validate_tensor("beta", beta, (tokens, heads_out), ("float32", *io))
+    if a_log is not None:
+        validate_tensor("a_log", a_log, (heads_out,), ("float32", *io), align=4)
+    if dt_bias is not None:
+        shape = (heads_out,) if dt_bias.ndim == 1 else (heads_out, dim_k)
+        validate_tensor("dt_bias", dt_bias, shape, ("float32", *io), align=4)
+    return tokens, heads_out, num_seqs
+
+
+def validate_forward_states(q, v, heads_out, num_seqs, **states):
+    """Check ``name=(state, routed)`` ``[rows, HO, V, K]`` states: at least ``num_seqs`` rows unless routed through an
+    index table (a paged pool or seed/final indices)."""
+    validate_cuda_tensors(q, **{name: state for name, (state, _) in states.items()})
+    for name, (state, routed) in states.items():
+        if state is not None:
+            validate_tensor(
+                name, state, (None, heads_out, v.shape[2], q.shape[2]), STATE_DTYPES, min_rows=0 if routed else num_seqs
+            )
+
+
+def validate_checkpoints(checkpoints, every_n, tokens, heads_out, num_seqs, q, v):
+    """Check the checkpoint interval (zero or a positive multiple of ``B_T``) and the checkpoint series' row capacity."""
+    every_n = int(every_n)
+    if every_n < 0 or every_n % CFG.B_T:
+        raise ValueError(f"checkpoint_every_n_tokens must be zero or a positive multiple of {CFG.B_T}, got {every_n}")
+    if every_n:
+        validate_cuda_tensors(q, checkpoints=checkpoints)
+        validate_tensor(
+            "checkpoints", checkpoints, (None, heads_out, v.shape[2], q.shape[2]),
+            (*STATE_DTYPES, str(q.dtype).removeprefix("torch.")), tma=True,
+            min_rows=checkpoint_capacity_bound(tokens, num_seqs, every_n),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ with a ``ValueError`` instead of compiling a kernel whose barriers or TMA descri
 
 from collections.abc import Sequence
 
+import cutlass
 import torch
 
 from attn_gym._backends.cute.utils import validate_tma_tensor
@@ -16,6 +17,25 @@ from .thd import TENSOR_MAP_QWORDS
 from .tvm_ffi import WORK_ITEM_FIELDS
 
 NAMED_BARRIER_IDS = range(1, 16)  # 0 is the CTA-wide barrier
+STATE_DIMS = (64, 128)
+TMEM_COLUMNS = 512
+
+
+def validate_kernel_domain(kernel: str, io_dtype, dims: Sequence[int], **positive: int) -> None:
+    """Check the io dtype (Float16/BFloat16), head dims in ``STATE_DIMS`` and positive counts."""
+    if io_dtype not in (cutlass.Float16, cutlass.BFloat16):
+        raise ValueError(f"{kernel} serves Float16/BFloat16 io, got {io_dtype}")
+    if any(dim not in STATE_DIMS for dim in dims):
+        raise ValueError(f"{kernel} serves head dims in {STATE_DIMS}, got {tuple(dims)}")
+    for name, value in positive.items():
+        if value < 1:
+            raise ValueError(f"{kernel} needs a positive {name}, got {value}")
+
+
+def validate_tmem_columns(kernel: str, columns: int) -> None:
+    """Check that a TMEM layout fits the 512-column allocation."""
+    if columns > TMEM_COLUMNS:
+        raise ValueError(f"{kernel} TMEM layout needs {columns} > {TMEM_COLUMNS} columns")
 
 
 def validate_warp_roles(groups: Sequence[Sequence[int]], singles: Sequence[int]) -> int:
