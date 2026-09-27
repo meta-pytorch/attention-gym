@@ -46,7 +46,9 @@ _GATE_FLAGS = {
 
 
 def _work_count(device) -> torch.Tensor:
-    """The uncut/split work-item count cell the prologue fills (tests record it here)."""
+    """The uncut/split work-item count cell the prologue fills.
+
+    Test hook: tests monkeypatch this to keep the cell and read the compacted item count."""
     return int32(1, device)
 
 
@@ -336,18 +338,17 @@ def kda_backward(
             "series_span_tokens": 0,
             "seed_every_n_tokens": 0,
             "scale": scale,
-            "log_gate": True,
         }
         launch = build_chain_backward(
             **buffers,
             **schedule,
+            **_GATE_FLAGS,
             unit_chunks=plan.unit_chunks,
             length_rule=False,
-            gate_lower_bound=_GATE_FLAGS["gate_lower_bound"],
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
         )
-        run_chain_backward(launch, **buffers, **schedule)
+        run_chain_backward(launch, **buffers, **schedule, log_gate=_GATE_FLAGS["log_gate"])
     else:
         schedulers = empty(4)
         ideal, rows, item_scratch, chunk_scratch = split_scratch(
