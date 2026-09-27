@@ -33,6 +33,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from ..common import split_k
 from ..common.host import get_dtype
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
@@ -410,7 +411,10 @@ def build_warmup_forward(
         work_items_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_table_placeholder = from_dlpack(work_count, assumed_align=4)
         work_count_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = persistent_compile(
+            "kda_warmup_forward",
+            key,
+            cute.compile,
             warmup_forward_host,
             facts.split,
             facts.b_t,

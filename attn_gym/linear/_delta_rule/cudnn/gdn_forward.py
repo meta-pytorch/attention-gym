@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the private CuTeDSL 4.7 scalar-GDN forward kernel."""
+"""Torch launcher for the scalar-GDN cuDNN forward (vendored cudnn-frontend v1.30 kernels;
+the in-tree CuTeDSL 4.7 kernel serves paged state)."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym._backends.cute.utils import get_device_properties
+from attn_gym.linear._delta_rule.cudnn_fe.gdn import gdn_forward
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
@@ -94,30 +96,33 @@ def run_forward_on_current_device(
         raise TypeError("cu_seqlens must be aligned contiguous int32 on q.device")
 
     num_sequences = cu_seqlens.shape[0] - 1
-    if paged_state is not None:
-        if output_final_state:
-            raise ValueError("paged state advances the pool in place; drop output_final_state")
-    elif initial_state is not None:
-        expected_state = (num_sequences, heads, 128, key_dim)
-        if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
-            raise TypeError(f"initial_state must be float32 with shape {expected_state}")
-        if not initial_state.is_cuda or initial_state.device != q.device:
-            raise ValueError("initial_state must be on q.device")
-        if not tensor_supports_tma(initial_state):
-            raise TypeError("initial_state requires a TMA-compatible inner mode")
-
-    if output_final_state and initial_state is None:
-        initial_state = torch.zeros(
-            num_sequences,
-            heads,
-            128,
-            key_dim,
-            dtype=torch.float32,
-            device=q.device,
+    if paged_state is None:
+        if initial_state is not None:
+            expected_state = (num_sequences, heads, 128, key_dim)
+            if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
+                raise TypeError(f"initial_state must be float32 with shape {expected_state}")
+            if not initial_state.is_cuda or initial_state.device != q.device:
+                raise ValueError("initial_state must be on q.device")
+            if not tensor_supports_tma(initial_state):
+                raise TypeError("initial_state requires a TMA-compatible inner mode")
+        # Unpaged forward: the cudnn-frontend v1.30 kernels (uncut, d_v split, exact chain, or split).
+        output, final_state = gdn_forward(
+            q[0],
+            k[0],
+            value[0],
+            gate[0],
+            beta[0],
+            cu_seqlens,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            split=split,
         )
-    final_state = initial_state.clone() if output_final_state else None
-    if paged_state is not None:
-        final_state = paged_state.cache
+        return output.unsqueeze(0), final_state
+
+    # Paged prefill: the older in-tree kernel advances the pool in place.
+    if output_final_state:
+        raise ValueError("paged state advances the pool in place; drop output_final_state")
     output = torch.empty_like(value)
     stream = torch.cuda.current_stream(q.device).cuda_stream
     schedule = prepare_cudnn_schedule(
@@ -125,7 +130,7 @@ def run_forward_on_current_device(
         cu_seqlens,
         tile_tokens=kernel.CFG.B_T,
         counter_count=2,
-        split=split,
+        split=False,
         stream=stream,
     )
     tensormap_workspace = torch.empty(
@@ -141,8 +146,8 @@ def run_forward_on_current_device(
         beta[0],
         output[0],
         cu_seqlens,
-        initial_state,
-        final_state,
+        paged_state.cache,
+        paged_state.cache,
         scale,
         work_items=schedule.work_items,
         work_count=schedule.work_count,
@@ -150,10 +155,10 @@ def run_forward_on_current_device(
         log_gate=True,
         work_item_scratch=schedule.item_scratch,
         tensormap_workspace=tensormap_workspace,
-        state_indices=None if paged_state is None else paged_state.indices,
-        has_initial_state=None if paged_state is None else paged_state.byte_mask,
+        state_indices=paged_state.indices,
+        has_initial_state=paged_state.byte_mask,
     )
-    return output, (None if paged_state is not None else final_state)
+    return output, None
 
 
 def run_forward(

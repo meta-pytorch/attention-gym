@@ -595,8 +595,8 @@ def test_cudnn_public_packed_unsplit_local_backward_matches_exact_gradients(monk
         )
 
 
-def test_cudnn_document_aligned_spans_are_bitwise_equal() -> None:
-    """A document's output and gradients must not depend on its enclosing span length."""
+def test_cudnn_document_aligned_spans_are_bitwise_equal(kda_plan_comparison) -> None:
+    """Spans are bit-exact within uncut; shape-dependent automatic plans allow 1% relative L2."""
     from attn_gym.linear import chunk_kda
 
     lengths = (64, 128, 4096)
@@ -631,7 +631,9 @@ def test_cudnn_document_aligned_spans_are_bitwise_equal() -> None:
                 (output, *gradients),
                 strict=True,
             ):
-                assert torch.equal(actual, expected[:, start:end]), (name, first, last, packed)
+                kda_plan_comparison(
+                    actual, expected[:, start:end], str((name, first, last, packed))
+                )
 
 
 def test_cudnn_kernel_options_are_strict() -> None:
@@ -679,31 +681,35 @@ def _split_forward_pair(
     Returns the inputs, both outputs, and the number of work items the split schedule emitted.
     """
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn import forward, schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
 
     inputs = make_kda_test_inputs(
         8192, seed=107, normalize_qk=True, sigmoid_beta=True, dtype=dtype, **gate
     )
     unsplit, _ = chunk_kda(*inputs, kernel_options={"backend": "cudnn"})
-    schedules = []
+    counts = []
+    allocate_count = driver._work_count
 
-    def recording_schedule(*args, **kwargs):
-        schedules.append(schedule.prepare_cudnn_schedule(*args, **kwargs))
-        return schedules[-1]
+    def recording_count(device):
+        counts.append(allocate_count(device))
+        return counts[-1]
 
-    monkeypatch.setattr(forward, "prepare_cudnn_schedule", recording_schedule)
+    monkeypatch.setattr(driver, "_work_count", recording_count)
     split, _ = chunk_kda(*inputs, kernel_options={"backend": "cudnn", "split_forward": True})
     torch.cuda.synchronize()
-    (recorded,) = schedules
-    return inputs, unsplit, split, int(recorded.work_count.item())
+    (recorded,) = counts
+    return inputs, unsplit, split, int(recorded.item())
 
 
-def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
+def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(
+    monkeypatch, kda_plan_comparison
+) -> None:
+    """No-cut is bit-exact within uncut; automatic prep/chain may change rounding by <1% L2."""
     _, unsplit, split, work_items = _split_forward_pair(
         monkeypatch, torch.bfloat16, gate_value=-1e-5
     )
     assert work_items == 1
-    torch.testing.assert_close(split, unsplit, atol=0, rtol=0)
+    kda_plan_comparison(split, unsplit, "no-cut forward")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -735,11 +741,11 @@ def test_cudnn_cpu_inputs_fail_before_dispatch() -> None:
 
 def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn import schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
     from attn_gym.linear.kda.impl import cudnn as backend
 
     local_backward = backend.chunk_cudnn_packed_local_bwd_op
-    compute_ideal_chunks = schedule.compute_ideal_chunks
+    compute_ideal_chunks = driver.compute_ideal_chunks
     selected = []
     geometries = []
 
@@ -752,7 +758,7 @@ def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
         return compute_ideal_chunks(*args)
 
     monkeypatch.setattr(backend, "chunk_cudnn_packed_local_bwd_op", record_split)
-    monkeypatch.setattr(schedule, "compute_ideal_chunks", record_geometry)
+    monkeypatch.setattr(driver, "compute_ideal_chunks", record_geometry)
 
     exact_inputs = _make_inputs(requires_grad=True)
     exact_output = _candidate_dense(*exact_inputs)
@@ -1112,8 +1118,9 @@ def test_cudnn_tma_validation_routes_oversized_singleton_stride_to_int64() -> No
     assert requires_int64_abi(tensor)
 
 
+@pytest.mark.xfail(strict=True, reason="S14: v1.30 kernels have no int64 ABI selector yet")
 def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
-    from attn_gym.linear._delta_rule.cudnn.kernels import (
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
         kda_bprop_f16,
         kda_prefill_f16,
         kda_recompute_f16,

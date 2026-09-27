@@ -40,7 +40,44 @@ plus the mandatory prune cut of the chain prologue's `gdp_bprop_v64` import unde
 cuDNN license texts verbatim under pre-commit". Replay: prove the tool against this drop first
 (`vendor.py --rev v1.30.0 --verify <A commit>`), then vendor the new tag.
 
+## 1. Bugs in upstream v1.30 (upstream draft exists or is possible)
+
+### B8 — Empty `cu_seqlens` intervals occupy the unsplit work table (C08) · bugfix
+- **Problem:** serving pads `cu_seqlens` with repeated boundaries; each empty interval consumed sort
+  slots, descriptors and persistent tiles. Naively dropping empties would leave empty-sequence
+  state gradients uninitialized or skip clearing a fresh paged slot.
+- **Found by:** benchmark (#603): 71 padded empties inflated GDN forward 29.9 → 96.3 µs (32.3 µs
+  after compaction).
+- **Fix:** deterministic ballot/prefix compaction of the unsplit table keeping original sequence IDs;
+  THD builders skip empty descriptors; empty stateful items keep pass-through writes (final = seed,
+  d_initial = d_final) and fresh-empty paged slots are still cleared (F3). `common/split_k.py`,
+  `common/thd.py`; "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels", KDA test
+  in "Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names,
+  grouped value heads".
+- **Evidence:** fails without = YES. Compaction disabled: GDN work counts `[8,4,2134,2134]` vs
+  `[8,4,4,4]`; KDA `[4,4,8,8]` vs 4; a clone→zeros mutation breaks all 65,536 empty-state cotangents.
+- **Tests:** GT::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work,
+  KV::test_cudnn_compaction_keeps_empty_state_cotangents.
+- **Upstream:** draft `03-compact-empty-unsplit-work.patch`, narrower (no-state uncut forward only,
+  since upstream has no per-sequence has-initial-state mask); stock fails 8/20 work-count checks.
+- **Replay:** most entangled with paging. Reapply compaction first, then F3's "Preserve fresh-empty
+  paged routes during work compaction", then run PO + GP + KP. Watch the >4096-sequence
+  (ORDER_CAPACITY) uncompacted fallback.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
+
+### B15 — Launch caches keyed on shape-unaware state
+- **Found by:** PR #604 review. A shape-unaware cache reused the first shape's launch.
+- **Fix:** builders cache compiled launches by static configuration only; scratch is rebuilt from
+  the batch shape per call (`plan.py`). "Route unpaged GDN and KDA …".
+- **Evidence:** fails without = YES: split GDN 4,909/33,280 values wrong, incl. NaNs, on the second
+  shape. **Tests:** GT::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default,
+  KV::test_v130_changing_shapes_reuses_only_static_configuration (asserts `cache_info()`).
+
+### B16 — 4-byte-aligned gate/beta views rejected
+- **Found by:** PR #604 review: legal 4-byte-offset views failed TVM-FFI's 16-byte base ABI.
+- **Fix:** `aligned()` copies such gate/beta into a 16-byte base (`plan.py`).
+- **Tests:** GL::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta. Fails without = YES.
 
 ### Other tests encoding decisions
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
@@ -50,6 +87,17 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 
 ## 3. Features and integration (AG-specific)
 
+- **F1/F2/F4/F6/F9 — drivers on v1.30.** `gdn.py` (from #604) and `kda.py` pick uncut, d_v split,
+  KDA prep, exact piece chain or approximate warmup split per call; staged stateful backward; AG plan
+  floors (d_v split below one wave, chain floors 8192/2048). KDA vs main: T8192 H48 fwd 434→344,
+  fwd+bwd 3207→1670; T32768 H48 fwd+bwd 12748→6297; T2048 H8 fwd 114.5→68.4 (bwd 490.5→496.4,
+  +1.2%, inside threshold). GDN bitwise identical to #604. Plan thresholds are GB200-tuned; re-bench
+  on new drops.
+- **F7/F8 — native CP summaries** `[B;A]` and reverse maps `[C;R]` for arbitrary bounds via a
+  device-selected uncut work table (graph-safe Triton selector). 0.43–0.55× of main (T16384 B4 H16
+  fwd 536→289 µs, rev 1439→647). KS::test_native_selected_bounds.
+- **F5 — grouped q/k GDN backward** through AG's deterministic `group_sum` (upstream `head_reduce`
+  unused, later deleted by R13).
 - **R2 — `compile_tvm_ffi(opt_level=...)`**, hosts keep O2 (see Lessons).
 
 ## 4. Restyle, pruning and infra (gated by SASS, not behavior)
@@ -69,6 +117,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 | Decision | Rationale / evidence | Revisit when |
 |---|---|---|
+| Shape-dependent KDA plans + pinned-plan tests | Auto plans keep v1.30 prep (fwd) and exact chain (bwd): T8192 H48 fwd 443.7→341.4 µs, fwd+bwd 2612.7→1836.8; T32768 H48 fwd+bwd 10362→6250. Prep/chain change arithmetic order, so bitwise tests pin the uncut plan and auto-plan companions use rel-L2 < 1e-2 (GDN policy from #604). | Planner heuristics change or new GPU. |
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
@@ -78,6 +127,9 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
+- **Shapes:** the cuDNN GDN/KDA adapters require `q.shape == [1, T, H, 128]` (V = 128); summaries
+  derive V, K ∈ {64, 128}.
+- Single-token KDA dgate leaves a 6e-10 residual vs an exact-zero reference.
 - Fails-without evidence predates the final commit order (see "Reading an entry").
 
 ## Lessons

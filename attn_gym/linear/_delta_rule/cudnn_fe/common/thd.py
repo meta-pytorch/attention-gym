@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
+# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; descriptor builds skip
+# empty sequences; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe.
 
 """Shared THD / varlen (packed ``[T,H,D]`` + ``cu_seqlens``) device helpers.
@@ -73,27 +74,29 @@ def emit_seq_descs(
         if cutlass.const_expr(expand_num > 1):
             cu_b = cu_b * cutlass.Int32(expand_num)
             s_b = s_b * cutlass.Int32(expand_num)
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        addr = base + cutlass.Int64(cu_b) * cutlass.Int64(base_ptr.stride[0])
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_ADDRESS,
-            dptr,
-            new_value=addr.toint(cutlass.Int64),
-        )
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_DIM,
-            dptr,
-            new_value=s_b,
-            ord=seq_ord,
-        )
-        set_tensor_map_bit21(
-            dptr,
-            cutlass.Int64(s_b)
-            * cutlass.Int64(base_ptr.stride[0])
-            * cutlass.Int64(base_ptr.element_type.width // 8),
-        )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_b > 0:
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            addr = base + cutlass.Int64(cu_b) * cutlass.Int64(base_ptr.stride[0])
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=addr.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=s_b,
+                ord=seq_ord,
+            )
+            set_tensor_map_bit21(
+                dptr,
+                cutlass.Int64(s_b)
+                * cutlass.Int64(base_ptr.stride[0])
+                * cutlass.Int64(base_ptr.element_type.width // 8),
+            )
 
 
 @cute.jit
@@ -128,27 +131,29 @@ def emit_tile_seq_descs(
             s_b = s_b * cutlass.Int32(expand_num)
         row_b = cu_b // cutlass.Int32(b_t) + b
         n_b = (s_b + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        addr = base + cutlass.Int64(row_b) * cutlass.Int64(base_ptr.stride[0])
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_ADDRESS,
-            dptr,
-            new_value=addr.toint(cutlass.Int64),
-        )
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_DIM,
-            dptr,
-            new_value=n_b,
-            ord=seq_ord,
-        )
-        set_tensor_map_bit21(
-            dptr,
-            cutlass.Int64(n_b)
-            * cutlass.Int64(base_ptr.stride[0])
-            * cutlass.Int64(base_ptr.element_type.width // 8),
-        )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_b > 0:
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            addr = base + cutlass.Int64(row_b) * cutlass.Int64(base_ptr.stride[0])
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=addr.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=n_b,
+                ord=seq_ord,
+            )
+            set_tensor_map_bit21(
+                dptr,
+                cutlass.Int64(n_b)
+                * cutlass.Int64(base_ptr.stride[0])
+                * cutlass.Int64(base_ptr.element_type.width // 8),
+            )
 
 
 @cute.jit
@@ -203,24 +208,26 @@ def emit_checkpoint_seq_descs(
                     s_tokn = s_tokn * cutlass.Int32(expand_num)
                 cntn = (s_tokn - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
                 run = run + (cntn if s_tokn > 0 else cutlass.Int32(0))
-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (dptr + i).store((src_words + i).load())
-        addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(base_ptr.stride[0])
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_ADDRESS,
-            dptr,
-            new_value=addr.toint(cutlass.Int64),
-        )
-        nvvm.tensormap_replace(
-            nvvm.TensormapField.GLOBAL_DIM,
-            dptr,
-            new_value=cnt,
-            ord=seq_ord,
-        )
-        set_tensor_map_bit21(
-            dptr,
-            cutlass.Int64(cnt)
-            * cutlass.Int64(base_ptr.stride[0])
-            * cutlass.Int64(base_ptr.element_type.width // 8),
-        )
+        # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
+        if s_tok > 0:
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(base_ptr.stride[0])
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=addr.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=cnt,
+                ord=seq_ord,
+            )
+            set_tensor_map_bit21(
+                dptr,
+                cutlass.Int64(cnt)
+                * cutlass.Int64(base_ptr.stride[0])
+                * cutlass.Int64(base_ptr.element_type.width // 8),
+            )

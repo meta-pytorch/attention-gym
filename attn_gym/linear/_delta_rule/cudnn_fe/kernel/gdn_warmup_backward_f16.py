@@ -35,6 +35,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from ..common import split_k
 from ..common.host import get_dtype
 from . import gdn_recompute_f16, gdn_tinv_f16
@@ -417,7 +418,10 @@ def build_warmup_backward(
         state_in_placeholder = None
         if state_in is not None:
             state_in_placeholder = from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        warmup_backward_cache[key] = cute.compile(
+        warmup_backward_cache[key] = persistent_compile(
+            "warmup_backward",
+            key,
+            cute.compile,
             warmup_backward_host,
             facts.split,
             facts.b_t,

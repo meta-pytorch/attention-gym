@@ -34,6 +34,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from .._compat import DeviceView
 
 from ..common.host import get_dtype
@@ -331,7 +332,10 @@ def build_chain_forward(
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
         work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_forward_cache[key] = cute.compile(
+        chain_forward_cache[key] = persistent_compile(
+            "kda_chain_forward",
+            key,
+            cute.compile,
             chain_forward_host,
             int(unit_chunks),
             int(b_t),

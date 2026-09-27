@@ -33,6 +33,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from ..common import split_k
 from ..common.host import get_dtype
 from . import kda_bprop_f16, kda_recompute_f16
@@ -420,7 +421,10 @@ def build_warmup_backward(
         if recompute:
             series_items_placeholder = from_dlpack(series_items, assumed_align=16)
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        warmup_backward_cache[key] = cute.compile(
+        warmup_backward_cache[key] = persistent_compile(
+            "kda_warmup_backward",
+            key,
+            cute.compile,
             warmup_backward_host,
             facts.split,
             facts.b_t,

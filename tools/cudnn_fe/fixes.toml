@@ -30,6 +30,65 @@ vendored_tag = "v1.30.0"
 upstream_commit = "42286a6fb8792055f3db80403350e80114ea086c"
 stack_prs = [606, 607, 608, 609]
 
+# --------------------------------------------------------------------------- bug fixes
+[[fix]]
+id = "B8"
+title = "Compact empty cu_seqlens intervals out of the unsplit work table"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work",
+]
+upstream_patch = "upstream/03-compact-empty-unsplit-work.patch"
+upstream_repro = "upstream/repro_03_empty_unsplit.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B15"
+title = "Driver launch caches keyed on static config, not shape"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default",
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
+]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "B16"
+title = "Copy 4-byte-aligned gate/beta to 16-byte bases"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta"]
+upstream_status = "ag-specific"
+
+# --------------------------------------------------------------------------- features / integration
+[[fix]]
+id = "F1/F2/F4/F6/F9"
+title = "GDN/KDA drivers (uncut, d_v split, prep, chain, warmup split, staged stateful bwd, AG plan floors)"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "F7/F8"
+title = "Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "F5"
+title = "Grouped q/k GDN backward through deterministic AG group_sum"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward"]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- performance
 [[fix]]
 id = "R2"
@@ -73,6 +132,7 @@ title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile 
 kind = "restyle"
 ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
 guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
   "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",
 ]
 gate = "sass (byte-identical per family)"

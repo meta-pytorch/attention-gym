@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Shared Torch launcher for the CuTeDSL 4.7 cuDNN forward kernel."""
+"""Validated KDA launchers: v1.30 unpaged kernels and the legacy paged path."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.utils import ceildiv
 
+from ..cudnn_fe.kda import kda_forward
 from .kernels import kda_prefill_f16 as kernel
 from .kernels.common.host import tensormap_workspace_bytes
 from .schedule import prepare_cudnn_schedule
@@ -100,6 +101,21 @@ def run_forward_on_current_device(
             raise TypeError("initial_state requires a TMA-compatible inner mode")
     if output_final_state and initial_state is None:
         raise ValueError("output_final_state requires an initial_state buffer")
+
+    if paged_state is None:
+        output, final_state = kda_forward(
+            q[0],
+            k[0],
+            value[0],
+            gate[0],
+            beta[0],
+            cu_seqlens,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            split=split,
+        )
+        return output.unsqueeze(0), final_state
 
     # Empty sequences emit no token work. Cloning only when requested preserves their state.
     final_state = initial_state.clone() if output_final_state else None

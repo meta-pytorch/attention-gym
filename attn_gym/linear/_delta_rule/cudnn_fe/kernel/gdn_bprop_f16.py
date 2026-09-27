@@ -126,6 +126,7 @@ from attn_gym._backends.cute.compat import SmemAllocator
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
 from ..common.host import get_dtype
+from .._persist import persistent_compile
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
     blockwise_diagonal_16x16_to_32x32,
@@ -4641,7 +4642,7 @@ def chunk_gdn_bwd(
         dt_bias = None
     fused_l2norm = inv_q is not None
     tinv_source = "gmem" if tinv is not None else "compute"
-    cache = get_compiled_cache(
+    compiled_key = (
         str(q.dtype),
         str(cu_seqlens.dtype),
         str(gate.dtype),
@@ -4667,6 +4668,7 @@ def chunk_gdn_bwd(
         order_gen,
         tinv_source,
     )
+    cache = get_compiled_cache(*compiled_key)
 
     if "compiled" not in cache:
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
@@ -4687,7 +4689,10 @@ def chunk_gdn_bwd(
         dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         inv_q_cute = from_dlpack(inv_q, assumed_align=4).mark_layout_dynamic(leading_dim=1) if fused_l2norm else None
         inv_k_cute = from_dlpack(inv_k, assumed_align=4).mark_layout_dynamic(leading_dim=1) if fused_l2norm else None
-        cache["compiled"] = compile(
+        cache["compiled"] = persistent_compile(
+            "gdn_bprop",
+            compiled_key,
+            compile,
             io_dtype,
             use_initial_state=use_initial_state,
             use_dstate_in=d_final_state is not None,

@@ -34,6 +34,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from .._compat import DeviceView
 
 from ..common.host import get_dtype
@@ -486,7 +487,10 @@ def build_chain_backward(
         if series_items is not None:
             series_items_placeholder = from_dlpack(series_items, assumed_align=16)
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        chain_backward_cache[key] = cute.compile(
+        chain_backward_cache[key] = persistent_compile(
+            "kda_chain_backward",
+            key,
+            cute.compile,
             chain_backward_host,
             int(unit_chunks),
             int(b_t),

@@ -34,6 +34,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from ..common import split_k
 from ..common.host import get_dtype
 from . import gdn_prefill_f16
@@ -318,7 +319,10 @@ def build_warmup_forward(
         state_out_placeholder = None
         if state_out is not None:
             state_out_placeholder = from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = persistent_compile(
+            "warmup_forward",
+            key,
+            cute.compile,
             warmup_forward_host,
             facts.split,
             facts.b_t,

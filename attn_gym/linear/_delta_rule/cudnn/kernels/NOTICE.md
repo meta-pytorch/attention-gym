@@ -14,18 +14,18 @@ of files under the MIT License as declared by each file's SPDX identifier.
 
 ## Attention Gym adaptation
 
-The low-level KDA and scalar-GDN prefill, checkpoint-recompute, bprop kernels, and supporting
-helpers are adapted from NVIDIA's `cudnn-frontend` repository at commit
+Unpaged scalar-GDN forward and backward use the newer cudnn-frontend v1.30.0 kernels in
+`_delta_rule/cudnn_fe/` (see `cudnn_fe/NOTICE.md`).
+
+
+The low-level KDA prefill, checkpoint-recompute, and bprop kernels, the paged scalar-GDN prefill,
+and supporting helpers are adapted from NVIDIA's `cudnn-frontend` repository at commit
 `085d50b33691f06e2309f8e6724741a021985649`.
 
 Source mapping:
 
 - `linear_attention/frost/kernel/gdn_prefill_f16.py` ->
   `_delta_rule/cudnn/kernels/gdn_prefill_f16.py`;
-- `linear_attention/frost/kernel/gdn_recompute_f16.py` ->
-  `_delta_rule/cudnn/kernels/gdn_recompute_f16.py`;
-- `linear_attention/frost/kernel/gdn_bprop_f16.py` ->
-  `_delta_rule/cudnn/kernels/gdn_bprop_f16.py`;
 - `linear_attention/frost/kernel/kda_prefill_f16.py` ->
   `_delta_rule/cudnn/kernels/kda_prefill_f16.py`;
 - `linear_attention/frost/kernel/kda_recompute_f16.py` ->

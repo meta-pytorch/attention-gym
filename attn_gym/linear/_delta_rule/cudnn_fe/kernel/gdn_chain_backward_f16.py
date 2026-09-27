@@ -36,6 +36,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._persist import persistent_compile
 from .._compat import DeviceView
 
 from ..common.host import get_dtype
@@ -631,7 +632,10 @@ def build_chain_backward(
         if series and not coarse:
             state_x_placeholder = from_dlpack(state_x, assumed_align=16)
             state_x_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        head = cute.compile(
+        head = persistent_compile(
+            "chain_backward_head",
+            key,
+            cute.compile,
             chain_backward_head_host,
             int(unit_chunks),
             int(b_t),
@@ -705,7 +709,10 @@ def build_chain_backward(
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
-        tail = cute.compile(
+        tail = persistent_compile(
+            "chain_backward_tail",
+            key,
+            cute.compile,
             chain_backward_tail_host,
             bprop_module,
             bool(compact_qdo),

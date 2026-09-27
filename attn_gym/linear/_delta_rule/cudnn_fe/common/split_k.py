@@ -1399,6 +1399,47 @@ def gen_interval_items(
 
 
 @cute.jit
+def compact_sequences(
+    n_threads: cutlass.Constexpr[int],
+    tidx,
+    n_batch: cutlass.Int32,
+    mCuSeqlens: cute.Tensor,
+    sIdx,
+    sWarp,
+):
+    """Attention Gym addition: write, in sequence order, the ids of sequences with tokens into
+    ``sIdx[0, M)`` and return ``M``.  A warp ballot ranks each round of ``n_threads`` sequences, so
+    the table is deterministic.  ``sWarp`` holds ``n_threads // 32`` Int32 cells."""
+    lane = cute.arch.lane_idx()
+    warp = tidx // cutlass.Int32(32)
+    base = cutlass.Int32(0)
+    start = cutlass.Int32(0)
+    while start < n_batch:
+        b = start + tidx
+        keep = cutlass.Boolean(False)
+        if b < n_batch:
+            keep = mCuSeqlens[b + 1] > mCuSeqlens[b]
+        ballot = cute.arch.vote_ballot_sync(keep)
+        rank = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot) & cute.arch.lanemask_lt()))
+        if lane == 0:
+            sWarp[warp] = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot)))
+        nvvm.barrier_cta_sync()
+        offset = base
+        total = cutlass.Int32(0)
+        for w in cutlass.range_constexpr(n_threads // 32):
+            count = sWarp[w]
+            total = total + count
+            if cutlass.Int32(w) < warp:
+                offset = offset + count
+        if keep:
+            sIdx[offset + rank] = b
+        base = base + total
+        nvvm.barrier_cta_sync()
+        start = start + cutlass.Int32(n_threads)
+    return base
+
+
+@cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
@@ -1441,7 +1482,21 @@ def order_body(
                 mScheduler[si] = cutlass.Int32(0)
                 si = si + cutlass.Int32(1)
 
-    if cutlass.const_expr(gen):
+    # Attention Gym modification: the uncut ``gen`` table emits no item for sequences without
+    # tokens, so padded ``cu_seqlens`` cost neither sort slots nor main-kernel tiles. Compacted item
+    # ``i`` maps back to the original ``sequence * n_heads_out + head`` index. Callers seed the final
+    # state and the state cotangent of empty sequences. Batches of more than ``capacity``
+    # sequences keep the uncompacted table.
+    compact = False
+    if cutlass.const_expr(gen and not chain and expand_num == 1):
+        n_batch = n_tiles // n_heads_out
+        compact = n_batch <= cutlass.Int32(capacity)
+        n = n_tiles
+        if compact:
+            n = compact_sequences(n_threads, tidx, n_batch, mCuSeqlens, sIdx, sKey) * n_heads_out
+        if tidx == 0:
+            mCount[0] = n
+    elif cutlass.const_expr(gen):
         n = n_tiles
         if tidx == 0:
             mCount[0] = n_tiles
@@ -1452,6 +1507,9 @@ def order_body(
     if (n > cutlass.Int32(capacity)) or (n <= cutlass.Int32(num_ctas)):
         i = tidx
         while i < n:
+            src = i
+            if compact:
+                src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
             write_item(
                 gen,
                 b_t,
@@ -1460,7 +1518,7 @@ def order_body(
                 mStaging,
                 mWorkItems,
                 i,
-                i,
+                src,
                 expand_num,
                 chain,
                 mRowBase,
@@ -1468,6 +1526,15 @@ def order_body(
             )
             i = i + cutlass.Int32(n_threads)
     else:
+        # Resolve compacted sources before sIdx is reused as the sort permutation.
+        sources = []
+        for e in cutlass.range_constexpr(order_elements):
+            i = tidx + cutlass.Int32(e * n_threads)
+            src = i
+            if compact:
+                if i < n:
+                    src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
+            sources.append(src)
         if tidx == 0:
             sSpread[0] = cutlass.Int32(2147483647)
             sSpread[1] = cutlass.Int32(-2147483648)
@@ -1489,13 +1556,13 @@ def order_body(
                     )
                 elif cutlass.const_expr(gen):
                     _batch_idx, _head_idx, _batch_start, _batch_end, batch_num_chunks = (
-                        gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i, expand_num)
+                        gen_item_bounds(b_t, n_heads_out, mCuSeqlens, sources[e], expand_num)
                     )
                     key = batch_num_chunks
                 else:
                     key = mStaging[i, 5] - mStaging[i, 4]
                 sKey[i] = key
-                sIdx[i] = i
+                sIdx[i] = sources[e]
                 kmin = kmin if kmin < key else key
                 kmax = kmax if kmax > key else key
             elif i < b_pad:
@@ -1517,7 +1584,7 @@ def order_body(
                     mStaging,
                     mWorkItems,
                     i2,
-                    i2,
+                    sIdx[i2],
                     expand_num,
                     chain,
                     mRowBase,

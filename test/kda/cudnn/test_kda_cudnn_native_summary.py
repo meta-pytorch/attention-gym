@@ -10,17 +10,12 @@ import torch
 
 pytest.importorskip("cutlass.experimental", reason="native cuDNN summaries require CuTeDSL 4.7")
 
-from attn_gym.linear._delta_rule.cudnn.kernels import (
-    kda_bprop_f16,
-    kda_prefill_f16,
-    kda_recompute_f16,
-)
-from attn_gym.linear._delta_rule.cudnn.kernels.common.host import tensormap_workspace_bytes
-from attn_gym.linear._delta_rule.cudnn.schedule import prepare_cudnn_schedule
 from attn_gym.linear._delta_rule.cudnn.state_summary import (
     build_cudnn_state_grad_summaries,
     build_cudnn_state_summaries,
 )
+from attn_gym.linear._delta_rule.cudnn_fe import kda as cudnn_fe_kda
+from attn_gym.linear._delta_rule.cudnn_fe import summary as native_summary
 from attn_gym.linear.context_parallel import merge_state
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.testing.kda import (
@@ -85,40 +80,40 @@ def _forbid_fused_factors(monkeypatch: pytest.MonkeyPatch) -> None:
 def _native_no_state_final(
     inputs: tuple[torch.Tensor, ...], cu_seqlens: torch.Tensor
 ) -> torch.Tensor:
-    """Run the output-producing native no-state specialization as an independent B oracle."""
-    q, k, value, gate, beta = inputs
-    sequences = cu_seqlens.numel() - 1
-    state = torch.zeros(sequences, q.shape[2], 128, 128, device=q.device)
-    schedule = prepare_cudnn_schedule(
-        gate,
-        cu_seqlens,
-        tile_tokens=16,
-        counter_count=2,
-        split=False,
-        stream=torch.cuda.current_stream().cuda_stream,
+    """Run the output-producing native no-state kernel as an independent B oracle.
+
+    ``split=True`` pins the uncut BT16 prefill plan (the split-K table never cuts these short
+    sequences); the automatic plan may pick the d_v split, whose rounding differs.
+    """
+    _, final = cudnn_fe_kda.kda_forward(
+        *(t[0] for t in inputs), cu_seqlens, scale=SCALE, output_final_state=True, split=True
     )
-    workspace = torch.empty(
-        ceildiv(tensormap_workspace_bytes(kda_prefill_f16, sequences), 8),
-        device=q.device,
-        dtype=torch.int64,
-    )
-    kda_prefill_f16.chunk_kda_sm100(
-        q[0],
-        k[0],
-        value[0],
-        gate[0],
-        beta[0],
-        torch.empty_like(value[0]),
-        cu_seqlens,
-        None,
-        state,
-        SCALE,
-        work_items=schedule.work_items,
-        work_count=schedule.work_count,
-        sched_ctr=schedule.counters,
-        tensormap_workspace=workspace,
-    )
-    return state
+    assert final is not None
+    return final
+
+
+def _forbid_driver_plans(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Summaries launch the summary kernels directly, never a forward/backward driver plan."""
+    for name in ("kda_forward", "kda_backward"):
+        monkeypatch.setattr(
+            cudnn_fe_kda,
+            name,
+            lambda *args, **kwargs: pytest.fail("native summaries must not select a driver plan"),
+        )
+
+
+def _record_work_tables(monkeypatch: pytest.MonkeyPatch) -> list[torch.Tensor]:
+    """Capture the selected work table handed to every native summary launch."""
+    tables: list[torch.Tensor] = []
+    for name in ("_forward_summary", "_reverse_summary"):
+        original = getattr(native_summary, name)
+
+        def checked(*args, original=original, **kwargs):
+            tables.append(args[-1].work_items.clone())
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(native_summary, name, checked)
+    return tables
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -305,30 +300,20 @@ def test_native_reverse_selection_skips_unrequested_work(monkeypatch) -> None:
     inputs, cu = _packed_inputs(LENGTHS)
     do = torch.randn_like(inputs[2])
     bounds = _bounds([[82, 211], [17, 17], [82, 211]])
-    tables = []
-    for module, name in (
-        (kda_bprop_f16, "chunk_kda_bwd_sm100"),
-        (kda_recompute_f16, "chunk_kda_recompute_sm100"),
-    ):
-        original = getattr(module, name)
-
-        def checked(*args, original=original, **kwargs):
-            assert not kwargs["order_in_prologue"]
-            tables.append(kwargs["work_items"].clone())
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(module, name, checked)
+    tables = _record_work_tables(monkeypatch)
+    _forbid_driver_plans(monkeypatch)
     grad_summaries = partial(
         build_cudnn_state_grad_summaries, *inputs, do, cu, SCALE, transpose_forward_transition=True
     )
     grad_summaries(bounds=bounds)
     assert len(tables) == 2
+    # [seq, head, write_start, write_end, compute_start, compute_end, start, stop, dsts...]
     expected = torch.tensor(
         [
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 0, 0, 0, 0, 0, 17, 17],
-            [2, 0, 0, 0, 0, 0, 17, 17],
-            [3, 0, 0, 9, 0, 9, 82, 211],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0, 0, 17, 17, 1, 1],
+            [2, 0, 0, 0, 0, 0, 17, 17, 2, 2],
+            [3, 0, 0, 9, 0, 9, 82, 211, 3, 3],
         ],
         device="cuda",
         dtype=torch.int32,
@@ -338,6 +323,88 @@ def test_native_reverse_selection_skips_unrequested_work(monkeypatch) -> None:
     tables.clear()
     assert grad_summaries(bounds=bounds[:0]).shape == (0, 1, 256, 128)
     assert not tables
+
+
+def test_native_summary_uses_no_legacy_kernels(monkeypatch) -> None:
+    """Every validated entry point launches only the v1.30 summary kernels."""
+    legacy = pytest.importorskip("attn_gym.linear._delta_rule.cudnn.kernels")
+    for module_name, entry in (
+        ("kda_prefill_f16", "chunk_kda_sm100"),
+        ("kda_recompute_f16", "chunk_kda_recompute_sm100"),
+        ("kda_bprop_f16", "chunk_kda_bwd_sm100"),
+    ):
+        module = getattr(legacy, module_name, None)
+        if module is not None and hasattr(module, entry):
+            monkeypatch.setattr(
+                module, entry, lambda *a, **k: pytest.fail("legacy summary kernel launched")
+            )
+    _forbid_driver_plans(monkeypatch)
+    tables = _record_work_tables(monkeypatch)
+    inputs, cu = _packed_inputs(LENGTHS)
+    do = torch.randn_like(inputs[2])
+    build_cudnn_state_summaries(*inputs[1:], cu)
+    build_cudnn_state_grad_summaries(*inputs, do, cu, SCALE, transpose_forward_transition=True)
+    build_cudnn_state_grad_summaries(*inputs, do, cu, SCALE)
+    assert len(tables) == 5
+
+
+def test_native_summary_all_empty_or_unmatched_bounds() -> None:
+    """Rows never touching a launch still follow the identity/NaN contract, also under replay."""
+    inputs, cu = _packed_inputs(LENGTHS)
+    do = torch.randn_like(inputs[2])
+    identity = torch.cat((torch.zeros(128, 128), torch.eye(128))).cuda()
+    bounds = _bounds([[0, 0], [17, 17], [211, 211]])
+    graphs = []
+    for build in (
+        partial(build_cudnn_state_summaries, *inputs[1:], cu),
+        partial(build_cudnn_state_grad_summaries, *inputs, do, cu, SCALE),
+    ):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = build(bounds=bounds)
+        graph.replay()
+        _assert_bitwise_equal(captured, identity.expand_as(captured))
+        bounds.copy_(_bounds([[0, 16], [18, 82], [83, 211]]))
+        graph.replay()
+        assert captured.isnan().all()
+        bounds.copy_(_bounds([[0, 0], [17, 17], [211, 211]]))
+        graphs.append((graph, captured))
+    for graph, captured in graphs:
+        graph.replay()
+        _assert_bitwise_equal(captured, identity.expand_as(captured))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_native_summary_k64_v64_composes(dtype: torch.dtype) -> None:
+    """``[B; A]`` and ``[C; A.T]`` track FP64 for the 64-wide state the kernels also support."""
+    inputs, cu = _packed_inputs([17, 65], dtype)
+    q, k, value, gate = (t[..., :64].contiguous() for t in inputs[:4])
+    beta = inputs[4]
+    do = torch.randn_like(value)
+    forward = build_cudnn_state_summaries(k, value, gate, beta, cu)
+    reverse = build_cudnn_state_grad_summaries(
+        q, k, value, gate, beta, do, cu, 0.125, transpose_forward_transition=True
+    )
+    assert forward.shape == reverse.shape == (2, 1, 128, 64)
+    assert torch.equal(forward[:, :, 64:].transpose(-1, -2), reverse[:, :, 64:])
+    references = []
+    for precision in (torch.float64, torch.float32):
+        leaves = clone_kda_inputs((q, k, value, gate, beta), dtype=precision)
+        rows = []
+        for start, stop in pairwise(cu.tolist()):
+            sliced = tuple(t[:, start:stop] for t in leaves)
+            state = torch.zeros(1, 1, 64, 64, device="cuda", dtype=precision, requires_grad=True)
+            output, final = kda_reference(*sliced, state, scale=0.125)
+            (bias,) = torch.autograd.grad(output, state, do[:, start:stop].to(precision))
+            basis = list(sliced)
+            basis[2] = torch.zeros_like(basis[2])
+            _, transition = kda_reference(
+                *basis, torch.eye(64, device="cuda", dtype=precision)[None, None], scale=0.125
+            )
+            rows.append(torch.cat((final.detach(), transition, bias), dim=-2))
+        references.append(torch.cat(rows))
+    actual = torch.cat((forward, reverse[:, :, :64]), dim=-2)
+    assert_matches_low_precision_reference(actual, *references, "K=V=64 maps", source_dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

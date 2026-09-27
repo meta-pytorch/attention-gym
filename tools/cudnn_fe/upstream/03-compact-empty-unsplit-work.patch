@@ -1,0 +1,353 @@
+diff --git a/python/cudnn/linear_attention/frost/common/split_k.py b/python/cudnn/linear_attention/frost/common/split_k.py
+--- a/python/cudnn/linear_attention/frost/common/split_k.py
++++ b/python/cudnn/linear_attention/frost/common/split_k.py
+@@ -1113,6 +1113,47 @@
+ 
+ 
+ @cute.jit
++def compact_sequences(
++    n_threads: cutlass.Constexpr[int],
++    tidx,
++    n_batch: cutlass.Int32,
++    mCuSeqlens: cute.Tensor,
++    sIdx,
++    sWarp,
++):
++    """Write, in sequence order, ids with tokens into
++    ``sIdx[0, M)`` and return ``M``.  A warp ballot ranks each round of ``n_threads`` sequences, so
++    the table is deterministic.  ``sWarp`` holds ``n_threads // 32`` Int32 cells."""
++    lane = cute.arch.lane_idx()
++    warp = tidx // cutlass.Int32(32)
++    base = cutlass.Int32(0)
++    start = cutlass.Int32(0)
++    while start < n_batch:
++        b = start + tidx
++        keep = cutlass.Boolean(False)
++        if b < n_batch:
++            keep = mCuSeqlens[b + 1] > mCuSeqlens[b]
++        ballot = cute.arch.vote_ballot_sync(keep)
++        rank = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot) & cute.arch.lanemask_lt()))
++        if lane == 0:
++            sWarp[warp] = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot)))
++        nvvm.barrier_cta_sync()
++        offset = base
++        total = cutlass.Int32(0)
++        for w in cutlass.range_constexpr(n_threads // 32):
++            count = sWarp[w]
++            total = total + count
++            if cutlass.Int32(w) < warp:
++                offset = offset + count
++        if keep:
++            sIdx[offset + rank] = b
++        base = base + total
++        nvvm.barrier_cta_sync()
++        start = start + cutlass.Int32(n_threads)
++    return base
++
++
++@cute.jit
+ def order_body(
+     gen: cutlass.Constexpr[bool],
+     b_t: cutlass.Constexpr[int],
+@@ -1135,6 +1176,7 @@
+     chain: cutlass.Constexpr[bool] = False,
+     mRowBase: cute.Tensor | None = None,
+     mSlotRows: cute.Tensor | None = None,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ):
+     """Bitonic-sort the staged items by ``compute_end - compute_start``,
+     longest first, into ``work_items``; with ``gen`` synthesize the uncut item
+@@ -1144,7 +1186,12 @@
+     (``mCount`` holds their number).  Thread 0 also zeroes the
+     scheduler ticket ring when one is passed.  Caller owns ``sKey``/``sIdx`` (``n_threads *
+     order_elements`` Int32 each) and a 2-cell ``sSpread``.  CTA-wide barriers
+-    inside: every thread of the calling CTA must reach it."""
++    inside: every thread of the calling CTA must reach it.
++
++    ``skip_empty`` opts uncut tables into compaction when the caller has no
++    per-sequence state output to write. Empty forward state and backward
++    state-cotangent pass-through otherwise require their work items. Chain
++    tables and batches beyond the sequence-ID scratch capacity are unchanged."""
+     capacity = cutlass.const_expr(n_threads * order_elements)
+ 
+     # ---- zero the scheduler ticket rings ---------------------------------------------
+@@ -1155,7 +1202,16 @@
+                 mScheduler[si] = cutlass.Int32(0)
+                 si = si + cutlass.Int32(1)
+ 
+-    if cutlass.const_expr(gen):
++    compact = False
++    if cutlass.const_expr(gen and not chain and skip_empty):
++        n_batch = n_tiles // n_heads_out
++        compact = n_batch <= cutlass.Int32(capacity)
++        n = n_tiles
++        if compact:
++            n = compact_sequences(n_threads, tidx, n_batch, mCuSeqlens, sIdx, sKey) * n_heads_out
++        if tidx == 0:
++            mCount[0] = n
++    elif cutlass.const_expr(gen):
+         n = n_tiles
+         if tidx == 0:
+             mCount[0] = n_tiles
+@@ -1166,9 +1222,21 @@
+     if (n > cutlass.Int32(capacity)) or (n <= cutlass.Int32(num_ctas)):
+         i = tidx
+         while i < n:
+-            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i, expand_num, chain, mRowBase, mSlotRows)
++            src = i
++            if compact:
++                src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
++            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src, expand_num, chain, mRowBase, mSlotRows)
+             i = i + cutlass.Int32(n_threads)
+     else:
++        # Resolve sequence IDs before sIdx is reused as the sort permutation.
++        sources = []
++        for e in cutlass.range_constexpr(order_elements):
++            i = tidx + cutlass.Int32(e * n_threads)
++            src = i
++            if compact:
++                if i < n:
++                    src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
++            sources.append(src)
+         if tidx == 0:
+             sSpread[0] = cutlass.Int32(2147483647)
+             sSpread[1] = cutlass.Int32(-2147483648)
+@@ -1187,12 +1255,12 @@
+                         b_t, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, i, expand_num
+                     )
+                 elif cutlass.const_expr(gen):
+-                    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i, expand_num)
++                    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, sources[e], expand_num)
+                     key = batch_num_chunks
+                 else:
+                     key = mStaging[i, 5] - mStaging[i, 4]
+                 sKey[i] = key
+-                sIdx[i] = i
++                sIdx[i] = sources[e]
+                 kmin = kmin if kmin < key else key
+                 kmax = kmax if kmax > key else key
+             elif i < b_pad:
+@@ -1206,7 +1274,7 @@
+             # ---- every key equal and nothing to sort ---------------------------------
+             i2 = tidx
+             while i2 < n:
+-                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2, expand_num, chain, mRowBase, mSlotRows)
++                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, sIdx[i2], expand_num, chain, mRowBase, mSlotRows)
+                 i2 = i2 + cutlass.Int32(n_threads)
+         else:
+             # ---- bitonic sort, descending: k = subsequence width, j = distance -------
+diff --git a/python/cudnn/linear_attention/frost/common/thd.py b/python/cudnn/linear_attention/frost/common/thd.py
+--- a/python/cudnn/linear_attention/frost/common/thd.py
++++ b/python/cudnn/linear_attention/frost/common/thd.py
+@@ -66,22 +66,24 @@
+         if cutlass.const_expr(expand_num > 1):
+             cu_b = cu_b * cutlass.Int32(expand_num)
+             s_b = s_b * cutlass.Int32(expand_num)
+-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+-            (dptr + i).store((src_words + i).load())
+-        addr = base + cutlass.Int64(cu_b) * cutlass.Int64(base_ptr.stride[0])
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_ADDRESS,
+-            dptr,
+-            new_value=addr.toint(cutlass.Int64),
+-        )
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_DIM,
+-            dptr,
+-            new_value=s_b,
+-            ord=seq_ord,
+-        )
+-        set_tensor_map_bit21(dptr, cutlass.Int64(s_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
++        # Empty sequences issue no TMA, including state-only work items.
++        if s_b > 0:
++            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
++            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
++                (dptr + i).store((src_words + i).load())
++            addr = base + cutlass.Int64(cu_b) * cutlass.Int64(base_ptr.stride[0])
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_ADDRESS,
++                dptr,
++                new_value=addr.toint(cutlass.Int64),
++            )
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_DIM,
++                dptr,
++                new_value=s_b,
++                ord=seq_ord,
++            )
++            set_tensor_map_bit21(dptr, cutlass.Int64(s_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
+ 
+ 
+ @cute.jit
+@@ -116,22 +118,24 @@
+             s_b = s_b * cutlass.Int32(expand_num)
+         row_b = cu_b // cutlass.Int32(b_t) + b
+         n_b = (s_b + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
+-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+-            (dptr + i).store((src_words + i).load())
+-        addr = base + cutlass.Int64(row_b) * cutlass.Int64(base_ptr.stride[0])
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_ADDRESS,
+-            dptr,
+-            new_value=addr.toint(cutlass.Int64),
+-        )
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_DIM,
+-            dptr,
+-            new_value=n_b,
+-            ord=seq_ord,
+-        )
+-        set_tensor_map_bit21(dptr, cutlass.Int64(n_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
++        # Empty sequences issue no TMA, including state-only work items.
++        if s_b > 0:
++            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
++            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
++                (dptr + i).store((src_words + i).load())
++            addr = base + cutlass.Int64(row_b) * cutlass.Int64(base_ptr.stride[0])
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_ADDRESS,
++                dptr,
++                new_value=addr.toint(cutlass.Int64),
++            )
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_DIM,
++                dptr,
++                new_value=n_b,
++                ord=seq_ord,
++            )
++            set_tensor_map_bit21(dptr, cutlass.Int64(n_b) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
+ 
+ 
+ @cute.jit
+@@ -186,19 +190,21 @@
+                     s_tokn = s_tokn * cutlass.Int32(expand_num)
+                 cntn = (s_tokn - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
+                 run = run + (cntn if s_tokn > 0 else cutlass.Int32(0))
+-        dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+-            (dptr + i).store((src_words + i).load())
+-        addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(base_ptr.stride[0])
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_ADDRESS,
+-            dptr,
+-            new_value=addr.toint(cutlass.Int64),
+-        )
+-        nvvm.tensormap_replace(
+-            nvvm.TensormapField.GLOBAL_DIM,
+-            dptr,
+-            new_value=cnt,
+-            ord=seq_ord,
+-        )
+-        set_tensor_map_bit21(dptr, cutlass.Int64(cnt) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
++        # Empty sequences issue no TMA, including state-only work items.
++        if s_tok > 0:
++            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
++            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
++                (dptr + i).store((src_words + i).load())
++            addr = base + cutlass.Int64(checkpoint_base) * cutlass.Int64(base_ptr.stride[0])
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_ADDRESS,
++                dptr,
++                new_value=addr.toint(cutlass.Int64),
++            )
++            nvvm.tensormap_replace(
++                nvvm.TensormapField.GLOBAL_DIM,
++                dptr,
++                new_value=cnt,
++                ord=seq_ord,
++            )
++            set_tensor_map_bit21(dptr, cutlass.Int64(cnt) * cutlass.Int64(base_ptr.stride[0]) * cutlass.Int64(base_ptr.element_type.width // 8))
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
+@@ -2425,6 +2425,7 @@
+     mScheduler: cute.Tensor,
+     n_batch: cutlass.Int32,
+     checkpoint_every_n: cutlass.Int32,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ) -> None:
+     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
+     scheduler rings via :func:`order_body`, block 1 builds the per-batch
+@@ -2460,6 +2461,7 @@
+             sIdx,
+             sSpread,
+             expand_num=expand_num,
++            skip_empty=skip_empty,
+         )
+     else:
+         build_descs_body(
+@@ -2506,6 +2508,7 @@
+     tensormap_workspace: cute.Tensor,
+     stream: cuda.CUstream,
+     tiles_per_head: cutlass.Constexpr[int] = 1,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ):
+     """One-launch prologue: LPT-order the work items and build the per-(b,h)
+     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
+@@ -2587,6 +2590,7 @@
+         scheduler_counter,
+         cutlass.Int32(batch_size),
+         checkpoint_every_n,
++        skip_empty,
+     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
+@@ -2248,6 +2248,7 @@
+     mScheduler: cute.Tensor,
+     n_batch: cutlass.Int32,
+     checkpoint_every_n: cutlass.Int32,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ) -> None:
+     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
+     scheduler rings via :func:`order_body`, block 1 builds the per-batch
+@@ -2283,6 +2284,7 @@
+             sIdx,
+             sSpread,
+             num_ctas=num_ctas,
++            skip_empty=skip_empty,
+         )
+     else:
+         build_descs_body(
+@@ -2327,6 +2329,7 @@
+     checkpoint_every_n: cutlass.Int32,
+     stream: cuda_driver.CUstream,
+     tiles_per_head: cutlass.Constexpr[int] = 1,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ):
+     """One-launch prologue: LPT-order the work items and build the 6
+     per-(batch, head) TMA-descriptor arrays (q, k, v, gate, o,
+@@ -2395,6 +2398,7 @@
+         scheduler_counter,
+         cutlass.Int32(batch_size),
+         checkpoint_every_n,
++        skip_empty,
+     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
+@@ -148,6 +148,7 @@
+         workspace,
+         stream,
+         tiles_per_head,
++        skip_empty=state_out is None,
+     )
+     gdn_prefill_f16.host(
+         prefill_cfg,
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
+@@ -208,6 +208,7 @@
+             checkpoint_every_n,
+             stream,
+             tiles_per_head,
++            skip_empty=state_out is None,
+         )
+     prefill_host = kda_prep_prefill_f16.host if cutlass.const_expr(prep) else kda_prefill_f16.host
+     prefill_host(
