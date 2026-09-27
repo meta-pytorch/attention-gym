@@ -164,7 +164,6 @@ def kda_forward(
             if initial_state is not None
             else torch.zeros(num_seqs, heads_out, dim_v, dim_k, dtype=torch.float32, device=device)
         )
-    stream = torch.cuda.current_stream(device).cuda_stream
     common = {
         "q": q,
         "k": k,
@@ -211,9 +210,7 @@ def kda_forward(
             checkpoint_every_n_tokens=0,
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-            device=device.index,
             num_sm=plan.num_sm,
-            stream=stream,
         )
         run_chain_forward(
             launch,
@@ -223,7 +220,6 @@ def kda_forward(
             num_seqs=num_seqs,
             checkpoint_every_n_tokens=0,
             scale=scale,
-            stream=stream,
         )
         return o, final_state
 
@@ -260,10 +256,8 @@ def kda_forward(
         **_GATE_FLAGS,
         checkpoint_every_n_tokens=0,
         scale=scale,
-        device=device.index,
-        stream=stream,
     )
-    run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale, stream=stream)
+    run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale)
     return o, final_state
 
 
@@ -397,7 +391,6 @@ def kda_backward(
     plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
     if split:
         plan = replace(plan, pieces=0)
-    stream = torch.cuda.current_stream(device).cuda_stream
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
 
     def empty(*shape, dtype=torch.int32):
@@ -483,11 +476,9 @@ def kda_backward(
             use_beta_sigmoid=False,
             allow_neg_eigval=False,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-            device=device.index,
             num_sm=plan.num_sm,
-            stream=stream,
         )
-        run_chain_backward(launch, **buffers, **schedule, stream=stream)
+        run_chain_backward(launch, **buffers, **schedule)
     else:
         schedulers = empty(4)
         ideal, rows, item_scratch, chunk_scratch = _split_scratch(
@@ -529,8 +520,6 @@ def kda_backward(
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
             **_GATE_FLAGS,
-            device=device.index,
-            stream=stream,
         )
-        run_warmup_backward(*launch, **buffers, **stages, stream=stream)
+        run_warmup_backward(*launch, **buffers, **stages)
     return dq, dk, dv, dgate, dbeta, d_initial_state

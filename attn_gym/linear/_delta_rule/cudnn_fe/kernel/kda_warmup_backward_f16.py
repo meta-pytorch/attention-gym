@@ -509,8 +509,6 @@ def build_warmup_backward(
     use_beta_sigmoid,
     allow_neg_eigval,
     scale,
-    device,
-    stream,
 ):
     """Compile (persisted per static config) the warmup or uncut backward launch over the buffers
     of one plan.  The fake signatures repeat the marks of the standalone builds so every kernel
@@ -652,7 +650,6 @@ def run_warmup_backward(
     seed_span_tokens,
     seed_every_n_tokens,
     scale,
-    stream,
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL on the current Torch stream.
     The plan validated the contract at build, so nothing here raises."""

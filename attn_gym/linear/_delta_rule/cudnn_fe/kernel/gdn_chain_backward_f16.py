@@ -903,9 +903,7 @@ def build_chain_backward(
     allow_neg_eigval,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
     """Compile (cached per static config) the head and tail launches of the chain backward over the
     buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The
@@ -1225,7 +1223,6 @@ def run_chain_backward(
     series_span_tokens,
     seed_every_n_tokens,
     scale,
-    stream,
 ) -> None:
     """Replay the chain backward: two crossings into the DSL for its eight launches.  The plan
     validated the contract at build, so nothing here raises."""

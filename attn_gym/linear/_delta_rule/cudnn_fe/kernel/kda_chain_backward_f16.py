@@ -606,9 +606,7 @@ def build_chain_backward(
     allow_neg_eigval,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
     """Compile (persisted per static config) the chain backward launch over the buffers of one
     plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The fake signatures
@@ -766,7 +764,6 @@ def run_chain_backward(
     log_gate,
     safe_gate,
     scale,
-    stream,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its seven launches.  The plan
     validated the contract at build, so nothing here raises."""

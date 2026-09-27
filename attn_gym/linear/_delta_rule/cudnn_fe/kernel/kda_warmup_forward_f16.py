@@ -679,8 +679,6 @@ def build_warmup_forward(
     allow_neg_eigval,
     checkpoint_every_n_tokens,
     scale,
-    device,
-    stream,
     tiles_per_head=1,
     prep=False,
     prep_k_decay=None,
@@ -698,12 +696,9 @@ def build_warmup_forward(
     geometry, the d_v split, state and checkpoint presence, the int64 ABI) the warmup or uncut
     forward launch over the buffers of one plan.  The fake signatures repeat the marks of the
     standalone split-table and prefill builds so every kernel compiles as it does there.
-    ``device`` and ``stream`` are unused: the compile is keyed on ``num_sm`` and launches on the
-    current Torch stream.  ``state_indices`` (int32 per sequence) and the optional uint8
-    ``has_initial_state`` select paged
-    state: ``state_in`` and ``state_out`` are then one pool routed per sequence (null, fresh and
-    resumed slots)."""
-    del device, stream
+    It launches on the current Torch stream.  ``state_indices`` (int32 per sequence) and the
+    optional uint8 ``has_initial_state`` select paged state: ``state_in`` and ``state_out`` are
+    then one pool routed per sequence (null, fresh and resumed slots)."""
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -890,7 +885,6 @@ def run_warmup_forward(
     workspace,
     checkpoint_every_n_tokens,
     scale,
-    stream,
     prep_k_decay=None,
     prep_q_decay=None,
     prep_t=None,
@@ -903,9 +897,8 @@ def run_warmup_forward(
     has_initial_state=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and
-    prefill launches, on the current Torch stream (``stream`` is unused).  The plan validated the
-    contract at build, so nothing here raises."""
-    del stream
+    prefill launches, on the current Torch stream.  The plan validated the contract at build, so
+    nothing here raises."""
     compiled(
         facts.n_heads_out,
         facts.n_tiles,

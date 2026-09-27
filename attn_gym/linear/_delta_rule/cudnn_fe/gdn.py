@@ -387,7 +387,6 @@ def gdn_backward(
     plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
     if split:
         plan = replace(plan, pieces=0)
-    stream = torch.cuda.current_stream(device).cuda_stream
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
 
     def empty(*shape, dtype=torch.int32):
@@ -483,11 +482,9 @@ def gdn_backward(
             summary_q_step=1,
             **_GATE_FLAGS,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-            device=device.index,
             num_sm=plan.num_sm,
-            stream=stream,
         )
-        run_chain_backward(launch, **buffers, **schedule, stream=stream)
+        run_chain_backward(launch, **buffers, **schedule)
     else:
         schedulers = empty(4)
         ideal, rows, item_scratch, chunk_scratch = _split_scratch(
@@ -529,10 +526,8 @@ def gdn_backward(
             num_sm=plan.num_sm,
             expand_num=1,
             **_GATE_FLAGS,
-            device=device.index,
-            stream=stream,
         )
-        run_warmup_backward(*warmup, **buffers, **stages, stream=stream)
+        run_warmup_backward(*warmup, **buffers, **stages)
         gdn_bprop_f16.chunk_gdn_bwd(
             q,
             k,
@@ -558,7 +553,7 @@ def gdn_backward(
             workspace=bprop_words,
             device=device.index,
             num_sm=plan.num_sm,
-            stream=stream,
+            stream=torch.cuda.current_stream(device).cuda_stream,
             own_prologue=False,
             tinv=common["tinv"],
         )

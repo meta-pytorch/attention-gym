@@ -544,8 +544,6 @@ def build_warmup_backward(
     safe_gate,
     use_beta_sigmoid,
     allow_neg_eigval,
-    device,
-    stream,
 ):
     """Compile (cached per static config) the head of the warmup or uncut backward over the buffers
     of one plan.  The placeholders repeat the marks of the standalone builds so every kernel
@@ -775,7 +773,6 @@ def run_warmup_backward(
     compact_qdo,
     seed_span_tokens,
     seed_every_n_tokens,
-    stream,
 ) -> None:
     """Replay the head of the warmup or uncut backward: one crossing into the DSL.  The plan
     validated the contract at build, so nothing here raises."""

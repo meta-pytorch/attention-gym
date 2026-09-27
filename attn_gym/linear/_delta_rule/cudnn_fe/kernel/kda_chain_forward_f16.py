@@ -544,16 +544,13 @@ def build_chain_forward(
     checkpoint_every_n_tokens,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
     """Compile (persisted per static config: dtypes, dims, gate flags and bound, checkpoint and
     final-state presence, seed dtype, chain rows, SM count, the int64 ABI) the chain forward launch
     over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.
     The fake signatures repeat the marks of the standalone modules' builds so every kernel compiles
-    as it does there.  ``device`` and ``stream`` are unused: the launch runs on the current Torch
-    stream."""
+    as it does there; the launch runs on the current Torch stream."""
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -597,7 +594,7 @@ def build_chain_forward(
         chain_rows=chain_rows,
         num_sm=num_sm,
     )
-    del pieces, heads_out, num_seqs, scale, device, stream
+    del pieces, heads_out, num_seqs, scale
     if int(checkpoint_every_n_tokens) <= 0:
         checkpoints = None
     for name, tensor in (("state_h", state_h), ("state_m", state_m), ("state_x", state_x)):
@@ -704,12 +701,9 @@ def run_chain_forward(
     num_seqs,
     checkpoint_every_n_tokens,
     scale,
-    stream,
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the four launches, on the current
-    Torch stream (``stream`` is unused).  The plan validated the contract at build, so nothing here
-    raises."""
-    del stream
+    Torch stream.  The plan validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
