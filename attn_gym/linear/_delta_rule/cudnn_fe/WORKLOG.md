@@ -76,6 +76,19 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   stock repro stays "bug" even against the patched tree unless it opts in.
 - **Replay:** if upstream adopts an opt-in flag, AG must still opt in on every no-state split path.
 
+### B13 — Scalar-gate split scan ignores the head stride (C13, E3) · bugfix
+- **Problem:** the scalar gate load used bare `h` instead of `h * stride[1]`; a non-unit-head-stride
+  view read the wrong head and corrupted decay sums and split decisions.
+- **Found by:** code audit of the address expression. Public GDN requires contiguous heads, so this
+  is raw-helper robustness, not a reproduced public failure.
+- **Fix:** Int64-widened `h * stride[1]`; symbolic head stride in the scalar-gate fake signature.
+  `common/split_k.py`; "Respect scalar-gate head strides in split scans".
+- **Evidence:** fails without = YES: 256/516 scan entries wrong, max abs error 4.6166.
+- **Tests:** CM::test_scalar_split_scan_respects_head_stride.
+- **Upstream:** draft `05-scalar-scan-head-stride.patch`.
+- **Replay:** keep the dynamic-stride fake ABI; `mark_layout_dynamic(leading_dim=None)` still infers
+  stride 1 from a compact first call, and the test then only exercises the host rejection.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
 
 ### B15 — Launch caches keyed on shape-unaware state
@@ -146,5 +159,10 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 ## Lessons
 
+2. **Fake signatures are an ABI (S5/S13, B13).** Upstream compiled from live tensors marked
+   `mark_layout_dynamic(leading_dim=rank-1)`: int32 shapes, int64 outer strides, divisibility 1.
+   int64 shapes changed register allocation (REG 52→46); promising aligned strides grew a
+   scalar-gate kernel from 200 to 512 instructions. A stride that must vary needs an explicit
+   symbolic stride; `leading_dim=None` still infers 1 from a compact first call.
 3. **Match upstream's opt level (R2).** The compiler default is not upstream's `--opt-level 2`;
    without an explicit level SASS differs and perf comparisons are meaningless.

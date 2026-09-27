@@ -51,3 +51,37 @@ def test_split_table_omits_zero_chunk_sequences(bounds):
     rows = staging[: count.item()].cpu()
     assert sorted(rows[:, 0].tolist()) == sorted(expected_sequences * heads)
     assert torch.all(rows[:, 5] > rows[:, 4])
+
+
+def test_scalar_split_scan_respects_head_stride():
+    """Inactive interleaved heads must not contribute to the forgetting-horizon scan."""
+    tokens, heads = 4096, 2
+    storage = torch.full((tokens, heads * 2), 37.0, device="cuda")
+    gate = storage[:, ::2]
+    gate[:, 0] = -0.1
+    gate[:, 1] = -0.2
+    cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    scans = []
+    for source in (gate.contiguous(), gate):
+        items = torch.empty(256, split_k.WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda")
+        chunks = torch.zeros(split_k.chunk_scratch_rows(tokens, 1, 16), heads, device="cuda")
+        split_k.build_split_table(
+            source,
+            cu,
+            items,
+            torch.empty(1, dtype=torch.int32, device="cuda"),
+            ideal_chunks=32,
+            n_tiles=heads,
+            num_sms=torch.cuda.get_device_properties(source.device).multi_processor_count,
+            b_t=16,
+            chunk_scratch=chunks,
+            item_scratch=torch.empty_like(items),
+            log_gate=True,
+            scheduler_counter=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            split=True,
+            opt_level=2,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+        scans.append(chunks)
+    assert torch.count_nonzero(scans[0][:-1]) > 0
+    torch.testing.assert_close(scans[1], scans[0], atol=0, rtol=0)

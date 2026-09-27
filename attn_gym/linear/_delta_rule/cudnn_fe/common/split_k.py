@@ -67,7 +67,7 @@ import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
@@ -965,7 +965,7 @@ def frost_split_k_scan_scalar(
                                 (
                                     mGate.iterator
                                     + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0])
-                                    + h_r
+                                    + cutlass.Int64(h_r) * cutlass.Int64(mGate.stride[1])
                                 )
                                 .load()
                                 .to(cutlass.Float32)
@@ -1829,6 +1829,14 @@ def _compile_split_table(
         if split
         else None
     )
+    if split and not gate_channels:
+        gate = make_fake_strided_tensor(
+            gate_dtype,
+            (sym_int(), sym_int()),
+            contiguous_dim=None,
+            assumed_align=4,
+            use_int64_strides=use_int64_offsets,
+        )
     a_log = tensor(a_dtype, 1) if a_dtype is not None else None
     dt_bias = tensor(*bias_spec) if bias_spec is not None else None
     flags = (

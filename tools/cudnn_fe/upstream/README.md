@@ -21,6 +21,7 @@ every optional specialization was tested.
 | Rank | Patch | Ledger | Stock v1.30 behavior reproduced? | Patched validation |
 |---:|---|---|---|---|
 | 3 | `03-compact-empty-unsplit-work.patch` | B8 | **Yes:** padded empty intervals stay in the work table; 8/20 work-count checks fail | 20/20 checks, incl. exact empty final-state/cotangent preservation |
+| 5 | `05-scalar-scan-head-stride.patch` | B13 | **Yes:** raw scan wrong in 256/516 entries, max abs error 4.6166; host rejects stride-2 replay | Raw scan and compact→strided host replay match exactly |
 | 6 | `04-omit-zero-chunk-split-work.patch` | B10 | **Yes:** 8 items instead of 4 (not a reproduced TMEM hang) | Opted-in table has 4 items, all-empty 0; stateful default unchanged |
 
 ## Running the repros
@@ -29,6 +30,7 @@ every optional specialization was tested.
 |---|---|---|---|
 | `repro_03_empty_unsplit.py` | optional export dir holding `python/cudnn` (defaults to the installed package) | 8/20 fail | 20/20 |
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
+| `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
 
 ## Source/history audit
 
@@ -38,6 +40,8 @@ dependencies**:
 - 03 (B8): PR #603 and its v1.30 replay in "Route unpaged GDN and KDA and native CP summaries to the
   v1.30 kernels"; adapted conservatively to upstream state ownership.
 - 04 (B10): "Omit zero-chunk split work items"; adds an upstream-specific safe opt-in.
+- 05 (B13): "Respect scalar-gate head strides in split scans"; uses upstream CuTeDSL's
+  `make_fake_tensor` instead of the AG fake-tensor helper.
 
 ## Draft issue 03 — Empty packed intervals consume unsplit scheduling slots
 
@@ -73,3 +77,18 @@ work. A scheduler inefficiency, not a reproduced persistent-TMEM hang.
 **Fix / safety.** Compile-time `skip_empty=False` threaded through launch and compile cache; zero
 chunks omitted only when opted in (split-forward hosts without a final state). State/cotangent-
 writing callers keep empty items. Distinct from 03's unsplit compaction.
+
+## Draft issue 05 — Scalar split scan ignores the head stride
+
+**Symptom.** A gate view in alternating columns of a poisoned `[4096,4]` tensor produces wrong
+per-head decay sums (logical heads −0.1 and −0.2; unused columns +37).
+
+**Root cause.** The scalar load adds bare `h` rather than `h * stride[1]`; the standalone host also
+marks the last dimension unit-stride, blocking legitimate non-unit-head-stride replay.
+
+**Repro.** `--raw`: stock 256/516 entries differ, max abs error 4.6166239; patched exact. Default:
+stock compact→strided replay raises a TVM-FFI stride mismatch; patched passes.
+
+**Fix.** Widen before multiplying by the actual head stride; explicit symbolic-stride fake signature
+for scalar gates. `mark_layout_dynamic(leading_dim=None)` is not enough: it infers stride 1 from a
+compact first call.
