@@ -412,6 +412,7 @@ def gdn_backward(
             workspace=bprop_words,
             num_sm=plan.num_sm,
             tinv=common["tinv"],
+            bundle_validated=True,  # build_warmup_backward checked the shared bundle
         )
 
     groups = heads_out // key_heads

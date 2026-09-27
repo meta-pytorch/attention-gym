@@ -5853,8 +5853,13 @@ def chunk_gdn_bwd(
     tinv=None,
     workspace,
     num_sm: int,
+    bundle_validated: bool = False,
 ) -> None:
     """Execute the chunked GDN bprop kernel (THD / varlen entry).
+
+    ``bundle_validated`` means the caller already ran ``validate_bwd_bundle`` over these
+    operands, checkpoints, tinv and workspace (one series per sequence) and checked the work
+    table; only the gradient, state-cotangent and ticket-counter checks run again.
 
     Produces dQ/dK/dV/dGate/dBeta at ``HO = max(HQ, HV)`` heads (the caller
     reduces over the head group; dGate = dL/d(ln alpha)).  With
@@ -5907,48 +5912,70 @@ def chunk_gdn_bwd(
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     if d_initial_state is not None and not use_initial_state:
         raise ValueError("d_initial_state needs use_initial_state")
-    tokens, heads_out, num_seqs = validate_bwd_operands(
-        q,
-        k,
-        v,
-        do,
-        gate,
-        beta,
-        cu_seqlens,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dgate=dgate,
-        dbeta=dbeta,
-    )
-    validate_cuda_tensors(
-        q,
-        state_checkpoints=state_checkpoints,
-        d_initial_state=d_initial_state,
-        d_final_state=d_final_state,
-        work_items=work_items,
-        work_count=work_count,
-        scheduler_counter=scheduler_counter,
-        tinv=tinv,
-        workspace=workspace,
-    )
     dim_v, dim_k, io = v.shape[2], q.shape[2], str(q.dtype).removeprefix("torch.")
-    validate_state_series(
-        "state_checkpoints",
-        state_checkpoints,
-        checkpoint_capacity_bound(tokens, num_seqs, CFG.B_T),
-        heads_out,
-        dim_v,
-        dim_k,
-        (io,),
-    )
+    if bundle_validated:
+        tokens, heads_out, num_seqs = q.shape[0], gate.shape[1], cu_seqlens.shape[0] - 1
+        validate_cuda_tensors(
+            q,
+            dgate=dgate,
+            dbeta=dbeta,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
+            scheduler_counter=scheduler_counter,
+        )
+        if dgate is not None:
+            validate_tensor("dgate", dgate, (tokens, heads_out), ("float32",))
+        if dbeta is not None:
+            validate_tensor(
+                "dbeta", dbeta, (tokens, heads_out), (str(beta.dtype).removeprefix("torch."),)
+            )
+        validate_tensor(
+            "scheduler_counter", scheduler_counter, (None,), ("int32",), align=4, min_rows=1
+        )
+    else:
+        tokens, heads_out, num_seqs = validate_bwd_operands(
+            q,
+            k,
+            v,
+            do,
+            gate,
+            beta,
+            cu_seqlens,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            dgate=dgate,
+            dbeta=dbeta,
+        )
+        validate_cuda_tensors(
+            q,
+            state_checkpoints=state_checkpoints,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
+            work_items=work_items,
+            work_count=work_count,
+            scheduler_counter=scheduler_counter,
+            tinv=tinv,
+            workspace=workspace,
+        )
+        validate_state_series(
+            "state_checkpoints",
+            state_checkpoints,
+            checkpoint_capacity_bound(tokens, num_seqs, CFG.B_T),
+            heads_out,
+            dim_v,
+            dim_k,
+            (io,),
+        )
+        if tinv is not None:
+            validate_tinv(tinv, tokens, num_seqs, heads_out, io)
+        validate_work_table(
+            work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out
+        )
+        validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     for name, tensor in (("d_initial_state", d_initial_state), ("d_final_state", d_final_state)):
         if tensor is not None:
             validate_state_series(name, tensor, num_seqs, heads_out, dim_v, dim_k, STATE_DTYPES)
-    if tinv is not None:
-        validate_tinv(tinv, tokens, num_seqs, heads_out, io)
-    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
-    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     tinv_source = "gmem" if tinv is not None else "compute"
     use_int64_offsets = requires_int64_abi(
         q,
