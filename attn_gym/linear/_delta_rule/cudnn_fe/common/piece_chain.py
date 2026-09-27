@@ -412,8 +412,10 @@ def piece_table_body(
 
 @cute.kernel
 def frost_state_chain(
+    shared_type: cutlass.Constexpr,
+    product_rows: cutlass.Constexpr[int],
+    part_rows: cutlass.Constexpr[int],
     heads_out: cutlass.Int32,
-    dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
     pieces: cutlass.Int32,
@@ -430,7 +432,6 @@ def frost_state_chain(
     mSummaryM: cute.Tensor | None,
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
-    shared_type: cutlass.Constexpr,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -440,10 +441,8 @@ def frost_state_chain(
     ``seq * pieces + j``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary and otherwise yields
     ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is walked."""
     K = cutlass.const_expr(dim_k)
-    V = cutlass.const_expr(dim_v)
     HO = heads_out
     P = pieces
-    product_rows = cutlass.const_expr(K * rows // V if emit_summary else 0)
     walk_state = cutlass.const_expr(has_seed or has_tail or not emit_summary)
     cols_per_lane = cutlass.const_expr(K // CHAIN_LANES)
     k_slice = cutlass.const_expr(K // CHAIN_K_WARPS)
@@ -453,7 +452,6 @@ def frost_state_chain(
     walk_own_rows = cutlass.const_expr(rows // CHAIN_WARPS)
     product_group_rows = cutlass.const_expr(product_rows // CHAIN_ROW_GROUPS)
     product_own_rows = cutlass.const_expr(product_rows // CHAIN_WARPS)
-    part_rows = cutlass.const_expr(rows + product_rows)
 
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -1073,11 +1071,9 @@ def frost_state_chain(
         launch_dependent_grids()
 
 
-def state_chain_storage(dim_v: int, dim_k: int, rows: int, emit_summary: bool):
+def state_chain_storage(dim_k: int, rows: int, product_rows: int, part_rows: int):
     """SMEM of one state-chain CTA in the v1.30 order: walk rows, product rows (empty without
     ``emit_summary``), the per-k-slice partials of both, then the double-buffered ``M_j``."""
-    product_rows = dim_k * rows // dim_v if emit_summary else 0
-    part_rows = rows + product_rows
 
     @cute.struct
     class SharedStorage:
@@ -1116,9 +1112,13 @@ def launch_state_chain(
     stream: cuda.CUstream,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
+    product_rows = cutlass.const_expr(dim_k * rows // dim_v if emit_summary else 0)
+    part_rows = cutlass.const_expr(rows + product_rows)
     frost_state_chain(
+        state_chain_storage(dim_k, rows, product_rows, part_rows),
+        product_rows,
+        part_rows,
         heads_out,
-        dim_v,
         dim_k,
         rows,
         pieces,
@@ -1135,7 +1135,6 @@ def launch_state_chain(
         mSummaryM,
         mMainRows,
         mSeedIndices,
-        state_chain_storage(dim_v, dim_k, rows, emit_summary),
     ).launch(
         grid=(num_seqs, heads_out, slices),
         block=(CHAIN_THREADS, 1, 1),

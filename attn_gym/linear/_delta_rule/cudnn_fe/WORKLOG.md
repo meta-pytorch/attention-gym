@@ -294,6 +294,14 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - Run S10 (ruff) last so upstream diffs stay readable during replay.
 - Append to, never replace, per-file notices (R12).
 
+S15 follow-up, "Pass state-chain storage before runtime arguments": moved `shared_type` before
+runtime arguments and derived product/partial row counts once in the launcher. Before/after
+GB200 snapshots (`python -m tools.cudnn_fe.sass snapshot <out> --cases chain`) covered eight
+GDN/KDA forward/backward cases, including int64. The corrected strict gate reported all ten
+compile artifacts identical; all twelve state-chain instances had byte-identical raw instruction
+lines, unchanged resources and unchanged shared-memory layout. Only symbol names changed.
+Performance was not measured. Snapshots: `agent_space/f3/{before,after}`, report:
+`agent_space/f3/diff-final.log` (local, gitignored).
 
 ## Decisions
 

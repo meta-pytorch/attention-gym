@@ -309,6 +309,7 @@ id = "S15"
 title = "Remaining exact KDA prefill swizzle forms; common-helper rmem tensors; state-chain SharedStorage"
 kind = "restyle"
 ag_subject = "Restyle the remaining cuDNN swizzle forms and common-helper arrays"
+ag_subjects_extra = ["Pass state-chain storage before runtime arguments"]
 guarding_tests = []
 gate = "sass (55/55 byte-identical SASS and resources)"
 upstream_status = "ag-specific"
