@@ -48,6 +48,10 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   #1013/#1015), B12 checkpoint `[V,K]` descriptors, S11 V-major state. Inherited from main: B4 dO
   dtype check.
 
+## 3. Features and integration (AG-specific)
+
+- **R2 — `compile_tvm_ffi(opt_level=...)`**, hosts keep O2 (see Lessons).
+
 ## 4. Restyle, pruning and infra (gated by SASS, not behavior)
 
 S1–S4, S8/S6/S3, S15 (restyle), S5/S13 (frozen cfgs, `@jit_cache` over fake TVM-FFI signatures,
@@ -65,6 +69,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 | Decision | Rationale / evidence | Revisit when |
 |---|---|---|
+| Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
 
@@ -74,3 +79,8 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
 - Fails-without evidence predates the final commit order (see "Reading an entry").
+
+## Lessons
+
+3. **Match upstream's opt level (R2).** The compiler default is not upstream's `--opt-level 2`;
+   without an explicit level SASS differs and perf comparisons are meaningless.

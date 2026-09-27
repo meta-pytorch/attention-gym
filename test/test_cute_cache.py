@@ -190,6 +190,10 @@ def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
         "name_prefix": "stable_kernel_name",
     }
 
+    compile_tvm_ffi(entrypoint, fake_tensor, opt_level=2)
+    first, level = observed["option"]
+    assert first is cute.EnableTVMFFI and isinstance(level, cute.OptLevel)
+
 
 def test_benchmark_gpu_uses_inductor_benchmarker(monkeypatch):
     import torch._inductor.runtime.benchmarking as inductor_benchmarking

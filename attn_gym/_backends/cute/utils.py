@@ -195,6 +195,7 @@ def compile_tvm_ffi(
     entrypoint: Any,
     *compile_args: Any,
     name: str | None = None,
+    opt_level: int | None = None,
 ) -> Any:
     """Compile a fake-tensor signature with the canonical TVM-FFI stream ABI.
 
@@ -204,7 +205,9 @@ def compile_tvm_ffi(
     a typed compile option, and gives the outer artifact a stable name.
 
     Class-based entrypoints should expose ``get_name()``. Free-function
-    entrypoints may instead provide ``name=`` explicitly.
+    entrypoints may instead provide ``name=`` explicitly. ``opt_level`` sets the
+    CuTeDSL optimization level (the compiler default when ``None``); it changes
+    generated code, so callers that need a specific level must pass it.
     """
     if name is None:
         get_name = getattr(entrypoint, "get_name", None)
@@ -226,7 +229,11 @@ def compile_tvm_ffi(
     jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
     jit_wrapper.set_name_prefix(name)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile[cute.EnableTVMFFI](
+    if opt_level is None:
+        compile_fn = cute.compile[cute.EnableTVMFFI]
+    else:
+        compile_fn = cute.compile[cute.EnableTVMFFI, cute.OptLevel(opt_level)]
+    return compile_fn(
         entrypoint,
         *compile_args,
         stream,
