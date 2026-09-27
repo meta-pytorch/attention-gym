@@ -35,9 +35,11 @@ stack_prs = [606, 607, 608, 609, 611]
 # --------------------------------------------------------------------------- bug fixes
 [[fix]]
 id = "B7"
-title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps)"
+title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) (reverted; tests xfail)"
 kind = "numerics"
 ag_subject = "Compute the GDN bprop dBeta without dividing by beta"
+# Reverted: the bf16 T = I - T_b L rebuild cost 1.5-2.6x dV/dBeta/dK error on trained weights.
+ag_subjects_extra = ["Restore the v1.30 divide-by-beta dBeta in the GDN cuDNN backward"]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient",
   "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference",
