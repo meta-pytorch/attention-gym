@@ -331,6 +331,15 @@ ag_subject = "Delete the legacy cuDNN kernel copy and its unused schedule helper
 guarding_tests = ["test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies"]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R11"
+title = "Drop the GDP d_v=64 bprop fork from the GDN chain prologue"
+kind = "pruning"
+ag_subject = "Drop the unused GDP d_v=64 bprop fork from the GDN chain prologue"
+guarding_tests = []
+gate = "vendor.py applies the GDP fork cut automatically; import test"
+upstream_status = "nv-surface-removed"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"

@@ -25,8 +25,8 @@ the recompute) runs the chain prologue, the T pass, the fused H and M summary an
 recompute when the forward's series is passed back) and the seeded series recompute; the tail (``--opt-level 2``, the option
 of the bprop summary and the bprop) runs the G summary, the reverse state chain and the bprop.  The series recompute moves
 ahead of the G summary (it depends only on the forward chain); the reverse chain is the one GDN kernel compiled at 2
-while GDN's standalone level is 3 (same instruction count, one runtime division per CTA folded differently).  The bprop module is a constexpr argument: GDP at d_v = 64
-runs the gdp_bprop_v64_f16 fork, whose host takes no T-pass tiles.  Every kernel, its host and the tensor placeholder each host
+while GDN's standalone level is 3 (same instruction count, one runtime division per CTA folded differently).  The bprop module is a constexpr argument; only gdn_bprop_f16
+is vendored (upstream's GDP d_v = 64 fork is not).  Every kernel, its host and the tensor placeholder each host
 was compiled with are the standalone modules' own; a buffer two hosts read through different placeholder types is passed
 twice, once per type (H, M and X: the summary's and recompute's mode-3 compact views against the state chain's ``(1, HO, V,
 K)`` device views)."""

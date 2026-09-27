@@ -27,8 +27,8 @@ builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bpr
 ``run_bwd`` without their prologue), so the call sequence is two crossings into the DSL instead of six.  Every kernel, its
 host and the tensor placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
 through different placeholder types is passed twice (the table's 4-byte compact views of work_items, work_count and
-item_scratch; the bprop prologue's 4-byte cu_seqlens).  The bprop module is a constexpr argument: GDP at d_v = 64 runs
-the gdp_bprop_v64_f16 fork, whose prologue takes no T-pass tiles."""
+item_scratch; the bprop prologue's 4-byte cu_seqlens).  The bprop module is a constexpr argument; only gdn_bprop_f16
+is vendored (upstream's GDP d_v = 64 fork is not)."""
 
 from typing import Optional
 

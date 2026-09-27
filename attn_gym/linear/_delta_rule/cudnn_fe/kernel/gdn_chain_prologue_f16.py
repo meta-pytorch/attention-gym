@@ -43,7 +43,7 @@ from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
-from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_prefill_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16, gdp_bprop_v64_f16
+from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_prefill_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
 
 USE_PDL = True
 
@@ -293,59 +293,33 @@ def frost_gdn_chain_prologue(
                 summary_q_step,
             )
         if cutlass.const_expr(bprop_words is not None):
-            if cutlass.const_expr(compact_qdo):
-                gdp_bprop_v64_f16.build_descs_body(
-                    widx - cutlass.Int32(18),
-                    base_q,
-                    base_k,
-                    base_v,
-                    base_do,
-                    base_checkpoint,
-                    base_dq,
-                    base_dk,
-                    base_dv,
-                    bprop_words,
-                    cu_pieces,
-                    q,
-                    k,
-                    v,
-                    do_,
-                    checkpoints,
-                    dq,
-                    dk,
-                    dv,
-                    n_pieces,
-                    checkpoint_every_n,
-                    expand_num,
-                )
-            else:
-                gdn_bprop_f16.build_descs_body(
-                    widx - cutlass.Int32(18),
-                    base_q,
-                    base_k,
-                    base_v,
-                    base_do,
-                    base_checkpoint,
-                    base_dq,
-                    base_dk,
-                    base_dv,
-                    base_tinv,
-                    bprop_words,
-                    cu_pieces,
-                    q,
-                    k,
-                    v,
-                    do_,
-                    checkpoints,
-                    dq,
-                    dk,
-                    dv,
-                    tinv,
-                    n_pieces,
-                    checkpoint_every_n,
-                    b_t,
-                    expand_num,
-                )
+            gdn_bprop_f16.build_descs_body(
+                widx - cutlass.Int32(18),
+                base_q,
+                base_k,
+                base_v,
+                base_do,
+                base_checkpoint,
+                base_dq,
+                base_dk,
+                base_dv,
+                base_tinv,
+                bprop_words,
+                cu_pieces,
+                q,
+                k,
+                v,
+                do_,
+                checkpoints,
+                dq,
+                dk,
+                dv,
+                tinv,
+                n_pieces,
+                checkpoint_every_n,
+                b_t,
+                expand_num,
+            )
 
 
 @cute.jit
@@ -395,6 +369,8 @@ def chain_prologue(
     tinv: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
+    if cutlass.const_expr(compact_qdo):
+        raise ValueError("compact_qdo needs the GDP d_v = 64 bprop, which is not vendored")
     swizzle_128b = tma.TensorMapSwizzle.s128b
     k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[1], k.shape[2]), stride=(k.stride[0], k.stride[1], 1)))
     base_k = tma.create_tensor_map_tiled_from_view(
