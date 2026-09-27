@@ -45,7 +45,12 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.host import get_dtype, validate_cuda_tensors
-from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
+from ..common.launch import (
+    memoize_launch_check,
+    validate_seqlens,
+    validate_tensor,
+    validate_workspace,
+)
 from ..common.piece_chain import CHAIN_WARPS, dtype_name, launch_state_chain
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_key, signature_spec
 from . import (
@@ -530,6 +535,7 @@ def _compile_chain_backward_tail(
     )
 
 
+@memoize_launch_check
 def _validate_launch(
     *,
     q,

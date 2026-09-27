@@ -45,6 +45,7 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from ..common import split_k
 from ..common.host import get_dtype, validate_cuda_tensors
 from ..common.launch import (
+    memoize_launch_check,
     validate_seqlens,
     validate_tensor,
     validate_work_table,
@@ -303,6 +304,7 @@ IO_DTYPE_SLOT = 10
 BPROP_SLOT = 11
 
 
+@memoize_launch_check
 def _validate_launch(
     *,
     q,

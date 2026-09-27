@@ -6,7 +6,8 @@ Every check runs on host metadata before cache selection, so an invalid config o
 with a ``ValueError`` instead of compiling a kernel whose barriers or TMA descriptors cannot work.
 """
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Callable, Sequence
 
 import cutlass
 import torch
@@ -19,6 +20,48 @@ from .tvm_ffi import WORK_ITEM_FIELDS
 NAMED_BARRIER_IDS = range(1, 16)  # 0 is the CTA-wide barrier
 STATE_DIMS = (64, 128)
 TMEM_COLUMNS = 512
+# Base-pointer residue kept in a memoized check's key; every checked alignment divides it.
+_ALIGNMENT_RESIDUE = 1024
+_MAX_MEMOIZED_CHECKS = 256
+
+
+def _check_key_item(value):
+    if isinstance(value, torch.Tensor):
+        return (
+            value.shape,
+            value.stride(),
+            value.dtype,
+            value.device,
+            value.data_ptr() % _ALIGNMENT_RESIDUE,
+        )
+    return value
+
+
+def memoize_launch_check(check: Callable[..., None]) -> Callable[..., None]:
+    """Skip a keyword-only launch check whose inputs repeat a call that already passed.
+
+    The check may read only tensor metadata (shape, strides, dtype, device, base alignment up to
+    ``_ALIGNMENT_RESIDUE`` bytes), tensor presence and the other hashable arguments, plus the
+    active CUDA device; all of them form the key. Failing calls are never recorded, so an
+    invalid launch raises the same error every time.
+    """
+    passed: set = set()
+
+    @functools.wraps(check)
+    def memoized(**kwargs) -> None:
+        key = (
+            torch.cuda.current_device() if torch.cuda.is_initialized() else None,
+            tuple(kwargs),
+            *map(_check_key_item, kwargs.values()),
+        )
+        if key in passed:
+            return
+        check(**kwargs)
+        if len(passed) >= _MAX_MEMOIZED_CHECKS:
+            passed.clear()
+        passed.add(key)
+
+    return memoized
 
 
 def validate_kernel_domain(kernel: str, io_dtype, dims: Sequence[int], **positive: int) -> None:
