@@ -1,0 +1,94 @@
+diff --git a/python/cudnn/linear_attention/frost/common/split_k.py b/python/cudnn/linear_attention/frost/common/split_k.py
+--- a/python/cudnn/linear_attention/frost/common/split_k.py
++++ b/python/cudnn/linear_attention/frost/common/split_k.py
+@@ -789,6 +789,7 @@
+     mChunkVals: cute.Tensor,
+     mStaging: cute.Tensor,
+     mCount: cute.Tensor,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ):
+     """One CTA per (batch, head).  With ``full_scan`` the CTA first sums the
+     tile's chunk values: a tile that does not saturate even as a whole stays
+@@ -864,8 +865,8 @@
+                 num_blocks = nb_w
+ 
+     if num_blocks <= 1:
+-        # ---- nothing to cut: emit the whole sequence ---------------------------------
+-        if tidx == 0:
++        # Empty items may own state pass-through stores; omit them only when the caller permits it.
++        if (tidx == 0) and ((not skip_empty) or (batch_num_chunks > 0)):
+             emit_item(
+                 mStaging,
+                 mCount,
+@@ -1274,6 +1275,7 @@
+     n_scan_blocks: cutlass.Int32,
+     n_walk_ctas: cutlass.Int32,
+     stream: cuda.CUstream,
++    skip_empty: cutlass.Constexpr[bool] = False,
+ ) -> None:
+     if cutlass.const_expr(split):
+         frost_split_k_plan(
+@@ -1362,6 +1364,7 @@
+             mChunkVals,
+             mStaging,
+             mCount,
++            skip_empty,
+         ).launch(
+             grid=(n_walk_ctas, 1, 1),
+             block=(THREADS_PER_BLOCK, 1, 1),
+@@ -1510,6 +1513,7 @@
+     gate_lower_bound=None,
+     scheduler_counter,
+     split=True,
++    skip_empty=False,
+     expand_num=1,
+     opt_level,
+     stream,
+@@ -1524,6 +1528,9 @@
+     (``gate_lower_bound`` required), scalar ``-exp(a_log[h]) * softplus(g +
+     dt_bias[h])``.  ``a_log`` / ``dt_bias`` may each be None under
+     ``safe_gate`` (unit amplitude / zero bias).
++
++    ``skip_empty=True`` omits zero-chunk items. Use it only if no empty-sequence
++    state outputs/cotangents need to be written, or those outputs are preinitialized.
+ 
+     With ``split=False`` nothing launches; each main kernel's prologue
+     synthesizes the no-cuts table itself (``order_gen``).
+@@ -1563,6 +1570,7 @@
+ 
+     key = (
+         bool(split),
++        bool(skip_empty),
+         b_t,
+         scan_rows,
+         num_sms,
+@@ -1626,6 +1634,7 @@
+             cutlass.Int32(n_scan_blocks),
+             cutlass.Int32(n_walk_ctas),
+             cu_stream,
++            skip_empty=bool(skip_empty),
+             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
+         )
+     compiled_cache[key](
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_warmup_forward_f16.py
+@@ -127,6 +127,7 @@
+             n_scan_blocks,
+             n_walk_ctas,
+             stream,
++            skip_empty=state_out is None,
+         )
+     gdn_prefill_f16.prologue(
+         io_dtype,
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_warmup_forward_f16.py
+@@ -136,6 +136,7 @@
+             n_scan_blocks,
+             n_walk_ctas,
+             stream,
++            skip_empty=state_out is None,
+         )
+     if cutlass.const_expr(prep):
+         kda_prep_prefill_f16.prologue(

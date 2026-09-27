@@ -64,6 +64,18 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   paged routes during work compaction", then run PO + GP + KP. Watch the >4096-sequence
   (ORDER_CAPACITY) uncompacted fallback.
 
+### B10 — Split walk emits zero-chunk items (C10, E2) · bugfix
+- **Problem:** the no-cut branch emitted a whole-sequence item unconditionally. The old vendor notice
+  tied empty items to invalid TMEM lifecycle transitions; no v1.30 hang was reproduced, the verified
+  effect is wasted work items.
+- **Found by:** carried from the old vendor catalog; confirmed on v1.30 by counting work items.
+- **Fix:** `num_chunks_b > 0` guard. `common/split_k.py`; "Omit zero-chunk split work items".
+- **Evidence:** fails without = YES: interior/trailing empties 8 items vs 4; all-empty 6 vs 0.
+- **Tests:** CM::test_split_table_omits_zero_chunk_sequences.
+- **Upstream:** draft `04-omit-zero-chunk-split-work.patch` adds an opt-in `skip_empty`, so the
+  stock repro stays "bug" even against the patched tree unless it opts in.
+- **Replay:** if upstream adopts an opt-in flag, AG must still opt in on every no-state split path.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
 
 ### B15 — Launch caches keyed on shape-unaware state

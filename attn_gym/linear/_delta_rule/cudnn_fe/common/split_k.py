@@ -1106,8 +1106,8 @@ def frost_split_k_walk(
                 num_blocks = nb_w
 
     if num_blocks <= 1:
-        # ---- nothing to cut: emit the whole sequence ---------------------------------
-        if tidx == 0:
+        # Empty sequences have no chunks and must not enter the persistent work queue.
+        if (tidx == 0) and (batch_num_chunks > 0):
             emit_item(
                 mStaging,
                 mCount,

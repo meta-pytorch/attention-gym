@@ -46,6 +46,18 @@ upstream_expect = "bug"
 upstream_status = "draft-not-filed"
 
 [[fix]]
+id = "B10"
+title = "Split-table walk omits zero-chunk sequences"
+kind = "bugfix"
+ag_subject = "Omit zero-chunk split work items"
+guarding_tests = ["test/test_cudnn_fe_common.py::test_split_table_omits_zero_chunk_sequences"]
+upstream_patch = "upstream/04-omit-zero-chunk-split-work.patch"
+upstream_repro = "upstream/repro_04_zero_chunk_walk.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
 id = "B15"
 title = "Driver launch caches keyed on static config, not shape"
 kind = "bugfix"
