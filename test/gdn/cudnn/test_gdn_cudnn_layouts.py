@@ -151,6 +151,63 @@ def test_gdn_cudnn_forward_rejects_misaligned_and_noncontiguous_inner_modes() ->
         )
 
 
+def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
+    """Public forward and backward must actually exercise their forced-wide launch ABIs."""
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
+        gdn_bprop_f16,
+        gdn_bprop_summary_f16,
+        gdn_chain_backward_f16,
+        gdn_chain_forward_f16,
+        gdn_recompute_f16,
+        gdn_warmup_backward_f16,
+        gdn_warmup_forward_f16,
+    )
+
+    q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
+        (65, 63), key_heads=2, value_heads=2, dtype=torch.float16, seed=229
+    )
+    torch.manual_seed(233)
+    d_output = torch.randn_like(value)
+    d_final_state = torch.randn_like(state)
+    expected_forward = run_forward(
+        q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
+    )
+    expected_backward = chunk_gdn_bwd_cudnn_packed(
+        q, k, value, gate, beta, d_output, cu_seqlens, state, d_final_state
+    )
+    forced_calls = []
+    for module in (
+        gdn_warmup_forward_f16,
+        gdn_chain_forward_f16,
+        gdn_recompute_f16,
+        gdn_bprop_f16,
+        gdn_warmup_backward_f16,
+        gdn_chain_backward_f16,
+        gdn_bprop_summary_f16,
+    ):
+
+        def force_wide(*tensors, name=module.__name__):
+            forced_calls.append(name)
+            return True
+
+        monkeypatch.setattr(module, "requires_int64_abi", force_wide)
+    actual_forward = run_forward(
+        q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
+    )
+    assert forced_calls, "forward did not invoke a forced int64 selector"
+    forced_calls.clear()
+    actual_backward = chunk_gdn_bwd_cudnn_packed(
+        q, k, value, gate, beta, d_output, cu_seqlens, state, d_final_state
+    )
+    assert forced_calls, "backward did not invoke a forced int64 selector"
+    for actual, expected in zip(actual_forward, expected_forward, strict=True):
+        assert actual is not None and expected is not None
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, expected in zip(actual_backward, expected_backward, strict=True):
+        assert actual is not None and expected is not None
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta() -> None:
     """Gate/beta sliced from a shared fp32 projection may start 4 bytes past a 16-byte boundary."""
     q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(

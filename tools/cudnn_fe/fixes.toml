@@ -264,7 +264,11 @@ id = "S14"
 title = "int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests"
 kind = "validation"
 ag_subject = "Route oversized GDN forward tensors to the wide-extent compile variant"
+ag_subjects_extra = [
+  "Restore non-vacuous forced-int64 GDN forward and backward coverage",
+]
 guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32",
   "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32",
   "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path",
 ]
