@@ -80,9 +80,6 @@ class ForwardPlan:
         return cls(num_seqs, heads_out, pieces, unit, DV_SPLIT_TILES if dv else 1, num_sm)
 
 
-_LAUNCH_CACHE: dict = {}
-
-
 def gdn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -138,20 +135,6 @@ def gdn_forward(
         "use_beta_sigmoid": False,
         "allow_neg_eigval": False,
     }
-    key = (
-        split,
-        plan.chain,
-        plan.pieces,
-        plan.tiles_per_head,
-        heads_out,
-        q.dtype,
-        initial_state is not None,
-        output_final_state,
-        device.index,
-        q.shape[1],
-        k.shape[1],
-        v.shape[1],
-    )
     if plan.chain:
         buffers = _chain_buffers(q, heads_out, dim_v, dim_k, plan, device)
         buffers.update(
@@ -162,25 +145,25 @@ def gdn_forward(
             final_indices=None,
             checkpoints=None,
         )
-        launch = _LAUNCH_CACHE.get(key)
-        if launch is None:
-            launch = _LAUNCH_CACHE[key] = build_chain_forward(
-                **buffers,
-                pieces=plan.pieces,
-                heads_out=heads_out,
-                num_seqs=num_seqs,
-                unit_chunks=plan.unit_chunks,
-                b_t=B_T,
-                expand_num=1,
-                length_rule=False,
-                **flags,
-                checkpoint_every_n_tokens=0,
-                scale=scale,
-                chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-                device=device.index,
-                num_sm=plan.num_sm,
-                stream=stream,
-            )
+        # The builders cache compiled launches by their static configuration; everything
+        # shape-dependent is recomputed per call.
+        launch = build_chain_forward(
+            **buffers,
+            pieces=plan.pieces,
+            heads_out=heads_out,
+            num_seqs=num_seqs,
+            unit_chunks=plan.unit_chunks,
+            b_t=B_T,
+            expand_num=1,
+            length_rule=False,
+            **flags,
+            checkpoint_every_n_tokens=0,
+            scale=scale,
+            chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
+            device=device.index,
+            num_sm=plan.num_sm,
+            stream=stream,
+        )
         run_chain_forward(
             launch,
             **buffers,
@@ -212,23 +195,21 @@ def gdn_forward(
         scheduler=_int32(2, device),
         workspace=torch.empty(words, dtype=torch.int64, device=device),
     )
-    launch = _LAUNCH_CACHE.get(key)
-    if launch is None:
-        launch = _LAUNCH_CACHE[key] = build_warmup_forward(
-            **buffers,
-            split=split,
-            tiles_per_head=plan.tiles_per_head,
-            n_tiles=n_tiles,
-            ideal_chunks=ideal,
-            num_sm=plan.num_sm,
-            b_t=B_T,
-            **flags,
-            expand_num=1,
-            checkpoint_every_n_tokens=0,
-            scale=scale,
-            device=device.index,
-            stream=stream,
-        )
+    launch = build_warmup_forward(
+        **buffers,
+        split=split,
+        tiles_per_head=plan.tiles_per_head,
+        n_tiles=n_tiles,
+        ideal_chunks=ideal,
+        num_sm=plan.num_sm,
+        b_t=B_T,
+        **flags,
+        expand_num=1,
+        checkpoint_every_n_tokens=0,
+        scale=scale,
+        device=device.index,
+        stream=stream,
+    )
     run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale, stream=stream)
     return o, final_state
 
@@ -333,9 +314,6 @@ class BackwardPlan:
         return cls(num_seqs, heads_out, pieces, unit, num_sm)
 
 
-_BWD_CACHE: dict = {}
-
-
 def gdn_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -413,18 +391,6 @@ def gdn_backward(
         "use_beta_sigmoid": False,
         "allow_neg_eigval": False,
     }
-    key = (
-        split,
-        plan.chain,
-        plan.pieces,
-        heads_out,
-        key_heads,
-        v.shape[1],
-        q.dtype,
-        initial_state is not None,
-        d_final_state is not None,
-        device.index,
-    )
 
     if plan.chain:
         table = piece_table_layout(num_seqs, plan.pieces, heads_out)
@@ -495,22 +461,20 @@ def gdn_backward(
             "seed_every_n_tokens": 0,
             "scale": scale,
         }
-        launch = _BWD_CACHE.get(key)
-        if launch is None:
-            launch = _BWD_CACHE[key] = build_chain_backward(
-                bprop_module=gdn_bprop_f16,
-                **buffers,
-                **schedule,
-                unit_chunks=plan.unit_chunks,
-                expand_num=1,
-                length_rule=False,
-                summary_q_step=1,
-                **flags,
-                chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-                device=device.index,
-                num_sm=plan.num_sm,
-                stream=stream,
-            )
+        launch = build_chain_backward(
+            bprop_module=gdn_bprop_f16,
+            **buffers,
+            **schedule,
+            unit_chunks=plan.unit_chunks,
+            expand_num=1,
+            length_rule=False,
+            summary_q_step=1,
+            **flags,
+            chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
+            device=device.index,
+            num_sm=plan.num_sm,
+            stream=stream,
+        )
         run_chain_backward(launch, **buffers, **schedule, stream=stream)
     else:
         schedulers = empty(4)
@@ -559,23 +523,20 @@ def gdn_backward(
             "seed_span_tokens": 0,
             "seed_every_n_tokens": 0,
         }
-        entry = _BWD_CACHE.get(key)
-        if entry is None:
-            warmup = build_warmup_backward(
-                bprop_module=gdn_bprop_f16,
-                **buffers,
-                **stages,
-                split=split,
-                n_tiles=num_seqs * heads_out,
-                ideal_chunks=ideal,
-                num_sm=plan.num_sm,
-                expand_num=1,
-                **flags,
-                device=device.index,
-                stream=stream,
-            )
-            entry = _BWD_CACHE[key] = [warmup, None]
-        run_warmup_backward(*entry[0], **buffers, **stages, stream=stream)
+        warmup = build_warmup_backward(
+            bprop_module=gdn_bprop_f16,
+            **buffers,
+            **stages,
+            split=split,
+            n_tiles=num_seqs * heads_out,
+            ideal_chunks=ideal,
+            num_sm=plan.num_sm,
+            expand_num=1,
+            **flags,
+            device=device.index,
+            stream=stream,
+        )
+        run_warmup_backward(*warmup, **buffers, **stages, stream=stream)
         bprop_args = (
             q,
             k,
@@ -591,65 +552,31 @@ def gdn_backward(
             dbeta,
             cu_seqlens,
         )
-        if entry[1] is None:
-            entry[1] = gdn_bprop_f16.chunk_gdn_bwd(
-                *bprop_args,
-                scale,
-                use_initial_state=initial_state is not None,
-                d_initial_state=d_initial_state,
-                d_final_state=d_final_state,
-                safe_gate=False,
-                a_log=None,
-                dt_bias=None,
-                use_beta_sigmoid=False,
-                allow_neg_eigval=False,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=schedulers[2:4],
-                log_gate=True,
-                inv_q=None,
-                inv_k=None,
-                expand_num=1,
-                workspace=bprop_words,
-                device=device.index,
-                num_sm=plan.num_sm,
-                stream=stream,
-                own_prologue=False,
-                tinv=tinv["tinv"],
-            )
-        else:
-            gdn_bprop_f16.run_bwd(
-                entry[1],
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                d_output,
-                checkpoints,
-                dq_ho,
-                dk_ho,
-                dv,
-                dgate,
-                dbeta,
-                cu_seqlens,
-                d_initial_state,
-                d_final_state,
-                work_items,
-                work_count,
-                schedulers[2:4],
-                None,
-                None,
-                bprop_words,
-                scale,
-                stream,
-                a_log=None,
-                dt_bias=None,
-                inv_q=None,
-                inv_k=None,
-                own_prologue=False,
-                tinv=tinv["tinv"],
-            )
+        gdn_bprop_f16.chunk_gdn_bwd(
+            *bprop_args,
+            scale,
+            use_initial_state=initial_state is not None,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
+            safe_gate=False,
+            a_log=None,
+            dt_bias=None,
+            use_beta_sigmoid=False,
+            allow_neg_eigval=False,
+            work_items=work_items,
+            work_count=work_count,
+            scheduler_counter=schedulers[2:4],
+            log_gate=True,
+            inv_q=None,
+            inv_k=None,
+            expand_num=1,
+            workspace=bprop_words,
+            device=device.index,
+            num_sm=plan.num_sm,
+            stream=stream,
+            own_prologue=False,
+            tinv=tinv["tinv"],
+        )
 
     groups = heads_out // key_heads
     dq = group_sum(dq_ho, groups, out_dtype=q.dtype) if groups > 1 else dq_ho

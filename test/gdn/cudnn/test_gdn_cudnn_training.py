@@ -788,3 +788,24 @@ def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> No
         real_items,
     ]
     assert [int(count.item()) for count in work_counts] == expected
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default(split: bool) -> None:
+    """Launch plans depend on the batch shape: a later call with a new shape must not replay the
+    previous plan (a stale split table once left the second sequence unwritten)."""
+    options = {"backend": "cudnn", "split_forward": split, "split_backward": split}
+    for lengths in ((65,), (65, 65), (130, 1, 64)):
+        q, k, value, gate, beta, _, cu_seqlens = make_gdn_test_inputs(
+            lengths, key_heads=1, value_heads=2, seed=714
+        )
+        inputs = tuple(t.requires_grad_() for t in (q, k, value, gate, beta))
+        d_output = torch.randn_like(value)
+        results = []
+        for kernel_options in (None, options):
+            output, _ = public_chunk_gdn(
+                *inputs, cu_seqlens=cu_seqlens, kernel_options=kernel_options
+            )
+            results.append((output, *torch.autograd.grad(output, inputs, d_output)))
+        for actual, expected in zip(results[1], results[0], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
