@@ -36,7 +36,8 @@ def _compact_beta(beta: torch.Tensor) -> torch.Tensor:
     The cuDNN forward only asks for an element-aligned contiguous inner mode, but the fused
     stateful backward's TVM-FFI ABI rejects token-strided or misaligned beta.
     """
-    if beta.is_contiguous() and beta.data_ptr() % 128 == 0:
+    # Dynamo cannot trace the alignment check, so compiled backward always copies.
+    if not torch.compiler.is_compiling() and beta.is_contiguous() and beta.data_ptr() % 128 == 0:
         return beta
     return beta.clone(memory_format=torch.contiguous_format)
 

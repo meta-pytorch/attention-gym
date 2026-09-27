@@ -151,6 +151,7 @@ id = "R15"
 title = "Composed KDA stateful bwd gets a compact 128-byte-aligned beta; traceable under Dynamo"
 kind = "bugfix"
 ag_subject = "Compact beta before the composed KDA cuDNN stateful backward"
+ag_subjects_extra = ["Make the KDA beta compaction traceable under torch.compile"]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_stateful_backward_accepts_forward_beta_layouts",
   "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_training_fullgraph_and_six_gradients",
