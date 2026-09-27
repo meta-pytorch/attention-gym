@@ -9,10 +9,11 @@ few tiles. Workspace regions are ordinary Torch allocations.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
+
+from attn_gym.linear._delta_rule.triton.group_sum import group_sum
 
 from .common.host import tensormap_workspace_bytes
 from .common.piece_chain import (
@@ -21,9 +22,23 @@ from .common.piece_chain import (
     choose_pieces,
     piece_table_layout,
 )
-from .common.split_k import WORK_ITEM_FIELDS
-from .kernel import gdn_prefill_f16, gdn_summary_f16, gdn_tinv_f16
+from .common.split_k import (
+    WORK_ITEM_FIELDS,
+    chunk_scratch_rows,
+    compute_ideal_chunks,
+    max_work_items,
+)
+from .kernel import (
+    gdn_bprop_f16,
+    gdn_bprop_summary_f16,
+    gdn_prefill_f16,
+    gdn_recompute_f16,
+    gdn_summary_f16,
+    gdn_tinv_f16,
+)
+from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
 from .kernel.gdn_chain_forward_f16 import build_chain_forward, run_chain_forward
+from .kernel.gdn_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
 from .kernel.gdn_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
 
 B_T = gdn_prefill_f16.CFG.B_T
@@ -34,10 +49,24 @@ B_T = gdn_prefill_f16.CFG.B_T
 # wins at ~2.7k tokens per piece (1x8192: 705 vs 928 us) but loses at 1k (1x2048: 279 vs 258).
 MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
 MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
+# Natural-log gate with no in-kernel gate or beta activation.
+_GATE_FLAGS = {
+    "log_gate": True,
+    "safe_gate": False,
+    "use_beta_sigmoid": False,
+    "allow_neg_eigval": False,
+}
 
 
 def _int32(n: int, device) -> torch.Tensor:
     return torch.empty(n, dtype=torch.int32, device=device)
+
+
+def _workspace(module, count: int, device) -> torch.Tensor:
+    """TMA-descriptor workspace for ``count`` batch entries of a kernel module."""
+    return torch.empty(
+        tensormap_workspace_bytes(module, count) // 8, dtype=torch.int64, device=device
+    )
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -54,8 +83,6 @@ def _work_count(device) -> torch.Tensor:
 class ForwardPlan:
     """Scheme and scratch sizes for one (shape, device) forward; a pure function of the shapes."""
 
-    num_seqs: int
-    heads_out: int
     pieces: int
     unit_chunks: int
     tiles_per_head: int
@@ -82,7 +109,7 @@ class ForwardPlan:
         # Upstream splits d_v only at a slot budget of exactly two; any unchained plan whose two
         # CTAs per tile fit in one wave gains (1x2048: 67 -> 58 us, 1x8192: 220 -> 193 us).
         dv = not pieces and dim_v == 128 and num_sm // (num_seqs * heads_out) >= DV_SPLIT_TILES
-        return cls(num_seqs, heads_out, pieces, unit, DV_SPLIT_TILES if dv else 1, num_sm)
+        return cls(pieces, unit, DV_SPLIT_TILES if dv else 1, num_sm)
 
 
 def gdn_forward(
@@ -93,10 +120,9 @@ def gdn_forward(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
     *,
-    scale: float | None = None,
+    scale: float,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
-    plan: ForwardPlan | None = None,
     split: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``."""
@@ -110,11 +136,10 @@ def gdn_forward(
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    scale = 1.0 / math.sqrt(dim_k) if scale is None else float(scale)
-    plan = plan or ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         # The approximate forgetting-horizon split replaces the exact schemes.
-        plan = ForwardPlan(num_seqs, heads_out, 0, plan.unit_chunks, 1, plan.num_sm)
+        plan = replace(plan, pieces=0, tiles_per_head=1)
     o = torch.empty(tokens, heads_out, dim_v, dtype=q.dtype, device=device)
     final_state = None
     if output_final_state:
@@ -135,22 +160,30 @@ def gdn_forward(
         "dt_bias": None,
         "o": o,
         "cu_seqlens": cu_seqlens,
-    }
-    flags = {
-        "log_gate": True,
-        "safe_gate": False,
-        "use_beta_sigmoid": False,
-        "allow_neg_eigval": False,
+        "seed_indices": None,
+        "final_indices": None,
+        "checkpoints": None,
     }
     if plan.chain:
-        buffers = _chain_buffers(q, heads_out, dim_v, dim_k, plan, device)
-        buffers.update(
+        num_pieces = num_seqs * plan.pieces
+        schedulers = _int32(6, device)
+        state = (num_pieces, heads_out, dim_v, dim_k)
+        buffers = dict(
             common,
+            **_piece_buffers(num_seqs, plan.pieces, heads_out, device),
+            **_tinv_buffers(tokens, num_pieces, heads_out, q.dtype, device),
+            scheduler_all=schedulers,
+            scheduler_summary=schedulers[2:4],
+            scheduler_prefill=schedulers[0:2],
+            summary_words=_workspace(gdn_summary_f16, num_pieces, device),
+            prefill_words=_workspace(gdn_prefill_f16, num_pieces, device),
+            state_h=torch.empty(state, dtype=torch.float32, device=device),
+            state_m=torch.empty(
+                num_pieces, heads_out, dim_k, dim_k, dtype=torch.float32, device=device
+            ),
+            state_x=torch.empty(state, dtype=torch.float32, device=device),
             seed=initial_state,
-            seed_indices=None,
             final_state=final_state,
-            final_indices=None,
-            checkpoints=None,
         )
         # The builders cache compiled launches by their static configuration; everything
         # shape-dependent is recomputed per call.
@@ -163,7 +196,7 @@ def gdn_forward(
             b_t=B_T,
             expand_num=1,
             length_rule=False,
-            **flags,
+            **_GATE_FLAGS,
             checkpoint_every_n_tokens=0,
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
@@ -184,7 +217,6 @@ def gdn_forward(
         return o, final_state
 
     n_tiles = num_seqs * heads_out * plan.tiles_per_head
-    words = tensormap_workspace_bytes(gdn_prefill_f16, num_seqs) // 8
     ideal, rows, item_scratch, chunk_scratch = _split_scratch(
         split, tokens, num_seqs, heads_out, plan.num_sm, n_tiles, device
     )
@@ -192,15 +224,12 @@ def gdn_forward(
         common,
         state_in=initial_state,
         state_out=final_state,
-        seed_indices=None,
-        final_indices=None,
-        checkpoints=None,
         work_items=torch.empty(rows, WORK_ITEM_FIELDS, dtype=torch.int32, device=device),
         work_count=_work_count(device),
         item_scratch=item_scratch,
         chunk_scratch=chunk_scratch,
         scheduler=_int32(2, device),
-        workspace=torch.empty(words, dtype=torch.int64, device=device),
+        workspace=_workspace(gdn_prefill_f16, num_seqs, device),
     )
     launch = build_warmup_forward(
         **buffers,
@@ -210,7 +239,7 @@ def gdn_forward(
         ideal_chunks=ideal,
         num_sm=plan.num_sm,
         b_t=B_T,
-        **flags,
+        **_GATE_FLAGS,
         expand_num=1,
         checkpoint_every_n_tokens=0,
         scale=scale,
@@ -225,8 +254,6 @@ def _split_scratch(
     split: bool, tokens: int, num_seqs: int, heads_out: int, num_sm: int, n_tiles: int, device
 ):
     """``(ideal_chunks, work_item_rows, item_scratch, chunk_scratch)`` of the warmup split table."""
-    from .common.split_k import chunk_scratch_rows, compute_ideal_chunks, max_work_items
-
     if not split:
         return None, n_tiles, None, None
     ideal = compute_ideal_chunks(tokens, heads_out, num_sm, B_T)
@@ -238,8 +265,8 @@ def _split_scratch(
     return ideal, rows, item_scratch, chunk_scratch
 
 
-def _chain_buffers(q, heads_out, dim_v, dim_k, plan: ForwardPlan, device) -> dict:
-    num_seqs, pieces = plan.num_seqs, plan.pieces
+def _piece_buffers(num_seqs: int, pieces: int, heads_out: int, device) -> dict:
+    """Piece-table views and work-item tables of an exact piece chain."""
     num_pieces = num_seqs * pieces
     table = piece_table_layout(num_seqs, pieces, heads_out)
     piece_table = torch.zeros(table.nbytes // 4, dtype=torch.int32, device=device)
@@ -247,10 +274,6 @@ def _chain_buffers(q, heads_out, dim_v, dim_k, plan: ForwardPlan, device) -> dic
     def words(offset: int, count: int) -> torch.Tensor:
         return piece_table[offset // 4 : offset // 4 + count]
 
-    schedulers = _int32(6, device)
-    rows = gdn_tinv_f16.tinv_rows(q.shape[0], num_pieces, 1, B_T)
-    tinv_words = tensormap_workspace_bytes(gdn_tinv_f16, num_pieces) // 8
-    state = (num_pieces, heads_out, dim_v, dim_k)
     return {
         "cu_pieces": words(table.cu_pieces, num_pieces + 1),
         "main_rows": words(table.main_rows, num_seqs + 1),
@@ -263,28 +286,17 @@ def _chain_buffers(q, heads_out, dim_v, dim_k, plan: ForwardPlan, device) -> dic
         "work_items_summary": torch.empty(
             table.item_rows, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
         ),
-        "scheduler_all": schedulers,
-        "scheduler_summary": schedulers[2:4],
-        "scheduler_prefill": schedulers[0:2],
-        "tinv_words": torch.empty(tinv_words, dtype=torch.int64, device=device),
+    }
+
+
+def _tinv_buffers(tokens: int, num_pieces: int, heads_out: int, dtype, device) -> dict:
+    """Chunk-inverse (T^-1) scratch shared by the chain and the backward stages."""
+    rows = gdn_tinv_f16.tinv_rows(tokens, num_pieces, 1, B_T)
+    return {
+        "tinv": torch.empty(rows, heads_out, B_T, B_T, dtype=dtype, device=device),
+        "tinv_words": _workspace(gdn_tinv_f16, num_pieces, device),
         "tinv_rows": torch.empty(rows, 4, dtype=torch.int32, device=device),
         "tinv_row_count": _int32(1, device),
-        "summary_words": torch.empty(
-            tensormap_workspace_bytes(gdn_summary_f16, num_pieces) // 8,
-            dtype=torch.int64,
-            device=device,
-        ),
-        "prefill_words": torch.empty(
-            tensormap_workspace_bytes(gdn_prefill_f16, num_pieces) // 8,
-            dtype=torch.int64,
-            device=device,
-        ),
-        "tinv": torch.empty(rows, heads_out, B_T, B_T, dtype=q.dtype, device=device),
-        "state_h": torch.empty(state, dtype=torch.float32, device=device),
-        "state_m": torch.empty(
-            num_pieces, heads_out, dim_k, dim_k, dtype=torch.float32, device=device
-        ),
-        "state_x": torch.empty(state, dtype=torch.float32, device=device),
     }
 
 
@@ -292,8 +304,6 @@ def _chain_buffers(q, heads_out, dim_v, dim_k, plan: ForwardPlan, device) -> dic
 class BackwardPlan:
     """Uncut or exact-chain backward scheme for one shape; mirrors ``ForwardPlan``."""
 
-    num_seqs: int
-    heads_out: int
     pieces: int
     unit_chunks: int
     num_sm: int
@@ -318,7 +328,7 @@ class BackwardPlan:
         )
         if pieces and tokens < MIN_CHAIN_TOKENS_PER_PIECE_BWD * pieces * num_seqs:
             pieces = 0
-        return cls(num_seqs, heads_out, pieces, unit, num_sm)
+        return cls(pieces, unit, num_sm)
 
 
 def gdn_backward(
@@ -330,10 +340,9 @@ def gdn_backward(
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor,
     *,
-    scale: float | None = None,
+    scale: float,
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
-    plan: BackwardPlan | None = None,
     split: bool = False,
 ):
     """Packed scalar-GDN backward: recompute the checkpoint series, then bprop.
@@ -341,35 +350,24 @@ def gdn_backward(
     Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)`` with dq/dk at the q/k head count
     (grouped heads are reduced in a fixed order) and fp32 dgate/dbeta.
     """
-    from attn_gym.linear._delta_rule.triton.group_sum import group_sum
-
     q, k, v, gate, beta, d_output, cu_seqlens = (
         _aligned(t.detach()) for t in (q, k, v, gate, beta, d_output, cu_seqlens)
     )
     initial_state = None if initial_state is None else initial_state.detach()
     d_final_state = None if d_final_state is None else d_final_state.detach()
-
-    from .kernel import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_recompute_f16
-    from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
-    from .kernel.gdn_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
-
     tokens, key_heads, dim_k = q.shape
     dim_v = v.shape[-1]
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    scale = 1.0 / math.sqrt(dim_k) if scale is None else float(scale)
-    plan = plan or BackwardPlan.build(tokens, num_seqs, heads_out, device)
+    plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
     if split:
-        plan = BackwardPlan(num_seqs, heads_out, 0, plan.unit_chunks, plan.num_sm)
+        plan = replace(plan, pieces=0)
     stream = torch.cuda.current_stream(device).cuda_stream
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
 
     def empty(*shape, dtype=torch.int32):
         return torch.empty(shape, dtype=dtype, device=device)
-
-    def words(module) -> torch.Tensor:
-        return empty(tensormap_workspace_bytes(module, num_pieces) // 8, dtype=torch.int64)
 
     dq_ho = empty(tokens, heads_out, dim_k, dtype=q.dtype)
     dk_ho = empty(tokens, heads_out, dim_k, dtype=q.dtype)
@@ -385,42 +383,32 @@ def gdn_backward(
             else d_final_state.clone(memory_format=torch.contiguous_format)
         )
     checkpoints = empty(max(tokens // B_T + num_pieces, 1), heads_out, dim_v, dim_k, dtype=q.dtype)
-    rows = gdn_tinv_f16.tinv_rows(tokens, num_pieces, 1, B_T)
-    tinv = {
-        "tinv": empty(rows, heads_out, B_T, B_T, dtype=q.dtype),
-        "tinv_words": words(gdn_tinv_f16),
-        "tinv_rows": empty(rows, 4),
-        "tinv_row_count": empty(1),
-    }
-    flags = {
-        "log_gate": True,
-        "safe_gate": False,
-        "use_beta_sigmoid": False,
-        "allow_neg_eigval": False,
-    }
+    bprop_words = _workspace(gdn_bprop_f16, num_pieces, device)
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        do=d_output,
+        gate=gate,
+        beta=beta,
+        a_log=None,
+        dt_bias=None,
+        cu_seqlens=cu_seqlens,
+        checkpoints=checkpoints,
+        seed_checkpoints=None,
+        dq=dq_ho,
+        dk=dk_ho,
+        dv=dv,
+        bprop_words=bprop_words,
+        **_tinv_buffers(tokens, num_pieces, heads_out, q.dtype, device),
+    )
 
     if plan.chain:
-        table = piece_table_layout(num_seqs, plan.pieces, heads_out)
-        piece_table = torch.zeros(table.nbytes // 4, dtype=torch.int32, device=device)
         schedulers = empty(10)
         state = (num_pieces, heads_out, dim_v, dim_k)
         buffers = dict(
-            q=q,
-            k=k,
-            v=v,
-            do=d_output,
-            gate=gate,
-            beta=beta,
-            a_log=None,
-            dt_bias=None,
-            cu_seqlens=cu_seqlens,
-            cu_pieces=piece_table[table.cu_pieces // 4 :][: num_pieces + 1],
-            main_rows=piece_table[table.main_rows // 4 :][: num_seqs + 1],
-            summary_rows=piece_table[table.summary_rows // 4 :][: num_seqs + 1],
-            main_count=piece_table[table.main_count // 4 :][:1],
-            summary_count=piece_table[table.summary_count // 4 :][:1],
-            work_items=empty(num_pieces * heads_out, WORK_ITEM_FIELDS),
-            work_items_summary=empty(table.item_rows, WORK_ITEM_FIELDS),
+            common,
+            **_piece_buffers(num_seqs, plan.pieces, heads_out, device),
             series_items=None,
             series_count=None,
             scheduler_all=schedulers,
@@ -429,16 +417,10 @@ def gdn_backward(
             scheduler_summary=schedulers[4:6],
             scheduler_m=schedulers[6:8],
             scheduler_series=schedulers[8:10],
-            summary_words=words(gdn_summary_f16),
-            recompute_m_words=words(gdn_recompute_f16),
-            series_words=words(gdn_recompute_f16),
-            bprop_summary_words=words(gdn_bprop_summary_f16),
-            bprop_words=words(gdn_bprop_f16),
-            checkpoints=checkpoints,
-            seed_checkpoints=None,
-            dq=dq_ho,
-            dk=dk_ho,
-            dv=dv,
+            summary_words=_workspace(gdn_summary_f16, num_pieces, device),
+            recompute_m_words=_workspace(gdn_recompute_f16, num_pieces, device),
+            series_words=_workspace(gdn_recompute_f16, num_pieces, device),
+            bprop_summary_words=_workspace(gdn_bprop_summary_f16, num_pieces, device),
             dgate=dgate,
             dbeta=dbeta,
             summary_q=q,
@@ -453,7 +435,6 @@ def gdn_backward(
             dstate0=d_initial_state,
             inv_q=None,
             inv_k=None,
-            **tinv,
         )
         schedule = {
             "pieces": plan.pieces,
@@ -476,7 +457,7 @@ def gdn_backward(
             expand_num=1,
             length_rule=False,
             summary_q_step=1,
-            **flags,
+            **_GATE_FLAGS,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             device=device.index,
             num_sm=plan.num_sm,
@@ -490,22 +471,8 @@ def gdn_backward(
         )
         work_items = empty(rows, WORK_ITEM_FIELDS)
         work_count = _work_count(device)
-        bprop_words = words(gdn_bprop_f16)
         buffers = dict(
-            q=q,
-            k=k,
-            v=v,
-            do=d_output,
-            dq=dq_ho,
-            dk=dk_ho,
-            dv=dv,
-            gate=gate,
-            beta=beta,
-            a_log=None,
-            dt_bias=None,
-            cu_seqlens=cu_seqlens,
-            checkpoints=checkpoints,
-            seed_checkpoints=None,
+            common,
             state_in=initial_state,
             work_items=work_items,
             work_count=work_count,
@@ -515,9 +482,7 @@ def gdn_backward(
             chunk_scratch=chunk_scratch,
             scheduler_all=schedulers,
             scheduler_recompute=schedulers[0:2],
-            recompute_words=words(gdn_recompute_f16),
-            bprop_words=bprop_words,
-            **tinv,
+            recompute_words=_workspace(gdn_recompute_f16, num_pieces, device),
         )
         stages = {
             "b_t": B_T,
@@ -539,12 +504,12 @@ def gdn_backward(
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
             expand_num=1,
-            **flags,
+            **_GATE_FLAGS,
             device=device.index,
             stream=stream,
         )
         run_warmup_backward(*warmup, **buffers, **stages, stream=stream)
-        bprop_args = (
+        gdn_bprop_f16.chunk_gdn_bwd(
             q,
             k,
             v,
@@ -558,31 +523,20 @@ def gdn_backward(
             dgate,
             dbeta,
             cu_seqlens,
-        )
-        gdn_bprop_f16.chunk_gdn_bwd(
-            *bprop_args,
             scale,
             use_initial_state=initial_state is not None,
             d_initial_state=d_initial_state,
             d_final_state=d_final_state,
-            safe_gate=False,
-            a_log=None,
-            dt_bias=None,
-            use_beta_sigmoid=False,
-            allow_neg_eigval=False,
+            **_GATE_FLAGS,
             work_items=work_items,
             work_count=work_count,
             scheduler_counter=schedulers[2:4],
-            log_gate=True,
-            inv_q=None,
-            inv_k=None,
-            expand_num=1,
             workspace=bprop_words,
             device=device.index,
             num_sm=plan.num_sm,
             stream=stream,
             own_prologue=False,
-            tinv=tinv["tinv"],
+            tinv=common["tinv"],
         )
 
     groups = heads_out // key_heads

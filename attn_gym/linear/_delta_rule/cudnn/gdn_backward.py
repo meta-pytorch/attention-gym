@@ -48,7 +48,7 @@ def chunk_gdn_bwd_cudnn_packed(
         key_heads, heads = q.shape[2], value.shape[2]
         if k.shape != q.shape or heads % key_heads:
             raise ValueError("k must match q and value heads must be divisible by query heads")
-        gradients = gdn_backward(
+        *gradients, d_initial_state = gdn_backward(
             q[0],
             k[0],
             value[0],
@@ -61,7 +61,7 @@ def chunk_gdn_bwd_cudnn_packed(
             d_final_state=d_final_state,
             split=split,
         )
-        return (*(gradient.unsqueeze(0) for gradient in gradients[:5]), gradients[5])
+        return (*(gradient.unsqueeze(0) for gradient in gradients), d_initial_state)
 
 
 __all__ = ["chunk_gdn_bwd_cudnn_packed"]
