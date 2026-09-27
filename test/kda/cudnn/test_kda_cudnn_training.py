@@ -715,6 +715,12 @@ def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cudnn_split_forward_matches_reference_on_a_contracting_gate(monkeypatch, dtype) -> None:
     """Cuts land only where the gate has saturated, so the result stays within the budget."""
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+
+    # Pin the uncut plan: the automatic d_v split also emits two work items per tile, which would
+    # satisfy the count below even if the split option were ignored.
+    sms = torch.cuda.get_device_properties().multi_processor_count
+    monkeypatch.setattr(driver.ForwardPlan, "build", lambda *_: driver.ForwardPlan(0, 1, 1, sms))
     inputs, _, split, work_items = _split_forward_pair(
         monkeypatch, dtype, gate_scale=math.log(2.0)
     )

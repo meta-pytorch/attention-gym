@@ -70,8 +70,10 @@ id = "B8"
 title = "Compact empty cu_seqlens intervals out of the unsplit work table"
 kind = "bugfix"
 ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+ag_subjects_extra = ["Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work",
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_cudnn_compaction_keeps_empty_state_cotangents",
 ]
 upstream_patch = "upstream/03-compact-empty-unsplit-work.patch"
 upstream_repro = "upstream/repro_03_empty_unsplit.py"
@@ -114,6 +116,15 @@ upstream_repro = "upstream/repro_09_replay_abi_scope.py"
 upstream_runs = [[]]
 upstream_expect = "scope"
 upstream_status = "excluded-no-upstream-abi"
+
+[[fix]]
+id = "E12"
+title = "get_dtype matches exact dtype names, not substrings"
+kind = "bugfix"
+ag_subject = "Prune and restyle the vendored v1.30 tile_dsl and common helpers"
+ag_subjects_extra = ["Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"]
+guarding_tests = ["test/test_cudnn_fe_common.py::test_cudnn_dtype_names_are_exact"]
+upstream_status = "candidate-no-patch"
 
 [[fix]]
 id = "B15"
@@ -357,6 +368,22 @@ kind = "test"
 ag_subject = "Cover KDA zero-chunk backward work items and tiny write gates"
 guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items"]
 upstream_status = "superseded-by-v1.30"
+
+[[fix]]
+id = "B9"
+title = "Test: contracting-gate split test pins the uncut plan so an ignored split fails"
+kind = "test"
+ag_subject = "Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "B17"
+title = "Test: GDN backward rejects HQ > HV before dispatch"
+kind = "test"
+ag_subject = "Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads"]
+upstream_status = "ag-specific"
 
 [[fix]]
 id = "R8"

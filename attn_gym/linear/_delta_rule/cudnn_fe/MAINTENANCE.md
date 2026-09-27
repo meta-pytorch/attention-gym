@@ -143,22 +143,23 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 26 modification rows below are generated from
+The 29 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 26 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 29 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
 | B6 | KDA delta residual kept in FP32 through subtraction and beta scaling (fwd + bwd) | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32`; `test/kda/cudnn/test_delta_rule_numerics.py::test_kda_cudnn_delta_residual_keeps_fp32_precision` |
-| B8 | Compact empty cu_seqlens intervals out of the unsplit work table | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work` |
+| B8 | Compact empty cu_seqlens intervals out of the unsplit work table | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work`; `test/kda/cudnn/test_kda_cudnn_v130.py::test_cudnn_compaction_keeps_empty_state_cotangents` |
 | B10 | Split-table walk omits zero-chunk sequences | `test/test_cudnn_fe_common.py::test_split_table_omits_zero_chunk_sequences` |
 | B13 | Scalar-gate split scan uses the head stride instead of assuming 1 | `test/test_cudnn_fe_common.py::test_scalar_split_scan_respects_head_stride` |
 | B14 | Split-table replay passes sched_ctr only when compiled with it | `test/test_cudnn_fe_common.py::test_split_table_replay_preserves_absent_scheduler_abi` |
+| E12 | get_dtype matches exact dtype names, not substrings | `test/test_cudnn_fe_common.py::test_cudnn_dtype_names_are_exact` |
 | B15 | Driver launch caches keyed on static config, not shape | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default`; `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration` |
 | B16 | Copy 4-byte-aligned gate/beta to 16-byte bases | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta` |
 | R3 | Warmup forward state_in/state_out get independent fake extents | none (no dedicated test; covered indirectly by GDN warmup split tests) |
@@ -178,6 +179,8 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | R10 | Delete the legacy 085d50b kernel copy, schedule.py, kda_plain_gate_bwd | `test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies` |
 | R11 | Drop the GDP d_v=64 bprop fork from the GDN chain prologue | vendor.py applies the GDP fork cut automatically; import test |
 | B3 | Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream) | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items` |
+| B9 | Test: contracting-gate split test pins the uncut plan so an ignored split fails | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate` |
+| B17 | Test: GDN backward rejects HQ > HV before dispatch | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads` |
 | R8 | Sharded KDA dbeta bounded by the operand-pack budget | `test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op` |
 <!-- END GENERATED FIX LEDGER -->
 

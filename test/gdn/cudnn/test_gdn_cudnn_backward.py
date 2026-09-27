@@ -378,3 +378,21 @@ def test_gdn_cudnn_packed_differential_fuzz(
         source_dtype=dtype,
     )
     assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
+
+
+def test_gdn_backward_rejects_more_query_than_value_heads(monkeypatch):
+    """Grouped value heads (HQ > HV) are rejected before dispatch; the kernel stores dV per value
+    head and would otherwise let several query heads overwrite one dV head."""
+    from attn_gym.linear._delta_rule.cudnn import gdn_backward as adapter
+
+    q = torch.zeros(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda")
+    value = q[:, :, :1].contiguous()
+    gate = torch.zeros(1, 16, 1, device="cuda")
+    cu = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+
+    def invalid_dispatch(*args, **kwargs):
+        pytest.fail("unsupported grouped-value heads reached the driver")
+
+    monkeypatch.setattr(adapter, "gdn_backward", invalid_dispatch)
+    with pytest.raises(ValueError, match="value heads must be divisible by query heads"):
+        adapter.chunk_gdn_bwd_cudnn_packed(q, q, value, gate, gate, value, cu)

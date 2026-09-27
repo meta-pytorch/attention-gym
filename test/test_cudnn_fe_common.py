@@ -151,3 +151,16 @@ def test_channel_gate_parameter_rows_may_be_strided():
         results.append((gradient, da, db))
     for strided, compact in zip(results[1], results[0]):
         torch.testing.assert_close(strided, compact, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["not_float16", "float32_extra", "torch.bfloat16_suffix"])
+def test_cudnn_dtype_names_are_exact(invalid):
+    """Dtype names match exactly; substrings of a supported name are rejected."""
+    import cutlass
+
+    from attn_gym.linear._delta_rule.cudnn_fe.common.host import get_dtype
+
+    assert get_dtype(torch.float16) is cutlass.Float16
+    assert get_dtype("half") is cutlass.Float16
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        get_dtype(invalid)

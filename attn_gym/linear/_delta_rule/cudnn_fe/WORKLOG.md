@@ -180,6 +180,13 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   dlpack, so `None` fails at build time (`repro_09_replay_abi_scope.py`); proposing it would be a
   feature request. Reapply unconditionally while AG keeps the optional-scheduler recipe.
 
+### E12 — `get_dtype` matched substrings · bugfix
+- **Problem:** substring parsing accepted `not_float16`, `float32_extra`, `torch.bfloat16_suffix`.
+- **Found by:** E-series audit. **Fix:** exact names in `common/host.py` ("Prune and restyle the
+  vendored v1.30 tile_dsl and common helpers"; test in "Close regression-test gaps: …").
+- **Tests:** CM::test_cudnn_dtype_names_are_exact (substring mutation: 3 fail). Candidate upstream,
+  no patch drafted.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
 
 ### B15 — Launch caches keyed on shape-unaware state
@@ -200,10 +207,18 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   writing the fake signatures; "Give the warmup forward state signatures independent extents". No
   dedicated test.
 
+### B9 — A non-vacuity check was vacuous (test)
+- **Found by:** mutation audit: ignoring `split` did not fail the contracting-gate test, because
+  under the automatic plan the d_v split alone made `work_items > 1`.
+- **Fix:** pin the uncut plan (`ForwardPlan(0,1,1,num_sm)`).
+  KT::test_cudnn_split_forward_matches_reference_on_a_contracting_gate.
+
 ### Other tests encoding decisions
 - **B3** — KT::test_cudnn_backward_past_sort_capacity_runs_empty_work_items: native KDA stateful
   backward over ORDER_CAPACITY+3 sequences (5,464/8,198 zero-chunk items). The fix (an empty item
   must not consume a dstate handshake phase, C03) is upstream in v1.30; reverting it historically hung.
+- **B17** — GB::test_gdn_backward_rejects_more_query_than_value_heads: HQ > HV rejected before
+  dispatch (the old dV last-write-wins store is gone in v1.30; the domain guard stays).
 - **R8** — test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op:
   sharded KDA dbeta bounded by an operand-pack budget (see Decisions).
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
