@@ -42,6 +42,26 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 
 ## 1. Bugs in upstream v1.30 (upstream draft exists or is possible)
 
+### B7 — GDN dBeta divided by beta (C07) · numerics
+- **Problem:** bprop recovers an already beta-scaled intermediate by `rowsum / (beta + 1e-10)`:
+  0% of the gradient at beta = 0, 50% at 1e-10, FP16 underflow for larger small betas. The API
+  accepts any post-activation beta.
+- **Found by:** originally #475; on v1.30 it resurfaced as 9 small-beta test failures when the
+  existing AG suite first ran against the new kernels.
+- **Fix:** keep beta-free inverse factors (T = I − T_b L) and stage Z separately from beta·Z, so
+  dBeta is computed directly; includes the coupled GEMM issue order and scratch lifetimes.
+  `kernel/gdn_bprop_f16.py`; "Compute the GDN bprop dBeta without dividing by beta".
+- **Evidence:** fails without = YES (mutation back to the divide: all 8 exact cases fail, dBeta
+  0 / 0.0099 / 0.5 / 0.9901 instead of 1). SASS: gdn_bprop +296 instructions, STACK 16→24, REG 128.
+  Fwd+bwd +0.4…+3.6% over four workloads (the cost #604 accepted). KDA bprop has no beta divide
+  (KN::test_kda_cudnn_backward_preserves_small_beta_gradient passes).
+- **Tests:** GB::test_gdn_cudnn_backward_preserves_small_beta_gradient,
+  GB::test_gdn_cudnn_backward_mixed_small_beta_matches_reference.
+- **Upstream:** draft `01-gdn-beta-free-dbeta.patch`; stock v1.30 returns dBeta = 0 instead of 1.
+- **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the two new barriers
+  must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`
+  rejects fused l2norm at d_v = 128 after this change; AG never passes `inv_q`.
+
 ### B8 — Empty `cu_seqlens` intervals occupy the unsplit work table (C08) · bugfix
 - **Problem:** serving pads `cu_seqlens` with repeated boundaries; each empty interval consumed sort
   slots, descriptors and persistent tiles. Naively dropping empties would leave empty-sequence
@@ -149,6 +169,8 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 ## Known limitations and pre-existing issues (not fixed)
 
+- **FP16 tiny beta:** with all beta ≤ 1e-6, FP16 beta-scaled operands underflow (subnormal range);
+  inherent to FP16, not the dBeta formula. BF16 is fine.
 - **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.

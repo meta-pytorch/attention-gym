@@ -32,6 +32,21 @@ stack_prs = [606, 607, 608, 609]
 
 # --------------------------------------------------------------------------- bug fixes
 [[fix]]
+id = "B7"
+title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps)"
+kind = "numerics"
+ag_subject = "Compute the GDN bprop dBeta without dividing by beta"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient",
+  "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference",
+]
+upstream_patch = "upstream/01-gdn-beta-free-dbeta.patch"
+upstream_repro = "upstream/repro_01_gdn_beta.py"
+upstream_runs = [["--beta", "0", "1e-12", "1e-10", "1e-8"], ["--beta", "0", "1e-12", "1e-10", "1e-8", "--checkpoints"]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
 id = "B8"
 title = "Compact empty cu_seqlens intervals out of the unsplit work table"
 kind = "bugfix"
