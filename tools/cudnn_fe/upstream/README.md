@@ -26,6 +26,7 @@ every optional specialization was tested.
 | 5 | `05-scalar-scan-head-stride.patch` | B13 | **Yes:** raw scan wrong in 256/516 entries, max abs error 4.6166; host rejects stride-2 replay | Raw scan and compact→strided host replay match exactly |
 | 6 | `04-omit-zero-chunk-split-work.patch` | B10 | **Yes:** 8 items instead of 4 (not a reproduced TMEM hang) | Opted-in table has 4 items, all-empty 0; stateful default unchanged |
 | 7 | `07-single-thread-gdn-mbarrier-init.patch` | B2 | **No isolated failure:** all-thread init pattern exists | Stock and patched 32-iteration multi-wave GDN fwd/bwd stress both pass |
+| 8 | `08-derive-scheduler-arrival-counts.patch` | S12 | **No current wrong count:** default literals are correct | Stock and patched 32-iteration multi-wave KDA fwd/bwd smoke both pass |
 
 ## Running the repros
 
@@ -37,6 +38,7 @@ every optional specialization was tested.
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
 | `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
 | `repro_07_mbarrier_stress.py` | `--iterations 32` | pass | pass |
+| `repro_08_scheduler_counts.py` | `--iterations 32` | pass | pass |
 | `repro_09_replay_abi_scope.py` | none; scope check for excluded B14 | pass (`None` fails at build) | n/a |
 
 ## Source/history audit
@@ -56,6 +58,8 @@ dependencies**:
 - 07 (B2): "Initialize the GDN prefill mbarriers from one thread", "Initialize the GDN backward
   mbarriers from one thread", summary part of "Initialize GDN summary mbarriers from one thread and
   tidy vendored kernel names".
+- 08 (S12): the arrival-count part of the three "Validate … launch contracts …" commits only, not
+  AG's launch-validation framework.
 
 ## Draft issue 01 — GDN backward loses dBeta at zero and tiny post-activation beta
 
@@ -164,6 +168,14 @@ items across persistent waves) passes 32 iterations on both stock and patched.
 
 **Fix.** Wrap each init inventory in `if tidx == 0`, keeping the init fence and CTA sync outside. No
 counts or steady-state handshakes change.
+
+## Draft issue 08 — Derive scheduler consumer arrivals from the active warp roles
+
+**Maintenance hardening, not a current bug.** Several GDN/KDA barriers use literal 11/15 arrivals
+though the consumer count follows the role map. For fully occupied role maps the patch derives CTA
+warps minus the TMA publisher; KDA bprop-summary derives two compute groups plus three scalar
+consumer roles (warps 8–11 idle), so it stays 11. `repro_08_scheduler_counts.py` passes on stock and
+patched. AG's broader commits produced identical default-kernel SASS (8 KDA backward cubins).
 
 ## Excluded — split-table replay absent-scheduler ABI (B14)
 

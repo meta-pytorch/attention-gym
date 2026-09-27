@@ -247,6 +247,29 @@ upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- validation / hardening
 [[fix]]
+id = "S12"
+title = "Launch-contract validation before compile; scheduler arrivals derived from warp counts"
+kind = "validation"
+ag_subject = "Validate GDN backward launch contracts and derive scheduler arrivals from warp counts"
+ag_subjects_extra = [
+  "Validate common cuDNN host launch contracts before compiling",
+  "Preserve strided gate parameter layouts in host validation",
+]
+guarding_tests = [
+  "test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_warp_role_and_named_barrier_tables_reject_conflicts",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_backward_cfgs_reject_unsupported_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers",
+]
+upstream_patch = "upstream/08-derive-scheduler-arrival-counts.patch"
+upstream_repro = "upstream/repro_08_scheduler_counts.py"
+upstream_runs = [[]]
+upstream_expect = "smoke"
+upstream_status = "hardening-draft"
+
+[[fix]]
 id = "B2"
 title = "Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary"
 kind = "validation"

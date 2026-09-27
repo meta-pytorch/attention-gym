@@ -39,8 +39,9 @@ from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common import split_k
-from ..common.host import get_dtype
-from ..common.tvm_ffi import make_signature, signature_spec
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import validate_seqlens, validate_tensor, validate_work_table, validate_workspace
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
 from . import gdn_bprop_f16, gdn_recompute_f16, gdn_tinv_f16
 
 
@@ -312,6 +313,58 @@ IO_DTYPE_SLOT = 12
 BPROP_SLOT = 13
 
 
+def _validate_launch(
+    *, q, k, v, do, dq, dk, dv, gate, beta, a_log, dt_bias, cu_seqlens, tinv, tinv_words, tinv_rows, tinv_row_count,
+    checkpoints, seed_checkpoints, state_in, work_items, work_count, series_items, series_count, item_scratch,
+    chunk_scratch, scheduler_all, scheduler_recompute, recompute_words, bprop_words, split, n_tiles, ideal_chunks,
+    num_sm, b_t, expand_num, tinv_pass, recompute, recompute_orders, coarse, bwd_orders,
+):
+    """Check the warmup / uncut backward buffers of one plan (one checkpoint series per sequence)."""
+    tokens, heads_out, num_seqs = gdn_bprop_f16.validate_bwd_bundle(
+        q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
+        num_pieces=validate_seqlens(cu_seqlens), expand_num=expand_num, b_t=b_t, tinv_pass=tinv_pass, a_log=a_log,
+        dt_bias=dt_bias,
+    )
+    validate_cuda_tensors(
+        q, tinv_words=tinv_words, seed_checkpoints=seed_checkpoints, state_in=state_in, work_items=work_items,
+        work_count=work_count, series_items=series_items, series_count=series_count, item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch, scheduler_all=scheduler_all, scheduler_recompute=scheduler_recompute,
+        recompute_words=recompute_words,
+    )
+    if num_sm <= 0 or n_tiles != num_seqs * heads_out:
+        raise ValueError("num_sm must be positive and n_tiles must equal the number of sequences times output heads")
+    dim_v, dim_k = v.shape[2], q.shape[2]
+    if state_in is not None:
+        validate_tensor(
+            "state_in", state_in, (None, heads_out, dim_v, dim_k), gdn_bprop_f16.STATE_DTYPES, min_rows=num_seqs
+        )
+    if coarse:
+        validate_tensor(
+            "seed_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k),
+            (*gdn_bprop_f16.STATE_DTYPES, str(q.dtype).removeprefix("torch.")),
+        )
+    table_rows = n_tiles
+    if split:
+        scan_tokens = gate.shape[0] * expand_num
+        if ideal_chunks:
+            table_rows = split_k.max_work_items(scan_tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm)
+        validate_tensor(
+            "item_scratch", item_scratch, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows
+        )
+        validate_tensor(
+            "chunk_scratch", chunk_scratch, (None, heads_out), ("float32",), align=4,
+            min_rows=split_k.chunk_scratch_rows(scan_tokens, num_seqs, b_t),
+        )
+    validate_work_table(work_items, work_count, scheduler_all, min_rows=table_rows)
+    validate_tensor("scheduler_recompute", scheduler_recompute, (None,), ("int32",), align=4, min_rows=1)
+    if recompute:
+        validate_tensor("series_items", series_items, (None, WORK_ITEM_FIELDS), ("int32",), compact=True)
+        validate_tensor("series_count", series_count, (None,), ("int32",), align=4, min_rows=1)
+        validate_workspace("recompute_words", recompute_words, gdn_recompute_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
+    if tinv_pass:
+        validate_workspace("tinv_words", tinv_words, gdn_tinv_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
+
+
 def build_warmup_backward(
     *,
     bprop_module,
@@ -390,6 +443,17 @@ def build_warmup_backward(
     )
     if bprop_module is not gdn_bprop_f16 or compact_qdo:
         raise ValueError("the GDN warmup backward supports only the gdn_bprop_f16 bprop without compact_qdo")
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    _validate_launch(
+        q=q, k=k, v=v, do=do, dq=dq, dk=dk, dv=dv, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens, tinv=tinv, tinv_words=tinv_words, tinv_rows=tinv_rows, tinv_row_count=tinv_row_count,
+        checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, state_in=state_in, work_items=work_items,
+        work_count=work_count, series_items=series_items, series_count=series_count, item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch, scheduler_all=scheduler_all, scheduler_recompute=scheduler_recompute,
+        recompute_words=recompute_words, bprop_words=bprop_words, split=split, n_tiles=n_tiles,
+        ideal_chunks=ideal_chunks, num_sm=num_sm, b_t=b_t, expand_num=expand_num, tinv_pass=tinv_pass,
+        recompute=recompute, recompute_orders=recompute_orders, coarse=coarse, bwd_orders=bwd_orders,
+    )
     recompute_order_gen = not (recompute_orders and split)
     bwd_order_gen = bwd_orders and not split
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4

@@ -91,7 +91,16 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import decode_head, ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, expanded_cu_seqlen, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import (
+    checkpoint_capacity_bound,
+    validate_named_barriers,
+    validate_seqlens,
+    validate_tensor,
+    validate_warp_roles,
+    validate_work_table,
+    validate_workspace,
+)
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
@@ -117,6 +126,11 @@ from ..tile_dsl.tma import (
 from .gdn_recompute_config import CFG
 
 USE_PDL = True
+STATE_DIMS = (64, 128)
+TMEM_COLUMNS = 512
+IO_DTYPES = ("bfloat16", "float16")
+SCALAR_DTYPES = ("float32", "bfloat16", "float16")
+STATE_DTYPES = ("float32", "bfloat16")
 
 
 class GdnRecomputeBars(NamedTuple):
@@ -1867,6 +1881,10 @@ def build_cfg(
 ) -> GdnRecomputeCfg:
     """Build the per-compile ``GdnRecomputeCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tiles_per_head`` > 1 runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value columns each."""
+    if io_dtype not in (cutlass.Float16, cutlass.BFloat16) or d_k not in STATE_DIMS or d_v not in STATE_DIMS:
+        raise ValueError(f"recompute serves Float16/BFloat16 with d_k, d_v in {STATE_DIMS}, got {io_dtype}, {d_k}, {d_v}")
+    if max_active_clusters <= 0 or expand_num < 1 or tiles_per_head < 1:
+        raise ValueError("max_active_clusters, expand_num and tiles_per_head must be positive")
     cfg = GdnRecomputeCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
@@ -1894,19 +1912,24 @@ def build_cfg(
     smem_checkpoint_stages = 1
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     warp = cfg.threads_per_warp
+    # Attention Gym modification: the warp count derives from the validated role table.
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_1_warp_ids,),
+        (cfg.load_gate_warp_id, cfg.tma_kv_warp_id, cfg.tcgen05_mma_warp_id, cfg.epilogue_warp_id),
+    )
     tmem_state_input_offset = cfg.tmem_state_acc_stages * cfg.d_k
     tmem_cg1_acc_offset = tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
     bytes_per_element = io_dtype.width // 8
     kq_tile = 2 * cfg.b_t * cfg.d_k
     v_tile = cfg.d_v * cfg.b_t
     tinv_tile = cfg.b_t * cfg.b_t
-    return replace(
+    cfg = replace(
         cfg,
         smem_checkpoint_stages=smem_checkpoint_stages,
         smem_kq_stages=smem_kq_stages,
         num_regs_compute_group_1=num_regs_compute_group_1,
         num_regs_other=num_regs_other,
-        threads_per_cta=warp * (4 + n_cg1),
+        threads_per_cta=warp * n_warps,
         tmem_user_threads=warp * (1 + n_cg1),
         tmem_state_acc_offset=0,
         tmem_state_input_offset=tmem_state_input_offset,
@@ -1920,6 +1943,10 @@ def build_cfg(
         tma_v_bytes=v_tile * bytes_per_element,
         tma_tinv_bytes=tinv_tile * bytes_per_element,
     )
+    validate_named_barriers(cfg.threads_per_cta, tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads))
+    if cfg.tmem_y_decay_u_input_offset + cfg.b_t > TMEM_COLUMNS:
+        raise ValueError(f"recompute TMEM layout needs {cfg.tmem_y_decay_u_input_offset + cfg.b_t} > {TMEM_COLUMNS} columns")
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: K, V, checkpoints, tinv
@@ -2199,6 +2226,54 @@ def _compile_gdn_recompute_prologue(
     )
 
 
+def validate_recompute_launch(
+    k, v, gate, cu_seqlens, initial_state, output_state, checkpoint_every_n_tokens, checkpoints,
+    seed_checkpoints, a_log, dt_bias, tinv, expand_num, tiles_per_head,
+):
+    """Check the recompute operands shared by the standalone and bundled hosts: packed k/v, the
+    ``[T, HO]`` gate, ``[B, HO, V, K]`` states, the checkpoint interval and row capacity, and the
+    chunk-factor tiles."""
+    validate_cuda_tensors(
+        k, v=v, gate=gate, cu_seqlens=cu_seqlens, initial_state=initial_state, output_state=output_state,
+        checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, a_log=a_log, dt_bias=dt_bias, tinv=tinv,
+    )
+    num_seqs = validate_seqlens(cu_seqlens)
+    if k.ndim != 3 or v.ndim != 3 or gate.ndim != 2:
+        raise ValueError("k and v must be packed [T, H, D] and gate [T, HO]")
+    tokens, dim_k, dim_v, heads_out = k.shape[0], k.shape[2], v.shape[2], gate.shape[1]
+    io = (str(k.dtype).removeprefix("torch."),)
+    if io[0] not in IO_DTYPES:
+        raise ValueError(f"k must have dtype in {IO_DTYPES}, got {k.dtype}")
+    validate_tensor("k", k, (tokens, None, dim_k), io, tma=True)
+    validate_tensor("v", v, (tokens, None, dim_v), io, tma=True)
+    for name, heads in (("k", k.shape[1]), ("v", v.shape[1])):
+        if heads <= 0 or heads_out % heads:
+            raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
+    if expand_num < 1 or tiles_per_head < 1 or dim_v % tiles_per_head:
+        raise ValueError("expand_num must be positive and tiles_per_head must divide d_v")
+    validate_tensor("gate", gate, (tokens, heads_out), SCALAR_DTYPES)
+    for name, tensor in (("a_log", a_log), ("dt_bias", dt_bias)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (heads_out,), SCALAR_DTYPES, align=4)
+    for name, tensor in (("initial_state", initial_state), ("output_state", output_state)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (None, heads_out, dim_v, dim_k), STATE_DTYPES, min_rows=num_seqs)
+    every_n = int(checkpoint_every_n_tokens)
+    if every_n < 0 or every_n % CFG.B_T:
+        raise ValueError(f"checkpoint_every_n_tokens must be zero or a positive multiple of {CFG.B_T}")
+    if every_n:
+        validate_tensor(
+            "output_state_checkpoints", checkpoints, (None, heads_out, dim_v, dim_k), io, tma=True,
+            min_rows=checkpoint_capacity_bound(tokens * expand_num, num_seqs, every_n),
+        )
+    if seed_checkpoints is not None:
+        validate_tensor("seed_state_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k), (*STATE_DTYPES, *io))
+    validate_tensor(
+        "tinv", tinv, (None, heads_out, CFG.B_T, CFG.B_T), io, align=128, tma=True,
+        min_rows=tokens * expand_num // CFG.B_T + num_seqs,
+    )
+
+
 def chunk_gdn_recompute(
     k,
     v,
@@ -2321,6 +2396,18 @@ def chunk_gdn_recompute(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    validate_recompute_launch(
+        k, v, gate, cu_seqlens, initial_state, output_state, checkpoint_every_n_tokens,
+        output_state_checkpoints, seed_state_checkpoints, a_log, dt_bias, tinv, expand_num, tiles_per_head,
+    )
+    validate_cuda_tensors(
+        k, work_items=work_items, work_count=work_count, scheduler_counter=scheduler_counter,
+        scheduler_all=scheduler_all, work_item_scratch=work_item_scratch, workspace=workspace,
+    )
+    num_seqs = cu_seqlens.numel() - 1
+    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * gate.shape[1])
+    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     checkpoints = output_state_checkpoints if enable_checkpoints else None
     work_item_staging = work_item_scratch if not order_gen else None
     scheduler_all = scheduler_all if (run_order or gen_intervals) else None

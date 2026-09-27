@@ -146,6 +146,20 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   (`ATTN_GYM_RUN_STRESS_TESTS=1`).
 - **Upstream:** draft `07-single-thread-gdn-mbarrier-init.patch`, hardening only.
 
+### S12 — Launch contracts unchecked; literal scheduler arrival counts (A8, E6, E10) · validation
+- **Problem:** invalid metadata (TMA shape/alignment, device, work-table shapes, `n_tiles != B*HO`,
+  checkpoint interval/capacity, role/barrier-ID conflicts) reached the compiler or kernel; literal
+  15/11 arrival counts break silently if a role map changes.
+- **Found by:** E-series diff audit of host code; the capacity case by constructing short-checkpoint
+  inputs that compiled.
+- **Fix:** host checks before compile; `mb_sched_done` arrivals = CTA warps − TMA publisher (KDA
+  bprop_summary: 11, warps 8–11 idle). Five "Validate … launch contracts …" / "Preserve strided gate
+  parameter layouts in host validation" commits.
+- **Evidence:** capacity guard YES (3 short-checkpoint cases reach the compiler without it);
+  arrival count NO (default literals are correct; SASS 8/8 identical).
+- **Tests:** the nine LC tests in `fixes.toml`.
+- **Upstream:** draft `08-derive-scheduler-arrival-counts.patch` (count derivation only, hardening).
+
 ### B14 — Split-table replay passes a tensor into a compiled `None` slot (E4) · bugfix, AG-only
 - **Problem:** replaying a table compiled without a scheduler passed `sched_ctr` anyway → TVM-FFI
   TypeError at argument 14.
@@ -254,3 +268,6 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
    symbolic stride; `leading_dim=None` still infers 1 from a compact first call.
 3. **Match upstream's opt level (R2).** The compiler default is not upstream's `--opt-level 2`;
    without an explicit level SASS differs and perf comparisons are meaningless.
+6. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
+   and one (B14) targets an ABI upstream lacks; the repros and `verify_fixes.py` classification keep
+   hardening drafts from being filed as bug fixes.

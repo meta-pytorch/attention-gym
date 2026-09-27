@@ -133,7 +133,16 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import (
+    checkpoint_capacity_bound,
+    validate_named_barriers,
+    validate_seqlens,
+    validate_tensor,
+    validate_warp_roles,
+    validate_work_table,
+    validate_workspace,
+)
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -166,6 +175,8 @@ from .gdn_bprop_config import CFG
 
 USE_PDL = True
 TINV_SOURCES = ("compute", "gmem")
+STATE_DIMS = (64, 128)
+TMEM_COLUMNS = 512
 
 
 class GdnBpropBars(NamedTuple):
@@ -355,7 +366,13 @@ def make_bars(cfg) -> GdnBpropBars:
         mb_sdv_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            try_wait=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -4401,6 +4418,10 @@ def build_cfg(
     ``gdn_tinv_f16.py``."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
+    if io_dtype not in (cutlass.Float16, cutlass.BFloat16) or d_k not in STATE_DIMS:
+        raise ValueError(f"bprop serves Float16/BFloat16 with d_k in {STATE_DIMS}, got {io_dtype}, d_k={d_k}")
+    if max_active_clusters <= 0 or expand_num < 1:
+        raise ValueError("max_active_clusters and expand_num must be positive")
     if d_k != d_v:
         raise ValueError("the bprop stages Z (d_v wide) in the dQ tile, whose fragment strides need d_k == d_v")
     if CFG.SMEM_DQ_STAGES != 1 or CFG.SMEM_DK_STAGES != 1:
@@ -4428,6 +4449,11 @@ def build_cfg(
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     n_cg2 = len(cfg.compute_group_2_warp_ids)
     warp = cfg.threads_per_warp
+    # Attention Gym modification: the warp count derives from the validated role table.
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids),
+        (cfg.tcgen05_mma_warp_id, cfg.tma_qkv_warp_id, cfg.load_gate_beta_warp_id, cfg.epilogue_warp_id),
+    )
     tmem_dvdk_acc_offset = cfg.tmem_dstate_acc_stages * cfg.d_k
     tmem_dstate_input_offset = tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * cfg.b_t
     tmem_shared_acc_offset = tmem_dstate_input_offset + cfg.tmem_dstate_input_stages * max(cfg.d_k // 2, cfg.b_t)
@@ -4437,9 +4463,9 @@ def build_cfg(
     v_tile = cfg.d_v * cfg.b_t
     state_tile = cfg.d_k * cfg.d_v
     square_tile = cfg.b_t * cfg.b_t
-    return replace(
+    cfg = replace(
         cfg,
-        threads_per_cta=warp * (4 + n_cg0 + n_cg1 + n_cg2),
+        threads_per_cta=warp * n_warps,
         tmem_user_threads=warp * (1 + n_cg0 + n_cg1 + n_cg2),
         cg0_barrier_threads=warp * n_cg0,
         inverse_inner_barrier_threads=warp * 2,
@@ -4469,6 +4495,17 @@ def build_cfg(
         tma_state_bytes=state_tile * bytes_per_element,
         tma_tinv_bytes=square_tile * bytes_per_element,
     )
+    validate_named_barriers(
+        cfg.threads_per_cta,
+        tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads),
+        cg0=(cfg.cg0_barrier_id, cfg.cg0_barrier_threads),
+        inverse_inner=(cfg.inverse_inner_barrier_id, cfg.inverse_inner_barrier_threads),
+        cg1=(cfg.cg1_barrier_id, cfg.cg1_barrier_threads),
+        cg2=(cfg.cg2_barrier_id, cfg.cg2_barrier_threads),
+    )
+    if cfg.tmem_y_offset + cfg.b_t > TMEM_COLUMNS:
+        raise ValueError(f"bprop TMEM layout needs {cfg.tmem_y_offset + cfg.b_t} > {TMEM_COLUMNS} columns")
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 9  # per-batch runtime TMA descriptors: Q, K, V, dO, checkpoints, dQ, dK, dV, tinv
@@ -4690,6 +4727,101 @@ def _compile_gdn_bprop_prologue(
     )
 
 
+IO_DTYPES = ("bfloat16", "float16")
+SCALAR_DTYPES = ("float32", "bfloat16", "float16")
+STATE_DTYPES = ("float32", "bfloat16")
+
+
+def validate_bwd_operands(
+    q, k, v, do, gate, beta, cu_seqlens, *, dq=None, dk=None, dv=None, dgate=None, dbeta=None,
+    a_log=None, dt_bias=None, inv_q=None, inv_k=None,
+):
+    """Check the packed GDN backward operands shared by the standalone and bundled hosts (every
+    ``None`` optional is skipped); return ``(tokens, heads_out, num_seqs)``."""
+    validate_cuda_tensors(
+        q, k=k, v=v, do=do, gate=gate, beta=beta, cu_seqlens=cu_seqlens, dq=dq, dk=dk, dv=dv,
+        dgate=dgate, dbeta=dbeta, a_log=a_log, dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+    )
+    num_seqs = validate_seqlens(cu_seqlens)
+    if q.ndim != 3 or v.ndim != 3 or gate.ndim != 2:
+        raise ValueError("q, k, v, do must be packed [T, H, D] and gate, beta [T, HO]")
+    tokens, dim_k, dim_v, heads_out = q.shape[0], q.shape[2], v.shape[2], gate.shape[1]
+    io = (str(q.dtype).removeprefix("torch."),)
+    if io[0] not in IO_DTYPES:
+        raise ValueError(f"q must have dtype in {IO_DTYPES}, got {q.dtype}")
+    for name, tensor, shape in (
+        ("q", q, (tokens, None, dim_k)),
+        ("k", k, (tokens, None, dim_k)),
+        ("v", v, (tokens, None, dim_v)),
+        ("do", do, (tokens, heads_out, dim_v)),
+        ("dq", dq, (tokens, heads_out, dim_k)),
+        ("dk", dk, (tokens, heads_out, dim_k)),
+        ("dv", dv, (tokens, heads_out, dim_v)),
+    ):
+        if tensor is not None or name in ("q", "k", "v"):
+            validate_tensor(name, tensor, shape, io, tma=True)
+    for name, heads in (("q", q.shape[1]), ("k", k.shape[1]), ("v", v.shape[1])):
+        if heads <= 0 or heads_out % heads:
+            raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
+    validate_tensor("gate", gate, (tokens, heads_out), SCALAR_DTYPES)
+    validate_tensor("beta", beta, (tokens, heads_out), ("float32", *io))
+    if dgate is not None:
+        validate_tensor("dgate", dgate, (tokens, heads_out), ("float32",))
+    if dbeta is not None:
+        validate_tensor("dbeta", dbeta, (tokens, heads_out), (str(beta.dtype).removeprefix("torch."),))
+    for name, tensor in (("a_log", a_log), ("dt_bias", dt_bias)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (heads_out,), SCALAR_DTYPES, align=4)
+    for name, tensor in (("inv_q", inv_q), ("inv_k", inv_k)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (tokens, None), ("float32",), align=4)
+    return tokens, heads_out, num_seqs
+
+
+def validate_state_series(name, tensor, rows, heads_out, dim_v, dim_k, dtypes, *, align=16):
+    """Check a ``[rows, HO, V, K]`` state or checkpoint series with at least ``rows`` rows."""
+    validate_tensor(name, tensor, (None, heads_out, dim_v, dim_k), dtypes, align=align, tma=True, min_rows=rows)
+
+
+def validate_tinv(tinv, tokens, num_seqs, heads_out, io_dtype, expand_num):
+    """Check the ``gdn_tinv_f16`` chunk-factor tiles, one row per chunk plus one per sequence."""
+    rows = tokens * expand_num // CFG.B_T + num_seqs
+    validate_state_series("tinv", tinv, rows, heads_out, CFG.B_T, CFG.B_T, (io_dtype,), align=128)
+
+
+def validate_bwd_bundle(
+    q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
+    *, num_pieces, expand_num, b_t, tinv_pass=True, dgate=None, dbeta=None, a_log=None, dt_bias=None, inv_q=None,
+    inv_k=None,
+):
+    """Check the operands every bundled backward host (warmup/uncut and chain) hands the bprop:
+    ``num_pieces`` checkpoint series (one per sequence, or per chain piece) and, with ``tinv_pass``,
+    the T-pass tiles and row table; return
+    ``(tokens, heads_out, num_seqs)``."""
+    if b_t != CFG.B_T or expand_num < 1 or num_pieces < 1:
+        raise ValueError(f"bundled backward hosts need b_t={CFG.B_T}, positive expand_num and piece count")
+    tokens, heads_out, num_seqs = validate_bwd_operands(
+        q, k, v, do, gate, beta, cu_seqlens, dq=dq, dk=dk, dv=dv, dgate=dgate, dbeta=dbeta,
+        a_log=a_log, dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+    )
+    validate_cuda_tensors(
+        q, checkpoints=checkpoints, tinv=tinv, tinv_rows=tinv_rows, tinv_row_count=tinv_row_count,
+        bprop_words=bprop_words,
+    )
+    io = str(q.dtype).removeprefix("torch.")
+    validate_state_series(
+        "checkpoints", checkpoints, checkpoint_capacity_bound(tokens * expand_num, num_pieces, CFG.B_T),
+        heads_out, v.shape[2], q.shape[2], (io,),
+    )
+    if tinv_pass:
+        validate_tinv(tinv, tokens, num_pieces, heads_out, io, expand_num)
+        rows = tokens * expand_num // CFG.B_T + num_pieces
+        validate_tensor("tinv_rows", tinv_rows, (None, 4), ("int32",), compact=True, min_rows=rows)
+        validate_tensor("tinv_row_count", tinv_row_count, (None,), ("int32",), align=4, min_rows=1)
+    validate_workspace("bprop_words", bprop_words, TENSORMAP_DESC_ARRAYS, num_pieces)
+    return tokens, heads_out, num_seqs
+
+
 def chunk_gdn_bwd(
     q,
     k,
@@ -4798,6 +4930,30 @@ def chunk_gdn_bwd(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    if expand_num < 1 or (inv_q is None) != (inv_k is None) or (d_initial_state is not None and not use_initial_state):
+        raise ValueError("expand_num must be positive, inv_q/inv_k go together, and d_initial_state needs use_initial_state")
+    tokens, heads_out, num_seqs = validate_bwd_operands(
+        q, k, v, do, gate, beta, cu_seqlens, dq=dq, dk=dk, dv=dv, dgate=dgate, dbeta=dbeta,
+        a_log=a_log, dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+    )
+    validate_cuda_tensors(
+        q, state_checkpoints=state_checkpoints, d_initial_state=d_initial_state, d_final_state=d_final_state,
+        work_items=work_items, work_count=work_count, scheduler_counter=scheduler_counter,
+        scheduler_all=scheduler_all, work_item_scratch=work_item_scratch, tinv=tinv, workspace=workspace,
+    )
+    dim_v, dim_k, io = v.shape[2], q.shape[2], str(q.dtype).removeprefix("torch.")
+    validate_state_series(
+        "state_checkpoints", state_checkpoints, checkpoint_capacity_bound(tokens * expand_num, num_seqs, CFG.B_T),
+        heads_out, dim_v, dim_k, (io,),
+    )
+    for name, tensor in (("d_initial_state", d_initial_state), ("d_final_state", d_final_state)):
+        if tensor is not None:
+            validate_state_series(name, tensor, num_seqs, heads_out, dim_v, dim_k, STATE_DTYPES)
+    if tinv is not None:
+        validate_tinv(tinv, tokens, num_seqs, heads_out, io, expand_num)
+    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
+    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     fused_l2norm = inv_q is not None
     tinv_source = "gmem" if tinv is not None else "compute"
     work_item_staging = work_item_scratch if run_order and not order_gen else None

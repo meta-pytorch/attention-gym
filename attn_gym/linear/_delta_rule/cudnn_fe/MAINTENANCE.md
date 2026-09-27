@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 21 modification rows below are generated from
+The 22 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 21 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 22 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -170,6 +170,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
 | S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
 | S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration`; `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
+| S12 | Launch-contract validation before compile; scheduler arrivals derived from warp counts | `test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry`; `test/test_cudnn_fe_launch_contract.py::test_warp_role_and_named_barrier_tables_reject_conflicts`; `test/test_cudnn_fe_launch_contract.py::test_gdn_backward_cfgs_reject_unsupported_geometry`; `test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata`; `test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers` |
 | B2 | Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary`; `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary`; cutracer random_delay (hardening; tests pass without the fix) |
 | S14 | int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path` |
 | B3 | Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream) | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items` |

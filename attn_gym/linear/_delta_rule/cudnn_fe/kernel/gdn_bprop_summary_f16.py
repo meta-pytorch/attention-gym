@@ -93,7 +93,15 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import (
+    validate_named_barriers,
+    validate_seqlens,
+    validate_tensor,
+    validate_warp_roles,
+    validate_work_table,
+    validate_workspace,
+)
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
@@ -116,6 +124,11 @@ from ..tile_dsl.tma import (
 from .gdn_bprop_summary_config import CFG
 
 USE_PDL = True
+STATE_DIMS = (64, 128)
+TMEM_COLUMNS = 512
+IO_DTYPES = ("bfloat16", "float16")
+SCALAR_DTYPES = ("float32", "bfloat16", "float16")
+STATE_DTYPES = ("float32", "bfloat16")
 
 
 class GdnBpropSummaryBars(NamedTuple):
@@ -215,7 +228,13 @@ def make_bars(cfg) -> GdnBpropSummaryBars:
         mb_a_done=MBarrier(alloc(cfg.smem_a_stages), try_wait=True, stages=cfg.smem_a_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            try_wait=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -2290,6 +2309,10 @@ def build_cfg(
     expand_num: int = 1,
 ) -> GdnBpropSummaryCfg:
     """Build the per-compile ``GdnBpropSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
+    if io_dtype not in (cutlass.Float16, cutlass.BFloat16) or d_k not in STATE_DIMS or d_v not in STATE_DIMS:
+        raise ValueError(f"bprop summary serves Float16/BFloat16 with d_k, d_v in {STATE_DIMS}, got {io_dtype}, {d_k}, {d_v}")
+    if max_active_clusters <= 0 or expand_num < 1:
+        raise ValueError("max_active_clusters and expand_num must be positive")
     if expand_num > 1 and (CFG.SMEM_Q_STAGES != 2 or CFG.SMEM_DO_STAGES != 2):
         raise ValueError("the compact q / dO block state assumes 2-stage q and dO rings")
     cfg = GdnBpropSummaryCfg(
@@ -2307,6 +2330,11 @@ def build_cfg(
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     n_cg2 = len(cfg.compute_group_2_warp_ids)
     warp = cfg.threads_per_warp
+    # Attention Gym modification: the warp count derives from the validated role table.
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids),
+        (cfg.tcgen05_mma_warp_id, cfg.tma_qkv_warp_id, cfg.load_gate_beta_warp_id, cfg.epilogue_warp_id),
+    )
     tmem_dvdk_acc_offset = cfg.tmem_dstate_acc_stages * cfg.d_k
     tmem_dstate_input_offset = tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * cfg.b_t
     tmem_shared_acc_offset = tmem_dstate_input_offset + cfg.tmem_dstate_input_stages * max(cfg.d_k // 2, cfg.b_t)
@@ -2315,9 +2343,9 @@ def build_cfg(
     qk_tile = cfg.b_t * cfg.d_k
     do_tile = cfg.d_v * cfg.b_t
     square_tile = cfg.b_t * cfg.b_t
-    return replace(
+    cfg = replace(
         cfg,
-        threads_per_cta=warp * (4 + n_cg0 + n_cg1 + n_cg2),
+        threads_per_cta=warp * n_warps,
         tmem_user_threads=warp * (1 + n_cg0 + n_cg1 + n_cg2),
         init_state_store_barrier_threads=warp * n_cg1,
         cg1_barrier_threads=warp * n_cg1,
@@ -2338,6 +2366,15 @@ def build_cfg(
         tma_do_bytes=do_tile * bytes_per_element,
         tma_tinv_bytes=square_tile * bytes_per_element,
     )
+    validate_named_barriers(
+        cfg.threads_per_cta,
+        tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads),
+        cg1=(cfg.cg1_barrier_id, cfg.cg1_barrier_threads),
+        cg2=(cfg.cg2_barrier_id, cfg.cg2_barrier_threads),
+    )
+    if cfg.tmem_y_offset + cfg.b_t // 2 > TMEM_COLUMNS:
+        raise ValueError(f"bprop summary TMEM layout needs {cfg.tmem_y_offset + cfg.b_t // 2} > {TMEM_COLUMNS} columns")
+    return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv
@@ -2564,6 +2601,38 @@ def chunk_gdn_bwd_summary(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    validate_cuda_tensors(
+        q, k=k, gate=gate, do=do, d_initial_state=d_initial_state, cu_seqlens=cu_seqlens, d_final_state=d_final_state,
+        work_items=work_items, work_count=work_count, scheduler_counter=scheduler_counter, scheduler_all=scheduler_all,
+        work_item_scratch=work_item_scratch, a_log=a_log, dt_bias=dt_bias, tinv=tinv, workspace=workspace,
+    )
+    num_seqs = validate_seqlens(cu_seqlens)
+    if q.ndim != 3 or k.ndim != 3 or do.ndim != 3 or gate.ndim != 2 or expand_num < 1 or q_step < 1:
+        raise ValueError("q, k, do must be packed [T, H, D], gate [T, HO], and expand_num, q_step positive")
+    tokens, dim_k, dim_v, heads_out = k.shape[0], k.shape[2], do.shape[2], gate.shape[1]
+    io = (str(k.dtype).removeprefix("torch."),)
+    if io[0] not in IO_DTYPES:
+        raise ValueError(f"k must have dtype in {IO_DTYPES}, got {k.dtype}")
+    validate_tensor("q", q, (None, None, dim_k), io, tma=True)
+    validate_tensor("k", k, (tokens, None, dim_k), io, tma=True)
+    validate_tensor("do", do, (q.shape[0], heads_out, dim_v), io, tma=True)
+    for name, heads in (("q", q.shape[1]), ("k", k.shape[1])):
+        if heads <= 0 or heads_out % heads:
+            raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
+    validate_tensor("gate", gate, (tokens, heads_out), SCALAR_DTYPES)
+    for name, tensor in (("a_log", a_log), ("dt_bias", dt_bias)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (heads_out,), SCALAR_DTYPES, align=4)
+    for name, tensor in (("d_initial_state", d_initial_state), ("d_final_state", d_final_state)):
+        if tensor is not None or name == "d_initial_state":
+            validate_tensor(name, tensor, (None, heads_out, dim_v, dim_k), STATE_DTYPES, min_rows=num_seqs)
+    validate_tensor(
+        "tinv", tinv, (None, heads_out, CFG.B_T, CFG.B_T), io, align=128, tma=True,
+        min_rows=tokens * expand_num // CFG.B_T + num_seqs,
+    )
+    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
+    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     work_item_staging = work_item_scratch if run_order and not order_gen else None
     scheduler_all = scheduler_all if run_order else None
     use_int64_offsets = requires_int64_abi(

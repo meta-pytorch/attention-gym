@@ -40,9 +40,10 @@ import cutlass.cute as cute
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
-from ..common.host import get_dtype
-from ..common.piece_chain import dtype_name, launch_state_chain
-from ..common.tvm_ffi import make_signature, signature_spec
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
+from ..common.piece_chain import CHAIN_WARPS, dtype_name, launch_state_chain
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
 from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_chain_prologue_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
 
 
@@ -551,6 +552,81 @@ def _compile_chain_backward_tail(constexprs: tuple, cfg_args: tuple, specs: tupl
     )
 
 
+def _validate_launch(
+    *, q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, cu_pieces, main_rows, summary_rows, main_count,
+    summary_count, work_items, work_items_summary, series_items, series_count, scheduler_all, scheduler_recompute,
+    scheduler_m, scheduler_series, scheduler_summary, scheduler_bwd, tinv_words, tinv_rows, tinv_row_count,
+    summary_words, recompute_m_words, series_words, bprop_summary_words, bprop_words, checkpoints, seed_checkpoints,
+    dq, dk, dv, dgate, dbeta, summary_q, summary_do, tinv, state_h, state_m, state_x, state_g, state_dx_end, seed,
+    dseed, dstate0, inv_q, inv_k, pieces, heads_out, num_seqs, unit_chunks, b_t, expand_num, summary_q_step,
+    fused_h_m, series, coarse, chain_rows, num_sm,
+):
+    """Check the chain backward buffers of one plan: ``num_seqs * pieces`` piece series and piece tables."""
+    if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 2 or gate.shape[1] != heads_out:
+        raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
+    if min(pieces, unit_chunks, summary_q_step, num_sm) < 1:
+        raise ValueError("pieces, unit_chunks, summary_q_step and num_sm must be positive")
+    num_pieces = num_seqs * pieces
+    gdn_bprop_f16.validate_bwd_bundle(
+        q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
+        num_pieces=num_pieces, expand_num=expand_num, b_t=b_t, dgate=dgate, dbeta=dbeta, a_log=a_log,
+        dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+    )
+    tables = dict(
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
+        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd,
+    )
+    states = dict(state_h=state_h, state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end)
+    words = dict(
+        tinv_words=tinv_words, summary_words=summary_words, recompute_m_words=recompute_m_words,
+        series_words=series_words, bprop_summary_words=bprop_summary_words,
+    )
+    operands = dict(summary_q=summary_q, summary_do=summary_do, seed_checkpoints=seed_checkpoints)
+    validate_cuda_tensors(q, **tables, **states, **words, **operands, seed=seed, dseed=dseed, dstate0=dstate0)
+    dim_v, dim_k = v.shape[2], q.shape[2]
+    if chain_rows < CHAIN_WARPS or dim_v % chain_rows or chain_rows % CHAIN_WARPS:
+        raise ValueError("chain_rows must divide d_v and contain whole chain warp groups")
+    for name, entries in (("cu_pieces", num_pieces + 1), ("main_rows", num_seqs + 1), ("summary_rows", num_seqs + 1)):
+        validate_tensor(name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16)
+    counters = ("main_count", "summary_count", *(name for name in tables if name.startswith("scheduler")))
+    for name in (*counters, *(("series_count",) if series and coarse else ())):
+        validate_tensor(name, tables[name], (None,), ("int32",), align=4, min_rows=1)
+    for name in ("work_items", "work_items_summary", *(("series_items",) if series and coarse else ())):
+        validate_tensor(
+            name, tables[name], (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=num_pieces * heads_out
+        )
+    for name, tensor in states.items():
+        if name == "state_h" and not fused_h_m or name == "state_x" and not (fused_h_m or series and not coarse):
+            continue
+        width = dim_k if name == "state_m" else dim_v
+        validate_tensor(name, tensor, (None, heads_out, width, dim_k), gdn_bprop_f16.STATE_DTYPES, min_rows=num_pieces)
+    for name, tensor in (("seed", seed), ("dseed", dseed), ("dstate0", dstate0)):
+        if tensor is not None:
+            validate_tensor(
+                name, tensor, (None, heads_out, dim_v, dim_k), gdn_bprop_f16.STATE_DTYPES,
+                align=16 if name == "dstate0" else 4, min_rows=num_seqs,
+            )
+    io = (str(q.dtype).removeprefix("torch."),)
+    validate_tensor("summary_q", summary_q, (None, None, dim_k), io, tma=True)
+    validate_tensor("summary_do", summary_do, (None, heads_out, dim_v), io, tma=True)
+    if coarse:
+        validate_tensor(
+            "seed_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k), (*gdn_bprop_f16.STATE_DTYPES, *io)
+        )
+    for name, module, needed in (
+        ("tinv_words", gdn_tinv_f16, True),
+        ("summary_words", gdn_summary_f16, fused_h_m),
+        ("recompute_m_words", gdn_recompute_f16, not fused_h_m),
+        ("series_words", gdn_recompute_f16, series),
+        ("bprop_summary_words", gdn_bprop_summary_f16, True),
+    ):
+        if needed:
+            validate_workspace(name, words[name], module.TENSORMAP_DESC_ARRAYS, num_pieces)
+
+
 def build_chain_backward(
     *,
     bprop_module,
@@ -641,6 +717,23 @@ def build_chain_backward(
         dt_bias = None
     if bprop_module is not gdn_bprop_f16 or compact_qdo:
         raise ValueError("the GDN chain backward supports only the gdn_bprop_f16 bprop without compact_qdo")
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    _validate_launch(
+        q=q, k=k, v=v, do=do, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, cu_seqlens=cu_seqlens,
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
+        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd, tinv_words=tinv_words,
+        tinv_rows=tinv_rows, tinv_row_count=tinv_row_count, summary_words=summary_words,
+        recompute_m_words=recompute_m_words, series_words=series_words, bprop_summary_words=bprop_summary_words,
+        bprop_words=bprop_words, checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, dq=dq, dk=dk,
+        dv=dv, dgate=dgate, dbeta=dbeta, summary_q=summary_q, summary_do=summary_do, tinv=tinv, state_h=state_h,
+        state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end, seed=seed, dseed=dseed,
+        dstate0=dstate0, inv_q=inv_q, inv_k=inv_k, pieces=pieces, heads_out=heads_out, num_seqs=num_seqs,
+        unit_chunks=unit_chunks, b_t=b_t, expand_num=expand_num, summary_q_step=summary_q_step,
+        fused_h_m=fused_h_m, series=series, coarse=coarse, chain_rows=chain_rows, num_sm=num_sm
+    )
     has_seed = seed is not None
     has_dseed = dseed is not None
     seed_name = dtype_name(seed.dtype) if has_seed else "float32"
