@@ -1,0 +1,15 @@
+cudnn-frontend
+Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This product includes software developed at NVIDIA CORPORATION
+(https://www.nvidia.com/).
+
+This product is distributed primarily under the Apache License, Version 2.0
+(see LICENSE.txt). Some files retain MIT or BSD-3-Clause terms for pre-existing
+code. Files with Apache-2.0 modifications declare the applicable licenses with
+an SPDX `AND` expression, preserving the original terms and notices. See
+LICENSING.md, LICENSE-MIT.txt and THIRD_PARTY_LICENSES.txt for details.
+
+This product also bundles, derives from, or fetches at build time third-party
+open source software. See THIRD_PARTY_LICENSES.txt for the complete list of
+attributions and license texts.
