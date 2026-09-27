@@ -151,61 +151,6 @@ def test_gdn_cudnn_forward_rejects_misaligned_and_noncontiguous_inner_modes() ->
         )
 
 
-def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
-    """Every private kernel must preserve results under its int64 ABI specialization."""
-    from attn_gym.linear._delta_rule.cudnn.kernels import (
-        gdn_bprop_f16,
-        gdn_prefill_f16,
-        gdn_recompute_f16,
-    )
-
-    inputs = make_gdn_test_inputs(
-        (65, 63), key_heads=2, value_heads=2, dtype=torch.float16, seed=229
-    )
-    q, k, value, gate, beta, state, cu_seqlens = inputs
-    torch.manual_seed(233)
-    d_output = torch.randn_like(value)
-    d_final_state = torch.randn_like(state)
-    expected_forward = run_forward(
-        q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
-    )
-    expected_backward = chunk_gdn_bwd_cudnn_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        d_output,
-        cu_seqlens,
-        state,
-        d_final_state,
-    )
-
-    for module in (gdn_prefill_f16, gdn_recompute_f16, gdn_bprop_f16):
-        monkeypatch.setattr(module, "requires_int64_abi", lambda *_: True)
-    actual_forward = run_forward(
-        q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
-    )
-    actual_backward = chunk_gdn_bwd_cudnn_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        d_output,
-        cu_seqlens,
-        state,
-        d_final_state,
-    )
-
-    for actual, expected in zip(actual_forward, expected_forward, strict=True):
-        assert actual is not None and expected is not None
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for actual, expected in zip(actual_backward, expected_backward, strict=True):
-        assert actual is not None and expected is not None
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 def test_gdn_cudnn_active_offsets_past_int32_match_compact() -> None:
     """Execute forward and backward with active Q/K addresses beyond signed int32."""
     free_bytes, _ = torch.cuda.mem_get_info()

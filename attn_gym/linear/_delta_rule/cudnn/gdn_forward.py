@@ -106,6 +106,24 @@ def run_forward_on_current_device(
         if not tensor_supports_tma(initial_state):
             raise TypeError("initial_state requires a TMA-compatible inner mode")
 
+    if paged_state is None:
+        # Unpaged forward: the cudnn-frontend v1.30 kernels (uncut, d_v split, exact chain, or split).
+        from attn_gym.linear._delta_rule.cudnn_fe.gdn import gdn_forward
+
+        output, final_state = gdn_forward(
+            q[0],
+            k[0],
+            value[0],
+            gate[0],
+            beta[0],
+            cu_seqlens,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            split=split,
+        )
+        return output.unsqueeze(0), final_state
+
     if output_final_state and initial_state is None:
         initial_state = torch.zeros(
             num_sequences,

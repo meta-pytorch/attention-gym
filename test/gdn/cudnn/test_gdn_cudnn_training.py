@@ -701,7 +701,7 @@ def test_gdn_cudnn_split_schedules_reject_stateful_calls(option: str) -> None:
 
 def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]:
     """Run exact and split cuDNN GDN fwd+bwd on one long stream; record split work items."""
-    from attn_gym.linear._delta_rule.cudnn import gdn_backward, gdn_forward, schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
 
     q, k, value, gate, beta, _state, _ = make_gdn_test_inputs(
         8192, gate_pattern=gate_pattern, seed=337
@@ -710,18 +710,16 @@ def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]
     d_output = torch.randn_like(value)
     work_counts = []
 
-    def recording_schedule(*args, **kwargs):
-        prepared = schedule.prepare_cudnn_schedule(*args, **kwargs)
-        work_counts.append(prepared.work_count)
-        return prepared
+    def recording_work_count(device):
+        work_counts.append(torch.empty(1, dtype=torch.int32, device=device))
+        return work_counts[-1]
 
     def run(options):
         output, _ = public_chunk_gdn(*inputs, kernel_options=options)
         return (output, *torch.autograd.grad(output, inputs, d_output))
 
     exact = run({"backend": "cudnn"})
-    for module in (gdn_forward, gdn_backward):
-        monkeypatch.setattr(module, "prepare_cudnn_schedule", recording_schedule)
+    monkeypatch.setattr(fe_gdn, "_work_count", recording_work_count)
     split = run({"backend": "cudnn", "split_forward": True, "split_backward": True})
     return (exact, split), [int(count.item()) for count in work_counts]
 
@@ -736,15 +734,17 @@ def test_gdn_cudnn_split_cuts_a_forgetting_stream_and_matches_exact(monkeypatch)
 
 
 def test_gdn_cudnn_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
+    """A gate that never forgets is not cut. The exact path runs this long stream as an exact
+    piece chain, so the uncut split result matches it to rounding rather than bitwise."""
     (exact, split), work_counts = _split_work_items(monkeypatch, "near_zero")
     assert work_counts == [exact[0].shape[2]] * 2
     for actual, expected in zip(split, exact, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual, expected)
 
 
 def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> None:
     """Empty cu_seqlens intervals change neither gradients nor the number of work items."""
-    from attn_gym.linear._delta_rule.cudnn import gdn_backward, gdn_forward, schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
 
     q, k, value, gate, beta, _, compact = make_gdn_test_inputs(
         (65, 63), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=433
@@ -758,13 +758,11 @@ def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> No
     d_output = torch.randn_like(value)
     work_counts = []
 
-    def recording_schedule(*args, **kwargs):
-        prepared = schedule.prepare_cudnn_schedule(*args, **kwargs)
-        work_counts.append(prepared.work_count)
-        return prepared
+    def recording_work_count(device):
+        work_counts.append(torch.empty(1, dtype=torch.int32, device=device))
+        return work_counts[-1]
 
-    for module in (gdn_forward, gdn_backward):
-        monkeypatch.setattr(module, "prepare_cudnn_schedule", recording_schedule)
+    monkeypatch.setattr(fe_gdn, "_work_count", recording_work_count)
     results = []
     for cu_seqlens in (compact, padded):
         inputs = tuple(t.detach().clone().requires_grad_() for t in (q, k, value, gate, beta))
@@ -774,5 +772,19 @@ def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> No
         results.append((output, *torch.autograd.grad(output, inputs, d_output)))
     for actual, expected in zip(results[1], results[0], strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Forward items are (sequence, head, d_v tile) triples; the d_v split depends on the interval
+    # count, so the compact and padded plans may differ, but neither emits empty-sequence work.
     real_items = 2 * value.shape[2]
-    assert [int(count.item()) for count in work_counts] == [real_items] * 4
+    forward_tiles = [
+        fe_gdn.ForwardPlan.build(
+            q.shape[1], cu_seqlens.numel() - 1, value.shape[2], value.shape[3], q.device
+        ).tiles_per_head
+        for cu_seqlens in (compact, padded)
+    ]
+    expected = [
+        real_items * forward_tiles[0],
+        real_items,
+        real_items * forward_tiles[1],
+        real_items,
+    ]
+    assert [int(count.item()) for count in work_counts] == expected
