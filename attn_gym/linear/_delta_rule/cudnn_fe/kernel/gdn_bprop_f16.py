@@ -4464,8 +4464,10 @@ def build_cfg(
     ``gdn_tinv_f16.py``."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
-    if d_k < d_v:
-        raise ValueError("the bprop stages Z (d_v wide) in the dQ tile and needs d_k >= d_v")
+    if d_k != d_v:
+        raise ValueError("the bprop stages Z (d_v wide) in the dQ tile, whose fragment strides need d_k == d_v")
+    if CFG.SMEM_DQ_STAGES != 1 or CFG.SMEM_DK_STAGES != 1:
+        raise ValueError("Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0]; both need one stage")
     if fused_l2norm and d_v == 128:
         raise ValueError("fused l2norm at d_v=128 hosts its scratch in sDm, which holds the in-kernel inverse")
     cfg = GdnBpropCfg(
