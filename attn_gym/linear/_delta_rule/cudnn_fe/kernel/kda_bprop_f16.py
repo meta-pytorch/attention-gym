@@ -314,7 +314,7 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_dstate0_acc_stored=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1 + CG2, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=cfg.scheduler_consumer_warps, producer=Producer.THREAD),
     )
 
 
@@ -4013,6 +4013,7 @@ class KdaBpropCfg:
     tmem_user_threads: int = 0
     cg1_sync_barrier_id: int = 4
     cg1_threads: int = 0
+    scheduler_consumer_warps: int = 0
 
     # ---- SMEM / TMEM stage counts + TMEM column offsets ------------------------------
     smem_raw_stages: int = CFG.SMEM_RAW_STAGES
@@ -4068,6 +4069,22 @@ class KdaBpropCfg:
     tma_state_bytes: int = 0
 
 
+def _validate_roles(role_ids: tuple, named_barrier_ids: tuple, cta_warps: int) -> int:
+    """Check the warp-role map and named-barrier slots; return the scheduler consumer count.
+
+    Every role warp except the TMA producer elects one arrival on ``mb_scheduler_done`` (the
+    upstream literal 15 for 16 role warps, 11 for 12), so an edited role map cannot silently
+    leave the scheduler ring under- or over-subscribed.
+    """
+    if len(set(role_ids)) != len(role_ids) or any(not 0 <= w < cta_warps for w in role_ids):
+        raise ValueError("warp roles must be disjoint IDs below the CTA warp count")
+    if len(set(named_barrier_ids)) != len(named_barrier_ids) or any(
+        not 1 <= barrier_id <= 15 for barrier_id in named_barrier_ids
+    ):
+        raise ValueError("named barrier IDs must be disjoint values in [1, 15]")
+    return len(role_ids) - 1
+
+
 def build_cfg(
     io_dtype: Type[cutlass.Numeric],
     gate_dtype: Type[cutlass.Numeric],
@@ -4101,6 +4118,23 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
     )
+    role_ids = (
+        *cfg.compute_group_0_warp_ids,
+        *cfg.compute_group_1_warp_ids,
+        *cfg.compute_group_2_warp_ids,
+        cfg.register_mma_warp_id,
+        cfg.tcgen05_mma_warp_id,
+        cfg.tma_warp_id,
+        cfg.epilogue_warp_id,
+    )
+    for group in (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids):
+        if len(group) != 4 or group != tuple(range(group[0], group[-1] + 1)):
+            raise ValueError("the fixed schedule requires contiguous four-warp compute groups")
+    scheduler_consumer_warps = _validate_roles(
+        role_ids,
+        (cfg.cg0_sync_barrier_id, cfg.cg2_sync_barrier_id, cfg.tmem_lifecycle_barrier_id, cfg.cg1_sync_barrier_id),
+        16,
+    )
     b_t, d_k, d_v, io_bytes = cfg.b_t, cfg.d_k, cfg.d_v, cfg.io_dtype.width // 8
     tmem_dstate_input_offset = d_k
     tmem_state_input_offset = tmem_dstate_input_offset + d_k // 2
@@ -4119,6 +4153,7 @@ def build_cfg(
     return replace(
         cfg,
         threads_per_cta=16 * cfg.threads_per_warp,
+        scheduler_consumer_warps=scheduler_consumer_warps,
         cg0_threads=len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp,
         cg2_threads=len(cfg.compute_group_2_warp_ids) * cfg.threads_per_warp,
         cg1_threads=len(cfg.compute_group_1_warp_ids) * cfg.threads_per_warp,

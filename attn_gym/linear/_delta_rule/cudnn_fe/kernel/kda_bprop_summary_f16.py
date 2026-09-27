@@ -92,6 +92,7 @@ from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from .kda_bprop_config import CFG
+from .kda_bprop_f16 import _validate_roles
 
 from ..tile_dsl.barrier import (
     launch_dependent_grids,
@@ -198,7 +199,7 @@ def make_bars(cfg) -> KdaBpropSummaryBars:
         mb_dstate0_acc_stored=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=cfg.scheduler_consumer_warps, producer=Producer.THREAD),
     )
 
 
@@ -2044,6 +2045,7 @@ class KdaBpropSummaryCfg:
     cg0_sync_barrier_id: int = 1
     cg0_threads: int = 0
     tmem_lifecycle_barrier_id: int = 3
+    scheduler_consumer_warps: int = 0
     tmem_user_threads: int = 0
 
     # ---- SMEM / TMEM stage counts + TMEM column offsets ------------------------------
@@ -2105,6 +2107,19 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
     )
+    # The bprop role map minus compute group 2: warps 8-11 launch (upstream 16-warp CTA) and exit
+    # after the role dispatch, so twelve warps consume the scheduler ring.
+    role_ids = (
+        *cfg.compute_group_0_warp_ids,
+        *cfg.compute_group_1_warp_ids,
+        cfg.register_mma_warp_id,
+        cfg.tcgen05_mma_warp_id,
+        cfg.tma_warp_id,
+        cfg.epilogue_warp_id,
+    )
+    scheduler_consumer_warps = _validate_roles(
+        role_ids, (cfg.cg0_sync_barrier_id, cfg.tmem_lifecycle_barrier_id), 16
+    )
     threads_per_cta = 16 * cfg.threads_per_warp
     cg0_threads = len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp
     tmem_user_threads = (1 + len(cfg.compute_group_1_warp_ids)) * cfg.threads_per_warp
@@ -2119,6 +2134,7 @@ def build_cfg(
     return replace(
         cfg,
         threads_per_cta=threads_per_cta,
+        scheduler_consumer_warps=scheduler_consumer_warps,
         cg0_threads=cg0_threads,
         tmem_user_threads=tmem_user_threads,
         tmem_dstate_acc_offset=0,

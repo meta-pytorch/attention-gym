@@ -94,6 +94,7 @@ from ..common.host import get_dtype
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
+from .kda_bprop_f16 import _validate_roles
 from .kda_recompute_config import CFG
 
 from ..tile_dsl.barrier import (
@@ -222,7 +223,7 @@ def make_bars(cfg) -> KdaRecomputeBars:
             alloc(cfg.smem_checkpoint_stages), try_wait=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
         ),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=cfg.scheduler_consumer_warps, producer=Producer.THREAD),
     )
 
 
@@ -2422,6 +2423,7 @@ class KdaRecomputeCfg:
     cg0_tile_entry_barrier_id: int = 5  # CG0-wide (both groups) work-item entry sync
     tmem_user_threads: int = 0
     tmem_lifecycle_barrier_id: int = 3
+    scheduler_consumer_warps: int = 0
     num_regs_compute_group_0: int = CFG.NUM_REGS_COMPUTE_GROUP_0
     num_regs_compute_group_1: int = CFG.NUM_REGS_COMPUTE_GROUP_1
     num_regs_other: int = CFG.NUM_REGS_OTHER
@@ -2510,6 +2512,25 @@ def build_cfg(
     if cfg.cg0_warps_per_group != len(cfg.compute_group_1_warp_ids):
         raise ValueError("the state halves are packed by one CG0 group and by CG1: their warp counts must match")
 
+    role_ids = (
+        *cfg.compute_group_0_warp_ids,
+        *cfg.compute_group_1_warp_ids,
+        cfg.register_mma_warp_id,
+        cfg.tcgen05_mma_warp_id,
+        cfg.tma_warp_id,
+        cfg.epilogue_warp_id,
+    )
+    if len(cfg.compute_group_0_warp_ids) != cfg.cg0_group_count * cfg.cg0_warps_per_group:
+        raise ValueError("compute group 0 must hold cg0_group_count groups of cg0_warps_per_group warps")
+    scheduler_consumer_warps = _validate_roles(
+        role_ids,
+        (
+            *(cfg.cg0_group_sync_barrier_base_id + g for g in range(cfg.cg0_group_count)),
+            cfg.cg0_tile_entry_barrier_id,
+            cfg.tmem_lifecycle_barrier_id,
+        ),
+        16,
+    )
     raw, b_t, d_k, d_v = cfg.smem_raw_stages, cfg.b_t, cfg.d_k, cfg.d_v
     io_bytes, gate_bytes = cfg.io_dtype.width // 8, cfg.gate_dtype.width // 8
     tmem_state_input_offset = cfg.tmem_state_acc_offset + d_k
@@ -2523,6 +2544,7 @@ def build_cfg(
     return replace(
         cfg,
         threads_per_cta=16 * cfg.threads_per_warp,
+        scheduler_consumer_warps=scheduler_consumer_warps,
         cg0_threads_per_group=cfg.cg0_warps_per_group * cfg.threads_per_warp,
         tmem_user_threads=(1 + len(cfg.compute_group_1_warp_ids) + len(cfg.compute_group_0_warp_ids)) * cfg.threads_per_warp,
         tmem_state_input_offset=tmem_state_input_offset,

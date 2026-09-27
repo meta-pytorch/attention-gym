@@ -254,6 +254,7 @@ ag_subject = "Validate GDN backward launch contracts and derive scheduler arriva
 ag_subjects_extra = [
   "Validate common cuDNN host launch contracts before compiling",
   "Preserve strided gate parameter layouts in host validation",
+  "Validate the KDA backward warp-role maps and derive the scheduler arrival count",
 ]
 guarding_tests = [
   "test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry",
