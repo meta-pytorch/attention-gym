@@ -25,6 +25,7 @@ from attn_gym.linear.context_parallel import (
 from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
 from attn_gym.linear.kda import chunk_kda
+from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import (
@@ -118,18 +119,66 @@ def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 def assert_sharded_matches(
-    name: str, actual: torch.Tensor, reference: torch.Tensor, unsharded: torch.Tensor, *, dtype
+    name: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    unsharded: torch.Tensor,
+    *,
+    dtype,
+    budget: torch.Tensor | None = None,
 ) -> None:
     """Sharding must not cost accuracy.
 
     Pointwise within the unsharded op's own budget against the FP32 oracle, and in aggregate
     within 1.5x of the unsharded op's relative RMS error: sharding only reorders accumulation, so
-    a systematic precision loss in the summary path would show up as a multiple.
+    a systematic precision loss in the summary path would show up as a multiple. ``budget`` is an
+    optional per-element absolute error floor the sharded result may meet instead (see
+    :func:`kda_dbeta_pack_budget`); it is reduced like the metric, so RMS(budget) / RMS(reference).
     """
     assert_matches_low_precision_reference(actual, reference, unsharded, name, source_dtype=dtype)
     sharded = relative_rms_error(actual, reference)
     baseline = relative_rms_error(unsharded, reference)
-    assert sharded <= 1.5 * baseline + 1e-6, (name, sharded, baseline)
+    floor = 0.0 if budget is None else relative_rms_error(reference + budget, reference)
+    assert sharded <= max(1.5 * baseline + 1e-6, floor), (name, sharded, baseline, floor)
+
+
+def kda_delta_residuals(
+    k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor
+) -> torch.Tensor:
+    """FP64 per-token delta-rule residual ``v_t - S_t k_t`` (decayed entering state) as [T, H, V]."""
+    k64, v64, decay, beta64 = (
+        k.double(),
+        v.double(),
+        (gate.double() * LOG2_E).exp2(),
+        beta.double(),
+    )
+    _, tokens, heads, dim_k = k.shape
+    state = torch.zeros(heads, v.shape[-1], dim_k, dtype=torch.float64, device=k.device)
+    residuals = torch.empty(tokens, heads, v.shape[-1], dtype=torch.float64, device=k.device)
+    for t in range(tokens):
+        state = state * decay[0, t][:, None, :]
+        residuals[t] = v64[0, t] - torch.einsum("hvk,hk->hv", state, k64[0, t])
+        state = state + torch.einsum("hv,hk->hvk", residuals[t] * beta64[0, t][:, None], k64[0, t])
+    return residuals
+
+
+def kda_dbeta_pack_budget(
+    inputs, d_value: torch.Tensor, token_ids: torch.Tensor, *, dtype
+) -> torch.Tensor:
+    """Per-token dBeta error the bf16/fp16 kernels' operand packing can produce, as [1, len, H].
+
+    ``dbeta_t = sum_v dY_tv * (v - S k)_tv`` where the kernels form ``dY`` from b16-packed MMA
+    operands (``dU`` and the state cotangent), so each product carries an independent relative
+    rounding of ``eps``; the random-walk sum is ``eps * ||dY_t * resid_t||_2``. ``dY = dv / beta``
+    since ``dv = beta * dY``. Sharding a document mid-chunk changes which rounding realization
+    the terminal chunk sees; with an O(1) FP32 state cotangent that chunk dominates the dbeta
+    RMS, so the sharded/unsharded ratio is noise (0.8x-1.8x over seeds) rather than a precision
+    signal, while every other gradient and every interior token stays at the 1.0x ratio.
+    """
+    _, k, v, gate, beta = inputs
+    residuals = kda_delta_residuals(k, v, gate, beta)[token_ids]
+    d_y = d_value[0, token_ids].double() / beta[0, token_ids].double()[..., None]
+    return (torch.finfo(dtype).eps * (d_y * residuals).norm(dim=-1))[None]
 
 
 def kda_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtype) -> Inputs:
@@ -696,7 +745,12 @@ def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout,
             sequence = result.plan.subsequences[index].sequence
             check("state", result.final_state[index], ref_final[sequence], final_state[sequence])
         names = ("dq", "dk", "dv", "dgate", "dbeta")
+        budgets = {}
+        if op.factory is kda_inputs:
+            budgets["dbeta"] = kda_dbeta_pack_budget(
+                (q, k, v, gate, beta), ref_grads[2], ids, dtype=dtype
+            )
         for name, actual, expected, reference in zip(
             names, result.grads, expected_grads, ref_grads, strict=True
         ):
-            check(name, actual, reference[:, ids], expected[:, ids])
+            check(name, actual, reference[:, ids], expected[:, ids], budget=budgets.get(name))

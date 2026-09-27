@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 19 modification rows below are generated from
+The 20 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 19 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 20 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -172,6 +172,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration`; `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
 | B2 | Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary`; `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary`; cutracer random_delay (hardening; tests pass without the fix) |
 | S14 | int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path` |
+| R8 | Sharded KDA dbeta bounded by the operand-pack budget | `test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op` |
 <!-- END GENERATED FIX LEDGER -->
 
 Superseded by v1.30 (no AG commit; tests kept): B1 seeded-state wait, B5 KDA FP32 factors,

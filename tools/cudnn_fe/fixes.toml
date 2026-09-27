@@ -281,6 +281,15 @@ guarding_tests = [
 ]
 upstream_status = "ag-specific"
 
+# --------------------------------------------------------------------------- tests / decisions
+[[fix]]
+id = "R8"
+title = "Sharded KDA dbeta bounded by the operand-pack budget"
+kind = "test"
+ag_subject = "Bound the sharded KDA dbeta error by the kernels' operand-pack budget"
+guarding_tests = ["test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op"]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.
 [[superseded]]

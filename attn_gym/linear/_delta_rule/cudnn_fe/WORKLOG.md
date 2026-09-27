@@ -177,6 +177,8 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   dedicated test.
 
 ### Other tests encoding decisions
+- **R8** — test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op:
+  sharded KDA dbeta bounded by an operand-pack budget (see Decisions).
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
   wait, B5 KDA FP32 factors, B11 terminal TMA overfetch (upstream bit-21 descriptor fix, NVIDIA
   #1013/#1015), B12 checkpoint `[V,K]` descriptors, S11 V-major state. Inherited from main: B4 dO
@@ -223,12 +225,15 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+| CP dbeta pack-budget criterion (R8) | The partial-chunk KDA-cuDNN CP case exceeded the old dbeta tolerance (2.9×) with both new and legacy summaries, i.e. rounding of the unsharded realization, not a bug. New bound: magnitude-weighted BF16 operand-pack budget; fail-closed (no-dstate penultimate chunk and a 1.01× terminal chunk both fail). | CP numerics change. |
 | Drop the replay-ABI upstream draft (B14) | Upstream has no optional-scheduler ABI; it would be a feature request. | Upstream makes the scheduler optional. |
 
 ## Known limitations and pre-existing issues (not fixed)
 
 - **FP16 tiny beta:** with all beta ≤ 1e-6, FP16 beta-scaled operands underflow (subnormal range);
   inherent to FP16, not the dBeta formula. BF16 is fine.
+- **FP16 KDA CP:** R8's six FP16 KDA-cuDNN CP cases are xfailed (`cuDNN FP16 gate overflow`).
+  KDA FP16 with `gate_scale=5` gives all-NaN output on main and v1.30 alike (FP16 range).
 - **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
