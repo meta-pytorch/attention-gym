@@ -208,6 +208,7 @@ kind = "restyle"
 ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
 ag_subjects_extra = [
   "Share exact legacy dynamic-layout fake signatures",
+  "Share static tensor ABI specifications for bundled hosts",
   "Compile common v1.30 hosts from persisted fake tensor signatures",
   "Compile the v1.30 GDN forward hosts from persisted fake tensor signatures",
 ]
