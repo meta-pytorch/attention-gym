@@ -202,6 +202,16 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Fix:** `aligned()` copies such gate/beta into a 16-byte base (`plan.py`).
 - **Tests:** GL::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta. Fails without = YES.
 
+### R15 — Composed KDA stateful backward got a strided/misaligned beta
+- **Found by:** review round on the stack: a 4-byte-offset or token-strided forward beta failed in
+  the composed stateful backward (pre-existing adapter bug, not a kernel bug).
+- **Fix:** `_compact_beta` in `../../kda/impl/cudnn.py` before
+  `chunk_bwd_recompute_factors_with_state_grad_op`, then made Dynamo-traceable. "Compact beta before
+  the composed KDA cuDNN stateful backward", "Make the KDA beta compaction traceable under
+  torch.compile".
+- **Tests:** KT::test_cudnn_stateful_backward_accepts_forward_beta_layouts,
+  KT::test_cudnn_training_fullgraph_and_six_gradients. Fails without = YES.
+
 ### R3 — Warmup forward state fakes shared one symbolic extent
 - A shared symbol forced equal extents on the distinct `state_in`/`state_out` fakes. Found while
   writing the fake signatures; "Give the warmup forward state signatures independent extents". No
@@ -264,6 +274,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 | Decision | Rationale / evidence | Revisit when |
 |---|---|---|
 | Shape-dependent KDA plans + pinned-plan tests | Auto plans keep v1.30 prep (fwd) and exact chain (bwd): T8192 H48 fwd 443.7→341.4 µs, fwd+bwd 2612.7→1836.8; T32768 H48 fwd+bwd 10362→6250. Prep/chain change arithmetic order, so bitwise tests pin the uncut plan and auto-plan companions use rel-L2 < 1e-2 (GDN policy from #604). | Planner heuristics change or new GPU. |
+| KDA stateful backward via the composed op | Public `chunk_kda` with `initial_state` backprops through `chunk_bwd_recompute_factors_with_state_grad_op`; the native stateful bprop is exercised directly by B3's test. R15 hardened its beta. | Routing public stateful bwd to the native kernel (then retarget R9's stress test). |
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
@@ -279,6 +290,8 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
+- **Default-backend beta alignment:** the default (non-cuDNN) WY backend requires a 128-byte-aligned
+  beta; outside cuDNN (R15 fixed only the composed cuDNN path).
 - **Shapes:** the cuDNN GDN/KDA adapters require `q.shape == [1, T, H, 128]` (V = 128); summaries
   derive V, K ∈ {64, 128}.
 - Single-token KDA dgate leaves a 6e-10 residual vs an exact-zero reference.

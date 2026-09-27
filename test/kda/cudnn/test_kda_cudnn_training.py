@@ -881,6 +881,50 @@ def test_cudnn_rejects_mismatched_value_and_beta_shapes() -> None:
         )
 
 
+def _strided_beta(beta: torch.Tensor, layout: str) -> torch.Tensor:
+    """A beta view the public contract accepts but the composed stateful backward ABI rejects."""
+    if layout == "misaligned":
+        storage = torch.empty(beta.numel() + 1, device=beta.device)
+        view = storage[1:].view_as(beta)  # 4-byte base offset
+    else:
+        heads = beta.shape[-1]
+        view = torch.empty(*beta.shape[:-1], 3 * heads, device=beta.device)[..., :heads]
+    view.copy_(beta)
+    return view
+
+
+@pytest.mark.parametrize("layout", ["misaligned", "token_strided"])
+@pytest.mark.parametrize("state", ["initial", "final_only"])
+def test_cudnn_stateful_backward_accepts_forward_beta_layouts(layout: str, state: str) -> None:
+    """Beta layouts the cuDNN forward accepts must also train through the composed backward.
+
+    The fused stateful backward requires a contiguous, 128-byte-aligned beta; the adapter has
+    to compact the saved beta instead of forwarding the caller's view.
+    """
+    from attn_gym.linear import chunk_kda
+
+    q, k, value, gate, beta, initial_state, cu_seqlens = _make_inputs(requires_grad=False)
+    if state == "final_only":
+        initial_state = None
+    results = []
+    for candidate in (beta, _strided_beta(beta, layout)):
+        inputs = tuple(
+            tensor.detach().clone().requires_grad_() if index != 4 else candidate.requires_grad_()
+            for index, tensor in enumerate((q, k, value, gate, beta))
+        )
+        leaves = inputs if initial_state is None else (*inputs, initial_state.requires_grad_())
+        output, final_state = chunk_kda(
+            *inputs,
+            None if initial_state is None else initial_state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options={"backend": "cudnn"},
+        )
+        results.append(torch.autograd.grad((output, final_state), leaves, (output, final_state)))
+    for expected, actual in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
     reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
