@@ -19,18 +19,17 @@
 # attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
 # jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream.
 
-"""One compiled launch for the GDN chain forward: chain prologue, T pass, fused summary, fp32 state chain and prefill issued
-from a single host, the way ``split_k.run_table`` launches plan, scan and walk.  Every kernel, its host and the tensor
-placeholder each host was compiled with are the standalone modules' own; this host only sequences the five launches, so the
-kernels' SASS is unchanged and the Python side crosses into the DSL once per call instead of five times.  A buffer that two
-hosts read through different signature types (the summary's ``state_out`` is the state chain's ``H``) is passed twice, once
-per type."""
-
-from typing import Optional
+"""One compiled launch for the GDN chain forward: chain prologue, T pass, fused summary, fp32 state
+chain and prefill issued from a single host, the way ``split_k.run_table`` launches plan, scan and
+walk.  Every kernel, its host and the tensor placeholder each host was compiled with are the
+standalone modules' own; this host only sequences the five launches, so the kernels' SASS is
+unchanged and the Python side crosses into the DSL once per call instead of five times.  A buffer
+that two hosts read through different signature types (the summary's ``state_out`` is the state
+chain's ``H``) is passed twice, once per type."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
@@ -74,8 +73,8 @@ def chain_forward_host(
     v: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
+    a_log: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
@@ -99,12 +98,12 @@ def chain_forward_host(
     state_h_chain: cute.Tensor,
     state_m_chain: cute.Tensor,
     state_x_chain: cute.Tensor,
-    seed: Optional[cute.Tensor],
-    seed_indices: Optional[cute.Tensor],
+    seed: cute.Tensor | None,
+    seed_indices: cute.Tensor | None,
     state_x_prefill: cute.Tensor,
-    final_state: Optional[cute.Tensor],
-    final_indices: Optional[cute.Tensor],
-    checkpoints: Optional[cute.Tensor],
+    final_state: cute.Tensor | None,
+    final_indices: cute.Tensor | None,
+    checkpoints: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     gdn_chain_prologue_f16.chain_prologue(
@@ -153,7 +152,21 @@ def chain_forward_host(
         tinv,
         stream,
     )
-    gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
+    gdn_tinv_f16.host(
+        tinv_cfg,
+        False,
+        k,
+        tinv_words,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        cu_pieces,
+        tinv,
+        tinv_rows,
+        tinv_row_count,
+        stream,
+    )
     gdn_summary_f16.host(
         summary_cfg,
         k,
@@ -263,7 +276,9 @@ def _compile_chain_forward(
         )
 
     def work_items():
-        return make_compact_signature_tensor(cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16)
+        return make_compact_signature_tensor(
+            cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16
+        )
 
     def rows():
         return make_compact_signature_tensor(cutlass.Int32, (sym_int(),), assumed_align=16)
@@ -450,9 +465,10 @@ def build_chain_forward(
     chain_rows,
     num_sm,
 ):
-    """Return the compiled chain forward launch over the buffers of one plan: compiled (and persisted) once per static
-    configuration (dtypes, dims, gate flags, checkpoint, seed and final-state presence, chain rows, device); ``pieces``,
-    ``heads_out`` and ``num_seqs`` are launch arguments."""
+    """Return the compiled chain forward launch over the buffers of one plan: compiled (and
+    persisted) once per static configuration (dtypes, dims, gate flags, checkpoint, seed and
+    final-state presence, chain rows, device); ``pieces``, ``heads_out`` and ``num_seqs`` are
+    launch arguments."""
     DK = q.shape[2]
     DV = v.shape[2]
     if not safe_gate:
@@ -462,7 +478,21 @@ def build_chain_forward(
         raise TypeError("the chain states must share one dtype")
     # Every tensor the launch addresses; bounded int32 tables and counters excepted.
     use_int64_offsets = requires_int64_abi(
-        q, k, v, gate, beta, a_log, dt_bias, o, tinv, state_h, state_m, state_x, seed, final_state, checkpoints
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        o,
+        tinv,
+        state_h,
+        state_m,
+        state_x,
+        seed,
+        final_state,
+        checkpoints,
     )
     return _compile_chain_forward(
         get_dtype(q.dtype),
@@ -534,8 +564,8 @@ def run_chain_forward(
     checkpoint_every_n_tokens,
     scale,
 ) -> None:
-    """Replay the chain forward on the current stream: one crossing into the DSL for the five launches.  The plan
-    validated the contract at build, so nothing here raises."""
+    """Replay the chain forward on the current stream: one crossing into the DSL for the five
+    launches.  The plan validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),

@@ -19,20 +19,20 @@
 # attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
 # jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream.
 
-"""One compiled launch for the GDN warmup, uncut and dv_split forwards: the split-K table (plan, scan and walk, warmup only), the
-prefill prologue and the prefill issued from a single host, the way ``split_k.launch`` already sequences its three kernels.
-Every kernel, its host and the tensor placeholder each host was compiled with are the standalone modules' own; this host
-only sequences the launches, so the kernels' SASS is unchanged and the Python side crosses into the DSL once per call
-instead of two or three times.  A buffer that two hosts read through different signature types is passed twice, once per
-type: the table reads the gate at its element alignment, dt_bias, work_items, work_count and item_scratch as 4-byte
-views, cu_seqlens at 4 bytes; the prologue and prefill read the same buffers at the standalone prefill wrapper's
-alignments."""
-
-from typing import Optional
+"""One compiled launch for the GDN warmup, uncut and dv_split forwards: the split-K table (plan,
+scan and walk, warmup only), the prefill prologue and the prefill issued from a single host, the
+way ``split_k.launch`` already sequences its three kernels. Every kernel, its host and the tensor
+placeholder each host was compiled with are the standalone modules' own; this host only sequences
+the launches, so the kernels' SASS is unchanged and the Python side crosses into the DSL once per
+call instead of two or three times.  A buffer that two hosts read through different signature types
+is passed twice, once per
+type: the table reads the gate at its element alignment, dt_bias, work_items, work_count and
+item_scratch as 4-byte views, cu_seqlens at 4 bytes; the prologue and prefill read the same buffers
+at the standalone prefill wrapper's alignments."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -84,28 +84,28 @@ def warmup_forward_host(
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
-    gate_table: Optional[cute.Tensor],
-    a_log: Optional[cute.Tensor],
-    a_log_table: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    dt_bias_table: Optional[cute.Tensor],
-    beta: Optional[cute.Tensor],
+    gate_table: cute.Tensor | None,
+    a_log: cute.Tensor | None,
+    a_log_table: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
+    dt_bias_table: cute.Tensor | None,
+    beta: cute.Tensor | None,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
-    state_in: Optional[cute.Tensor],
-    state_out: Optional[cute.Tensor],
-    seed_indices: Optional[cute.Tensor],
-    final_indices: Optional[cute.Tensor],
-    has_initial_state: Optional[cute.Tensor],
-    checkpoints: Optional[cute.Tensor],
+    state_in: cute.Tensor | None,
+    state_out: cute.Tensor | None,
+    seed_indices: cute.Tensor | None,
+    final_indices: cute.Tensor | None,
+    has_initial_state: cute.Tensor | None,
+    checkpoints: cute.Tensor | None,
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
     work_count: cute.Tensor,
     work_count_table: cute.Tensor,
-    staging: Optional[cute.Tensor],
-    item_scratch: Optional[cute.Tensor],
-    chunk_scratch: Optional[cute.Tensor],
+    staging: cute.Tensor | None,
+    item_scratch: cute.Tensor | None,
+    chunk_scratch: cute.Tensor | None,
     scheduler: cute.Tensor,
     workspace: cute.Tensor,
     stream: cuda.CUstream,
@@ -242,7 +242,9 @@ def _compile_warmup_forward(
         )
 
     def work_items(align):
-        return make_compact_signature_tensor(cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=align)
+        return make_compact_signature_tensor(
+            cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=align
+        )
 
     prefill_cfg = gdn_prefill_f16.build_cfg(
         io_dtype,
@@ -288,7 +290,14 @@ def _compile_warmup_forward(
         tiles_per_head,
         use_int64_offsets,
     )
-    dtypes = (io_dtype, state_dtype, gate_dtype, a_log_dtype, None if bias_spec is None else bias_spec[0], beta_dtype)
+    dtypes = (
+        io_dtype,
+        state_dtype,
+        gate_dtype,
+        a_log_dtype,
+        None if bias_spec is None else bias_spec[0],
+        beta_dtype,
+    )
     name = "gdn_warmup_forward_" + "_".join(str(int(flag)) for flag in flags)
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
     name += f"_biasrank{0 if bias_spec is None else bias_spec[1]}"
@@ -333,7 +342,9 @@ def _compile_warmup_forward(
         tensor(state_dtype, 4, 16) if store_final_state else None,
         make_counter_signature(sym_int()) if has_seed_indices else None,
         make_counter_signature(sym_int()) if has_final_indices else None,
-        make_compact_signature_tensor(cutlass.Uint8, (sym_int(),), assumed_align=1) if has_initial_state else None,
+        make_compact_signature_tensor(cutlass.Uint8, (sym_int(),), assumed_align=1)
+        if has_initial_state
+        else None,
         tensor(io_dtype, 4, 16) if enable_checkpoints else None,
         work_items(16),
         work_items(4),
@@ -387,8 +398,9 @@ def build_warmup_forward(
     has_initial_state=None,
     paged_state=False,
 ):
-    """Return ``(compiled, facts)`` for the warmup or uncut forward over the buffers of one plan: the launch is compiled
-    (and persisted) once per static configuration, so every shape-dependent value is a launch argument."""
+    """Return ``(compiled, facts)`` for the warmup or uncut forward over the buffers of one plan:
+    the launch is compiled (and persisted) once per static configuration, so every shape-dependent
+    value is a launch argument."""
     DK = q.shape[2]
     DV = v.shape[2]
     if not safe_gate:
@@ -477,8 +489,9 @@ def run_warmup_forward(
     scale,
     has_initial_state=None,
 ) -> None:
-    """Replay the warmup or uncut forward on the current stream: one crossing into the DSL for the table, prologue and
-    prefill launches.  The plan validated the contract at build, so nothing here raises."""
+    """Replay the warmup or uncut forward on the current stream: one crossing into the DSL for the
+    table, prologue and prefill launches.  The plan validated the contract at build, so nothing
+    here raises."""
     compiled(
         facts.n_heads_out,
         facts.n_tiles,

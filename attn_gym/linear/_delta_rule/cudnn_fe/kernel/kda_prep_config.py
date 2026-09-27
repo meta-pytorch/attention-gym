@@ -18,9 +18,9 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe.
 
-"""Fixed compile-time constants of the KDA prep (SM100 / SM103 / SM107): the five per-(chunk, head) prep records
-(k_decay, q_decay, t, a, diag) of the BT = 16 schedule ahead of the prep-fed prefill; the per-compile attributes
-live on ``KdaPrepCfg`` in the kernel file.
+"""Fixed compile-time constants of the KDA prep (SM100 / SM103 / SM107): the five per-(chunk, head)
+prep records (k_decay, q_decay, t, a, diag) of the BT = 16 schedule ahead of the prep-fed prefill;
+the per-compile attributes live on ``KdaPrepCfg`` in the kernel file.
 """
 
 from dataclasses import dataclass

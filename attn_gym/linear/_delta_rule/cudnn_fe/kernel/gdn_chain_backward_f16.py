@@ -17,25 +17,25 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe.
-# Modified by Attention Gym in 2026: persistent jit_cache compiles on fake-tensor TVM-FFI signatures
-# (legacy placeholder ABI) with an int64-shape variant.
+# Modified by Attention Gym in 2026: persistent jit_cache compiles on fake-tensor TVM-FFI
+# signatures (legacy placeholder ABI) with an int64-shape variant.
 
-"""Two compiled launches for the GDN chain backward.  The head (``--opt-level 2``, the option of the T pass, the summary and
-the recompute) runs the chain prologue, the T pass, the fused H and M summary and the forward state chain (M alone from the
-recompute when the forward's series is passed back) and the seeded series recompute; the tail (``--opt-level 2``, the option
-of the bprop summary and the bprop) runs the G summary, the reverse state chain and the bprop.  The series recompute moves
-ahead of the G summary (it depends only on the forward chain); the reverse chain is the one GDN kernel compiled at 2
-while GDN's standalone level is 3 (same instruction count, one runtime division per CTA folded differently).  The bprop module is a constexpr argument; only gdn_bprop_f16
-is vendored (upstream's GDP d_v = 64 fork is not).  Every kernel, its host and the tensor placeholder each host
-was compiled with are the standalone modules' own; a buffer two hosts read through different placeholder types is passed
-twice, once per type (H, M and X: the summary's and recompute's mode-3 compact views against the state chain's ``(1, HO, V,
-K)`` device views)."""
-
-from typing import Optional
+"""Two compiled launches for the GDN chain backward.  The head (``--opt-level 2``, the option of
+the T pass, the summary and the recompute) runs the chain prologue, the T pass, the fused H and M
+summary and the forward state chain (M alone from the recompute when the forward's series is passed
+back) and the seeded series recompute; the tail (``--opt-level 2``, the option of the bprop summary
+and the bprop) runs the G summary, the reverse state chain and the bprop.  The series recompute
+moves ahead of the G summary (it depends only on the forward chain); the reverse chain is the one
+GDN kernel compiled at 2 while GDN's standalone level is 3 (same instruction count, one runtime
+division per CTA folded differently).  The bprop module is a constexpr argument; only gdn_bprop_f16
+is vendored (upstream's GDP d_v = 64 fork is not).  Every kernel, its host and the tensor
+placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
+through different placeholder types is passed twice, once per type (H, M and X: the summary's and
+recompute's mode-3 compact views against the state chain's ``(1, HO, V, K)`` device views)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -44,7 +44,14 @@ from ..common.host import get_dtype, validate_cuda_tensors
 from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
 from ..common.piece_chain import CHAIN_WARPS, dtype_name, launch_state_chain
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
-from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_chain_prologue_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
+from . import (
+    gdn_bprop_f16,
+    gdn_bprop_summary_f16,
+    gdn_chain_prologue_f16,
+    gdn_recompute_f16,
+    gdn_summary_f16,
+    gdn_tinv_f16,
+)
 
 
 @cute.jit
@@ -77,8 +84,8 @@ def chain_backward_head_host(
     do: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
+    a_log: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
@@ -87,10 +94,10 @@ def chain_backward_head_host(
     summary_count: cute.Tensor,
     work_items: cute.Tensor,
     work_items_summary: cute.Tensor,
-    series_items: Optional[cute.Tensor],
-    series_count: Optional[cute.Tensor],
-    recompute_items: Optional[cute.Tensor],
-    recompute_count: Optional[cute.Tensor],
+    series_items: cute.Tensor | None,
+    series_count: cute.Tensor | None,
+    recompute_items: cute.Tensor | None,
+    recompute_count: cute.Tensor | None,
     scheduler_all: cute.Tensor,
     scheduler_recompute: cute.Tensor,
     scheduler_m: cute.Tensor,
@@ -98,9 +105,9 @@ def chain_backward_head_host(
     tinv_words: cute.Tensor,
     tinv_rows: cute.Tensor,
     tinv_row_count: cute.Tensor,
-    summary_words: Optional[cute.Tensor],
+    summary_words: cute.Tensor | None,
     recompute_m_words: cute.Tensor,
-    series_words: Optional[cute.Tensor],
+    series_words: cute.Tensor | None,
     bprop_summary_words: cute.Tensor,
     bprop_words: cute.Tensor,
     checkpoints: cute.Tensor,
@@ -110,14 +117,14 @@ def chain_backward_head_host(
     summary_q: cute.Tensor,
     summary_do: cute.Tensor,
     tinv: cute.Tensor,
-    state_h_summary: Optional[cute.Tensor],
+    state_h_summary: cute.Tensor | None,
     state_m_main: cute.Tensor,
-    state_h_chain: Optional[cute.Tensor],
-    state_m_chain: Optional[cute.Tensor],
-    state_x_chain: Optional[cute.Tensor],
-    seed: Optional[cute.Tensor],
-    state_x_series: Optional[cute.Tensor],
-    seed_checkpoints: Optional[cute.Tensor],
+    state_h_chain: cute.Tensor | None,
+    state_m_chain: cute.Tensor | None,
+    state_x_chain: cute.Tensor | None,
+    seed: cute.Tensor | None,
+    state_x_series: cute.Tensor | None,
+    seed_checkpoints: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     gdn_chain_prologue_f16.chain_prologue(
@@ -166,7 +173,21 @@ def chain_backward_head_host(
         tinv,
         stream,
     )
-    gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
+    gdn_tinv_f16.host(
+        tinv_cfg,
+        False,
+        k,
+        tinv_words,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        cu_pieces,
+        tinv,
+        tinv_rows,
+        tinv_row_count,
+        stream,
+    )
     if cutlass.const_expr(fused_h_m):
         gdn_summary_f16.host(
             summary_cfg,
@@ -268,15 +289,15 @@ def chain_backward_tail_host(
     summary_q: cute.Tensor,
     k: cute.Tensor,
     gate: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
+    a_log: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
     summary_do: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
     state_g: cute.Tensor,
     state_m_chain: cute.Tensor,
     state_dx_end: cute.Tensor,
-    seed: Optional[cute.Tensor],
+    seed: cute.Tensor | None,
     q: cute.Tensor,
     v: cute.Tensor,
     beta: cute.Tensor,
@@ -286,9 +307,9 @@ def chain_backward_tail_host(
     dv: cute.Tensor,
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
-    dstate0: Optional[cute.Tensor],
-    inv_q: Optional[cute.Tensor],
-    inv_k: Optional[cute.Tensor],
+    dstate0: cute.Tensor | None,
+    inv_q: cute.Tensor | None,
+    inv_k: cute.Tensor | None,
     tinv: cute.Tensor,
     work_items_summary: cute.Tensor,
     summary_count: cute.Tensor,
@@ -405,8 +426,25 @@ def _as_dtype(spec, dtype):
 
 
 def _build_cfgs(cfg_args):
-    (io_dtype, state_h_dtype, state_m_dtype, state_x_dtype, num_sm, d_k, d_v, expand_num, fused_h_m, series, coarse,
-     log_gate, safe_gate, use_beta_sigmoid, allow_neg_eigval, use_dstate0, fused_l2norm) = cfg_args
+    (
+        io_dtype,
+        state_h_dtype,
+        state_m_dtype,
+        state_x_dtype,
+        num_sm,
+        d_k,
+        d_v,
+        expand_num,
+        fused_h_m,
+        series,
+        coarse,
+        log_gate,
+        safe_gate,
+        use_beta_sigmoid,
+        allow_neg_eigval,
+        use_dstate0,
+        fused_l2norm,
+    ) = cfg_args
     io = get_dtype(io_dtype)
     tinv_cfg = gdn_tinv_f16.build_cfg(
         io,
@@ -500,10 +538,25 @@ def _name(prefix, constexprs, use_int64_offsets):
 
 
 @jit_cache
-def _compile_chain_backward_head(constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool):
+def _compile_chain_backward_head(
+    constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool
+):
     """Compile the chain-backward head over the upstream dynamic-layout tensor ABI."""
     tinv_cfg, summary_cfg, transition_cfg, series_cfg, _, _ = _build_cfgs(cfg_args)
-    unit_chunks, b_t, expand_num, length_rule, compact_qdo, summary_q_step, fused_h_m, series, dim_v, dim_k, rows, has_seed = constexprs
+    (
+        unit_chunks,
+        b_t,
+        expand_num,
+        length_rule,
+        compact_qdo,
+        summary_q_step,
+        fused_h_m,
+        series,
+        dim_v,
+        dim_k,
+        rows,
+        has_seed,
+    ) = constexprs
     return compile_tvm_ffi(
         chain_backward_head_host,
         unit_chunks,
@@ -524,13 +577,17 @@ def _compile_chain_backward_head(constexprs: tuple, cfg_args: tuple, specs: tupl
         has_seed,
         *(cutlass.Int32(0) for _ in range(6)),
         *(make_signature(spec, use_int64_offsets=use_int64_offsets) for spec in specs),
-        name=_name("gdn_cudnn_chain_backward_head", constexprs, use_int64_offsets) + "_" + "_".join(cfg_args[:4]),
+        name=_name("gdn_cudnn_chain_backward_head", constexprs, use_int64_offsets)
+        + "_"
+        + "_".join(cfg_args[:4]),
         opt_level=2,
     )
 
 
 @jit_cache
-def _compile_chain_backward_tail(constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool):
+def _compile_chain_backward_tail(
+    constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool
+):
     """Compile the chain-backward tail over the upstream dynamic-layout tensor ABI."""
     *_, bwd_summary_cfg, bprop_cfg = _build_cfgs(cfg_args)
     compact_qdo, dim_v, dim_k, rows, has_dseed = constexprs
@@ -547,74 +604,218 @@ def _compile_chain_backward_tail(constexprs: tuple, cfg_args: tuple, specs: tupl
         *(cutlass.Int32(0) for _ in range(3)),
         cutlass.Float32(1.0),
         *(make_signature(spec, use_int64_offsets=use_int64_offsets) for spec in specs),
-        name=_name("gdn_cudnn_chain_backward_tail", constexprs, use_int64_offsets) + "_" + "_".join(cfg_args[:4]),
+        name=_name("gdn_cudnn_chain_backward_tail", constexprs, use_int64_offsets)
+        + "_"
+        + "_".join(cfg_args[:4]),
         opt_level=2,
     )
 
 
 def _validate_launch(
-    *, q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, cu_pieces, main_rows, summary_rows, main_count,
-    summary_count, work_items, work_items_summary, series_items, series_count, scheduler_all, scheduler_recompute,
-    scheduler_m, scheduler_series, scheduler_summary, scheduler_bwd, tinv_words, tinv_rows, tinv_row_count,
-    summary_words, recompute_m_words, series_words, bprop_summary_words, bprop_words, checkpoints, seed_checkpoints,
-    dq, dk, dv, dgate, dbeta, summary_q, summary_do, tinv, state_h, state_m, state_x, state_g, state_dx_end, seed,
-    dseed, dstate0, inv_q, inv_k, pieces, heads_out, num_seqs, unit_chunks, b_t, expand_num, summary_q_step,
-    fused_h_m, series, coarse, chain_rows, num_sm,
+    *,
+    q,
+    k,
+    v,
+    do,
+    gate,
+    beta,
+    a_log,
+    dt_bias,
+    cu_seqlens,
+    cu_pieces,
+    main_rows,
+    summary_rows,
+    main_count,
+    summary_count,
+    work_items,
+    work_items_summary,
+    series_items,
+    series_count,
+    scheduler_all,
+    scheduler_recompute,
+    scheduler_m,
+    scheduler_series,
+    scheduler_summary,
+    scheduler_bwd,
+    tinv_words,
+    tinv_rows,
+    tinv_row_count,
+    summary_words,
+    recompute_m_words,
+    series_words,
+    bprop_summary_words,
+    bprop_words,
+    checkpoints,
+    seed_checkpoints,
+    dq,
+    dk,
+    dv,
+    dgate,
+    dbeta,
+    summary_q,
+    summary_do,
+    tinv,
+    state_h,
+    state_m,
+    state_x,
+    state_g,
+    state_dx_end,
+    seed,
+    dseed,
+    dstate0,
+    inv_q,
+    inv_k,
+    pieces,
+    heads_out,
+    num_seqs,
+    unit_chunks,
+    b_t,
+    expand_num,
+    summary_q_step,
+    fused_h_m,
+    series,
+    coarse,
+    chain_rows,
+    num_sm,
 ):
-    """Check the chain backward buffers of one plan: ``num_seqs * pieces`` piece series and piece tables."""
+    """Check the chain backward buffers of one plan: ``num_seqs * pieces`` piece series and piece
+    tables."""
     if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 2 or gate.shape[1] != heads_out:
         raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
     if min(pieces, unit_chunks, summary_q_step, num_sm) < 1:
         raise ValueError("pieces, unit_chunks, summary_q_step and num_sm must be positive")
     num_pieces = num_seqs * pieces
     gdn_bprop_f16.validate_bwd_bundle(
-        q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
-        num_pieces=num_pieces, expand_num=expand_num, b_t=b_t, dgate=dgate, dbeta=dbeta, a_log=a_log,
-        dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        gate,
+        beta,
+        cu_seqlens,
+        checkpoints,
+        tinv,
+        tinv_rows,
+        tinv_row_count,
+        bprop_words,
+        num_pieces=num_pieces,
+        expand_num=expand_num,
+        b_t=b_t,
+        dgate=dgate,
+        dbeta=dbeta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        inv_q=inv_q,
+        inv_k=inv_k,
     )
-    tables = dict(
-        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
-        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
-        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
-        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
-        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd,
+    tables = {
+        "cu_pieces": cu_pieces,
+        "main_rows": main_rows,
+        "summary_rows": summary_rows,
+        "main_count": main_count,
+        "summary_count": summary_count,
+        "work_items": work_items,
+        "work_items_summary": work_items_summary,
+        "series_items": series_items,
+        "series_count": series_count,
+        "scheduler_all": scheduler_all,
+        "scheduler_recompute": scheduler_recompute,
+        "scheduler_m": scheduler_m,
+        "scheduler_series": scheduler_series,
+        "scheduler_summary": scheduler_summary,
+        "scheduler_bwd": scheduler_bwd,
+    }
+    states = {
+        "state_h": state_h,
+        "state_m": state_m,
+        "state_x": state_x,
+        "state_g": state_g,
+        "state_dx_end": state_dx_end,
+    }
+    words = {
+        "tinv_words": tinv_words,
+        "summary_words": summary_words,
+        "recompute_m_words": recompute_m_words,
+        "series_words": series_words,
+        "bprop_summary_words": bprop_summary_words,
+    }
+    operands = {
+        "summary_q": summary_q,
+        "summary_do": summary_do,
+        "seed_checkpoints": seed_checkpoints,
+    }
+    validate_cuda_tensors(
+        q, **tables, **states, **words, **operands, seed=seed, dseed=dseed, dstate0=dstate0
     )
-    states = dict(state_h=state_h, state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end)
-    words = dict(
-        tinv_words=tinv_words, summary_words=summary_words, recompute_m_words=recompute_m_words,
-        series_words=series_words, bprop_summary_words=bprop_summary_words,
-    )
-    operands = dict(summary_q=summary_q, summary_do=summary_do, seed_checkpoints=seed_checkpoints)
-    validate_cuda_tensors(q, **tables, **states, **words, **operands, seed=seed, dseed=dseed, dstate0=dstate0)
     dim_v, dim_k = v.shape[2], q.shape[2]
     if chain_rows < CHAIN_WARPS or dim_v % chain_rows or chain_rows % CHAIN_WARPS:
         raise ValueError("chain_rows must divide d_v and contain whole chain warp groups")
-    for name, entries in (("cu_pieces", num_pieces + 1), ("main_rows", num_seqs + 1), ("summary_rows", num_seqs + 1)):
-        validate_tensor(name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16)
-    counters = ("main_count", "summary_count", *(name for name in tables if name.startswith("scheduler")))
+    for name, entries in (
+        ("cu_pieces", num_pieces + 1),
+        ("main_rows", num_seqs + 1),
+        ("summary_rows", num_seqs + 1),
+    ):
+        validate_tensor(
+            name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16
+        )
+    counters = (
+        "main_count",
+        "summary_count",
+        *(name for name in tables if name.startswith("scheduler")),
+    )
     for name in (*counters, *(("series_count",) if series and coarse else ())):
         validate_tensor(name, tables[name], (None,), ("int32",), align=4, min_rows=1)
-    for name in ("work_items", "work_items_summary", *(("series_items",) if series and coarse else ())):
+    for name in (
+        "work_items",
+        "work_items_summary",
+        *(("series_items",) if series and coarse else ()),
+    ):
         validate_tensor(
-            name, tables[name], (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=num_pieces * heads_out
+            name,
+            tables[name],
+            (None, WORK_ITEM_FIELDS),
+            ("int32",),
+            compact=True,
+            min_rows=num_pieces * heads_out,
         )
     for name, tensor in states.items():
-        if name == "state_h" and not fused_h_m or name == "state_x" and not (fused_h_m or series and not coarse):
+        if (
+            name == "state_h"
+            and not fused_h_m
+            or name == "state_x"
+            and not (fused_h_m or series and not coarse)
+        ):
             continue
         width = dim_k if name == "state_m" else dim_v
-        validate_tensor(name, tensor, (None, heads_out, width, dim_k), gdn_bprop_f16.STATE_DTYPES, min_rows=num_pieces)
+        validate_tensor(
+            name,
+            tensor,
+            (None, heads_out, width, dim_k),
+            gdn_bprop_f16.STATE_DTYPES,
+            min_rows=num_pieces,
+        )
     for name, tensor in (("seed", seed), ("dseed", dseed), ("dstate0", dstate0)):
         if tensor is not None:
             validate_tensor(
-                name, tensor, (None, heads_out, dim_v, dim_k), gdn_bprop_f16.STATE_DTYPES,
-                align=16 if name == "dstate0" else 4, min_rows=num_seqs,
+                name,
+                tensor,
+                (None, heads_out, dim_v, dim_k),
+                gdn_bprop_f16.STATE_DTYPES,
+                align=16 if name == "dstate0" else 4,
+                min_rows=num_seqs,
             )
     io = (str(q.dtype).removeprefix("torch."),)
     validate_tensor("summary_q", summary_q, (None, None, dim_k), io, tma=True)
     validate_tensor("summary_do", summary_do, (None, heads_out, dim_v), io, tma=True)
     if coarse:
         validate_tensor(
-            "seed_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k), (*gdn_bprop_f16.STATE_DTYPES, *io)
+            "seed_checkpoints",
+            seed_checkpoints,
+            (None, heads_out, dim_v, dim_k),
+            (*gdn_bprop_f16.STATE_DTYPES, *io),
         )
     for name, module, needed in (
         ("tinv_words", gdn_tinv_f16, True),
@@ -706,9 +907,10 @@ def build_chain_backward(
     num_sm,
     stream,
 ):
-    """Compile (cached per static config) the head and tail launches of the chain backward over the buffers of one plan;
-    ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone
-    modules' builds so every kernel compiles as it does there."""
+    """Compile (cached per static config) the head and tail launches of the chain backward over the
+    buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The
+    placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it
+    does there."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -716,23 +918,75 @@ def build_chain_backward(
         a_log = None
         dt_bias = None
     if bprop_module is not gdn_bprop_f16 or compact_qdo:
-        raise ValueError("the GDN chain backward supports only the gdn_bprop_f16 bprop without compact_qdo")
+        raise ValueError(
+            "the GDN chain backward supports only the gdn_bprop_f16 bprop without compact_qdo"
+        )
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
-        q=q, k=k, v=v, do=do, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, cu_seqlens=cu_seqlens,
-        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
-        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
-        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
-        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
-        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd, tinv_words=tinv_words,
-        tinv_rows=tinv_rows, tinv_row_count=tinv_row_count, summary_words=summary_words,
-        recompute_m_words=recompute_m_words, series_words=series_words, bprop_summary_words=bprop_summary_words,
-        bprop_words=bprop_words, checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, dq=dq, dk=dk,
-        dv=dv, dgate=dgate, dbeta=dbeta, summary_q=summary_q, summary_do=summary_do, tinv=tinv, state_h=state_h,
-        state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end, seed=seed, dseed=dseed,
-        dstate0=dstate0, inv_q=inv_q, inv_k=inv_k, pieces=pieces, heads_out=heads_out, num_seqs=num_seqs,
-        unit_chunks=unit_chunks, b_t=b_t, expand_num=expand_num, summary_q_step=summary_q_step,
-        fused_h_m=fused_h_m, series=series, coarse=coarse, chain_rows=chain_rows, num_sm=num_sm
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        gate=gate,
+        beta=beta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        cu_pieces=cu_pieces,
+        main_rows=main_rows,
+        summary_rows=summary_rows,
+        main_count=main_count,
+        summary_count=summary_count,
+        work_items=work_items,
+        work_items_summary=work_items_summary,
+        series_items=series_items,
+        series_count=series_count,
+        scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute,
+        scheduler_m=scheduler_m,
+        scheduler_series=scheduler_series,
+        scheduler_summary=scheduler_summary,
+        scheduler_bwd=scheduler_bwd,
+        tinv_words=tinv_words,
+        tinv_rows=tinv_rows,
+        tinv_row_count=tinv_row_count,
+        summary_words=summary_words,
+        recompute_m_words=recompute_m_words,
+        series_words=series_words,
+        bprop_summary_words=bprop_summary_words,
+        bprop_words=bprop_words,
+        checkpoints=checkpoints,
+        seed_checkpoints=seed_checkpoints,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        dgate=dgate,
+        dbeta=dbeta,
+        summary_q=summary_q,
+        summary_do=summary_do,
+        tinv=tinv,
+        state_h=state_h,
+        state_m=state_m,
+        state_x=state_x,
+        state_g=state_g,
+        state_dx_end=state_dx_end,
+        seed=seed,
+        dseed=dseed,
+        dstate0=dstate0,
+        inv_q=inv_q,
+        inv_k=inv_k,
+        pieces=pieces,
+        heads_out=heads_out,
+        num_seqs=num_seqs,
+        unit_chunks=unit_chunks,
+        b_t=b_t,
+        expand_num=expand_num,
+        summary_q_step=summary_q_step,
+        fused_h_m=fused_h_m,
+        series=series,
+        coarse=coarse,
+        chain_rows=chain_rows,
+        num_sm=num_sm,
     )
     has_seed = seed is not None
     has_dseed = dseed is not None
@@ -824,7 +1078,9 @@ def build_chain_backward(
         _as_dtype(signature_spec(state_m, assumed_align=16), "float32") if fused_h_m else None,
         _as_dtype(signature_spec(state_x, assumed_align=16), "float32") if fused_h_m else None,
         _as_dtype(signature_spec(seed, assumed_align=4), seed_name),
-        signature_spec(state_x, assumed_align=16, mode3_divisibility=DK) if series and not coarse else None,
+        signature_spec(state_x, assumed_align=16, mode3_divisibility=DK)
+        if series and not coarse
+        else None,
         signature_spec(seed_checkpoints, assumed_align=16) if coarse else None,
     )
     tail_specs = (
@@ -863,12 +1119,42 @@ def build_chain_backward(
         signature_spec(bprop_words, assumed_align=128),
     )
     use_int64_offsets = requires_int64_abi(
-        q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, checkpoints, seed_checkpoints, dq, dk, dv, dgate, dbeta,
-        summary_q, summary_do, tinv, state_h, state_m, state_x, state_g, state_dx_end, seed, dseed, dstate0, inv_q, inv_k,
+        q,
+        k,
+        v,
+        do,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        checkpoints,
+        seed_checkpoints,
+        dq,
+        dk,
+        dv,
+        dgate,
+        dbeta,
+        summary_q,
+        summary_do,
+        tinv,
+        state_h,
+        state_m,
+        state_x,
+        state_g,
+        state_dx_end,
+        seed,
+        dseed,
+        dstate0,
+        inv_q,
+        inv_k,
     )
     head = _compile_chain_backward_head(head_constexprs, cfg_args, head_specs, use_int64_offsets)
     tail = _compile_chain_backward_tail(
-        (bool(compact_qdo), DV, DK, int(chain_rows), has_dseed), cfg_args, tail_specs, use_int64_offsets
+        (bool(compact_qdo), DV, DK, int(chain_rows), has_dseed),
+        cfg_args,
+        tail_specs,
+        use_int64_offsets,
     )
     return head, tail
 
@@ -941,8 +1227,8 @@ def run_chain_backward(
     scale,
     stream,
 ) -> None:
-    """Replay the chain backward: two crossings into the DSL for its eight launches.  The plan validated the contract at
-    build, so nothing here raises."""
+    """Replay the chain backward: two crossings into the DSL for its eight launches.  The plan
+    validated the contract at build, so nothing here raises."""
     head, tail = compiled
     head(
         int(pieces),

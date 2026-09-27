@@ -245,6 +245,15 @@ guarding_tests = [
 gate = "sass (byte-identical per family)"
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "S10"
+title = "Ruff lint/format the vendored kernels"
+kind = "restyle"
+ag_subject = "Lint and format the vendored v1.30 GDN and KDA kernels"
+guarding_tests = []
+gate = "sass (42/42 identical)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- validation / hardening
 [[fix]]
 id = "S12"

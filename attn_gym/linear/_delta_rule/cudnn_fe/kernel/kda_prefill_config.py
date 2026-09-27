@@ -27,7 +27,6 @@ Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -36,8 +35,8 @@ class Cfg:
     B_T: int = 16
 
     # --- warp assignments (16 warps = 512 threads) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
+    COMPUTE_GROUP_0_WARP_IDS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
+    COMPUTE_GROUP_1_WARP_IDS: tuple[int, ...] = (8, 9, 10, 11)
     REGISTER_MMA_WARP_ID: int = 12
     TCGEN05_MMA_WARP_ID: int = 13
     TMA_WARP_ID: int = 14
@@ -61,7 +60,7 @@ class Cfg:
     QK_SCALE_READY_STAGES: int = 4
     TMEM_Q_STATE_ACC_STAGES: int = 2
 
-    CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
+    CLUSTER_SHAPE_MNK: tuple[int, int, int] = (1, 1, 1)
 
 
 CFG = Cfg()

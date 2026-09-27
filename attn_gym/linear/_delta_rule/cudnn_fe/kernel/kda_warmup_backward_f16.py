@@ -16,22 +16,21 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host compiles through a persisted ``jit_cache`` function
-# over fake TVM-FFI signatures and launches on the current Torch stream.
+# attn_gym.linear._delta_rule.cudnn_fe. The host compiles through a persisted ``jit_cache``
+# function over fake TVM-FFI signatures and launches on the current Torch stream.
 
-"""One compiled launch for the KDA warmup and uncut backward: the split-K table (warmup only), the recompute prologue and
-the checkpoint-series recompute (unless the forward's per-chunk series is passed back), the bprop prologue and the bprop,
-issued from a single host at ``--opt-level 2``, the level of every KDA module, its prologues and the split table
-(``opt_level``), so every nested kernel is the standalone one.  Every kernel, its host and the tensor placeholder each host was
-compiled with are the standalone modules' own; a buffer two hosts read through different placeholder types is passed twice
-(the table's 4-byte compact views of work_items, work_count, item_scratch and cu_seqlens; the gate when the bprop reads it
-as a linear alpha)."""
-
-from typing import Optional
+"""One compiled launch for the KDA warmup and uncut backward: the split-K table (warmup only), the
+recompute prologue and the checkpoint-series recompute (unless the forward's per-chunk series is
+passed back), the bprop prologue and the bprop, issued from a single host at ``--opt-level 2``, the
+level of every KDA module, its prologues and the split table (``opt_level``), so every nested
+kernel is the standalone one.  Every kernel, its host and the tensor placeholder each host was
+compiled with are the standalone modules' own; a buffer two hosts read through different
+placeholder types is passed twice (the table's 4-byte compact views of work_items, work_count,
+item_scratch and cu_seqlens; the gate when the bprop reads it as a linear alpha)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 
@@ -89,38 +88,38 @@ def warmup_backward_host(
     dk: cute.Tensor,
     dv: cute.Tensor,
     gate: cute.Tensor,
-    gate_table: Optional[cute.Tensor],
-    gate_main: Optional[cute.Tensor],
+    gate_table: cute.Tensor | None,
+    gate_main: cute.Tensor | None,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    a_log_table: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    dt_bias_table: Optional[cute.Tensor],
+    a_log: cute.Tensor | None,
+    a_log_table: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
+    dt_bias_table: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     checkpoints: cute.Tensor,
-    seed_checkpoints: Optional[cute.Tensor],
-    state_in: Optional[cute.Tensor],
+    seed_checkpoints: cute.Tensor | None,
+    state_in: cute.Tensor | None,
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
-    dstate0: Optional[cute.Tensor],
-    dstate_in: Optional[cute.Tensor],
+    dstate0: cute.Tensor | None,
+    dstate_in: cute.Tensor | None,
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
     work_count: cute.Tensor,
     work_count_table: cute.Tensor,
-    series_items: Optional[cute.Tensor],
-    series_count: Optional[cute.Tensor],
-    staging_recompute: Optional[cute.Tensor],
-    staging_bprop: Optional[cute.Tensor],
-    item_scratch: Optional[cute.Tensor],
-    chunk_scratch: Optional[cute.Tensor],
+    series_items: cute.Tensor | None,
+    series_count: cute.Tensor | None,
+    staging_recompute: cute.Tensor | None,
+    staging_bprop: cute.Tensor | None,
+    item_scratch: cute.Tensor | None,
+    chunk_scratch: cute.Tensor | None,
     scheduler_all: cute.Tensor,
-    scheduler_all_recompute: Optional[cute.Tensor],
-    scheduler_all_bprop: Optional[cute.Tensor],
+    scheduler_all_recompute: cute.Tensor | None,
+    scheduler_all_bprop: cute.Tensor | None,
     scheduler_recompute: cute.Tensor,
     scheduler_bwd: cute.Tensor,
-    recompute_words: Optional[cute.Tensor],
+    recompute_words: cute.Tensor | None,
     bprop_words: cute.Tensor,
     stream: cuda.CUstream,
 ) -> None:
@@ -307,16 +306,16 @@ def _compile_warmup_backward(
     bwd_order_gen = bwd_orders and not split
     recompute_staging = recompute and recompute_orders and split
     bwd_staging = bwd_orders and split
-    flags = dict(
-        l2norm=use_qk_l2norm,
-        safe_gate=safe_gate,
-        gate_scale_log2=gate_scale_log2,
-        log_gate=log_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        max_active_clusters=num_sms,
-        d_k=d_k,
-    )
+    flags = {
+        "l2norm": use_qk_l2norm,
+        "safe_gate": safe_gate,
+        "gate_scale_log2": gate_scale_log2,
+        "log_gate": log_gate,
+        "beta_sigmoid": use_beta_sigmoid,
+        "allow_neg_eigval": allow_neg_eigval,
+        "max_active_clusters": num_sms,
+        "d_k": d_k,
+    }
     recompute_cfg = None
     if recompute:
         recompute_cfg = kda_recompute_f16.build_cfg(
@@ -417,12 +416,16 @@ def _compile_warmup_backward(
         strided(io_dtype, 3, 16),  # dk
         strided(io_dtype, 3, 16),  # dv
         strided(gate_dtype, 3, 16),  # gate
-        strided(gate_dtype, 3, 8 if gate_dtype.width == 16 else 4) if split else None,  # gate_table
+        strided(gate_dtype, 3, 8 if gate_dtype.width == 16 else 4)
+        if split
+        else None,  # gate_table
         strided(gate_dtype, 3, 4) if gate_main else None,  # gate_main
         strided(beta_dtype, 2, 4),  # beta
         strided(a_log_dtype, 1, 4) if a_log_dtype is not None else None,  # a_log
         strided(a_log_dtype, 1, 4) if a_log_dtype is not None else None,  # a_log_table
-        strided(dt_bias_spec[0], dt_bias_rank, 16) if dt_bias_spec is not None else None,  # dt_bias
+        strided(dt_bias_spec[0], dt_bias_rank, 16)
+        if dt_bias_spec is not None
+        else None,  # dt_bias
         dt_bias_table,
         strided(cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4),  # cu_seqlens
         strided(cu_seqlens_dtype, 1, 4),  # cu_seqlens_table
@@ -509,10 +512,11 @@ def build_warmup_backward(
     device,
     stream,
 ):
-    """Compile (persisted per static config) the warmup or uncut backward launch over the buffers of one plan.  The
-    fake signatures repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute and
-    bprop prologues read the split table's item scratch as their ordering staging when the plan hands it to them
-    (``recompute_orders`` / ``bwd_orders`` with ``split``)."""
+    """Compile (persisted per static config) the warmup or uncut backward launch over the buffers
+    of one plan.  The fake signatures repeat the marks of the standalone builds so every kernel
+    compiles as it does there; the recompute and bprop prologues read the split table's item
+    scratch as their ordering staging when the plan hands it to them (``recompute_orders`` /
+    ``bwd_orders`` with ``split``)."""
     DK = q.shape[2]
     DV = v.shape[2]
     if not safe_gate:
@@ -535,8 +539,24 @@ def build_warmup_backward(
     shared = (gate, beta, a_log, dt_bias, cu_seqlens, checkpoints, seed_checkpoints, state_in)
     recompute_tensors = (k, v, series_items, series_count, scheduler_recompute, recompute_words)
     bprop_tensors = (
-        q, k, v, do, dq, dk, dv, dgate, dbeta, dstate0, dstate_in, work_items, work_count,
-        item_scratch, chunk_scratch, scheduler_all, scheduler_bwd, bprop_words,
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        dgate,
+        dbeta,
+        dstate0,
+        dstate_in,
+        work_items,
+        work_count,
+        item_scratch,
+        chunk_scratch,
+        scheduler_all,
+        scheduler_bwd,
+        bprop_words,
     )
     # Each kernel module owns its ABI selector (tests monkeypatch them); the bundled host
     # widens every signature when either kernel needs int64 offsets.
@@ -634,8 +654,8 @@ def run_warmup_backward(
     scale,
     stream,
 ) -> None:
-    """Replay the warmup or uncut backward: one crossing into the DSL on the current Torch stream.  The plan validated
-    the contract at build, so nothing here raises."""
+    """Replay the warmup or uncut backward: one crossing into the DSL on the current Torch stream.
+    The plan validated the contract at build, so nothing here raises."""
     compiled(
         facts.n_heads_out,
         facts.n_tiles,

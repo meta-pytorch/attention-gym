@@ -26,7 +26,6 @@ Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -35,9 +34,9 @@ class Cfg:
     B_T: int = 64
 
     # --- warp assignments (16 warps total) ---
-    COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)
-    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)
+    COMPUTE_GROUP_0_WARP_IDS: tuple[int, ...] = (0, 1, 2, 3)
+    COMPUTE_GROUP_1_WARP_IDS: tuple[int, ...] = (4, 5, 6, 7)
+    COMPUTE_GROUP_2_WARP_IDS: tuple[int, ...] = (8, 9, 10, 11)
     TCGEN05_MMA_WARP_ID: int = 12
     TMA_QKV_WARP_ID: int = 13
     LOAD_GATE_BETA_WARP_ID: int = 14
@@ -51,7 +50,7 @@ class Cfg:
 
     THREADS_PER_WARP: int = 32
 
-    CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
+    CLUSTER_SHAPE_MNK: tuple[int, int, int] = (1, 1, 1)
     SMEM_SCHEDULER_STAGES: int = 2
 
     # --- SMEM stage counts ---

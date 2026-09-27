@@ -20,27 +20,33 @@
 # Modified by Attention Gym in 2026: persistent jit_cache compile on fake-tensor TVM-FFI signatures
 # (legacy placeholder ABI) with an int64-shape variant.
 
-"""One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the T pass (with its own
-descriptor prologue), the split-K table (warmup only), the recompute prologue and the checkpoint-series recompute (unless
-the forward's per-chunk series is passed back) and the bprop prologue, all at ``--opt-level 2`` like their standalone
-builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd`` /
-``run_bwd`` without their prologue), so the call sequence is two crossings into the DSL instead of six.  Every kernel, its
-host and the tensor placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
-through different placeholder types is passed twice (the table's 4-byte compact views of work_items, work_count and
-item_scratch; the bprop prologue's 4-byte cu_seqlens).  The bprop module is a constexpr argument; only gdn_bprop_f16
-is vendored (upstream's GDP d_v = 64 fork is not)."""
-
-from typing import Optional
+"""One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the
+T pass (with its own descriptor prologue), the split-K table (warmup only), the recompute prologue
+and the checkpoint-series recompute (unless the forward's per-chunk series is passed back) and the
+bprop prologue, all at ``--opt-level 2`` like their standalone builds; the bprop itself keeps its
+standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd`` / ``run_bwd`` without
+their prologue), so the call sequence is two crossings into the DSL instead of six.  Every kernel,
+its host and the tensor placeholder each host was compiled with are the standalone modules' own; a
+buffer two hosts read through different placeholder types is passed twice (the table's 4-byte
+compact views of work_items, work_count and item_scratch; the bprop prologue's 4-byte cu_seqlens).
+The bprop module is a constexpr argument; only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64
+fork is not)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
+
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common import split_k
 from ..common.host import get_dtype, validate_cuda_tensors
-from ..common.launch import validate_seqlens, validate_tensor, validate_work_table, validate_workspace
+from ..common.launch import (
+    validate_seqlens,
+    validate_tensor,
+    validate_work_table,
+    validate_workspace,
+)
 from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
 from . import gdn_bprop_f16, gdn_recompute_f16, gdn_tinv_f16
 
@@ -90,42 +96,56 @@ def warmup_backward_host(
     dk: cute.Tensor,
     dv: cute.Tensor,
     gate: cute.Tensor,
-    gate_table: Optional[cute.Tensor],
+    gate_table: cute.Tensor | None,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    a_log_table: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    dt_bias_table: Optional[cute.Tensor],
+    a_log: cute.Tensor | None,
+    a_log_table: cute.Tensor | None,
+    dt_bias: cute.Tensor | None,
+    dt_bias_table: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     cu_seqlens_bprop: cute.Tensor,
-    tinv: Optional[cute.Tensor],
-    tinv_words: Optional[cute.Tensor],
-    tinv_rows: Optional[cute.Tensor],
-    tinv_row_count: Optional[cute.Tensor],
+    tinv: cute.Tensor | None,
+    tinv_words: cute.Tensor | None,
+    tinv_rows: cute.Tensor | None,
+    tinv_row_count: cute.Tensor | None,
     checkpoints: cute.Tensor,
-    seed_checkpoints: Optional[cute.Tensor],
-    state_in: Optional[cute.Tensor],
+    seed_checkpoints: cute.Tensor | None,
+    state_in: cute.Tensor | None,
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
     work_count: cute.Tensor,
     work_count_table: cute.Tensor,
-    series_items: Optional[cute.Tensor],
-    series_count: Optional[cute.Tensor],
-    staging_recompute: Optional[cute.Tensor],
-    staging_bprop: Optional[cute.Tensor],
-    item_scratch: Optional[cute.Tensor],
-    chunk_scratch: Optional[cute.Tensor],
+    series_items: cute.Tensor | None,
+    series_count: cute.Tensor | None,
+    staging_recompute: cute.Tensor | None,
+    staging_bprop: cute.Tensor | None,
+    item_scratch: cute.Tensor | None,
+    chunk_scratch: cute.Tensor | None,
     scheduler_all: cute.Tensor,
-    scheduler_all_recompute: Optional[cute.Tensor],
-    scheduler_all_bprop: Optional[cute.Tensor],
+    scheduler_all_recompute: cute.Tensor | None,
+    scheduler_all_bprop: cute.Tensor | None,
     scheduler_recompute: cute.Tensor,
-    recompute_words: Optional[cute.Tensor],
+    recompute_words: cute.Tensor | None,
     bprop_words: cute.Tensor,
     stream: cuda.CUstream,
 ) -> None:
     if cutlass.const_expr(tinv_pass):
-        gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
+        gdn_tinv_f16.host(
+            tinv_cfg,
+            True,
+            k,
+            tinv_words,
+            gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_seqlens,
+            tinv,
+            tinv_rows,
+            tinv_row_count,
+            stream,
+        )
     if cutlass.const_expr(split):
         split_k.launch(
             split,
@@ -252,14 +272,30 @@ def warmup_backward_host(
 
 
 @jit_cache
-def _compile_warmup_backward(constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool):
+def _compile_warmup_backward(
+    constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool
+):
     """Compile the warmup / uncut backward head over the upstream dynamic-layout tensor ABI.
 
     ``constexprs`` are the host's static arguments ahead of ``tinv_cfg`` (with the bprop module
     slot left as None), ``cfg_args`` rebuild the T-pass and recompute configs, and ``specs``
     describe every tensor argument in host order."""
-    (io_dtype, state_dtype, num_sm, d_k, d_v, expand_num, tinv_pass, recompute, coarse, log_gate, safe_gate,
-     use_beta_sigmoid, allow_neg_eigval, state_in) = cfg_args
+    (
+        io_dtype,
+        state_dtype,
+        num_sm,
+        d_k,
+        d_v,
+        expand_num,
+        tinv_pass,
+        recompute,
+        coarse,
+        log_gate,
+        safe_gate,
+        use_beta_sigmoid,
+        allow_neg_eigval,
+        state_in,
+    ) = cfg_args
     io = get_dtype(io_dtype)
     tinv_cfg = None
     if tinv_pass:
@@ -294,7 +330,9 @@ def _compile_warmup_backward(constexprs: tuple, cfg_args: tuple, specs: tuple, u
     head[IO_DTYPE_SLOT] = io
     head[N_HEADS_SLOT] = cutlass.Int32(0)
     scalars = [cutlass.Int32(0)] * 3 + [cutlass.Float32(0.0)] * 2 + [cutlass.Int32(0)] * 6
-    flags = "_".join(str(int(v)) if isinstance(v, bool) else str(v) for v in constexprs if v is not None)
+    flags = "_".join(
+        str(int(v)) if isinstance(v, bool) else str(v) for v in constexprs if v is not None
+    )
     return compile_tvm_ffi(
         warmup_backward_host,
         *head,
@@ -314,53 +352,144 @@ BPROP_SLOT = 13
 
 
 def _validate_launch(
-    *, q, k, v, do, dq, dk, dv, gate, beta, a_log, dt_bias, cu_seqlens, tinv, tinv_words, tinv_rows, tinv_row_count,
-    checkpoints, seed_checkpoints, state_in, work_items, work_count, series_items, series_count, item_scratch,
-    chunk_scratch, scheduler_all, scheduler_recompute, recompute_words, bprop_words, split, n_tiles, ideal_chunks,
-    num_sm, b_t, expand_num, tinv_pass, recompute, recompute_orders, coarse, bwd_orders,
+    *,
+    q,
+    k,
+    v,
+    do,
+    dq,
+    dk,
+    dv,
+    gate,
+    beta,
+    a_log,
+    dt_bias,
+    cu_seqlens,
+    tinv,
+    tinv_words,
+    tinv_rows,
+    tinv_row_count,
+    checkpoints,
+    seed_checkpoints,
+    state_in,
+    work_items,
+    work_count,
+    series_items,
+    series_count,
+    item_scratch,
+    chunk_scratch,
+    scheduler_all,
+    scheduler_recompute,
+    recompute_words,
+    bprop_words,
+    split,
+    n_tiles,
+    ideal_chunks,
+    num_sm,
+    b_t,
+    expand_num,
+    tinv_pass,
+    recompute,
+    recompute_orders,
+    coarse,
+    bwd_orders,
 ):
-    """Check the warmup / uncut backward buffers of one plan (one checkpoint series per sequence)."""
-    tokens, heads_out, num_seqs = gdn_bprop_f16.validate_bwd_bundle(
-        q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
-        num_pieces=validate_seqlens(cu_seqlens), expand_num=expand_num, b_t=b_t, tinv_pass=tinv_pass, a_log=a_log,
+    """Check the warmup / uncut backward buffers of one plan (one checkpoint series per
+    sequence)."""
+    _tokens, heads_out, num_seqs = gdn_bprop_f16.validate_bwd_bundle(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        gate,
+        beta,
+        cu_seqlens,
+        checkpoints,
+        tinv,
+        tinv_rows,
+        tinv_row_count,
+        bprop_words,
+        num_pieces=validate_seqlens(cu_seqlens),
+        expand_num=expand_num,
+        b_t=b_t,
+        tinv_pass=tinv_pass,
+        a_log=a_log,
         dt_bias=dt_bias,
     )
     validate_cuda_tensors(
-        q, tinv_words=tinv_words, seed_checkpoints=seed_checkpoints, state_in=state_in, work_items=work_items,
-        work_count=work_count, series_items=series_items, series_count=series_count, item_scratch=item_scratch,
-        chunk_scratch=chunk_scratch, scheduler_all=scheduler_all, scheduler_recompute=scheduler_recompute,
+        q,
+        tinv_words=tinv_words,
+        seed_checkpoints=seed_checkpoints,
+        state_in=state_in,
+        work_items=work_items,
+        work_count=work_count,
+        series_items=series_items,
+        series_count=series_count,
+        item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch,
+        scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute,
         recompute_words=recompute_words,
     )
     if num_sm <= 0 or n_tiles != num_seqs * heads_out:
-        raise ValueError("num_sm must be positive and n_tiles must equal the number of sequences times output heads")
+        raise ValueError(
+            "num_sm must be positive and n_tiles must equal the number of sequences times output "
+            "heads"
+        )
     dim_v, dim_k = v.shape[2], q.shape[2]
     if state_in is not None:
         validate_tensor(
-            "state_in", state_in, (None, heads_out, dim_v, dim_k), gdn_bprop_f16.STATE_DTYPES, min_rows=num_seqs
+            "state_in",
+            state_in,
+            (None, heads_out, dim_v, dim_k),
+            gdn_bprop_f16.STATE_DTYPES,
+            min_rows=num_seqs,
         )
     if coarse:
         validate_tensor(
-            "seed_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k),
+            "seed_checkpoints",
+            seed_checkpoints,
+            (None, heads_out, dim_v, dim_k),
             (*gdn_bprop_f16.STATE_DTYPES, str(q.dtype).removeprefix("torch.")),
         )
     table_rows = n_tiles
     if split:
         scan_tokens = gate.shape[0] * expand_num
         if ideal_chunks:
-            table_rows = split_k.max_work_items(scan_tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm)
+            table_rows = split_k.max_work_items(
+                scan_tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm
+            )
         validate_tensor(
-            "item_scratch", item_scratch, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows
+            "item_scratch",
+            item_scratch,
+            (None, WORK_ITEM_FIELDS),
+            ("int32",),
+            compact=True,
+            min_rows=table_rows,
         )
         validate_tensor(
-            "chunk_scratch", chunk_scratch, (None, heads_out), ("float32",), align=4,
+            "chunk_scratch",
+            chunk_scratch,
+            (None, heads_out),
+            ("float32",),
+            align=4,
             min_rows=split_k.chunk_scratch_rows(scan_tokens, num_seqs, b_t),
         )
     validate_work_table(work_items, work_count, scheduler_all, min_rows=table_rows)
-    validate_tensor("scheduler_recompute", scheduler_recompute, (None,), ("int32",), align=4, min_rows=1)
+    validate_tensor(
+        "scheduler_recompute", scheduler_recompute, (None,), ("int32",), align=4, min_rows=1
+    )
     if recompute:
-        validate_tensor("series_items", series_items, (None, WORK_ITEM_FIELDS), ("int32",), compact=True)
+        validate_tensor(
+            "series_items", series_items, (None, WORK_ITEM_FIELDS), ("int32",), compact=True
+        )
         validate_tensor("series_count", series_count, (None,), ("int32",), align=4, min_rows=1)
-        validate_workspace("recompute_words", recompute_words, gdn_recompute_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
+        validate_workspace(
+            "recompute_words", recompute_words, gdn_recompute_f16.TENSORMAP_DESC_ARRAYS, num_seqs
+        )
     if tinv_pass:
         validate_workspace("tinv_words", tinv_words, gdn_tinv_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
 
@@ -418,8 +547,9 @@ def build_warmup_backward(
     device,
     stream,
 ):
-    """Compile (cached per static config) the head of the warmup or uncut backward over the buffers of one plan.  The
-    placeholders repeat the marks of the standalone builds so every kernel compiles as it does there."""
+    """Compile (cached per static config) the head of the warmup or uncut backward over the buffers
+    of one plan.  The placeholders repeat the marks of the standalone builds so every kernel
+    compiles as it does there."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -442,17 +572,51 @@ def build_warmup_backward(
         expand_num=expand_num,
     )
     if bprop_module is not gdn_bprop_f16 or compact_qdo:
-        raise ValueError("the GDN warmup backward supports only the gdn_bprop_f16 bprop without compact_qdo")
+        raise ValueError(
+            "the GDN warmup backward supports only the gdn_bprop_f16 bprop without compact_qdo"
+        )
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
-        q=q, k=k, v=v, do=do, dq=dq, dk=dk, dv=dv, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias,
-        cu_seqlens=cu_seqlens, tinv=tinv, tinv_words=tinv_words, tinv_rows=tinv_rows, tinv_row_count=tinv_row_count,
-        checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, state_in=state_in, work_items=work_items,
-        work_count=work_count, series_items=series_items, series_count=series_count, item_scratch=item_scratch,
-        chunk_scratch=chunk_scratch, scheduler_all=scheduler_all, scheduler_recompute=scheduler_recompute,
-        recompute_words=recompute_words, bprop_words=bprop_words, split=split, n_tiles=n_tiles,
-        ideal_chunks=ideal_chunks, num_sm=num_sm, b_t=b_t, expand_num=expand_num, tinv_pass=tinv_pass,
-        recompute=recompute, recompute_orders=recompute_orders, coarse=coarse, bwd_orders=bwd_orders,
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        gate=gate,
+        beta=beta,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        tinv=tinv,
+        tinv_words=tinv_words,
+        tinv_rows=tinv_rows,
+        tinv_row_count=tinv_row_count,
+        checkpoints=checkpoints,
+        seed_checkpoints=seed_checkpoints,
+        state_in=state_in,
+        work_items=work_items,
+        work_count=work_count,
+        series_items=series_items,
+        series_count=series_count,
+        item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch,
+        scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute,
+        recompute_words=recompute_words,
+        bprop_words=bprop_words,
+        split=split,
+        n_tiles=n_tiles,
+        ideal_chunks=ideal_chunks,
+        num_sm=num_sm,
+        b_t=b_t,
+        expand_num=expand_num,
+        tinv_pass=tinv_pass,
+        recompute=recompute,
+        recompute_orders=recompute_orders,
+        coarse=coarse,
+        bwd_orders=bwd_orders,
     )
     recompute_order_gen = not (recompute_orders and split)
     bwd_order_gen = bwd_orders and not split
@@ -531,20 +695,40 @@ def build_warmup_backward(
         signature_spec(work_count, assumed_align=4, compact=True),
         signature_spec(series_items, assumed_align=16, compact=True) if recompute else None,
         signature_spec(series_count, assumed_align=4) if recompute else None,
-        signature_spec(staging, assumed_align=16, compact=True) if recompute and recompute_orders else None,
+        signature_spec(staging, assumed_align=16, compact=True)
+        if recompute and recompute_orders
+        else None,
         signature_spec(staging, assumed_align=16, compact=True) if bwd_orders else None,
         signature_spec(staging, assumed_align=4, compact=True),
         signature_spec(chunk_scratch if split else None, assumed_align=4),
         signature_spec(scheduler_all, assumed_align=4),
-        signature_spec(scheduler_all, assumed_align=4) if recompute and (recompute_orders or coarse) else None,
+        signature_spec(scheduler_all, assumed_align=4)
+        if recompute and (recompute_orders or coarse)
+        else None,
         signature_spec(scheduler_all, assumed_align=4) if bwd_orders else None,
         signature_spec(scheduler_recompute, assumed_align=4),
         signature_spec(recompute_words, assumed_align=128) if recompute else None,
         signature_spec(bprop_words, assumed_align=128),
     )
     use_int64_offsets = requires_int64_abi(
-        q, k, v, do, dq, dk, dv, gate, beta, a_log, dt_bias, cu_seqlens, tinv, checkpoints, seed_checkpoints, state_in,
-        recompute_words, bprop_words,
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        tinv,
+        checkpoints,
+        seed_checkpoints,
+        state_in,
+        recompute_words,
+        bprop_words,
     )
     return _compile_warmup_backward(constexprs, cfg_args, specs, use_int64_offsets), facts
 
@@ -593,8 +777,8 @@ def run_warmup_backward(
     seed_every_n_tokens,
     stream,
 ) -> None:
-    """Replay the head of the warmup or uncut backward: one crossing into the DSL.  The plan validated the contract at
-    build, so nothing here raises."""
+    """Replay the head of the warmup or uncut backward: one crossing into the DSL.  The plan
+    validated the contract at build, so nothing here raises."""
     compiled(
         facts.n_heads_out,
         facts.n_tiles,

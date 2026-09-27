@@ -133,8 +133,6 @@ exclude = [
     "site-packages",
     "venv",
     "*.ipynb",
-    # Vendored cudnn-frontend v1.30 kernels; restyled and linted in a follow-up.
-    "attn_gym/linear/_delta_rule/cudnn_fe/kernel",
 ]
 
 [tool.ruff.lint]
@@ -146,4 +144,4 @@ ignore = ['E231', 'E731']
 "test/test_kda_kernels.py" = ["E402"]
 # CuTeDSL traces if-expressions and nested ifs as device selects/branches; min/max builtins and
 # `and` do not trace the same way on dynamic values, so keep the vendored control flow.
-"attn_gym/linear/_delta_rule/cudnn_fe/{common,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]
+"attn_gym/linear/_delta_rule/cudnn_fe/{common,kernel,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]
