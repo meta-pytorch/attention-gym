@@ -14,8 +14,9 @@ the GDN chain prologue imports), SDPA, and the upstream engines are omitted.
 
 Changes made for Attention Gym:
 
-- imports were moved from `cudnn.frost.*` into this package, and the cuDNN host buffer/device
-  utilities were replaced by the Torch-backed shims in `_compat.py`.
+- Imports were moved from `cudnn.frost.*` into this package. Host device queries use PyTorch;
+  compilation uses module-level `jit_cache` functions and fake TVM-FFI tensor signatures from
+  `common/tvm_ffi.py`, without allocating live placeholder tensors or importing cuDNN host shims.
 
 Modified upstream files carry an explicit modification notice and keep their original SPDX
 identifiers.

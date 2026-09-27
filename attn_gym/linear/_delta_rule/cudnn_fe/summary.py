@@ -19,24 +19,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import ModuleType
 
-import cuda.bindings.driver as cuda_driver
 import cutlass
 import torch
 import triton
 import triton.language as tl
-from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from attn_gym._backends.cute.utils import get_device_properties, initialized_cuda_device
+from attn_gym._backends.cute.utils import (
+    get_device_properties,
+    initialized_cuda_device,
+    requires_int64_abi,
+)
 from attn_gym.utils import ceildiv
 
-from ._persist import persistent_compile
 from .common.host import get_dtype, tensormap_workspace_bytes
 from .common.split_k import WORK_ITEM_FIELDS
 from .kernel import kda_bprop_summary_f16, kda_summary_f16
 
-B_T = kda_summary_f16.CFG.B_T
-_COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 # Staged KDA tensors: natural-log FP32 channel gate, FP32 post-sigmoid beta, normalized keys.
 _GATE = {
     "l2norm": False,
@@ -140,7 +138,6 @@ class _Launch:
     counters: torch.Tensor
     workspace: torch.Tensor
     num_sm: int
-    stream: cuda_driver.CUstream
 
     @classmethod
     def prepare(
@@ -176,28 +173,11 @@ class _Launch:
             torch.empty(2, dtype=torch.int32, device=device),
             workspace,
             get_device_properties(device).multi_processor_count,
-            cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
         )
 
     def reset(self) -> None:
         """The work-stealing counters must be zero before every launch, including replays."""
         self.counters.zero_()
-
-
-def _dynamic(tensor: torch.Tensor, align: int = 16):
-    return from_dlpack(tensor, assumed_align=align).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
-
-
-def _work_table(tensor: torch.Tensor):
-    view = from_dlpack(tensor, assumed_align=16)
-    view.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-    return view
-
-
-def _cu_view(cu_seqlens: torch.Tensor):
-    return _dynamic(cu_seqlens, 8 if cu_seqlens.dtype == torch.int64 else 4)
 
 
 def _forward_summary(
@@ -211,28 +191,7 @@ def _forward_summary(
     launch: _Launch,
 ) -> None:
     """Write H into ``state`` and stored-domain M into ``transition`` for every work item."""
-    key = (
-        str(k.dtype),
-        str(gate.dtype),
-        str(cu_seqlens.dtype),
-        k.shape[-1],
-        v.shape[-1],
-        launch.num_sm,
-    )
-    prologue = persistent_compile(
-        "kda_summary_prologue",
-        key,
-        _compile_forward_prologue,
-        k,
-        v,
-        gate,
-        cu_seqlens,
-        launch,
-    )
-    compiled = persistent_compile(
-        "kda_summary",
-        key,
-        _compile_forward,
+    use_int64_offsets = requires_int64_abi(
         k,
         v,
         gate,
@@ -240,7 +199,38 @@ def _forward_summary(
         cu_seqlens,
         state,
         transition,
-        launch,
+        launch.work_items,
+        launch.work_count,
+        launch.counters,
+        launch.workspace,
+    )
+    cu_dtype = cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32
+    prologue = kda_summary_f16._compile_kda_summary_prologue(
+        get_dtype(k.dtype),
+        get_dtype(gate.dtype),
+        cu_dtype,
+        False,
+        False,
+        use_int64_offsets,
+    )
+    compiled = kda_summary_f16._compile_kda_summary(
+        get_dtype(k.dtype),
+        get_dtype(gate.dtype),
+        get_dtype(beta.dtype),
+        None,
+        None,
+        cu_dtype,
+        None,
+        k.shape[-1],
+        v.shape[-1],
+        _GATE["l2norm"],
+        _GATE["safe_gate"],
+        _GATE_SCALE_LOG2,
+        _GATE["log_gate"],
+        _GATE["beta_sigmoid"],
+        _GATE["allow_neg_eigval"],
+        launch.num_sm,
+        use_int64_offsets,
     )
     launch.reset()
     prologue(
@@ -253,7 +243,6 @@ def _forward_summary(
         launch.work_items,
         None,
         launch.workspace,
-        launch.stream,
     )
     compiled(
         k,
@@ -270,60 +259,6 @@ def _forward_summary(
         launch.work_count,
         launch.counters,
         launch.workspace,
-        launch.stream,
-    )
-
-
-def _compile_forward_prologue(k, v, gate, cu_seqlens, launch: _Launch):
-    return cute.compile(
-        kda_summary_f16.prologue,
-        get_dtype(k.dtype),
-        B_T,
-        False,
-        False,
-        _dynamic(k),
-        _dynamic(v),
-        _dynamic(gate),
-        _cu_view(cu_seqlens),
-        None,
-        _dynamic(launch.work_count, 4),
-        _work_table(launch.work_items),
-        None,
-        _dynamic(launch.workspace, 128),
-        launch.stream,
-        options=_COMPILE_OPTIONS,
-    )
-
-
-def _compile_forward(k, v, gate, beta, cu_seqlens, state, transition, launch: _Launch):
-    return kda_summary_f16.compile(
-        get_dtype(k.dtype),
-        get_dtype(gate.dtype),
-        False,
-        _GATE["l2norm"],
-        _GATE["safe_gate"],
-        _GATE_SCALE_LOG2,
-        _GATE["beta_sigmoid"],
-        _GATE["allow_neg_eigval"],
-        d_k=k.shape[-1],
-        d_v=v.shape[-1],
-        num_sm=launch.num_sm,
-        log_gate=_GATE["log_gate"],
-        k_cute=_dynamic(k),
-        v_cute=_dynamic(v),
-        gate_cute=_dynamic(gate),
-        a_log_cute=None,
-        dt_bias_cute=None,
-        beta_cute=_dynamic(beta, 4),
-        cu_seqlens_cute=_cu_view(cu_seqlens),
-        state_in_cute=None,
-        state_out_cute=_dynamic(state),
-        transition_cute=_dynamic(transition),
-        work_items_cute=_work_table(launch.work_items),
-        work_count_cute=_dynamic(launch.work_count, 4),
-        scheduler_counter_cute=_dynamic(launch.counters, 4),
-        tensormap_workspace_cute=_dynamic(launch.workspace, 128),
-        stream=launch.stream,
     )
 
 
@@ -340,38 +275,52 @@ def _reverse_summary(
     launch: _Launch,
 ) -> None:
     """Write the entry cotangent for every work item; ``d_final_state`` None seeds zero."""
-    key = (
-        str(q.dtype),
-        str(gate.dtype),
-        str(cu_seqlens.dtype),
-        q.shape[-1],
-        d_output.shape[-1],
-        launch.num_sm,
-        d_final_state is not None,
-    )
-    prologue = persistent_compile(
-        "kda_bprop_summary_prologue",
-        key,
-        _compile_reverse_prologue,
+    use_int64_offsets = requires_int64_abi(
         q,
         k,
         gate,
-        d_output,
-        cu_seqlens,
-        launch,
-    )
-    compiled = persistent_compile(
-        "kda_bprop_summary",
-        key,
-        _compile_reverse,
-        q,
-        gate,
-        d_output,
         beta,
+        d_output,
         cu_seqlens,
         d_initial_state,
         d_final_state,
-        launch,
+        launch.work_items,
+        launch.work_count,
+        launch.counters,
+        launch.workspace,
+    )
+    cu_dtype = cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32
+    prologue = kda_bprop_summary_f16._compile_kda_bprop_summary_prologue(
+        get_dtype(q.dtype),
+        get_dtype(gate.dtype),
+        cu_dtype,
+        False,
+        False,
+        False,
+        use_int64_offsets,
+    )
+    compiled = kda_bprop_summary_f16._compile_kda_bprop_summary(
+        get_dtype(q.dtype),
+        get_dtype(gate.dtype),
+        None,
+        None,
+        cu_dtype,
+        get_dtype(beta.dtype),
+        get_dtype(d_initial_state.dtype),
+        None if d_final_state is None else get_dtype(d_final_state.dtype),
+        d_final_state is not None,
+        _GATE["l2norm"],
+        _GATE["safe_gate"],
+        _GATE_SCALE_LOG2,
+        _GATE["log_gate"],
+        _GATE["beta_sigmoid"],
+        _GATE["allow_neg_eigval"],
+        1,
+        1,
+        q.shape[-1],
+        d_output.shape[-1],
+        launch.num_sm,
+        use_int64_offsets,
     )
     launch.reset()
     prologue(
@@ -385,7 +334,6 @@ def _reverse_summary(
         launch.work_items,
         None,
         launch.workspace,
-        launch.stream,
     )
     compiled(
         cutlass.Int32(1),
@@ -401,60 +349,6 @@ def _reverse_summary(
         launch.counters,
         launch.workspace,
         scale,
-        launch.stream,
-    )
-
-
-def _compile_reverse_prologue(q, k, gate, d_output, cu_seqlens, launch: _Launch):
-    return cute.compile(
-        kda_bprop_summary_f16.prologue,
-        get_dtype(q.dtype),
-        B_T,
-        False,
-        False,
-        _dynamic(q),
-        _dynamic(k),
-        _dynamic(gate),
-        _dynamic(d_output),
-        _cu_view(cu_seqlens),
-        None,
-        _dynamic(launch.work_count, 4),
-        _work_table(launch.work_items),
-        None,
-        _dynamic(launch.workspace, 128),
-        launch.stream,
-        options=_COMPILE_OPTIONS,
-    )
-
-
-def _compile_reverse(q, gate, d_output, beta, cu_seqlens, d_initial_state, d_final_state, launch):
-    return kda_bprop_summary_f16.compile(
-        get_dtype(q.dtype),
-        get_dtype(gate.dtype),
-        d_final_state is not None,
-        _GATE["l2norm"],
-        _GATE["safe_gate"],
-        _GATE_SCALE_LOG2,
-        _GATE["log_gate"],
-        _GATE["beta_sigmoid"],
-        _GATE["allow_neg_eigval"],
-        1,
-        1,
-        d_k=q.shape[-1],
-        d_v=d_output.shape[-1],
-        num_sm=launch.num_sm,
-        a_log_cute=None,
-        dt_bias_cute=None,
-        beta_cute=_dynamic(beta, 4),
-        cu_seqlens_cute=_cu_view(cu_seqlens),
-        dstate0_cute=_dynamic(d_initial_state),
-        dstate_in_cute=None if d_final_state is None else _dynamic(d_final_state),
-        work_items_cute=_work_table(launch.work_items),
-        work_count_cute=_dynamic(launch.work_count, 4),
-        scheduler_counter_cute=_dynamic(launch.counters, 4),
-        tensormap_workspace_cute=_dynamic(launch.workspace, 128),
-        scale=0.0,
-        stream=launch.stream,
     )
 
 

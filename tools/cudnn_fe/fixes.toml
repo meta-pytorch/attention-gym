@@ -138,6 +138,7 @@ id = "F7/F8"
 title = "Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds"
 kind = "feature"
 ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+ag_subjects_extra = ["Use native cached summary compilers and retire temporary shims"]
 guarding_tests = ["test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds"]
 upstream_status = "ag-specific"
 
@@ -211,6 +212,7 @@ ag_subjects_extra = [
   "Share static tensor ABI specifications for bundled hosts",
   "Compile common v1.30 hosts from persisted fake tensor signatures",
   "Compile the v1.30 GDN forward hosts from persisted fake tensor signatures",
+  "Use native cached summary compilers and retire temporary shims",
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
