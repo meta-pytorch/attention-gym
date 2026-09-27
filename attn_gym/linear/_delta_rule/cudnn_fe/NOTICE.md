@@ -12,7 +12,8 @@ the low-level tile helpers (`tile_dsl/`) are vendored from
 tag.
 Only the modules the GDN and KDA launch paths import are kept; GDN2, GDP (including the
 `gdp_bprop_v64` backward fork; `compact_qdo` is rejected), SDPA, and the upstream engines are
-omitted. The Torch drivers `gdn.py`, `kda.py`, and `summary.py` are Attention Gym code.
+omitted. The Torch drivers `gdn.py`, `kda.py`, `plan.py`, and `summary.py` are Attention Gym
+code.
 
 Changes made for Attention Gym:
 

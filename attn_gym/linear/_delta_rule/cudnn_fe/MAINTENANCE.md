@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 29 modification rows below are generated from
+The 30 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 29 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 30 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -171,6 +171,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
 | S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
 | S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration`; `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
+| R5 | Driver simplification: shared plan.py, no device/stream args, shared allocators, _GATE_FLAGS | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference`; sass + existing suites bitwise unchanged |
 | S10 | Ruff lint/format the vendored kernels | sass (42/42 identical) |
 | S12 | Launch-contract validation before compile; scheduler arrivals derived from warp counts | `test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry`; `test/test_cudnn_fe_launch_contract.py::test_warp_role_and_named_barrier_tables_reject_conflicts`; `test/test_cudnn_fe_launch_contract.py::test_gdn_backward_cfgs_reject_unsupported_geometry`; `test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata`; `test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_kda_forward_cfgs_reject_unsupported_geometry`; `test/test_cudnn_fe_launch_contract.py::test_kda_warmup_forward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_kda_chain_forward_rejects_invalid_plan_buffers` |
 | R7 | Reject misaligned per-channel gate rows before the vectorized split scan | `test/kda/cudnn/test_kda_cudnn_forward.py::test_cudnn_split_table_rejects_misaligned_vector_gate_rows` |

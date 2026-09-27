@@ -747,11 +747,11 @@ def test_cudnn_cpu_inputs_fail_before_dispatch() -> None:
 
 def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.cudnn_fe import plan
     from attn_gym.linear.kda.impl import cudnn as backend
 
     local_backward = backend.chunk_cudnn_packed_local_bwd_op
-    compute_ideal_chunks = driver.compute_ideal_chunks
+    compute_ideal_chunks = plan.compute_ideal_chunks
     selected = []
     geometries = []
 
@@ -764,7 +764,7 @@ def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
         return compute_ideal_chunks(*args)
 
     monkeypatch.setattr(backend, "chunk_cudnn_packed_local_bwd_op", record_split)
-    monkeypatch.setattr(driver, "compute_ideal_chunks", record_geometry)
+    monkeypatch.setattr(plan, "compute_ideal_chunks", record_geometry)
 
     exact_inputs = _make_inputs(requires_grad=True)
     exact_output = _candidate_dense(*exact_inputs)
