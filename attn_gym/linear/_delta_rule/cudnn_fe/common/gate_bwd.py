@@ -530,8 +530,8 @@ def _validate_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a
         if parameter is None and (gradient is not None or partial is not None):
             raise ValueError(f"{name} gradients require the corresponding parameter")
         if parameter is not None:
-            allowed = ((d_gate.shape[1],), tuple(d_gate.shape[1:]))
-            if tuple(parameter.shape) not in allowed or not parameter.is_contiguous():
+            shape = tuple(d_gate.shape[1:]) if channel and name == "dt" else (d_gate.shape[1],)
+            if tuple(parameter.shape) != shape:
                 raise ValueError(f"{name} parameter has an incompatible shape or layout")
         if gradient is not None:
             if partial is None or gradient.shape != parameter.shape:
@@ -542,8 +542,10 @@ def _validate_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a
             if get_dtype(partial.dtype) != cutlass.Float32:
                 raise ValueError(f"part_{name} must have dtype float32")
         for tensor in (parameter, gradient, partial):
-            if tensor is not None and (not tensor.is_contiguous() or tensor.data_ptr() % 4):
-                raise ValueError(f"{name} buffers must be compact and 4-byte aligned")
+            if tensor is not None and not tensor_supports_contiguous_dim(
+                tensor, alignment_bytes=4
+            ):
+                raise ValueError(f"{name} buffers require aligned contiguous inner rows")
 
 
 def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, *, stream):
