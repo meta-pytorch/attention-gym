@@ -276,7 +276,13 @@ def make_bars(cfg) -> GdnPrefillBars:
         ),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_THREADS, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            try_wait=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA producer
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -2894,53 +2900,55 @@ def frost_gdn_prefill(
         beta_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.smem_kq_stages):
-        bars.mb_kq_ready[s].init()
-        bars.mb_kq_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.smem_beta_stages):
-        bars.mb_beta_ready[s].init()
-        bars.mb_beta_done[s].init()
-    if cutlass.const_expr(cfg.expand_num > 1):
+    # ---- mbarrier init (one thread; every thread fences and syncs below) ----------------
+    # Attention Gym modification: a single initializer instead of a racy all-thread init.
+    if tidx == 0:
+        for s in range(cfg.smem_kq_stages):
+            bars.mb_kq_ready[s].init()
+            bars.mb_kq_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
         for s in range(cfg.smem_gate_stages):
-            bars.mb_gate_cumsum_done[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_ready[s].init()
-    for s in range(cfg.tmem_q_state_acc_stages):
-        bars.mb_o_acc_ready[s].init()
-        bars.mb_o_final_acc_ready[s].init()
-        bars.mb_o_state_scale_acc_done[s].init()
-    for s in range(cfg.tmem_cg0_acc_stages):
-        bars.mb_cg0_acc_ready[s].init()
-        bars.mb_cg0_acc_done[s].init()
-    bars.mb_k_state_acc_ready[0].init()
-    bars.mb_u_acc_ready[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.smem_a_stages):
-        bars.mb_a_ready[s].init()
-        bars.mb_a_done[s].init()
-    for s in range(cfg.tmem_state_input_stages):
-        bars.mb_state_input_ready[s].init()
-    for b in (bars.mb_y_input_ready, bars.mb_u_input_ready, bars.mb_decay_u_input_ready):
-        b[0].init()
-    for s in range(cfg.smem_o_stages):
-        bars.mb_o_tmastg_ready[s].init()
-        bars.mb_o_tmastg_done[s].init()
-    for s in range(cfg.smem_checkpoint_stages):
-        bars.mb_checkpoint_tmastg_ready[s].init()
-        bars.mb_checkpoint_tmastg_done[s].init()
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    bars.mb_tmem_done[0].init()
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.smem_beta_stages):
+            bars.mb_beta_ready[s].init()
+            bars.mb_beta_done[s].init()
+        if cutlass.const_expr(cfg.expand_num > 1):
+            for s in range(cfg.smem_gate_stages):
+                bars.mb_gate_cumsum_done[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_ready[s].init()
+        for s in range(cfg.tmem_q_state_acc_stages):
+            bars.mb_o_acc_ready[s].init()
+            bars.mb_o_final_acc_ready[s].init()
+            bars.mb_o_state_scale_acc_done[s].init()
+        for s in range(cfg.tmem_cg0_acc_stages):
+            bars.mb_cg0_acc_ready[s].init()
+            bars.mb_cg0_acc_done[s].init()
+        bars.mb_k_state_acc_ready[0].init()
+        bars.mb_u_acc_ready[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.smem_a_stages):
+            bars.mb_a_ready[s].init()
+            bars.mb_a_done[s].init()
+        for s in range(cfg.tmem_state_input_stages):
+            bars.mb_state_input_ready[s].init()
+        for b in (bars.mb_y_input_ready, bars.mb_u_input_ready, bars.mb_decay_u_input_ready):
+            b[0].init()
+        for s in range(cfg.smem_o_stages):
+            bars.mb_o_tmastg_ready[s].init()
+            bars.mb_o_tmastg_done[s].init()
+        for s in range(cfg.smem_checkpoint_stages):
+            bars.mb_checkpoint_tmastg_ready[s].init()
+            bars.mb_checkpoint_tmastg_done[s].init()
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()

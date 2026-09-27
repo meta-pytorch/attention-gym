@@ -109,6 +109,23 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Replay:** keep the dynamic-stride fake ABI; `mark_layout_dynamic(leading_dim=None)` still infers
   stride 1 from a compact first call, and the test then only exercises the host rejection.
 
+### B2 — All-thread mbarrier init in GDN kernels (C02) · hardening
+- **Problem:** upstream initializes every barrier from every thread; one sync object should have one
+  initializer.
+- **Found by:** hardened during #444's deadlock hunt (the proven cause there was C01); re-applied
+  on v1.30 by inspection.
+- **Fix:** init under `if tidx == 0`, fence and CTA sync outside, in GDN prefill, bprop, recompute,
+  bprop_summary, summary. "Initialize the GDN prefill mbarriers from one thread", "Initialize the GDN
+  backward mbarriers from one thread", "Initialize GDN summary mbarriers from one thread and tidy
+  vendored kernel names".
+- **Evidence:** fails without = **NO** (1,000 fwd / 500 bwd iterations pass with all-thread init).
+  SASS ±8, gdn_recompute ckpt64 STACK 120→72, perf neutral. CUTracer `random_delay` 9/9 bitwise on
+  every GDN/KDA filter at the final SASS.
+- **Tests:** GT::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary,
+  GT::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary
+  (`ATTN_GYM_RUN_STRESS_TESTS=1`).
+- **Upstream:** draft `07-single-thread-gdn-mbarrier-init.patch`, hardening only.
+
 ### B14 — Split-table replay passes a tensor into a compiled `None` slot (E4) · bugfix, AG-only
 - **Problem:** replaying a table compiled without a scheduler passed `sched_ctr` anyway → TVM-FFI
   TypeError at argument 14.

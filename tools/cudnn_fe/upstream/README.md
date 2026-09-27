@@ -24,6 +24,7 @@ every optional specialization was tested.
 | 3 | `03-compact-empty-unsplit-work.patch` | B8 | **Yes:** padded empty intervals stay in the work table; 8/20 work-count checks fail | 20/20 checks, incl. exact empty final-state/cotangent preservation |
 | 5 | `05-scalar-scan-head-stride.patch` | B13 | **Yes:** raw scan wrong in 256/516 entries, max abs error 4.6166; host rejects stride-2 replay | Raw scan and compact→strided host replay match exactly |
 | 6 | `04-omit-zero-chunk-split-work.patch` | B10 | **Yes:** 8 items instead of 4 (not a reproduced TMEM hang) | Opted-in table has 4 items, all-empty 0; stateful default unchanged |
+| 7 | `07-single-thread-gdn-mbarrier-init.patch` | B2 | **No isolated failure:** all-thread init pattern exists | Stock and patched 32-iteration multi-wave GDN fwd/bwd stress both pass |
 
 ## Running the repros
 
@@ -33,6 +34,7 @@ every optional specialization was tested.
 | `repro_03_empty_unsplit.py` | optional export dir holding `python/cudnn` (defaults to the installed package) | 8/20 fail | 20/20 |
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
 | `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
+| `repro_07_mbarrier_stress.py` | `--iterations 32` | pass | pass |
 | `repro_09_replay_abi_scope.py` | none; scope check for excluded B14 | pass (`None` fails at build) | n/a |
 
 ## Source/history audit
@@ -46,6 +48,9 @@ dependencies**:
 - 04 (B10): "Omit zero-chunk split work items"; adds an upstream-specific safe opt-in.
 - 05 (B13): "Respect scalar-gate head strides in split scans"; uses upstream CuTeDSL's
   `make_fake_tensor` instead of the AG fake-tensor helper.
+- 07 (B2): "Initialize the GDN prefill mbarriers from one thread", "Initialize the GDN backward
+  mbarriers from one thread", summary part of "Initialize GDN summary mbarriers from one thread and
+  tidy vendored kernel names".
 
 ## Draft issue 01 — GDN backward loses dBeta at zero and tiny post-activation beta
 
@@ -124,6 +129,16 @@ stock compact→strided replay raises a TVM-FFI stride mismatch; patched passes.
 **Fix.** Widen before multiplying by the actual head stride; explicit symbolic-stride fake signature
 for scalar gates. `mark_layout_dynamic(leading_dim=None)` is not enough: it infers stride 1 from a
 compact first call.
+
+## Draft issue 07 — Initialize each GDN CTA mbarrier from one thread
+
+**Hardening, not a reproduced deadlock.** GDN prefill, recompute, bprop, bprop-summary and forward
+summary initialize mbarriers from every CTA thread; each sync object should have one initializer.
+`repro_07_mbarrier_stress.py` (32 sequences × 128 tokens, H=32, D=128, seeded state, backward; 1024
+items across persistent waves) passes 32 iterations on both stock and patched.
+
+**Fix.** Wrap each init inventory in `if tidx == 0`, keeping the init fence and CTA sync outside. No
+counts or steady-state handshakes change.
 
 ## Excluded — split-table replay absent-scheduler ABI (B14)
 

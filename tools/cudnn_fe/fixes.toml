@@ -224,6 +224,23 @@ upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- validation / hardening
 [[fix]]
+id = "B2"
+title = "Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary"
+kind = "validation"
+ag_subject = "Initialize the GDN prefill mbarriers from one thread"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary",
+]
+env = { ATTN_GYM_RUN_STRESS_TESTS = "1" }
+gate = "cutracer random_delay (hardening; tests pass without the fix)"
+upstream_patch = "upstream/07-single-thread-gdn-mbarrier-init.patch"
+upstream_repro = "upstream/repro_07_mbarrier_stress.py"
+upstream_runs = [[]]
+upstream_expect = "smoke"
+upstream_status = "hardening-draft"
+
+[[fix]]
 id = "S14"
 title = "int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests"
 kind = "validation"
