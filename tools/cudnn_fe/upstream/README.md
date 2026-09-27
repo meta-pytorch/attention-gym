@@ -21,6 +21,7 @@ every optional specialization was tested.
 | Rank | Patch | Ledger | Stock v1.30 behavior reproduced? | Patched validation |
 |---:|---|---|---|---|
 | 1 | `01-gdn-beta-free-dbeta.patch` | B7 | **Yes:** dBeta=0 instead of 1 at beta=0, BF16/FP16, both inverse-factor routes | All five gradients exact vs FP64 in 16 dtype × beta × factor-route cases |
+| 2 | `02-kda-fp32-delta-residual.patch` | B6 | **Yes:** output 2 instead of 1.5; dBeta 0 instead of −256; later dQ 128 instead of 96 | 16 forward plan cases and four uncut backward cases |
 | 3 | `03-compact-empty-unsplit-work.patch` | B8 | **Yes:** padded empty intervals stay in the work table; 8/20 work-count checks fail | 20/20 checks, incl. exact empty final-state/cotangent preservation |
 | 5 | `05-scalar-scan-head-stride.patch` | B13 | **Yes:** raw scan wrong in 256/516 entries, max abs error 4.6166; host rejects stride-2 replay | Raw scan and compact→strided host replay match exactly |
 | 6 | `04-omit-zero-chunk-split-work.patch` | B10 | **Yes:** 8 items instead of 4 (not a reproduced TMEM hang) | Opted-in table has 4 items, all-empty 0; stateful default unchanged |
@@ -31,6 +32,7 @@ every optional specialization was tested.
 | Script | Arguments | Stock v1.30 | Patched |
 |---|---|---|---|
 | `repro_01_gdn_beta.py` | `--beta B...`; `--checkpoints` selects the compute-factor route (default gmem factors) | fails (dBeta 0) | pass |
+| `repro_02_kda_residual.py` | default: public-API uncut fwd+bwd; `--scheme dv\|prep\|chain` forward plan probes via upstream planning hooks | fails | pass |
 | `repro_03_empty_unsplit.py` | optional export dir holding `python/cudnn` (defaults to the installed package) | 8/20 fail | 20/20 |
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
 | `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
@@ -43,6 +45,9 @@ Translated from these AG commits (by subject; see `../fixes.toml`), **without AG
 dependencies**:
 
 - 01 (B7): "Compute the GDN bprop dBeta without dividing by beta".
+- 02 (B6): "Add an FP32 KDA delta-residual staging helper", "Keep the KDA forward delta residual
+  in FP32 before the MMA pack", "Keep the KDA backward delta residual in FP32 through subtraction
+  and beta scaling".
 - 03 (B8): PR #603 and its v1.30 replay in "Route unpaged GDN and KDA and native CP summaries to the
   v1.30 kernels"; adapted conservatively to upstream state ownership.
 - 04 (B10): "Omit zero-chunk split work items"; adds an upstream-specific safe opt-in.
@@ -79,6 +84,26 @@ factor sources, including reconstructing the beta-free inverse from gmem factors
 
 **Historical performance (AG port, not this export).** GB200 fwd+bwd +0.4% to +3.6% across four
 workloads (lower is better).
+
+## Draft issue 02 — KDA rounds away the delta residual before subtraction and beta scaling
+
+**Symptom.** A small delta next to a large state contraction disappears: 4098 rounds to 4096 in BF16
+and FP16, so V=4096 minus the packed contraction gives 0 instead of −2. The exact 64-token fixture
+expects output=1.5, dBeta₁₆=−256, dQ₃₂=96; stock yields 2, 0, 128.
+
+**Root cause.** The state·K accumulator is packed before subtraction, then residual/beta are packed
+again. Backward consumes the rounded residual for its value contribution to dBeta.
+
+**Repro.** `repro_02_kda_residual.py` (default and `--scheme dv|prep|chain`) fails on stock at the
+exact probes; patched passes 16 forward cases (4 plans × 2 dtypes × seed absent/present) and four
+uncut backward cases.
+
+**Fix.** A packed helper unpacks V, subtracts FP32 state·K, applies FP32 beta and packs once for MMA,
+keeping the FP32 residual for dBeta. Covers prefill, prep-prefill, summary, recompute and bprop. Prep
+keeps residual-only staging because its factors already contain beta.
+
+**Historical performance (AG port).** T=32768, H=48 chain forward 1360→1378 µs (+1.3%, lower is
+better), others within noise; backward ≈+1% at T2048/H8 and packed; REG/STACK unchanged.
 
 ## Draft issue 03 — Empty packed intervals consume unsplit scheduling slots
 

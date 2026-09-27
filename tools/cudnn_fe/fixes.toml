@@ -47,6 +47,24 @@ upstream_expect = "bug"
 upstream_status = "draft-not-filed"
 
 [[fix]]
+id = "B6"
+title = "KDA delta residual kept in FP32 through subtraction and beta scaling (fwd + bwd)"
+kind = "numerics"
+ag_subject = "Keep the KDA forward delta residual in FP32 before the MMA pack"
+ag_subjects_extra = [
+  "Add an FP32 KDA delta-residual staging helper",
+]
+guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32",
+  "test/kda/cudnn/test_delta_rule_numerics.py::test_kda_cudnn_delta_residual_keeps_fp32_precision",
+]
+upstream_patch = "upstream/02-kda-fp32-delta-residual.patch"
+upstream_repro = "upstream/repro_02_kda_residual.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
 id = "B8"
 title = "Compact empty cu_seqlens intervals out of the unsplit work table"
 kind = "bugfix"

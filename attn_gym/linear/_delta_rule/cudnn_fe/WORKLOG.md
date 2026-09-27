@@ -62,6 +62,26 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`
   rejects fused l2norm at d_v = 128 after this change; AG never passes `inv_q`.
 
+### B6 — KDA delta residual rounded before subtraction (C06) · numerics
+- **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large
+  contractions: 4098 rounds to 4096 in BF16/FP16, so −2 becomes 0. Exact 64-token fixture: output
+  2.0 vs 1.5, dBeta 0 vs −256, later dQ 128 vs 96.
+- **Found by:** originally #465 (exact cancellation fixture); re-checked on v1.30 with the same
+  fixture across every forward plan (uncut, d_v split, prep, chain).
+- **Fix:** helper `beta_residual_f16x2` (unpack V, subtract FP32 state·K, apply FP32 beta, pack once
+  for MMA, keep the FP32 residual for dBeta) in kda prefill / prep_prefill / summary / recompute /
+  bprop; prep keeps residual-only staging because its factors already contain beta. Subjects: "Add
+  an FP32 KDA delta-residual staging helper", "Keep the KDA forward delta residual in FP32 before the
+  MMA pack", "Keep the KDA backward delta residual in FP32 through subtraction and beta scaling".
+- **Evidence:** fails without = YES (forward hunks reverted 16/16 fail, backward 2/2). SASS +16…56
+  instructions/kernel, REG/STACK unchanged. Chain T32768 H48 fwd 1360→1378 µs (+1.3%), bwd ≈+1% at
+  T2048/packed, noise elsewhere.
+- **Tests:** KV::test_v130_forward_plans_keep_delta_residual_in_fp32,
+  KN::test_kda_cudnn_delta_residual_keeps_fp32_precision.
+- **Upstream:** draft `02-kda-fp32-delta-residual.patch`.
+- **Replay:** touches five kernels in steady/seeded/first stages; grep every KDA kernel, including
+  new ones, for the `pack(state@K)` subtraction.
+
 ### B8 — Empty `cu_seqlens` intervals occupy the unsplit work table (C08) · bugfix
 - **Problem:** serving pads `cu_seqlens` with repeated boundaries; each empty interval consumed sort
   slots, descriptors and persistent tiles. Naively dropping empties would leave empty-sequence
