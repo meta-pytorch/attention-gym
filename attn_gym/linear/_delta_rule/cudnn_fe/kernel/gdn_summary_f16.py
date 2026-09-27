@@ -69,8 +69,7 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : register pool  - setmaxnreg.dec only; its share feeds the chain groups
 """
 
-import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -80,11 +79,9 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
-from cutlass.cute.runtime import from_dlpack
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_head, decode_work_item, order_body
-from ..common.host import get_dtype
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from ..tile_dsl.barrier import (
@@ -103,7 +100,6 @@ from ..tile_dsl.pointwise import fadd2, fmul2, fp32_to_fp16, opaque_f32_zero, op
 from ..tile_dsl.swizzle import swizzle_xor_128b
 from ..tile_dsl.tma import tma_load_tile, tma_tensormap_acquire
 from .gdn_summary_config import CFG
-from .gdn_tinv_f16 import tinv_rows
 
 USE_PDL = True
 STATE_DIMS = (64, 128)
@@ -1505,7 +1501,7 @@ def frost_gdn_summary(
         nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnSummaryCfg:
     """Per-compile fused-summary kernel knob (``build_cfg``): the dtype / GQA / state-flag fields are the ``cute.compile``
     cache keys, the rest derives from ``CFG``.
@@ -1597,395 +1593,38 @@ def build_cfg(
         tiles_per_head=tiles_per_head,
     )
     n_chain = len(cfg.chain_h_warp_ids) + len(cfg.chain_m_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_chain)
-    cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_chain)
-    cfg.tmem_state_h_offset = 0
-    cfg.tmem_state_m_offset = cfg.tmem_state_h_offset + cfg.tmem_state_acc_stages * cfg.d_k
-    cfg.tmem_state_input_h_offset = cfg.tmem_state_m_offset + cfg.tmem_state_acc_stages * cfg.d_k
-    cfg.tmem_state_input_m_offset = cfg.tmem_state_input_h_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
-    cfg.tmem_acc_h_offset = cfg.tmem_state_input_m_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
-    cfg.tmem_acc_m_offset = cfg.tmem_acc_h_offset + cfg.b_t
-    if cfg.tmem_acc_m_offset + cfg.b_t > 512:
-        raise ValueError(f"TMEM layout exceeds 512 columns: {cfg.tmem_acc_m_offset + cfg.b_t}")
+    tmem_state_m_offset = cfg.tmem_state_acc_stages * cfg.d_k
+    tmem_state_input_h_offset = tmem_state_m_offset + cfg.tmem_state_acc_stages * cfg.d_k
+    tmem_state_input_m_offset = tmem_state_input_h_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
+    tmem_acc_h_offset = tmem_state_input_m_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
+    tmem_acc_m_offset = tmem_acc_h_offset + cfg.b_t
+    if tmem_acc_m_offset + cfg.b_t > 512:
+        raise ValueError(f"TMEM layout exceeds 512 columns: {tmem_acc_m_offset + cfg.b_t}")
     # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
     bytes_per_element = io_dtype.width // 8
     k_tile_elements = cfg.b_t * cfg.d_k
     v_tile_elements = cfg.d_v * cfg.b_t
     tinv_tile_elements = cfg.b_t * cfg.b_t
-    cfg.k_cosize = k_tile_elements * cfg.smem_k_stages
-    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-    cfg.tma_k_bytes = k_tile_elements * bytes_per_element
-    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
-    return cfg
+    return replace(
+        cfg,
+        threads_per_cta=cfg.threads_per_warp * (4 + n_chain),
+        tmem_user_threads=cfg.threads_per_warp * (1 + n_chain),
+        tmem_state_h_offset=0,
+        tmem_state_m_offset=tmem_state_m_offset,
+        tmem_state_input_h_offset=tmem_state_input_h_offset,
+        tmem_state_input_m_offset=tmem_state_input_m_offset,
+        tmem_acc_h_offset=tmem_acc_h_offset,
+        tmem_acc_m_offset=tmem_acc_m_offset,
+        k_cosize=k_tile_elements * cfg.smem_k_stages,
+        v_cosize=v_tile_elements * cfg.smem_v_stages,
+        t_inv_cosize=tinv_tile_elements * cfg.smem_t_inv_stages,
+        tma_k_bytes=k_tile_elements * bytes_per_element,
+        tma_v_bytes=v_tile_elements * bytes_per_element,
+        tma_tinv_bytes=tinv_tile_elements * bytes_per_element,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, tinv
-
-
-# ---------------------------------------------------------------------------
-
-
-@functools.cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    state_dtype_str: str,
-    transition_dtype_str: str,
-    cu_dtype_str: str,
-    gate_dtype_str: str,
-    a_log_dtype_str: str,
-    dt_bias_dtype_str: str,
-    device: int,
-    num_sm: int,
-    DK: int,
-    DV: int,
-    expand_num: int,
-    use_initial_state: bool,
-    log_gate: bool,
-    safe_gate: bool,
-    run_order: bool,
-    order_gen: bool,
-    tiles_per_head: int,
-):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
-
-
-def compile(
-    io_dtype,
-    state_dtype,
-    use_initial_state: bool,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    *,
-    num_sm: int,
-    d_k: int,
-    d_v: int,
-    expand_num: int = 1,
-    tiles_per_head: int = 1,
-    k_cute,
-    v_cute,
-    gate_cute,
-    a_log_cute=None,
-    dt_bias_cute=None,
-    cu_seqlens_cute,
-    tinv_cute,
-    state_in_cute,
-    state_out_cute,
-    transition_out_cute,
-    work_items_cute,
-    work_count_cute,
-    scheduler_counter_cute=None,
-    workspace_cute,
-    stream,
-):
-    """JIT-compile the fused GDN summary kernel for one static config."""
-    cfg = build_cfg(
-        io_dtype,
-        state_dtype,
-        max_active_clusters=num_sm,
-        use_initial_state=use_initial_state,
-        log_gate=log_gate,
-        safe_gate=safe_gate,
-        d_k=d_k,
-        d_v=d_v,
-        expand_num=expand_num,
-        tiles_per_head=tiles_per_head,
-    )
-
-    return cute.compile(
-        host,
-        cfg,
-        k_cute,
-        v_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        cu_seqlens_cute,
-        tinv_cute,
-        state_in_cute,
-        state_out_cute,
-        transition_out_cute,
-        work_items_cute,
-        work_count_cute,
-        scheduler_counter_cute,
-        workspace_cute,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
-    )
-
-
-def chunk_gdn_summary(
-    k,
-    v,
-    gate,
-    cu_seqlens,
-    tinv,
-    initial_state,
-    output_state,
-    output_transition,
-    work_items=None,
-    work_count=None,
-    scheduler_counter=None,
-    scheduler_all=None,
-    work_item_scratch=None,
-    order_in_prologue: bool = False,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    a_log=None,
-    dt_bias=None,
-    *,
-    expand_num: int = 1,
-    tiles_per_head: int = 1,
-    workspace,
-    device: int,
-    num_sm: int,
-    stream,
-    own_prologue: bool = True,
-) -> None:
-    """Execute the fused GDN state-summary kernel (H and M in one launch, THD / varlen entry), compiled once per static
-    config and replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``initial_state`` None = zero seed.
-    gate: raw linear alpha, natural-log decay under ``log_gate``, or raw logits under ``safe_gate`` (``-exp(a_log) * softplus(gate + dt_bias)``)
-    tinv: the beta-folded chunk-factor tiles of ``gdn_tinv_f16.chunk_gdn_tinv`` over the same inputs (the kernel takes no beta)
-    output_transition: ``(num_seqs, HO, DK, DK)`` in stored domain ``M_buf = M^T``, in its own fp32 / bf16 dtype (every
-        store converts from the fp32 state to the output tensor's element type); empty items receive the identity
-    work_items / work_count: the recompute's ``(max_items, 8)`` int32 table and ``(1,)`` int32 count (REQUIRED)
-    expand_num: GDP's ``num_householder`` timeline factor (1 = off)
-    tiles_per_head: tiles per gate head (2 = the d_v split: two CTAs per (sequence, head), each owning half of d_v)
-    own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
-    """
-    k.shape[1]
-    HO = gate.shape[1]
-    DK = k.shape[2]
-    v.shape[1]
-    DV = v.shape[2]
-    B = cu_seqlens.shape[0] - 1
-    if tuple(tinv.shape[1:]) != (HO, CFG.B_T, CFG.B_T):
-        raise ValueError(f"tinv must be (rows, {HO}, {CFG.B_T}, {CFG.B_T}), got {tuple(tinv.shape)}")
-    if tinv.shape[0] < tinv_rows(gate.shape[0], B, expand_num):
-        raise ValueError(f"tinv has {tinv.shape[0]} rows, needs {tinv_rows(gate.shape[0], B, expand_num)}")
-    if tinv.dtype != k.dtype:
-        raise ValueError(f"tinv dtype {tinv.dtype} must match k dtype {k.dtype}")
-    if output_state is None or output_transition is None:
-        raise ValueError("fused GDN summary writes both output_state and output_transition")
-    if initial_state is not None and initial_state.dtype != output_state.dtype:
-        raise ValueError("initial_state and output_state must share a dtype")
-    if work_items is None or work_count is None or scheduler_counter is None:
-        raise ValueError("work_items, work_count and scheduler_counter are required")
-    use_initial_state = initial_state is not None
-    run_order = bool(order_in_prologue)
-    order_gen = work_item_scratch is None
-    if run_order and scheduler_all is None:
-        raise ValueError("order_in_prologue requires scheduler_all (the prologue zeroes the scheduler rings)")
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
-    io_dtype = get_dtype(k.dtype)
-    state_dtype = get_dtype(output_state.dtype)
-
-    cu_stream = cuda.CUstream(int(stream))
-    cache = get_compiled_cache(
-        str(k.dtype),
-        str(output_state.dtype),
-        str(output_transition.dtype),
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        device,
-        num_sm,
-        DK,
-        DV,
-        expand_num,
-        use_initial_state,
-        log_gate,
-        safe_gate,
-        run_order,
-        order_gen,
-        tiles_per_head,
-    )
-
-    if "compiled" not in cache:
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        tinv_cute = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
-
-        state_in_cute = None
-        if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        transition_out_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-
-        work_items_cute = from_dlpack(work_items, assumed_align=16)
-        work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-
-        scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
-
-        cache["compiled"] = compile(
-            io_dtype,
-            state_dtype,
-            use_initial_state,
-            log_gate,
-            safe_gate,
-            num_sm=num_sm,
-            d_k=DK,
-            d_v=DV // tiles_per_head,
-            expand_num=expand_num,
-            tiles_per_head=tiles_per_head,
-            k_cute=k_cute,
-            v_cute=v_cute,
-            gate_cute=gate_cute,
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            cu_seqlens_cute=cu_seqlens_cute,
-            tinv_cute=tinv_cute,
-            state_in_cute=state_in_cute,
-            state_out_cute=state_out_cute,
-            transition_out_cute=transition_out_cute,
-            work_items_cute=work_items_cute,
-            work_count_cute=work_count_cute,
-            scheduler_counter_cute=scheduler_counter_cute,
-            workspace_cute=workspace_cute,
-            stream=cu_stream,
-        )
-
-    compiled = cache["compiled"]
-
-    if own_prologue and "prologue" not in cache:
-        k_placeholder = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_placeholder = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        staging_placeholder = None
-        if not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        scheduler_all_placeholder = None
-        if run_order:
-            scheduler_all_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
-        workspace_placeholder = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        tinv_placeholder = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3) if tinv is not None else None
-        cache["prologue"] = cute.compile(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            run_order,
-            order_gen,
-            expand_num,
-            k_placeholder,
-            v_placeholder,
-            gate_placeholder,
-            cu_placeholder,
-            staging_placeholder,
-            work_count_placeholder,
-            work_items_placeholder,
-            scheduler_all_placeholder,
-            tinv_placeholder,
-            workspace_placeholder,
-            cu_stream,
-            tiles_per_head,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    if own_prologue:
-        cache["prologue"](
-            k,
-            v,
-            gate,
-            cu_seqlens,
-            work_item_scratch if not order_gen else None,
-            work_count,
-            work_items,
-            scheduler_all if run_order else None,
-            tinv,
-            workspace,
-            cu_stream,
-        )
-    compiled(
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        tinv,
-        initial_state,
-        output_state,
-        output_transition,
-        work_items,
-        work_count,
-        scheduler_counter,
-        workspace,
-        cu_stream,
-    )
-    return cache
-
-
-def run_summary(
-    cache,
-    k,
-    v,
-    gate,
-    cu_seqlens,
-    tinv,
-    initial_state,
-    output_state,
-    output_transition,
-    work_items,
-    work_count,
-    scheduler_counter,
-    scheduler_all,
-    work_item_scratch,
-    tensormap_workspace,
-    stream,
-    a_log=None,
-    dt_bias=None,
-    own_prologue=True,
-) -> None:
-    """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
-    nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
-    if own_prologue:
-        cache["prologue"](
-            k,
-            v,
-            gate,
-            cu_seqlens,
-            work_item_scratch,
-            work_count,
-            work_items,
-            scheduler_all,
-            tinv,
-            tensormap_workspace,
-            cu_stream,
-        )
-    cache["compiled"](
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        tinv,
-        initial_state,
-        output_state,
-        output_transition,
-        work_items,
-        work_count,
-        scheduler_counter,
-        tensormap_workspace,
-        cu_stream,
-    )
 
 
 frost_gdn_summary_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

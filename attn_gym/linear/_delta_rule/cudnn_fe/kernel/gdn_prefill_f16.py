@@ -89,7 +89,7 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : epilogue warp  - O then checkpoint TMA stores
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -1849,6 +1849,7 @@ def compute1_warp_group(
     mState_out,
     mSeedIndices,
     mFinalIndices,
+    mHasInitialState,
     checkpoint_every_n_tokens,
     sScheduler,
     bars,
@@ -2427,6 +2428,8 @@ def frost_gdn_prefill_prologue(
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    mStateIndices: Optional[cute.Tensor],
+    mHasInitialState: Optional[cute.Tensor],
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
     scheduler rings via :func:`order_body`, block 1 builds the per-batch
@@ -2462,6 +2465,8 @@ def frost_gdn_prefill_prologue(
             sIdx,
             sSpread,
             expand_num=expand_num,
+            mStateIndices=mStateIndices,
+            mHasInitialState=mHasInitialState,
         )
     else:
         build_descs_body(
@@ -2508,10 +2513,13 @@ def prologue(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
+    state_indices: Optional[cute.Tensor] = None,
+    has_initial_state: Optional[cute.Tensor] = None,
 ):
     """One-launch prologue: LPT-order the work items and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
-    ``tensormap_workspace``."""
+    ``tensormap_workspace``.  ``state_indices`` / ``has_initial_state`` reach the work-table
+    compactor (see ``common/split_k.order_body``)."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -2589,6 +2597,8 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         checkpoint_every_n,
+        state_indices,
+        has_initial_state,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -2608,6 +2618,7 @@ def host(
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
+    has_initial_state: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
@@ -2683,6 +2694,7 @@ def host(
         state_out,
         seed_indices,
         final_indices,
+        has_initial_state,
         tinv,
         work_items,
         work_count,
@@ -2723,6 +2735,7 @@ def frost_gdn_prefill(
     mState_out: Optional[cute.Tensor],
     mSeedIndices: Optional[cute.Tensor],
     mFinalIndices: Optional[cute.Tensor],
+    mHasInitialState: Optional[cute.Tensor],
     mTinv: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
@@ -2999,6 +3012,7 @@ def frost_gdn_prefill(
             mState_out=mState_out,
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
+            mHasInitialState=mHasInitialState,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             sScheduler=sScheduler,
             bars=bars,
@@ -3100,7 +3114,7 @@ def frost_gdn_prefill(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnPrefillCfg:
     """Per-compile GDN kernel knob, built by ``build_cfg``.
 
@@ -3208,6 +3222,12 @@ def build_cfg(
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
+    stages = {"smem_checkpoint_stages": 1}
+    if enable_checkpoints and d_v != 64:
+        stages["smem_kq_stages"] = 3
+    if expand_num > 1 and d_v != 64:
+        stages["smem_gate_stages"] = 2
+        stages["smem_beta_stages"] = 2
     cfg = GdnPrefillCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
@@ -3225,24 +3245,14 @@ def build_cfg(
         d_v=d_v,
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
+        **stages,
     )
-    cfg.smem_checkpoint_stages = 1
-    if enable_checkpoints and d_v != 64:
-        cfg.smem_kq_stages = 3
-    if expand_num > 1 and d_v != 64:
-        cfg.smem_gate_stages = 2
-        cfg.smem_beta_stages = 2
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
-    cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_cg0 + n_cg1)
-    cfg.inverse_barrier_threads = cfg.threads_per_warp * n_cg0
-    cfg.tmem_state_acc_offset = 0
-    cfg.tmem_q_state_acc_offset = cfg.tmem_state_acc_offset + cfg.tmem_state_acc_stages * cfg.d_k
-    cfg.tmem_state_input_offset = cfg.tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
-    cfg.tmem_cg0_acc_offset = cfg.tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
-    cfg.tmem_cg1_acc_offset = cfg.tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * cfg.b_t
-    cfg.tmem_y_decay_u_input_offset = cfg.tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t
+    tmem_q_state_acc_offset = cfg.tmem_state_acc_stages * cfg.d_k
+    tmem_state_input_offset = tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
+    tmem_cg0_acc_offset = tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
+    tmem_cg1_acc_offset = tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * cfg.b_t
     # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
     bytes_per_element = io_dtype.width // 8
     kq_tile_elements = 2 * cfg.b_t * cfg.d_k
@@ -3250,17 +3260,28 @@ def build_cfg(
     tinv_tile_elements = cfg.b_t * cfg.b_t
     a_tile_elements = cfg.b_t * cfg.b_t
     o_tile_elements = cfg.d_v * cfg.b_t
-    cfg.kq_cosize = kq_tile_elements * cfg.smem_kq_stages
-    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-    cfg.a_cosize = a_tile_elements * cfg.smem_a_stages
-    cfg.o_cosize = o_tile_elements * cfg.smem_o_stages
-    cfg.checkpoint_cosize = cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages
-    cfg.tma_kq_bytes = kq_tile_elements * bytes_per_element
-    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
-    cfg.tma_o_bytes = o_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
-    return cfg
+    return replace(
+        cfg,
+        threads_per_cta=cfg.threads_per_warp * (4 + n_cg0 + n_cg1),
+        tmem_user_threads=cfg.threads_per_warp * (1 + n_cg0 + n_cg1),
+        inverse_barrier_threads=cfg.threads_per_warp * n_cg0,
+        tmem_state_acc_offset=0,
+        tmem_q_state_acc_offset=tmem_q_state_acc_offset,
+        tmem_state_input_offset=tmem_state_input_offset,
+        tmem_cg0_acc_offset=tmem_cg0_acc_offset,
+        tmem_cg1_acc_offset=tmem_cg1_acc_offset,
+        tmem_y_decay_u_input_offset=tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t,
+        kq_cosize=kq_tile_elements * cfg.smem_kq_stages,
+        v_cosize=v_tile_elements * cfg.smem_v_stages,
+        t_inv_cosize=tinv_tile_elements * cfg.smem_t_inv_stages,
+        a_cosize=a_tile_elements * cfg.smem_a_stages,
+        o_cosize=o_tile_elements * cfg.smem_o_stages,
+        checkpoint_cosize=cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages,
+        tma_kq_bytes=kq_tile_elements * bytes_per_element,
+        tma_v_bytes=v_tile_elements * bytes_per_element,
+        tma_o_bytes=o_tile_elements * bytes_per_element,
+        tma_tinv_bytes=tinv_tile_elements * bytes_per_element,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: Q, K, V, O, checkpoints, tinv

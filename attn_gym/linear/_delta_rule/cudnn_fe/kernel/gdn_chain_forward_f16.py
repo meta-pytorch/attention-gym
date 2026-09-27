@@ -16,13 +16,14 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
+# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream.
 
 """One compiled launch for the GDN chain forward: chain prologue, T pass, fused summary, fp32 state chain and prefill issued
 from a single host, the way ``split_k.run_table`` launches plan, scan and walk.  Every kernel, its host and the tensor
 placeholder each host was compiled with are the standalone modules' own; this host only sequences the five launches, so the
 kernels' SASS is unchanged and the Python side crosses into the DSL once per call instead of five times.  A buffer that two
-hosts read through different placeholder types (the summary's ``state_out`` is the state chain's ``H``) is passed twice, once
+hosts read through different signature types (the summary's ``state_out`` is the state chain's ``H``) is passed twice, once
 per type."""
 
 from typing import Optional
@@ -30,16 +31,23 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor
 
-from .._persist import persistent_compile
-from .._compat import DeviceView
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 
 from ..common.host import get_dtype
-from ..common.piece_chain import dtype_name, launch_state_chain
+from ..common.piece_chain import launch_state_chain
+from ..common.tvm_ffi import (
+    WORK_ITEM_FIELDS,
+    make_compact_signature_tensor,
+    make_counter_signature,
+    make_cu_seqlens_signature,
+    make_strided_signature_tensor,
+    make_workspace_signature,
+)
 from . import gdn_chain_prologue_f16, gdn_prefill_f16, gdn_summary_f16, gdn_tinv_f16
 
-chain_forward_cache = {}
+OPT_LEVEL = 2
 
 
 @cute.jit
@@ -199,6 +207,7 @@ def chain_forward_host(
         final_state,
         None,
         final_indices,
+        None,
         tinv,
         work_items,
         main_count,
@@ -207,6 +216,181 @@ def chain_forward_host(
         scale,
         prefill_words,
         stream,
+    )
+
+
+@jit_cache
+def _compile_chain_forward(
+    io_dtype,
+    state_dtype,
+    final_dtype,
+    gate_dtype,
+    a_log_dtype,
+    bias_spec,
+    beta_dtype,
+    seed_dtype,
+    num_sm,
+    d_k,
+    d_v,
+    unit_chunks,
+    b_t,
+    expand_num,
+    length_rule,
+    log_gate,
+    safe_gate,
+    use_beta_sigmoid,
+    allow_neg_eigval,
+    enable_checkpoints,
+    has_seed_indices,
+    has_final_indices,
+    chain_rows,
+):
+    """Compile the chain forward launch for one static configuration (dtypes, heads-independent
+    gate and state flags, dims, chain rows, device target); every extent is symbolic."""
+    sym_int = cute.sym_int
+
+    def tensor(dtype, rank, align):
+        return make_strided_signature_tensor(
+            dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=align,
+            use_int64_offsets=True,
+            stride_divisibility=1,
+        )
+
+    def work_items():
+        return make_compact_signature_tensor(cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16)
+
+    def rows():
+        return make_compact_signature_tensor(cutlass.Int32, (sym_int(),), assumed_align=16)
+
+    def summary_state():
+        # The summary's outputs and the prefill's seed read the compact [P, HO, D, d_k] chain
+        # states whose inner extent is a multiple of d_k (16-byte vector accesses).
+        return make_fake_compact_tensor(
+            state_dtype,
+            (sym_int(), sym_int(), sym_int(), sym_int(divisibility=d_k)),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+
+    tinv_cfg = gdn_tinv_f16.build_cfg(
+        io_dtype,
+        num_sm=num_sm,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        beta_sigmoid=use_beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
+        d_k=d_k,
+        expand_num=expand_num,
+    )
+    summary_cfg = gdn_summary_f16.build_cfg(
+        io_dtype,
+        state_dtype,
+        max_active_clusters=num_sm,
+        use_initial_state=False,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        d_k=d_k,
+        d_v=d_v,
+        expand_num=expand_num,
+    )
+    prefill_cfg = gdn_prefill_f16.build_cfg(
+        io_dtype,
+        state_dtype,
+        max_active_clusters=num_sm,
+        use_initial_state=True,
+        store_final_state=final_dtype is not None,
+        enable_checkpoints=enable_checkpoints,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        tinv_source="gmem",
+        d_k=d_k,
+        d_v=d_v,
+        expand_num=expand_num,
+    )
+    has_seed = seed_dtype is not None
+    flags = (
+        num_sm,
+        d_k,
+        d_v,
+        unit_chunks,
+        b_t,
+        expand_num,
+        length_rule,
+        log_gate,
+        safe_gate,
+        use_beta_sigmoid,
+        allow_neg_eigval,
+        enable_checkpoints,
+        has_seed_indices,
+        has_final_indices,
+        chain_rows,
+    )
+    dtypes = (
+        io_dtype,
+        state_dtype,
+        final_dtype,
+        gate_dtype,
+        a_log_dtype,
+        None if bias_spec is None else bias_spec[0],
+        beta_dtype,
+        seed_dtype,
+    )
+    name = "gdn_chain_forward_" + "_".join(str(int(flag)) for flag in flags)
+    name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
+    name += f"_biasrank{0 if bias_spec is None else bias_spec[1]}"
+    return compile_tvm_ffi(
+        chain_forward_host,
+        unit_chunks,
+        b_t,
+        expand_num,
+        length_rule,
+        tinv_cfg,
+        summary_cfg,
+        prefill_cfg,
+        d_v,
+        d_k,
+        chain_rows,
+        has_seed,
+        *(cutlass.Int32(0) for _ in range(4)),
+        cutlass.Float32(0),
+        tensor(io_dtype, 3, 16),
+        tensor(io_dtype, 3, 16),
+        tensor(io_dtype, 3, 16),
+        tensor(gate_dtype, 2, 16),
+        tensor(beta_dtype, 2, 16),
+        tensor(a_log_dtype, 1, 4) if a_log_dtype is not None else None,
+        tensor(bias_spec[0], bias_spec[1], 4) if bias_spec is not None else None,
+        tensor(io_dtype, 3, 16),
+        make_cu_seqlens_signature(sym_int(), assumed_align=4),
+        make_counter_signature(sym_int()),
+        rows(),
+        rows(),
+        make_counter_signature(sym_int()),
+        make_counter_signature(sym_int()),
+        work_items(),
+        work_items(),
+        make_counter_signature(sym_int()),
+        make_counter_signature(sym_int()),
+        make_counter_signature(sym_int()),
+        make_workspace_signature(sym_int()),
+        tensor(cutlass.Int32, 2, 16),
+        make_counter_signature(sym_int()),
+        make_workspace_signature(sym_int()),
+        make_workspace_signature(sym_int()),
+        tensor(io_dtype, 4, 128),
+        summary_state(),
+        summary_state(),
+        *(tensor(state_dtype, 4, 16) for _ in range(3)),
+        tensor(seed_dtype, 4, 4) if has_seed else None,
+        make_counter_signature(sym_int()) if has_seed_indices else None,
+        summary_state(),
+        tensor(final_dtype, 4, 16) if final_dtype is not None else None,
+        make_counter_signature(sym_int()) if has_final_indices else None,
+        tensor(io_dtype, 4, 16) if enable_checkpoints else None,
+        name=name,
+        opt_level=OPT_LEVEL,
     )
 
 
@@ -259,39 +443,30 @@ def build_chain_forward(
     checkpoint_every_n_tokens,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
-    """Compile (cached per static config: dtypes, heads, dims, gate flags, checkpoint and final-state presence, seed dtype,
-    chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are
-    launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel compiles as it
-    does there."""
-    _HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    _HV, DV = v.shape[1], v.shape[2]
-    HO = gate.shape[1]
+    """Return the compiled chain forward launch over the buffers of one plan: compiled (and persisted) once per static
+    configuration (dtypes, dims, gate flags, checkpoint, seed and final-state presence, chain rows, device); ``pieces``,
+    ``heads_out`` and ``num_seqs`` are launch arguments."""
+    DK = q.shape[2]
+    DV = v.shape[2]
     if not safe_gate:
         a_log = None
         dt_bias = None
-    io_dtype = get_dtype(q.dtype)
-    state_dtype = get_dtype(state_x.dtype)
-    has_seed = seed is not None
-    seed_name = dtype_name(seed.dtype) if has_seed else "float32"
-    key = (
-        str(q.dtype),
-        str(state_x.dtype),
-        str(final_state.dtype) if final_state is not None else "none",
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(beta.dtype),
-        seed_name,
-        int(device),
+    if state_h.dtype != state_x.dtype or state_h.dtype != state_m.dtype:
+        raise TypeError("the chain states must share one dtype")
+    return _compile_chain_forward(
+        get_dtype(q.dtype),
+        get_dtype(state_x.dtype),
+        get_dtype(final_state.dtype) if final_state is not None else None,
+        get_dtype(gate.dtype),
+        get_dtype(a_log.dtype) if a_log is not None else None,
+        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
+        get_dtype(beta.dtype),
+        get_dtype(seed.dtype) if seed is not None else None,
         int(num_sm),
-        DK,
-        DV,
+        int(DK),
+        int(DV),
         int(unit_chunks),
         int(b_t),
         int(expand_num),
@@ -301,123 +476,10 @@ def build_chain_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
-        final_state is not None,
-        has_seed,
         seed_indices is not None,
         final_indices is not None,
         int(chain_rows),
     )
-    if key not in chain_forward_cache:
-        tinv_cfg = gdn_tinv_f16.build_cfg(
-            io_dtype,
-            num_sm=num_sm,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            d_k=DK,
-            expand_num=expand_num,
-        )
-        summary_cfg = gdn_summary_f16.build_cfg(
-            io_dtype,
-            get_dtype(state_h.dtype),
-            max_active_clusters=num_sm,
-            use_initial_state=False,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            d_k=DK,
-            d_v=DV,
-            expand_num=expand_num,
-        )
-        prefill_cfg = gdn_prefill_f16.build_cfg(
-            io_dtype,
-            state_dtype,
-            max_active_clusters=num_sm,
-            use_initial_state=True,
-            store_final_state=final_state is not None,
-            enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            tinv_source="gmem",
-            d_k=DK,
-            d_v=DV,
-            expand_num=expand_num,
-        )
-
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
-        work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        state_h_placeholder = from_dlpack(state_h, assumed_align=16)
-        state_h_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        state_m_placeholder = from_dlpack(state_m, assumed_align=16)
-        state_m_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        state_x_placeholder = from_dlpack(state_x, assumed_align=16)
-        state_x_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        final_state_placeholder = None
-        if final_state is not None:
-            final_state_placeholder = from_dlpack(final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        chain_forward_cache[key] = persistent_compile(
-            "chain_forward",
-            key,
-            cute.compile,
-            chain_forward_host,
-            int(unit_chunks),
-            int(b_t),
-            int(expand_num),
-            bool(length_rule),
-            tinv_cfg,
-            summary_cfg,
-            prefill_cfg,
-            DV,
-            DK,
-            int(chain_rows),
-            has_seed,
-            cutlass.Int32(int(pieces)),
-            cutlass.Int32(int(heads_out)),
-            cutlass.Int32(int(num_seqs)),
-            cutlass.Int32(int(checkpoint_every_n_tokens)),
-            float(scale),
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
-            from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
-            from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
-            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
-            work_items_placeholder,
-            work_items_summary_placeholder,
-            from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_summary, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_prefill, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(tinv_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(tinv_rows, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(tinv_row_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(prefill_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3),
-            state_h_placeholder,
-            state_m_placeholder,
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
-            from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None,
-            state_x_placeholder,
-            final_state_placeholder,
-            from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
-            from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
-            cuda.CUstream(int(stream)),
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    return chain_forward_cache[key]
 
 
 def run_chain_forward(
@@ -461,10 +523,9 @@ def run_chain_forward(
     num_seqs,
     checkpoint_every_n_tokens,
     scale,
-    stream,
 ) -> None:
-    """Replay the chain forward: one crossing into the DSL for the five launches.  The plan validated the contract at build,
-    so nothing here raises."""
+    """Replay the chain forward on the current stream: one crossing into the DSL for the five launches.  The plan
+    validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
@@ -507,5 +568,4 @@ def run_chain_forward(
         final_state,
         final_indices,
         checkpoints,
-        cuda.CUstream(int(stream)),
     )

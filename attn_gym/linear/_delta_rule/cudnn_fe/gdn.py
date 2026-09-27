@@ -126,7 +126,7 @@ def gdn_forward(
     split: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``."""
-    # DLPack refuses tensors that require grad; the kernels never differentiate.
+    # The kernels never differentiate.
     q, k, v, gate, beta, cu_seqlens = (
         _aligned(t.detach()) for t in (q, k, v, gate, beta, cu_seqlens)
     )
@@ -149,7 +149,6 @@ def gdn_forward(
             if initial_state is not None
             else torch.zeros(num_seqs, heads_out, dim_v, dim_k, dtype=torch.float32, device=device)
         )
-    stream = torch.cuda.current_stream(device).cuda_stream
     common = {
         "q": q,
         "k": k,
@@ -200,9 +199,7 @@ def gdn_forward(
             checkpoint_every_n_tokens=0,
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
-            device=device.index,
             num_sm=plan.num_sm,
-            stream=stream,
         )
         run_chain_forward(
             launch,
@@ -212,7 +209,6 @@ def gdn_forward(
             num_seqs=num_seqs,
             checkpoint_every_n_tokens=0,
             scale=scale,
-            stream=stream,
         )
         return o, final_state
 
@@ -243,10 +239,8 @@ def gdn_forward(
         expand_num=1,
         checkpoint_every_n_tokens=0,
         scale=scale,
-        device=device.index,
-        stream=stream,
     )
-    run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale, stream=stream)
+    run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale)
     return o, final_state
 
 

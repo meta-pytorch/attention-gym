@@ -185,6 +185,7 @@ ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
 ag_subjects_extra = [
   "Share exact legacy dynamic-layout fake signatures",
   "Compile common v1.30 hosts from persisted fake tensor signatures",
+  "Compile the v1.30 GDN forward hosts from persisted fake tensor signatures",
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
