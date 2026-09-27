@@ -16,12 +16,13 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe; operand SMEM in a SharedStorage struct read through
-# smem_data_ptr and named swizzle-box checkpoint offsets; mbarriers initialized by one thread, with
-# the scheduler-done count derived from the warp count; a frozen cfg whose build_cfg derives the
-# SMEM cosizes and TMA byte counts; paged state (null/fresh/resumed routes resolved through
-# paged_state, route metadata threaded to the work-table prologue); the upstream-only expand_num,
-# safe_gate/A_log/dt_bias, beta-sigmoid, and negative-eigenvalue paths removed; Ruff formatting.
+# attn_gym.linear._delta_rule.cudnn_fe; operand SMEM in lead/tail SharedStorage structs (v1.30
+# order) read through smem_data_ptr and named swizzle-box checkpoint offsets; mbarriers initialized
+# by one thread, with the scheduler-done count derived from the warp count; a frozen cfg whose
+# build_cfg derives the SMEM cosizes and TMA byte counts; paged state (null/fresh/resumed routes
+# resolved through paged_state, route metadata threaded to the work-table prologue); the
+# upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and negative-eigenvalue paths
+# removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) prefill kernel for SM100 / SM103 / SM107 (Cutlass primitives)
@@ -3364,8 +3365,11 @@ def host(
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
     beta_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_beta_stages))
 
+    # Two tile structs keep the v1.30 SMEM order: O, checkpoint and K+Q, then the barrier and
+    # staging arrays, then T_inv, A and V. Moving the arrays ahead of the tiles slows the kernel
+    # (~3% at 10x4096: 3.7x the shared-load bank conflicts).
     @cute.struct
-    class SharedStorage:
+    class LeadStorage:
         output: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.o_cosize], cfg.buffer_align_bytes
         ]
@@ -3378,6 +3382,9 @@ def host(
         kq: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.kq_cosize], cfg.buffer_align_bytes
         ]
+
+    @cute.struct
+    class TailStorage:
         t_inv: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.t_inv_cosize], cfg.buffer_align_bytes
         ]
@@ -3395,7 +3402,8 @@ def host(
 
     frost_gdn_prefill(
         cfg,
-        SharedStorage,
+        LeadStorage,
+        TailStorage,
         q_ratio,
         k_ratio,
         v_ratio,
@@ -3434,7 +3442,8 @@ def host(
 @cute.kernel
 def frost_gdn_prefill(
     cfg: cutlass.Constexpr,
-    shared_type: cutlass.Constexpr,
+    lead_storage_type: cutlass.Constexpr,
+    tail_storage_type: cutlass.Constexpr,
     q_ratio: cute.FastDivmodDivisorV2,
     k_ratio: cute.FastDivmodDivisorV2,
     v_ratio: cute.FastDivmodDivisorV2,
@@ -3495,23 +3504,10 @@ def frost_gdn_prefill(
     STRIDE = 8 * 128
     KT_LEAD = cfg.b_t * 128
     V_LEAD = cfg.b_t * 128
-    # Barrier, scheduler and gate/beta staging arrays keep stable raw pointers; the 1024-aligned
-    # tile buffers share one SharedStorage allocation placed after them (same footprint as the
-    # per-buffer arrays: the small staging arrays fill the alignment gap ahead of the tiles).
-    bars = make_bars(cfg)
-    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
-    sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
-    cumsumlog_raw = cutlass.Array(
-        cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
-    )
-    cumprod_raw = cutlass.Array(
-        cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
-    )
-    beta_raw = cutlass.Array(
-        cutlass.Float32, cute.cosize(beta_smem_layout_staged), space=SMEM, alignment=128
-    )
-    storage = SmemAllocator().allocate(shared_type)
-    sO_raw = storage.output.get_tensor(cute.make_layout((cfg.o_cosize,)))
+    # SMEM in v1.30 order (see LeadStorage): lead tiles, barrier/scheduler/staging arrays, tail
+    # tiles.
+    lead = SmemAllocator().allocate(lead_storage_type)
+    sO_raw = lead.output.get_tensor(cute.make_layout((cfg.o_cosize,)))
     sO = SmemTile(
         base=sO_raw,
         elems_per_stage=(cfg.o_cosize // cfg.smem_o_stages),
@@ -3521,10 +3517,10 @@ def frost_gdn_prefill(
         layout=SWZ,
     )
     if cutlass.const_expr(cfg.enable_checkpoints):
-        sCheckpoint_raw = storage.checkpoint.get_tensor(cute.make_layout((cfg.checkpoint_cosize,)))
+        sCheckpoint_raw = lead.checkpoint.get_tensor(cute.make_layout((cfg.checkpoint_cosize,)))
     else:
         sCheckpoint_raw = None
-    sKQ_raw = storage.kq.get_tensor(cute.make_layout((cfg.kq_cosize,)))
+    sKQ_raw = lead.kq.get_tensor(cute.make_layout((cfg.kq_cosize,)))
     sKQ = SmemTile(
         base=sKQ_raw,
         elems_per_stage=(cfg.kq_cosize // cfg.smem_kq_stages),
@@ -3541,7 +3537,20 @@ def frost_gdn_prefill(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sTinv_raw = storage.t_inv.get_tensor(cute.make_layout((cfg.t_inv_cosize,)))
+    bars = make_bars(cfg)
+    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
+    sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
+    cumsumlog_raw = cutlass.Array(
+        cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
+    )
+    cumprod_raw = cutlass.Array(
+        cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
+    )
+    beta_raw = cutlass.Array(
+        cutlass.Float32, cute.cosize(beta_smem_layout_staged), space=SMEM, alignment=128
+    )
+    tail = SmemAllocator().allocate(tail_storage_type)
+    sTinv_raw = tail.t_inv.get_tensor(cute.make_layout((cfg.t_inv_cosize,)))
     sTinv = SmemTile(
         base=sTinv_raw,
         elems_per_stage=(cfg.t_inv_cosize // cfg.smem_t_inv_stages),
@@ -3550,7 +3559,7 @@ def frost_gdn_prefill(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sA_raw = storage.a.get_tensor(cute.make_layout((cfg.a_cosize,)))
+    sA_raw = tail.a.get_tensor(cute.make_layout((cfg.a_cosize,)))
     sA = SmemTile(
         base=sA_raw,
         elems_per_stage=(cfg.a_cosize // cfg.smem_a_stages),
@@ -3559,7 +3568,7 @@ def frost_gdn_prefill(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sV_raw = storage.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
+    sV_raw = tail.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
     sV_trans = SmemTile(
         base=sV_raw,
         elems_per_stage=(cfg.v_cosize // cfg.smem_v_stages),

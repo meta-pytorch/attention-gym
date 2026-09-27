@@ -227,6 +227,17 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   KT::test_cudnn_forced_int64_forward_backward_matches_int32,
   GL::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path. Fails without = YES.
 
+### R1 — The restyle moved the barrier block and cost 1–4% · perf
+- **Found by:** bench gate (GDN forward-only +1.0…+4.4% vs #604) → bisect to the restyle commit that
+  moved the mbarrier + gate/beta staging block to the first KB of dynamic SMEM → ncu: identical
+  instruction count, shared-load bank conflicts ×3.7, `stall_mio` ×1.4. The SASS gate passed.
+- **Fix:** `LeadStorage`/`TailStorage` around the barrier arrays (tiles before barriers) in
+  gdn_prefill, gdn_tinv, gdn_summary. "Restore the v1.30 SMEM order in the GDN prefill, tinv and
+  summary kernels".
+- **Evidence:** gdn_prefill 10x4096 456.3 µs (#604 456.9); 1x2048 49.5 vs 50.7 per kernel.
+- **Replay:** see [Lessons](#lessons). With 4 KQ stages the tile struct is exactly 224 KiB; the
+  2.3 KiB staging must fill the alignment gap before it or the layout overflows 227 KiB by 256 B (F11).
+
 ### B9 — A non-vacuity check was vacuous (test)
 - **Found by:** mutation audit: ignoring `split` did not fail the contracting-gate test, because
   under the automatic plan the d_v split alone made `work_items > 1`.
@@ -294,6 +305,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+| Keep upstream's 4 KQ SMEM stages (F11) | Old AG reduced to 3 for budget; v1.30 fits 4 by putting the small staging in the alignment gap. | SMEM layout changes. |
 | CP dbeta pack-budget criterion (R8) | The partial-chunk KDA-cuDNN CP case exceeded the old dbeta tolerance (2.9×) with both new and legacy summaries, i.e. rounding of the unsharded realization, not a bug. New bound: magnitude-weighted BF16 operand-pack budget; fail-closed (no-dstate penultimate chunk and a 1.01× terminal chunk both fail). | CP numerics change. |
 | Drop the replay-ABI upstream draft (B14) | Upstream has no optional-scheduler ABI; it would be a feature request. | Upstream makes the scheduler optional. |
 
@@ -315,6 +327,11 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 ## Lessons
 
+1. **Barrier-block relocation is a perf change the SASS gate cannot see (R1).** Moving the mbarrier
+   and gate/beta staging arrays to the start of dynamic SMEM kept every instruction identical and
+   cost gdn_prefill ~2.8% through shared-load bank conflicts. Keep upstream's order (tiles first);
+   any `SharedStorage` change needs the bench gate, and a bench regression with identical SASS
+   should go straight to a bisect plus ncu memory-workload comparison.
 2. **Fake signatures are an ABI (S5/S13, B13).** Upstream compiled from live tensors marked
    `mark_layout_dynamic(leading_dim=rank-1)`: int32 shapes, int64 outer strides, divisibility 1.
    int64 shapes changed register allocation (REG 52→46); promising aligned strides grew a

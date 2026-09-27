@@ -1100,8 +1100,8 @@ def frost_gdn_tinv(
     SWZ = 2
     LEAD = 16
     STRIDE = 8 * 128
-    # Barrier and gate/beta staging arrays keep stable raw pointers; the 1024-aligned tile
-    # buffers share one SharedStorage allocation placed after them.
+    # v1.30 SMEM order: the tile buffers first, then the barrier and staging arrays.
+    storage = SmemAllocator().allocate(shared_type)
     bars = make_bars(cfg)
     tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, 2, NG * GS))
@@ -1111,7 +1111,6 @@ def frost_gdn_tinv(
     beta_raw = cutlass.Array(
         cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
     )
-    storage = SmemAllocator().allocate(shared_type)
     sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
     sK = SmemTile(
         base=sK_raw,

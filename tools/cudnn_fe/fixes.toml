@@ -237,6 +237,15 @@ upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- performance
 [[fix]]
+id = "R1"
+title = "Restore upstream SMEM order (tiles before barriers) in GDN prefill/tinv/summary"
+kind = "perf"
+ag_subject = "Restore the v1.30 SMEM order in the GDN prefill, tinv and summary kernels"
+guarding_tests = []
+gate = "bench (tools/cudnn_fe/bench; gdn_prefill main kernel vs previous tip)"
+upstream_status = "ag-specific"
+
+[[fix]]
 id = "R2"
 title = "compile_tvm_ffi takes opt_level; hosts keep O2"
 kind = "perf"

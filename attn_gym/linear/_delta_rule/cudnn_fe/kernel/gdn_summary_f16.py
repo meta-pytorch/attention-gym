@@ -1647,8 +1647,8 @@ def frost_gdn_summary(
     LEAD = 16
     STRIDE = 8 * 128
     KT_LEAD = cfg.b_t * 128
-    # Barrier, scheduler and gate staging arrays keep stable raw pointers; the 1024-aligned tile
-    # buffers share one SharedStorage allocation placed after them.
+    # v1.30 SMEM order: the tile buffers first, then the barrier and staging arrays.
+    storage = SmemAllocator().allocate(shared_type)
     bars = make_bars(cfg)
     tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
@@ -1658,7 +1658,6 @@ def frost_gdn_summary(
     cumprod_raw = cutlass.Array(
         cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
     )
-    storage = SmemAllocator().allocate(shared_type)
     sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
     sK = SmemTile(
         base=sK_raw,
