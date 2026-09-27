@@ -2018,54 +2018,55 @@ def frost_gdn_bprop_summary(
         cumsumlog_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    for s in range(cfg.smem_q_stages):
-        bars.mb_q_ready[s].init()
-        bars.mb_q_mma_done[s].init()
-    for s in range(cfg.smem_k_stages):
-        bars.mb_k_ready[s].init()
-        bars.mb_k_mma_done[s].init()
-    for s in range(cfg.smem_do_stages):
-        bars.mb_do_ready[s].init()
-        bars.mb_do_mma_done[s].init()
-        bars.mb_do_cg0_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.tmem_dstate_acc_stages):
-        bars.mb_dstate_acc_ready[s].init()
-        bars.mb_dstate_scale_acc_done[s].init()
-    for b in (
-        bars.mb_du_scale_acc_ready,
-        bars.mb_du_scale_acc_done,
-        bars.mb_du_total_acc_ready,
-        bars.mb_du_total_acc_done,
-    ):
-        b[0].init()
-    for b in (
-        bars.mb_a_acc_ready,
-        bars.mb_dy_acc_ready,
-    ):
-        b[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.smem_a_stages):
-        bars.mb_a_ready[s].init()
-        bars.mb_a_done[s].init()
-    for s in range(cfg.tmem_dstate_input_stages):
-        bars.mb_dstate_input_ready[s].init()
-        bars.mb_dstate_input_done[s].init()
-    for b in (
-        bars.mb_do_prime_input_ready,
-        bars.mb_du_input_ready,
-        bars.mb_dyp_input_ready,
-    ):
-        b[0].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init (one thread; the fence + CTA barrier publish it) ---------------
+    if tidx == 0:
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        for s in range(cfg.smem_q_stages):
+            bars.mb_q_ready[s].init()
+            bars.mb_q_mma_done[s].init()
+        for s in range(cfg.smem_k_stages):
+            bars.mb_k_ready[s].init()
+            bars.mb_k_mma_done[s].init()
+        for s in range(cfg.smem_do_stages):
+            bars.mb_do_ready[s].init()
+            bars.mb_do_mma_done[s].init()
+            bars.mb_do_cg0_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.tmem_dstate_acc_stages):
+            bars.mb_dstate_acc_ready[s].init()
+            bars.mb_dstate_scale_acc_done[s].init()
+        for b in (
+            bars.mb_du_scale_acc_ready,
+            bars.mb_du_scale_acc_done,
+            bars.mb_du_total_acc_ready,
+            bars.mb_du_total_acc_done,
+        ):
+            b[0].init()
+        for b in (
+            bars.mb_a_acc_ready,
+            bars.mb_dy_acc_ready,
+        ):
+            b[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.smem_a_stages):
+            bars.mb_a_ready[s].init()
+            bars.mb_a_done[s].init()
+        for s in range(cfg.tmem_dstate_input_stages):
+            bars.mb_dstate_input_ready[s].init()
+            bars.mb_dstate_input_done[s].init()
+        for b in (
+            bars.mb_do_prime_input_ready,
+            bars.mb_du_input_ready,
+            bars.mb_dyp_input_ready,
+        ):
+            b[0].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()

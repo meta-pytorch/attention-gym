@@ -1647,34 +1647,35 @@ def frost_gdn_recompute(
         cumsumlog_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.smem_kq_stages):
-        bars.mb_kq_ready[s].init()
-        bars.mb_kq_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_ready[s].init()
-    bars.mb_k_state_acc_ready[0].init()
-    bars.mb_u_acc_ready[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.tmem_state_input_stages):
-        bars.mb_state_input_ready[s].init()
-    for b in (bars.mb_y_input_ready, bars.mb_decay_u_input_ready):
-        b[0].init()
-    for s in range(cfg.smem_checkpoint_stages):
-        bars.mb_checkpoint_tmastg_ready[s].init()
-        bars.mb_checkpoint_tmastg_done[s].init()
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init (one thread; the fence + CTA barrier publish it) ---------------
+    if tidx == 0:
+        for s in range(cfg.smem_kq_stages):
+            bars.mb_kq_ready[s].init()
+            bars.mb_kq_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_ready[s].init()
+        bars.mb_k_state_acc_ready[0].init()
+        bars.mb_u_acc_ready[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.tmem_state_input_stages):
+            bars.mb_state_input_ready[s].init()
+        for b in (bars.mb_y_input_ready, bars.mb_decay_u_input_ready):
+            b[0].init()
+        for s in range(cfg.smem_checkpoint_stages):
+            bars.mb_checkpoint_tmastg_ready[s].init()
+            bars.mb_checkpoint_tmastg_done[s].init()
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()

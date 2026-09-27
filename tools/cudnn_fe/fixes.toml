@@ -248,6 +248,9 @@ id = "B2"
 title = "Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary"
 kind = "validation"
 ag_subject = "Initialize the GDN prefill mbarriers from one thread"
+ag_subjects_extra = [
+  "Initialize the GDN backward mbarriers from one thread",
+]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary",
