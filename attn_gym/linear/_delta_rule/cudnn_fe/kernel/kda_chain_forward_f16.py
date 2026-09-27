@@ -18,7 +18,8 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. The host nests the summary / prefill Ops, compiles through
 # a persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor
-# needs it), and launches with live tensors on the current Torch stream.
+# needs it), and launches with live tensors on the current Torch stream. The always-pinned
+# safe_gate, a_log, dt_bias, beta-sigmoid, allow_neg_eigval and Q/K L2-norm knobs are removed.
 
 """One compiled launch for the KDA chain forward: chain prologue, fused summary, fp32 state chain
 and prefill issued from a single host, the way ``split_k.run_table`` launches plan, scan and walk.
@@ -71,8 +72,6 @@ def chain_forward_host(
     v: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
@@ -144,8 +143,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces_main,
         None,
@@ -183,8 +180,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces_main,
         state_x_prefill,
@@ -229,8 +224,6 @@ def _compile_chain_forward(
     io_dtype,
     gate_dtype,
     beta_dtype,
-    a_log_dtype,
-    dt_bias_spec,
     cu_seqlens_dtype,
     state_dtype,
     final_state_dtype,
@@ -242,25 +235,16 @@ def _compile_chain_forward(
     d_v: int,
     chain_rows: int,
     log_gate: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
-    use_qk_l2norm: bool,
-    use_beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     num_sm: int,
     use_int64_offsets: bool,
 ):
     """Compile the chain forward host for one static config over fake tensors that repeat the
-    standalone builds' placeholders.  Absent tensors have a None dtype; ``dt_bias_spec`` is
-    ``(dtype, rank)`` or None."""
+    standalone builds' placeholders.  Absent tensors have a None dtype."""
     i64 = use_int64_offsets
     flags = {
-        "l2norm": use_qk_l2norm,
-        "safe_gate": safe_gate,
         "gate_scale_log2": gate_scale_log2,
         "log_gate": log_gate,
-        "beta_sigmoid": use_beta_sigmoid,
-        "allow_neg_eigval": allow_neg_eigval,
         "max_active_clusters": num_sm,
         "d_k": d_k,
         "d_v": d_v,
@@ -288,10 +272,6 @@ def _compile_chain_forward(
         d_v,
         chain_rows,
         log_gate,
-        safe_gate,
-        use_qk_l2norm,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         num_sm,
         i64,
     )
@@ -301,8 +281,6 @@ def _compile_chain_forward(
             io_dtype,
             gate_dtype,
             beta_dtype,
-            a_log_dtype,
-            None if dt_bias_spec is None else dt_bias_spec[0],
             cu_seqlens_dtype,
             state_dtype,
             final_state_dtype,
@@ -310,12 +288,11 @@ def _compile_chain_forward(
             seed_dtype,
         )
     )
-    dt_bias_rank = 0 if dt_bias_spec is None else dt_bias_spec[1]
     gate_tag = str(float(gate_scale_log2)).replace(".", "p").replace("-", "m").replace("+", "")
     name = (
         "kda_chain_forward_"
         + "_".join(str(int(flag)) for flag in static)
-        + f"_{dtype_names}_biasrank{dt_bias_rank}_g{gate_tag}"
+        + f"_{dtype_names}_g{gate_tag}"
     )
     f32_state = lambda: _dynamic(cutlass.Float32, 4, 16, i64)
     counter = lambda: _dynamic(cutlass.Int32, 1, 4, i64)
@@ -337,8 +314,6 @@ def _compile_chain_forward(
         _dynamic(io_dtype, 3, 16, i64),  # v
         _dynamic(gate_dtype, 3, 16, i64),  # gate
         _dynamic(beta_dtype, 2, 4, i64),  # beta
-        _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None,
-        _dynamic(dt_bias_spec[0], dt_bias_spec[1], 16, i64) if dt_bias_spec is not None else None,
         _dynamic(io_dtype, 3, 16, i64),  # o
         _dynamic(
             cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64
@@ -383,8 +358,6 @@ def _validate_launch(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -423,7 +396,7 @@ def _validate_launch(
     if min(pieces, unit_chunks, num_sm) < 1:
         raise ValueError("pieces, unit_chunks and num_sm must be positive")
     tokens, _, _ = kda_prefill_f16.validate_forward_operands(
-        q, k, v, gate, beta, o, cu_seqlens, a_log=a_log, dt_bias=dt_bias, b_t=b_t
+        q, k, v, gate, beta, o, cu_seqlens, b_t=b_t
     )
     kda_prefill_f16.validate_forward_states(
         q,
@@ -505,8 +478,6 @@ def build_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -536,11 +507,7 @@ def build_chain_forward(
     b_t,
     length_rule,
     log_gate,
-    safe_gate,
     gate_lower_bound,
-    use_qk_l2norm,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     checkpoint_every_n_tokens,
     scale,
     chain_rows,
@@ -551,9 +518,6 @@ def build_chain_forward(
     over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.
     The fake signatures repeat the marks of the standalone modules' builds so every kernel compiles
     as it does there; the launch runs on the current Torch stream."""
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
         q=q,
@@ -561,8 +525,6 @@ def build_chain_forward(
         v=v,
         gate=gate,
         beta=beta,
-        a_log=a_log,
-        dt_bias=dt_bias,
         o=o,
         cu_seqlens=cu_seqlens,
         cu_pieces=cu_pieces,
@@ -609,8 +571,6 @@ def build_chain_forward(
         v,
         gate,
         beta,
-        a_log,
-        dt_bias,
         o,
         cu_seqlens,
         cu_pieces,
@@ -641,8 +601,6 @@ def build_chain_forward(
         get_dtype(q.dtype),
         get_dtype(gate.dtype),
         get_dtype(beta.dtype),
-        _dtype_or_none(a_log),
-        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
         cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32,
         get_dtype(state_x.dtype),
         _dtype_or_none(final_state),
@@ -654,11 +612,7 @@ def build_chain_forward(
         int(v.shape[2]),
         int(chain_rows),
         bool(log_gate),
-        bool(safe_gate),
         float(gate_lower_bound) * kda_summary_f16.LOG2_E,
-        bool(use_qk_l2norm),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         int(num_sm),
         requires_int64_abi(*tensors),
     )
@@ -672,8 +626,6 @@ def run_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -715,8 +667,6 @@ def run_chain_forward(
         v,
         gate,
         beta,
-        a_log,
-        dt_bias,
         o,
         cu_seqlens,
         cu_pieces,

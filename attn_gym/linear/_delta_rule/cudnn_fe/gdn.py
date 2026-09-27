@@ -42,12 +42,7 @@ B_T = gdn_prefill_f16.CFG.B_T
 MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
 MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
 # Natural-log gate with no in-kernel gate or beta activation.
-_GATE_FLAGS = {
-    "log_gate": True,
-    "safe_gate": False,
-    "use_beta_sigmoid": False,
-    "allow_neg_eigval": False,
-}
+_GATE_FLAGS = {"log_gate": True}
 
 
 def _work_count(device) -> torch.Tensor:
@@ -132,8 +127,6 @@ def gdn_forward(
         "v": v,
         "gate": gate,
         "beta": beta,
-        "a_log": None,
-        "dt_bias": None,
         "o": o,
         "cu_seqlens": cu_seqlens,
         "seed_indices": None,
@@ -162,7 +155,6 @@ def gdn_forward(
             num_seqs=num_seqs,
             unit_chunks=plan.unit_chunks,
             b_t=B_T,
-            expand_num=1,
             length_rule=False,
             **_GATE_FLAGS,
             checkpoint_every_n_tokens=0,
@@ -207,7 +199,6 @@ def gdn_forward(
         num_sm=plan.num_sm,
         b_t=B_T,
         **_GATE_FLAGS,
-        expand_num=1,
         checkpoint_every_n_tokens=0,
         scale=scale,
         has_initial_state=has_initial_state,
@@ -225,7 +216,7 @@ def gdn_forward(
 
 def _tinv_buffers(tokens: int, num_pieces: int, heads_out: int, dtype, device) -> dict:
     """Chunk-inverse (T^-1) scratch shared by the chain and the backward stages."""
-    rows = gdn_tinv_f16.tinv_rows(tokens, num_pieces, 1, B_T)
+    rows = gdn_tinv_f16.tinv_rows(tokens, num_pieces, B_T)
     return {
         "tinv": torch.empty(rows, heads_out, B_T, B_T, dtype=dtype, device=device),
         "tinv_words": workspace(gdn_tinv_f16, num_pieces, device),
@@ -306,8 +297,6 @@ def gdn_backward(
         do=d_output,
         gate=gate,
         beta=beta,
-        a_log=None,
-        dt_bias=None,
         cu_seqlens=cu_seqlens,
         checkpoints=checkpoints,
         seed_checkpoints=None,
@@ -333,8 +322,6 @@ def gdn_backward(
             seed=initial_state,
             dseed=d_final_state,
             dstate0=d_initial_state,
-            inv_q=None,
-            inv_k=None,
         )
         schedule = {
             "pieces": plan.pieces,
@@ -352,9 +339,7 @@ def gdn_backward(
             **buffers,
             **schedule,
             unit_chunks=plan.unit_chunks,
-            expand_num=1,
             length_rule=False,
-            summary_q_step=1,
             **_GATE_FLAGS,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
@@ -397,7 +382,6 @@ def gdn_backward(
             n_tiles=num_seqs * heads_out,
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
-            expand_num=1,
             **_GATE_FLAGS,
         )
         run_warmup_backward(*warmup, **buffers, **stages)
@@ -424,10 +408,7 @@ def gdn_backward(
             work_count=work_count,
             scheduler_counter=schedulers[2:4],
             workspace=bprop_words,
-            device=device.index,
             num_sm=plan.num_sm,
-            stream=torch.cuda.current_stream(device).cuda_stream,
-            own_prologue=False,
             tinv=common["tinv"],
         )
 

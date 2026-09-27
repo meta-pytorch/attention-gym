@@ -17,7 +17,9 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
-# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream.
+# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream; and the
+# upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and negative-eigenvalue host
+# paths are removed at their pinned values.
 
 """One compiled launch for the GDN chain forward: chain prologue, T pass, fused summary, fp32 state
 chain and prefill issued from a single host, the way ``split_k.run_table`` launches plan, scan and
@@ -54,7 +56,6 @@ OPT_LEVEL = 2
 def chain_forward_host(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
     tinv_cfg: cutlass.Constexpr,
     summary_cfg: cutlass.Constexpr,
@@ -73,8 +74,6 @@ def chain_forward_host(
     v: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
@@ -110,11 +109,8 @@ def chain_forward_host(
         pieces,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         heads_out,
-        False,
-        1,
         cutlass.Int32(0),
         checkpoint_every_n,
         cu_seqlens,
@@ -158,8 +154,6 @@ def chain_forward_host(
         k,
         tinv_words,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces,
         tinv,
@@ -172,8 +166,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         cu_pieces,
         tinv,
         None,
@@ -212,8 +204,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         None,
         o,
         cu_pieces,
@@ -239,8 +229,6 @@ def _compile_chain_forward(
     state_dtype,
     final_dtype,
     gate_dtype,
-    a_log_dtype,
-    bias_spec,
     beta_dtype,
     seed_dtype,
     num_sm,
@@ -248,12 +236,8 @@ def _compile_chain_forward(
     d_v,
     unit_chunks,
     b_t,
-    expand_num,
     length_rule,
     log_gate,
-    safe_gate,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     enable_checkpoints,
     has_seed_indices,
     has_final_indices,
@@ -297,11 +281,7 @@ def _compile_chain_forward(
         io_dtype,
         num_sm=num_sm,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         d_k=d_k,
-        expand_num=expand_num,
     )
     summary_cfg = gdn_summary_f16.build_cfg(
         io_dtype,
@@ -309,10 +289,8 @@ def _compile_chain_forward(
         max_active_clusters=num_sm,
         use_initial_state=False,
         log_gate=log_gate,
-        safe_gate=safe_gate,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
     prefill_cfg = gdn_prefill_f16.build_cfg(
         io_dtype,
@@ -322,11 +300,9 @@ def _compile_chain_forward(
         store_final_state=final_dtype is not None,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
-        safe_gate=safe_gate,
         tinv_source="gmem",
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
     has_seed = seed_dtype is not None
     flags = (
@@ -335,12 +311,8 @@ def _compile_chain_forward(
         d_v,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         log_gate,
-        safe_gate,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         enable_checkpoints,
         has_seed_indices,
         has_final_indices,
@@ -352,19 +324,15 @@ def _compile_chain_forward(
         state_dtype,
         final_dtype,
         gate_dtype,
-        a_log_dtype,
-        None if bias_spec is None else bias_spec[0],
         beta_dtype,
         seed_dtype,
     )
     name = "gdn_chain_forward_" + "_".join(str(int(flag)) for flag in flags)
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
-    name += f"_biasrank{0 if bias_spec is None else bias_spec[1]}"
     return compile_tvm_ffi(
         chain_forward_host,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         tinv_cfg,
         summary_cfg,
@@ -380,8 +348,6 @@ def _compile_chain_forward(
         tensor(io_dtype, 3, 16),
         tensor(gate_dtype, 2, 16),
         tensor(beta_dtype, 2, 16),
-        tensor(a_log_dtype, 1, 4) if a_log_dtype is not None else None,
-        tensor(bias_spec[0], bias_spec[1], 4) if bias_spec is not None else None,
         tensor(io_dtype, 3, 16),
         make_cu_seqlens_signature(sym_int(), assumed_align=4),
         make_counter_signature(sym_int()),
@@ -421,8 +387,6 @@ def build_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -454,12 +418,8 @@ def build_chain_forward(
     num_seqs,
     unit_chunks,
     b_t,
-    expand_num,
     length_rule,
     log_gate,
-    safe_gate,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     checkpoint_every_n_tokens,
     scale,
     chain_rows,
@@ -471,9 +431,6 @@ def build_chain_forward(
     launch arguments."""
     DK = q.shape[2]
     DV = v.shape[2]
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     if state_h.dtype != state_x.dtype or state_h.dtype != state_m.dtype:
         raise TypeError("the chain states must share one dtype")
     # Every tensor the launch addresses; bounded int32 tables and counters excepted.
@@ -483,8 +440,6 @@ def build_chain_forward(
         v,
         gate,
         beta,
-        a_log,
-        dt_bias,
         o,
         tinv,
         state_h,
@@ -499,8 +454,6 @@ def build_chain_forward(
         get_dtype(state_x.dtype),
         get_dtype(final_state.dtype) if final_state is not None else None,
         get_dtype(gate.dtype),
-        get_dtype(a_log.dtype) if a_log is not None else None,
-        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
         get_dtype(beta.dtype),
         get_dtype(seed.dtype) if seed is not None else None,
         int(num_sm),
@@ -508,12 +461,8 @@ def build_chain_forward(
         int(DV),
         int(unit_chunks),
         int(b_t),
-        int(expand_num),
         bool(length_rule),
         bool(log_gate),
-        bool(safe_gate),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
         seed_indices is not None,
         final_indices is not None,
@@ -530,8 +479,6 @@ def run_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -577,8 +524,6 @@ def run_chain_forward(
         v,
         gate,
         beta,
-        a_log,
-        dt_bias,
         o,
         cu_seqlens,
         cu_pieces,

@@ -421,6 +421,16 @@ guarding_tests = []
 gate = "reachability (package import + full suite)"
 upstream_status = "nv-surface-removed"
 
+[[fix]]
+id = "R14"
+title = "Prune upstream-only constexpr knobs AG never sets"
+kind = "pruning"
+ag_subject = "Prune upstream-only constexpr knobs from the vendored cuDNN v1.30 kernels"
+ag_subjects_extra = ["Simplify the GDN backward hosts: drop the always-default bprop_module and compact_qdo knobs"]
+guarding_tests = []
+gate = "sass (51/51 identical)"
+upstream_status = "nv-surface-removed"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"

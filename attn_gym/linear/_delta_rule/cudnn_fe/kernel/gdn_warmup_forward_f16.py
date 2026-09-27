@@ -17,7 +17,9 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; the launch compiles once per static configuration through
-# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream.
+# jit_cache over fake TVM-FFI tensor signatures and runs on the environment stream; and the
+# upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and negative-eigenvalue host
+# paths are removed at their pinned values.
 
 """One compiled launch for the GDN warmup, uncut and dv_split forwards: the split-K table (plan,
 scan and walk, warmup only), the prefill prologue and the prefill issued from a single host, the
@@ -26,7 +28,7 @@ placeholder each host was compiled with are the standalone modules' own; this ho
 the launches, so the kernels' SASS is unchanged and the Python side crosses into the DSL once per
 call instead of two or three times.  A buffer that two hosts read through different signature types
 is passed twice, once per
-type: the table reads the gate at its element alignment, dt_bias, work_items, work_count and
+type: the table reads the gate at its element alignment, work_items, work_count and
 item_scratch as 4-byte views, cu_seqlens at 4 bytes; the prologue and prefill read the same buffers
 at the standalone prefill wrapper's alignments."""
 
@@ -58,10 +60,8 @@ def warmup_forward_host(
     b_t: cutlass.Constexpr[int],
     scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
-    safe_gate: cutlass.Constexpr[bool],
     gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Int32,
@@ -85,10 +85,6 @@ def warmup_forward_host(
     v: cute.Tensor,
     gate: cute.Tensor,
     gate_table: cute.Tensor | None,
-    a_log: cute.Tensor | None,
-    a_log_table: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
-    dt_bias_table: cute.Tensor | None,
     beta: cute.Tensor | None,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
@@ -116,10 +112,8 @@ def warmup_forward_host(
             b_t,
             scan_rows,
             log_gate,
-            safe_gate,
             gate_channels,
             overhead_chunks,
-            expand_num,
             warmup_cap,
             full_scan,
             n_heads_out,
@@ -130,8 +124,6 @@ def warmup_forward_host(
             log2_thresh,
             gate_scale_log2,
             gate_table,
-            a_log_table,
-            dt_bias_table,
             cu_seqlens_table,
             chunk_scratch,
             item_scratch,
@@ -147,7 +139,6 @@ def warmup_forward_host(
         io_dtype,
         b_t,
         order_gen,
-        expand_num,
         q,
         k,
         v,
@@ -172,8 +163,6 @@ def warmup_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         o,
         cu_seqlens,
@@ -198,17 +187,13 @@ def _compile_warmup_forward(
     io_dtype,
     state_dtype,
     gate_dtype,
-    a_log_dtype,
-    bias_spec,
     beta_dtype,
     split,
     b_t,
     scan_rows,
     log_gate,
-    safe_gate,
     gate_channels,
     overhead_chunks,
-    expand_num,
     warmup_cap,
     full_scan,
     num_sms,
@@ -219,8 +204,6 @@ def _compile_warmup_forward(
     paged_state,
     has_initial_state,
     enable_checkpoints,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     d_k,
     d_v,
     tiles_per_head,
@@ -254,13 +237,9 @@ def _compile_warmup_forward(
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         tinv_source="compute",
         d_k=d_k,
         d_v=d_v // tiles_per_head,
-        expand_num=expand_num,
         tiles_per_head=tiles_per_head,
         paged_state=paged_state,
     )
@@ -269,10 +248,8 @@ def _compile_warmup_forward(
         b_t,
         scan_rows,
         log_gate,
-        safe_gate,
         gate_channels,
         overhead_chunks,
-        expand_num,
         warmup_cap,
         full_scan,
         num_sms,
@@ -283,8 +260,6 @@ def _compile_warmup_forward(
         paged_state,
         has_initial_state,
         enable_checkpoints,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         d_k,
         d_v,
         tiles_per_head,
@@ -294,13 +269,10 @@ def _compile_warmup_forward(
         io_dtype,
         state_dtype,
         gate_dtype,
-        a_log_dtype,
-        None if bias_spec is None else bias_spec[0],
         beta_dtype,
     )
     name = "gdn_warmup_forward_" + "_".join(str(int(flag)) for flag in flags)
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
-    name += f"_biasrank{0 if bias_spec is None else bias_spec[1]}"
     gate_align = 8 if gate_dtype.width == 16 else 4
     return compile_tvm_ffi(
         warmup_forward_host,
@@ -308,10 +280,8 @@ def _compile_warmup_forward(
         b_t,
         scan_rows,
         log_gate,
-        safe_gate,
         gate_channels,
         overhead_chunks,
-        expand_num,
         warmup_cap,
         full_scan,
         cutlass.Int32(0),
@@ -330,10 +300,6 @@ def _compile_warmup_forward(
         tensor(io_dtype, 3, 16),
         tensor(gate_dtype, 2, 16),
         tensor(gate_dtype, 3 if gate_channels else 2, gate_align) if split else None,
-        tensor(a_log_dtype, 1, 4) if a_log_dtype is not None else None,
-        tensor(a_log_dtype, 1, 4) if a_log_dtype is not None else None,
-        tensor(bias_spec[0], bias_spec[1], 4) if bias_spec is not None else None,
-        tensor(bias_spec[0], bias_spec[1], 4) if bias_spec is not None else None,
         tensor(beta_dtype, 2, 16) if beta_dtype is not None else None,
         tensor(io_dtype, 3, 16),
         make_cu_seqlens_signature(sym_int(), assumed_align=4),
@@ -367,8 +333,6 @@ def build_warmup_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     state_in,
@@ -388,10 +352,6 @@ def build_warmup_forward(
     num_sm,
     b_t,
     log_gate,
-    safe_gate,
-    use_beta_sigmoid,
-    allow_neg_eigval,
-    expand_num,
     checkpoint_every_n_tokens,
     scale,
     tiles_per_head=1,
@@ -403,9 +363,6 @@ def build_warmup_forward(
     value is a launch argument."""
     DK = q.shape[2]
     DV = v.shape[2]
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     facts = split_k.split_table_facts(
         gate,
         cu_seqlens,
@@ -414,33 +371,25 @@ def build_warmup_forward(
         ideal_chunks=ideal_chunks,
         num_sms=num_sm,
         b_t=b_t,
-        log2_threshold=None,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        gate_lower_bound=None,
-        expand_num=expand_num,
     )
     state_src = state_in if state_in is not None else state_out
     state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
     # Every tensor the launch addresses; bounded int32 routing arrays and counters excepted.
     use_int64_offsets = requires_int64_abi(
-        q, k, v, gate, beta, a_log, dt_bias, o, state_in, state_out, checkpoints, chunk_scratch
+        q, k, v, gate, beta, o, state_in, state_out, checkpoints, chunk_scratch
     )
     compiled = _compile_warmup_forward(
         get_dtype(q.dtype),
         state_dtype,
         get_dtype(gate.dtype),
-        get_dtype(a_log.dtype) if a_log is not None else None,
-        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
         get_dtype(beta.dtype) if beta is not None else None,
         facts.split,
         facts.b_t,
         facts.scan_rows,
         facts.log_gate,
-        facts.safe_gate,
         facts.gate_channels,
         facts.overhead_chunks,
-        facts.expand_num,
         facts.warmup_cap,
         facts.full_scan,
         facts.num_sms,
@@ -451,8 +400,6 @@ def build_warmup_forward(
         bool(paged_state),
         has_initial_state is not None,
         int(checkpoint_every_n_tokens) > 0,
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         int(DK),
         int(DV),
         int(tiles_per_head),
@@ -470,8 +417,6 @@ def run_warmup_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     state_in,
@@ -509,10 +454,6 @@ def run_warmup_forward(
         v,
         gate,
         gate if facts.split else None,
-        a_log if facts.safe_gate else None,
-        a_log if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
         beta,
         o,
         cu_seqlens,

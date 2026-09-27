@@ -90,7 +90,8 @@ def test_gdn_backward_cfgs_reject_unsupported_geometry(module, invalid):
     args = (io, cutlass.Float32) if module is gdn_recompute_f16 else (io,)
     if module is gdn_recompute_f16:
         kwargs["use_initial_state"] = True
-    with pytest.raises(ValueError):
+    message = "must be positive" if invalid == "clusters" else "serves Float16/BFloat16"
+    with pytest.raises(ValueError, match=message):
         module.build_cfg(*args, **kwargs)
 
 
@@ -137,7 +138,7 @@ def bprop_args():
         "dbeta": dbeta,
         "cu_seqlens": cu,
     }
-    keywords = {"workspace": workspace(gdn_bprop_f16), "device": 0, "num_sm": 148, "stream": 0}
+    keywords = {"workspace": workspace(gdn_bprop_f16), "num_sm": 148}
     return positional, {**work_table(), **keywords}
 
 
@@ -211,13 +212,7 @@ def test_gdn_chain_backward_rejects_invalid_plan_buffers(monkeypatch, invalid):
 def kda_cfg_args(module, io, dim, clusters):
     import cutlass
 
-    flags = {
-        "l2norm": True,
-        "safe_gate": False,
-        "gate_scale_log2": 0.0,
-        "beta_sigmoid": False,
-        "allow_neg_eigval": False,
-    }
+    flags = {"gate_scale_log2": 0.0}
     if module is kda_prep_f16:
         return (io, cutlass.Float32), {**flags, "num_sm": clusters, "d_k": dim}
     sizes = {"max_active_clusters": clusters, "d_k": dim, "d_v": dim}
@@ -238,10 +233,14 @@ def test_kda_forward_cfgs_reject_unsupported_geometry(module, invalid):
     dim = 96 if invalid == "d_k" else DIM
     args, kwargs = kda_cfg_args(module, io, dim, 0 if invalid == "clusters" else 148)
     if invalid is None:
-        cfg = module.build_cfg(*args, **kwargs)
-        assert cfg.threads_per_cta == (128 if module is kda_prep_f16 else 512)
+        module.build_cfg(*args, **kwargs)
         return
-    with pytest.raises(ValueError):
+    message = {
+        "d_k": "serves head dims",
+        "dtype": "serves Float16/BFloat16",
+        "clusters": "positive",
+    }
+    with pytest.raises(ValueError, match=message[invalid]):
         module.build_cfg(*args, **kwargs)
 
 

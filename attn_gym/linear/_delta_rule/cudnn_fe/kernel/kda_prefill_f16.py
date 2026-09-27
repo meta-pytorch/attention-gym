@@ -20,7 +20,9 @@
 # buffers share one SharedStorage struct, raw SMEM pointers go through smem_data_ptr, and
 # segment-major swizzle offsets use swizzle_box_offset_128b. The frozen cfg launches through
 # KdaPrefillOp, whose name encodes every static flag. The delta residual stays FP32 until the MMA
-# pack, and optional paged routes (resolve_paged_state) seed, store, clear, or skip pool slots.
+# pack, and optional paged routes (resolve_paged_state) seed, store, clear, or skip pool slots. The
+# safe-gate, a_log/dt_bias, beta-sigmoid, allow_neg_eigval, and in-kernel Q/K L2-norm paths are
+# removed (the name keeps their flag slots as 0).
 
 """
 Chunked Kimi Delta Attention (KDA) prefill kernel for SM100 / SM103 / SM107 (Cutlass primitives):
@@ -31,11 +33,10 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
   State  : S_prev[DK,DV]  (recurrent state, held in TMEM, fp32 carry)
 
   Preprocessing (compute group 0, two ping-pong groups of four warps):
-    g[t,d]           = sum_{l=0}^{t} log2(Gate_ld)             per-channel cumulative log2 of gates (safe-gate / log)
+    g[t,d]           = sum_{l=0}^{t} log2(Gate_ld)             per-channel cumulative log2 of gates (natural-log / linear)
     K decay[t,d]     = K[t,d] * exp2(+g[t,d])                    (KK A operand, K*state B operand)
     K inv[t,d]       = K[t,d] * exp2(-g[t,d])                    (KK / A tile B operand)
     K restore[t,d]   = K[t,d] * exp2(g[BT-1,d] - g[t,d])         (state update B operand)
-    (optional in-kernel Q/K L2-norm folds 1/|q|, 1/|k| into the operands)
     Q decay[t,d]     = Q[t,d] * exp2(+g[t,d])                    (Q*state / A tile A operand)
 
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = Beta * tril(W_kk, -1)
@@ -129,12 +130,10 @@ from ..tile_dsl.mma import desc_opaque, mma_step, mma_ts_step
 from ..tile_dsl.pointwise import (
     beta_residual_f16x2,
     fadd2,
-    ffma2,
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
     opaque_i32,
-    sigmoid,
 )
 from ..tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_xor_32b, swizzle_xor_128b
 from ..tile_dsl.tma import (
@@ -150,7 +149,6 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
 
 
 class KdaPrefillBars(NamedTuple):
@@ -1267,12 +1265,6 @@ def tmaldg_warp(
         if lane_idx < cfg.b_t:
             if beta_token < batch_seqlen:
                 beta_carry = mBeta[batch_start + beta_token, head_o].to(cutlass.Float32)
-                if cutlass.const_expr(cfg.beta_sigmoid):
-                    beta_carry = (
-                        (sigmoid(beta_carry) * (2.0 if cfg.allow_neg_eigval else 1.0))
-                        .to(mBeta.element_type)
-                        .to(cutlass.Float32)
-                    )
 
         for chunk_idx in cutlass.range(compute_start, write_end, 1, unroll=1):
             chunk_start = chunk_idx * cfg.b_t
@@ -1288,12 +1280,6 @@ def tmaldg_warp(
             if lane_idx < cfg.b_t:
                 if beta_token < batch_seqlen:
                     beta_carry = mBeta[batch_start + beta_token, head_o].to(cutlass.Float32)
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_carry = (
-                            (sigmoid(beta_carry) * (2.0 if cfg.allow_neg_eigval else 1.0))
-                            .to(mBeta.element_type)
-                            .to(cutlass.Float32)
-                        )
 
             # ---- Q / K / Gate / V loads: one transaction barrier per stage -----------
             bars.mb_raw_done[raw_index.idx].wait(raw_index.phase)
@@ -1329,8 +1315,6 @@ def tmaldg_warp(
 def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
     """Map raw gate to the log2-domain decay increment used by KDA."""
 
-    if cutlass.const_expr(cfg.safe_gate):
-        return cfg.gate_scale_log2 * sigmoid(raw_gate)
     if cutlass.const_expr(cfg.log_gate):
         return raw_gate * cutlass.Float32(LOG2_E)
     return cute.math.log2(raw_gate + cutlass.Float32(1e-10), fastmath=True)
@@ -1348,8 +1332,6 @@ def compute0_warp_group(
     lane_idx,
     warp_idx,
     mQ,
-    mA_log,
-    mDt_bias,
     sK_inv_raw,
     sGate_exchange_raw,
     sGate_load_ptr,
@@ -1392,8 +1374,6 @@ def compute0_warp_group(
     channel_dim = cg0_local_warp * cfg.threads_per_warp + lane_idx
     if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
         channel_dim = cg0_local_warp * channel_rows + lane_idx % channel_rows
-    cg0_a_log_exp = cutlass.Float32(1.0)
-    cg0_dt_bias_value = cutlass.Float32(0.0)
     if cutlass.const_expr(cfg.enable_checkpoints):
         checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
         checkpoint_row_base = cutlass.Int32(0)
@@ -1443,21 +1423,13 @@ def compute0_warp_group(
             compute_start,
             _compute_end,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
-        head_o, _v_offset = decode_head(cfg, head_idx)
+        _head_o, _v_offset = decode_head(cfg, head_idx)
         num_chunks_tile = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_lo = compute_start + cutlass.Int32(1)
             checkpoint_lo = write_start if write_start > checkpoint_lo else checkpoint_lo
             checkpoint_seed_rows = cutlass.Int32(1) if write_start == 0 else cutlass.Int32(0)
             checkpoint_lo_quotient = (checkpoint_lo - cutlass.Int32(1)) // checkpoint_chunks
-        if cutlass.const_expr(mA_log is not None):
-            if num_chunks_tile > 0:
-                cg0_a_log_exp = cute.math.exp2(
-                    mA_log[head_o].to(cutlass.Float32) * LOG2_E, fastmath=True
-                )
-        if cutlass.const_expr(mDt_bias is not None):
-            if num_chunks_tile > 0:
-                cg0_dt_bias_value = mDt_bias[head_o, channel_dim].to(cutlass.Float32)
         nvvm.barrier_cta_sync(
             cfg.cg0_tile_entry_barrier_id,
             thread_count=cfg.cg0_group_count * cfg.cg0_threads_per_group,
@@ -1507,14 +1479,8 @@ def compute0_warp_group(
                         .to(cutlass.Float32)
                     )
             g_prefix_regs = cute.make_rmem_tensor((cfg.b_t,), cutlass.Float32)
-            if cutlass.const_expr(cfg.safe_gate):
-                for row in cutlass.range_constexpr(cfg.b_t):
-                    g_prefix_regs[row] = gate_scale(
-                        cfg, cg0_a_log_exp * (gate_raw[row] + cg0_dt_bias_value)
-                    )
-            else:
-                for row in cutlass.range_constexpr(cfg.b_t):
-                    g_prefix_regs[row] = gate_scale(cfg, gate_raw[row])
+            for row in cutlass.range_constexpr(cfg.b_t):
+                g_prefix_regs[row] = gate_scale(cfg, gate_raw[row])
 
             # ---- ragged tail chunk: padded rows carry no decay -----------------------
             if chunk_start + cutlass.Int32(cfg.b_t) > batch_seqlen:
@@ -1568,12 +1534,6 @@ def compute0_warp_group(
             raw_q_regs = cute.make_rmem_tensor((dk_halves * 8,), cutlass.Float32)
             raw_k_regs = cute.make_rmem_tensor((dk_halves * 8,), cutlass.Float32)
 
-            # ---- optional Q/K L2-norm ------------------------------------------------
-            if cutlass.const_expr(cfg.l2norm):
-                q_sq_even = opaque_f32_zero()
-                k_sq_even = opaque_f32_zero()
-                q_sq_odd = opaque_f32_zero()
-                k_sq_odd = opaque_f32_zero()
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
@@ -1585,45 +1545,9 @@ def compute0_warp_group(
                 for dim_offset in cutlass.range_constexpr(8):
                     raw_q_regs[reg_base + dim_offset] = raw_q_vec_f32[dim_offset]
                     raw_k_regs[reg_base + dim_offset] = raw_k_vec_f32[dim_offset]
-                if cutlass.const_expr(cfg.l2norm):
-                    for pair_idx in cutlass.range_constexpr(4):
-                        q_val0 = raw_q_vec_f32[2 * pair_idx]
-                        q_val1 = raw_q_vec_f32[2 * pair_idx + 1]
-                        k_val0 = raw_k_vec_f32[2 * pair_idx]
-                        k_val1 = raw_k_vec_f32[2 * pair_idx + 1]
-                        q_sq_even, q_sq_odd = ffma2(
-                            q_val0, q_val1, q_val0, q_val1, q_sq_even, q_sq_odd
-                        )
-                        k_sq_even, k_sq_odd = ffma2(
-                            k_val0, k_val1, k_val0, k_val1, k_sq_even, k_sq_odd
-                        )
 
             q_inv_norm = opaque_one
             k_inv_norm = opaque_one
-            if cutlass.const_expr(cfg.l2norm):
-                q_sum_sq = q_sq_even + q_sq_odd
-                k_sum_sq = k_sq_even + k_sq_odd
-                q_sum_sq = q_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY)
-                )
-                q_sum_sq = q_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY)
-                )
-                q_sum_sq = q_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, q_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY)
-                )
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY)
-                )
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY)
-                )
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY)
-                )
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cute.make_rmem_tensor((dk_halves * 8,), cutlass.Float32)
@@ -3275,11 +3199,11 @@ class KdaPrefillOp:
                 cfg.use_initial_state,
                 cfg.store_final_state,
                 cfg.enable_checkpoints,
-                cfg.l2norm,
-                cfg.safe_gate,
+                False,
+                False,
                 cfg.log_gate,
-                cfg.beta_sigmoid,
-                cfg.allow_neg_eigval,
+                False,
+                False,
             )
         )
         dtypes = "_".join(
@@ -3298,8 +3222,6 @@ class KdaPrefillOp:
         k: cute.Tensor,
         v: cute.Tensor,
         raw_gate: cute.Tensor,
-        a_log: cute.Tensor | None,
-        dt_bias: cute.Tensor | None,
         beta: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state: cute.Tensor | None,
@@ -3386,8 +3308,6 @@ class KdaPrefillOp:
             k,
             v,
             raw_gate,
-            a_log,
-            dt_bias,
             beta,
             cu_seqlens,
             initial_state,
@@ -3424,8 +3344,6 @@ def frost_kda_prefill(
     mK: cute.Tensor,
     mV: cute.Tensor,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
@@ -3681,8 +3599,6 @@ def frost_kda_prefill(
             lane_idx,
             warp_idx,
             mQ,
-            mA_log,
-            mDt_bias,
             sK_inv_raw,
             sGate_exchange_raw,
             sGate_load_ptr,
@@ -3742,12 +3658,8 @@ class KdaPrefillCfg:
     use_initial_state: bool
     store_final_state: bool
     enable_checkpoints: bool
-    l2norm: bool
-    safe_gate: bool
     gate_scale_log2: float
     log_gate: bool
-    beta_sigmoid: bool
-    allow_neg_eigval: bool
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -3828,12 +3740,8 @@ def build_cfg(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
-    l2norm: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
     log_gate: bool = True,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -3857,12 +3765,8 @@ def build_cfg(
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
-        l2norm=l2norm,
-        safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         log_gate=log_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -3971,15 +3875,11 @@ IO_DTYPES = ("bfloat16", "float16")
 STATE_DTYPES = ("float32", "bfloat16")
 
 
-def validate_forward_operands(
-    q, k, v, gate, beta, o, cu_seqlens, *, a_log=None, dt_bias=None, b_t=CFG.B_T
-):
+def validate_forward_operands(q, k, v, gate, beta, o, cu_seqlens, *, b_t=CFG.B_T):
     """Check the packed KDA forward operands: ``[T, H, D]`` q/k/v, ``[T, HO, DV]`` output, the
-    ``[T, HO, DK]`` channel gate and ``[T, HO]`` beta (fp32 or the io dtype), per-head a_log /
-    dt_bias; return ``(tokens, heads_out, num_seqs)``."""
-    validate_cuda_tensors(
-        q, k=k, v=v, gate=gate, beta=beta, o=o, cu_seqlens=cu_seqlens, a_log=a_log, dt_bias=dt_bias
-    )
+    ``[T, HO, DK]`` channel gate and ``[T, HO]`` beta (fp32 or the io dtype); return
+    ``(tokens, heads_out, num_seqs)``."""
+    validate_cuda_tensors(q, k=k, v=v, gate=gate, beta=beta, o=o, cu_seqlens=cu_seqlens)
     num_seqs = validate_seqlens(cu_seqlens)
     if b_t != CFG.B_T:
         raise ValueError(f"the KDA forward runs B_T={CFG.B_T} chunks, got b_t={b_t}")
@@ -4001,11 +3901,6 @@ def validate_forward_operands(
             raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
     validate_tensor("gate", gate, (tokens, heads_out, dim_k), ("float32", *io), tma=True)
     validate_tensor("beta", beta, (tokens, heads_out), ("float32", *io))
-    if a_log is not None:
-        validate_tensor("a_log", a_log, (heads_out,), ("float32", *io), align=4)
-    if dt_bias is not None:
-        shape = (heads_out,) if dt_bias.ndim == 1 else (heads_out, dim_k)
-        validate_tensor("dt_bias", dt_bias, shape, ("float32", *io), align=4)
     return tokens, heads_out, num_seqs
 
 

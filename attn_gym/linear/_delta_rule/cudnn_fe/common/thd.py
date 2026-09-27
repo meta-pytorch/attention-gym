@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; descriptor builds skip
-# empty sequences; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0 with imports relocated
+# into attn_gym.linear._delta_rule.cudnn_fe, descriptor builds skipping empty sequences, and the
+# upstream-only GDP expand_num knob resolved to 1.
 
 """Shared THD / varlen (packed ``[T,H,D]`` + ``cu_seqlens``) device helpers.
 
@@ -45,7 +45,6 @@ def emit_seq_descs(
     base_ptr,
     n_batch: cutlass.Int32,
     seq_ord: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int] = 1,
     lanes: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-BATCH TMA-descriptor array for a VARLEN (THD) tensor whose base
@@ -54,8 +53,7 @@ def emit_seq_descs(
     base and length are patched per slot.  GLOBAL_ADDRESS folds
     ``cu_seqlens[b] * base_ptr.stride[0]`` (Int64, the token-axis stride); GLOBAL_DIM[``seq_ord``] is
     capped to the per-sequence token count so tail loads zero-fill and tail
-    stores clip in hardware.  ``expand_num`` scales every loaded ``cu``
-    value onto GDP's sub-token timeline (1 = off).  GQA/GVA head grouping
+    stores clip in hardware.  GQA/GVA head grouping
     happens at the issue site (``head_idx // group`` with a static group),
     not here.  ``lanes == 1``: one electing thread emits every slot (the
     caller elects and release-fences GENERIC->TENSORMAP); ``lanes == 32``:
@@ -71,9 +69,6 @@ def emit_seq_descs(
     for b in cutlass.range(first, n_batch, lanes, unroll=1):
         cu_b = cutlass.Int32(cu[b])
         s_b = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cu_b
-        if cutlass.const_expr(expand_num > 1):
-            cu_b = cu_b * cutlass.Int32(expand_num)
-            s_b = s_b * cutlass.Int32(expand_num)
         # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
         if s_b > 0:
             dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -108,14 +103,12 @@ def emit_tile_seq_descs(
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
     seq_ord: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int] = 1,
     lanes: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-BATCH descriptor array for the chunk-inverse tile buffer ``(row, head, b_t, b_t)`` of gdn_tinv_f16.  Sequence b
     owns the tile rows from ``cu[b] // b_t + b`` (one padding row per sequence keeps that base closed-form), so
     GLOBAL_ADDRESS advances by that row times ``base_ptr.stride[0]`` and GLOBAL_DIM[``seq_ord``] is capped to the
-    sequence's chunk count.  ``expand_num`` scales the loaded ``cu`` values onto GDP's sub-token timeline (1 = off);
-    ``lanes`` as in :func:`emit_seq_descs`."""
+    sequence's chunk count.  ``lanes`` as in :func:`emit_seq_descs`."""
     desc_base = desc_words.iterator.raw_ptr()
     src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
     cu = cutlass.make_array_view(cu_seqlens)
@@ -126,9 +119,6 @@ def emit_tile_seq_descs(
     for b in cutlass.range(first, n_batch, lanes, unroll=1):
         cu_b = cutlass.Int32(cu[b])
         s_b = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cu_b
-        if cutlass.const_expr(expand_num > 1):
-            cu_b = cu_b * cutlass.Int32(expand_num)
-            s_b = s_b * cutlass.Int32(expand_num)
         row_b = cu_b // cutlass.Int32(b_t) + b
         n_b = (s_b + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
         # Attention Gym modification: empty sequences issue no TMA, so skip their maps.
@@ -165,7 +155,6 @@ def emit_checkpoint_seq_descs(
     n_batch: cutlass.Int32,
     every_n: cutlass.Int32,
     seq_ord: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int] = 1,
     lanes: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-BATCH descriptor array for the per-chunk checkpoint tensor with the head
@@ -173,9 +162,8 @@ def emit_checkpoint_seq_descs(
     per-sequence checkpoint offsets from the TOKEN ``cu_seqlens`` on the fly
     (``count_b = (batch_seqlen - 1) // every_n + 1``, running-prefix-summed) and
     caps GLOBAL_DIM[``seq_ord``] to ``count_b``; GLOBAL_ADDRESS advances by
-    ``count_prefix * base_ptr.stride[0]`` (the checkpoint-row stride).  ``expand_num`` scales the
-    loaded per-sequence token counts onto GDP's sub-token timeline (1 =
-    off).  The head index is a load coordinate.  ``lanes`` as in
+    ``count_prefix * base_ptr.stride[0]`` (the checkpoint-row stride).  The head index is a load
+    coordinate.  ``lanes`` as in
     :func:`emit_seq_descs`; a striped lane re-derives the prefix of its
     slot from the sequences before it."""
     desc_base = desc_words.iterator.raw_ptr()
@@ -189,14 +177,10 @@ def emit_checkpoint_seq_descs(
     for b0 in cutlass.range(0, first, 1, unroll=1):
         if b0 < n_batch:
             s_tok0 = cutlass.Int32(cu[b0 + cutlass.Int32(1)]) - cutlass.Int32(cu[b0])
-            if cutlass.const_expr(expand_num > 1):
-                s_tok0 = s_tok0 * cutlass.Int32(expand_num)
             cnt0 = (s_tok0 - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
             run = run + (cnt0 if s_tok0 > 0 else cutlass.Int32(0))
     for b in cutlass.range(first, n_batch, lanes, unroll=1):
         s_tok = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cutlass.Int32(cu[b])
-        if cutlass.const_expr(expand_num > 1):
-            s_tok = s_tok * cutlass.Int32(expand_num)
         cnt = (s_tok - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
         cnt = cnt if s_tok > 0 else cutlass.Int32(0)
         checkpoint_base = run
@@ -204,8 +188,6 @@ def emit_checkpoint_seq_descs(
         for bn in cutlass.range(b + cutlass.Int32(1), b + cutlass.Int32(lanes), 1, unroll=1):
             if bn < n_batch:
                 s_tokn = cutlass.Int32(cu[bn + cutlass.Int32(1)]) - cutlass.Int32(cu[bn])
-                if cutlass.const_expr(expand_num > 1):
-                    s_tokn = s_tokn * cutlass.Int32(expand_num)
                 cntn = (s_tokn - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
                 run = run + (cntn if s_tokn > 0 else cutlass.Int32(0))
         # Attention Gym modification: empty sequences issue no TMA, so skip their maps.

@@ -15,13 +15,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
-# Modified by Attention Gym in 2026: register arrays as rmem tensors, operand SMEM in a
-# SharedStorage struct read through smem_data_ptr, and named swizzle-box offsets. Modified by
-# Attention Gym in 2026: beta-free dBeta (T = I - T_b L staged in sDm, Z in sdQ, dV = beta Z).
-# Modified by Attention Gym in 2026: frozen cfg, GdnBpropOp, and persistent jit_cache compiles on
-# fake-tensor TVM-FFI signatures with an int64-shape variant.
+# Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0 with imports relocated
+# into attn_gym.linear._delta_rule.cudnn_fe; register arrays as rmem tensors, operand SMEM in a
+# SharedStorage struct read through smem_data_ptr, and named swizzle-box offsets; beta-free dBeta
+# (T = I - T_b L staged in sDm, Z in sdQ, dV = beta Z); frozen cfg, GdnBpropOp, and persistent
+# jit_cache compiles on fake-tensor TVM-FFI signatures with an int64-shape variant; and the
+# upstream-only expand_num, safe_gate/a_log/dt_bias, beta-sigmoid, negative-eigenvalue,
+# fused-l2norm, and chunk_gdn_bwd-owned prologue paths removed.
 
 """
 Chunked Gated Delta Net (GDN) BPROP kernel for SM100 / SM103 / SM107 (Cutlass primitives).
@@ -186,8 +186,6 @@ from ..tile_dsl.pointwise import (
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
-    sigmoid,
-    softplus2,
     sub_f16x2,
 )
 from ..tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_xor_128b
@@ -919,8 +917,6 @@ def gate_warp(
     mWorkItems,
     tidx,
     mGate,
-    mA_log,
-    mDt_bias,
     mBeta,
     mDgate,
     mDbeta,
@@ -944,12 +940,7 @@ def gate_warp(
     lane_idx = tidx % cfg.threads_per_warp
 
     n_cols = cfg.b_t // cfg.threads_per_warp
-    linear_gate = cutlass.const_expr(not cfg.log_gate and not cfg.safe_gate)
-    if cutlass.const_expr(cfg.safe_gate and mA_log is None):
-        a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
-    else:
-        a = cutlass.Float32(0.0)
-    bias = cutlass.Float32(0.0)
+    linear_gate = cutlass.const_expr(not cfg.log_gate)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
         (
@@ -965,14 +956,6 @@ def gate_warp(
             compute_end,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = compute_end - write_start
-        if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
-            if num_item_chunks > 0:
-                a = -cute.math.exp2(
-                    mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True
-                ) * cutlass.Float32(RCP_LN2)
-        if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
-            if num_item_chunks > 0:
-                bias = mDt_bias[head_idx].to(cutlass.Float32)
         write_end_token = batch_start + write_end * cfg.b_t
         write_end_token = write_end_token if write_end_token < batch_end else batch_end
 
@@ -996,47 +979,16 @@ def gate_warp(
                     if cutlass.const_expr(cfg.log_gate)
                     else cutlass.Float32(1.0)
                 )
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    gate_toks = [
-                        chunk_offset + lane_idx + col * cfg.threads_per_warp
-                        for col in range(n_cols)
-                    ]
-                    gate_rows = [tok // cutlass.Int32(cfg.expand_num) for tok in gate_toks]
-                    gate_valid = [
-                        valid and (tok - row * cutlass.Int32(cfg.expand_num) == 0)
-                        for tok, row, valid in zip(gate_toks, gate_rows, pos_valid)
-                    ]
-                    gate_vals = [
-                        gGateSeq[row if valid else cutlass.Int32(0)].to(cutlass.Float32)
-                        if valid
-                        else oob_neutral
-                        for row, valid in zip(gate_rows, gate_valid)
-                    ]
-                else:
-                    gate_valid = pos_valid
-                    gate_vals = [
-                        gGate[
-                            min(
-                                lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1
-                            )
-                        ].to(cutlass.Float32)
-                        if pos_valid[col]
-                        else oob_neutral
-                        for col in range(n_cols)
-                    ]
+                gate_vals = [
+                    gGate[
+                        min(lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1)
+                    ].to(cutlass.Float32)
+                    if pos_valid[col]
+                    else oob_neutral
+                    for col in range(n_cols)
+                ]
 
-                if cutlass.const_expr(cfg.safe_gate):
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        biased_lo, biased_hi = fadd2(
-                            gate_vals[col], gate_vals[col + 1], bias, bias
-                        )
-                        sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                        contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                        gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
-                        gate_vals[col + 1] = (
-                            contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
-                        )
-                elif cutlass.const_expr(cfg.log_gate):
+                if cutlass.const_expr(cfg.log_gate):
                     rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
                     for col in cutlass.range_constexpr(0, n_cols, 2):
                         gate_vals[col], gate_vals[col + 1] = fmul2(
@@ -1077,18 +1029,12 @@ def gate_warp(
                 # ---- Beta load: GMEM -> SMEM (per-element cp.async) ------------------
                 beta_idx = beta_index.idx
                 beta_index = advance(beta_index, cfg.smem_beta_stages)
-                if cutlass.const_expr(cfg.beta_sigmoid or mBeta.element_type != cutlass.Float32):
+                if cutlass.const_expr(mBeta.element_type != cutlass.Float32):
                     for col in cutlass.range_constexpr(n_cols):
                         pos = lane_idx + col * cfg.threads_per_warp
                         beta_value = cutlass.Float32(0.0)
                         if pos_valid[col]:
                             beta_value = gBeta[pos].to(cutlass.Float32)
-                            if cutlass.const_expr(cfg.beta_sigmoid):
-                                beta_value = (
-                                    (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0))
-                                    .to(mBeta.element_type)
-                                    .to(cutlass.Float32)
-                                )
                         sBeta[pos, 0, beta_idx] = beta_value
                     bars.mb_beta_ready[beta_idx].arrive()
                 else:
@@ -1134,33 +1080,16 @@ def gate_warp(
                     dgate_vals[rev_col] = dgate_vals[rev_col] + later_total
                 for col in cutlass.range_constexpr(n_cols):
                     pos = lane_idx + col * cfg.threads_per_warp
-                    if cutlass.const_expr(cfg.expand_num > 1):
-                        dgate_tok = st_offset + pos
-                        dgate_row = dgate_tok // cutlass.Int32(cfg.expand_num)
-                        if (
-                            dgate_tok < write_end_token
-                            and dgate_tok - dgate_row * cutlass.Int32(cfg.expand_num) == 0
-                        ):
-                            dgate_out = dgate_vals[col]
-                            if cutlass.const_expr(linear_gate):
-                                dgate_out = dgate_out * cute.math.rcp(
-                                    mGate[dgate_row, head_idx].to(cutlass.Float32)
-                                    + cutlass.Float32(1e-10),
-                                    approx=True,
-                                    ftz=True,
-                                )
-                            gDgateSeq[dgate_row] = dgate_out.to(mDgate.element_type)
-                    else:
-                        if st_offset + pos < write_end_token:
-                            dgate_out = dgate_vals[col]
-                            if cutlass.const_expr(linear_gate):
-                                dgate_out = dgate_out * cute.math.rcp(
-                                    mGate[st_offset + pos, head_idx].to(cutlass.Float32)
-                                    + cutlass.Float32(1e-10),
-                                    approx=True,
-                                    ftz=True,
-                                )
-                            gDgate[pos] = dgate_out.to(mDgate.element_type)
+                    if st_offset + pos < write_end_token:
+                        dgate_out = dgate_vals[col]
+                        if cutlass.const_expr(linear_gate):
+                            dgate_out = dgate_out * cute.math.rcp(
+                                mGate[st_offset + pos, head_idx].to(cutlass.Float32)
+                                + cutlass.Float32(1e-10),
+                                approx=True,
+                                ftz=True,
+                            )
+                        gDgate[pos] = dgate_out.to(mDgate.element_type)
 
                 # ---- dBeta store -----------------------------------------------------
                 beta_store_idx = beta_store_index.idx
@@ -2282,7 +2211,6 @@ def compute0_warp_group(
     cg0_a_ready = PipelineState.start(phase=0)
     cg0_dstate_smem_ready = PipelineState.start(phase=0)
     cg0_state_ready_index = PipelineState.start(phase=0)
-    cg0_l2_reduction_index = PipelineState.start(phase=1)
     cg0_tinv_ready = PipelineState.start(phase=0)
 
     num_threads_cg0 = cfg.threads_per_warp * len(cfg.compute_group_0_warp_ids)
@@ -2764,9 +2692,6 @@ def compute0_warp_group(
                 v0 = cutlass.Float32(0.0) - p0
                 v1 = cutlass.Float32(0.0) - p1
                 dm_pack.append(fp32_to_fp16(v0, v1, dtype=cfg.io_dtype))
-            if cutlass.const_expr(cfg.fused_l2norm and cfg.d_v == 128):
-                bars.mb_l2_reduction_k_done[0].wait(cg0_l2_reduction_index.phase)
-                cg0_l2_reduction_index = advance(cg0_l2_reduction_index, 1)
             for c in cutlass.range_constexpr(ACC_N_FRAGS):
                 nvvm.stmatrix(
                     dm_base
@@ -2854,9 +2779,6 @@ def compute0_warp_group(
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
                     db = sBeta[crow_r, 0, beta_idx] - row_part[rp]
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        b = gBeta[2 * rp]
-                        db = db * (b - b * b * (0.5 if cfg.allow_neg_eigval else 1.0))
                     sBeta[crow_r, 0, beta_idx] = db
 
             bars.mb_beta_done[beta_idx].arrive()
@@ -2893,9 +2815,6 @@ def compute1_warp_group(
     sdK,
     sDa,
     sDm,
-    mInvQ,
-    q_ratio,
-    sL2ReductionQ,
     sScheduler,
     bars,
 ):
@@ -2998,13 +2917,12 @@ def compute1_warp_group(
     ldtm_width = 32
     num_ldtms = cutlass.const_expr(cfg.d_k // ldtm_width)
     cg1_dk_index = PipelineState.start(phase=1)
-    cg1_l2_reduction_gate = PipelineState.start(phase=0)
     while tile_idx < total_tiles:
         (
             _batch_idx,
-            head_idx,
-            batch_start,
-            batch_end,
+            _head_idx,
+            _batch_start,
+            _batch_end,
             _batch_seqlen,
             _batch_num_chunks,
             write_start,
@@ -3013,7 +2931,6 @@ def compute1_warp_group(
             compute_end,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = compute_end - write_start
-        head_q = head_idx // q_ratio
 
         # ---- chunks NT-1 .. 0 (backward) ---------------------------------------------
         for rev_idx in cutlass.range(num_item_chunks):
@@ -3611,22 +3528,8 @@ def compute1_warp_group(
                         dq_pack,
                         nvvm.MMALayout.COL,
                     )
-            if cutlass.const_expr(not cfg.fused_l2norm):
-                nvvm.fence_proxy("async.shared", space="cta")
-                bars.mb_dq_tmastg_ready[dq_stg_idx].arrive()
-
-            # ---- inv_q row (fused l2norm) --------------------------------------------
-            fused_inv_q = cutlass.Float32(1.0)
-            if cutlass.const_expr(cfg.fused_l2norm):
-                gInvQ = cute.domain_offset(
-                    (batch_start + chunk_idx * cfg.b_t,), mInvQ[None, head_q]
-                )
-                pos_valid_q = batch_start + chunk_idx * cfg.b_t + cg1_tidx < batch_end
-                fused_inv_q = (
-                    gInvQ[min(cg1_tidx, batch_end - (batch_start + chunk_idx * cfg.b_t) - 1)]
-                    if pos_valid_q
-                    else cutlass.Float32(1.0)
-                )
+            nvvm.fence_proxy("async.shared", space="cta")
+            bars.mb_dq_tmastg_ready[dq_stg_idx].arrive()
 
             # ---- dQ dot (part q) -----------------------------------------------------
             part_q = [None] * 16
@@ -3658,9 +3561,6 @@ def compute1_warp_group(
             nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
             bars.mb_dgate_cg0_ready[0].wait(cg1_dgate_cg0_index.phase)
             cg1_dgate_cg0_index = advance(cg1_dgate_cg0_index, 1)
-            if cutlass.const_expr(cfg.fused_l2norm and cfg.d_v == 128):
-                bars.mb_dk_total_acc_ready[0].wait(cg1_l2_reduction_gate.phase)
-                cg1_l2_reduction_gate = advance(cg1_l2_reduction_gate, 1)
             if cg1_tidx < 64:
                 pq_sum = (
                     (sdk_reduction + PART_Q_SCRATCH_OFF + cg1_tidx).load()
@@ -3668,63 +3568,11 @@ def compute1_warp_group(
                     + (sdk_reduction + PART_Q_SCRATCH_OFF + 128 + cg1_tidx).load()
                     + (sdk_reduction + PART_Q_SCRATCH_OFF + 192 + cg1_tidx).load()
                 )
-                if cutlass.const_expr(cfg.fused_l2norm):
-                    (sL2ReductionQ + cg1_tidx).store(fused_inv_q)
-                    (sL2ReductionQ + 64 + cg1_tidx).store(-(fused_inv_q * pq_sum))
                 sCumsumlog[cg1_tidx, 0, gate_idx] = (
                     sCumsumlog[cg1_tidx, 0, gate_idx] + pq_sum - gsum
                 )
             bars.mb_gate_done[gate_idx].arrive()
             bars.mb_dgate_cg1_ready[0].arrive()
-
-            # ---- dQ l2norm projection ------------------------------------------------
-            if cutlass.const_expr(cfg.fused_l2norm):
-                nvvm.barrier_cta_sync_aligned(
-                    cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads
-                )
-                inv_fp32 = []
-                na_fp32 = []
-                for i in cutlass.range_constexpr(16):
-                    tok = cutlass.const_expr((i // 2) * 8 + i % 2)
-                    inv_fp32.append((sL2ReductionQ + (lane_idx % 4) * 2 + tok).load())
-                    na_fp32.append((sL2ReductionQ + 64 + (lane_idx % 4) * 2 + tok).load())
-                inv_vals = [inv_fp32[(kk // 4) * 2 + (kk % 2)] for kk in range(num_vals)]
-                na_vals = [na_fp32[(kk // 4) * 2 + (kk % 2)] for kk in range(num_vals)]
-                for half in cutlass.range_constexpr(dk_halves):
-                    q_vec = nvvm.tcgen05_ld(
-                        "16x128b",
-                        nvvm.make_tmem_ptr(
-                            ((tmem_row + half * 16) << 16) + tmem_y_col, cutlass.Int32
-                        ),
-                        num=8,
-                    )
-                    nvvm.tcgen05_wait("load")
-                    for block in cutlass.range_constexpr(4):
-                        frag_addr = (
-                            dk_frag_segment
-                            + (frag_row + block * 16) * 64
-                            + swizzle_xor_128b(frag_row + block * 16, dk_frag_col + half * 16)
-                        )
-                        dq_w = nvvm.ldmatrix(
-                            sdQ_base + dq_stg_idx * dq_stage_elements + frag_addr,
-                            4,
-                            nvvm.MMALayout.COL,
-                        )
-                        out_pack = []
-                        for i in cutlass.range_constexpr(4):
-                            e = cutlass.const_expr(8 * block + 2 * i)
-                            d_lo, d_hi = f16x2_to_f32(dq_w[i], dtype=cfg.io_dtype)
-                            q_lo, q_hi = f16x2_to_f32(q_vec[4 * block + i], dtype=cfg.io_dtype)
-                            s_lo, s_hi = fmul2(d_lo, d_hi, inv_vals[e], inv_vals[e + 1])
-                            p_lo, p_hi = ffma2(q_lo, q_hi, na_vals[e], na_vals[e + 1], s_lo, s_hi)
-                            out_pack.append(fp32_to_fp16(p_lo, p_hi, dtype=cfg.io_dtype))
-                        nvvm.stmatrix(
-                            sdQ_base + dq_stg_idx * dq_stage_elements + frag_addr,
-                            out_pack,
-                            nvvm.MMALayout.COL,
-                        )
-                nvvm.fence_proxy("async.shared", space="cta")
-                bars.mb_dq_tmastg_ready[dq_stg_idx].arrive()
 
         tile_idx, scheduler_state = scheduler_next_tile(
             cfg, bars, sScheduler, scheduler_state, elect_one
@@ -3753,9 +3601,6 @@ def compute2_warp_group(
     sK,
     sdK,
     sDstate_trans,
-    mInvK,
-    k_ratio,
-    sL2ReductionK,
     sScheduler,
     bars,
 ):
@@ -3841,8 +3686,8 @@ def compute2_warp_group(
         (
             batch_idx,
             head_idx,
-            batch_start,
-            batch_end,
+            _batch_start,
+            _batch_end,
             _batch_seqlen,
             batch_num_chunks,
             write_start,
@@ -3851,7 +3696,6 @@ def compute2_warp_group(
             compute_end,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = compute_end - write_start
-        head_k = head_idx // k_ratio
 
         # ---- dstate seed prologue ----------------------------------------------------
         if cutlass.const_expr(cfg.use_dstate_in):
@@ -3949,19 +3793,6 @@ def compute2_warp_group(
                 )
             decay_scale_vals = [decay_scale_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
             bars.mb_cg2_chunk_ready[0].arrive()
-
-            # ---- inv_k row (fused l2norm) --------------------------------------------
-            fused_inv_k = cutlass.Float32(1.0)
-            if cutlass.const_expr(cfg.fused_l2norm):
-                gInvK = cute.domain_offset(
-                    (batch_start + abs_chunk * cfg.b_t,), mInvK[None, head_k]
-                )
-                pos_valid_k = batch_start + abs_chunk * cfg.b_t + cg2_tidx < batch_end
-                fused_inv_k = (
-                    gInvK[min(cg2_tidx, batch_end - (batch_start + abs_chunk * cfg.b_t) - 1)]
-                    if pos_valid_k
-                    else cutlass.Float32(1.0)
-                )
 
             # ---- dK inter rescale ----------------------------------------------------
             cg2_k_idx = cg2_k_index.idx
@@ -4088,9 +3919,8 @@ def compute2_warp_group(
                                 part_k[part_e0],
                                 part_k[part_e0 + 1],
                             )
-            if cutlass.const_expr(not cfg.fused_l2norm):
-                nvvm.fence_proxy("async.shared", space="cta")
-                bars.mb_k_cg2_done[cg2_k_idx].arrive()
+            nvvm.fence_proxy("async.shared", space="cta")
+            bars.mb_k_cg2_done[cg2_k_idx].arrive()
 
             part_k_lo, part_k_hi = warp_reduce_scatter_sum_16_elements(part_k, lane_idx)
             tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
@@ -4273,102 +4103,7 @@ def compute2_warp_group(
                             nvvm.MMALayout.COL,
                         )
 
-            # ---- dK l2norm projection ------------------------------------------------
-            if cutlass.const_expr(cfg.fused_l2norm):
-                nvvm.barrier_cta_sync_aligned(
-                    cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads
-                )
-                part_pk = [acc_zero] * 16
-                for half in cutlass.range_constexpr(dk_halves):
-                    for block in cutlass.range_constexpr(4):
-                        frag_addr = (
-                            dk_frag_segment
-                            + (frag_row + block * 16) * 64
-                            + swizzle_xor_128b(frag_row + block * 16, dk_frag_col + half * 16)
-                        )
-                        dk_w = nvvm.ldmatrix(
-                            sdK_base + dk_stg_idx * dk_stage_elements + frag_addr,
-                            4,
-                            nvvm.MMALayout.COL,
-                        )
-                        k_frag = nvvm.ldmatrix(
-                            sK_base + cg2_k_idx * k_stage_elements_cg2 + frag_addr,
-                            4,
-                            nvvm.MMALayout.COL,
-                        )
-                        for i in cutlass.range_constexpr(4):
-                            e = cutlass.const_expr(8 * block + 2 * i)
-                            pe = cutlass.const_expr((e // 4) * 2 + (e % 2))
-                            d_lo, d_hi = f16x2_to_f32(dk_w[i], dtype=cfg.io_dtype)
-                            k_lo, k_hi = f16x2_to_f32(k_frag[i], dtype=cfg.io_dtype)
-                            if cutlass.const_expr(half == 0 and i % 2 == 0):
-                                part_pk[pe], part_pk[pe + 1] = fmul2(d_lo, d_hi, k_lo, k_hi)
-                            else:
-                                part_pk[pe], part_pk[pe + 1] = ffma2(
-                                    d_lo, d_hi, k_lo, k_hi, part_pk[pe], part_pk[pe + 1]
-                                )
-                part_pk_lo, part_pk_hi = warp_reduce_scatter_sum_16_elements(part_pk, lane_idx)
-                pk_tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
-                (sL2ReductionK + warp_id * 64 + pk_tok0).store(part_pk_lo)
-                (sL2ReductionK + warp_id * 64 + pk_tok0 + 1).store(part_pk_hi)
-                nvvm.barrier_cta_sync_aligned(
-                    cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads
-                )
-                if cg2_tidx < 64:
-                    pk_sum = (
-                        (sL2ReductionK + cg2_tidx).load()
-                        + (sL2ReductionK + 64 + cg2_tidx).load()
-                        + (sL2ReductionK + 128 + cg2_tidx).load()
-                        + (sL2ReductionK + 192 + cg2_tidx).load()
-                    )
-                    (sL2ReductionK + cg2_tidx).store(fused_inv_k)
-                    (sL2ReductionK + 64 + cg2_tidx).store(-(fused_inv_k * pk_sum))
-                nvvm.barrier_cta_sync_aligned(
-                    cfg.cg2_barrier_id, thread_count=cfg.cg2_barrier_threads
-                )
-                inv_fp32 = []
-                na_fp32 = []
-                for i in cutlass.range_constexpr(16):
-                    tok = cutlass.const_expr((i // 2) * 8 + i % 2)
-                    inv_fp32.append((sL2ReductionK + (lane_idx % 4) * 2 + tok).load())
-                    na_fp32.append((sL2ReductionK + 64 + (lane_idx % 4) * 2 + tok).load())
-                if cutlass.const_expr(cfg.d_v == 128):
-                    bars.mb_l2_reduction_k_done[0].arrive()
-                inv_vals = [inv_fp32[(kk // 4) * 2 + (kk % 2)] for kk in range(num_vals)]
-                na_vals = [na_fp32[(kk // 4) * 2 + (kk % 2)] for kk in range(num_vals)]
-                for half in cutlass.range_constexpr(dk_halves):
-                    for block in cutlass.range_constexpr(4):
-                        frag_addr = (
-                            dk_frag_segment
-                            + (frag_row + block * 16) * 64
-                            + swizzle_xor_128b(frag_row + block * 16, dk_frag_col + half * 16)
-                        )
-                        dk_w = nvvm.ldmatrix(
-                            sdK_base + dk_stg_idx * dk_stage_elements + frag_addr,
-                            4,
-                            nvvm.MMALayout.COL,
-                        )
-                        k_frag = nvvm.ldmatrix(
-                            sK_base + cg2_k_idx * k_stage_elements_cg2 + frag_addr,
-                            4,
-                            nvvm.MMALayout.COL,
-                        )
-                        out_pack = []
-                        for i in cutlass.range_constexpr(4):
-                            e = cutlass.const_expr(8 * block + 2 * i)
-                            d_lo, d_hi = f16x2_to_f32(dk_w[i], dtype=cfg.io_dtype)
-                            k_lo, k_hi = f16x2_to_f32(k_frag[i], dtype=cfg.io_dtype)
-                            s_lo, s_hi = fmul2(d_lo, d_hi, inv_vals[e], inv_vals[e + 1])
-                            p_lo, p_hi = ffma2(k_lo, k_hi, na_vals[e], na_vals[e + 1], s_lo, s_hi)
-                            out_pack.append(fp32_to_fp16(p_lo, p_hi, dtype=cfg.io_dtype))
-                        nvvm.stmatrix(
-                            sdK_base + dk_stg_idx * dk_stage_elements + frag_addr,
-                            out_pack,
-                            nvvm.MMALayout.COL,
-                        )
             nvvm.fence_proxy("async.shared", space="cta")
-            if cutlass.const_expr(cfg.fused_l2norm):
-                bars.mb_k_cg2_done[cg2_k_idx].arrive()
             bars.mb_dk_tmastg_ready[dk_stg_idx].arrive()
             bars.mb_gate_done[gate_idx].arrive()
 
@@ -4473,7 +4208,6 @@ def build_descs_body(
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp). Runs
     inside the prologue kernel after its order pass; warps past the array count fall through the
@@ -4506,26 +4240,24 @@ def build_descs_body(
     )
 
     if widx == 0:
-        emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 1:
-        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, lanes=32)
         if cutlass.const_expr(tinv is not None):
-            emit_tile_seq_descs(
-                base_tinv, sub8, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32
-            )
+            emit_tile_seq_descs(base_tinv, sub8, cu_seqlens, tinv, n_batch, b_t, 3, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 2:
-        emit_seq_descs(base_v, sub2, cu_seqlens, v, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_v, sub2, cu_seqlens, v, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 3:
-        emit_seq_descs(base_do, sub3, cu_seqlens, do_, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_do, sub3, cu_seqlens, do_, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
@@ -4538,24 +4270,23 @@ def build_descs_body(
             n_batch,
             checkpoint_every_n,
             2,
-            expand_num,
             lanes=32,
         )
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 5:
-        emit_seq_descs(base_dq, sub5, cu_seqlens, dq, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_dq, sub5, cu_seqlens, dq, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 6:
-        emit_seq_descs(base_dk, sub6, cu_seqlens, dk, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_dk, sub6, cu_seqlens, dk, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 7:
-        emit_seq_descs(base_dv, sub7, cu_seqlens, dv, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_dv, sub7, cu_seqlens, dv, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
@@ -4566,7 +4297,6 @@ def frost_gdn_bprop_prologue(
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
     base_v: cutlass.GridConstant[tma.TensorMap],
@@ -4632,7 +4362,6 @@ def frost_gdn_bprop_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                expand_num=expand_num,
             )
     else:
         build_descs_body(
@@ -4660,7 +4389,6 @@ def frost_gdn_bprop_prologue(
             n_batch,
             checkpoint_every_n,
             b_t,
-            expand_num,
         )
 
 
@@ -4670,7 +4398,6 @@ def prologue(
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
-    expand_num: cutlass.Constexpr[int],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -4792,7 +4519,6 @@ def prologue(
         run_order,
         order_gen,
         b_t,
-        expand_num,
         base_desc_q,
         base_desc_k,
         base_desc_v,
@@ -4829,8 +4555,6 @@ def host(
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     beta: cute.Tensor,
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
@@ -4841,8 +4565,6 @@ def host(
     cu_seqlens: cute.Tensor,
     dstate0: cute.Tensor | None,
     dstate_in: cute.Tensor | None,
-    inv_q: cute.Tensor | None,
-    inv_k: cute.Tensor | None,
     tinv: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
@@ -4859,8 +4581,6 @@ def host(
 
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
     beta_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_beta_stages))
-
-    l2_reduction_elements = cfg.b_t if cfg.fused_l2norm and cfg.d_v == 64 else 0
 
     @cute.struct
     class SharedStorage:
@@ -4888,13 +4608,6 @@ def host(
         dm: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.a_cosize // cfg.smem_a_stages],
             cfg.buffer_align_bytes,
-        ]
-        # d_v == 64 fused-l2norm reduction scratch; otherwise it aliases dm.
-        l2_reduction_q: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, 2 * l2_reduction_elements], 16
-        ]
-        l2_reduction_k: cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, 4 * l2_reduction_elements], 16
         ]
         v: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes
@@ -4924,8 +4637,6 @@ def host(
         k_ratio,
         v_ratio,
         gate,
-        a_log,
-        dt_bias,
         beta,
         dgate,
         dbeta,
@@ -4942,8 +4653,6 @@ def host(
         dv,
         dstate0,
         dstate_in,
-        inv_q,
-        inv_k,
         tinv,
         work_items,
         work_count,
@@ -4968,8 +4677,6 @@ def frost_gdn_bprop(
     k_ratio: cute.FastDivmodDivisorV2,
     v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     mBeta: cute.Tensor,
     mDgate: cute.Tensor,
     mDbeta: cute.Tensor,
@@ -4986,8 +4693,6 @@ def frost_gdn_bprop(
     mdV,
     mDstate0,
     mDstate_in,
-    mInvQ: cute.Tensor | None,
-    mInvK: cute.Tensor | None,
     mTinv: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
@@ -5217,26 +4922,6 @@ def frost_gdn_bprop(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sL2ReductionQ = None
-    sL2ReductionK = None
-    if cutlass.const_expr(cfg.fused_l2norm):
-        if cutlass.const_expr(cfg.d_v == 64):
-            l2_reduction_q_raw = storage.l2_reduction_q.get_tensor(
-                cute.make_layout((2 * cfg.b_t,))
-            )
-            l2_reduction_k_raw = storage.l2_reduction_k.get_tensor(
-                cute.make_layout((4 * cfg.b_t,))
-            )
-            sL2ReductionQ = smem_data_ptr(l2_reduction_q_raw)
-            sL2ReductionK = smem_data_ptr(l2_reduction_k_raw)
-        else:
-            sL2ReductionQ = cute.make_ptr(
-                cutlass.Float32,
-                smem_data_ptr(sDm_raw).toint(),
-                mem_space=cute.AddressSpace.smem,
-                assumed_align=cfg.buffer_align_bytes,
-            )
-            sL2ReductionK = sL2ReductionQ + 2 * cfg.b_t
     sV_raw = storage.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
     sV_trans = SmemTile(
         base=smem_data_ptr(sV_raw),
@@ -5494,9 +5179,6 @@ def frost_gdn_bprop(
             sdK=sdK,
             sDa=sDa,
             sDm=sDm,
-            mInvQ=mInvQ,
-            q_ratio=q_ratio,
-            sL2ReductionQ=sL2ReductionQ,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -5520,9 +5202,6 @@ def frost_gdn_bprop(
             sK=sK,
             sdK=sdK,
             sDstate_trans=sDstate_trans,
-            mInvK=mInvK,
-            k_ratio=k_ratio,
-            sL2ReductionK=sL2ReductionK,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -5599,8 +5278,6 @@ def frost_gdn_bprop(
             mWorkItems,
             tidx,
             mGate=mGate,
-            mA_log=mA_log,
-            mDt_bias=mDt_bias,
             mBeta=mBeta,
             mDgate=mDgate,
             mDbeta=mDbeta,
@@ -5646,15 +5323,10 @@ class GdnBpropCfg:
     d_k: int
     d_v: int
     log_gate: bool = False
-    safe_gate: bool = False
-    beta_sigmoid: bool = False
-    allow_neg_eigval: bool = False
-    fused_l2norm: bool = False
     tinv_source: str = "compute"
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
-    expand_num: int = 1
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
     compute_group_2_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_2_WARP_IDS
@@ -5737,14 +5409,9 @@ def build_cfg(
     use_dstate_in: bool = False,
     use_dstate0: bool = False,
     log_gate: bool = False,
-    safe_gate: bool = False,
-    beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
-    fused_l2norm: bool = False,
     tinv_source: str = "compute",
     d_k: int,
     d_v: int,
-    expand_num: int = 1,
 ) -> GdnBpropCfg:
     """Build the per-compile ``GdnBpropCfg`` (io_dtype in {Float16, BFloat16}; acc is always
     Float32). ``tinv_source`` "compute" inverts the strict-masked M_kk in compute group 0; "gmem"
@@ -5755,8 +5422,8 @@ def build_cfg(
         raise ValueError(
             f"bprop serves Float16/BFloat16 with d_k in {STATE_DIMS}, got {io_dtype}, d_k={d_k}"
         )
-    if max_active_clusters <= 0 or expand_num < 1:
-        raise ValueError("max_active_clusters and expand_num must be positive")
+    if max_active_clusters <= 0:
+        raise ValueError("max_active_clusters must be positive")
     if d_k != d_v:
         raise ValueError(
             "the bprop stages Z (d_v wide) in the dQ tile, whose fragment strides need d_k == d_v"
@@ -5766,10 +5433,6 @@ def build_cfg(
             "Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0]; both need one "
             "stage"
         )
-    if fused_l2norm and d_v == 128:
-        raise ValueError(
-            "fused l2norm at d_v=128 hosts its scratch in sDm, which holds the in-kernel inverse"
-        )
     cfg = GdnBpropCfg(
         use_initial_state=use_initial_state,
         use_dstate_in=use_dstate_in,
@@ -5778,14 +5441,9 @@ def build_cfg(
         acc_dtype=cutlass.Float32,
         max_active_clusters=max_active_clusters,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        fused_l2norm=fused_l2norm,
         tinv_source=tinv_source,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
@@ -5895,15 +5553,10 @@ class GdnBpropOp:
                 cfg.use_dstate_in,
                 cfg.use_dstate0,
                 cfg.log_gate,
-                cfg.safe_gate,
-                cfg.beta_sigmoid,
-                cfg.allow_neg_eigval,
-                cfg.fused_l2norm,
             )
         )
         return (
             f"gdn_cudnn_bprop_{cfg.io_dtype.__name__.lower()}_k{cfg.d_k}_v{cfg.d_v}"
-            f"_e{cfg.expand_num}"
             f"_f{flags}_t{cfg.tinv_source}_{self.dtypes}_sm{cfg.max_active_clusters}"
             f"_i64{int(self.use_int64_offsets)}"
         )
@@ -5915,8 +5568,6 @@ class GdnBpropOp:
         k: cute.Tensor,
         v: cute.Tensor,
         gate: cute.Tensor,
-        a_log: cute.Tensor | None,
-        dt_bias: cute.Tensor | None,
         beta: cute.Tensor,
         dgate: cute.Tensor,
         dbeta: cute.Tensor,
@@ -5927,8 +5578,6 @@ class GdnBpropOp:
         cu_seqlens: cute.Tensor,
         dstate0: cute.Tensor | None,
         dstate_in: cute.Tensor | None,
-        inv_q: cute.Tensor | None,
-        inv_k: cute.Tensor | None,
         tinv: cute.Tensor | None,
         work_items: cute.Tensor | None,
         work_count: cute.Tensor | None,
@@ -5943,8 +5592,6 @@ class GdnBpropOp:
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             beta,
             dgate,
             dbeta,
@@ -5955,8 +5602,6 @@ class GdnBpropOp:
             cu_seqlens,
             dstate0,
             dstate_in,
-            inv_q,
-            inv_k,
             tinv,
             work_items,
             work_count,
@@ -5972,21 +5617,14 @@ def _compile_gdn_bprop(
     io_dtype: str,
     cu_dtype: str,
     gate_dtype: str,
-    a_log_dtype: str,
-    dt_bias_dtype: str,
     beta_dtype: str,
     dstate_in_dtype: str,
     dstate0_dtype: str,
     num_sm: int,
     d_k: int,
     d_v: int,
-    expand_num: int,
     use_initial_state: bool,
     log_gate: bool,
-    safe_gate: bool,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
-    fused_l2norm: bool,
     tinv_source: str,
     use_int64_offsets: bool,
 ):
@@ -5999,19 +5637,11 @@ def _compile_gdn_bprop(
         use_dstate_in=dstate_in_dtype != "none",
         use_dstate0=dstate0_dtype != "none",
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        fused_l2norm=fused_l2norm,
         tinv_source=tinv_source,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
-    dtypes = (
-        f"{cu_dtype}_{gate_dtype}_{a_log_dtype}_{dt_bias_dtype}_{beta_dtype}"
-        f"_{dstate_in_dtype}_{dstate0_dtype}"
-    )
+    dtypes = f"{cu_dtype}_{gate_dtype}_{beta_dtype}_{dstate_in_dtype}_{dstate0_dtype}"
     dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
 
     def optional(dtype_name, rank, align):
@@ -6024,8 +5654,6 @@ def _compile_gdn_bprop(
         dyn(io, 3, assumed_align=16),
         dyn(io, 3, assumed_align=16),
         dyn(get_dtype(gate_dtype), 2, assumed_align=16),
-        optional(a_log_dtype, 1, 4),
-        optional(dt_bias_dtype, 1, 4),
         dyn(get_dtype(beta_dtype), 2, assumed_align=16),
         dyn(cutlass.Float32, 2, assumed_align=16),
         dyn(get_dtype(beta_dtype), 2, assumed_align=16),
@@ -6036,8 +5664,6 @@ def _compile_gdn_bprop(
         dyn(_index_dtype(cu_dtype), 1, assumed_align=4),
         optional(dstate0_dtype, 4, 16),
         optional(dstate_in_dtype, 4, 16),
-        dyn(cutlass.Float32, 2, assumed_align=4) if fused_l2norm else None,
-        dyn(cutlass.Float32, 2, assumed_align=4) if fused_l2norm else None,
         dyn(io, 4, assumed_align=128) if tinv_source == "gmem" else None,
         make_compact_signature_tensor(
             cutlass.Int32, (cute.sym_int(), WORK_ITEM_FIELDS), assumed_align=16
@@ -6046,45 +5672,6 @@ def _compile_gdn_bprop(
         dyn(cutlass.Int32, 1, assumed_align=4),
         cutlass.Float32(1.0),
         dyn(cutlass.Int64, 1, assumed_align=128),
-        opt_level=2,
-    )
-
-
-@jit_cache
-def _compile_gdn_bprop_prologue(
-    io_dtype: str,
-    cu_dtype: str,
-    run_order: bool,
-    order_gen: bool,
-    expand_num: int,
-    has_tinv: bool,
-    use_int64_offsets: bool,
-):
-    """Compile the standalone bprop descriptor (and optional ordering) prologue."""
-    io = get_dtype(io_dtype)
-    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
-    items = partial(make_compact_signature_tensor, cutlass.Int32, assumed_align=16)
-    flags = "".join(str(int(flag)) for flag in (run_order, order_gen, has_tinv))
-    return compile_tvm_ffi(
-        prologue,
-        io,
-        CFG.B_T,
-        run_order,
-        order_gen,
-        expand_num,
-        *(dyn(io, 3, assumed_align=16) for _ in range(7)),
-        dyn(io, 4, assumed_align=16),
-        dyn(_index_dtype(cu_dtype), 1, assumed_align=4),
-        items((cute.sym_int(), WORK_ITEM_FIELDS)) if run_order and not order_gen else None,
-        dyn(cutlass.Int32, 1, assumed_align=4),
-        items((cute.sym_int(), WORK_ITEM_FIELDS)),
-        dyn(cutlass.Int32, 1, assumed_align=4) if run_order else None,
-        dyn(io, 4, assumed_align=128) if has_tinv else None,
-        dyn(cutlass.Int64, 1, assumed_align=128),
-        name=(
-            f"gdn_cudnn_bprop_prologue_{io_dtype}_{cu_dtype}_e{expand_num}_f{flags}"
-            f"_i64{int(use_int64_offsets)}"
-        ),
         opt_level=2,
     )
 
@@ -6108,10 +5695,6 @@ def validate_bwd_operands(
     dv=None,
     dgate=None,
     dbeta=None,
-    a_log=None,
-    dt_bias=None,
-    inv_q=None,
-    inv_k=None,
 ):
     """Check the packed GDN backward operands shared by the standalone and bundled hosts (every
     ``None`` optional is skipped); return ``(tokens, heads_out, num_seqs)``."""
@@ -6128,10 +5711,6 @@ def validate_bwd_operands(
         dv=dv,
         dgate=dgate,
         dbeta=dbeta,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        inv_q=inv_q,
-        inv_k=inv_k,
     )
     num_seqs = validate_seqlens(cu_seqlens)
     if q.ndim != 3 or v.ndim != 3 or gate.ndim != 2:
@@ -6162,12 +5741,6 @@ def validate_bwd_operands(
         validate_tensor(
             "dbeta", dbeta, (tokens, heads_out), (str(beta.dtype).removeprefix("torch."),)
         )
-    for name, tensor in (("a_log", a_log), ("dt_bias", dt_bias)):
-        if tensor is not None:
-            validate_tensor(name, tensor, (heads_out,), SCALAR_DTYPES, align=4)
-    for name, tensor in (("inv_q", inv_q), ("inv_k", inv_k)):
-        if tensor is not None:
-            validate_tensor(name, tensor, (tokens, None), ("float32",), align=4)
     return tokens, heads_out, num_seqs
 
 
@@ -6178,9 +5751,9 @@ def validate_state_series(name, tensor, rows, heads_out, dim_v, dim_k, dtypes, *
     )
 
 
-def validate_tinv(tinv, tokens, num_seqs, heads_out, io_dtype, expand_num):
+def validate_tinv(tinv, tokens, num_seqs, heads_out, io_dtype):
     """Check the ``gdn_tinv_f16`` chunk-factor tiles, one row per chunk plus one per sequence."""
-    rows = tokens * expand_num // CFG.B_T + num_seqs
+    rows = tokens // CFG.B_T + num_seqs
     validate_state_series("tinv", tinv, rows, heads_out, CFG.B_T, CFG.B_T, (io_dtype,), align=128)
 
 
@@ -6202,23 +5775,16 @@ def validate_bwd_bundle(
     bprop_words,
     *,
     num_pieces,
-    expand_num,
     b_t,
     tinv_pass=True,
     dgate=None,
     dbeta=None,
-    a_log=None,
-    dt_bias=None,
-    inv_q=None,
-    inv_k=None,
 ):
     """Check the operands every bundled backward host (warmup/uncut and chain) hands the bprop:
     ``num_pieces`` checkpoint series (one per sequence, or per chain piece) and, with
     ``tinv_pass``, the T-pass tiles and row table; return ``(tokens, heads_out, num_seqs)``."""
-    if b_t != CFG.B_T or expand_num < 1 or num_pieces < 1:
-        raise ValueError(
-            f"bundled backward hosts need b_t={CFG.B_T}, positive expand_num and piece count"
-        )
+    if b_t != CFG.B_T or num_pieces < 1:
+        raise ValueError(f"bundled backward hosts need b_t={CFG.B_T} and a positive piece count")
     tokens, heads_out, num_seqs = validate_bwd_operands(
         q,
         k,
@@ -6232,10 +5798,6 @@ def validate_bwd_bundle(
         dv=dv,
         dgate=dgate,
         dbeta=dbeta,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        inv_q=inv_q,
-        inv_k=inv_k,
     )
     validate_cuda_tensors(
         q,
@@ -6249,15 +5811,15 @@ def validate_bwd_bundle(
     validate_state_series(
         "checkpoints",
         checkpoints,
-        checkpoint_capacity_bound(tokens * expand_num, num_pieces, CFG.B_T),
+        checkpoint_capacity_bound(tokens, num_pieces, CFG.B_T),
         heads_out,
         v.shape[2],
         q.shape[2],
         (io,),
     )
     if tinv_pass:
-        validate_tinv(tinv, tokens, num_pieces, heads_out, io, expand_num)
-        rows = tokens * expand_num // CFG.B_T + num_pieces
+        validate_tinv(tinv, tokens, num_pieces, heads_out, io)
+        rows = tokens // CFG.B_T + num_pieces
         validate_tensor("tinv_rows", tinv_rows, (None, 4), ("int32",), compact=True, min_rows=rows)
         validate_tensor("tinv_row_count", tinv_row_count, (None,), ("int32",), align=4, min_rows=1)
     validate_workspace("bprop_words", bprop_words, TENSORMAP_DESC_ARRAYS, num_pieces)
@@ -6286,24 +5848,10 @@ def chunk_gdn_bwd(
     work_items=None,
     work_count=None,
     scheduler_counter=None,
-    scheduler_all=None,
-    work_item_scratch=None,
-    order_in_prologue: bool = False,
     log_gate: bool = False,
-    safe_gate: bool = False,
-    a_log=None,
-    dt_bias=None,
-    use_beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
-    inv_q=None,
-    inv_k=None,
     tinv=None,
-    expand_num: int = 1,
     workspace,
-    device: int,
     num_sm: int,
-    stream,
-    own_prologue: bool = True,
 ) -> None:
     """Execute the chunked GDN bprop kernel (THD / varlen entry).
 
@@ -6319,17 +5867,16 @@ def chunk_gdn_bwd(
     same device with a stride-1 innermost dim (outer strides are runtime
     arguments).
     Compiles through the persistent ``jit_cache`` and launches on the current torch stream.
+    The caller has already run the prologue that fills ``workspace`` with the per-(b,h) TMA
+    descriptors (``build_descs_body``).
 
     Args:
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
         v: ``(total_tokens, HV, DV)`` float16/bfloat16
         gate: ``(total_tokens, HO)`` float32, forget gate, raw linear
-            alpha, or the natural-log decay when ``log_gate``, or raw logits
-            when ``safe_gate``, which applies the safe-gate transform
-            ``-exp(a_log) * softplus(gate + dt_bias)``
-        beta: ``(total_tokens, HO)`` float32, update gate, post-sigmoid, or
-            raw logits (float32 or the io dtype) when ``use_beta_sigmoid``
+            alpha, or the natural-log decay when ``log_gate``
+        beta: ``(total_tokens, HO)`` float32, update gate, post-sigmoid
         do: ``(total_tokens, HO, DV)`` float16/bfloat16, output gradient
         state_checkpoints: ``(total_checkpoints, HO, DV, DK)`` io dtype, per-chunk
             forward states from the prefill kernel's checkpoint output
@@ -6337,56 +5884,28 @@ def chunk_gdn_bwd(
         dq/dk/dv: pre-allocated output gradients, shaped/typed like q/k/v at
             HO heads
         dgate: pre-allocated ``(total_tokens, HO)`` float32 gate gradient
-            (``safe_gate`` leaves it in the transformed gate space)
         dbeta: pre-allocated ``(total_tokens, HO)`` matching beta's dtype;
-            gradient wrt the post-sigmoid beta, or wrt the raw logits under
-            ``use_beta_sigmoid`` (the kernel folds the sigmoid derivative
-            into its own dbeta write)
+            gradient wrt the post-sigmoid beta
         cu_seqlens: ``(num_seqs + 1,)`` int32
         use_initial_state: the forward ran with an initial state, so chunk 0
             has an entering state to load from ``state_checkpoints`` row 0
         scale: attention scale factor (must not be 0)
-        safe_gate: interpret ``gate`` through the safe-gate transform
-        a_log: ``(HO,)`` float32/bf16/fp16 safe-gate per-head log-amplitude, or None for unit
-        amplitude
-        dt_bias: ``(HO,)`` float32/bf16/fp16 safe-gate per-head bias, or None for zero bias
-        use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         work_items: ``(max_items, 8)`` int32 work-item table from
             ``common/split_k.py`` (REQUIRED; an uncut table row is the whole
             (b, h) sequence).  Each item computes chunks ``[write_start, compute_end)``
             backward and writes gradients only for ``[write_start, write_end)``.
         work_count: ``(1,)`` int32 device-side item count (REQUIRED)
         tinv: ``(tinv_rows, HO, B_T, B_T)`` io dtype, the chunk-factor tiles of
-            ``gdn_tinv_f16.chunk_gdn_tinv`` (same k / gate / beta / cu_seqlens /
-            expand_num), or None to invert the chunk factor in-kernel
-        expand_num: multiply every device-side ``cu_seqlens`` value by this
-            factor (GDP's ``num_householder``-expanded timeline; 1 = off)
+            ``gdn_tinv_f16.chunk_gdn_tinv`` (same k / gate / beta / cu_seqlens),
+            or None to invert the chunk factor in-kernel
         workspace: ``(>= tensormap_workspace_bytes(module, B) // 8,)`` int64,
             128-byte aligned; holds the per-(b,h) TMA descriptors
-        stream: CUDA stream handle (``cudaStream_t`` as an int)
     """
     if scheduler_counter is None:
         raise ValueError("scheduler_counter is required")
-    run_order = bool(order_in_prologue)
-    order_gen = run_order and work_item_scratch is None
-    if run_order and scheduler_all is None:
-        raise ValueError(
-            "order_in_prologue requires scheduler_all (the prologue zeroes both consumers' sched "
-            "rings)"
-        )
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
-    if (
-        expand_num < 1
-        or (inv_q is None) != (inv_k is None)
-        or (d_initial_state is not None and not use_initial_state)
-    ):
-        raise ValueError(
-            "expand_num must be positive, inv_q/inv_k go together, and d_initial_state needs use"
-            "_initial_state"
-        )
+    if d_initial_state is not None and not use_initial_state:
+        raise ValueError("d_initial_state needs use_initial_state")
     tokens, heads_out, num_seqs = validate_bwd_operands(
         q,
         k,
@@ -6400,10 +5919,6 @@ def chunk_gdn_bwd(
         dv=dv,
         dgate=dgate,
         dbeta=dbeta,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        inv_q=inv_q,
-        inv_k=inv_k,
     )
     validate_cuda_tensors(
         q,
@@ -6413,8 +5928,6 @@ def chunk_gdn_bwd(
         work_items=work_items,
         work_count=work_count,
         scheduler_counter=scheduler_counter,
-        scheduler_all=scheduler_all,
-        work_item_scratch=work_item_scratch,
         tinv=tinv,
         workspace=workspace,
     )
@@ -6422,7 +5935,7 @@ def chunk_gdn_bwd(
     validate_state_series(
         "state_checkpoints",
         state_checkpoints,
-        checkpoint_capacity_bound(tokens * expand_num, num_seqs, CFG.B_T),
+        checkpoint_capacity_bound(tokens, num_seqs, CFG.B_T),
         heads_out,
         dim_v,
         dim_k,
@@ -6432,20 +5945,15 @@ def chunk_gdn_bwd(
         if tensor is not None:
             validate_state_series(name, tensor, num_seqs, heads_out, dim_v, dim_k, STATE_DTYPES)
     if tinv is not None:
-        validate_tinv(tinv, tokens, num_seqs, heads_out, io, expand_num)
+        validate_tinv(tinv, tokens, num_seqs, heads_out, io)
     validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
     validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
-    fused_l2norm = inv_q is not None
     tinv_source = "gmem" if tinv is not None else "compute"
-    work_item_staging = work_item_scratch if run_order and not order_gen else None
-    scheduler_all = scheduler_all if run_order else None
     use_int64_offsets = requires_int64_abi(
         q,
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         dgate,
         dbeta,
@@ -6457,47 +5965,26 @@ def chunk_gdn_bwd(
         cu_seqlens,
         d_initial_state,
         d_final_state,
-        inv_q,
-        inv_k,
         tinv,
         workspace,
     )
-    cache = {
-        "compiled": _compile_gdn_bprop(
-            _dtype_name(q),
-            _dtype_name(cu_seqlens),
-            _dtype_name(gate),
-            _dtype_name(a_log),
-            _dtype_name(dt_bias),
-            _dtype_name(beta),
-            _dtype_name(d_final_state),
-            _dtype_name(d_initial_state),
-            num_sm,
-            q.shape[2],
-            v.shape[2],
-            expand_num,
-            use_initial_state,
-            log_gate,
-            safe_gate,
-            use_beta_sigmoid,
-            allow_neg_eigval,
-            fused_l2norm,
-            tinv_source,
-            use_int64_offsets,
-        )
-    }
-    if own_prologue:
-        cache["prologue"] = _compile_gdn_bprop_prologue(
-            _dtype_name(q),
-            _dtype_name(cu_seqlens),
-            run_order,
-            order_gen,
-            expand_num,
-            tinv is not None,
-            use_int64_offsets,
-        )
+    compiled = _compile_gdn_bprop(
+        _dtype_name(q),
+        _dtype_name(cu_seqlens),
+        _dtype_name(gate),
+        _dtype_name(beta),
+        _dtype_name(d_final_state),
+        _dtype_name(d_initial_state),
+        num_sm,
+        q.shape[2],
+        v.shape[2],
+        use_initial_state,
+        log_gate,
+        tinv_source,
+        use_int64_offsets,
+    )
     run_bwd(
-        cache,
+        compiled,
         q,
         k,
         v,
@@ -6516,19 +6003,10 @@ def chunk_gdn_bwd(
         work_items,
         work_count,
         scheduler_counter,
-        scheduler_all,
-        work_item_staging,
         workspace,
         scale,
-        stream,
-        a_log,
-        dt_bias,
-        inv_q,
-        inv_k,
         tinv=tinv,
-        own_prologue=own_prologue,
     )
-    return cache
 
 
 def _dtype_name(tensor) -> str:
@@ -6536,7 +6014,7 @@ def _dtype_name(tensor) -> str:
 
 
 def run_bwd(
-    cache,
+    compiled,
     q,
     k,
     v,
@@ -6555,47 +6033,18 @@ def run_bwd(
     work_items,
     work_count,
     scheduler_counter,
-    scheduler_all,
-    work_item_scratch,
     tensormap_workspace,
     scale,
-    stream,
-    a_log=None,
-    dt_bias=None,
-    inv_q=None,
-    inv_k=None,
     *,
     tinv=None,
-    own_prologue=True,
 ) -> None:
-    """Replay the compiled plan: the prologue launch, then the main launch, on the current
-    torch stream (``stream`` is kept for the upstream call signature). The caller owns the
+    """Replay the compiled main launch on the current torch stream. The caller owns the
     contract, which the plan validated at build, so nothing here raises."""
-    if own_prologue:
-        cache["prologue"](
-            q,
-            k,
-            v,
-            do,
-            dq,
-            dk,
-            dv,
-            state_checkpoints,
-            cu_seqlens,
-            work_item_scratch,
-            work_count,
-            work_items,
-            scheduler_all,
-            tinv,
-            tensormap_workspace,
-        )
-    cache["compiled"](
+    compiled(
         q,
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         dgate,
         dbeta,
@@ -6606,8 +6055,6 @@ def run_bwd(
         cu_seqlens,
         d_initial_state,
         d_final_state,
-        inv_q,
-        inv_k,
         tinv,
         work_items,
         work_count,

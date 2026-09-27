@@ -16,7 +16,8 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; upstream GDP (expand_num), safe_gate/A_log/dt_bias and
+# beta-sigmoid/allow_neg_eigval constexpr paths pruned.
 
 """
 Chunked Gated Delta Net (GDN) chunk-factor pass (the T pass) for SM100 / SM103 / SM107 (Cutlass
@@ -25,13 +26,12 @@ summary / bprop kernels consume, one BT x BT tile per (chunk, head), in bf16 / f
 
 Algorithm overview (per chunk c of sequence b, tokens [cC, (c+1)C); heads independent):
   Inputs : K[BT,DK], Gate[BT] (scalar gate), Beta[BT] (scalar LR)
-  Output : tinv[row, head, BT, BT] (io dtype), row = cu[b] * expand_num // BT + b + c; the rows
-           between one sequence's last chunk and the next base are padding (rows = total_tokens *
-           expand_num // BT + num_seqs, tinv_rows)
+  Output : tinv[row, head, BT, BT] (io dtype), row = cu[b] // BT + b + c; the rows between one
+           sequence's last chunk and the next base are padding (rows = total_tokens // BT +
+           num_seqs, tinv_rows)
 
   Preprocessing (gate warp, registers):
-    cumsumlog[t]     = sum_{l=0}^{t} log2(Gate_l)             cumulative log2 of gates (safe-gate / log / linear)
-    Beta[t]          = sigmoid(beta_t) [* 2]                   when the kernel applies the sigmoid
+    cumsumlog[t]     = sum_{l=0}^{t} log2(Gate_l)             cumulative log2 of gates (log / linear)
 
   KK GEMM        : W_kk[2BT,2BT] = [K0;K1] @ [K0;K1]^T   (one M = N = 2 BT GEMM per pair; member m is diagonal block m)
   KK epilogue    : M_kk[i,j] = W_kk[i,j] * exp2(cumsumlog[i] - cumsumlog[j]) * Beta[i]   (i >= j, else 0)
@@ -96,8 +96,6 @@ from ..tile_dsl.pointwise import (
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
-    sigmoid,
-    softplus2,
 )
 from ..tile_dsl.swizzle import swizzle_xor_128b
 from ..tile_dsl.tma import (
@@ -299,8 +297,6 @@ def gate_warp(
     mRows,
     lane_idx,
     mGate,
-    mA_log,
-    mDt_bias,
     mBeta,
     sCumsumlog,
     sBeta,
@@ -342,61 +338,22 @@ def gate_warp(
                 chunk_offset = mRows[r, 2] + mRows[r, 0] * cutlass.Int32(cfg.b_t)
                 member_end = mRows[r, 3]
 
-                # ---- safe-gate per-head parameters: a = -exp(A_log) / ln 2, bias -----
-                if cutlass.const_expr(cfg.safe_gate and mA_log is None):
-                    a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
-                else:
-                    a = cutlass.Float32(0.0)
-                bias = cutlass.Float32(0.0)
-                if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
-                    a = -cute.math.exp2(
-                        mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2),
-                        fastmath=True,
-                    ) * cutlass.Float32(RCP_LN2)
-                if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
-                    bias = mDt_bias[head_idx].to(cutlass.Float32)
-
                 # ---- Gate load: GMEM -> registers (OOB neutral: 1.0 -> log2 = 0.0) ----
                 tok_lo = chunk_offset + lane_idx
                 tok_hi = tok_lo + cutlass.Int32(cfg.threads_per_warp)
                 pos_valid_lo = tok_lo < member_end
                 pos_valid_hi = tok_hi < member_end
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    row_lo = tok_lo // cutlass.Int32(cfg.expand_num)
-                    row_hi = tok_hi // cutlass.Int32(cfg.expand_num)
-                    gate_valid_lo = pos_valid_lo and (
-                        tok_lo - row_lo * cutlass.Int32(cfg.expand_num) == 0
-                    )
-                    gate_valid_hi = pos_valid_hi and (
-                        tok_hi - row_hi * cutlass.Int32(cfg.expand_num) == 0
-                    )
-                    gate_row_end = member_end // cutlass.Int32(cfg.expand_num)
-                    raw_lo = mGate[cutlass.min(row_lo, gate_row_end - 1), head_idx]
-                    raw_hi = mGate[cutlass.min(row_hi, gate_row_end - 1), head_idx]
-                else:
-                    gate_valid_lo = pos_valid_lo
-                    gate_valid_hi = pos_valid_hi
-                    raw_lo = mGate[cutlass.min(tok_lo, member_end - 1), head_idx]
-                    raw_hi = mGate[cutlass.min(tok_hi, member_end - 1), head_idx]
-                gate_valid = [gate_valid_lo, gate_valid_hi]
+                gate_valid_lo = pos_valid_lo
+                gate_valid_hi = pos_valid_hi
+                raw_lo = mGate[cutlass.min(tok_lo, member_end - 1), head_idx]
+                raw_hi = mGate[cutlass.min(tok_hi, member_end - 1), head_idx]
                 gate_vals = [
                     raw_lo.to(cutlass.Float32) if gate_valid_lo else oob_neutral,
                     raw_hi.to(cutlass.Float32) if gate_valid_hi else oob_neutral,
                 ]
 
                 # ---- Gate transform into the log2 domain -----------------------------
-                if cutlass.const_expr(cfg.safe_gate):
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        biased_lo, biased_hi = fadd2(
-                            gate_vals[col], gate_vals[col + 1], bias, bias
-                        )
-                        sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                        contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                        gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
-                        gate_vals[col + 1] = (
-                            contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
-                        )
-                elif cutlass.const_expr(cfg.log_gate):
+                if cutlass.const_expr(cfg.log_gate):
                     rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
                     for col in cutlass.range_constexpr(0, n_cols, 2):
                         gate_vals[col], gate_vals[col + 1] = fmul2(
@@ -441,12 +398,6 @@ def gate_warp(
                 for col in cutlass.range_constexpr(n_cols):
                     pos = lane_idx + col * cfg.threads_per_warp
                     beta_value = raws[col].to(cutlass.Float32)
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_value = (
-                            (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0))
-                            .to(mBeta.element_type)
-                            .to(cutlass.Float32)
-                        )
                     sBeta[pos, 0, member, gate_slot] = (
                         beta_value if valids[col] else cutlass.Float32(0.0)
                     )
@@ -921,7 +872,6 @@ def compute_warp_group(
 @cute.jit
 def emit_tinv_rows(
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     cu_seqlens: cute.Tensor,
     mRows: cute.Tensor,
     mCount: cute.Tensor,
@@ -938,8 +888,8 @@ def emit_tinv_rows(
         batch_start = cutlass.Int32(0)
         batch_end = cutlass.Int32(0)
         if b < n_batch:
-            batch_start = expanded_cu_seqlen(expand_num, cu_seqlens, b)
-            batch_end = expanded_cu_seqlen(expand_num, cu_seqlens, b + cutlass.Int32(1))
+            batch_start = expanded_cu_seqlen(cu_seqlens, b)
+            batch_end = expanded_cu_seqlen(cu_seqlens, b + cutlass.Int32(1))
             n_chunks = (batch_end - batch_start + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
         incl = n_chunks
         for offset in [1, 2, 4, 8, 16]:
@@ -973,7 +923,6 @@ def build_descs_body(
     tinv: cute.Tensor,
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
 ) -> None:
     """Per-batch descriptor-array build on one warp, the K array then the tinv array."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -984,10 +933,8 @@ def build_descs_body(
         desc_workspace.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,))
     )
     if widx == 0:
-        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
-        emit_tile_seq_descs(
-            base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32
-        )
+        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, lanes=32)
+        emit_tile_seq_descs(base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
@@ -996,7 +943,6 @@ def build_descs_body(
 @cute.kernel
 def frost_gdn_tinv_prologue(
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     base_k: cutlass.GridConstant[tma.TensorMap],
     base_tinv: cutlass.GridConstant[tma.TensorMap],
     desc_words: cute.Tensor,
@@ -1016,10 +962,8 @@ def frost_gdn_tinv_prologue(
     widx = cutlass.Int32(tidx) // cutlass.Int32(32)
     lane_idx = cutlass.Int32(tidx) % cutlass.Int32(32)
     n_batch = cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1)
-    build_descs_body(
-        widx, base_k, base_tinv, desc_words, cu_seqlens, k, tinv, n_batch, b_t, expand_num
-    )
-    emit_tinv_rows(b_t, expand_num, cu_seqlens, mRows, mCount, lane_idx)
+    build_descs_body(widx, base_k, base_tinv, desc_words, cu_seqlens, k, tinv, n_batch, b_t)
+    emit_tinv_rows(b_t, cu_seqlens, mRows, mCount, lane_idx)
 
 
 @cute.jit
@@ -1029,8 +973,6 @@ def host(
     k: cute.Tensor,
     k_desc: cute.Tensor,
     gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     tinv: cute.Tensor,
@@ -1084,7 +1026,6 @@ def host(
     if cutlass.const_expr(publish_desc):
         frost_gdn_tinv_prologue(
             cfg.b_t,
-            cfg.expand_num,
             base_desc_k,
             base_desc_tinv,
             k_desc,
@@ -1104,8 +1045,6 @@ def host(
         cute.FastDivmodDivisorV2(num_ctas),
         k_desc,
         gate,
-        a_log,
-        dt_bias,
         beta,
         rows,
         row_count,
@@ -1129,8 +1068,6 @@ def frost_gdn_tinv(
     num_ctas: cute.FastDivmodDivisorV2,
     mDesc: cute.Tensor,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     mBeta: cute.Tensor,
     mRows: cute.Tensor,
     mCount: cute.Tensor,
@@ -1300,8 +1237,6 @@ def frost_gdn_tinv(
             mRows,
             lane_idx=lane_idx,
             mGate=mGate,
-            mA_log=mA_log,
-            mDt_bias=mDt_bias,
             mBeta=mBeta,
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
@@ -1363,13 +1298,9 @@ class GdnTinvCfg:
     acc_dtype: type[cutlass.Numeric]
     d_k: int
     log_gate: bool = False
-    safe_gate: bool = False
-    beta_sigmoid: bool = False
-    allow_neg_eigval: bool = False
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
-    expand_num: int = 1
     num_sm: int = 0  # SM count of the device the plan is built for
     compute_group_warp_ids: tuple[tuple[int, ...], ...] = CFG.COMPUTE_GROUP_WARP_IDS
     load_gate_warp_id: int = CFG.LOAD_GATE_WARP_ID
@@ -1405,11 +1336,7 @@ def build_cfg(
     *,
     num_sm: int,
     log_gate: bool = False,
-    safe_gate: bool = False,
-    beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
     d_k: int,
-    expand_num: int = 1,
 ) -> GdnTinvCfg:
     """Build the per-compile ``GdnTinvCfg`` (io_dtype in {Float16, BFloat16}; acc is always
     Float32)."""
@@ -1420,11 +1347,7 @@ def build_cfg(
         acc_dtype=cutlass.Float32,
         num_sm=num_sm,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         d_k=d_k,
-        expand_num=expand_num,
     )
     n_groups = len(cfg.compute_group_warp_ids)
     n_group_warps = len(cfg.compute_group_warp_ids[0])
@@ -1454,9 +1377,9 @@ def build_cfg(
     )
 
 
-def tinv_rows(total_tokens: int, num_seqs: int, expand_num: int = 1, b_t: int = CFG.B_T) -> int:
+def tinv_rows(total_tokens: int, num_seqs: int, b_t: int = CFG.B_T) -> int:
     """Tile rows of the ``tinv`` buffer: one row per chunk plus one padding row per sequence."""
-    return total_tokens * expand_num // b_t + num_seqs
+    return total_tokens // b_t + num_seqs
 
 
 TENSORMAP_DESC_ARRAYS = 2  # per-batch runtime TMA descriptors: K, tinv

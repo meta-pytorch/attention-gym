@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; the upstream-only GDP expand_num, compact_qdo, and
+# summary_q_step paths are removed at their pinned values.
 
 """
-Chunked Gated Delta Net (GDN / GDP) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass
+Chunked Gated Delta Net (GDN) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass
 primitives): the one launch that builds every table the chain's kernels read, so each consumer
 keeps its body and skips its own prologue.
 
@@ -17,8 +18,7 @@ descriptor arrays):
                        T pass row table
   descriptor arrays  : the per-piece TMA descriptor arrays of every chain kernel, the T pass's K / tinv included
 
-The bprop summary's q and dO arrays address the compact token timeline (summary_q_step > 1 reads
-the phase rows of an expanded q buffer).
+The bprop summary's q and dO arrays address the compact token timeline.
 
 Warp assignments (descriptor phase, one warp per array):
   warp  0       : T pass K / tinv
@@ -65,11 +65,8 @@ def frost_gdn_chain_prologue(
     pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
     heads_out: cutlass.Int32,
-    compact_qdo: cutlass.Constexpr[bool],
-    summary_q_step: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
     base_v: cutlass.GridConstant[tma.TensorMap],
@@ -134,7 +131,6 @@ def frost_gdn_chain_prologue(
         pieces,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         heads_out,
         tidx,
@@ -172,7 +168,6 @@ def frost_gdn_chain_prologue(
             sKey,
             sIdx,
             sSpread,
-            expand_num=expand_num,
             chain=True,
             mRowBase=main_rows,
         )
@@ -194,7 +189,6 @@ def frost_gdn_chain_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                expand_num=expand_num,
                 chain=True,
                 mRowBase=summary_rows,
                 mSlotRows=main_rows,
@@ -211,18 +205,17 @@ def frost_gdn_chain_prologue(
                 series_count,
                 series_items,
                 None,
-                expand_num,
             )
     else:
         # ---- descriptor arrays -------------------------------------------------------
         if cutlass.const_expr(tinv_words is not None):
             gdn_tinv_f16.build_descs_body(
-                widx, base_k, base_tinv, tinv_words, cu_pieces, k, tinv, n_pieces, b_t, expand_num
+                widx, base_k, base_tinv, tinv_words, cu_pieces, k, tinv, n_pieces, b_t
             )
         if cutlass.const_expr(tinv_rows is not None):
             if widx == 26:
                 gdn_tinv_f16.emit_tinv_rows(
-                    b_t, expand_num, cu_pieces, tinv_rows, tinv_row_count, tidx % cutlass.Int32(32)
+                    b_t, cu_pieces, tinv_rows, tinv_row_count, tidx % cutlass.Int32(32)
                 )
         if cutlass.const_expr(summary_words is not None):
             gdn_summary_f16.build_descs_body(
@@ -237,7 +230,6 @@ def frost_gdn_chain_prologue(
                 tinv,
                 n_pieces,
                 b_t,
-                expand_num,
             )
         if cutlass.const_expr(recompute_h_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -255,7 +247,6 @@ def frost_gdn_chain_prologue(
                 n_pieces,
                 cutlass.Int32(0),
                 b_t,
-                expand_num,
             )
         if cutlass.const_expr(recompute_m_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -273,7 +264,6 @@ def frost_gdn_chain_prologue(
                 n_pieces,
                 cutlass.Int32(0),
                 b_t,
-                expand_num,
             )
         if cutlass.const_expr(series_words is not None):
             gdn_recompute_f16.build_descs_body(
@@ -291,7 +281,6 @@ def frost_gdn_chain_prologue(
                 n_pieces,
                 checkpoint_every_n,
                 b_t,
-                expand_num,
             )
         if cutlass.const_expr(prefill_words is not None):
             gdn_prefill_f16.build_descs_body(
@@ -313,7 +302,6 @@ def frost_gdn_chain_prologue(
                 n_pieces,
                 checkpoint_every_n,
                 b_t,
-                expand_num,
             )
         if cutlass.const_expr(bprop_summary_words is not None):
             gdn_bprop_summary_f16.build_descs_body(
@@ -330,8 +318,6 @@ def frost_gdn_chain_prologue(
                 tinv,
                 n_pieces,
                 b_t,
-                expand_num,
-                summary_q_step,
             )
         if cutlass.const_expr(bprop_words is not None):
             gdn_bprop_f16.build_descs_body(
@@ -359,7 +345,6 @@ def frost_gdn_chain_prologue(
                 n_pieces,
                 checkpoint_every_n,
                 b_t,
-                expand_num,
             )
 
 
@@ -368,11 +353,8 @@ def chain_prologue(
     pieces: cutlass.Int32,
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
     heads_out: cutlass.Int32,
-    compact_qdo: cutlass.Constexpr[bool],
-    summary_q_step: cutlass.Constexpr[int],
     series_span_chunks: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     cu_seqlens: cute.Tensor,
@@ -410,8 +392,6 @@ def chain_prologue(
     tinv: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
-    if cutlass.const_expr(compact_qdo):
-        raise ValueError("compact_qdo needs the GDP d_v = 64 bprop, which is not vendored")
     swizzle_128b = tma.TensorMapSwizzle.s128b
     k_headed = cute.make_tensor(
         k.iterator,
@@ -565,30 +545,13 @@ def chain_prologue(
             swizzle=swizzle_128b,
         )
     if cutlass.const_expr(summary_q is not None):
-        if cutlass.const_expr(summary_q_step > 1):
-            summary_q_headed = cute.make_tensor(
-                summary_q.iterator + cutlass.Int32(summary_q_step - 1) * summary_q.stride[0],
-                cute.make_layout(
-                    (
-                        summary_q.shape[0] // cutlass.Int32(summary_q_step),
-                        summary_q.shape[1],
-                        summary_q.shape[2],
-                    ),
-                    stride=(
-                        summary_q.stride[0] * cutlass.Int32(summary_q_step),
-                        summary_q.stride[1],
-                        1,
-                    ),
-                ),
-            )
-        else:
-            summary_q_headed = cute.make_tensor(
-                summary_q.iterator,
-                cute.make_layout(
-                    (summary_q.shape[0], summary_q.shape[1], summary_q.shape[2]),
-                    stride=(summary_q.stride[0], summary_q.stride[1], 1),
-                ),
-            )
+        summary_q_headed = cute.make_tensor(
+            summary_q.iterator,
+            cute.make_layout(
+                (summary_q.shape[0], summary_q.shape[1], summary_q.shape[2]),
+                stride=(summary_q.stride[0], summary_q.stride[1], 1),
+            ),
+        )
         base_summary_q = tma.create_tensor_map_tiled_from_view(
             summary_q_headed,
             box_dims=(b_t, 1, 128 // (summary_q.element_type.width // 8)),
@@ -624,11 +587,8 @@ def chain_prologue(
         pieces,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         heads_out,
-        compact_qdo,
-        summary_q_step,
         base_q,
         base_k,
         base_v,

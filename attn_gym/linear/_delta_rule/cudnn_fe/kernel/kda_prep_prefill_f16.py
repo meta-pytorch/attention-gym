@@ -19,7 +19,8 @@
 # attn_gym.linear._delta_rule.cudnn_fe; register arrays, SMEM storage, and swizzle offsets
 # restyled. The frozen cfg launches through KdaPrepPrefillOp, whose name encodes every static flag.
 # The delta residual stays FP32 until the MMA pack, and optional paged routes seed, store, clear,
-# or skip slots.
+# or skip slots. The safe-gate, a_log/dt_bias, beta-sigmoid, allow_neg_eigval, and in-kernel Q/K
+# L2-norm paths are removed (the name keeps their flag slots as 0).
 
 """
 Prep-fed chunked Kimi Delta Attention (KDA) prefill for SM100 / SM103 / SM107: the BT = 16
@@ -119,7 +120,6 @@ from ..tile_dsl.pointwise import (
     fp32_to_fp16,
     opaque_f32_zero,
     opaque_i32,
-    sigmoid,
 )
 from ..tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_xor_128b
 from ..tile_dsl.tma import (
@@ -137,7 +137,6 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
 
 
 @cute.jit
@@ -1028,8 +1027,6 @@ def tmaldg_warp(
 def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
     """Map raw gate to the log2-domain decay increment used by KDA."""
 
-    if cutlass.const_expr(cfg.safe_gate):
-        return cfg.gate_scale_log2 * sigmoid(raw_gate)
     if cutlass.const_expr(cfg.log_gate):
         return raw_gate * cutlass.Float32(LOG2_E)
     return cute.math.log2(raw_gate + cutlass.Float32(1e-10), fastmath=True)
@@ -2461,7 +2458,7 @@ def frost_kda_prep_prefill_prologue(
             b_t,
         )
         if widx == cutlass.Int32(0):
-            emit_tinv_rows(b_t, 1, cu_seqlens, prep_rows, prep_count, lane_idx)
+            emit_tinv_rows(b_t, cu_seqlens, prep_rows, prep_count, lane_idx)
 
 
 @cute.jit
@@ -2686,11 +2683,11 @@ class KdaPrepPrefillOp:
                 cfg.use_initial_state,
                 cfg.store_final_state,
                 cfg.enable_checkpoints,
-                cfg.l2norm,
-                cfg.safe_gate,
+                False,
+                False,
                 cfg.log_gate,
-                cfg.beta_sigmoid,
-                cfg.allow_neg_eigval,
+                False,
+                False,
             )
         )
         dtypes = "_".join(
@@ -2709,8 +2706,6 @@ class KdaPrepPrefillOp:
         k: cute.Tensor,
         v: cute.Tensor,
         raw_gate: cute.Tensor,
-        a_log: cute.Tensor | None,
-        dt_bias: cute.Tensor | None,
         beta: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state: cute.Tensor | None,
@@ -2777,8 +2772,6 @@ class KdaPrepPrefillOp:
             k,
             v,
             raw_gate,
-            a_log,
-            dt_bias,
             beta,
             cu_seqlens,
             initial_state,
@@ -2813,8 +2806,6 @@ def frost_kda_prep_prefill(
     mK: cute.Tensor,
     mV: cute.Tensor,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
@@ -3115,12 +3106,8 @@ class KdaPrepPrefillCfg:
     use_initial_state: bool
     store_final_state: bool
     enable_checkpoints: bool
-    l2norm: bool
-    safe_gate: bool
     gate_scale_log2: float
     log_gate: bool
-    beta_sigmoid: bool
-    allow_neg_eigval: bool
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -3188,12 +3175,8 @@ def build_cfg(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
-    l2norm: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
     log_gate: bool = True,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -3217,12 +3200,8 @@ def build_cfg(
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
-        l2norm=l2norm,
-        safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         log_gate=log_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,

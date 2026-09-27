@@ -58,7 +58,6 @@ def _chain_pieces(
         b_t=b_t,
         cadence_tokens=0,
         batch_invariant=False,
-        expand_num=1,
         reverse=reverse,
     )
     if pieces and tokens < min_tokens_per_piece * pieces * num_seqs:

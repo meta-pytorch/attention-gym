@@ -16,9 +16,10 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
-# Modified by Attention Gym in 2026: persistent jit_cache compile on fake-tensor TVM-FFI signatures
-# (legacy placeholder ABI) with an int64-shape variant.
+# attn_gym.linear._delta_rule.cudnn_fe; persistent jit_cache compile on fake-tensor TVM-FFI
+# signatures (legacy placeholder ABI) with an int64-shape variant; and the upstream-only
+# expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue, and compact_qdo host
+# paths removed at their pinned values.
 
 """One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the
 T pass (with its own descriptor prologue), the split-K table (warmup only), the recompute prologue
@@ -30,7 +31,7 @@ its host and the tensor placeholder each host was compiled with are the standalo
 buffer two hosts read through different placeholder types is passed twice (the table's 4-byte
 compact views of work_items, work_count and item_scratch; the bprop prologue's 4-byte cu_seqlens).
 Only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64 fork and its ``compact_qdo`` operands are
-not), so the host compiles ``compact_qdo`` off."""
+not), so the host has no ``compact_qdo`` path."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -57,17 +58,14 @@ def warmup_backward_host(
     b_t: cutlass.Constexpr[int],
     scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
-    safe_gate: cutlass.Constexpr[bool],
     gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     bprop: cutlass.Constexpr,
-    compact_qdo: cutlass.Constexpr[bool],
     tinv_pass: cutlass.Constexpr[bool],
     recompute: cutlass.Constexpr[bool],
     recompute_orders: cutlass.Constexpr[bool],
@@ -98,10 +96,6 @@ def warmup_backward_host(
     gate: cute.Tensor,
     gate_table: cute.Tensor | None,
     beta: cute.Tensor,
-    a_log: cute.Tensor | None,
-    a_log_table: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
-    dt_bias_table: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     cu_seqlens_bprop: cute.Tensor,
@@ -137,8 +131,6 @@ def warmup_backward_host(
             k,
             tinv_words,
             gate,
-            a_log,
-            dt_bias,
             beta,
             cu_seqlens,
             tinv,
@@ -152,10 +144,8 @@ def warmup_backward_host(
             b_t,
             scan_rows,
             log_gate,
-            safe_gate,
             gate_channels,
             overhead_chunks,
-            expand_num,
             warmup_cap,
             full_scan,
             n_heads_out,
@@ -166,8 +156,6 @@ def warmup_backward_host(
             log2_thresh,
             gate_scale_log2,
             gate_table,
-            a_log_table,
-            dt_bias_table,
             cu_seqlens_table,
             chunk_scratch,
             item_scratch,
@@ -186,7 +174,6 @@ def warmup_backward_host(
             recompute_orders,
             recompute_order_gen,
             coarse,
-            expand_num,
             k,
             v,
             gate,
@@ -207,8 +194,6 @@ def warmup_backward_host(
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             cu_seqlens,
             state_in,
             None,
@@ -222,53 +207,28 @@ def warmup_backward_host(
             recompute_words,
             stream,
         )
-    if cutlass.const_expr(compact_qdo):
-        bprop.prologue(
-            io_dtype,
-            b_t,
-            bwd_orders,
-            bwd_order_gen,
-            expand_num,
-            q,
-            k,
-            v,
-            do,
-            dq,
-            dk,
-            dv,
-            checkpoints,
-            cu_seqlens_bprop,
-            staging_bprop,
-            work_count,
-            work_items,
-            scheduler_all_bprop,
-            bprop_words,
-            stream,
-        )
-    else:
-        bprop.prologue(
-            io_dtype,
-            b_t,
-            bwd_orders,
-            bwd_order_gen,
-            expand_num,
-            q,
-            k,
-            v,
-            do,
-            dq,
-            dk,
-            dv,
-            checkpoints,
-            cu_seqlens_bprop,
-            staging_bprop,
-            work_count,
-            work_items,
-            scheduler_all_bprop,
-            tinv,
-            bprop_words,
-            stream,
-        )
+    bprop.prologue(
+        io_dtype,
+        b_t,
+        bwd_orders,
+        bwd_order_gen,
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        checkpoints,
+        cu_seqlens_bprop,
+        staging_bprop,
+        work_count,
+        work_items,
+        scheduler_all_bprop,
+        tinv,
+        bprop_words,
+        stream,
+    )
 
 
 @jit_cache
@@ -286,14 +246,10 @@ def _compile_warmup_backward(
         num_sm,
         d_k,
         d_v,
-        expand_num,
         tinv_pass,
         recompute,
         coarse,
         log_gate,
-        safe_gate,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         state_in,
     ) = cfg_args
     io = get_dtype(io_dtype)
@@ -303,11 +259,7 @@ def _compile_warmup_backward(
             io,
             num_sm=num_sm,
             log_gate=log_gate,
-            safe_gate=safe_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
             d_k=d_k,
-            expand_num=expand_num,
         )
     recompute_cfg = None
     if recompute:
@@ -320,10 +272,8 @@ def _compile_warmup_backward(
             enable_checkpoints=True,
             seed_checkpoints=coarse,
             log_gate=log_gate,
-            safe_gate=safe_gate,
             d_k=d_k,
             d_v=d_v,
-            expand_num=expand_num,
         )
     head = list(constexprs)
     head[BPROP_SLOT] = gdn_bprop_f16
@@ -346,9 +296,9 @@ def _compile_warmup_backward(
 
 
 # Positions in the host's leading static-argument block (see ``warmup_backward_host``).
-N_HEADS_SLOT = 10
-IO_DTYPE_SLOT = 12
-BPROP_SLOT = 13
+N_HEADS_SLOT = 8
+IO_DTYPE_SLOT = 10
+BPROP_SLOT = 11
 
 
 def _validate_launch(
@@ -362,8 +312,6 @@ def _validate_launch(
     dv,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     tinv,
     tinv_words,
@@ -387,7 +335,6 @@ def _validate_launch(
     ideal_chunks,
     num_sm,
     b_t,
-    expand_num,
     tinv_pass,
     recompute,
     recompute_orders,
@@ -413,11 +360,8 @@ def _validate_launch(
         tinv_row_count,
         bprop_words,
         num_pieces=validate_seqlens(cu_seqlens),
-        expand_num=expand_num,
         b_t=b_t,
         tinv_pass=tinv_pass,
-        a_log=a_log,
-        dt_bias=dt_bias,
     )
     validate_cuda_tensors(
         q,
@@ -457,7 +401,7 @@ def _validate_launch(
         )
     table_rows = n_tiles
     if split:
-        scan_tokens = gate.shape[0] * expand_num
+        scan_tokens = gate.shape[0]
         if ideal_chunks:
             table_rows = split_k.max_work_items(
                 scan_tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm
@@ -505,8 +449,6 @@ def build_warmup_backward(
     dv,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     tinv,
     tinv_words,
@@ -530,7 +472,6 @@ def build_warmup_backward(
     ideal_chunks,
     num_sm,
     b_t,
-    expand_num,
     tinv_pass,
     recompute,
     recompute_orders,
@@ -539,9 +480,6 @@ def build_warmup_backward(
     seed_span_tokens,
     seed_every_n_tokens,
     log_gate,
-    safe_gate,
-    use_beta_sigmoid,
-    allow_neg_eigval,
 ):
     """Compile (cached per static config) the head of the warmup or uncut backward over the buffers
     of one plan.  The placeholders repeat the marks of the standalone builds so every kernel
@@ -550,9 +488,6 @@ def build_warmup_backward(
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
     gate.shape[1]
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     facts = split_k.split_table_facts(
         gate,
         cu_seqlens,
@@ -561,11 +496,7 @@ def build_warmup_backward(
         ideal_chunks=ideal_chunks,
         num_sms=num_sm,
         b_t=b_t,
-        log2_threshold=None,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        gate_lower_bound=None,
-        expand_num=expand_num,
     )
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
@@ -578,8 +509,6 @@ def build_warmup_backward(
         dv=dv,
         gate=gate,
         beta=beta,
-        a_log=a_log,
-        dt_bias=dt_bias,
         cu_seqlens=cu_seqlens,
         tinv=tinv,
         tinv_words=tinv_words,
@@ -603,7 +532,6 @@ def build_warmup_backward(
         ideal_chunks=ideal_chunks,
         num_sm=num_sm,
         b_t=b_t,
-        expand_num=expand_num,
         tinv_pass=tinv_pass,
         recompute=recompute,
         recompute_orders=recompute_orders,
@@ -619,17 +547,14 @@ def build_warmup_backward(
         facts.b_t,
         facts.scan_rows,
         facts.log_gate,
-        facts.safe_gate,
         facts.gate_channels,
         facts.overhead_chunks,
-        facts.expand_num,
         facts.warmup_cap,
         facts.full_scan,
         None,  # n_heads_out is a runtime scalar
         facts.num_sms,
         io_dtype,
         None,  # the bprop module
-        False,  # compact_qdo
         bool(tinv_pass),
         bool(recompute),
         bool(recompute_orders),
@@ -644,14 +569,10 @@ def build_warmup_backward(
         int(num_sm),
         DK,
         DV,
-        int(expand_num),
         bool(tinv_pass),
         bool(recompute),
         bool(coarse),
         bool(log_gate),
-        bool(safe_gate),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         state_in is not None,
     )
     gate_table = gate if split else None
@@ -667,10 +588,6 @@ def build_warmup_backward(
         signature_spec(gate, assumed_align=16),
         signature_spec(gate_table, assumed_align=8 if facts.gate_elem_bytes == 2 else 4),
         signature_spec(beta, assumed_align=16),
-        signature_spec(a_log, assumed_align=4),
-        signature_spec(a_log, assumed_align=4),
-        signature_spec(dt_bias, assumed_align=4),
-        signature_spec(dt_bias, assumed_align=4, compact=True),
         signature_spec(cu_seqlens, assumed_align=cu_align),
         signature_spec(cu_seqlens, assumed_align=4),
         signature_spec(cu_seqlens, assumed_align=4),
@@ -712,8 +629,6 @@ def build_warmup_backward(
         dv,
         gate,
         beta,
-        a_log,
-        dt_bias,
         cu_seqlens,
         tinv,
         checkpoints,
@@ -738,8 +653,6 @@ def run_warmup_backward(
     dv,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     tinv,
     tinv_words,
@@ -792,10 +705,6 @@ def run_warmup_backward(
         gate,
         gate if facts.split else None,
         beta,
-        a_log if facts.safe_gate else None,
-        a_log if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
         cu_seqlens,
         cu_seqlens,
         cu_seqlens,

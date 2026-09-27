@@ -3,7 +3,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; the per-call run_chain_prologue compile wrapper is removed
-# (the chain hosts nest chain_prologue in their persisted compiles).
+# (the chain hosts nest chain_prologue in their persisted compiles); the pinned expand_num=1
+# argument to piece_table_body is dropped.
 
 """
 Chunked Kimi Delta Attention (KDA) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass
@@ -118,7 +119,6 @@ def frost_kda_chain_prologue(
         pieces,
         unit_chunks,
         b_t,
-        1,
         length_rule,
         heads_out,
         tidx,

@@ -41,10 +41,6 @@ MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
 PREP_TILE_FRACTION = 0.475
 _GATE_FLAGS = {
     "log_gate": True,
-    "safe_gate": False,
-    "use_beta_sigmoid": False,
-    "allow_neg_eigval": False,
-    "use_qk_l2norm": False,
     "gate_lower_bound": kda_prefill_f16.DEFAULT_GATE_LOWER_BOUND,
 }
 
@@ -127,8 +123,6 @@ def kda_forward(
         "v": v,
         "gate": gate,
         "beta": beta,
-        "a_log": None,
-        "dt_bias": None,
         "o": o,
         "cu_seqlens": cu_seqlens,
         "seed_indices": None,
@@ -226,7 +220,7 @@ def _prep_buffers(
     )
     if not prep:
         return dict.fromkeys(names)
-    rows = gdn_tinv_f16.tinv_rows(tokens, num_seqs, 1, B_T)
+    rows = gdn_tinv_f16.tinv_rows(tokens, num_seqs, B_T)
     buffers = {
         name: torch.empty(rows, heads_out, B_T, dim_k, dtype=dtype, device=device)
         for name in ("prep_k_decay", "prep_q_decay", "prep_t")
@@ -309,8 +303,6 @@ def kda_backward(
         "do": d_output,
         "gate": gate,
         "beta": beta,
-        "a_log": None,
-        "dt_bias": None,
         "cu_seqlens": cu_seqlens,
         "checkpoints": checkpoints,
         "seed_checkpoints": None,
@@ -345,7 +337,6 @@ def kda_backward(
             "seed_every_n_tokens": 0,
             "scale": scale,
             "log_gate": True,
-            "safe_gate": False,
         }
         launch = build_chain_backward(
             **buffers,
@@ -353,9 +344,6 @@ def kda_backward(
             unit_chunks=plan.unit_chunks,
             length_rule=False,
             gate_lower_bound=_GATE_FLAGS["gate_lower_bound"],
-            use_qk_l2norm=False,
-            use_beta_sigmoid=False,
-            allow_neg_eigval=False,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
         )

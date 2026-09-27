@@ -16,9 +16,10 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
-# Modified by Attention Gym in 2026: persistent jit_cache compiles on fake-tensor TVM-FFI
-# signatures (legacy placeholder ABI) with an int64-shape variant.
+# attn_gym.linear._delta_rule.cudnn_fe; persistent jit_cache compiles on fake-tensor TVM-FFI
+# signatures (legacy placeholder ABI) with an int64-shape variant; and the upstream-only GDP
+# expand_num/summary_q_step, safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue,
+# fused-l2norm (inv_q/inv_k), and compact_qdo host paths removed at their pinned values.
 
 """Two compiled launches for the GDN chain backward.  The head (``--opt-level 2``, the option of
 the T pass, the summary and the recompute) runs the chain prologue, the T pass, the fused H and M
@@ -28,7 +29,7 @@ and the bprop) runs the G summary, the reverse state chain and the bprop.  The s
 moves ahead of the G summary (it depends only on the forward chain); the reverse chain is the one
 GDN kernel compiled at 2 while GDN's standalone level is 3 (same instruction count, one runtime
 division per CTA folded differently).  Only gdn_bprop_f16 is vendored (upstream's GDP d_v = 64 fork
-and its ``compact_qdo`` operands are not), so the hosts compile ``compact_qdo`` off.  Every
+and its ``compact_qdo`` operands are not), so the hosts have no ``compact_qdo`` path.  Every
 kernel, its host and the tensor placeholder each host was compiled with are the standalone modules'
 own; a buffer two hosts read through different placeholder types is passed twice, once per type (H,
 M and X: the summary's and recompute's mode-3 compact views against the state chain's ``(1, HO, V,
@@ -59,10 +60,7 @@ from . import (
 def chain_backward_head_host(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
-    compact_qdo: cutlass.Constexpr[bool],
-    summary_q_step: cutlass.Constexpr[int],
     fused_h_m: cutlass.Constexpr[bool],
     series: cutlass.Constexpr[bool],
     tinv_cfg: cutlass.Constexpr,
@@ -85,8 +83,6 @@ def chain_backward_head_host(
     do: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
@@ -132,11 +128,8 @@ def chain_backward_head_host(
         pieces,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
         heads_out,
-        compact_qdo,
-        summary_q_step,
         series_span_chunks,
         checkpoint_every_n,
         cu_seqlens,
@@ -180,8 +173,6 @@ def chain_backward_head_host(
         k,
         tinv_words,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces,
         tinv,
@@ -195,8 +186,6 @@ def chain_backward_head_host(
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             cu_pieces,
             tinv,
             None,
@@ -235,8 +224,6 @@ def chain_backward_head_host(
             k,
             k,
             gate,
-            a_log,
-            dt_bias,
             cu_pieces,
             None,
             state_m_main,
@@ -256,8 +243,6 @@ def chain_backward_head_host(
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             cu_pieces,
             state_x_series,
             None,
@@ -276,7 +261,6 @@ def chain_backward_head_host(
 @cute.jit
 def chain_backward_tail_host(
     bprop: cutlass.Constexpr,
-    compact_qdo: cutlass.Constexpr[bool],
     summary_cfg: cutlass.Constexpr,
     bprop_cfg: cutlass.Constexpr,
     dim_v: cutlass.Constexpr[int],
@@ -290,8 +274,6 @@ def chain_backward_tail_host(
     summary_q: cute.Tensor,
     k: cute.Tensor,
     gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     summary_do: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
@@ -309,8 +291,6 @@ def chain_backward_tail_host(
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
     dstate0: cute.Tensor | None,
-    inv_q: cute.Tensor | None,
-    inv_k: cute.Tensor | None,
     tinv: cute.Tensor,
     work_items_summary: cute.Tensor,
     summary_count: cute.Tensor,
@@ -327,8 +307,6 @@ def chain_backward_tail_host(
         summary_q,
         k,
         gate,
-        a_log,
-        dt_bias,
         summary_do,
         cu_pieces,
         state_g,
@@ -362,63 +340,30 @@ def chain_backward_tail_host(
         None,
         stream,
     )
-    if cutlass.const_expr(compact_qdo):
-        bprop.host(
-            bprop_cfg,
-            q,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            dgate,
-            dbeta,
-            do,
-            dq,
-            dk,
-            dv,
-            cu_pieces,
-            dstate0,
-            state_dx_end,
-            inv_q,
-            inv_k,
-            work_items,
-            main_count,
-            scheduler_bwd,
-            scale,
-            bprop_words,
-            stream,
-        )
-    else:
-        bprop.host(
-            bprop_cfg,
-            q,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            dgate,
-            dbeta,
-            do,
-            dq,
-            dk,
-            dv,
-            cu_pieces,
-            dstate0,
-            state_dx_end,
-            inv_q,
-            inv_k,
-            tinv,
-            work_items,
-            main_count,
-            scheduler_bwd,
-            scale,
-            bprop_words,
-            stream,
-        )
+    bprop.host(
+        bprop_cfg,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        dgate,
+        dbeta,
+        do,
+        dq,
+        dk,
+        dv,
+        cu_pieces,
+        dstate0,
+        state_dx_end,
+        tinv,
+        work_items,
+        main_count,
+        scheduler_bwd,
+        scale,
+        bprop_words,
+        stream,
+    )
 
 
 def _as_dtype(spec, dtype):
@@ -435,27 +380,18 @@ def _build_cfgs(cfg_args):
         num_sm,
         d_k,
         d_v,
-        expand_num,
         fused_h_m,
         series,
         coarse,
         log_gate,
-        safe_gate,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         use_dstate0,
-        fused_l2norm,
     ) = cfg_args
     io = get_dtype(io_dtype)
     tinv_cfg = gdn_tinv_f16.build_cfg(
         io,
         num_sm=num_sm,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         d_k=d_k,
-        expand_num=expand_num,
     )
     summary_cfg = None
     transition_cfg = None
@@ -466,10 +402,8 @@ def _build_cfgs(cfg_args):
             max_active_clusters=num_sm,
             use_initial_state=False,
             log_gate=log_gate,
-            safe_gate=safe_gate,
             d_k=d_k,
             d_v=d_v,
-            expand_num=expand_num,
         )
     else:
         transition_cfg = gdn_recompute_f16.build_cfg(
@@ -481,12 +415,10 @@ def _build_cfgs(cfg_args):
             enable_checkpoints=False,
             seed_checkpoints=False,
             log_gate=log_gate,
-            safe_gate=safe_gate,
             seed_identity=True,
             v_is_zero=True,
             d_k=d_k,
             d_v=d_k,
-            expand_num=expand_num,
         )
     series_cfg = None
     if series:
@@ -499,20 +431,16 @@ def _build_cfgs(cfg_args):
             enable_checkpoints=True,
             seed_checkpoints=coarse,
             log_gate=log_gate,
-            safe_gate=safe_gate,
             d_k=d_k,
             d_v=d_v,
-            expand_num=expand_num,
         )
     bwd_summary_cfg = gdn_bprop_summary_f16.build_cfg(
         io,
         max_active_clusters=num_sm,
         use_dstate_in=False,
         log_gate=log_gate,
-        safe_gate=safe_gate,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
     bprop_cfg = gdn_bprop_f16.build_cfg(
         io,
@@ -521,13 +449,8 @@ def _build_cfgs(cfg_args):
         use_dstate_in=True,
         use_dstate0=use_dstate0,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        fused_l2norm=fused_l2norm,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
         tinv_source="gmem",
     )
     return tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg
@@ -547,10 +470,7 @@ def _compile_chain_backward_head(
     (
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
-        compact_qdo,
-        summary_q_step,
         fused_h_m,
         series,
         dim_v,
@@ -562,10 +482,7 @@ def _compile_chain_backward_head(
         chain_backward_head_host,
         unit_chunks,
         b_t,
-        expand_num,
         length_rule,
-        compact_qdo,
-        summary_q_step,
         fused_h_m,
         series,
         tinv_cfg,
@@ -591,11 +508,10 @@ def _compile_chain_backward_tail(
 ):
     """Compile the chain-backward tail over the upstream dynamic-layout tensor ABI."""
     *_, bwd_summary_cfg, bprop_cfg = _build_cfgs(cfg_args)
-    compact_qdo, dim_v, dim_k, rows, has_dseed = constexprs
+    dim_v, dim_k, rows, has_dseed = constexprs
     return compile_tvm_ffi(
         chain_backward_tail_host,
         gdn_bprop_f16,
-        compact_qdo,
         bwd_summary_cfg,
         bprop_cfg,
         dim_v,
@@ -620,8 +536,6 @@ def _validate_launch(
     do,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     cu_pieces,
     main_rows,
@@ -664,15 +578,11 @@ def _validate_launch(
     seed,
     dseed,
     dstate0,
-    inv_q,
-    inv_k,
     pieces,
     heads_out,
     num_seqs,
     unit_chunks,
     b_t,
-    expand_num,
-    summary_q_step,
     fused_h_m,
     series,
     coarse,
@@ -683,8 +593,8 @@ def _validate_launch(
     tables."""
     if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 2 or gate.shape[1] != heads_out:
         raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
-    if min(pieces, unit_chunks, summary_q_step, num_sm) < 1:
-        raise ValueError("pieces, unit_chunks, summary_q_step and num_sm must be positive")
+    if min(pieces, unit_chunks, num_sm) < 1:
+        raise ValueError("pieces, unit_chunks and num_sm must be positive")
     num_pieces = num_seqs * pieces
     gdn_bprop_f16.validate_bwd_bundle(
         q,
@@ -703,14 +613,9 @@ def _validate_launch(
         tinv_row_count,
         bprop_words,
         num_pieces=num_pieces,
-        expand_num=expand_num,
         b_t=b_t,
         dgate=dgate,
         dbeta=dbeta,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        inv_q=inv_q,
-        inv_k=inv_k,
     )
     tables = {
         "cu_pieces": cu_pieces,
@@ -837,8 +742,6 @@ def build_chain_backward(
     do,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     cu_pieces,
     main_rows,
@@ -881,25 +784,18 @@ def build_chain_backward(
     seed,
     dseed,
     dstate0,
-    inv_q,
-    inv_k,
     pieces,
     heads_out,
     num_seqs,
     unit_chunks,
     b_t,
-    expand_num,
     length_rule,
-    summary_q_step,
     fused_h_m,
     series,
     coarse,
     series_span_tokens,
     seed_every_n_tokens,
     log_gate,
-    safe_gate,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     scale,
     chain_rows,
     num_sm,
@@ -911,9 +807,6 @@ def build_chain_backward(
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
         q=q,
@@ -922,8 +815,6 @@ def build_chain_backward(
         do=do,
         gate=gate,
         beta=beta,
-        a_log=a_log,
-        dt_bias=dt_bias,
         cu_seqlens=cu_seqlens,
         cu_pieces=cu_pieces,
         main_rows=main_rows,
@@ -966,15 +857,11 @@ def build_chain_backward(
         seed=seed,
         dseed=dseed,
         dstate0=dstate0,
-        inv_q=inv_q,
-        inv_k=inv_k,
         pieces=pieces,
         heads_out=heads_out,
         num_seqs=num_seqs,
         unit_chunks=unit_chunks,
         b_t=b_t,
-        expand_num=expand_num,
-        summary_q_step=summary_q_step,
         fused_h_m=fused_h_m,
         series=series,
         coarse=coarse,
@@ -998,26 +885,18 @@ def build_chain_backward(
         int(num_sm),
         DK,
         DV,
-        int(expand_num),
         bool(fused_h_m),
         bool(series),
         bool(coarse),
         bool(log_gate),
-        bool(safe_gate),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         dstate0 is not None,
-        inv_q is not None,
     )
     recompute_items = (series_items if coarse else work_items) if series else None
     recompute_count = (series_count if coarse else main_count) if series else None
     head_constexprs = (
         int(unit_chunks),
         int(b_t),
-        int(expand_num),
         bool(length_rule),
-        False,  # compact_qdo
-        int(summary_q_step),
         bool(fused_h_m),
         bool(series),
         DV,
@@ -1032,8 +911,6 @@ def build_chain_backward(
         signature_spec(do, assumed_align=16),
         signature_spec(gate, assumed_align=16),
         signature_spec(beta, assumed_align=16),
-        signature_spec(a_log, assumed_align=4),
-        signature_spec(dt_bias, assumed_align=4),
         signature_spec(cu_seqlens, assumed_align=cu_align),
         signature_spec(cu_pieces, assumed_align=4),
         signature_spec(main_rows, assumed_align=16),
@@ -1080,8 +957,6 @@ def build_chain_backward(
         signature_spec(summary_q, assumed_align=16),
         signature_spec(k, assumed_align=16),
         signature_spec(gate, assumed_align=16),
-        signature_spec(a_log, assumed_align=4),
-        signature_spec(dt_bias, assumed_align=4),
         signature_spec(summary_do, assumed_align=16),
         signature_spec(cu_pieces, assumed_align=4),
         signature_spec(main_rows, assumed_align=16),
@@ -1099,8 +974,6 @@ def build_chain_backward(
         signature_spec(dgate, assumed_align=16),
         signature_spec(dbeta, assumed_align=16),
         signature_spec(dstate0, assumed_align=16),
-        signature_spec(inv_q, assumed_align=4),
-        signature_spec(inv_k, assumed_align=4),
         signature_spec(tinv, assumed_align=128),
         signature_spec(work_items_summary, assumed_align=16, compact=True),
         signature_spec(summary_count, assumed_align=4),
@@ -1118,8 +991,6 @@ def build_chain_backward(
         do,
         gate,
         beta,
-        a_log,
-        dt_bias,
         cu_seqlens,
         checkpoints,
         seed_checkpoints,
@@ -1139,12 +1010,10 @@ def build_chain_backward(
         seed,
         dseed,
         dstate0,
-        inv_q,
-        inv_k,
     )
     head = _compile_chain_backward_head(head_constexprs, cfg_args, head_specs, use_int64_offsets)
     tail = _compile_chain_backward_tail(
-        (False, DV, DK, int(chain_rows), has_dseed),  # compact_qdo off
+        (DV, DK, int(chain_rows), has_dseed),
         cfg_args,
         tail_specs,
         use_int64_offsets,
@@ -1161,8 +1030,6 @@ def run_chain_backward(
     do,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     cu_pieces,
     main_rows,
@@ -1205,8 +1072,6 @@ def run_chain_backward(
     seed,
     dseed,
     dstate0,
-    inv_q,
-    inv_k,
     pieces,
     heads_out,
     num_seqs,
@@ -1234,8 +1099,6 @@ def run_chain_backward(
         do,
         gate,
         beta,
-        a_log,
-        dt_bias,
         cu_seqlens,
         cu_pieces,
         main_rows,
@@ -1284,8 +1147,6 @@ def run_chain_backward(
         summary_q,
         k,
         gate,
-        a_log,
-        dt_bias,
         summary_do,
         cu_pieces,
         main_rows,
@@ -1303,8 +1164,6 @@ def run_chain_backward(
         dgate,
         dbeta,
         dstate0,
-        inv_q,
-        inv_k,
         tinv,
         work_items_summary,
         summary_count,

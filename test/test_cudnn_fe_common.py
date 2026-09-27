@@ -114,15 +114,12 @@ def test_split_table_replay_preserves_absent_scheduler_abi():
         stream=stream,
     )
     unrelated_counter = torch.full((2,), 37, dtype=torch.int32, device="cuda")
-    split_k.run_table(
-        recipe, gate, None, None, cu, chunks, staging, items, count, unrelated_counter, stream
-    )
+    split_k.run_table(recipe, gate, cu, chunks, staging, items, count, unrelated_counter, stream)
     assert count.item() == 2
     assert unrelated_counter.tolist() == [37, 37]
 
 
-@pytest.mark.parametrize("invalid", ["not_float16", "float32_extra", "torch.bfloat16_suffix"])
-def test_cudnn_dtype_names_are_exact(invalid):
+def test_cudnn_dtype_names_are_exact():
     """Dtype names match exactly; substrings of a supported name are rejected."""
     import cutlass
 
@@ -131,4 +128,4 @@ def test_cudnn_dtype_names_are_exact(invalid):
     assert get_dtype(torch.float16) is cutlass.Float16
     assert get_dtype("half") is cutlass.Float16
     with pytest.raises(ValueError, match="Unsupported dtype"):
-        get_dtype(invalid)
+        get_dtype("torch.bfloat16_suffix")

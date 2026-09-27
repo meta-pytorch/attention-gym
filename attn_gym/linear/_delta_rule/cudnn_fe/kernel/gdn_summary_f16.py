@@ -16,7 +16,8 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; upstream GDP (expand_num) and safe_gate/A_log/dt_bias
+# constexpr paths pruned.
 
 """
 Chunked Gated Delta Net (GDN) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass
@@ -110,7 +111,6 @@ from ..tile_dsl.pointwise import (
     fp32_to_fp16,
     opaque_f32_zero,
     opaque_i32_zero,
-    softplus2,
     sub_f16x2,
 )
 from ..tile_dsl.swizzle import swizzle_xor_128b
@@ -353,8 +353,6 @@ def gate_warp(
     mWorkItems,
     tidx,
     mGate,
-    mA_log,
-    mDt_bias,
     sCumsumlog,
     sCumprod,
     sScheduler,
@@ -371,11 +369,6 @@ def gate_warp(
 
     lane_idx = tidx % cfg.threads_per_warp
 
-    if cutlass.const_expr(cfg.safe_gate and mA_log is None):
-        a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
-    else:
-        a = cutlass.Float32(0.0)
-    bias = cutlass.Float32(0.0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
         (
@@ -392,14 +385,6 @@ def gate_warp(
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o, _v_offset = decode_head(cfg, head_idx)
         n_local = write_end - compute_start
-        if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
-            if n_local > 0:
-                a = -cute.math.exp2(
-                    mA_log[head_o].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True
-                ) * cutlass.Float32(RCP_LN2)
-        if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
-            if n_local > 0:
-                bias = mDt_bias[head_o].to(cutlass.Float32)
         if n_local > 0:
             for local_idx in cutlass.range(n_local):
                 # ---- Gate load: GMEM -> SMEM (OOB neutral: 1.0 -> log2 = 0.0) --------
@@ -421,40 +406,14 @@ def gate_warp(
                     chunk_offset + lane_idx + col * cfg.threads_per_warp for col in range(n_cols)
                 ]
                 pos_valid = [tok < batch_end for tok in toks]
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    gate_rows = [tok // cutlass.Int32(cfg.expand_num) for tok in toks]
-                    gate_valid = [
-                        valid and (tok - row * cutlass.Int32(cfg.expand_num) == 0)
-                        for tok, row, valid in zip(toks, gate_rows, pos_valid)
-                    ]
-                    gate_row_end = batch_end // cutlass.Int32(cfg.expand_num)
-                    gate_vals = [
-                        gGateSeq[cutlass.min(row, gate_row_end - 1)].to(cutlass.Float32)
-                        if valid
-                        else oob_neutral
-                        for row, valid in zip(gate_rows, gate_valid)
-                    ]
-                else:
-                    gate_valid = pos_valid
-                    gate_vals = [
-                        gGateSeq[cutlass.min(tok, batch_end - 1)].to(cutlass.Float32)
-                        if valid
-                        else oob_neutral
-                        for tok, valid in zip(toks, pos_valid)
-                    ]
+                gate_vals = [
+                    gGateSeq[cutlass.min(tok, batch_end - 1)].to(cutlass.Float32)
+                    if valid
+                    else oob_neutral
+                    for tok, valid in zip(toks, pos_valid)
+                ]
 
-                if cutlass.const_expr(cfg.safe_gate):
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        biased_lo, biased_hi = fadd2(
-                            gate_vals[col], gate_vals[col + 1], bias, bias
-                        )
-                        sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                        contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                        gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
-                        gate_vals[col + 1] = (
-                            contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
-                        )
-                elif cutlass.const_expr(cfg.log_gate):
+                if cutlass.const_expr(cfg.log_gate):
                     rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
                     for col in cutlass.range_constexpr(0, n_cols, 2):
                         gate_vals[col], gate_vals[col + 1] = fmul2(
@@ -1323,7 +1282,6 @@ def build_descs_body(
     tinv: cute.Tensor | None,
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (K, V), the tinv array on the K
     warp."""
@@ -1339,16 +1297,16 @@ def build_descs_body(
     )
 
     if widx == 0:
-        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, lanes=32)
         if cutlass.const_expr(tinv is not None):
             emit_tile_seq_descs(
-                base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32
+                base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, lanes=32
             )
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 1:
-        emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
@@ -1359,7 +1317,6 @@ def frost_gdn_summary_prologue(
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     tiles_per_head: cutlass.Constexpr[int],
     base_k: cutlass.GridConstant[tma.TensorMap],
     base_v: cutlass.GridConstant[tma.TensorMap],
@@ -1414,7 +1371,6 @@ def frost_gdn_summary_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                expand_num=expand_num,
             )
     else:
         build_descs_body(
@@ -1429,7 +1385,6 @@ def frost_gdn_summary_prologue(
             tinv,
             n_batch,
             b_t,
-            expand_num,
         )
 
 
@@ -1439,7 +1394,6 @@ def prologue(
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
-    expand_num: cutlass.Constexpr[int],
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
@@ -1498,7 +1452,6 @@ def prologue(
         run_order,
         order_gen,
         b_t,
-        expand_num,
         tiles_per_head,
         base_desc_k,
         base_desc_v,
@@ -1523,8 +1476,6 @@ def host(
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     tinv: cute.Tensor,
     state_in: cute.Tensor | None,
@@ -1625,8 +1576,6 @@ def host(
         k_ratio,
         v_ratio,
         gate,
-        a_log,
-        dt_bias,
         cu_seqlens,
         tinv,
         state_in,
@@ -1657,8 +1606,6 @@ def frost_gdn_summary(
     k_ratio: cute.FastDivmodDivisorV2,
     v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     mTinv: cute.Tensor,
     mState_init: cute.Tensor | None,
@@ -1855,8 +1802,6 @@ def frost_gdn_summary(
             mWorkItems,
             tidx=tidx,
             mGate=mGate,
-            mA_log=mA_log,
-            mDt_bias=mDt_bias,
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
             sScheduler=sScheduler,
@@ -1918,13 +1863,11 @@ class GdnSummaryCfg:
     d_k: int
     d_v: int
     log_gate: bool = False
-    safe_gate: bool = False
     tiles_per_head: int = 1
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
-    expand_num: int = 1
     chain_m_warp_ids: tuple[int, ...] = CFG.CHAIN_M_WARP_IDS
     chain_h_warp_ids: tuple[int, ...] = CFG.CHAIN_H_WARP_IDS
     load_gate_warp_id: int = CFG.LOAD_GATE_WARP_ID
@@ -1972,10 +1915,8 @@ def build_cfg(
     max_active_clusters: int,
     use_initial_state: bool,
     log_gate: bool = False,
-    safe_gate: bool = False,
     d_k: int,
     d_v: int,
-    expand_num: int = 1,
     tiles_per_head: int = 1,
 ) -> GdnSummaryCfg:
     """Build the per-compile ``GdnSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always
@@ -1990,10 +1931,8 @@ def build_cfg(
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
         log_gate=log_gate,
-        safe_gate=safe_gate,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
         tiles_per_head=tiles_per_head,
     )
     n_chain = len(cfg.chain_h_warp_ids) + len(cfg.chain_m_warp_ids)

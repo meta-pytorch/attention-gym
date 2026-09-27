@@ -19,7 +19,8 @@
 # attn_gym.linear._delta_rule.cudnn_fe. Register arrays are rmem tensors, SMEM data buffers share
 # one SharedStorage struct, and segment-major swizzle offsets use swizzle_box_offset_{128b,32b}.
 # The frozen cfg launches through KdaSummaryOp, compiled from persisted fake TVM-FFI signatures.
-# The delta residual stays FP32 until the MMA pack.
+# The delta residual stays FP32 until the MMA pack. The always-pinned safe_gate, a_log, dt_bias,
+# beta_sigmoid, allow_neg_eigval, and l2norm knobs are removed.
 
 """
 Chunked Kimi Delta Attention (KDA) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass
@@ -32,11 +33,10 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C), for each chain X in {H, M}
   State  : S_X[DK,DV]  (recurrent state, held in TMEM, fp32 carry; H seeded from zero / initial_state, M from I)
 
   Preprocessing (compute group 0, two ping-pong groups of four warps):
-    g[t,d]           = sum_{l=0}^{t} log2(Gate_ld)             per-channel cumulative log2 of gates (safe-gate / log)
+    g[t,d]           = sum_{l=0}^{t} log2(Gate_ld)             per-channel cumulative log2 of gates (log)
     K decay[t,d]     = K[t,d] * exp2(+g[t,d])                    (KK A operand, K*state B operand)
     K inv[t,d]       = K[t,d] * exp2(-g[t,d])                    (KK / A tile B operand)
     K restore[t,d]   = K[t,d] * exp2(g[BT-1,d] - g[t,d])         (state update B operand)
-    (optional in-kernel Q/K L2-norm folds 1/|q|, 1/|k| into the operands)
 
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = Beta * tril(W_kk, -1)   (shared by both chains)
   T_inv (register MMA) : T_inv = (I + L)^-1 blockwise, 4x4 diagonal blocks then the 4 -> 8 and 8 ->
@@ -121,13 +121,11 @@ from ..tile_dsl.mma import desc_opaque, mma_step, mma_ts_step
 from ..tile_dsl.pointwise import (
     beta_residual_f16x2,
     fadd2,
-    ffma2,
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
     opaque_i32,
     opaque_i32_zero,
-    sigmoid,
 )
 from ..tile_dsl.swizzle import swizzle_box_offset_32b, swizzle_box_offset_128b, swizzle_xor_128b
 from ..tile_dsl.tma import tma_load_tile, tma_tensormap_acquire
@@ -138,7 +136,6 @@ STATE_DIMS = (64, 128)
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
 
 
 class KdaSummaryBars(NamedTuple):
@@ -1039,8 +1036,6 @@ def tmaldg_warp(
 def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
     """Map raw gate to the log2-domain decay increment used by KDA."""
 
-    if cutlass.const_expr(cfg.safe_gate):
-        return cfg.gate_scale_log2 * sigmoid(raw_gate)
     if cutlass.const_expr(cfg.log_gate):
         return raw_gate * cutlass.Float32(LOG2_E)
     return cute.math.log2(raw_gate + cutlass.Float32(1e-10), fastmath=True)
@@ -1057,8 +1052,6 @@ def compute0_warp_group(
     sScheduler,
     lane_idx,
     warp_idx,
-    mA_log,
-    mDt_bias,
     sK_inv_raw,
     sGate_exchange_raw,
     sGate_load_ptr,
@@ -1101,8 +1094,6 @@ def compute0_warp_group(
     channel_dim = cg0_local_warp * cfg.threads_per_warp + lane_idx
     if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
         channel_dim = cg0_local_warp * channel_rows + lane_idx % channel_rows
-    cg0_a_log_exp = cutlass.Float32(1.0)
-    cg0_dt_bias_value = cutlass.Float32(0.0)
     prefix_segment = channel_dim // 32
     prefix_seg_base = prefix_segment * (cfg.b_t * 32)
     prefix_col = channel_dim - prefix_segment * 32
@@ -1142,14 +1133,6 @@ def compute0_warp_group(
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o = head_idx
         num_chunks_tile = write_end - compute_start
-        if cutlass.const_expr(mA_log is not None):
-            if num_chunks_tile > 0:
-                cg0_a_log_exp = cute.math.exp2(
-                    mA_log[head_o].to(cutlass.Float32) * LOG2_E, fastmath=True
-                )
-        if cutlass.const_expr(mDt_bias is not None):
-            if num_chunks_tile > 0:
-                cg0_dt_bias_value = mDt_bias[head_o, channel_dim].to(cutlass.Float32)
         nvvm.barrier_cta_sync(
             cfg.cg0_tile_entry_barrier_id,
             thread_count=cfg.cg0_group_count * cfg.cg0_threads_per_group,
@@ -1185,12 +1168,6 @@ def compute0_warp_group(
                     beta_value = cutlass.Float32(0.0)
                     if token_idx < batch_seqlen:
                         beta_value = mBeta[batch_start + token_idx, head_o].to(cutlass.Float32)
-                        if cutlass.const_expr(cfg.beta_sigmoid):
-                            beta_value = (
-                                (sigmoid(beta_value) * (2.0 if cfg.allow_neg_eigval else 1.0))
-                                .to(mBeta.element_type)
-                                .to(cutlass.Float32)
-                            )
                     sBeta_raw[raw_stage * cfg.b_t + lane_idx] = beta_value
                 if nvvm.elect_sync():
                     bars.mb_beta_ready[raw_stage].arrive()
@@ -1214,14 +1191,8 @@ def compute0_warp_group(
                         .to(cutlass.Float32)
                     )
             g_prefix_regs = cute.make_rmem_tensor((cfg.b_t,), cutlass.Float32)
-            if cutlass.const_expr(cfg.safe_gate):
-                for row in cutlass.range_constexpr(cfg.b_t):
-                    g_prefix_regs[row] = gate_scale(
-                        cfg, cg0_a_log_exp * (gate_raw[row] + cg0_dt_bias_value)
-                    )
-            else:
-                for row in cutlass.range_constexpr(cfg.b_t):
-                    g_prefix_regs[row] = gate_scale(cfg, gate_raw[row])
+            for row in cutlass.range_constexpr(cfg.b_t):
+                g_prefix_regs[row] = gate_scale(cfg, gate_raw[row])
 
             # ---- ragged tail chunk: padded rows carry no decay -----------------------
             if chunk_start + cutlass.Int32(cfg.b_t) > batch_seqlen:
@@ -1274,10 +1245,7 @@ def compute0_warp_group(
             k_restore_pack = cute.make_rmem_tensor((dk_halves * 4,), cutlass.Int32)
             raw_k_regs = cute.make_rmem_tensor((dk_halves * 8,), cutlass.Float32)
 
-            # ---- optional K L2-norm + K inv stage ------------------------------------
-            if cutlass.const_expr(cfg.l2norm):
-                kk_lo = opaque_f32_zero()
-                kk_hi = opaque_f32_zero()
+            # ---- K inv stage ---------------------------------------------------------
             for dim_half in cutlass.range_constexpr(dk_halves):
                 dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
@@ -1287,26 +1255,8 @@ def compute0_warp_group(
                 for dim_offset in cutlass.range_constexpr(8):
                     k_val = raw_k_vec_f32[dim_offset]
                     raw_k_regs[reg_base + dim_offset] = k_val
-                if cutlass.const_expr(cfg.l2norm):
-                    for dim_pair in cutlass.range_constexpr(4):
-                        k_even = raw_k_vec_f32[2 * dim_pair]
-                        k_odd = raw_k_vec_f32[2 * dim_pair + 1]
-                        kk_lo, kk_hi = ffma2(k_even, k_odd, k_even, k_odd, kk_lo, kk_hi)
 
             k_inv_norm = opaque_one
-            if cutlass.const_expr(cfg.l2norm):
-                k_sum_sq = kk_lo + kk_hi
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY)
-                )
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY)
-                )
-                k_sum_sq = k_sum_sq + cutlass.Float32(
-                    nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY)
-                )
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cute.make_rmem_tensor((dk_halves * 8,), cutlass.Float32)
@@ -2681,11 +2631,7 @@ class KdaSummaryOp:
             str(int(flag))
             for flag in (
                 cfg.use_initial_state,
-                cfg.l2norm,
-                cfg.safe_gate,
                 cfg.log_gate,
-                cfg.beta_sigmoid,
-                cfg.allow_neg_eigval,
             )
         )
         dtypes = "_".join(t.__name__.lower() for t in (cfg.io_dtype, cfg.gate_dtype))
@@ -2701,8 +2647,6 @@ class KdaSummaryOp:
         k: cute.Tensor,
         v: cute.Tensor,
         raw_gate: cute.Tensor,
-        a_log: cute.Tensor | None,
-        dt_bias: cute.Tensor | None,
         beta: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state: cute.Tensor | None,
@@ -2761,8 +2705,6 @@ class KdaSummaryOp:
             k,
             v,
             raw_gate,
-            a_log,
-            dt_bias,
             beta,
             cu_seqlens,
             initial_state,
@@ -2791,8 +2733,6 @@ def frost_kda_summary(
     mK: cute.Tensor,
     mV: cute.Tensor,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
@@ -3009,8 +2949,6 @@ def frost_kda_summary(
             sScheduler,
             lane_idx,
             warp_idx,
-            mA_log,
-            mDt_bias,
             sK_inv_raw,
             sGate_exchange_raw,
             sGate_load_ptr,
@@ -3056,12 +2994,8 @@ class KdaSummaryCfg:
     io_dtype: type[cutlass.Numeric]
     gate_dtype: type[cutlass.Numeric]
     use_initial_state: bool
-    l2norm: bool
-    safe_gate: bool
     gate_scale_log2: float
     log_gate: bool
-    beta_sigmoid: bool
-    allow_neg_eigval: bool
     max_active_clusters: int
     d_k: int
     d_v: int
@@ -3132,12 +3066,8 @@ def build_cfg(
     gate_dtype: type[cutlass.Numeric],
     *,
     use_initial_state: bool,
-    l2norm: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
     log_gate: bool = True,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     max_active_clusters: int,
     d_k: int,
     d_v: int,
@@ -3151,12 +3081,8 @@ def build_cfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_initial_state=use_initial_state,
-        l2norm=l2norm,
-        safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         log_gate=log_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
@@ -3275,36 +3201,25 @@ def _compile_kda_summary(
     io_dtype,
     gate_dtype,
     beta_dtype,
-    a_log_dtype,
-    dt_bias_spec,
     cu_seqlens_dtype,
     state_in_dtype,
     d_k: int,
     d_v: int,
-    l2norm: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
     log_gate: bool,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     num_sm: int,
     use_int64_offsets: bool,
 ):
-    """Compile the fused summary for one static config.  ``a_log_dtype`` / ``state_in_dtype`` are
-    None when the tensor is absent; ``dt_bias_spec`` is ``(dtype, rank)`` or None.  Launch with
-    live tensors in ``KdaSummaryOp.__call__`` order (k, v, gate, a_log, dt_bias, beta, cu_seqlens,
-    initial_state, final_state, transition, work_items, work_count, scheduler_counter,
-    tensormap_workspace) on the current Torch stream."""
+    """Compile the fused summary for one static config.  ``state_in_dtype`` is None when the
+    tensor is absent.  Launch with live tensors in ``KdaSummaryOp.__call__`` order (k, v, gate,
+    beta, cu_seqlens, initial_state, final_state, transition, work_items, work_count,
+    scheduler_counter, tensormap_workspace) on the current Torch stream."""
     cfg = build_cfg(
         io_dtype,
         gate_dtype,
         use_initial_state=state_in_dtype is not None,
-        l2norm=l2norm,
-        safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         log_gate=log_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
         max_active_clusters=num_sm,
         d_k=d_k,
         d_v=d_v,
@@ -3316,8 +3231,6 @@ def _compile_kda_summary(
         _dynamic(io_dtype, 3, 16, i64),  # k
         _dynamic(io_dtype, 3, 16, i64),  # v
         _dynamic(gate_dtype, 3, 16, i64),  # gate
-        _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None,
-        _dynamic(dt_bias_spec[0], dt_bias_spec[1], 16, i64) if dt_bias_spec is not None else None,
         _dynamic(beta_dtype, 2, 4, i64),  # beta
         _dynamic(cu_seqlens_dtype, 1, cu_align, i64),  # cu_seqlens
         _dynamic(state_in_dtype, 4, 16, i64) if state_in_dtype is not None else None,

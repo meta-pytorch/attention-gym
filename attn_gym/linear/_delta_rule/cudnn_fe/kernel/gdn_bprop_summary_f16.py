@@ -17,9 +17,10 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. Register arrays use cute.make_rmem_tensor, operand SMEM
-# buffers share one SharedStorage struct, and raw SMEM pointers go through smem_data_ptr.
-# Modified by Attention Gym in 2026: frozen cfg (build_cfg derives the SMEM cosizes and TMA byte
-# counts) and jit_cache fake-tensor TVM-FFI compiles for the standalone launcher.
+# buffers share one SharedStorage struct, and raw SMEM pointers go through smem_data_ptr. A frozen
+# cfg (build_cfg derives the SMEM cosizes and TMA byte counts) is compiled through the warmup/chain
+# bundle hosts, and the upstream-only GDP expand_num, safe_gate, A_log, and dt_bias knobs are
+# removed at their pinned values.
 
 """
 Chunked Gated Delta Net (GDN) bprop state-summary kernel for SM100 / SM103 / SM107 (Cutlass
@@ -44,12 +45,7 @@ Algorithm overview (per chunk c, iterated c = compute_end-1 .. write_start):
   Epilogue (CG2): dstate carried to the next chunk as an f16 pack with the total-decay rescale; the
   item owning chunk 0 stores d_initial_state.
 
-GDP (expand_num > 1): q and dO stay on the compact token timeline, one 64-token tile of each per
-block of expand_num chunks held in SMEM; CG0 masks the dO' stage and the A tile to the tokens whose
-readout sub-token lies in the chunk (slot = expand_num * (token - first token of the chunk) +
-phase, every other row zero) from the token tables the gate warp publishes per chunk (readout slot
-or -1, cumsum / cumprod at the slot or 0); q_step > 1 reads the phase rows of an expanded q buffer
-through a strided descriptor.
+q_step > 1 reads the phase rows of an expanded q buffer through a strided descriptor.
 
 SMEM layout (stage counts live in gdn_bprop_summary_config.py; sizes at DK = DV = 128):
   Buffer                       Size (B)  Stages
@@ -59,7 +55,6 @@ SMEM layout (stage counts live in gdn_bprop_summary_config.py; sizes at DK = DV 
   T_inv                            8192       1
   A tile                           8192       1
   cumsumlog / cumprod               256       2
-  token slot / cumsum / cumprod   3 x 256     2    <-- expand_num > 1 only
   scheduler ticket ring               4       2    <-- next-tile publish ring
 
 TMEM layout (512 columns):
@@ -122,7 +117,6 @@ from ..tile_dsl.pointwise import (
     fmul2,
     fp32_to_fp16,
     opaque_f32_zero,
-    softplus2,
 )
 from ..tile_dsl.swizzle import swizzle_xor_128b
 from ..tile_dsl.tma import (
@@ -203,7 +197,7 @@ def make_bars(cfg) -> GdnBpropSummaryBars:
             alloc(cfg.smem_q_stages),
             try_wait=True,
             stages=cfg.smem_q_stages,
-            init_count=MMA_ARRIVERS * cfg.expand_num,
+            init_count=MMA_ARRIVERS,
             producer=Producer.MMA_COMMIT,
         ),
         mb_k_ready=MBarrier(
@@ -231,14 +225,14 @@ def make_bars(cfg) -> GdnBpropSummaryBars:
             alloc(cfg.smem_do_stages),
             try_wait=True,
             stages=cfg.smem_do_stages,
-            init_count=MMA_ARRIVERS * cfg.expand_num,
+            init_count=MMA_ARRIVERS,
             producer=Producer.MMA_COMMIT,
         ),
         mb_do_cg0_done=MBarrier(
             alloc(cfg.smem_do_stages),
             try_wait=True,
             stages=cfg.smem_do_stages,
-            init_count=CG0_THREADS * cfg.expand_num,
+            init_count=CG0_THREADS,
             producer=Producer.THREAD,
         ),
         mb_gate_ready=MBarrier(
@@ -439,19 +433,13 @@ def gate_warp(
     mWorkItems,
     tidx,
     mGate,
-    mA_log,
-    mDt_bias,
     sCumsumlog,
     sCumprod,
-    sTokSlot,
-    sTokCumsum,
-    sTokCumprod,
     sScheduler,
     bars,
 ):
-    """Gate load warp role (warp 14): per-chunk Gate G->S loads and, under expand_num > 1, the
-    chunk's block-token tables (readout slot, cumsum and cumprod at the slot); the stage recycle
-    waits on the consumers' done barrier."""
+    """Gate load warp role (warp 14): per-chunk Gate G->S loads; the stage recycle waits on the
+    consumers' done barrier."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     elect_one = nvvm.elect_sync()
 
@@ -462,11 +450,6 @@ def gate_warp(
     lane_idx = tidx % cfg.threads_per_warp
 
     n_cols = cfg.b_t // cfg.threads_per_warp
-    if cutlass.const_expr(cfg.safe_gate and mA_log is None):
-        a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
-    else:
-        a = cutlass.Float32(0.0)
-    bias = cutlass.Float32(0.0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
         (
@@ -482,14 +465,6 @@ def gate_warp(
             compute_end,
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = compute_end - write_start
-        if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
-            if num_item_chunks > 0:
-                a = -cute.math.exp2(
-                    mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True
-                ) * cutlass.Float32(RCP_LN2)
-        if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
-            if num_item_chunks > 0:
-                bias = mDt_bias[head_idx].to(cutlass.Float32)
 
         for rev_idx in cutlass.range(num_item_chunks + 1):
             # ---- prefetch the NEXT chunk's Gate --------------------------------------
@@ -510,47 +485,16 @@ def gate_warp(
                     if cutlass.const_expr(cfg.log_gate)
                     else cutlass.Float32(1.0)
                 )
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    gate_toks = [
-                        chunk_offset + lane_idx + col * cfg.threads_per_warp
-                        for col in range(n_cols)
-                    ]
-                    gate_rows = [tok // cutlass.Int32(cfg.expand_num) for tok in gate_toks]
-                    gate_valid = [
-                        valid and (tok - row * cutlass.Int32(cfg.expand_num) == 0)
-                        for tok, row, valid in zip(gate_toks, gate_rows, pos_valid)
-                    ]
-                    gate_vals = [
-                        gGateSeq[row if valid else cutlass.Int32(0)].to(cutlass.Float32)
-                        if valid
-                        else oob_neutral
-                        for row, valid in zip(gate_rows, gate_valid)
-                    ]
-                else:
-                    gate_valid = pos_valid
-                    gate_vals = [
-                        gGate[
-                            min(
-                                lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1
-                            )
-                        ].to(cutlass.Float32)
-                        if pos_valid[col]
-                        else oob_neutral
-                        for col in range(n_cols)
-                    ]
+                gate_vals = [
+                    gGate[
+                        min(lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1)
+                    ].to(cutlass.Float32)
+                    if pos_valid[col]
+                    else oob_neutral
+                    for col in range(n_cols)
+                ]
 
-                if cutlass.const_expr(cfg.safe_gate):
-                    for col in cutlass.range_constexpr(0, n_cols, 2):
-                        biased_lo, biased_hi = fadd2(
-                            gate_vals[col], gate_vals[col + 1], bias, bias
-                        )
-                        sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                        contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                        gate_vals[col] = contrib_lo if gate_valid[col] else cutlass.Float32(0.0)
-                        gate_vals[col + 1] = (
-                            contrib_hi if gate_valid[col + 1] else cutlass.Float32(0.0)
-                        )
-                elif cutlass.const_expr(cfg.log_gate):
+                if cutlass.const_expr(cfg.log_gate):
                     rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
                     for col in cutlass.range_constexpr(0, n_cols, 2):
                         gate_vals[col], gate_vals[col + 1] = fmul2(
@@ -585,35 +529,6 @@ def gate_warp(
                     pos = lane_idx + col * cfg.threads_per_warp
                     sCumsumlog[pos, 0, gate_idx] = gate_vals[col]
                     sCumprod[pos, 0, gate_idx] = cute.math.exp2(gate_vals[col], fastmath=True)
-
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    # token tables: the block's token t reads out at slot R * (t - lo) + phi of
-                    # this chunk when lo <= t < lo + n, else nowhere (slot -1, cumsum and cumprod
-                    # 0)
-                    ld_chunk = compute_end - 1 - rev_idx
-                    gdp_sub = ld_chunk % cutlass.Int32(cfg.expand_num)
-                    gdp_lo = (cutlass.Int32(cfg.b_t) * gdp_sub) // cutlass.Int32(cfg.expand_num)
-                    gdp_n = (cutlass.Int32(cfg.b_t) * (gdp_sub + 1)) // cutlass.Int32(
-                        cfg.expand_num
-                    ) - gdp_lo
-                    gdp_phi = (
-                        cutlass.Int32(cfg.expand_num) * gdp_lo
-                        + cutlass.Int32(cfg.expand_num - 1)
-                        - cutlass.Int32(cfg.b_t) * gdp_sub
-                    )
-                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-                    for col in cutlass.range_constexpr(n_cols):
-                        tok = lane_idx + col * cfg.threads_per_warp
-                        member = tok >= gdp_lo and tok < gdp_lo + gdp_n
-                        slot = cutlass.Int32(cfg.expand_num) * (tok - gdp_lo) + gdp_phi
-                        slot = slot if member else cutlass.Int32(0)
-                        sTokSlot[tok, 0, gate_idx] = slot if member else cutlass.Int32(-1)
-                        sTokCumsum[tok, 0, gate_idx] = (
-                            sCumsumlog[slot, 0, gate_idx] if member else cutlass.Float32(0.0)
-                        )
-                        sTokCumprod[tok, 0, gate_idx] = (
-                            sCumprod[slot, 0, gate_idx] if member else cutlass.Float32(0.0)
-                        )
 
                 bars.mb_gate_ready[gate_idx].arrive()
 
@@ -842,46 +757,11 @@ def tcgen05_mma_warp(
         k_cur = k_index.idx
         q_cur = q_index.idx
         do_cur = do_index.idx
-        block_last = True
-        if cutlass.const_expr(cfg.expand_num > 1):
-            # the q / dO slots are per block; sub is the chunk's position in its block (R-1 at the
-            # head, 0 at the last chunk), their done barriers take R commits per phase, one per
-            # chunk, and the item's partial first and last blocks are padded with idle commits so
-            # every block use completes exactly one phase
-            sub = (compute_end - 1) % cutlass.Int32(cfg.expand_num)
-            first_block_start = (
-                (compute_end - 1) // cutlass.Int32(cfg.expand_num)
-            ) * cutlass.Int32(cfg.expand_num)
-            last_block_end = (write_start // cutlass.Int32(cfg.expand_num) + 1) * cutlass.Int32(
-                cfg.expand_num
-            )
-            first_block_start = (
-                first_block_start if first_block_start > write_start else write_start
-            )
-            last_block_end = last_block_end if last_block_end < compute_end else compute_end
-            single_block = first_block_start <= write_start
-            pad_pre = (
-                (cutlass.Int32(cfg.expand_num) - num_item_chunks)
-                if single_block
-                else (cutlass.Int32(cfg.expand_num) - (compute_end - first_block_start))
-            )
-            pad_post = (
-                cutlass.Int32(0)
-                if single_block
-                else (cutlass.Int32(cfg.expand_num) - (last_block_end - write_start))
-            )
-            block_last = sub == 0
-            if num_item_chunks > 0:
-                for _ in cutlass.range(pad_pre):
-                    if elect_one:
-                        bars.mb_q_mma_done[q_cur].arrive(cta_group=1)
-                        bars.mb_do_mma_done[do_cur].arrive(cta_group=1)
         if num_item_chunks > 0:
             bars.mb_k_ready[k_cur].wait(k_index.phase)
             k_index = advance(k_index, cfg.smem_k_stages)
             bars.mb_q_ready[q_cur].wait(q_index.phase)
-            if cutlass.const_expr(cfg.expand_num == 1):
-                q_index = advance(q_index, cfg.smem_q_stages)
+            q_index = advance(q_index, cfg.smem_q_stages)
             mma_ss(
                 bmm_q_k_desc,
                 d_q0.advance_start_address(q_cur * Q_STAGE_BYTES),
@@ -953,12 +833,9 @@ def tcgen05_mma_warp(
                 bars.mb_q_mma_done[q_cur].arrive(cta_group=1)
 
             # ---- dU intra += dO^T(S) @ A (the block's dO tile) -----------------------
-            if cutlass.const_expr(cfg.expand_num > 1):
-                bars.mb_do_ready[do_cur].wait(do_index.phase)
-            else:
-                do_cur = do_index.idx
-                bars.mb_do_ready[do_cur].wait(do_index.phase)
-                do_index = advance(do_index, cfg.smem_do_stages)
+            do_cur = do_index.idx
+            bars.mb_do_ready[do_cur].wait(do_index.phase)
+            do_index = advance(do_index, cfg.smem_do_stages)
             du_a_idx = a_index.idx
             bars.mb_a_ready[du_a_idx].wait(a_index.phase)
             a_index = advance(a_index, cfg.smem_a_stages)
@@ -987,14 +864,9 @@ def tcgen05_mma_warp(
                 k_next = k_index.idx
                 bars.mb_k_ready[k_next].wait(k_index.phase)
                 k_index = advance(k_index, cfg.smem_k_stages)
-                if cutlass.const_expr(cfg.expand_num > 1):
-                    q_next = (q_cur ^ cutlass.Int32(1)) if block_last else q_cur
-                    q_next_phase = (q_index.phase ^ q_cur) if block_last else q_index.phase
-                    bars.mb_q_ready[q_next].wait(q_next_phase)
-                else:
-                    q_next = q_index.idx
-                    bars.mb_q_ready[q_next].wait(q_index.phase)
-                    q_index = advance(q_index, cfg.smem_q_stages)
+                q_next = q_index.idx
+                bars.mb_q_ready[q_next].wait(q_index.phase)
+                q_index = advance(q_index, cfg.smem_q_stages)
                 mma_ss(
                     bmm_q_k_desc,
                     d_q0.advance_start_address(q_next * Q_STAGE_BYTES),
@@ -1051,29 +923,7 @@ def tcgen05_mma_warp(
                 bars.mb_dstate_acc_ready[dstate_idx].arrive(cta_group=1)
                 bars.mb_k_mma_done[k_cur].arrive(cta_group=1)
             k_cur = k_next
-            if cutlass.const_expr(cfg.expand_num > 1):
-                # q and dO share the block state (both rings hold 2 block tiles); placed after the
-                # chunk's last GEMM issue so it overlaps the K-term
-                q_index = PipelineState(
-                    idx=(q_cur ^ cutlass.Int32(1)) if block_last else q_cur,
-                    phase=(q_index.phase ^ q_cur) if block_last else q_index.phase,
-                )
-                do_index = q_index
-                q_cur = q_index.idx
-                do_cur = q_cur
-                sub = cutlass.Int32(cfg.expand_num - 1) if block_last else sub - cutlass.Int32(1)
-                block_last = sub == 0
-            else:
-                q_cur = q_next
-
-        if cutlass.const_expr(cfg.expand_num > 1):
-            if num_item_chunks > 0:
-                q_last = q_index.idx ^ cutlass.Int32(1)
-                do_last = q_last
-                for _ in cutlass.range(pad_post):
-                    if elect_one:
-                        bars.mb_q_mma_done[q_last].arrive(cta_group=1)
-                        bars.mb_do_mma_done[do_last].arrive(cta_group=1)
+            q_cur = q_next
 
         tile_idx, scheduler_state = scheduler_next_tile(
             cfg, bars, sScheduler, scheduler_state, elect_one
@@ -1202,19 +1052,9 @@ def tmaldg_warp(
         if elect_one:
             tma_tensormap_acquire(desc_tinv_slot)
 
-        if cutlass.const_expr(cfg.expand_num > 1):
-            sub = (compute_end - 1) % cutlass.Int32(cfg.expand_num)
         for rev_idx in cutlass.range(compute_end - write_start):
             chunk_idx = compute_end - 1 - rev_idx
             tok_coord = chunk_idx * cutlass.Int32(cfg.b_t)
-            block_head = True
-            block_token_coord = tok_coord
-            if cutlass.const_expr(cfg.expand_num > 1):
-                block_head = (sub == cutlass.Int32(cfg.expand_num - 1)) or rev_idx == 0
-                block_token_coord = (chunk_idx // cutlass.Int32(cfg.expand_num)) * cutlass.Int32(
-                    cfg.b_t
-                )
-                sub = cutlass.Int32(cfg.expand_num - 1) if sub == 0 else sub - cutlass.Int32(1)
 
             # ---- K load --------------------------------------------------------------
             k_idx = k_index.idx
@@ -1226,29 +1066,23 @@ def tmaldg_warp(
             tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
             # ---- Q load: the block's 64 compact tokens -------------------------------
-            if block_head:
-                q_idx = q_index.idx
-                bars.mb_q_mma_done[q_idx].wait(q_index.phase)
-                q_index = advance(q_index, cfg.smem_q_stages)
-                if elect_one:
-                    bars.mb_q_ready[q_idx].arrive(n_bytes=cfg.tma_q_bytes)
-                q_slice = tma_slice_runtime_desc(
-                    desc_q_slot, cutlass.Int32(0), head_q, block_token_coord
-                )
-                tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr)
+            q_idx = q_index.idx
+            bars.mb_q_mma_done[q_idx].wait(q_index.phase)
+            q_index = advance(q_index, cfg.smem_q_stages)
+            if elect_one:
+                bars.mb_q_ready[q_idx].arrive(n_bytes=cfg.tma_q_bytes)
+            q_slice = tma_slice_runtime_desc(desc_q_slot, cutlass.Int32(0), head_q, tok_coord)
+            tma_load_tile(sQ_tma[q_idx], q_slice, bars.mb_q_ready[q_idx].smem_ptr)
 
             # ---- dO load: the block's 64 compact tokens ------------------------------
-            if block_head:
-                do_idx = do_index.idx
-                bars.mb_do_mma_done[do_idx].wait(do_index.phase)
-                bars.mb_do_cg0_done[do_idx].wait(do_index.phase)
-                do_index = advance(do_index, cfg.smem_do_stages)
-                if elect_one:
-                    bars.mb_do_ready[do_idx].arrive(n_bytes=cfg.tma_do_bytes)
-                do_slice = tma_slice_runtime_desc(
-                    desc_do_slot, cutlass.Int32(0), head_o, block_token_coord
-                )
-                tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr)
+            do_idx = do_index.idx
+            bars.mb_do_mma_done[do_idx].wait(do_index.phase)
+            bars.mb_do_cg0_done[do_idx].wait(do_index.phase)
+            do_index = advance(do_index, cfg.smem_do_stages)
+            if elect_one:
+                bars.mb_do_ready[do_idx].arrive(n_bytes=cfg.tma_do_bytes)
+            do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, tok_coord)
+            tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr)
 
             # ---- chunk-factor tile load ----------------------------------------------
             tinv_idx = tinv_index.idx
@@ -1298,9 +1132,6 @@ def compute0_warp_group(
     sdO,
     sCumsumlog,
     sCumprod,
-    sTokSlot,
-    sTokCumsum,
-    sTokCumprod,
     sA,
     sScheduler,
     bars,
@@ -1376,34 +1207,6 @@ def compute0_warp_group(
         ) = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = compute_end - write_start
 
-        block_last = True
-        if cutlass.const_expr(cfg.expand_num > 1):
-            sub = (compute_end - 1) % cutlass.Int32(cfg.expand_num)
-            first_block_start = (
-                (compute_end - 1) // cutlass.Int32(cfg.expand_num)
-            ) * cutlass.Int32(cfg.expand_num)
-            last_block_end = (write_start // cutlass.Int32(cfg.expand_num) + 1) * cutlass.Int32(
-                cfg.expand_num
-            )
-            first_block_start = (
-                first_block_start if first_block_start > write_start else write_start
-            )
-            last_block_end = last_block_end if last_block_end < compute_end else compute_end
-            single_block = first_block_start <= write_start
-            pad_pre = (
-                (cutlass.Int32(cfg.expand_num) - num_item_chunks)
-                if single_block
-                else (cutlass.Int32(cfg.expand_num) - (compute_end - first_block_start))
-            )
-            pad_post = (
-                cutlass.Int32(0)
-                if single_block
-                else (cutlass.Int32(cfg.expand_num) - (last_block_end - write_start))
-            )
-            block_last = sub == 0
-            if num_item_chunks > 0:
-                for _ in cutlass.range(pad_pre):
-                    bars.mb_do_cg0_done[do_index.idx].arrive()
         for chunk_idx in cutlass.range(num_item_chunks):
             # ---- T-pairwise ----------------------------------------------------------
             gate_idx = gate_index.idx
@@ -1414,56 +1217,26 @@ def compute0_warp_group(
             for g in cutlass.range_constexpr(8):
                 for b in cutlass.range_constexpr(2):
                     col_cumsums.append(sCumsumlog[(lane_idx % 4) * 2 + g * 8 + b, 0, gate_idx])
-            if cutlass.const_expr(cfg.expand_num > 1):
-                # tile rows are the block's tokens; the gate warp's tables carry each row's readout
-                # slot in this chunk (-1 = none) and its cumsum / cumprod there (0 = none)
-                row_cumsums = []
-                row_slot = []
-                for r in cutlass.range_constexpr(2):
-                    tokr = warp_id * 16 + lane_idx // 4 + r * 8
-                    row_cumsums.append(sTokCumsum[tokr, 0, gate_idx])
-                    row_slot.append(sTokSlot[tokr, 0, gate_idx])
-                decay_t = []
-                for k in cutlass.range_constexpr(num_vals):
-                    rp = cutlass.const_expr((k // 2) % 2)
-                    chunk_col = (lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2)
-                    decay_t.append(
-                        cute.math.exp2(
-                            row_cumsums[rp] - col_cumsums[(k // 4) * 2 + (k % 2)], fastmath=True
-                        )
-                        if chunk_col <= row_slot[rp]
-                        else mask_zero
+            row_cumsums = []
+            for r in cutlass.range_constexpr(2):
+                row_cumsums.append(sCumsumlog[warp_id * 16 + lane_idx // 4 + r * 8, 0, gate_idx])
+            decay_t = []
+            for k in cutlass.range_constexpr(num_vals):
+                chunk_row = warp_id * 16 + lane_idx // 4 + ((k // 2) % 2) * 8
+                chunk_col = (lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2)
+                decay_t.append(
+                    cute.math.exp2(
+                        row_cumsums[(k // 2) % 2] - col_cumsums[(k // 4) * 2 + (k % 2)],
+                        fastmath=True,
                     )
-                cumprod_fp32 = []
-                for g in cutlass.range_constexpr(8):
-                    for b in cutlass.range_constexpr(2):
-                        cumprod_fp32.append(
-                            sTokCumprod[(lane_idx % 4) * 2 + g * 8 + b, 0, gate_idx]
-                        )
-                cumprod_vals = [cumprod_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
-            else:
-                row_cumsums = []
-                for r in cutlass.range_constexpr(2):
-                    row_cumsums.append(
-                        sCumsumlog[warp_id * 16 + lane_idx // 4 + r * 8, 0, gate_idx]
-                    )
-                decay_t = []
-                for k in cutlass.range_constexpr(num_vals):
-                    chunk_row = warp_id * 16 + lane_idx // 4 + ((k // 2) % 2) * 8
-                    chunk_col = (lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2)
-                    decay_t.append(
-                        cute.math.exp2(
-                            row_cumsums[(k // 2) % 2] - col_cumsums[(k // 4) * 2 + (k % 2)],
-                            fastmath=True,
-                        )
-                        if chunk_row >= chunk_col
-                        else mask_zero
-                    )
-                cumprod_fp32 = []
-                for g in cutlass.range_constexpr(8):
-                    for b in cutlass.range_constexpr(2):
-                        cumprod_fp32.append(sCumprod[(lane_idx % 4) * 2 + g * 8 + b, 0, gate_idx])
-                cumprod_vals = [cumprod_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
+                    if chunk_row >= chunk_col
+                    else mask_zero
+                )
+            cumprod_fp32 = []
+            for g in cutlass.range_constexpr(8):
+                for b in cutlass.range_constexpr(2):
+                    cumprod_fp32.append(sCumprod[(lane_idx % 4) * 2 + g * 8 + b, 0, gate_idx])
+            cumprod_vals = [cumprod_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
 
             # ---- A acc ready (the QK GEMM of this chunk committed) -------------------
             a_idx = a_index.idx
@@ -1475,8 +1248,7 @@ def compute0_warp_group(
             # ---- dO fragment preload (the block's tile, held for its chunks) ---------
             do_cur = do_index.idx
             bars.mb_do_ready[do_cur].wait(do_index.phase)
-            if cutlass.const_expr(cfg.expand_num == 1):
-                do_index = advance(do_index, cfg.smem_do_stages)
+            do_index = advance(do_index, cfg.smem_do_stages)
             do_raw_frag = []
             for half in cutlass.range_constexpr(dv_halves):
                 do_words_raw = []
@@ -1539,18 +1311,6 @@ def compute0_warp_group(
 
             # ---- Gate stage release --------------------------------------------------
             bars.mb_gate_done[gate_idx].arrive()
-            if cutlass.const_expr(cfg.expand_num > 1):
-                do_index = PipelineState(
-                    idx=(do_index.idx ^ cutlass.Int32(1)) if block_last else do_index.idx,
-                    phase=(do_index.phase ^ do_index.idx) if block_last else do_index.phase,
-                )
-                sub = cutlass.Int32(cfg.expand_num - 1) if block_last else sub - cutlass.Int32(1)
-                block_last = sub == 0
-        if cutlass.const_expr(cfg.expand_num > 1):
-            if num_item_chunks > 0:
-                do_last = do_index.idx ^ cutlass.Int32(1)
-                for _ in cutlass.range(pad_post):
-                    bars.mb_do_cg0_done[do_last].arrive()
         tile_idx, scheduler_state = scheduler_next_tile(
             cfg, bars, sScheduler, scheduler_state, elect_one
         )
@@ -2022,12 +1782,10 @@ def build_descs_body(
     tinv: cute.Tensor | None,
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp), after
-    the prologue's order pass. q and dO address the compact token timeline (``expand_num`` scales k
-    alone); ``q_step`` > 1 reads the phase rows of an expanded q buffer."""
+    the prologue's order pass; ``q_step`` > 1 reads the phase rows of an expanded q buffer."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
     sub0 = cute.make_tensor(desc_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
     sub1 = cute.make_tensor(
@@ -2049,23 +1807,21 @@ def build_descs_body(
                     stride=(q.stride[0] * cutlass.Int32(q_step), q.stride[1], 1),
                 ),
             )
-            emit_seq_descs(base_q, sub0, cu_seqlens, q_phase, n_batch, 2, 1, lanes=32)
+            emit_seq_descs(base_q, sub0, cu_seqlens, q_phase, n_batch, 2, lanes=32)
         else:
-            emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, 1, lanes=32)
+            emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 1:
-        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, lanes=32)
         if cutlass.const_expr(tinv is not None):
-            emit_tile_seq_descs(
-                base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32
-            )
+            emit_tile_seq_descs(base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
     if widx == 2:
-        emit_seq_descs(base_do, sub2, cu_seqlens, do_, n_batch, 2, 1, lanes=32)
+        emit_seq_descs(base_do, sub2, cu_seqlens, do_, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP
         )
@@ -2076,7 +1832,6 @@ def frost_gdn_bprop_summary_prologue(
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
@@ -2130,7 +1885,6 @@ def frost_gdn_bprop_summary_prologue(
                 sKey,
                 sIdx,
                 sSpread,
-                expand_num=expand_num,
             )
     else:
         build_descs_body(
@@ -2147,7 +1901,6 @@ def frost_gdn_bprop_summary_prologue(
             tinv,
             n_batch,
             b_t,
-            expand_num,
             q_step,
         )
 
@@ -2158,7 +1911,6 @@ def prologue(
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
-    expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int],
     q: cute.Tensor,
     k: cute.Tensor,
@@ -2238,7 +1990,6 @@ def prologue(
         run_order,
         order_gen,
         b_t,
-        expand_num,
         q_step,
         base_desc_q,
         base_desc_k,
@@ -2264,8 +2015,6 @@ def host(
     q: cute.Tensor,
     k: cute.Tensor,
     gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
     do_: cute.Tensor,
     cu_seqlens: cute.Tensor,
     dstate0: cute.Tensor,
@@ -2314,8 +2063,6 @@ def host(
         q_ratio,
         k_ratio,
         gate,
-        a_log,
-        dt_bias,
         cu_seqlens,
         scale,
         cumsumlog_smem_layout_staged,
@@ -2347,8 +2094,6 @@ def frost_gdn_bprop_summary(
     q_ratio: cute.FastDivmodDivisorV2,
     k_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
-    mA_log: cute.Tensor | None,
-    mDt_bias: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
     scale: cutlass.Float32,
     cumsumlog_smem_layout_staged: cute.Layout,
@@ -2426,46 +2171,6 @@ def frost_gdn_bprop_summary(
     cumprod_raw = cutlass.Array(
         cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
     )
-    sTokSlot = None
-    sTokCumsum = None
-    sTokCumprod = None
-    if cutlass.const_expr(cfg.expand_num > 1):
-        tok_slot_raw = cutlass.Array(
-            cutlass.Int32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
-        )
-        tok_cumsum_raw = cutlass.Array(
-            cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
-        )
-        tok_cumprod_raw = cutlass.Array(
-            cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128
-        )
-        sTokSlot = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Int32,
-                smem_data_ptr(tok_slot_raw).toint(),
-                mem_space=cute.AddressSpace.smem,
-                assumed_align=128,
-            ),
-            cumsumlog_smem_layout_staged,
-        )
-        sTokCumsum = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Float32,
-                smem_data_ptr(tok_cumsum_raw).toint(),
-                mem_space=cute.AddressSpace.smem,
-                assumed_align=128,
-            ),
-            cumsumlog_smem_layout_staged,
-        )
-        sTokCumprod = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Float32,
-                smem_data_ptr(tok_cumprod_raw).toint(),
-                mem_space=cute.AddressSpace.smem,
-                assumed_align=128,
-            ),
-            cumsumlog_smem_layout_staged,
-        )
     storage = SmemAllocator().allocate(shared_type)
 
     SWZ = 2
@@ -2640,9 +2345,6 @@ def frost_gdn_bprop_summary(
             sdO=sdO,
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
-            sTokSlot=sTokSlot,
-            sTokCumsum=sTokCumsum,
-            sTokCumprod=sTokCumprod,
             sA=sA,
             sScheduler=sScheduler,
             bars=bars,
@@ -2742,13 +2444,8 @@ def frost_gdn_bprop_summary(
             mWorkItems,
             tidx,
             mGate=mGate,
-            mA_log=mA_log,
-            mDt_bias=mDt_bias,
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
-            sTokSlot=sTokSlot,
-            sTokCumsum=sTokCumsum,
-            sTokCumprod=sTokCumprod,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -2777,11 +2474,9 @@ class GdnBpropSummaryCfg:
     d_k: int
     d_v: int
     log_gate: bool = False
-    safe_gate: bool = False
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
-    expand_num: int = 1
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
     compute_group_2_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_2_WARP_IDS
@@ -2845,10 +2540,8 @@ def build_cfg(
     max_active_clusters: int,
     use_dstate_in: bool = False,
     log_gate: bool = False,
-    safe_gate: bool = False,
     d_k: int,
     d_v: int,
-    expand_num: int = 1,
 ) -> GdnBpropSummaryCfg:
     """Build the per-compile ``GdnBpropSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always
     Float32)."""
@@ -2861,20 +2554,16 @@ def build_cfg(
             f"bprop summary serves Float16/BFloat16 with d_k, d_v in {STATE_DIMS}, got "
             f"{io_dtype}, {d_k}, {d_v}"
         )
-    if max_active_clusters <= 0 or expand_num < 1:
-        raise ValueError("max_active_clusters and expand_num must be positive")
-    if expand_num > 1 and (CFG.SMEM_Q_STAGES != 2 or CFG.SMEM_DO_STAGES != 2):
-        raise ValueError("the compact q / dO block state assumes 2-stage q and dO rings")
+    if max_active_clusters <= 0:
+        raise ValueError("max_active_clusters must be positive")
     cfg = GdnBpropSummaryCfg(
         use_dstate_in=use_dstate_in,
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
         max_active_clusters=max_active_clusters,
         log_gate=log_gate,
-        safe_gate=safe_gate,
         d_k=d_k,
         d_v=d_v,
-        expand_num=expand_num,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
