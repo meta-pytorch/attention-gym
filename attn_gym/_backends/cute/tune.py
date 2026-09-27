@@ -111,6 +111,7 @@ def tune(
     workers: int | None = None,
     target: CompileTarget | None = None,
     timeout: float | None = DEFAULT_COMPILE_TIMEOUT_SECONDS,
+    skip_errors: tuple[type[BaseException], ...] = (),
 ) -> ConfigT:
     """Compile candidates, benchmark GPU launches sequentially, and return the fastest.
 
@@ -141,6 +142,10 @@ def tune(
             launch,
             compile_call=lambda config: (head_dim, config),
         )
+
+    A candidate whose benchmark raises one of ``skip_errors`` (for example Triton's
+    ``OutOfResources``, raised when a lazily compiled kernel is loaded) is skipped; if every
+    candidate raises, the last error propagates.
     """
     candidates = list(configs)
     if not candidates:
@@ -170,11 +175,18 @@ def tune(
 
     measure = benchmark_gpu if benchmark is None else benchmark
     timings = []
+    error = None
     for compiled, config in zip(compiled_candidates, candidates):
-        timing = float(measure(functools.partial(launch, compiled, config)))
+        try:
+            timing = float(measure(functools.partial(launch, compiled, config)))
+        except skip_errors as candidate_error:
+            error = candidate_error
+            timing = math.inf
         if math.isnan(timing):
             raise ValueError(f"benchmark returned NaN for config {config!r}")
         timings.append(timing)
+    if error is not None and all(timing == math.inf for timing in timings):
+        raise error
     return candidates[min(range(len(candidates)), key=timings.__getitem__)]
 
 
@@ -283,7 +295,9 @@ def run_tunable(
     Kernels that mutate their inputs define ``benchmark_reset(*runtime_args)``, which
     snapshots the mutable state and returns a zero-argument restore callable. When a
     decision is benchmarked, restore runs before every candidate launch and before the
-    final winner launch, so the caller observes exactly one launch. An explicit
+    final winner launch, so the caller observes exactly one launch. Kernels may list
+    ``benchmark_errors``, exception types that mark a candidate unusable while tuning
+    (see ``tune``'s ``skip_errors``). An explicit
     ``target`` is installed process-wide before candidate generation and remains active
     after this function returns.
     """
@@ -352,6 +366,7 @@ def run_tunable(
                     workers=workers,
                     target=target,
                     timeout=timeout,
+                    skip_errors=getattr(kernel, "benchmark_errors", ()),
                 )
                 if winner_key is not None:
                     _store_winner(winner_key, selected)

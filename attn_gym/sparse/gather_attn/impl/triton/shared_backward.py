@@ -8,27 +8,17 @@ an inverted query map so each sparse-KV program exclusively owns its output.
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
 
-from .primitives import load_document_bounds, offset_strides, prune_wide_backward_configs
-
-
-def prune_shared_dq_configs(configs, named_args, D, **kwargs):
-    if D == 512:
-        return prune_wide_backward_configs(configs, named_args, D=D, **kwargs)
-    return [config for config in configs if config.kwargs["BLOCK_N"] != 16]
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-        for block_n in (16, 64, 128)
-        for num_warps in (4, 8)
-    ],
-    key=["B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"],
-    prune_configs_by={"early_config_prune": prune_shared_dq_configs},
-    cache_results=True,
+from .primitives import (
+    load_document_bounds,
+    offset_strides,
+    prune_wide_backward_configs,
+    tuning_key,
 )
+
+
 @triton.jit
 def _gather_attn_bwd_dq_shared(
     query_ptr,
@@ -214,28 +204,6 @@ def _gather_attn_bwd_dq_shared(
     )
 
 
-# Atomic configs accumulate into the same FP32 output, so clear it between tuning trials.
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_H": block_h, "BLOCK_K": block_k},
-            num_warps=num_warps,
-            num_stages=1,
-        )
-        for block_h, block_k, num_warps in (
-            (16, 16, 4),
-            (32, 16, 4),
-            (16, 32, 4),
-            (32, 32, 8),
-            (16, 64, 8),
-            (32, 64, 8),
-        )
-    ],
-    key=["B", "H", "D", "TOPK", "HAS_CU_SEQLENS"],
-    reset_to_zero=["grad_sparse_kv_ptr"],
-    prune_configs_by={"early_config_prune": prune_wide_backward_configs},
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
@@ -369,27 +337,6 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     )
 
 
-# Different BLOCK_H configs write different partial slots, so clear stale slots between trials.
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_H": block_h, "BLOCK_M": block_m},
-            num_warps=num_warps,
-            num_stages=1,
-        )
-        for block_h, block_m, num_warps in (
-            (2, 32, 4),
-            (4, 16, 4),
-            (4, 32, 4),
-            (4, 32, 8),
-            (8, 16, 4),
-            (8, 16, 8),
-        )
-    ],
-    key=["H", "D", "TOPK"],
-    reset_to_zero=["grad_sparse_kv_ptr"],
-    cache_results=True,
-)
 @triton.jit
 def _gather_attn_bwd_dsparse_kv_shared(
     query_ptr,
@@ -522,3 +469,61 @@ def _gather_attn_bwd_dsparse_kv_shared(
         tl.sum(grad_value * (dot_rows[:, None] == 0), axis=0),
         mask=dimension_mask,
     )
+
+
+def prune_shared_dq_configs(configs, args):
+    if args["D"] == 512:
+        return prune_wide_backward_configs(configs, args)
+    return [config for config in configs if config.kwargs["BLOCK_N"] != 16]
+
+
+def _zero_grad_sparse_kv(_grid, args):
+    """Clear the zero-initialized output that candidates accumulate into or partially write."""
+    return args["grad_sparse_kv_ptr"].zero_
+
+
+BWD_DQ_SHARED = TritonTuner(
+    _gather_attn_bwd_dq_shared,
+    [
+        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
+        for block_n in (16, 64, 128)
+        for num_warps in (4, 8)
+    ],
+    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    prune=prune_shared_dq_configs,
+)
+# Atomic configs accumulate into the same FP32 output, so it is cleared between trials.
+BWD_DSPARSE_KV_SHARED_ATOMIC = TritonTuner(
+    _gather_attn_bwd_dsparse_kv_shared_atomic,
+    [
+        triton.Config({"BLOCK_H": block_h, "BLOCK_K": block_k}, num_warps=num_warps, num_stages=1)
+        for block_h, block_k, num_warps in (
+            (16, 16, 4),
+            (32, 16, 4),
+            (16, 32, 4),
+            (32, 32, 8),
+            (16, 64, 8),
+            (32, 64, 8),
+        )
+    ],
+    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "HAS_CU_SEQLENS"),
+    prune=prune_wide_backward_configs,
+    reset=_zero_grad_sparse_kv,
+)
+# Different BLOCK_H configs write different partial slots, so stale slots are cleared.
+BWD_DSPARSE_KV_SHARED = TritonTuner(
+    _gather_attn_bwd_dsparse_kv_shared,
+    [
+        triton.Config({"BLOCK_H": block_h, "BLOCK_M": block_m}, num_warps=num_warps, num_stages=1)
+        for block_h, block_m, num_warps in (
+            (2, 32, 4),
+            (4, 16, 4),
+            (4, 32, 4),
+            (4, 32, 8),
+            (8, 16, 4),
+            (8, 16, 8),
+        )
+    ],
+    key=tuning_key("query_ptr", "H", "D", "TOPK"),
+    reset=_zero_grad_sparse_kv,
+)

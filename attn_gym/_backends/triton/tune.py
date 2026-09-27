@@ -10,6 +10,8 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import triton
+from triton.compiler.errors import CompileTimeAssertionFailure
+from triton.runtime.errors import OutOfResources, PTXASError
 
 from attn_gym._backends.cute import run_tunable
 
@@ -21,8 +23,11 @@ Grid = tuple[int, ...] | Callable[[dict[str, Any]], tuple[int, ...]]
 class TritonTuner:
     """Tune a ``@triton.jit`` kernel over ``triton.Config`` candidates with ``run_tunable``.
 
-    Launch with ``tuner[grid](**args)`` as with the kernel itself; ``grid`` may be a tuple or
-    ``grid(meta)`` over the arguments and the candidate's meta-parameters.
+    Launch with ``tuner[grid](*args, **kwargs)`` as with the kernel itself; ``grid`` may be a
+    tuple or ``grid(meta)`` over the arguments and the candidate's meta-parameters.
+
+    Like ``triton.autotune``, a candidate that fails to compile or load while tuning (more
+    shared memory, tensor memory, or threads than the device has) is skipped.
 
     Args:
         kernel: The ``@triton.jit`` function, without autotune or heuristics decorators.
@@ -33,6 +38,9 @@ class TritonTuner:
         reset: Optional ``reset(grid, args) -> restore`` for kernels that mutate their inputs;
             see ``run_tunable``'s ``benchmark_reset``.
     """
+
+    # Errors triton.autotune also treats as an unusable candidate rather than a failure.
+    benchmark_errors = (OutOfResources, CompileTimeAssertionFailure, PTXASError)
 
     def __init__(
         self,
@@ -49,6 +57,7 @@ class TritonTuner:
         # Winners are namespaced by the kernel source and its @triton.jit dependencies.
         compile_kernel.cache_namespace = lambda: kernel.cache_key  # type: ignore[attr-defined]
         self.compile = compile_kernel
+        self._arg_names = kernel.arg_names
         self._configs = list(configs)
         self._candidates = {id(c): tuple(sorted(c.all_kwargs().items())) for c in self._configs}
         self._key = key
@@ -57,7 +66,13 @@ class TritonTuner:
             self.benchmark_reset = reset
 
     def __getitem__(self, grid: Grid) -> Callable[..., None]:
-        return lambda **args: run_tunable(self, grid, args, autotune=True)
+        return lambda *args, **kwargs: run_tunable(
+            self, grid, self.bind(args, kwargs), autotune=True
+        )
+
+    def bind(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Name positional launch arguments by the kernel's parameters."""
+        return {**dict(zip(self._arg_names, args)), **kwargs}
 
     def configs(self, _grid: Grid, args: dict[str, Any]) -> list[TritonCandidate]:
         configs = self._configs if self._prune is None else self._prune(self._configs, args)

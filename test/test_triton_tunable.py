@@ -48,3 +48,27 @@ def test_tuned_triton_kernel_mutates_its_output_exactly_once(isolated_winners):
     torch.testing.assert_close(out, initial + x)
     launch()  # cached winner
     torch.testing.assert_close(out, initial + 2 * x)
+
+
+@triton.jit
+def _row_sums_kernel(x, out, n, BLOCK: tl.constexpr):
+    """Stage a BLOCK x BLOCK FP32 dot, whose shared memory grows with BLOCK squared."""
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tile = tl.load(x + rows[:, None] * 0 + tl.arange(0, BLOCK)[None, :], rows[:, None] < n)
+    tl.store(out + rows, tl.sum(tl.dot(tile, tl.trans(tile)), axis=1), rows < n)
+
+
+def test_tuning_skips_candidates_exceeding_device_resources(isolated_winners):
+    """A candidate over the shared-memory limit is skipped; if all are, its error surfaces."""
+    oversized = triton.Config({"BLOCK": 512}, num_stages=4)  # about 1 MiB of shared memory
+    x = torch.ones(1024, device="cuda")
+    out = torch.empty(1024, device="cuda")
+
+    def launch(configs):
+        tuner = TritonTuner(_row_sums_kernel, configs, key=lambda args: (args["n"],))
+        tuner[lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)](x=x, out=out, n=1024)
+
+    launch([oversized, triton.Config({"BLOCK": 64})])
+    torch.testing.assert_close(out, torch.full_like(out, 64 * 64))
+    with pytest.raises(triton.OutOfResources):
+        launch([oversized])

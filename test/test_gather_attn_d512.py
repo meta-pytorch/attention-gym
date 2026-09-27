@@ -300,21 +300,21 @@ def test_d512_backward_config_pruning(kernel_name):
     pytest.importorskip("triton")
     from attn_gym.sparse.gather_attn.impl.triton import backward, shared_backward
 
-    kernels = {
-        "dq_shared": shared_backward._gather_attn_bwd_dq_shared,
-        "dsparse_shared_atomic": shared_backward._gather_attn_bwd_dsparse_kv_shared_atomic,
-        "dsparse_generic": backward._gather_attn_bwd_dsparse_kv,
+    tuners = {
+        "dq_shared": shared_backward.BWD_DQ_SHARED,
+        "dsparse_shared_atomic": shared_backward.BWD_DSPARSE_KV_SHARED_ATOMIC,
+        "dsparse_generic": backward._BWD_DSPARSE_KV,
     }
-    kernel = kernels[kernel_name]
-    wide_configs = kernel.early_config_prune(kernel.configs, {}, D=512)
+    tuner = tuners[kernel_name]
+    wide_configs = [dict(candidate) for candidate in tuner.configs(None, {"D": 512})]
     assert len(wide_configs) == 1
     config = wide_configs[0]
-    assert config.num_warps == 4
-    assert config.num_stages == 1
-    assert all(size == 16 for size in config.kwargs.values())
-    narrow_configs = kernel.early_config_prune(kernel.configs, {}, D=128)
+    assert config["num_warps"] == 4
+    assert config["num_stages"] == 1
+    assert all(config[name] == 16 for name in config if name.startswith("BLOCK_"))
+    narrow_configs = [dict(candidate) for candidate in tuner.configs(None, {"D": 128})]
     assert len(narrow_configs) > 1
     if kernel_name == "dq_shared":
-        assert {config.kwargs["BLOCK_N"] for config in narrow_configs} == {64, 128}
+        assert {config["BLOCK_N"] for config in narrow_configs} == {64, 128}
     else:
-        assert narrow_configs == kernel.configs
+        assert len(narrow_configs) == len(tuner._configs)

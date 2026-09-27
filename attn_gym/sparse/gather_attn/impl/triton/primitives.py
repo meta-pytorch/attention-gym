@@ -6,6 +6,7 @@ from typing import NamedTuple
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset
 
@@ -43,6 +44,14 @@ class TileConfig(NamedTuple):
     # Shared memory in BLOCK_D-wide rows: the largest ``metadata.shared / (BLOCK_D *
     # element_size)`` measured for SM86 at D in {64, 128, 256} with Triton 3.8.
     shared_rows: int = 0
+    # Tensor-memory columns: the largest ``metadata.tmem_size`` measured on SM103 (GB300) for
+    # BF16 and FP32 at D in {64, 128, 256} with Triton 3.8. Only 64-row tiles use tcgen05 MMAs.
+    tmem_cols: int = 0
+
+
+# Tensor-memory columns one CTA may allocate on datacenter Blackwell; Triton rejects kernels
+# above it when loading them.
+TENSOR_MEMORY_COLUMNS = 512
 
 
 def select_tiles(
@@ -51,20 +60,42 @@ def select_tiles(
     element_size: int,
     device: torch.device,
 ) -> TileConfig:
-    """Return the first candidate whose estimated shared memory fits one block on ``device``.
+    """Return the first candidate whose estimated shared and tensor memory fit ``device``.
 
     Candidates are ordered by preference; the last one is the fallback for tiny budgets.
     """
-    budget = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    properties = torch.cuda.get_device_properties(device)
+    shared_budget = properties.shared_memory_per_block_optin
+    # SM10x/SM11x accumulate tcgen05 MMAs in tensor memory; other GPUs have none.
+    tmem_budget = TENSOR_MEMORY_COLUMNS if properties.major in (10, 11) else float("inf")
     return next(
-        (c for c in candidates if c.shared_rows * block_d * element_size <= budget),
+        (
+            c
+            for c in candidates
+            if c.shared_rows * block_d * element_size <= shared_budget
+            and c.tmem_cols <= tmem_budget
+        ),
         candidates[-1],
     )
 
 
-def prune_wide_backward_configs(configs, _named_args, D, **_):
+def tuning_key(tensor: str, *names: str):
+    """Key a ``TritonTuner`` by the dtype of argument ``tensor`` and the arguments ``names``.
+
+    Unlike ``triton.autotune``'s implicit dtype key, this also sees through TMA descriptors.
+    """
+
+    def key(args):
+        value = args[tensor]
+        dtype = (value.base if isinstance(value, TensorDescriptor) else value).dtype
+        return (dtype, *(args[name] for name in names))
+
+    return key
+
+
+def prune_wide_backward_configs(configs, args):
     """Bound full-width D=512 gradient tiles without changing smaller-head tuning."""
-    if D != 512:
+    if args["D"] != 512:
         return configs
     return [
         config
