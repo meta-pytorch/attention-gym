@@ -50,7 +50,7 @@ from ..common.launch import (
     validate_work_table,
     validate_workspace,
 )
-from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_key, signature_spec
 from . import gdn_bprop_f16, gdn_recompute_f16, gdn_tinv_f16
 
 
@@ -577,50 +577,6 @@ def build_warmup_backward(
         bool(log_gate),
         state_in is not None,
     )
-    gate_table = gate if split else None
-    staging = item_scratch if split else None
-    specs = (
-        signature_spec(q, assumed_align=16),
-        signature_spec(k, assumed_align=16),
-        signature_spec(v, assumed_align=16),
-        signature_spec(do, assumed_align=16),
-        signature_spec(dq, assumed_align=16),
-        signature_spec(dk, assumed_align=16),
-        signature_spec(dv, assumed_align=16),
-        signature_spec(gate, assumed_align=16),
-        signature_spec(gate_table, assumed_align=8 if facts.gate_elem_bytes == 2 else 4),
-        signature_spec(beta, assumed_align=16),
-        signature_spec(cu_seqlens, assumed_align=cu_align),
-        signature_spec(cu_seqlens, assumed_align=4),
-        signature_spec(cu_seqlens, assumed_align=4),
-        signature_spec(tinv, assumed_align=128) if tinv_pass else None,
-        signature_spec(tinv_words, assumed_align=128) if tinv_pass else None,
-        signature_spec(tinv_rows, assumed_align=16) if tinv_pass else None,
-        signature_spec(tinv_row_count, assumed_align=4) if tinv_pass else None,
-        signature_spec(checkpoints, assumed_align=16),
-        signature_spec(seed_checkpoints, assumed_align=16) if coarse else None,
-        signature_spec(state_in, assumed_align=16),
-        signature_spec(work_items, assumed_align=16, compact=True),
-        signature_spec(work_items, assumed_align=4, compact=True),
-        signature_spec(work_count, assumed_align=4),
-        signature_spec(work_count, assumed_align=4, compact=True),
-        signature_spec(series_items, assumed_align=16, compact=True) if recompute else None,
-        signature_spec(series_count, assumed_align=4) if recompute else None,
-        signature_spec(staging, assumed_align=16, compact=True)
-        if recompute and recompute_orders
-        else None,
-        signature_spec(staging, assumed_align=16, compact=True) if bwd_orders else None,
-        signature_spec(staging, assumed_align=4, compact=True),
-        signature_spec(chunk_scratch if split else None, assumed_align=4),
-        signature_spec(scheduler_all, assumed_align=4),
-        signature_spec(scheduler_all, assumed_align=4)
-        if recompute and (recompute_orders or coarse)
-        else None,
-        signature_spec(scheduler_all, assumed_align=4) if bwd_orders else None,
-        signature_spec(scheduler_recompute, assumed_align=4),
-        signature_spec(recompute_words, assumed_align=128) if recompute else None,
-        signature_spec(bprop_words, assumed_align=128),
-    )
     use_int64_offsets = requires_int64_abi(
         q,
         k,
@@ -639,7 +595,90 @@ def build_warmup_backward(
         recompute_words,
         bprop_words,
     )
-    return _compile_warmup_backward(constexprs, cfg_args, specs, use_int64_offsets), facts
+    # Every tensor a signature spec reads, so the warm path keys the launch without the specs.
+    static_key = (
+        constexprs,
+        cfg_args,
+        use_int64_offsets,
+        signature_key(
+            dynamic=(
+                q,
+                k,
+                v,
+                do,
+                dq,
+                dk,
+                dv,
+                gate,
+                beta,
+                cu_seqlens,
+                tinv,
+                tinv_words,
+                tinv_row_count,
+                checkpoints,
+                seed_checkpoints,
+                state_in,
+                work_count,
+                series_count,
+                chunk_scratch,
+                scheduler_all,
+                scheduler_recompute,
+                recompute_words,
+                bprop_words,
+                tinv_rows,
+            ),
+            compact=(work_items, work_count, series_items, item_scratch),
+        ),
+    )
+
+    def compile_launch():
+        gate_table = gate if split else None
+        staging = item_scratch if split else None
+        specs = (
+            signature_spec(q, assumed_align=16),
+            signature_spec(k, assumed_align=16),
+            signature_spec(v, assumed_align=16),
+            signature_spec(do, assumed_align=16),
+            signature_spec(dq, assumed_align=16),
+            signature_spec(dk, assumed_align=16),
+            signature_spec(dv, assumed_align=16),
+            signature_spec(gate, assumed_align=16),
+            signature_spec(gate_table, assumed_align=8 if facts.gate_elem_bytes == 2 else 4),
+            signature_spec(beta, assumed_align=16),
+            signature_spec(cu_seqlens, assumed_align=cu_align),
+            signature_spec(cu_seqlens, assumed_align=4),
+            signature_spec(cu_seqlens, assumed_align=4),
+            signature_spec(tinv, assumed_align=128) if tinv_pass else None,
+            signature_spec(tinv_words, assumed_align=128) if tinv_pass else None,
+            signature_spec(tinv_rows, assumed_align=16) if tinv_pass else None,
+            signature_spec(tinv_row_count, assumed_align=4) if tinv_pass else None,
+            signature_spec(checkpoints, assumed_align=16),
+            signature_spec(seed_checkpoints, assumed_align=16) if coarse else None,
+            signature_spec(state_in, assumed_align=16),
+            signature_spec(work_items, assumed_align=16, compact=True),
+            signature_spec(work_items, assumed_align=4, compact=True),
+            signature_spec(work_count, assumed_align=4),
+            signature_spec(work_count, assumed_align=4, compact=True),
+            signature_spec(series_items, assumed_align=16, compact=True) if recompute else None,
+            signature_spec(series_count, assumed_align=4) if recompute else None,
+            signature_spec(staging, assumed_align=16, compact=True)
+            if recompute and recompute_orders
+            else None,
+            signature_spec(staging, assumed_align=16, compact=True) if bwd_orders else None,
+            signature_spec(staging, assumed_align=4, compact=True),
+            signature_spec(chunk_scratch if split else None, assumed_align=4),
+            signature_spec(scheduler_all, assumed_align=4),
+            signature_spec(scheduler_all, assumed_align=4)
+            if recompute and (recompute_orders or coarse)
+            else None,
+            signature_spec(scheduler_all, assumed_align=4) if bwd_orders else None,
+            signature_spec(scheduler_recompute, assumed_align=4),
+            signature_spec(recompute_words, assumed_align=128) if recompute else None,
+            signature_spec(bprop_words, assumed_align=128),
+        )
+        return _compile_warmup_backward(constexprs, cfg_args, specs, use_int64_offsets)
+
+    return _compile_warmup_backward.by_static_key(static_key, compile_launch), facts
 
 
 def run_warmup_backward(

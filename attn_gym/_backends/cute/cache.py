@@ -287,6 +287,7 @@ def jit_cache(
     source_paths = tuple(os.fspath(Path(path).expanduser().resolve()) for path in extra_sources)
     memory_cache: dict[str, T] = {}
     runtime_cache: dict[Any, T] = {}
+    static_cache: dict[Any, T] = {}
     key_locks: dict[str, threading.Lock] = {}
     state_lock = threading.RLock()
     cache_pid = os.getpid()
@@ -301,6 +302,7 @@ def jit_cache(
         state_lock = threading.RLock()
         memory_cache.clear()
         runtime_cache.clear()
+        static_cache.clear()
         key_locks.clear()
         hits = 0
         misses = 0
@@ -442,6 +444,41 @@ def jit_cache(
                     hit=False,
                 )
 
+    def by_static_key(static_key: Hashable, compile_call: Callable[[], T]) -> T:
+        """Return the launch cached under a caller-computed ``static_key``.
+
+        ``compile_call`` must call this function and is invoked only on a miss, so a warm launch
+        skips building and hashing the full argument key. The caller guarantees that
+        ``static_key`` determines ``compile_call``'s arguments completely; the compile target is
+        added here. A hit counts in ``cache_info`` like any other hit.
+        """
+        nonlocal hits
+        reset_after_fork()
+        key = (get_compile_target(), static_key)
+        with state_lock:
+            compiled = static_cache.get(key)
+            if compiled is not None:
+                hits += 1
+                return compiled
+        compiled = compile_call()
+        with state_lock:
+            static_cache[key] = compiled
+        return compiled
+
+    def by_args(*args: P.args) -> T:
+        """``by_static_key`` keyed by the positional arguments themselves.
+
+        Each value is tagged with its type (``True`` and ``1`` stay apart) and floats key on
+        ``float.hex``; values inside nested tuples key by equality, so they must have one type
+        per position.
+        """
+        types = tuple(map(type, args))
+        if float in types:
+            key = tuple(arg.hex() if type(arg) is float else arg for arg in args)
+        else:
+            key = args
+        return by_static_key((types, key), lambda: wrapper(*args))
+
     def precompile(*args: P.args, **kwargs: P.kwargs) -> None:
         """Populate one disk entry without loading or returning the artifact."""
         if not disk_cache_enabled():
@@ -473,6 +510,7 @@ def jit_cache(
         with state_lock:
             memory_cache.clear()
             runtime_cache.clear()
+            static_cache.clear()
             key_locks.clear()
             hits = 0
             misses = 0
@@ -488,6 +526,8 @@ def jit_cache(
         return _source_fingerprint(fn, source_paths)
 
     wrapper.cache_namespace = cache_namespace  # type: ignore[attr-defined]
+    wrapper.by_static_key = by_static_key  # type: ignore[attr-defined]
+    wrapper.by_args = by_args  # type: ignore[attr-defined]
     wrapper.precompile = precompile  # type: ignore[attr-defined]
     wrapper.is_cached = is_cached  # type: ignore[attr-defined]
     wrapper.disk_cache_enabled = disk_cache_enabled  # type: ignore[attr-defined]

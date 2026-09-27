@@ -751,7 +751,7 @@ def build_warmup_forward(
         raise ValueError("has_initial_state requires state_indices")
     paged_state = 0 if state_indices is None else 1 + (has_initial_state is not None)
     use_int64_offsets = requires_int64_abi(*tensors)
-    compiled = _compile_warmup_forward(
+    compiled = _compile_warmup_forward.by_args(
         (
             bool(facts.split),
             int(facts.b_t),

@@ -595,7 +595,7 @@ def build_chain_forward(
         final_indices,
         checkpoints,
     )
-    return _compile_chain_forward(
+    return _compile_chain_forward.by_args(
         int(unit_chunks),
         int(b_t),
         bool(length_rule),

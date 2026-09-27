@@ -5996,7 +5996,7 @@ def chunk_gdn_bwd(
         tinv,
         workspace,
     )
-    compiled = _compile_gdn_bprop(
+    compiled = _compile_gdn_bprop.by_args(
         _dtype_name(q),
         _dtype_name(cu_seqlens),
         _dtype_name(gate),
