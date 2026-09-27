@@ -134,6 +134,11 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Fix:** `aligned()` copies such gate/beta into a 16-byte base (`plan.py`).
 - **Tests:** GL::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta. Fails without = YES.
 
+### R3 — Warmup forward state fakes shared one symbolic extent
+- A shared symbol forced equal extents on the distinct `state_in`/`state_out` fakes. Found while
+  writing the fake signatures; "Give the warmup forward state signatures independent extents". No
+  dedicated test.
+
 ### Other tests encoding decisions
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
   wait, B5 KDA FP32 factors, B11 terminal TMA overfetch (upstream bit-21 descriptor fix, NVIDIA

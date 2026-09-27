@@ -115,6 +115,15 @@ ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 ker
 guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta"]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R3"
+title = "Warmup forward state_in/state_out get independent fake extents"
+kind = "bugfix"
+ag_subject = "Give the warmup forward state signatures independent extents"
+guarding_tests = []
+gate = "none (no dedicated test; covered indirectly by GDN warmup split tests)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- features / integration
 [[fix]]
 id = "F1/F2/F4/F6/F9"

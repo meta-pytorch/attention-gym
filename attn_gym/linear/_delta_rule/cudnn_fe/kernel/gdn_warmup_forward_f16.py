@@ -285,7 +285,6 @@ def _compile_warmup_forward(
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
     name += f"_biasrank{0 if bias_spec is None else bias_spec[1]}"
     gate_align = 8 if gate_dtype.width == 16 else 4
-    state = tensor(state_dtype, 4, 16)
     return compile_tvm_ffi(
         warmup_forward_host,
         split,
@@ -322,8 +321,8 @@ def _compile_warmup_forward(
         tensor(io_dtype, 3, 16),
         make_cu_seqlens_signature(sym_int(), assumed_align=4),
         make_cu_seqlens_signature(sym_int(), assumed_align=4),
-        state if use_initial_state else None,
-        state if store_final_state else None,
+        tensor(state_dtype, 4, 16) if use_initial_state else None,
+        tensor(state_dtype, 4, 16) if store_final_state else None,
         make_counter_signature(sym_int()) if has_seed_indices else None,
         make_counter_signature(sym_int()) if has_final_indices else None,
         make_compact_signature_tensor(cutlass.Uint8, (sym_int(),), assumed_align=1) if has_initial_state else None,
