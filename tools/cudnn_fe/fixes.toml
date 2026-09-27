@@ -172,6 +172,7 @@ id = "R4"
 title = "Restore kda_recompute int64 selector; stop forcing selectors on GDN modules that no longer launch"
 kind = "bugfix"
 ag_subject = "Restore kda_recompute_f16's module-level int64 ABI selector"
+ag_subjects_extra = ["Stop forcing int64 selectors on GDN modules that no longer launch"]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference",
   "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32",

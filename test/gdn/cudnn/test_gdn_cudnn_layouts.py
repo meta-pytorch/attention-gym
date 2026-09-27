@@ -155,10 +155,8 @@ def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> N
     """Public forward and backward must actually exercise their forced-wide launch ABIs."""
     from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
         gdn_bprop_f16,
-        gdn_bprop_summary_f16,
         gdn_chain_backward_f16,
         gdn_chain_forward_f16,
-        gdn_recompute_f16,
         gdn_warmup_backward_f16,
         gdn_warmup_forward_f16,
     )
@@ -179,11 +177,9 @@ def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> N
     for module in (
         gdn_warmup_forward_f16,
         gdn_chain_forward_f16,
-        gdn_recompute_f16,
         gdn_bprop_f16,
         gdn_warmup_backward_f16,
         gdn_chain_backward_f16,
-        gdn_bprop_summary_f16,
     ):
 
         def force_wide(*tensors, name=module.__name__):
