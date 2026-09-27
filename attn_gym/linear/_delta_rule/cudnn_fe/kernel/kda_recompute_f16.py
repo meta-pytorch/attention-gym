@@ -2723,6 +2723,9 @@ def host(
         k_inv: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, cfg.k_inv_cosize], cfg.buffer_align_bytes
         ]
+        beta: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, cfg.beta_cosize], cfg.buffer_align_bytes
+        ]
         checkpoint: cute.struct.Align[
             cute.struct.MemRange[cfg.io_dtype, checkpoint_elements], cfg.buffer_align_bytes
         ]
@@ -2823,9 +2826,7 @@ def frost_kda_recompute(
             cute.make_layout((cfg.gate_exchange_cosize,))
         )
     sK_inv_raw = storage.k_inv.get_tensor(cute.make_layout((cfg.k_inv_cosize,)))
-    sBeta_raw = cutlass.Array(
-        cutlass.Float32, cfg.beta_cosize, space=SMEM, alignment=cfg.buffer_align_bytes
-    )
+    sBeta_raw = storage.beta.get_tensor(cute.make_layout((cfg.beta_cosize,)))
     sCheckpoint_raw = (
         storage.checkpoint.get_tensor(
             cute.make_layout((cfg.smem_checkpoint_stages * cfg.d_k * cfg.d_v,))
