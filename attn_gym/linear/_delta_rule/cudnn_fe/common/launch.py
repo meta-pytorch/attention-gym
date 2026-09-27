@@ -20,8 +20,9 @@ from .tvm_ffi import WORK_ITEM_FIELDS
 NAMED_BARRIER_IDS = range(1, 16)  # 0 is the CTA-wide barrier
 STATE_DIMS = (64, 128)
 TMEM_COLUMNS = 512
-# Base-pointer residue kept in a memoized check's key; every checked alignment divides it.
-_ALIGNMENT_RESIDUE = 1024
+# Base-pointer residue kept in a memoized check's key; every host-checked alignment divides it.
+# Larger would split keys on allocator placement (caching-allocator blocks are 512-byte rounded).
+_ALIGNMENT_RESIDUE = 128
 _MAX_MEMOIZED_CHECKS = 256
 
 
@@ -61,6 +62,7 @@ def memoize_launch_check(check: Callable[..., None]) -> Callable[..., None]:
             passed.clear()
         passed.add(key)
 
+    memoized.cache_clear = passed.clear
     return memoized
 
 
