@@ -17,7 +17,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. Register arrays are rmem tensors, SMEM data buffers share one
-# SharedStorage struct, and segment-major swizzle offsets use swizzle_box_offset_{128b,32b}.
+# SharedStorage struct, and segment-major swizzle offsets use swizzle_box_offset_{128b,32b}. The frozen
+# cfg launches through KdaSummaryOp, compiled from persisted fake TVM-FFI signatures.
 
 """
 Chunked Kimi Delta Attention (KDA) fused state-summary kernel for SM100 / SM103 / SM107 (Cutlass primitives): the BT = 16
@@ -76,8 +77,7 @@ Warp assignments (16 warps = 512 threads):
   warp  15      : register-MMA twin - KK and T_inv of the odd cumulative chunks
 """
 
-from dataclasses import dataclass
-import functools
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -85,14 +85,14 @@ import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.compat import SmemAllocator
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
-from ..common.host import get_dtype
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 from .kda_summary_config import CFG
 
 from ..tile_dsl.barrier import (
@@ -1965,71 +1965,103 @@ def prologue(
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
-@cute.jit
-def host(
-    cfg: cutlass.Constexpr,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    raw_gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
-    beta: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    initial_state: cute.Tensor | None,
-    final_state: cute.Tensor,
-    transition: cute.Tensor,
-    work_items: cute.Tensor,
-    work_count: cute.Tensor,
-    scheduler_counter: cute.Tensor,
-    tensormap_workspace: cute.Tensor,
-    stream,
-) -> None:
-    heads_out = cutlass.Int32(raw_gate.shape[1])
-    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
-    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
-    num_sequences = cu_seqlens.shape[0] - 1
+def _name_float(value: float) -> str:
+    return str(float(value)).replace(".", "p").replace("-", "m").replace("+", "")
 
-    @cute.struct
-    class SharedStorage:
-        k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_decay_cosize], cfg.buffer_align_bytes]
-        k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_restore_cosize], cfg.buffer_align_bytes]
-        intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.intermediate_cosize], cfg.buffer_align_bytes]
-        k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_cosize], cfg.buffer_align_bytes]
-        v: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes]
-        gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], 1024]
-        gate_exchange: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_exchange_cosize], 1024]  # 0 for fp32 Gate
-        k_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_inv_cosize], cfg.buffer_align_bytes]
-        beta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.beta_cosize], cfg.buffer_align_bytes]
 
-    # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
-    frost_kda_summary(
-        cfg,
-        SharedStorage,
-        k_ratio,
-        v_ratio,
-        tensormap_workspace,
-        cutlass.Int32(num_sequences),
-        k,
-        v,
-        raw_gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        final_state,
-        transition,
-        work_items,
-        work_count,
-        scheduler_counter,
-    ).launch(
-        grid=grid_shape,
-        block=(cfg.threads_per_cta, 1, 1),
-        stream=stream,
-        use_pdl=USE_PDL,
-        min_blocks_per_mp=1,
-    )
+class KdaSummaryOp:
+    """The fused summary launch for one frozen ``KdaSummaryCfg``; standalone or nested into the chain hosts."""
+
+    def __init__(self, cfg: "KdaSummaryCfg", use_int64_offsets: bool = False):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        flags = "".join(
+            str(int(flag))
+            for flag in (
+                cfg.use_initial_state,
+                cfg.l2norm,
+                cfg.safe_gate,
+                cfg.log_gate,
+                cfg.beta_sigmoid,
+                cfg.allow_neg_eigval,
+            )
+        )
+        dtypes = "_".join(t.__name__.lower() for t in (cfg.io_dtype, cfg.gate_dtype))
+        return (
+            f"kda_cudnn_summary_{dtypes}_k{cfg.d_k}_v{cfg.d_v}_f{flags}_g{_name_float(cfg.gate_scale_log2)}"
+            f"_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}"
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        raw_gate: cute.Tensor,
+        a_log: cute.Tensor | None,
+        dt_bias: cute.Tensor | None,
+        beta: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        initial_state: cute.Tensor | None,
+        final_state: cute.Tensor,
+        transition: cute.Tensor,
+        work_items: cute.Tensor,
+        work_count: cute.Tensor,
+        scheduler_counter: cute.Tensor,
+        tensormap_workspace: cute.Tensor,
+        stream,
+    ) -> None:
+        cfg = self.cfg
+        heads_out = cutlass.Int32(raw_gate.shape[1])
+        k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+        v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
+        num_sequences = cu_seqlens.shape[0] - 1
+
+        @cute.struct
+        class SharedStorage:
+            k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_decay_cosize], cfg.buffer_align_bytes]
+            k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_restore_cosize], cfg.buffer_align_bytes]
+            intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.intermediate_cosize], cfg.buffer_align_bytes]
+            k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_cosize], cfg.buffer_align_bytes]
+            v: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes]
+            gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], 1024]
+            gate_exchange: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_exchange_cosize], 1024]  # 0 for fp32 Gate
+            k_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_inv_cosize], cfg.buffer_align_bytes]
+            beta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.beta_cosize], cfg.buffer_align_bytes]
+
+        frost_kda_summary.set_name_prefix(self.get_name())
+        # ---- launch ----------------------------------------------------------------------
+        grid_shape = (cfg.max_active_clusters, 1, 1)
+        frost_kda_summary(
+            cfg,
+            SharedStorage,
+            k_ratio,
+            v_ratio,
+            tensormap_workspace,
+            cutlass.Int32(num_sequences),
+            k,
+            v,
+            raw_gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_seqlens,
+            initial_state,
+            final_state,
+            transition,
+            work_items,
+            work_count,
+            scheduler_counter,
+        ).launch(
+            grid=grid_shape,
+            block=(cfg.threads_per_cta, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+            min_blocks_per_mp=1,
+        )
 
 
 @cute.kernel
@@ -2287,7 +2319,7 @@ def frost_kda_summary(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class KdaSummaryCfg:
     """Kernel cfg: fixed BT=16 schedule constants plus the TMEM column offsets and SMEM cosizes stamped by ``build_cfg``;
     passed ``cfg``-first as a ``cutlass.Constexpr`` into ``host`` / ``kernel`` and every warp body."""
@@ -2315,13 +2347,13 @@ class KdaSummaryCfg:
     b_t: int = CFG.B_T
     threads_per_warp: int = CFG.THREADS_PER_WARP
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
-    threads_per_cta: int = 0
+    threads_per_cta: int = 0  # derived by build_cfg
     cg0_group_count: int = 2
     cg0_warps_per_group: int = 4
-    cg0_threads_per_group: int = 0
+    cg0_threads_per_group: int = 0  # derived by build_cfg
     cg0_group_sync_barrier_base_id: int = 1  # CG0 group g syncs on named-barrier id 1 + g
     cg0_tile_entry_barrier_id: int = 5  # CG0-wide (both groups) work-item entry sync
-    tmem_user_threads: int = 0
+    tmem_user_threads: int = 0  # derived by build_cfg
     tmem_lifecycle_barrier_id: int = 3
     num_regs_compute_group_0: int = CFG.NUM_REGS_COMPUTE_GROUP_0
     num_regs_compute_group_1: int = CFG.NUM_REGS_COMPUTE_GROUP_1
@@ -2334,36 +2366,36 @@ class KdaSummaryCfg:
     qk_scale_ready_stages: int = CFG.QK_SCALE_READY_STAGES
 
     # ---- TMEM column offsets of the two chains ---------------------------------------
-    tmem_state_acc_h_offset: int = 0
-    tmem_state_input_h_offset: int = 0
-    tmem_state_k_acc_h_offset: int = 0
-    tmem_u_acc_h_offset: int = 0
-    tmem_y_input_h_offset: int = 0
-    tmem_u_input_h_offset: int = 0
-    tmem_state_acc_m_offset: int = 0
-    tmem_state_input_m_offset: int = 0
-    tmem_state_k_acc_m_offset: int = 0
-    tmem_u_acc_m_offset: int = 0
-    tmem_y_input_m_offset: int = 0
-    tmem_u_input_m_offset: int = 0
+    tmem_state_acc_h_offset: int = 0  # derived by build_cfg
+    tmem_state_input_h_offset: int = 0  # derived by build_cfg
+    tmem_state_k_acc_h_offset: int = 0  # derived by build_cfg
+    tmem_u_acc_h_offset: int = 0  # derived by build_cfg
+    tmem_y_input_h_offset: int = 0  # derived by build_cfg
+    tmem_u_input_h_offset: int = 0  # derived by build_cfg
+    tmem_state_acc_m_offset: int = 0  # derived by build_cfg
+    tmem_state_input_m_offset: int = 0  # derived by build_cfg
+    tmem_state_k_acc_m_offset: int = 0  # derived by build_cfg
+    tmem_u_acc_m_offset: int = 0  # derived by build_cfg
+    tmem_y_input_m_offset: int = 0  # derived by build_cfg
+    tmem_u_input_m_offset: int = 0  # derived by build_cfg
 
     # ---- SMEM buffer cosizes ---------------------------------------------------------
-    k_cosize: int = 0
-    v_cosize: int = 0
-    gate_cosize: int = 0
-    gate_stage_elems: int = 0
-    gate_exchange_stages: int = 0
-    gate_exchange_cosize: int = 0
-    beta_cosize: int = 0
-    k_inv_cosize: int = 0
-    k_decay_cosize: int = 0
-    k_restore_cosize: int = 0
+    k_cosize: int = 0  # derived by build_cfg
+    v_cosize: int = 0  # derived by build_cfg
+    gate_cosize: int = 0  # derived by build_cfg
+    gate_stage_elems: int = 0  # derived by build_cfg
+    gate_exchange_stages: int = 0  # derived by build_cfg
+    gate_exchange_cosize: int = 0  # derived by build_cfg
+    beta_cosize: int = 0  # derived by build_cfg
+    k_inv_cosize: int = 0  # derived by build_cfg
+    k_decay_cosize: int = 0  # derived by build_cfg
+    k_restore_cosize: int = 0  # derived by build_cfg
 
     # ---- TMA transaction bytes per stage ---------------------------------------------
-    tma_k_bytes: int = 0
-    tma_v_bytes: int = 0
-    tma_gate_bytes: int = 0
-    intermediate_cosize: int = 0
+    tma_k_bytes: int = 0  # derived by build_cfg
+    tma_v_bytes: int = 0  # derived by build_cfg
+    tma_gate_bytes: int = 0  # derived by build_cfg
+    intermediate_cosize: int = 0  # derived by build_cfg
 
 
 def build_cfg(
@@ -2401,46 +2433,46 @@ def build_cfg(
         raise ValueError(f"the fused KDA summary serves DK, DV in {STATE_DIMS}, got DK={cfg.d_k} DV={cfg.d_v}")
     if cfg.smem_raw_stages % 2 != 0:
         raise ValueError("smem_raw_stages must be even: the CG0 ping-pong groups alias parity waits on odd rings")
-    cfg.threads_per_cta = 16 * cfg.threads_per_warp
-    cfg.cg0_threads_per_group = cfg.cg0_warps_per_group * cfg.threads_per_warp
-    cfg.tmem_user_threads = (1 + len(cfg.compute_group_1_warp_ids) + len(cfg.compute_group_0_warp_ids)) * cfg.threads_per_warp
     if cfg.cg0_warps_per_group != len(cfg.compute_group_1_warp_ids):
         raise ValueError("the state halves are packed by one CG0 group and by CG1: their warp counts must match")
-
-    cfg.tmem_state_acc_h_offset = 0
-    cfg.tmem_state_input_h_offset = cfg.tmem_state_acc_h_offset + cfg.d_k
-    cfg.tmem_state_k_acc_h_offset = cfg.tmem_state_input_h_offset + cfg.d_k // 2
-    cfg.tmem_u_acc_h_offset = cfg.tmem_state_k_acc_h_offset + cfg.b_t
-    cfg.tmem_y_input_h_offset = cfg.tmem_u_acc_h_offset + cfg.b_t
-    cfg.tmem_u_input_h_offset = cfg.tmem_y_input_h_offset + cfg.b_t // 2
-    cfg.tmem_state_acc_m_offset = cfg.tmem_u_input_h_offset + cfg.b_t // 2
-    cfg.tmem_state_input_m_offset = cfg.tmem_state_acc_m_offset + cfg.d_k
-    cfg.tmem_state_k_acc_m_offset = cfg.tmem_state_input_m_offset + cfg.d_k // 2
-    cfg.tmem_u_acc_m_offset = cfg.tmem_state_k_acc_m_offset + cfg.b_t
-    cfg.tmem_y_input_m_offset = cfg.tmem_u_acc_m_offset + cfg.b_t
-    cfg.tmem_u_input_m_offset = cfg.tmem_y_input_m_offset + cfg.b_t // 2
-    if cfg.tmem_u_input_m_offset + cfg.b_t // 2 > 512:
-        raise ValueError(f"TMEM layout exceeds 512 columns: {cfg.tmem_u_input_m_offset + cfg.b_t // 2}")
-
-    cfg.k_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
-    cfg.v_cosize = cfg.smem_raw_stages * cfg.d_v * cfg.b_t
-    cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8) // 4
-    cfg.gate_stage_elems = cfg.d_k * cfg.b_t
-    if gate_dtype == cutlass.Float32:
-        cfg.gate_exchange_stages = cfg.smem_raw_stages
-        cfg.gate_exchange_cosize = 0
-    else:
-        cfg.gate_exchange_stages = 4
-        cfg.gate_exchange_cosize = cfg.gate_exchange_stages * cfg.d_k * cfg.b_t
-    cfg.beta_cosize = cfg.smem_raw_stages * cfg.b_t
-    cfg.k_inv_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
-    cfg.k_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.k_restore_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.intermediate_cosize = cfg.smem_intermediate_stages * 2 * cfg.b_t * cfg.b_t
-    cfg.tma_k_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_v_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8)
-    return cfg
+    b_t, d_k, d_v, raw = cfg.b_t, cfg.d_k, cfg.d_v, cfg.smem_raw_stages
+    io_bytes, gate_bytes = cfg.io_dtype.width // 8, cfg.gate_dtype.width // 8
+    offsets = {}
+    base = 0
+    for chain in ("h", "m"):
+        offsets[f"tmem_state_acc_{chain}_offset"] = base
+        offsets[f"tmem_state_input_{chain}_offset"] = base + d_k
+        offsets[f"tmem_state_k_acc_{chain}_offset"] = base + d_k + d_k // 2
+        offsets[f"tmem_u_acc_{chain}_offset"] = base + d_k + d_k // 2 + b_t
+        offsets[f"tmem_y_input_{chain}_offset"] = base + d_k + d_k // 2 + 2 * b_t
+        offsets[f"tmem_u_input_{chain}_offset"] = base + d_k + d_k // 2 + 2 * b_t + b_t // 2
+        base = offsets[f"tmem_u_input_{chain}_offset"] + b_t // 2
+    if base > 512:
+        raise ValueError(f"TMEM layout exceeds 512 columns: {base}")
+    # A Float32 gate exchanges in place (empty exchange buffer over the raw gate stages).
+    gate_exchange_stages = raw if gate_dtype == cutlass.Float32 else 4
+    gate_exchange_cosize = 0 if gate_dtype == cutlass.Float32 else gate_exchange_stages * d_k * b_t
+    return replace(
+        cfg,
+        threads_per_cta=16 * cfg.threads_per_warp,
+        cg0_threads_per_group=cfg.cg0_warps_per_group * cfg.threads_per_warp,
+        tmem_user_threads=(1 + len(cfg.compute_group_1_warp_ids) + len(cfg.compute_group_0_warp_ids)) * cfg.threads_per_warp,
+        **offsets,
+        k_cosize=raw * d_k * b_t,
+        v_cosize=raw * d_v * b_t,
+        gate_cosize=raw * d_k * b_t * gate_bytes // 4,
+        gate_stage_elems=d_k * b_t,
+        gate_exchange_stages=gate_exchange_stages,
+        gate_exchange_cosize=gate_exchange_cosize,
+        beta_cosize=raw * b_t,
+        k_inv_cosize=cfg.smem_decay_stages * b_t * d_k,
+        k_decay_cosize=cfg.smem_decay_stages * d_k * b_t,
+        k_restore_cosize=cfg.smem_decay_stages * d_k * b_t,
+        intermediate_cosize=cfg.smem_intermediate_stages * 2 * b_t * b_t,
+        tma_k_bytes=d_k * b_t * io_bytes,
+        tma_v_bytes=d_v * b_t * io_bytes,
+        tma_gate_bytes=d_k * b_t * gate_bytes,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, Gate
@@ -2449,69 +2481,45 @@ TENSORMAP_DESC_ARRAYS = 3  # per-batch runtime TMA descriptors: K, V, Gate
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    state_dtype_str: str,
-    transition_dtype_str: str,
-    gate_dtype_str: str,
-    a_log_dtype_str: str,
-    dt_bias_dtype_str: str,
-    cu_dtype_str: str,
-    beta_dtype_str: str,
-    device: int,
-    num_sm: int,
-    DK: int,
-    DV: int,
-    use_initial_state: bool,
-    l2norm: bool,
-    safe_gate: bool,
-    gate_lower_bound: float,
-    log_gate: bool,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
-    run_order: bool,
-    order_gen: bool,
-):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
+def _dynamic(dtype, rank: int, align: int, use_int64_offsets: bool):
+    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last mode contiguous)."""
+    return make_dynamic_signature_tensor(dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets)
 
 
-def compile(
+def _work_table(use_int64_offsets: bool):
+    """The legacy work-item placeholder: compact ``[rows, WORK_ITEM_FIELDS]`` int32, only the row count dynamic."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    return make_compact_signature_tensor(cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16)
+
+
+@jit_cache
+def _compile_kda_summary(
     io_dtype,
     gate_dtype,
-    use_initial_state: bool,
+    beta_dtype,
+    a_log_dtype,
+    dt_bias_spec,
+    cu_seqlens_dtype,
+    state_in_dtype,
+    d_k: int,
+    d_v: int,
     l2norm: bool,
     safe_gate: bool,
     gate_scale_log2: float,
+    log_gate: bool,
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
-    *,
-    d_k: int,
-    d_v: int,
     num_sm: int,
-    log_gate: bool = True,
-    k_cute,
-    v_cute,
-    gate_cute,
-    a_log_cute,
-    dt_bias_cute,
-    beta_cute,
-    cu_seqlens_cute,
-    state_in_cute,
-    state_out_cute,
-    transition_cute,
-    work_items_cute,
-    work_count_cute,
-    scheduler_counter_cute,
-    tensormap_workspace_cute,
-    stream,
+    use_int64_offsets: bool,
 ):
-    """JIT-compile the fused KDA summary kernel for one static config."""
+    """Compile the fused summary for one static config.  ``a_log_dtype`` / ``state_in_dtype`` are None when the tensor
+    is absent; ``dt_bias_spec`` is ``(dtype, rank)`` or None.  Launch with live tensors in ``KdaSummaryOp.__call__``
+    order (k, v, gate, a_log, dt_bias, beta, cu_seqlens, initial_state, final_state, transition, work_items, work_count,
+    scheduler_counter, tensormap_workspace) on the current Torch stream."""
     cfg = build_cfg(
         io_dtype,
         gate_dtype,
-        use_initial_state=use_initial_state,
+        use_initial_state=state_in_dtype is not None,
         l2norm=l2norm,
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
@@ -2522,295 +2530,61 @@ def compile(
         d_k=d_k,
         d_v=d_v,
     )
-
-    return cute.compile(
-        host,
-        cfg,
-        k_cute,
-        v_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        beta_cute,
-        cu_seqlens_cute,
-        state_in_cute,
-        state_out_cute,
-        transition_cute,
-        work_items_cute,
-        work_count_cute,
-        scheduler_counter_cute,
-        tensormap_workspace_cute,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
+    i64 = use_int64_offsets
+    cu_align = 8 if cu_seqlens_dtype is cutlass.Int64 else 4
+    return compile_tvm_ffi(
+        KdaSummaryOp(cfg, use_int64_offsets),
+        _dynamic(io_dtype, 3, 16, i64),  # k
+        _dynamic(io_dtype, 3, 16, i64),  # v
+        _dynamic(gate_dtype, 3, 16, i64),  # gate
+        _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None,
+        _dynamic(dt_bias_spec[0], dt_bias_spec[1], 16, i64) if dt_bias_spec is not None else None,
+        _dynamic(beta_dtype, 2, 4, i64),  # beta
+        _dynamic(cu_seqlens_dtype, 1, cu_align, i64),  # cu_seqlens
+        _dynamic(state_in_dtype, 4, 16, i64) if state_in_dtype is not None else None,
+        _dynamic(cutlass.Float32, 4, 16, i64),  # final_state (H)
+        _dynamic(cutlass.Float32, 4, 16, i64),  # transition (M)
+        _work_table(i64),  # work_items
+        _dynamic(cutlass.Int32, 1, 4, i64),  # work_count
+        _dynamic(cutlass.Int32, 1, 4, i64),  # scheduler_counter
+        _dynamic(cutlass.Int64, 1, 128, i64),  # tensormap_workspace
+        opt_level=2,
     )
 
 
-def chunk_kda_summary(
-    k,
-    v,
-    gate,
-    beta,
-    cu_seqlens,
-    initial_state,
-    output_state,
-    output_transition,
-    use_qk_l2norm_in_kernel: bool = False,
-    safe_gate: bool = False,
-    gate_lower_bound: float = DEFAULT_GATE_LOWER_BOUND,
-    a_log=None,
-    dt_bias=None,
-    use_beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
-    work_items=None,
-    work_count=None,
-    scheduler_counter=None,
-    scheduler_all=None,
-    work_item_scratch=None,
-    order_in_prologue: bool = False,
-    *,
-    log_gate: bool = True,
-    tensormap_workspace,
-    device: int,
-    num_sm: int,
-    stream,
-    own_prologue: bool = True,
-) -> None:
-    """BT=16 fused KDA state summary: one launch writes H (``output_state``, fp32; ``initial_state`` or zero on an empty
-    sequence) and M (``output_transition``, fp32, stored domain ``M_buf = M^T`` with ``X_final = X_init @ M_buf + X_H``; identity on
-    an empty sequence) for every work item.  Innermost strides 1; DK, DV in {64, 128}.  log_gate: ``gate`` is the natural-log decay,
-    else alpha in (0, 1] floored at 1e-10; safe_gate overrides with ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``.
-    use_beta_sigmoid: ``beta`` holds io-dtype logits, else fp32 post-sigmoid.  work_items / work_count: REQUIRED; an item seeds when
-    ``compute_start == 0`` and stores when ``write_end == batch_num_chunks``.  scheduler_counter: ``[ticket, done]`` work-stealing
-    scratch zeroed before every launch (REQUIRED; the ordering prologue zeroes ``scheduler_all``).  work_item_scratch:
-    staged items the prologue LPT-orders (None: uncut table from ``cu_seqlens``).  own_prologue: launch the prologue here."""
-    k.shape[1]
-    HO = gate.shape[1]
-    DK = k.shape[2]
-    v.shape[1]
-    DV = v.shape[2]
-    if output_state is None or output_transition is None:
-        raise ValueError("the fused summary writes both output_state (H) and output_transition (M)")
-    if tuple(output_transition.shape) != (cu_seqlens.shape[0] - 1, HO, DK, DK):
-        raise ValueError(f"output_transition must be (num_seqs, HO, DK, DK), got {tuple(output_transition.shape)}")
-    if work_items is None or work_count is None or scheduler_counter is None:
-        raise ValueError("work_items, work_count and scheduler_counter are required")
-    use_initial_state = initial_state is not None
-    run_order = order_in_prologue
-    order_gen = order_in_prologue and work_item_scratch is None
-    if run_order and scheduler_all is None:
-        raise ValueError("order in the prologue requires scheduler_all (the prologue zeroes the scheduler rings)")
-
-    gate_scale_log2 = gate_lower_bound * LOG2_E
-
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
-    cu_stream = cuda_driver.CUstream(int(stream))
-
-    cache = get_compiled_cache(
-        str(k.dtype),
-        str(output_state.dtype),
-        str(output_transition.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(cu_seqlens.dtype),
-        str(beta.dtype),
-        device,
-        num_sm,
-        DK,
-        DV,
-        use_initial_state,
-        use_qk_l2norm_in_kernel,
-        safe_gate,
-        gate_lower_bound,
-        log_gate,
-        use_beta_sigmoid,
-        allow_neg_eigval,
+@jit_cache
+def _compile_kda_summary_prologue(
+    io_dtype,
+    gate_dtype,
+    cu_seqlens_dtype,
+    run_order: bool,
+    order_gen: bool,
+    use_int64_offsets: bool,
+):
+    """Compile the summary prologue for one static config.  Launch with live tensors in ``prologue`` order (k, v, gate,
+    cu_seqlens, work_item_staging, work_count, work_items, scheduler_all, tensormap_workspace); the staging table is
+    None unless ``run_order and not order_gen`` and ``scheduler_all`` is None unless ``run_order``."""
+    i64 = use_int64_offsets
+    cu_align = 8 if cu_seqlens_dtype is cutlass.Int64 else 4
+    dtypes = "_".join(t.__name__.lower() for t in (io_dtype, gate_dtype, cu_seqlens_dtype))
+    return compile_tvm_ffi(
+        prologue,
+        io_dtype,
+        CFG.B_T,
         run_order,
         order_gen,
-    )
-
-    if "compiled" not in cache:
-        io_dtype = get_dtype(k.dtype)
-        gate_dtype = get_dtype(gate.dtype)
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
-        beta_cute = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-
-        state_in_cute = None
-        if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        transition_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        work_items_cute = from_dlpack(work_items, assumed_align=16)
-        work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-
-        scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
-
-        tensormap_workspace_cute = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-
-        cache["compiled"] = compile(
-            io_dtype,
-            gate_dtype,
-            use_initial_state,
-            use_qk_l2norm_in_kernel,
-            safe_gate,
-            gate_scale_log2,
-            use_beta_sigmoid,
-            allow_neg_eigval,
-            d_k=DK,
-            d_v=DV,
-            log_gate=log_gate,
-            num_sm=num_sm,
-            k_cute=k_cute,
-            v_cute=v_cute,
-            gate_cute=gate_cute,
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            beta_cute=beta_cute,
-            cu_seqlens_cute=cu_seqlens_cute,
-            state_in_cute=state_in_cute,
-            state_out_cute=state_out_cute,
-            transition_cute=transition_cute,
-            work_items_cute=work_items_cute,
-            work_count_cute=work_count_cute,
-            scheduler_counter_cute=scheduler_counter_cute,
-            tensormap_workspace_cute=tensormap_workspace_cute,
-            stream=cu_stream,
-        )
-
-    compiled = cache["compiled"]
-    if own_prologue and "prologue" not in cache:
-        io_dtype = get_dtype(k.dtype)
-        k_placeholder = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_placeholder = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-        staging_placeholder = None
-        if run_order and not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        cache["prologue_scheduler_all"] = run_order
-        scheduler_placeholder = None
-        if run_order:
-            scheduler_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
-        cache["prologue"] = cute.compile(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            run_order,
-            order_gen,
-            k_placeholder,
-            v_placeholder,
-            gate_placeholder,
-            cu_placeholder,
-            staging_placeholder,
-            work_count_placeholder,
-            work_items_placeholder,
-            scheduler_placeholder,
-            workspace_placeholder,
-            cu_stream,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    if own_prologue:
-        cache["prologue"](
-            k,
-            v,
-            gate,
-            cu_seqlens,
-            work_item_scratch if run_order else None,
-            work_count,
-            work_items,
-            scheduler_all if run_order else None,
-            tensormap_workspace,
-            cu_stream,
-        )
-    compiled(
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state if use_initial_state else None,
-        output_state,
-        output_transition,
-        work_items,
-        work_count,
-        scheduler_counter,
-        tensormap_workspace,
-        cu_stream,
-    )
-    return cache
-
-
-def run_summary(
-    cache,
-    k,
-    v,
-    gate,
-    a_log,
-    dt_bias,
-    beta,
-    cu_seqlens,
-    initial_state,
-    output_state,
-    output_transition,
-    work_items,
-    work_count,
-    scheduler_counter,
-    scheduler_all,
-    work_item_scratch,
-    tensormap_workspace,
-    stream,
-    own_prologue=True,
-) -> None:
-    """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build,
-    so nothing here raises."""
-    cu_stream = cuda_driver.CUstream(int(stream))
-    if own_prologue:
-        cache["prologue"](
-            k,
-            v,
-            gate,
-            cu_seqlens,
-            work_item_scratch,
-            work_count,
-            work_items,
-            scheduler_all if cache["prologue_scheduler_all"] else None,
-            tensormap_workspace,
-            cu_stream,
-        )
-    cache["compiled"](
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        output_state,
-        output_transition,
-        work_items,
-        work_count,
-        scheduler_counter,
-        tensormap_workspace,
-        cu_stream,
+        _dynamic(io_dtype, 3, 16, i64),  # k
+        _dynamic(io_dtype, 3, 16, i64),  # v
+        _dynamic(gate_dtype, 3, 16, i64),  # gate
+        _dynamic(cu_seqlens_dtype, 1, cu_align, i64),  # cu_seqlens
+        _work_table(i64) if run_order and not order_gen else None,  # work_item_staging
+        _dynamic(cutlass.Int32, 1, 4, i64),  # work_count
+        _work_table(i64),  # work_items
+        _dynamic(cutlass.Int32, 1, 4, i64) if run_order else None,  # scheduler_all
+        _dynamic(cutlass.Int64, 1, 128, i64),  # tensormap_workspace
+        name=f"kda_cudnn_summary_prologue_{dtypes}_r{int(run_order)}_o{int(order_gen)}_i64{int(i64)}",
+        opt_level=2,
     )
 
 
 frost_kda_summary_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)
-frost_kda_summary.set_name_prefix("cudnn", remove_cutlass_symbol=False)

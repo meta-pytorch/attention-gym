@@ -16,13 +16,15 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe. The host nests the prep / prefill Ops, compiles through a
+# persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor needs it),
+# and launches with live tensors on the current Torch stream.
 
 """One compiled launch for the KDA warmup and uncut forwards: the split-K table (plan, scan and walk, warmup only), the
 prefill prologue and the prefill issued from a single host.  Every kernel, its host and the tensor placeholder each host
 was compiled with are the standalone modules' own; this host only sequences the launches, so the kernels' SASS is
 unchanged and the Python side crosses into the DSL once per call instead of two or three times.  A buffer that two hosts
-read through different placeholder types is passed twice, once per type: the table marks the gate at its element
+read through different signature types is passed twice, once per type: the table marks the gate at its element
 alignment along its last mode, a_log fully dynamic, dt_bias, work_items, work_count and item_scratch as 4-byte compact
 views, cu_seqlens at 4 bytes; the prologue and prefill mark the same buffers as the standalone prefill wrapper does."""
 
@@ -31,14 +33,19 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+import torch
 
-from .._persist import persistent_compile
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import requires_int64_abi
+
 from ..common import split_k
 from ..common.host import get_dtype
+from ..common.tvm_ffi import (
+    WORK_ITEM_FIELDS,
+    make_compact_signature_tensor,
+    make_dynamic_signature_tensor,
+)
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
-
-warmup_forward_cache = {}
 
 
 @cute.jit
@@ -57,7 +64,7 @@ def warmup_forward_host(
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     order_gen: cutlass.Constexpr[bool],
-    prefill_cfg: cutlass.Constexpr,
+    prefill_op: cutlass.Constexpr,
     tiles_per_head: cutlass.Constexpr[int],
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
@@ -97,7 +104,7 @@ def warmup_forward_host(
     scheduler: cute.Tensor,
     workspace: cute.Tensor,
     prep: cutlass.Constexpr[bool],
-    prep_cfg: cutlass.Constexpr,
+    prep_op: cutlass.Constexpr,
     prep_k_decay: Optional[cute.Tensor],
     prep_q_decay: Optional[cute.Tensor],
     prep_t: Optional[cute.Tensor],
@@ -167,13 +174,12 @@ def warmup_forward_host(
             prep_t,
             prep_a,
             prep_diag,
-            prep_cfg,
+            prep_op.cfg,
             prep_words,
             prep_rows,
             prep_row_count,
         )
-        kda_prep_f16.host(
-            prep_cfg,
+        prep_op(
             q,
             k,
             prep_words,
@@ -213,9 +219,7 @@ def warmup_forward_host(
             stream,
             tiles_per_head,
         )
-    prefill_host = kda_prep_prefill_f16.host if cutlass.const_expr(prep) else kda_prefill_f16.host
-    prefill_host(
-        prefill_cfg,
+    prefill_op(
         q,
         k,
         v,
@@ -237,6 +241,207 @@ def warmup_forward_host(
         scale,
         stream,
     )
+
+
+def _dynamic(dtype, rank: int, align: int, use_int64_offsets: bool):
+    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last mode contiguous)."""
+    return make_dynamic_signature_tensor(dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets)
+
+
+def _compact(dtype, tail: tuple, align: int, use_int64_offsets: bool):
+    """The legacy ``mark_compact_shape_dynamic(mode=0, ...)`` placeholder: row-major, only the leading mode dynamic."""
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    return make_compact_signature_tensor(dtype, (sym_int(), *tail), assumed_align=align)
+
+
+@jit_cache
+def _compile_warmup_forward(
+    facts_static: tuple,
+    io_dtype,
+    gate_dtype,
+    beta_dtype,
+    a_log_dtype,
+    dt_bias_spec,
+    cu_seqlens_dtype,
+    state_in_dtype,
+    state_out_dtype,
+    checkpoint_dtype,
+    d_k: int,
+    d_v: int,
+    tiles_per_head: int,
+    has_seed_indices: bool,
+    has_final_indices: bool,
+    gate_scale_log2: float,
+    use_qk_l2norm: bool,
+    use_beta_sigmoid: bool,
+    allow_neg_eigval: bool,
+    prep: bool,
+    use_int64_offsets: bool,
+):
+    """Compile the warmup / uncut forward host for one static config over fake tensors that repeat the standalone
+    builds' placeholders.  ``facts_static`` is the split table's constexpr facts (split, b_t, scan_rows, log_gate,
+    safe_gate, gate_channels, overhead_chunks, expand_num, warmup_cap, full_scan, num_sms); absent tensors have a None
+    dtype; ``dt_bias_spec`` is ``(dtype, trailing shape)`` or None."""
+    (
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        num_sms,
+    ) = facts_static
+    i64 = use_int64_offsets
+    state_dtype = cutlass.Float32
+    if state_out_dtype is not None:
+        state_dtype = state_out_dtype
+    if state_in_dtype is not None:
+        state_dtype = state_in_dtype
+    flags = dict(
+        l2norm=use_qk_l2norm,
+        safe_gate=safe_gate,
+        gate_scale_log2=gate_scale_log2,
+        log_gate=log_gate,
+        beta_sigmoid=use_beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
+        d_k=d_k,
+    )
+    prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
+    prefill_cfg = prefill_module.build_cfg(
+        io_dtype,
+        state_dtype,
+        gate_dtype,
+        use_initial_state=state_in_dtype is not None,
+        store_final_state=state_out_dtype is not None,
+        enable_checkpoints=checkpoint_dtype is not None,
+        max_active_clusters=num_sms,
+        d_v=d_v // tiles_per_head,
+        tiles_per_head=tiles_per_head,
+        **flags,
+    )
+    prefill_op_type = kda_prep_prefill_f16.KdaPrepPrefillOp if prep else kda_prefill_f16.KdaPrefillOp
+    prefill_op = prefill_op_type(prefill_cfg, i64)
+    prep_op = None
+    prep_signatures = [None] * 8
+    if prep:
+        prep_op = kda_prep_f16.KdaPrepOp(kda_prep_f16.build_cfg(io_dtype, gate_dtype, num_sm=num_sms, **flags), i64)
+        prep_signatures = [
+            _dynamic(io_dtype, 4, 128, i64),  # prep_k_decay
+            _dynamic(io_dtype, 4, 128, i64),  # prep_q_decay
+            _dynamic(io_dtype, 4, 128, i64),  # prep_t
+            _dynamic(cutlass.Int32, 3, 16, i64),  # prep_a
+            _dynamic(cutlass.Float32, 3, 16, i64),  # prep_diag
+            _dynamic(cutlass.Int64, 1, 128, i64),  # prep_words
+            _dynamic(cutlass.Int32, 2, 16, i64),  # prep_rows
+            _dynamic(cutlass.Int32, 1, 4, i64),  # prep_row_count
+        ]
+    a_log = _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None
+    a_log_table = _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None
+    dt_bias = dt_bias_table = None
+    if dt_bias_spec is not None:
+        dt_bias_dtype, dt_bias_tail = dt_bias_spec
+        dt_bias = _dynamic(dt_bias_dtype, 1 + len(dt_bias_tail), 16, i64)
+        dt_bias_table = _compact(dt_bias_dtype, dt_bias_tail, 4, i64)
+    static = (
+        *facts_static,
+        d_k,
+        d_v,
+        tiles_per_head,
+        state_in_dtype is not None,
+        state_out_dtype is not None,
+        checkpoint_dtype is not None,
+        has_seed_indices,
+        has_final_indices,
+        use_qk_l2norm,
+        use_beta_sigmoid,
+        allow_neg_eigval,
+        prep,
+        i64,
+    )
+    dtype_names = "_".join(
+        "none" if dtype is None else dtype.__name__.lower()
+        for dtype in (
+            io_dtype,
+            gate_dtype,
+            beta_dtype,
+            a_log_dtype,
+            None if dt_bias_spec is None else dt_bias_spec[0],
+            cu_seqlens_dtype,
+            state_in_dtype,
+            state_out_dtype,
+            checkpoint_dtype,
+        )
+    )
+    dt_bias_shape = "none" if dt_bias_spec is None else "x".join(str(n) for n in dt_bias_spec[1]) or "r1"
+    gate_tag = str(float(gate_scale_log2)).replace(".", "p").replace("-", "m").replace("+", "")
+    name = (
+        "kda_warmup_forward_" + "_".join(str(int(flag)) for flag in static)
+        + f"_{dtype_names}_bias{dt_bias_shape}_g{gate_tag}"
+    )
+    return compile_tvm_ffi(
+        warmup_forward_host,
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        cutlass.Int32(0),  # n_heads_out
+        num_sms,
+        io_dtype,
+        not split,  # order_gen
+        prefill_op,
+        tiles_per_head,
+        *(cutlass.Int32(0) for _ in range(3)),  # n_tiles, ideal_chunks, batch_size
+        cutlass.Float32(0),  # log2_thresh
+        cutlass.Float32(0),  # gate_scale_log2
+        *(cutlass.Int32(0) for _ in range(4)),  # n_scan_ctas, n_scan_blocks, n_walk_ctas, checkpoint_every_n
+        cutlass.Float32(0),  # scale
+        _dynamic(io_dtype, 3, 16, i64),  # q
+        _dynamic(io_dtype, 3, 16, i64),  # k
+        _dynamic(io_dtype, 3, 16, i64),  # v
+        _dynamic(gate_dtype, 3, 16, i64),  # gate
+        _dynamic(gate_dtype, 3, 8 if gate_dtype.width == 16 else 4, i64) if split else None,  # gate_table
+        a_log,
+        a_log_table,
+        dt_bias,
+        dt_bias_table,
+        _dynamic(beta_dtype, 2, 4, i64),  # beta
+        _dynamic(io_dtype, 3, 16, i64),  # o
+        _dynamic(cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64),  # cu_seqlens
+        _dynamic(cu_seqlens_dtype, 1, 4, i64),  # cu_seqlens_table
+        _dynamic(state_in_dtype, 4, 16, i64) if state_in_dtype is not None else None,
+        _dynamic(state_out_dtype, 4, 16, i64) if state_out_dtype is not None else None,
+        _dynamic(cutlass.Int32, 1, 4, i64) if has_seed_indices else None,
+        _dynamic(cutlass.Int32, 1, 4, i64) if has_final_indices else None,
+        _dynamic(checkpoint_dtype, 4, 16, i64) if checkpoint_dtype is not None else None,
+        _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 16, i64),  # work_items
+        _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 4, i64),  # work_items_table
+        _dynamic(cutlass.Int32, 1, 4, i64),  # work_count
+        _compact(cutlass.Int32, (), 4, i64),  # work_count_table
+        _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 16, i64) if split else None,  # staging
+        _compact(cutlass.Int32, (WORK_ITEM_FIELDS,), 4, i64) if split else None,  # item_scratch
+        _dynamic(cutlass.Float32, 2, 4, i64) if split else None,  # chunk_scratch
+        _dynamic(cutlass.Int32, 1, 4, i64),  # scheduler
+        _dynamic(cutlass.Int64, 1, 128, i64),  # workspace
+        prep,
+        prep_op,
+        *prep_signatures,
+        name=name,
+        opt_level=2,
+    )
+
+
+def _dtype_or_none(tensor):
+    return None if tensor is None else get_dtype(tensor.dtype)
 
 
 def build_warmup_forward(
@@ -287,13 +492,12 @@ def build_warmup_forward(
     prep_rows=None,
     prep_row_count=None,
 ):
-    """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the split-K geometry, the d_v split, state and
-    checkpoint presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat
-    the marks of the standalone split-table and prefill builds so every kernel compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
-    max(HQ, HV)
+    """Compile (persisted per static config: dtypes, dims, gate flags and bound, the split-K geometry, the d_v split,
+    state and checkpoint presence, the int64 ABI) the warmup or uncut forward launch over the buffers of one plan.  The
+    fake signatures repeat the marks of the standalone split-table and prefill builds so every kernel compiles as it
+    does there.  ``device`` and ``stream`` are unused: the compile is keyed on ``num_sm`` and launches on the current
+    Torch stream."""
+    del device, stream
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -311,171 +515,57 @@ def build_warmup_forward(
         gate_lower_bound=gate_lower_bound if safe_gate else None,
         expand_num=1,
     )
-    io_dtype = get_dtype(q.dtype)
-    gate_dtype = get_dtype(gate.dtype)
-    state_src = state_in if state_in is not None else state_out
-    state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
-    key = (
-        str(q.dtype),
-        str(gate.dtype),
-        str(beta.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(cu_seqlens.dtype),
-        str(state_src.dtype) if state_src is not None else "none",
-        int(device),
-        int(num_sm),
-        DK,
-        DV,
-        int(b_t),
-        bool(split),
-        facts.scan_rows,
-        bool(log_gate),
-        bool(safe_gate),
-        float(gate_lower_bound),
+    for name, tensor in (("seed_indices", seed_indices), ("final_indices", final_indices)):
+        if tensor is not None and tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must be int32, got {tensor.dtype}")
+    if work_items.shape[1:] != (WORK_ITEM_FIELDS,) or (split and item_scratch.shape[1:] != (WORK_ITEM_FIELDS,)):
+        raise ValueError(f"work-item tables must be [rows, {WORK_ITEM_FIELDS}]")
+    enable_checkpoints = int(checkpoint_every_n_tokens) > 0
+    if not enable_checkpoints:
+        checkpoints = None
+    tensors = (
+        q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, state_in, state_out, seed_indices,
+        final_indices, checkpoints, work_items, work_count, item_scratch, chunk_scratch, scheduler,
+        workspace, prep_k_decay, prep_q_decay, prep_t, prep_a, prep_diag, prep_words, prep_rows,
+        prep_row_count,
+    )
+    use_int64_offsets = requires_int64_abi(*tensors)
+    compiled = _compile_warmup_forward(
+        (
+            bool(facts.split),
+            int(facts.b_t),
+            int(facts.scan_rows),
+            bool(facts.log_gate),
+            bool(facts.safe_gate),
+            int(facts.gate_channels),
+            int(facts.overhead_chunks),
+            int(facts.expand_num),
+            int(facts.warmup_cap),
+            bool(facts.full_scan),
+            int(facts.num_sms),
+        ),
+        get_dtype(q.dtype),
+        get_dtype(gate.dtype),
+        get_dtype(beta.dtype),
+        _dtype_or_none(a_log),
+        (get_dtype(dt_bias.dtype), tuple(int(n) for n in dt_bias.shape[1:])) if dt_bias is not None else None,
+        cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32,
+        _dtype_or_none(state_in),
+        _dtype_or_none(state_out),
+        _dtype_or_none(checkpoints),
+        int(q.shape[2]),
+        int(v.shape[2]),
+        int(tiles_per_head),
+        seed_indices is not None,
+        final_indices is not None,
+        float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
         bool(use_qk_l2norm),
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
-        state_in is not None,
-        state_out is not None,
-        seed_indices is not None,
-        final_indices is not None,
-        int(checkpoint_every_n_tokens) > 0,
-        int(tiles_per_head),
         bool(prep),
+        use_int64_offsets,
     )
-    if key not in warmup_forward_cache:
-        prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
-        prefill_cfg = prefill_module.build_cfg(
-            io_dtype,
-            state_dtype,
-            gate_dtype,
-            use_initial_state=state_in is not None,
-            store_final_state=state_out is not None,
-            enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
-            l2norm=use_qk_l2norm,
-            safe_gate=safe_gate,
-            gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
-            log_gate=log_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            max_active_clusters=num_sm,
-            d_k=DK,
-            d_v=DV // tiles_per_head,
-            tiles_per_head=tiles_per_head,
-        )
-        prep_cfg = None
-        if prep:
-            prep_cfg = kda_prep_f16.build_cfg(
-                io_dtype,
-                gate_dtype,
-                num_sm=num_sm,
-                l2norm=use_qk_l2norm,
-                safe_gate=safe_gate,
-                gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
-                log_gate=log_gate,
-                beta_sigmoid=use_beta_sigmoid,
-                allow_neg_eigval=allow_neg_eigval,
-                d_k=DK,
-            )
-        prep_placeholders = [None] * 8
-        if prep:
-            prep_placeholders = [from_dlpack(rec, assumed_align=128).mark_layout_dynamic(leading_dim=3) for rec in (prep_k_decay, prep_q_decay, prep_t)]
-            prep_placeholders.append(from_dlpack(prep_a, assumed_align=16).mark_layout_dynamic(leading_dim=2))
-            prep_placeholders.append(from_dlpack(prep_diag, assumed_align=16).mark_layout_dynamic(leading_dim=2))
-            prep_placeholders.append(from_dlpack(prep_words, assumed_align=128).mark_layout_dynamic())
-            prep_placeholders.append(from_dlpack(prep_rows, assumed_align=16).mark_layout_dynamic(leading_dim=1))
-            prep_placeholders.append(from_dlpack(prep_row_count, assumed_align=4).mark_layout_dynamic())
-
-        gate_table_placeholder = None
-        dt_bias_table_placeholder = None
-        staging_placeholder = None
-        item_scratch_placeholder = None
-        chunk_scratch_placeholder = None
-        if split:
-            gate_table_placeholder = from_dlpack(gate, assumed_align=8 if facts.gate_elem_bytes == 2 else 4).mark_layout_dynamic(
-                leading_dim=len(gate.shape) - 1
-            )
-            staging_placeholder = from_dlpack(item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-            item_scratch_placeholder = from_dlpack(item_scratch, assumed_align=4)
-            item_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-            chunk_scratch_placeholder = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_placeholder.mark_layout_dynamic(leading_dim=1)
-        if dt_bias is not None:
-            dt_bias_table_placeholder = from_dlpack(dt_bias, assumed_align=4)
-            dt_bias_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_table_placeholder = from_dlpack(work_items, assumed_align=4)
-        work_items_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_table_placeholder = from_dlpack(work_count, assumed_align=4)
-        work_count_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        warmup_forward_cache[key] = persistent_compile(
-            "kda_warmup_forward",
-            key,
-            cute.compile,
-            warmup_forward_host,
-            facts.split,
-            facts.b_t,
-            facts.scan_rows,
-            facts.log_gate,
-            facts.safe_gate,
-            facts.gate_channels,
-            facts.overhead_chunks,
-            facts.expand_num,
-            facts.warmup_cap,
-            facts.full_scan,
-            cutlass.Int32(facts.n_heads_out),
-            facts.num_sms,
-            io_dtype,
-            not split,
-            prefill_cfg,
-            int(tiles_per_head),
-            cutlass.Int32(facts.n_tiles),
-            cutlass.Int32(facts.ideal_chunks),
-            cutlass.Int32(facts.batch_size),
-            cutlass.Float32(facts.log2_threshold),
-            cutlass.Float32(facts.gate_scale_log2),
-            cutlass.Int32(facts.n_scan_ctas),
-            cutlass.Int32(facts.n_scan_blocks),
-            cutlass.Int32(facts.n_walk_ctas),
-            cutlass.Int32(int(checkpoint_every_n_tokens)),
-            float(scale),
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            gate_table_placeholder,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
-            from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
-            dt_bias_table_placeholder,
-            from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
-            from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_in is not None else None,
-            from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_out is not None else None,
-            from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None,
-            from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
-            from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if int(checkpoint_every_n_tokens) > 0 else None,
-            work_items_placeholder,
-            work_items_table_placeholder,
-            from_dlpack(work_count, assumed_align=4).mark_layout_dynamic(),
-            work_count_table_placeholder,
-            staging_placeholder,
-            item_scratch_placeholder,
-            chunk_scratch_placeholder,
-            from_dlpack(scheduler, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(workspace, assumed_align=128).mark_layout_dynamic(),
-            bool(prep),
-            prep_cfg,
-            *prep_placeholders,
-            cuda.CUstream(int(stream)),
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    return warmup_forward_cache[key], facts
+    return compiled, facts
 
 
 def run_warmup_forward(
@@ -514,8 +604,9 @@ def run_warmup_forward(
     prep_rows=None,
     prep_row_count=None,
 ) -> None:
-    """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
-    plan validated the contract at build, so nothing here raises."""
+    """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches, on the
+    current Torch stream (``stream`` is unused).  The plan validated the contract at build, so nothing here raises."""
+    del stream
     compiled(
         facts.n_heads_out,
         facts.n_tiles,
@@ -563,5 +654,4 @@ def run_warmup_forward(
         prep_words,
         prep_rows,
         prep_row_count,
-        cuda.CUstream(int(stream)),
     )
