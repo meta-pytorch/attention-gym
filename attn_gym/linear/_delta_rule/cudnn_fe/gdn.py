@@ -117,7 +117,9 @@ def gdn_forward(
     if paged:
         # The chain seeds pieces through the state chain, which has no route predicates.
         plan = replace(plan, pieces=0)
-    o = torch.empty(tokens, heads_out, dim_v, dtype=q.dtype, device=device)
+    # Paged calls may end cu_seqlens before the token capacity; nothing writes that tail.
+    new = torch.zeros if paged else torch.empty
+    o = new(tokens, heads_out, dim_v, dtype=q.dtype, device=device)
     final_state = None
     if output_final_state:
         # Empty sequences emit no work item (compacted table), so seed their exit state here.
