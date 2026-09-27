@@ -208,6 +208,18 @@ guarding_tests = [
 ]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R6"
+title = "Paged outputs past cu_seqlens[-1] documented as unspecified (zero-fill reverted for cost)"
+kind = "feature"
+ag_subject = "Document that paged cuDNN output rows past cu_seqlens[-1] are unspecified"
+ag_subjects_extra = ["Zero-fill paged cuDNN outputs past cu_seqlens[-1]"]
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval",
+  "test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval",
+]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- performance
 [[fix]]
 id = "R2"

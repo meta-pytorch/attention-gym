@@ -383,23 +383,26 @@ def test_cudnn_paged_driver_rejects_split_and_final_state() -> None:
         )
 
 
-def test_cudnn_paged_output_is_zero_past_the_last_interval() -> None:
-    """Tokens after ``cu_seqlens[-1]`` belong to no sequence and must read as zero."""
+def test_cudnn_paged_writes_every_token_up_to_the_last_interval() -> None:
+    """Every token in ``[0, cu_seqlens[-1])`` is written: sequence tokens with their output and
+    null-route tokens with zeros. Rows past ``cu_seqlens[-1]`` are unspecified (not written)."""
     q, k, value, gate, beta, _state, _cu = make_gdn_test_inputs(
         (128,), key_heads=1, value_heads=2, seed=3
     )
-    cu_seqlens = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
     pool = torch.zeros(2, 2, 128, 128, device="cuda")
-    state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    state_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     expected, _final = _expected_from_cudnn(
-        tuple(t[:, :64] for t in (q, k, value, gate, beta)), pool[1:2].clone(), cu_seqlens
+        tuple(t[:, 32:96] for t in (q, k, value, gate, beta)),
+        pool[1:2].clone(),
+        torch.tensor([0, 64], device="cuda", dtype=torch.int32),
     )
     _paged((q, k, value, gate, beta), pool.clone(), state_indices, cu_seqlens)
-    # Leave NaN-filled output-sized blocks in the caching allocator so an unwritten tail shows.
+    # Leave NaN-filled output-sized blocks in the caching allocator so an unwritten token shows.
     poison = [torch.full_like(value, torch.nan) for _ in range(4)]
     del poison
 
     output = _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens)
 
-    torch.testing.assert_close(output[:, :64], expected, rtol=0, atol=0)
-    torch.testing.assert_close(output[:, 64:], torch.zeros_like(output[:, 64:]), rtol=0, atol=0)
+    torch.testing.assert_close(output[:, :32], torch.zeros_like(output[:, :32]), rtol=0, atol=0)
+    torch.testing.assert_close(output[:, 32:96], expected, rtol=0, atol=0)

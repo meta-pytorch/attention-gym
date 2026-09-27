@@ -151,6 +151,7 @@ def paged_chunk_gdn(
         cu_seqlens: Optional packed offsets shaped ``[N + 1]`` for batch-one inputs. Values
             must start at zero, be nondecreasing, and end at or before the physical token
             capacity ``T``; the tensor defines one interval per ``state_indices`` entry.
+            Output rows past ``cu_seqlens[-1]`` are not written and hold unspecified values.
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.

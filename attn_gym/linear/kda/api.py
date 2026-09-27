@@ -220,7 +220,8 @@ def paged_chunk_kda(
             non-positive indices produce zero output and leave the cache untouched.
         cu_seqlens: Packed offsets shaped ``[N + 1]`` for batch-one inputs, as
             contiguous ``int32`` on ``q.device``. They start at zero, never
-            decrease, may repeat for empty sequences, and may end before ``T``.
+            decrease, may repeat for empty sequences, and may end before ``T``; output rows
+            past ``cu_seqlens[-1]`` are not written and hold unspecified values.
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.

@@ -112,8 +112,7 @@ def kda_forward(
     if paged:
         # The piece chain has no paged routing; seed and store through the prefill instead.
         plan = replace(plan, pieces=0)
-    # Paged calls may end cu_seqlens before the token capacity; nothing writes that tail.
-    o = torch.zeros_like(v) if paged else torch.empty_like(v)
+    o = torch.empty_like(v)
     final_state = None
     if output_final_state:
         # Compacted empty sequences emit no work: seed their final state here.

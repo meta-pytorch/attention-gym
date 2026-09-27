@@ -254,6 +254,9 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   has seed/final indices but no has-initial-state mask; the hardest port. 6/8 KDA paged tests fail
   on the pre-commit tree; dense-prefill SASS unchanged; paged fwd vs main 0.88–0.90×. Reapply after
   B8; if upstream adds a has-initial-state mask, evaluate mapping AG routes onto it.
+- **R6 — paged tail unspecified.** Review asked for zero rows past `cu_seqlens[-1]`; the zero-fill
+  commit was measured and reverted (see Decisions), and the docstrings now say the rows are
+  unspecified.
 - **R2 — `compile_tvm_ffi(opt_level=...)`**, hosts keep O2 (see Lessons).
 
 ## 4. Restyle, pruning and infra (gated by SASS, not behavior)
@@ -275,6 +278,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 |---|---|---|
 | Shape-dependent KDA plans + pinned-plan tests | Auto plans keep v1.30 prep (fwd) and exact chain (bwd): T8192 H48 fwd 443.7→341.4 µs, fwd+bwd 2612.7→1836.8; T32768 H48 fwd+bwd 10362→6250. Prep/chain change arithmetic order, so bitwise tests pin the uncut plan and auto-plan companions use rel-L2 < 1e-2 (GDN policy from #604). | Planner heuristics change or new GPU. |
 | KDA stateful backward via the composed op | Public `chunk_kda` with `initial_state` backprops through `chunk_bwd_recompute_factors_with_state_grad_op`; the native stateful bprop is exercised directly by B3's test. R15 hardened its beta. | Routing public stateful bwd to the native kernel (then retarget R9's stress test). |
+| Paged tail unspecified (R6) | Full-output memset cost 31–33 µs (≈200 MB) per paged call at 16k tok × 48 heads, +5.7% on kda_paged_4x4096. If needed, fill only rows ≥ `cu_seqlens[-1]` or do it in-kernel. | A consumer needs defined tail rows. |
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |

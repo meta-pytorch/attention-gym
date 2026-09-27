@@ -143,14 +143,14 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 32 modification rows below are generated from
+The 33 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 32 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 33 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
@@ -168,6 +168,7 @@ subjects, guarding node IDs, gates and upstream status. Regenerate with
 | F7/F8 | Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds | `test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds` |
 | F5 | Grouped q/k GDN backward through deterministic AG group_sum | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward` |
 | F3 | Paged recurrent state (null/fresh/resumed/empty routes) in the v1.30 GDN/KDA prefill | `test/test_cudnn_fe_paged_order.py::test_paged_order_keeps_only_nonempty_and_fresh_empty_routes`; `test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_are_null`; `test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_never_touch_the_pool` |
+| R6 | Paged outputs past cu_seqlens[-1] documented as unspecified (zero-fill reverted for cost) | `test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval`; `test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval` |
 | R2 | compile_tvm_ffi takes opt_level; hosts keep O2 | `test/test_cute_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option` |
 | S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
 | S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
