@@ -19,6 +19,8 @@
 # attn_gym.linear._delta_rule.cudnn_fe. The T_inv and V rings live in a SharedStorage struct, raw
 # SMEM pointers go through smem_data_ptr, and the checkpoint staging offset uses
 # swizzle_box_offset_128b.
+# Modified by Attention Gym in 2026: frozen cfg (build_cfg derives the SMEM cosizes and TMA byte
+# counts) and jit_cache fake-tensor TVM-FFI compiles for the standalone launcher.
 
 """
 Chunked Gated Delta Net (GDN) recompute (state/checkpoint-only) kernel for SM100 / SM103 / SM107
@@ -73,8 +75,8 @@ Warp assignments (8 warps = 256 threads):
   warp  7       : epilogue warp  - checkpoint TMA stores
 """
 
-import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -83,13 +85,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
-from cutlass.cute.runtime import from_dlpack
-
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import decode_head, ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, expanded_cu_seqlen, order_body
 from ..common.host import get_dtype
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from ..tile_dsl.barrier import (
@@ -1481,21 +1484,7 @@ def host(
             ),
         )
 
-    # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
-    bytes_per_element = cfg.io_dtype.width // 8
-    kq_tile_elements = 2 * cfg.b_t * cfg.d_k
-    v_tile_elements = cfg.d_v * cfg.b_t
-    tinv_tile_elements = cfg.b_t * cfg.b_t
-    cfg.kq_cosize = kq_tile_elements * cfg.smem_kq_stages
-    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-    cfg.checkpoint_cosize = cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages
-
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
-
-    cfg.tma_kq_bytes = (kq_tile_elements // 2) * bytes_per_element
-    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
 
     num_descs = batch_size
 
@@ -1787,14 +1776,13 @@ def frost_gdn_recompute(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnRecomputeCfg:
     """Per-compile GDN kernel knob, built by ``build_cfg``.
 
-    The per-compile parameters (dtypes, GQA, state flags) are the
-    ``cute.compile`` cache keys; the rest is derived from the module-global
-    ``CFG`` constants.  ``host`` stamps the shape-derived fields at trace
-    time.  Passed ``cfg``-first (a ``cutlass.Constexpr``) into ``host`` /
+    The per-compile parameters (dtypes, GQA, state flags) are the compile
+    cache keys; the rest, including the SMEM cosizes and TMA byte counts, is
+    derived by ``build_cfg`` from the module-global ``CFG`` constants.  Passed ``cfg``-first (a ``cutlass.Constexpr``) into ``host`` /
     ``kernel`` and every warp body.
     """
 
@@ -1848,7 +1836,7 @@ class GdnRecomputeCfg:
     tmem_y_decay_u_input_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time (shape-derived) -------------------------------
+    # ---- SMEM cosizes and TMA byte counts, derived by build_cfg ----------------------
     kq_cosize: int = 0
     v_cosize: int = 0
     t_inv_cosize: int = 0
@@ -1896,20 +1884,41 @@ def build_cfg(
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
     )
-    cfg.smem_checkpoint_stages = 1
-    if enable_checkpoints:
-        cfg.smem_kq_stages = 3
+    smem_kq_stages = 3 if enable_checkpoints else cfg.smem_kq_stages
+    num_regs_compute_group_1 = cfg.num_regs_compute_group_1
+    num_regs_other = cfg.num_regs_other
     if not (use_initial_state or seed_identity):
-        cfg.num_regs_compute_group_1 = 232
-        cfg.num_regs_other = 48
+        num_regs_compute_group_1 = 232
+        num_regs_other = 48
+    smem_checkpoint_stages = 1
     n_cg1 = len(cfg.compute_group_1_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg1)
-    cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_cg1)
-    cfg.tmem_state_acc_offset = 0
-    cfg.tmem_state_input_offset = cfg.tmem_state_acc_offset + cfg.tmem_state_acc_stages * cfg.d_k
-    cfg.tmem_cg1_acc_offset = cfg.tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
-    cfg.tmem_y_decay_u_input_offset = cfg.tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t
-    return cfg
+    warp = cfg.threads_per_warp
+    tmem_state_input_offset = cfg.tmem_state_acc_stages * cfg.d_k
+    tmem_cg1_acc_offset = tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
+    bytes_per_element = io_dtype.width // 8
+    kq_tile = 2 * cfg.b_t * cfg.d_k
+    v_tile = cfg.d_v * cfg.b_t
+    tinv_tile = cfg.b_t * cfg.b_t
+    return replace(
+        cfg,
+        smem_checkpoint_stages=smem_checkpoint_stages,
+        smem_kq_stages=smem_kq_stages,
+        num_regs_compute_group_1=num_regs_compute_group_1,
+        num_regs_other=num_regs_other,
+        threads_per_cta=warp * (4 + n_cg1),
+        tmem_user_threads=warp * (1 + n_cg1),
+        tmem_state_acc_offset=0,
+        tmem_state_input_offset=tmem_state_input_offset,
+        tmem_cg1_acc_offset=tmem_cg1_acc_offset,
+        tmem_y_decay_u_input_offset=tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t,
+        kq_cosize=kq_tile * smem_kq_stages,
+        v_cosize=v_tile * cfg.smem_v_stages,
+        t_inv_cosize=tinv_tile * cfg.smem_t_inv_stages,
+        checkpoint_cosize=cfg.d_k * cfg.d_v * smem_checkpoint_stages,
+        tma_kq_bytes=(kq_tile // 2) * bytes_per_element,
+        tma_v_bytes=v_tile * bytes_per_element,
+        tma_tinv_bytes=tinv_tile * bytes_per_element,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: K, V, checkpoints, tinv
@@ -1918,79 +1927,197 @@ TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: K, V, checkpoint
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    state_dtype_str: str,
-    cu_dtype_str: str,
-    gate_dtype_str: str,
-    a_log_dtype_str: str,
-    dt_bias_dtype_str: str,
-    device: int,
+_INDEX_DTYPES = {"int32": cutlass.Int32, "int64": cutlass.Int64}
+
+
+def _index_dtype(name: str):
+    return _INDEX_DTYPES[name]
+
+
+def _index_align(name: str) -> int:
+    return 8 if name == "int64" else 4
+
+
+def _dtype_or_none(name: str):
+    return None if name == "none" else get_dtype(name)
+
+
+def _dtype_name(tensor) -> str:
+    return "none" if tensor is None else str(tensor.dtype).removeprefix("torch.")
+
+
+class GdnRecomputeOp:
+    """Standalone recompute launch over ``host`` for one static config."""
+
+    def __init__(self, cfg: GdnRecomputeCfg, use_int64_offsets: bool = False, dtypes: str = ""):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+        self.dtypes = dtypes
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        flags = "".join(
+            str(int(flag))
+            for flag in (
+                cfg.use_initial_state,
+                cfg.store_final_state,
+                cfg.enable_checkpoints,
+                cfg.seed_checkpoints,
+                cfg.log_gate,
+                cfg.safe_gate,
+                cfg.seed_identity,
+                cfg.v_is_zero,
+            )
+        )
+        return (
+            f"gdn_cudnn_recompute_{cfg.io_dtype.__name__.lower()}_{cfg.state_dtype.__name__.lower()}"
+            f"_k{cfg.d_k}_v{cfg.d_v}_e{cfg.expand_num}_t{cfg.tiles_per_head}_f{flags}_{self.dtypes}"
+            f"_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}"
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        gate: cute.Tensor,
+        a_log: Optional[cute.Tensor],
+        dt_bias: Optional[cute.Tensor],
+        cu_seqlens: cute.Tensor,
+        state_in: Optional[cute.Tensor],
+        state_out: Optional[cute.Tensor],
+        seed_state_checkpoints: Optional[cute.Tensor],
+        tinv: cute.Tensor,
+        work_items: Optional[cute.Tensor],
+        work_count: Optional[cute.Tensor],
+        scheduler_counter: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seed_every_n_tokens: cutlass.Int32,
+        tensormap_workspace: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        host(
+            self.cfg,
+            k,
+            v,
+            gate,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            state_in,
+            state_out,
+            seed_state_checkpoints,
+            tinv,
+            work_items,
+            work_count,
+            scheduler_counter,
+            checkpoint_every_n_tokens,
+            seed_every_n_tokens,
+            tensormap_workspace,
+            stream,
+        )
+
+
+class GdnRecomputePrologueOp:
+    """Standalone recompute prologue launch; a class so ``tiles_per_head`` can follow the stream."""
+
+    def __init__(
+        self,
+        io_dtype: Type[cutlass.Numeric],
+        run_order: bool,
+        order_gen: bool,
+        gen_intervals: bool,
+        expand_num: int,
+        tiles_per_head: int,
+        name: str,
+    ):
+        self.io_dtype = io_dtype
+        self.run_order = run_order
+        self.order_gen = order_gen
+        self.gen_intervals = gen_intervals
+        self.expand_num = expand_num
+        self.tiles_per_head = tiles_per_head
+        self.name = name
+
+    def get_name(self) -> str:
+        return self.name
+
+    @cute.jit
+    def __call__(
+        self,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        gate: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        state_checkpoints_out: Optional[cute.Tensor],
+        work_item_staging: Optional[cute.Tensor],
+        work_count: cute.Tensor,
+        work_items: cute.Tensor,
+        scheduler_all: Optional[cute.Tensor],
+        checkpoint_every_n: cutlass.Int32,
+        seed_span_chunks: cutlass.Int32,
+        tinv: cute.Tensor,
+        tensormap_workspace: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        prologue(
+            self.io_dtype,
+            CFG.B_T,
+            self.run_order,
+            self.order_gen,
+            self.gen_intervals,
+            self.expand_num,
+            k,
+            v,
+            gate,
+            cu_seqlens,
+            state_checkpoints_out,
+            work_item_staging,
+            work_count,
+            work_items,
+            scheduler_all,
+            checkpoint_every_n,
+            seed_span_chunks,
+            tinv,
+            tensormap_workspace,
+            stream,
+            self.tiles_per_head,
+        )
+
+
+@jit_cache
+def _compile_gdn_recompute(
+    io_dtype: str,
+    state_in_dtype: str,
+    state_out_dtype: str,
+    seed_dtype: str,
+    cu_dtype: str,
+    gate_dtype: str,
+    a_log_dtype: str,
+    dt_bias_dtype: str,
     num_sm: int,
-    DK: int,
-    DV: int,
+    d_k: int,
+    d_v: int,
     expand_num: int,
-    use_initial_state: bool,
-    store_final_state: bool,
+    tiles_per_head: int,
     enable_checkpoints: bool,
-    seed_checkpoints: bool,
     log_gate: bool,
     safe_gate: bool,
     seed_identity: bool,
     v_is_zero: bool,
-    run_order: bool,
-    order_gen: bool,
-    tiles_per_head: int,
+    use_int64_offsets: bool,
 ):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
-
-
-def compile(
-    io_dtype,
-    state_dtype,
-    use_initial_state: bool,
-    store_final_state: bool,
-    enable_checkpoints: bool,
-    seed_checkpoints: bool = False,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    seed_identity: bool = False,
-    v_is_zero: bool = False,
-    *,
-    num_sm: int,
-    d_k: int,
-    d_v: int,
-    expand_num: int = 1,
-    tiles_per_head: int = 1,
-    k_cute,
-    v_cute,
-    gate_cute,
-    a_log_cute=None,
-    dt_bias_cute=None,
-    cu_seqlens_cute,
-    state_in_cute,
-    state_out_cute,
-    seed_checkpoints_cute=None,
-    tinv_cute,
-    work_items_cute=None,
-    work_count_cute=None,
-    scheduler_counter_cute=None,
-    checkpoint_every_n_tokens,
-    seed_every_n_tokens,
-    workspace_cute,
-    stream,
-):
-    """JIT-compile the chunked GDN recompute kernel for one static config."""
+    """Compile the recompute main launch over the upstream dynamic-layout tensor ABI."""
+    io = get_dtype(io_dtype)
+    state_dtype = _dtype_or_none(state_in_dtype) or _dtype_or_none(state_out_dtype) or cutlass.Float32
     cfg = build_cfg(
-        io_dtype,
+        io,
         state_dtype,
         max_active_clusters=num_sm,
-        use_initial_state=use_initial_state,
-        store_final_state=store_final_state,
+        use_initial_state=state_in_dtype != "none",
+        store_final_state=state_out_dtype != "none",
         enable_checkpoints=enable_checkpoints,
-        seed_checkpoints=seed_checkpoints,
+        seed_checkpoints=seed_dtype != "none",
         log_gate=log_gate,
         safe_gate=safe_gate,
         seed_identity=seed_identity,
@@ -2000,28 +2127,74 @@ def compile(
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
     )
+    dtypes = "_".join((state_in_dtype, state_out_dtype, seed_dtype, cu_dtype, gate_dtype, a_log_dtype, dt_bias_dtype))
+    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
 
-    return cute.compile(
-        host,
-        cfg,
-        k_cute,
-        v_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        cu_seqlens_cute,
-        state_in_cute,
-        state_out_cute,
-        seed_checkpoints_cute,
-        tinv_cute,
-        work_items_cute,
-        work_count_cute,
-        scheduler_counter_cute,
-        checkpoint_every_n_tokens,
-        seed_every_n_tokens,
-        workspace_cute,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
+    def optional(dtype_name, rank, align):
+        dtype = _dtype_or_none(dtype_name)
+        return None if dtype is None else dyn(dtype, rank, assumed_align=align)
+
+    return compile_tvm_ffi(
+        GdnRecomputeOp(cfg, use_int64_offsets, dtypes),
+        dyn(io, 3, assumed_align=16),
+        dyn(io, 3, assumed_align=16),
+        dyn(get_dtype(gate_dtype), 2, assumed_align=16),
+        optional(a_log_dtype, 1, 4),
+        optional(dt_bias_dtype, 1, 4),
+        dyn(_index_dtype(cu_dtype), 1, assumed_align=_index_align(cu_dtype)),
+        optional(state_in_dtype, 4, 16),
+        optional(state_out_dtype, 4, 16),
+        optional(seed_dtype, 4, 16),
+        dyn(io, 4, assumed_align=128),
+        make_compact_signature_tensor(cutlass.Int32, (cute.sym_int(), WORK_ITEM_FIELDS), assumed_align=16),
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        dyn(cutlass.Int64, 1, assumed_align=128),
+        opt_level=2,
+    )
+
+
+@jit_cache
+def _compile_gdn_recompute_prologue(
+    io_dtype: str,
+    gate_dtype: str,
+    cu_dtype: str,
+    checkpoint_dtype: str,
+    run_order: bool,
+    order_gen: bool,
+    gen_intervals: bool,
+    expand_num: int,
+    tiles_per_head: int,
+    use_int64_offsets: bool,
+):
+    """Compile the standalone recompute descriptor (and optional ordering) prologue."""
+    io = get_dtype(io_dtype)
+    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
+    items = partial(make_compact_signature_tensor, cutlass.Int32, assumed_align=16)
+    checkpoint = _dtype_or_none(checkpoint_dtype)
+    flags = "".join(str(int(flag)) for flag in (run_order, order_gen, gen_intervals))
+    name = (
+        f"gdn_cudnn_recompute_prologue_{io_dtype}_{gate_dtype}_{cu_dtype}_{checkpoint_dtype}"
+        f"_e{expand_num}_t{tiles_per_head}_f{flags}_i64{int(use_int64_offsets)}"
+    )
+    return compile_tvm_ffi(
+        GdnRecomputePrologueOp(io, run_order, order_gen, gen_intervals, expand_num, tiles_per_head, name),
+        dyn(io, 3, assumed_align=16),
+        dyn(io, 3, assumed_align=16),
+        dyn(get_dtype(gate_dtype), 2, assumed_align=16),
+        dyn(_index_dtype(cu_dtype), 1, assumed_align=_index_align(cu_dtype)),
+        None if checkpoint is None else dyn(checkpoint, 4, assumed_align=16),
+        None if order_gen else items((cute.sym_int(), WORK_ITEM_FIELDS)),
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        items((cute.sym_int(), WORK_ITEM_FIELDS)),
+        dyn(cutlass.Int32, 1, assumed_align=4) if run_order or gen_intervals else None,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        dyn(io, 4, assumed_align=128),
+        dyn(cutlass.Int64, 1, assumed_align=128),
+        opt_level=2,
     )
 
 
@@ -2063,8 +2236,8 @@ def chunk_gdn_recompute(
     THD / varlen entry).
 
     All tensors are DLPack-compatible CUDA tensors on the same device with a
-    stride-1 innermost dim (outer strides are runtime arguments).  Compile-cache-and-replay: the kernel is compiled once per static
-    config (dtypes, head counts, state flags) and replayed afterwards.
+    stride-1 innermost dim (outer strides are runtime arguments).  Compiles through the persistent ``jit_cache`` once per static
+    config (dtypes, head counts, state flags) and launches on the current torch stream.
 
     Args:
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
@@ -2112,8 +2285,6 @@ def chunk_gdn_recompute(
             managed here, reuse the same buffer across calls)
         stream: CUDA stream handle (``cudaStream_t`` as an int)
     """
-    k.shape[1]
-    gate.shape[1]
     DK = k.shape[2]
     if v_is_zero:
         if checkpoint_every_n_tokens > 0 or seed_state_checkpoints is not None:
@@ -2121,7 +2292,6 @@ def chunk_gdn_recompute(
         v = k if v is None else v
         DV = DK
     else:
-        v.shape[1]
         DV = v.shape[2]
     if seed_identity:
         if initial_state is not None:
@@ -2130,9 +2300,6 @@ def chunk_gdn_recompute(
             raise ValueError("seed_identity requires a square (DK, DK) state")
         if checkpoint_every_n_tokens > 0 or seed_state_checkpoints is not None:
             raise ValueError("seed_identity does not support checkpoint staging")
-    cu_seqlens.shape[0] - 1
-    use_initial_state = initial_state is not None
-    store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
     seed_checkpoints = seed_state_checkpoints is not None
     gen_intervals = seed_checkpoints
@@ -2153,189 +2320,73 @@ def chunk_gdn_recompute(
     if not safe_gate:
         a_log = None
         dt_bias = None
-    io_dtype = get_dtype(k.dtype)
-
-    if initial_state is not None:
-        state_dtype_src = initial_state.dtype
-    elif output_state is not None:
-        state_dtype_src = output_state.dtype
-    else:
-        state_dtype_src = None
-    state_dtype = get_dtype(state_dtype_src) if state_dtype_src is not None else cutlass.Float32
-
-    cu_stream = cuda.CUstream(int(stream))
-    cache = get_compiled_cache(
-        str(k.dtype),
-        str(state_dtype_src),
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        device,
-        num_sm,
-        DK,
-        DV,
-        expand_num,
-        use_initial_state,
-        store_final_state,
-        enable_checkpoints,
-        seed_checkpoints,
-        log_gate,
-        safe_gate,
-        seed_identity,
-        v_is_zero,
-        run_order,
-        order_gen,
-        tiles_per_head,
+    checkpoints = output_state_checkpoints if enable_checkpoints else None
+    work_item_staging = work_item_scratch if not order_gen else None
+    scheduler_all = scheduler_all if (run_order or gen_intervals) else None
+    use_int64_offsets = requires_int64_abi(
+        k, v, gate, a_log, dt_bias, cu_seqlens, initial_state, output_state, checkpoints,
+        seed_state_checkpoints, tinv, workspace,
     )
-
-    if "compiled" not in cache:
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-
-        state_in_cute = None
-        if use_initial_state:
-            state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        state_out_cute = None
-        if store_final_state:
-            state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        seed_checkpoints_cute = None
-        if seed_checkpoints:
-            seed_checkpoints_cute = from_dlpack(seed_state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-        tinv_cute = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
-
-        workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-
-        work_items_cute = from_dlpack(work_items, assumed_align=16)
-        work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-
-        scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
-
-        cache["compiled"] = compile(
-            io_dtype,
-            state_dtype,
-            use_initial_state,
-            store_final_state,
+    cache = {
+        "compiled": _compile_gdn_recompute(
+            _dtype_name(k),
+            _dtype_name(initial_state),
+            _dtype_name(output_state),
+            _dtype_name(seed_state_checkpoints),
+            _dtype_name(cu_seqlens),
+            _dtype_name(gate),
+            _dtype_name(a_log),
+            _dtype_name(dt_bias),
+            num_sm,
+            DK,
+            DV // tiles_per_head,
+            expand_num,
+            tiles_per_head,
             enable_checkpoints,
-            seed_checkpoints,
             log_gate,
             safe_gate,
             seed_identity,
             v_is_zero,
-            num_sm=num_sm,
-            d_k=DK,
-            d_v=DV // tiles_per_head,
-            expand_num=expand_num,
-            tiles_per_head=tiles_per_head,
-            k_cute=k_cute,
-            v_cute=v_cute,
-            gate_cute=gate_cute,
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            cu_seqlens_cute=cu_seqlens_cute,
-            state_in_cute=state_in_cute,
-            state_out_cute=state_out_cute,
-            seed_checkpoints_cute=seed_checkpoints_cute,
-            tinv_cute=tinv_cute,
-            work_items_cute=work_items_cute,
-            work_count_cute=work_count_cute,
-            scheduler_counter_cute=scheduler_counter_cute,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            seed_every_n_tokens=seed_every_n_tokens,
-            workspace_cute=workspace_cute,
-            stream=cu_stream,
+            use_int64_offsets,
         )
-
-    compiled = cache["compiled"]
-
-    if own_prologue and "prologue" not in cache:
-        k_placeholder = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        v_placeholder = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        gate_placeholder = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        checkpoints_placeholder = None
-        if enable_checkpoints:
-            checkpoints_placeholder = from_dlpack(output_state_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        staging_placeholder = None
-        if not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        scheduler_all_placeholder = None
-        if run_order or gen_intervals:
-            scheduler_all_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
-        workspace_placeholder = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        tinv_placeholder = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
-        cache["prologue"] = cute.compile(
-            prologue,
-            io_dtype,
-            CFG.B_T,
+    }
+    if own_prologue:
+        cache["prologue"] = _compile_gdn_recompute_prologue(
+            _dtype_name(k),
+            _dtype_name(gate),
+            _dtype_name(cu_seqlens),
+            _dtype_name(checkpoints),
             run_order,
             order_gen,
             gen_intervals,
             expand_num,
-            k_placeholder,
-            v_placeholder,
-            gate_placeholder,
-            cu_placeholder,
-            checkpoints_placeholder,
-            staging_placeholder,
-            work_count_placeholder,
-            work_items_placeholder,
-            scheduler_all_placeholder,
-            cutlass.Int32(checkpoint_every_n_tokens),
-            cutlass.Int32((seed_span_tokens or seed_every_n_tokens) // CFG.B_T),
-            tinv_placeholder,
-            workspace_placeholder,
-            cu_stream,
             tiles_per_head,
-            options="--enable-tvm-ffi --opt-level 2",
+            use_int64_offsets,
         )
-    if own_prologue:
-        cache["prologue"](
-            k,
-            v,
-            gate,
-            cu_seqlens,
-            output_state_checkpoints if enable_checkpoints else None,
-            work_item_scratch if not order_gen else None,
-            work_count,
-            work_items,
-            scheduler_all if (run_order or gen_intervals) else None,
-            checkpoint_every_n_tokens,
-            (seed_span_tokens or seed_every_n_tokens) // CFG.B_T,
-            tinv,
-            workspace,
-            cu_stream,
-        )
-    compiled(
+    run_recompute(
+        cache,
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         cu_seqlens,
         initial_state,
         output_state,
-        seed_state_checkpoints,
-        tinv,
+        checkpoints,
         work_items,
         work_count,
         scheduler_counter,
-        checkpoint_every_n_tokens,
-        seed_every_n_tokens,
+        scheduler_all,
+        work_item_staging,
         workspace,
-        cu_stream,
+        checkpoint_every_n_tokens,
+        stream,
+        a_log,
+        dt_bias,
+        seed_state_checkpoints,
+        seed_every_n_tokens,
+        seed_span_tokens,
+        tinv=tinv,
+        own_prologue=own_prologue,
     )
     return cache
 
@@ -2366,10 +2417,9 @@ def run_recompute(
     tinv,
     own_prologue=True,
 ) -> None:
-    """Replay the compiled plan: the prologue launch, then the main launch.
-    The caller owns the contract, which the plan validated at build, so
-    nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
+    """Replay the compiled plan: the prologue launch, then the main launch, on the current
+    torch stream (``stream`` is kept for the upstream call signature). The caller owns the
+    contract, which the plan validated at build, so nothing here raises."""
     if own_prologue:
         cache["prologue"](
             k,
@@ -2385,7 +2435,6 @@ def run_recompute(
             (seed_span_tokens or seed_every_n_tokens) // CFG.B_T,
             tinv,
             tensormap_workspace,
-            cu_stream,
         )
     cache["compiled"](
         k,
@@ -2404,7 +2453,6 @@ def run_recompute(
         checkpoint_every_n_tokens,
         seed_every_n_tokens,
         tensormap_workspace,
-        cu_stream,
     )
 
 
