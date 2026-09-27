@@ -31,9 +31,10 @@ from attn_gym._backends.cute.utils import (
 )
 from attn_gym.utils import ceildiv
 
-from .common.host import get_dtype, tensormap_workspace_bytes
+from .common.host import get_dtype
 from .common.split_k import WORK_ITEM_FIELDS
 from .kernel import kda_bprop_summary_f16, kda_summary_f16
+from .plan import int32, workspace
 
 # Staged KDA tensors: natural-log FP32 channel gate, FP32 post-sigmoid beta, normalized keys.
 _GATE = {
@@ -152,7 +153,7 @@ class _Launch:
         work_items = torch.empty(
             sequences * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
         )
-        work_count = torch.empty(1, dtype=torch.int32, device=device)
+        work_count = int32(1, device)
         _select_summary_work[(sequences, heads)](
             cu_seqlens,
             work_count if bounds is None else bounds,
@@ -162,16 +163,11 @@ class _Launch:
             0 if bounds is None else bounds.shape[0],
             WORK_ITEM_FIELDS,
         )
-        workspace = torch.empty(
-            ceildiv(tensormap_workspace_bytes(kernel, sequences), 8),
-            dtype=torch.int64,
-            device=device,
-        )
         return cls(
             work_items,
             work_count,
-            torch.empty(2, dtype=torch.int32, device=device),
-            workspace,
+            int32(2, device),
+            workspace(kernel, sequences, device),
             get_device_properties(device).multi_processor_count,
         )
 
