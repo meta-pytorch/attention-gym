@@ -54,6 +54,9 @@ id = "S1-S4"
 title = "Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes"
 kind = "restyle"
 ag_subject = "Restyle the v1.30 GDN prefill, tinv and summary kernel storage"
+ag_subjects_extra = [
+  "Restyle the v1.30 GDN bprop kernel storage and swizzle offsets",
+]
 guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts"]
 gate = "sass (identical or offset-only noise)"
 upstream_status = "ag-specific"
