@@ -86,6 +86,17 @@ upstream_bug_patterns = ["Mismatched mGate.strides"]
 upstream_status = "draft-not-filed"
 
 [[fix]]
+id = "B14"
+title = "Split-table replay passes sched_ctr only when compiled with it"
+kind = "bugfix"
+ag_subject = "Preserve the scheduler ABI when replaying split tables"
+guarding_tests = ["test/test_cudnn_fe_common.py::test_split_table_replay_preserves_absent_scheduler_abi"]
+upstream_repro = "upstream/repro_09_replay_abi_scope.py"
+upstream_runs = [[]]
+upstream_expect = "scope"
+upstream_status = "excluded-no-upstream-abi"
+
+[[fix]]
 id = "B15"
 title = "Driver launch caches keyed on static config, not shape"
 kind = "bugfix"

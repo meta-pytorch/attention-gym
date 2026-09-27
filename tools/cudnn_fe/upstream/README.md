@@ -33,6 +33,7 @@ every optional specialization was tested.
 | `repro_03_empty_unsplit.py` | optional export dir holding `python/cudnn` (defaults to the installed package) | 8/20 fail | 20/20 |
 | `repro_04_zero_chunk_walk.py` | `--skip-empty` on patched (opt-in) | fails (8 vs 4) | pass with `--skip-empty` only |
 | `repro_05_scalar_head_stride.py` | default: host replay; `--raw`: explicit dynamic signature isolates address arithmetic | fails (both) | pass |
+| `repro_09_replay_abi_scope.py` | none; scope check for excluded B14 | pass (`None` fails at build) | n/a |
 
 ## Source/history audit
 
@@ -123,3 +124,11 @@ stock compact→strided replay raises a TVM-FFI stride mismatch; patched passes.
 **Fix.** Widen before multiplying by the actual head stride; explicit symbolic-stride fake signature
 for scalar gates. `mark_layout_dynamic(leading_dim=None)` is not enough: it infers stride 1 from a
 compact first call.
+
+## Excluded — split-table replay absent-scheduler ABI (B14)
+
+AG guards a `None` scheduler slot with `r.has_sched` ("Preserve the scheduler ABI when replaying
+split tables"). Upstream `build_split_table` converts `scheduler_counter` through `from_dlpack`
+unconditionally and every caller passes a tensor. `repro_09_replay_abi_scope.py` shows `None` failing
+at build time (`AttributeError: 'NoneType' object has no attribute '__dlpack__'`) while tensor
+build+replay succeeds. Supporting it upstream would be a feature request, so nothing is proposed.

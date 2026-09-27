@@ -143,20 +143,21 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 13 modification rows below are generated from
+The 14 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 13 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 14 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
 | B8 | Compact empty cu_seqlens intervals out of the unsplit work table | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work` |
 | B10 | Split-table walk omits zero-chunk sequences | `test/test_cudnn_fe_common.py::test_split_table_omits_zero_chunk_sequences` |
 | B13 | Scalar-gate split scan uses the head stride instead of assuming 1 | `test/test_cudnn_fe_common.py::test_scalar_split_scan_respects_head_stride` |
+| B14 | Split-table replay passes sched_ctr only when compiled with it | `test/test_cudnn_fe_common.py::test_split_table_replay_preserves_absent_scheduler_abi` |
 | B15 | Driver launch caches keyed on static config, not shape | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default`; `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration` |
 | B16 | Copy 4-byte-aligned gate/beta to 16-byte bases | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta` |
 | F1/F2/F4/F6/F9 | GDN/KDA drivers (uncut, d_v split, prep, chain, warmup split, staged stateful bwd, AG plan floors) | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference` |

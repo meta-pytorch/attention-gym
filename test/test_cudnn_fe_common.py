@@ -85,3 +85,37 @@ def test_scalar_split_scan_respects_head_stride():
         scans.append(chunks)
     assert torch.count_nonzero(scans[0][:-1]) > 0
     torch.testing.assert_close(scans[1], scans[0], atol=0, rtol=0)
+
+
+def test_split_table_replay_preserves_absent_scheduler_abi():
+    """A caller's unrelated counter must not become a tensor in a compiled None slot."""
+    gate = torch.zeros(32, 2, device="cuda")
+    cu = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    items = torch.empty(64, split_k.WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda")
+    staging = torch.empty_like(items)
+    count = torch.empty(1, dtype=torch.int32, device="cuda")
+    chunks = torch.zeros(split_k.chunk_scratch_rows(32, 1, 16), 2, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    recipe = split_k.build_split_table(
+        gate,
+        cu,
+        items,
+        count,
+        ideal_chunks=32,
+        n_tiles=2,
+        num_sms=torch.cuda.get_device_properties(gate.device).multi_processor_count,
+        b_t=16,
+        chunk_scratch=chunks,
+        item_scratch=staging,
+        log_gate=True,
+        scheduler_counter=None,
+        split=True,
+        opt_level=2,
+        stream=stream,
+    )
+    unrelated_counter = torch.full((2,), 37, dtype=torch.int32, device="cuda")
+    split_k.run_table(
+        recipe, gate, None, None, cu, chunks, staging, items, count, unrelated_counter, stream
+    )
+    assert count.item() == 2
+    assert unrelated_counter.tolist() == [37, 37]

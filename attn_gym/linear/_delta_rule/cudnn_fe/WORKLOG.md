@@ -109,6 +109,16 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Replay:** keep the dynamic-stride fake ABI; `mark_layout_dynamic(leading_dim=None)` still infers
   stride 1 from a compact first call, and the test then only exercises the host rejection.
 
+### B14 — Split-table replay passes a tensor into a compiled `None` slot (E4) · bugfix, AG-only
+- **Problem:** replaying a table compiled without a scheduler passed `sched_ctr` anyway → TVM-FFI
+  TypeError at argument 14.
+- **Found by:** E-series diff audit.
+- **Fix:** `r.has_sched` guard. "Preserve the scheduler ABI when replaying split tables".
+- **Tests:** CM::test_split_table_replay_preserves_absent_scheduler_abi. Fails without = YES.
+- **Upstream:** excluded. Upstream `build_split_table` always converts `scheduler_counter` through
+  dlpack, so `None` fails at build time (`repro_09_replay_abi_scope.py`); proposing it would be a
+  feature request. Reapply unconditionally while AG keeps the optional-scheduler recipe.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
 
 ### B15 — Launch caches keyed on shape-unaware state
@@ -166,6 +176,7 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+| Drop the replay-ABI upstream draft (B14) | Upstream has no optional-scheduler ABI; it would be a feature request. | Upstream makes the scheduler optional. |
 
 ## Known limitations and pre-existing issues (not fixed)
 

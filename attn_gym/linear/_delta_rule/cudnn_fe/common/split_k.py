@@ -2029,7 +2029,7 @@ def run_table(
         item_scratch if r.split else None,
         work_items,
         work_count,
-        scheduler_counter,
+        scheduler_counter if r.has_sched else None,
         r.n_scan_ctas,
         r.n_scan_blocks,
         r.n_walk_ctas,
