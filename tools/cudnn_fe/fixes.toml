@@ -53,6 +53,7 @@ kind = "numerics"
 ag_subject = "Keep the KDA forward delta residual in FP32 before the MMA pack"
 ag_subjects_extra = [
   "Add an FP32 KDA delta-residual staging helper",
+  "Keep the KDA backward delta residual in FP32 through subtraction and beta scaling",
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32",

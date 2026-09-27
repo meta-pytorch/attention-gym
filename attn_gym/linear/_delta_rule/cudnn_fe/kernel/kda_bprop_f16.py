@@ -135,6 +135,7 @@ from ..tile_dsl.mma import desc_opaque, mma_ss, mma_step, mma_ts_step
 from ..tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from ..tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from ..tile_dsl.pointwise import (
+    beta_residual_f16x2,
     sigmoid,
     f16x2_to_f32,
     fadd2,
@@ -2189,14 +2190,16 @@ def compute1_warp_group(
             bars.mb_raw_done[raw_index.idx].arrive()
 
             bars.mb_beta_ready[chunk_serial % cfg.smem_beta_stages].wait((chunk_serial // cfg.smem_beta_stages) % 2)
-            beta_pairs = cute.make_rmem_tensor((2,), cutlass.Int32)
+            # FP32 beta per token pair (pair p of the ldmatrix fragment reads tokens of half p // 2).
+            beta_regs = cute.make_rmem_tensor((4,), cutlass.Float32)
             for half in cutlass.range_constexpr(2):
                 token0 = (half * 4 + (lane_idx & 3)) * 2
-                beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
-                beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pairs[half] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
-            diff_w_lo = cute.make_rmem_tensor((4,), cutlass.Int32)
-            diff_w_hi = cute.make_rmem_tensor((4,), cutlass.Int32)
+                beta_regs[2 * half] = (sBeta_ptr + token0).load().to(cutlass.Float32)
+                beta_regs[2 * half + 1] = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
+            # FP32 residual V - k state, kept for the dBeta v-term below; only the Beta-scaled MMA
+            # operand is packed (the packed residual lost small residuals against a large contraction).
+            diff_w_lo = cute.make_rmem_tensor((8,), cutlass.Float32)
+            diff_w_hi = cute.make_rmem_tensor((8,), cutlass.Float32)
             y_input_pack_lo = cute.make_rmem_tensor((4,), cutlass.Int32)
             y_input_pack_hi = cute.make_rmem_tensor((4,), cutlass.Int32)
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -2204,27 +2207,33 @@ def compute1_warp_group(
                 state_k_index = advance(state_k_index, 1)
                 state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
                 for reg_idx in cutlass.range_constexpr(4):
-                    frag_pair = reg_idx * 2
-                    state_k_pair = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(raw_v_frag_lo[reg_idx], state_k_pair, cfg.io_dtype)
-                    diff_w_lo[reg_idx] = diff_pair
-                    y_input_pack_lo[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], diff_pair, cfg.io_dtype)
+                    lo, hi = 2 * reg_idx, 2 * reg_idx + 1
+                    b_lo, b_hi = 2 * (reg_idx // 2), 2 * (reg_idx // 2) + 1
+                    y_input_pack_lo[reg_idx], diff_w_lo[lo], diff_w_lo[hi] = beta_residual_f16x2(
+                        raw_v_frag_lo[reg_idx], beta_regs[b_lo], beta_regs[b_hi], state_k_vec_lo[lo], state_k_vec_lo[hi], dtype=cfg.io_dtype
+                    )
                 if cutlass.const_expr(cfg.d_v == 128):
                     state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
                     for reg_idx in cutlass.range_constexpr(4):
-                        frag_pair = reg_idx * 2
-                        state_k_pair = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
-                        diff_pair = sub_f16x2(raw_v_frag_hi[reg_idx], state_k_pair, cfg.io_dtype)
-                        diff_w_hi[reg_idx] = diff_pair
-                        y_input_pack_hi[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], diff_pair, cfg.io_dtype)
+                        lo, hi = 2 * reg_idx, 2 * reg_idx + 1
+                        b_lo, b_hi = 2 * (reg_idx // 2), 2 * (reg_idx // 2) + 1
+                        y_input_pack_hi[reg_idx], diff_w_hi[lo], diff_w_hi[hi] = beta_residual_f16x2(
+                            raw_v_frag_hi[reg_idx], beta_regs[b_lo], beta_regs[b_hi], state_k_vec_hi[lo], state_k_vec_hi[hi], dtype=cfg.io_dtype
+                        )
             if chunk_idx < FIRST_STATE_CHUNK:
                 for reg_idx in cutlass.range_constexpr(4):
-                    diff_w_lo[reg_idx] = raw_v_frag_lo[reg_idx]
-                    y_input_pack_lo[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], raw_v_frag_lo[reg_idx], cfg.io_dtype)
+                    lo, hi = 2 * reg_idx, 2 * reg_idx + 1
+                    b_lo, b_hi = 2 * (reg_idx // 2), 2 * (reg_idx // 2) + 1
+                    y_input_pack_lo[reg_idx], diff_w_lo[lo], diff_w_lo[hi] = beta_residual_f16x2(
+                        raw_v_frag_lo[reg_idx], beta_regs[b_lo], beta_regs[b_hi], dtype=cfg.io_dtype
+                    )
                 if cutlass.const_expr(cfg.d_v == 128):
                     for reg_idx in cutlass.range_constexpr(4):
-                        diff_w_hi[reg_idx] = raw_v_frag_hi[reg_idx]
-                        y_input_pack_hi[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], raw_v_frag_hi[reg_idx], cfg.io_dtype)
+                        lo, hi = 2 * reg_idx, 2 * reg_idx + 1
+                        b_lo, b_hi = 2 * (reg_idx // 2), 2 * (reg_idx // 2) + 1
+                        y_input_pack_hi[reg_idx], diff_w_hi[lo], diff_w_hi[hi] = beta_residual_f16x2(
+                            raw_v_frag_hi[reg_idx], beta_regs[b_lo], beta_regs[b_hi], dtype=cfg.io_dtype
+                        )
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id, cutlass.Int8), y_input_pack_lo.load())
             if cutlass.const_expr(cfg.d_v == 128):
                 nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi.load())
@@ -2366,12 +2375,10 @@ def compute1_warp_group(
             for s in cutlass.range_constexpr(4):
                 token4[s] = cutlass.Float32(0.0)
             for j in cutlass.range_constexpr(4):
-                d0_lo, d0_hi = f16x2_to_f32(diff_w_lo[j], dtype=cfg.io_dtype)
                 slot = cutlass.const_expr(2 * (j // 2))
-                lo, hi = ffma2(dy_vec_lo[2 * j], dy_vec_lo[2 * j + 1], d0_lo, d0_hi, token4[slot], token4[slot + 1])
+                lo, hi = ffma2(dy_vec_lo[2 * j], dy_vec_lo[2 * j + 1], diff_w_lo[2 * j], diff_w_lo[2 * j + 1], token4[slot], token4[slot + 1])
                 if cutlass.const_expr(cfg.d_v == 128):
-                    d1_lo, d1_hi = f16x2_to_f32(diff_w_hi[j], dtype=cfg.io_dtype)
-                    lo, hi = ffma2(dy_vec_hi[2 * j], dy_vec_hi[2 * j + 1], d1_lo, d1_hi, lo, hi)
+                    lo, hi = ffma2(dy_vec_hi[2 * j], dy_vec_hi[2 * j + 1], diff_w_hi[2 * j], diff_w_hi[2 * j + 1], lo, hi)
                 token4[slot] = lo
                 token4[slot + 1] = hi
 
