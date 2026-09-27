@@ -100,6 +100,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.paged_state import resolve_paged_state
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -1855,7 +1856,11 @@ def compute1_warp_group(
     bars,
 ):
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
-    running the per-chunk state-update and output epilogues."""
+    running the per-chunk state-update and output epilogues.
+
+    With ``cfg.paged_state`` the state tensors alias one pool and ``mSeedIndices[batch_idx]``
+    selects the slot: non-positive routes are null (zero output, pool untouched), a zero
+    ``mHasInitialState[batch_idx]`` seeds from zero and, for an empty sequence, clears the slot."""
     nvvm.setmaxregister(cfg.num_regs_compute_group_1, nvvm.SetMaxRegisterAction.INCREASE)
 
     v_index = PipelineState.start(phase=0)
@@ -1929,8 +1934,13 @@ def compute1_warp_group(
             cfg, tile_idx, mWorkItems
         )
         head_o, v_offset = decode_head(cfg, head_idx)
+        # Attention Gym modification: paged state resolves the sequence's pool slot and its
+        # load/store predicates once per work item (null routes never touch the pool, fresh
+        # routes zero-seed, empty fresh routes clear their slot); dense calls index directly.
         seed_row = batch_idx
-        if cutlass.const_expr(mSeedIndices is not None):
+        if cutlass.const_expr(cfg.paged_state):
+            seed_row, state_active, load_initial, clear_empty = resolve_paged_state(batch_idx, mSeedIndices, mHasInitialState)
+        elif cutlass.const_expr(mSeedIndices is not None):
             seed_row = cutlass.Int32(mSeedIndices[batch_idx])
         n_local = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
@@ -1940,6 +1950,8 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.use_initial_state):
                 gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
+                if cutlass.const_expr(cfg.paged_state):
+                    seed_state = seed_state and load_initial
                 if seed_state:
                     seed_vw = 16 // (mState_init.element_type.width // 8)
                     seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
@@ -2254,6 +2266,9 @@ def compute1_warp_group(
                             )
                             o_regs.append([o_vec[k] for k in range(32)])
                         nvvm.tcgen05_wait("load")
+                        if cutlass.const_expr(cfg.paged_state):
+                            # Null-route padding may hold NaNs: select, never multiply, to emit zeros.
+                            o_regs = [[val if state_active else cutlass.Float32(0.0) for val in regs] for regs in o_regs]
                         o_idx = o_index.idx
                         bars.mb_o_tmastg_done[o_idx].wait(o_index.phase)
                         o_index = advance(o_index, cfg.smem_o_stages)
@@ -2282,11 +2297,17 @@ def compute1_warp_group(
             bars.mb_state_acc_ready[kv_last_idx].wait(kv_acc_index.phase)
             kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
             if cutlass.const_expr(cfg.store_final_state):
-                final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
-                if final_dst >= 0:
+                if cutlass.const_expr(cfg.paged_state):
+                    store_final = state_active
+                    final_row = seed_row
+                else:
+                    final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+                    store_final = final_dst >= 0
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        if store_final:
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
+                if store_final:
                     gState_out = mState_out[None, None, head_o, final_row]
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
@@ -2302,13 +2323,20 @@ def compute1_warp_group(
                                 )
         else:
             if cutlass.const_expr(cfg.store_final_state):
-                final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
-                if final_dst >= 0:
+                if cutlass.const_expr(cfg.paged_state):
+                    # Only a fresh route clears its slot; resumed and null routes leave the pool.
+                    write_empty = state_active and clear_empty
+                    final_row = seed_row
+                else:
+                    final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+                    write_empty = final_dst >= 0
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        if write_empty:
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
+                if write_empty:
                     gState_out = mState_out[None, None, head_o, final_row]
-                    if cutlass.const_expr(cfg.use_initial_state):
+                    if cutlass.const_expr(cfg.use_initial_state and not cfg.paged_state):
                         gState_in = mState_init[None, None, head_o, seed_row]
                         for i in cutlass.range_constexpr(num_ldtms):
                             for k in cutlass.range_constexpr(32):
@@ -2518,8 +2546,8 @@ def prologue(
 ):
     """One-launch prologue: LPT-order the work items and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
-    ``tensormap_workspace``.  ``state_indices`` / ``has_initial_state`` reach the work-table
-    compactor (see ``common/split_k.order_body``)."""
+    ``tensormap_workspace``.  Paged ``state_indices`` / ``has_initial_state`` keep the empty
+    sequences whose fresh slot the main kernel must clear in the compacted uncut table."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -2760,6 +2788,11 @@ def frost_gdn_prefill(
     num_ctas = cute.arch.grid_dim()[0]
 
     total_tiles = mCount[0]
+    if cutlass.const_expr(cfg.paged_state):
+        assert mSeedIndices is not None, "paged_state routes every sequence through mSeedIndices"
+        assert cfg.use_initial_state and cfg.store_final_state, "paged_state reads and writes the pool"
+    else:
+        assert mHasInitialState is None, "mHasInitialState requires paged_state"
 
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -3139,6 +3172,8 @@ class GdnPrefillCfg:
     allow_neg_eigval: bool = False
     tinv_source: str = "compute"
     tiles_per_head: int = 1
+    # Attention Gym: the seed and final indices address one mutable pool (see common/paged_state.py).
+    paged_state: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3215,6 +3250,7 @@ def build_cfg(
     d_v: int,
     expand_num: int = 1,
     tiles_per_head: int = 1,
+    paged_state: bool = False,
 ) -> GdnPrefillCfg:
     """Build the per-compile ``GdnPrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tinv_source`` "compute" builds the chunk factor in compute
@@ -3222,6 +3258,8 @@ def build_cfg(
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
+    if paged_state and not (use_initial_state and store_final_state):
+        raise ValueError("paged_state reads and writes one state pool: use_initial_state and store_final_state")
     stages = {"smem_checkpoint_stages": 1}
     if enable_checkpoints and d_v != 64:
         stages["smem_kq_stages"] = 3
@@ -3245,6 +3283,7 @@ def build_cfg(
         d_v=d_v,
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
+        paged_state=paged_state,
         **stages,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)

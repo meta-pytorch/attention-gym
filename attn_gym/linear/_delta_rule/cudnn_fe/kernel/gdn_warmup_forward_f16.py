@@ -215,6 +215,7 @@ def _compile_warmup_forward(
     store_final_state,
     has_seed_indices,
     has_final_indices,
+    paged_state,
     has_initial_state,
     enable_checkpoints,
     use_beta_sigmoid,
@@ -255,6 +256,7 @@ def _compile_warmup_forward(
         d_v=d_v // tiles_per_head,
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
+        paged_state=paged_state,
     )
     flags = (
         split,
@@ -272,6 +274,7 @@ def _compile_warmup_forward(
         store_final_state,
         has_seed_indices,
         has_final_indices,
+        paged_state,
         has_initial_state,
         enable_checkpoints,
         use_beta_sigmoid,
@@ -377,6 +380,7 @@ def build_warmup_forward(
     scale,
     tiles_per_head=1,
     has_initial_state=None,
+    paged_state=False,
 ):
     """Return ``(compiled, facts)`` for the warmup or uncut forward over the buffers of one plan: the launch is compiled
     (and persisted) once per static configuration, so every shape-dependent value is a launch argument."""
@@ -423,6 +427,7 @@ def build_warmup_forward(
         state_out is not None,
         seed_indices is not None,
         final_indices is not None,
+        bool(paged_state),
         has_initial_state is not None,
         int(checkpoint_every_n_tokens) > 0,
         bool(use_beta_sigmoid),

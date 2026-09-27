@@ -124,13 +124,30 @@ def gdn_forward(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     split: bool = False,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``."""
+    """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``.
+
+    ``state_indices`` switches to paged state: ``initial_state`` is a ``[slots, HO, V, K]`` pool
+    that sequence ``b`` reads from and writes back to slot ``state_indices[b]`` in place (see
+    ``common/paged_state.py`` for the null, fresh and resumed route rules and the optional uint8
+    ``has_initial_state`` mask); the call returns no separate final state. Paged calls run the
+    uncut or d_v-split table, never the chain or the approximate split.
+    """
     # The kernels never differentiate.
     q, k, v, gate, beta, cu_seqlens = (
         _aligned(t.detach()) for t in (q, k, v, gate, beta, cu_seqlens)
     )
     initial_state = None if initial_state is None else initial_state.detach()
+    paged = state_indices is not None
+    if paged:
+        if initial_state is None or output_final_state or split:
+            raise ValueError(
+                "paged state needs the pool as initial_state and no final state/split"
+            )
+    elif has_initial_state is not None:
+        raise ValueError("has_initial_state requires state_indices")
     tokens, _, dim_k = q.shape
     dim_v = v.shape[-1]
     heads_out = gate.shape[1]
@@ -140,6 +157,9 @@ def gdn_forward(
     if split:
         # The approximate forgetting-horizon split replaces the exact schemes.
         plan = replace(plan, pieces=0, tiles_per_head=1)
+    if paged:
+        # The chain seeds pieces through the state chain, which has no route predicates.
+        plan = replace(plan, pieces=0)
     o = torch.empty(tokens, heads_out, dim_v, dtype=q.dtype, device=device)
     final_state = None
     if output_final_state:
@@ -216,10 +236,12 @@ def gdn_forward(
     ideal, rows, item_scratch, chunk_scratch = _split_scratch(
         split, tokens, num_seqs, heads_out, plan.num_sm, n_tiles, device
     )
+    if paged:
+        common.update(state_in=initial_state, state_out=initial_state, seed_indices=state_indices)
+    else:
+        common.update(state_in=initial_state, state_out=final_state)
     buffers = dict(
         common,
-        state_in=initial_state,
-        state_out=final_state,
         work_items=torch.empty(rows, WORK_ITEM_FIELDS, dtype=torch.int32, device=device),
         work_count=_work_count(device),
         item_scratch=item_scratch,
@@ -239,8 +261,16 @@ def gdn_forward(
         expand_num=1,
         checkpoint_every_n_tokens=0,
         scale=scale,
+        has_initial_state=has_initial_state,
+        paged_state=paged,
     )
-    run_warmup_forward(*launch, **buffers, checkpoint_every_n_tokens=0, scale=scale)
+    run_warmup_forward(
+        *launch,
+        **buffers,
+        checkpoint_every_n_tokens=0,
+        scale=scale,
+        has_initial_state=has_initial_state,
+    )
     return o, final_state
 
 

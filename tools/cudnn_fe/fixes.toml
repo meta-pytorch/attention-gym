@@ -149,6 +149,20 @@ ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 ker
 guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward"]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "F3"
+title = "Paged recurrent state (null/fresh/resumed/empty routes) in the v1.30 GDN/KDA prefill"
+kind = "feature"
+ag_subject = "Serve paged GDN state from the v1.30 prefill"
+ag_subjects_extra = [
+  "Preserve fresh-empty paged routes during work compaction",
+]
+guarding_tests = [
+  "test/test_cudnn_fe_paged_order.py::test_paged_order_keeps_only_nonempty_and_fresh_empty_routes",
+  "test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_are_null",
+]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- performance
 [[fix]]
 id = "R2"

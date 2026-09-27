@@ -158,6 +158,11 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   fwd 536→289 µs, rev 1439→647). KS::test_native_selected_bounds.
 - **F5 — grouped q/k GDN backward** through AG's deterministic `group_sum` (upstream `head_reduce`
   unused, later deleted by R13).
+- **F3 — paged recurrent state** in the v1.30 prefill: null route → zero output by select, no pool
+  write; fresh → zero seed + write; empty fresh → clear; resumed/null empty → untouched. Upstream
+  has seed/final indices but no has-initial-state mask; the hardest port. 6/8 KDA paged tests fail
+  on the pre-commit tree; dense-prefill SASS unchanged; paged fwd vs main 0.88–0.90×. Reapply after
+  B8; if upstream adds a has-initial-state mask, evaluate mapping AG routes onto it.
 - **R2 — `compile_tvm_ffi(opt_level=...)`**, hosts keep O2 (see Lessons).
 
 ## 4. Restyle, pruning and infra (gated by SASS, not behavior)

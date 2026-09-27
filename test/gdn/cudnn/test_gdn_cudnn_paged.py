@@ -11,6 +11,10 @@ pytest.importorskip(
 )
 
 from attn_gym.linear import chunk_gdn, paged_chunk_gdn
+from attn_gym.linear._delta_rule.cudnn import gdn_forward as gdn_forward_adapter
+from attn_gym.linear._delta_rule.cudnn_fe import gdn as gdn_driver
+from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import ORDER_CAPACITY
+from attn_gym.linear._delta_rule.cudnn_fe.kernel import gdn_warmup_forward_f16
 from attn_gym.linear.gdn.impl.cudnn_ops import chunk_gdn_cudnn_packed_fwd_paged_op
 from attn_gym.testing import make_gdn_test_inputs, strided_state_pool
 
@@ -234,3 +238,146 @@ def test_cudnn_paged_fullgraph_compile_and_cuda_graph_replay() -> None:
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         torch.testing.assert_close(graph_pool, eager_pool, rtol=0, atol=0)
+
+
+def _paged(inputs, pool, state_indices, cu_seqlens, has_initial_state=None):
+    q, k, value, gate, beta = inputs
+    with torch.no_grad():
+        return paged_chunk_gdn(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            pool,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            kernel_options=_CUDNN,
+        )
+
+
+def test_cudnn_paged_runs_the_v130_work_table() -> None:
+    """The paged route compiles through the v1.30 warmup host, not a separate legacy kernel."""
+    assert not hasattr(gdn_forward_adapter, "kernel")
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (64, 32), key_heads=1, value_heads=2, seed=2
+    )
+    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    before = gdn_warmup_forward_f16._compile_warmup_forward.cache_info()
+    _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens)
+    after = gdn_warmup_forward_f16._compile_warmup_forward.cache_info()
+    assert after.hits + after.misses == before.hits + before.misses + 1
+
+
+def test_cudnn_paged_negative_and_zero_routes_are_null() -> None:
+    """Non-positive routes zero their output (even over NaN padding) and never touch the pool."""
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (64, 96, 32), key_heads=1, value_heads=2, seed=5
+    )
+    for tensor in (q, k, value, gate, beta):
+        tensor[:, :160] = torch.nan
+    state_indices = torch.tensor([-1, 0, 2], device="cuda", dtype=torch.int32)
+    pool = torch.randn(3, 2, 128, 128, device="cuda")
+    expected_pool = pool.clone()
+    expected_output, final_state = _expected_from_cudnn(
+        tuple(t[:, 160:] for t in (q, k, value, gate, beta)),
+        pool[2:3].clone(),
+        torch.tensor([0, 32], device="cuda", dtype=torch.int32),
+    )
+    expected_pool[2] = final_state[0]
+
+    output = _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens)
+
+    assert output.shape == value.shape
+    torch.testing.assert_close(output[:, :160], torch.zeros_like(output[:, :160]), rtol=0, atol=0)
+    torch.testing.assert_close(output[:, 160:], expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_mask", [True, False])
+def test_cudnn_paged_empty_sequences_clear_fresh_and_preserve_resumed(with_mask: bool) -> None:
+    """Empty fresh routes clear their slot; empty resumed and null routes leave the pool alone."""
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (0, 0, 0, 64), key_heads=1, value_heads=2, seed=9
+    )
+    state_indices = torch.tensor([1, 2, 0, 3], device="cuda", dtype=torch.int32)
+    has_initial_state = (
+        torch.tensor([False, True, True, True], device="cuda") if with_mask else None
+    )
+    pool = torch.randn(4, 2, 128, 128, device="cuda")
+    expected_pool = pool.clone()
+    expected_output, final_state = _expected_from_cudnn(
+        (q, k, value, gate, beta), pool[[0, 0, 0, 3]].clone(), cu_seqlens
+    )
+    expected_pool[3] = final_state[3]
+    if with_mask:
+        expected_pool[1] = 0
+
+    output = _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens, has_initial_state)
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
+
+
+def test_cudnn_paged_beyond_compaction_capacity_still_clears_fresh_empties() -> None:
+    """More sequences than the compactor's capacity fall back to the full table, which still
+    applies the route predicates to every (empty) sequence."""
+    num_seqs = ORDER_CAPACITY + 3
+    lengths = [0] * num_seqs
+    lengths[1] = 64
+    lengths[-1] = 32
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        tuple(lengths), key_heads=1, value_heads=1, seed=13
+    )
+    state_indices = torch.zeros(num_seqs, device="cuda", dtype=torch.int32)
+    state_indices[0] = 1  # empty fresh: clear
+    state_indices[1] = 2  # nonempty fresh: zero seed, write
+    state_indices[2] = 3  # empty resumed: preserve
+    state_indices[-1] = 4  # nonempty resumed
+    has_initial_state = torch.ones(num_seqs, device="cuda", dtype=torch.bool)
+    has_initial_state[:2] = False
+    pool = torch.randn(5, 1, 128, 128, device="cuda")
+    expected_pool = pool.clone()
+    seeds = torch.zeros(num_seqs, 1, 128, 128, device="cuda")
+    seeds[-1] = pool[4]
+    expected_output, final_state = _expected_from_cudnn(
+        (q, k, value, gate, beta), seeds, cu_seqlens
+    )
+    expected_pool[1] = 0
+    expected_pool[2] = final_state[1]
+    expected_pool[4] = final_state[-1]
+
+    output = _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens, has_initial_state)
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
+
+
+def test_cudnn_paged_driver_rejects_split_and_final_state() -> None:
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (64,), key_heads=1, value_heads=1, seed=1
+    )
+    pool = torch.zeros(2, 1, 128, 128, device="cuda")
+    state_indices = torch.ones(1, device="cuda", dtype=torch.int32)
+    args = (q[0], k[0], value[0], gate[0].float(), beta[0].float(), cu_seqlens)
+    with pytest.raises(ValueError, match="paged state"):
+        gdn_driver.gdn_forward(
+            *args, scale=1.0, initial_state=pool, state_indices=state_indices, split=True
+        )
+    with pytest.raises(ValueError, match="paged state"):
+        gdn_driver.gdn_forward(
+            *args,
+            scale=1.0,
+            initial_state=pool,
+            state_indices=state_indices,
+            output_final_state=True,
+        )
+    with pytest.raises(ValueError, match="requires state_indices"):
+        gdn_driver.gdn_forward(
+            *args,
+            scale=1.0,
+            initial_state=pool[:1],
+            has_initial_state=torch.ones(1, device="cuda", dtype=torch.uint8),
+        )

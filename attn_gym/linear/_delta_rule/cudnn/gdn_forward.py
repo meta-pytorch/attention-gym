@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the scalar-GDN cuDNN forward (vendored cudnn-frontend v1.30 kernels;
-the in-tree CuTeDSL 4.7 kernel serves paged state)."""
+"""Torch launcher for the scalar-GDN cuDNN forward (vendored cudnn-frontend v1.30 kernels)."""
 
 from __future__ import annotations
 
@@ -12,14 +11,8 @@ from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.cudnn_fe.gdn import gdn_forward
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.utils import ceildiv
-
-from .kernels import gdn_prefill_f16 as kernel
-from .kernels.common.host import tensormap_workspace_bytes
-from .schedule import prepare_cudnn_schedule
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-_WORKSPACE_WORD_BYTES = 8
 
 
 def validate_available(q: torch.Tensor) -> None:
@@ -47,7 +40,7 @@ def run_forward_on_current_device(
     """Validate and launch one packed scalar-GDN forward.
 
     A ``PagedState`` is advanced in place and produces no separate final state. ``split``
-    enables the approximate forgetting-horizon work table (see ``kernels/common/split_k.py``)
+    enables the approximate forgetting-horizon work table (see ``cudnn_fe/common/split_k.py``)
     and is only offered for calls without recurrent state.
     """
     if split and (state is not None or output_final_state):
@@ -96,69 +89,34 @@ def run_forward_on_current_device(
         raise TypeError("cu_seqlens must be aligned contiguous int32 on q.device")
 
     num_sequences = cu_seqlens.shape[0] - 1
-    if paged_state is None:
-        if initial_state is not None:
-            expected_state = (num_sequences, heads, 128, key_dim)
-            if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
-                raise TypeError(f"initial_state must be float32 with shape {expected_state}")
-            if not initial_state.is_cuda or initial_state.device != q.device:
-                raise ValueError("initial_state must be on q.device")
-            if not tensor_supports_tma(initial_state):
-                raise TypeError("initial_state requires a TMA-compatible inner mode")
-        # Unpaged forward: the cudnn-frontend v1.30 kernels (uncut, d_v split, exact chain, or split).
-        output, final_state = gdn_forward(
-            q[0],
-            k[0],
-            value[0],
-            gate[0],
-            beta[0],
-            cu_seqlens,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            split=split,
-        )
-        return output.unsqueeze(0), final_state
-
-    # Paged prefill: the older in-tree kernel advances the pool in place.
-    if output_final_state:
-        raise ValueError("paged state advances the pool in place; drop output_final_state")
-    output = torch.empty_like(value)
-    stream = torch.cuda.current_stream(q.device).cuda_stream
-    schedule = prepare_cudnn_schedule(
-        gate,
-        cu_seqlens,
-        tile_tokens=kernel.CFG.B_T,
-        counter_count=2,
-        split=False,
-        stream=stream,
-    )
-    tensormap_workspace = torch.empty(
-        ceildiv(tensormap_workspace_bytes(kernel, num_sequences), _WORKSPACE_WORD_BYTES),
-        dtype=torch.int64,
-        device=q.device,
-    )
-    kernel.chunk_gdn_sm100(
+    if paged_state is not None:
+        if output_final_state:
+            raise ValueError("paged state advances the pool in place; drop output_final_state")
+    elif initial_state is not None:
+        expected_state = (num_sequences, heads, 128, key_dim)
+        if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
+            raise TypeError(f"initial_state must be float32 with shape {expected_state}")
+        if not initial_state.is_cuda or initial_state.device != q.device:
+            raise ValueError("initial_state must be on q.device")
+        if not tensor_supports_tma(initial_state):
+            raise TypeError("initial_state requires a TMA-compatible inner mode")
+    # The cudnn-frontend v1.30 kernels: uncut, d_v split, exact chain, or split; a paged pool is
+    # advanced in place through the uncut / d_v-split table.
+    output, final_state = gdn_forward(
         q[0],
         k[0],
         value[0],
         gate[0],
         beta[0],
-        output[0],
         cu_seqlens,
-        paged_state.cache,
-        paged_state.cache,
-        scale,
-        work_items=schedule.work_items,
-        work_count=schedule.work_count,
-        sched_ctr=schedule.counters,
-        log_gate=True,
-        work_item_scratch=schedule.item_scratch,
-        tensormap_workspace=tensormap_workspace,
-        state_indices=paged_state.indices,
-        has_initial_state=paged_state.byte_mask,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        split=split,
+        state_indices=None if paged_state is None else paged_state.indices,
+        has_initial_state=None if paged_state is None else paged_state.byte_mask,
     )
-    return output, None
+    return output.unsqueeze(0), final_state
 
 
 def run_forward(
