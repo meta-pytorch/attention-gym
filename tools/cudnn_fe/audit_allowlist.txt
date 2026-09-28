@@ -1,0 +1,5 @@
+# Documented exceptions for tools/cudnn_fe/audit.py (and the entries restyle.py leaves alone).
+# Format: <rule> <path regex relative to cudnn_fe> <key regex> -- <reason> (full-match regexes)
+# Keys are assigned names or enclosing functions, so entries survive line drift. List each
+# evidenced key explicitly (no `.*`), so a new occurrence is reported until it has its own evidence.
+# Remove an entry when its finding is gone; `audit --strict` fails on entries that match nothing.
