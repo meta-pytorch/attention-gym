@@ -85,7 +85,7 @@ def chunk_gdn_bwd_intra_kernel(
 
     raw_qk = tl.zeros((BT, BT), dtype=tl.float32)
     raw_kk = tl.zeros((BT, BT), dtype=tl.float32)
-    raw_gate_grad = tl.zeros((BT,), dtype=tl.float32)
+    raw_gate_grad = tl.load(d_gate_raw + scalar_offset, mask=token_mask, other=0.0)
     for key_block in range(0, K, BK):
         feature = key_block + tl.arange(0, BK)
         q_offset = ptr_offset((token[:, None], qk_head, feature[None, :]), (q_stride_t, K, 1))
@@ -103,12 +103,6 @@ def chunk_gdn_bwd_intra_kernel(
         )
         raw_qk += tl.dot(q_tile, tl.trans(k_tile))
         raw_kk += tl.dot(k_tile, tl.trans(k_tile))
-        gate_tile = tl.load(
-            d_gate_raw + output_offset,
-            mask=token_mask[:, None],
-            other=0.0,
-        )
-        raw_gate_grad += tl.sum(gate_tile, axis=1)
 
         d_q_tile = tl.dot(aq_weight.to(q_tile.dtype), k_tile)
         d_k_tile = tl.dot(tl.trans(aq_weight).to(q_tile.dtype), q_tile)
@@ -152,8 +146,8 @@ def chunk_gdn_bwd_intra_dense(
     if d_aqk.shape != expected_factor_shape or d_akk.shape != expected_factor_shape:
         raise ValueError(f"factor gradients must have shape {expected_factor_shape}")
     value_head_shape = (batch, tokens, heads, key_dim)
-    if d_gate_raw.shape != value_head_shape:
-        raise ValueError(f"d_gate_raw must have shape {value_head_shape}")
+    if d_gate_raw.shape != cumulative_gate.shape:
+        raise ValueError("d_gate_raw must match cumulative_gate")
 
     d_q = torch.empty(value_head_shape, dtype=torch.float32, device=q.device)
     d_k = torch.empty(value_head_shape, dtype=torch.float32, device=k.device)
@@ -208,8 +202,8 @@ def chunk_gdn_bwd_intra_packed(
     if d_aqk.shape != expected_factor_shape or d_akk.shape != expected_factor_shape:
         raise ValueError(f"factor gradients must have shape {expected_factor_shape}")
     value_head_shape = (batch, tokens, heads, key_dim)
-    if d_gate_raw.shape != value_head_shape:
-        raise ValueError(f"d_gate_raw must have shape {value_head_shape}")
+    if d_gate_raw.shape != cumulative_gate.shape:
+        raise ValueError("d_gate_raw must match cumulative_gate")
 
     d_q = torch.empty(value_head_shape, dtype=torch.float32, device=q.device)
     d_k = torch.empty(value_head_shape, dtype=torch.float32, device=k.device)

@@ -438,8 +438,8 @@ def _finish_chunk_gdn_bwd(
     The Blackwell path releases every recomputed tensor at its last use (``prepared`` fields
     and the ``del`` statements) because the step's peak memory sits inside this function:
     the wy/dqkg and intra stages each allocate several ``[T, H, K]`` FP32 buffers, and holding
-    the dead ``h``/``dh``/``w``/``qg``/``kg``/``vector_gate`` alongside them costs ~1 GiB per
-    16k tokens at 32 heads.
+    the dead ``h``/``dh``/``w``/``qg``/``kg`` alongside them costs ~1 GiB per 16k tokens at
+    32 heads.
     """
     w, qg, kg, h, v_new = prepared.w, prepared.qg, prepared.kg, prepared.h, prepared.v_new
     assert w is not None and qg is not None and kg is not None
@@ -482,11 +482,9 @@ def _finish_chunk_gdn_bwd(
         metadata=metadata,
     )
 
-    # Reuse the proven vector-gate KDA gradient stages only after the scalar recompute. Every
-    # stage reads grouped q/k directly and returns dQ/dK per value head, summed below.
+    # The reused KDA stages take the scalar gate directly and read grouped q/k; each returns
+    # dQ/dK per value head, summed below.
     groups = v.shape[2] // q.shape[2]
-    vector_gate = cumulative_gate.unsqueeze(-1).expand(*cumulative_gate.shape, q.shape[3])
-    vector_gate = vector_gate.contiguous()
     if aqk is None:
         aqk = (
             chunk_gdn_recompute_aqk_dense(q, k, cumulative_gate, scale)
@@ -499,7 +497,7 @@ def _finish_chunk_gdn_bwd(
         w,
         d_output,
         aqk,
-        gk=vector_gate,
+        gk=cumulative_gate,
         h0=initial_state,
         dht=d_final_state,
         scale=scale,
@@ -513,7 +511,7 @@ def _finish_chunk_gdn_bwd(
         k,
         v,
         v_new,
-        vector_gate,
+        cumulative_gate,
         beta,
         inverse,
         h,
@@ -527,7 +525,7 @@ def _finish_chunk_gdn_bwd(
         autotune=False,
     )
     prepared.h = prepared.v_new = None
-    del h, v_new, dh, vector_gate
+    del h, v_new, dh
     intra = (
         chunk_gdn_bwd_intra_dense(
             q,
@@ -552,8 +550,8 @@ def _finish_chunk_gdn_bwd(
     )
     intra_dq, intra_dk, intra_db, d_gate = intra
     del d_aqk, d_raw_akk, dg_raw
-    # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk`` (allocated like the FP32 vector
-    # gate), so accumulating in place is the same FP32 add without a third full-size buffer.
+    # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk``, so accumulating in place is
+    # the same FP32 add without a third full-size buffer.
     assert dq.dtype == torch.float32 and dk.dtype == torch.float32
     if groups > 1:
         # One deterministic pass adds the two FP32 parts, sums each head group, and casts.

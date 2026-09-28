@@ -129,7 +129,7 @@ class TmaOps(NamedTuple):
     aqk: TmaOp
     dh_store: TmaOp
     dv2_store: TmaOp
-    gk: TmaOp
+    gk: TmaOp | None  # None for a scalar gate, which the gate warp loads directly
 
 
 class Mmas(NamedTuple):
@@ -206,6 +206,7 @@ class BlackwellDeltaHBwd:
         bound_sequence_extent: bool = False,
         dynamic_state_layout: bool = False,
         fastmath: bool = False,
+        scalar_gate: bool = False,
     ):
         assert head_bv in (16, 32), f"BV must be 16 or 32, got {head_bv}"
         self.head_k = 128
@@ -218,6 +219,8 @@ class BlackwellDeltaHBwd:
         self.bound_sequence_extent = bound_sequence_extent
         self.dynamic_state_layout = dynamic_state_layout
         self.fastmath = fastmath
+        # Scalar gate: gk is one decay per (token, head) instead of one per key dimension.
+        self.scalar_gate = scalar_gate
         assert not bound_sequence_extent or varlen, "sequence extent applies only to varlen inputs"
 
         # Tile dimensions
@@ -312,7 +315,13 @@ class BlackwellDeltaHBwd:
             ),
         )
         g_wt = cute.make_tensor(w_in.iterator, g_qt.layout)
-        g_gk_k = cute.make_tensor(gk_in.iterator, g_qt.layout)
+        if cutlass.const_expr(self.scalar_gate):
+            g_gk_k = cute.make_tensor(
+                gk_in.iterator,
+                cute.make_layout((T, (H, dB)), stride=(self.upcast(H), (1, self.upcast(T) * H))),
+            )
+        else:
+            g_gk_k = cute.make_tensor(gk_in.iterator, g_qt.layout)
         g_do_vt = cute.make_tensor(
             do_in.iterator,
             cute.make_layout(
@@ -417,6 +426,11 @@ class BlackwellDeltaHBwd:
                 cute.group_modes(cute.select(w_in.layout, mode=[3, 1, 2, 0]), 2, 4),
             ),
             cute.make_tensor(
+                gk_in.iterator,
+                cute.group_modes(cute.select(gk_in.layout, mode=[1, 2, 0]), 1, 3),
+            )
+            if cutlass.const_expr(self.scalar_gate)
+            else cute.make_tensor(
                 gk_in.iterator,
                 cute.group_modes(cute.select(gk_in.layout, mode=[3, 1, 2, 0]), 2, 4),
             ),
@@ -752,14 +766,19 @@ class BlackwellDeltaHBwd:
             (self.BV, self.BT),
         )
 
-        # gk TMA: BK×1 fp32 tile (last timestep per chunk)
+        # gk TMA: BK×1 fp32 tile (last timestep per chunk). A scalar gate is below the TMA
+        # box minimum, so the gate warp reads it from global memory instead.
         s_gk_2d = cute.make_layout((self.BK, 1))
-        atom_gk, desc_gk = cpasync.make_tiled_tma_atom(
-            tma_ld,
-            g_gk_k,
-            s_gk_2d,
-            (self.BK, 1),
-        )
+        tma_gk = None
+        if cutlass.const_expr(not self.scalar_gate):
+            tma_gk = TmaOp(
+                *cpasync.make_tiled_tma_atom(
+                    tma_ld,
+                    g_gk_k,
+                    s_gk_2d,
+                    (self.BK, 1),
+                )
+            )
 
         cp_bits = 128
         cp_elems = cp_bits // self.io_type.width
@@ -854,8 +873,9 @@ class BlackwellDeltaHBwd:
                 TmaOp(atom_aqk, desc_aqk),
                 TmaOp(atom_dhst, desc_dhst),
                 TmaOp(atom_dv2st, desc_dv2st),
-                TmaOp(atom_gk, desc_gk),
+                tma_gk,
             ),
+            g_gk_k if cutlass.const_expr(self.scalar_gate) else None,
             g_dht,
             g_dh0_t,
             g_dv2,
@@ -1322,7 +1342,8 @@ class BlackwellDeltaHBwd:
                 do_desc = cute.domain_offset((0, bos, (0, 0)), desc_do)
                 w_desc = cute.domain_offset((0, bos, (0, 0)), desc_w)
                 aqk_desc = cute.domain_offset((0, bos, (0, 0)), desc_aqk)
-                gk_desc = cute.domain_offset((0, bos, (0, 0)), desc_gk)
+                if cutlass.const_expr(not self.scalar_gate):
+                    gk_desc = cute.domain_offset((0, bos, (0, 0)), desc_gk)
             else:
                 sequence_length = tokens
                 num_chunks = dense_chunks
@@ -1358,26 +1379,28 @@ class BlackwellDeltaHBwd:
                 h_idx,
             )
 
-            gGK_l = gk_desc[None, None, (h_idx, db)]
-            sSGK, gSGK = self._part_epi(atom_gk, gGK_l, (self.BK, 1), gk_3d)
+            if cutlass.const_expr(not self.scalar_gate):
+                gGK_l = gk_desc[None, None, (h_idx, db)]
+                sSGK, gSGK = self._part_epi(atom_gk, gGK_l, (self.BK, 1), gk_3d)
 
             # ---------- Chunk loop (reverse TMA loads) ----------
             for ct in cutlass.range(0, num_chunks, unroll=0):
                 rev_ct = num_chunks - 1 - ct
 
                 # gk load FIRST, clamping the tail to its final valid token.
-                if use_gk:
-                    gk_t = rev_ct * self.BT + self.BT - 1
-                    remaining = sequence_length - rev_ct * self.BT
-                    if remaining < self.BT:
-                        gk_t = sequence_length - 1
-                    gkh = pgk_P.acquire_and_advance()
-                    cute.copy(
-                        atom=atom_gk,
-                        src=gSGK[(None, 0, gk_t)],
-                        dst=sSGK[None, gkh.index],
-                        tma_bar_ptr=gkh.barrier,
-                    )
+                if cutlass.const_expr(not self.scalar_gate):  # noqa: SIM102
+                    if use_gk:
+                        gk_t = rev_ct * self.BT + self.BT - 1
+                        remaining = sequence_length - rev_ct * self.BT
+                        if remaining < self.BT:
+                            gk_t = sequence_length - 1
+                        gkh = pgk_P.acquire_and_advance()
+                        cute.copy(
+                            atom=atom_gk,
+                            src=gSGK[(None, 0, gk_t)],
+                            dst=sSGK[None, gkh.index],
+                            tma_bar_ptr=gkh.barrier,
+                        )
 
                 # k load (A-operand for MMA1)
                 kh = pk_P.acquire_and_advance()
@@ -1427,15 +1450,21 @@ class BlackwellDeltaHBwd:
         bx,
         gdx,
         n_iters,
+        tokens,
         dense_chunks,
         cu_seqlens,
+        g_gate,
         use_gk,
         gk_buf,
         gk_exp_buf,
         pgk_C,
         pgk_rdy_P,
     ):
-        """Consume gk TMA stages and produce exp2 gate stages for the state warps."""
+        """Consume gk TMA stages and produce exp2 gate stages for the state warps.
+
+        A scalar gate has no TMA stage: each lane loads the chunk's last-token decay and
+        broadcasts its exp2 across the key dimensions it owns.
+        """
         cute.arch.setmaxregister_decrease(self.aux_regs)
         tid, _, _ = cute.arch.thread_idx()
         gk_tid = tid - WarpRole.GATE * self.WARP_SZ
@@ -1445,23 +1474,40 @@ class BlackwellDeltaHBwd:
 
         while has_work:
             work_index = bx + tile_idx * gdx
-            _value_tile, _head_idx, sequence_idx = self._decode_work(work_index)
+            _value_tile, head_idx, sequence_idx = self._decode_work(work_index)
             if cutlass.const_expr(self.varlen):
-                num_chunks = (
-                    cu_seqlens[sequence_idx + 1] - cu_seqlens[sequence_idx] + self.BT - 1
-                ) // self.BT
+                bos = cu_seqlens[sequence_idx]
+                sequence_length = cu_seqlens[sequence_idx + 1] - bos
+                num_chunks = (sequence_length + self.BT - 1) // self.BT
+                db = Int32(0)
             else:
+                bos = Int32(0)
+                sequence_length = tokens
                 num_chunks = dense_chunks
-            for _ct in cutlass.range(0, num_chunks, unroll=0):
+                db = sequence_idx
+            for ct in cutlass.range(0, num_chunks, unroll=0):
                 if use_gk:
-                    gkh = pgk_C.wait_and_advance()
-                    gk_rdy = pgk_rdy_P.acquire_and_advance()
-                    for i in cutlass.range(4, unroll_full=True):
-                        idx = gk_tid * 4 + i
-                        gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(
-                            gk_buf[(idx, gkh.index)], fastmath=self.fastmath
+                    if cutlass.const_expr(self.scalar_gate):
+                        rev_ct = num_chunks - 1 - ct
+                        gk_t = rev_ct * self.BT + self.BT - 1
+                        if sequence_length - rev_ct * self.BT < self.BT:
+                            gk_t = sequence_length - 1
+                        gk_exp = cute.exp2(
+                            Float32(g_gate[(bos + gk_t, (head_idx, db))]),
+                            fastmath=self.fastmath,
                         )
-                    gkh.release()
+                        gk_rdy = pgk_rdy_P.acquire_and_advance()
+                        for i in cutlass.range(4, unroll_full=True):
+                            gk_exp_buf[(gk_tid * 4 + i, gk_rdy.index)] = gk_exp
+                    else:
+                        gkh = pgk_C.wait_and_advance()
+                        gk_rdy = pgk_rdy_P.acquire_and_advance()
+                        for i in cutlass.range(4, unroll_full=True):
+                            idx = gk_tid * 4 + i
+                            gk_exp_buf[(idx, gk_rdy.index)] = cute.exp2(
+                                gk_buf[(idx, gkh.index)], fastmath=self.fastmath
+                            )
+                        gkh.release()
                     cute.arch.fence_proxy("async.shared", space="cta")
                     gk_rdy.commit()
 
@@ -1622,6 +1668,7 @@ class BlackwellDeltaHBwd:
         self,
         mmas: Mmas,
         tma: TmaOps,
+        g_gate: cute.Tensor | None,
         g_dht: cute.Tensor,
         g_dh0_t: cute.Tensor,
         g_dv2: cute.Tensor,
@@ -1643,7 +1690,9 @@ class BlackwellDeltaHBwd:
         atom_aqk, desc_aqk = tma.aqk
         atom_dhst, desc_dhst = tma.dh_store
         atom_dv2st, desc_dv2st = tma.dv2_store
-        atom_gk, desc_gk = tma.gk
+        atom_gk = desc_gk = None
+        if cutlass.const_expr(not self.scalar_gate):
+            atom_gk, desc_gk = tma.gk
         (
             s_k_staged,
             s_dhb_staged,
@@ -1668,7 +1717,8 @@ class BlackwellDeltaHBwd:
             cpasync.prefetch_descriptor(atom_do)
             cpasync.prefetch_descriptor(atom_w)
             cpasync.prefetch_descriptor(atom_aqk)
-            cpasync.prefetch_descriptor(atom_gk)
+            if cutlass.const_expr(not self.scalar_gate):
+                cpasync.prefetch_descriptor(atom_gk)
 
         # SMEM allocation
         sa = SmemAllocator()
@@ -1978,8 +2028,10 @@ class BlackwellDeltaHBwd:
                 bx=bx,
                 gdx=gdx,
                 n_iters=n_iters,
+                tokens=T,
                 dense_chunks=dense_chunks,
                 cu_seqlens=cu_seqlens,
+                g_gate=g_gate,
                 use_gk=use_gk,
                 gk_buf=gk_buf,
                 gk_exp_buf=gk_exp_buf,
@@ -2232,7 +2284,13 @@ def requires_dynamic_state_layout(*states: torch.Tensor) -> bool:
 
 @jit_cache
 def _compile_delta_h_bwd(
-    H, bv, io_type, use_int64_offsets, dynamic_state_layout, fastmath: bool = False
+    H,
+    bv,
+    io_type,
+    use_int64_offsets,
+    dynamic_state_layout,
+    fastmath: bool = False,
+    scalar_gate: bool = False,
 ):
     """Compile one dense BlackwellDeltaHBwd variant."""
     target = get_compile_target()
@@ -2247,6 +2305,7 @@ def _compile_delta_h_bwd(
         use_int64_offsets=use_int64_offsets,
         dynamic_state_layout=dynamic_state_layout,
         fastmath=fastmath,
+        scalar_gate=scalar_gate,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     sa, sb, snt, sns, sn = (sym_int() for _ in range(5))
@@ -2254,7 +2313,7 @@ def _compile_delta_h_bwd(
     qf, kf, wf = (make_fake_tensor(io_type, (sa, sb, H, K)) for _ in range(3))
     dof = make_fake_tensor(io_type, (sa, sb, H, V))
     aqkf = make_fake_tensor(io_type, (sa, sb, H, chunk_size))
-    gkf = make_fake_tensor(cutlass.Float32, (sa, sb, H, K))
+    gkf = make_fake_tensor(cutlass.Float32, (sa, sb, H) if scalar_gate else (sa, sb, H, K))
     dhtf = make_state_signature_tensor(
         cutlass.Float32,
         (sns, H, V, K),
@@ -2303,6 +2362,7 @@ def _compile_delta_h_bwd_packed(
     bound_sequence_extent: bool,
     dynamic_state_layout: bool,
     fastmath: bool = False,
+    scalar_gate: bool = False,
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
     target = get_compile_target()
@@ -2319,6 +2379,7 @@ def _compile_delta_h_bwd_packed(
         bound_sequence_extent=bound_sequence_extent,
         dynamic_state_layout=dynamic_state_layout,
         fastmath=fastmath,
+        scalar_gate=scalar_gate,
     )
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens, chunks, sequences, metadata_entries = (sym_int() for _ in range(4))
@@ -2348,7 +2409,11 @@ def _compile_delta_h_bwd_packed(
         token_tensor(io_type, key_dim),
         token_tensor(io_type, value_dim),
         token_tensor(io_type, chunk_size),
-        token_tensor(cutlass.Float32, key_dim),
+        (
+            make_fake_tensor(cutlass.Float32, (tokens, heads))
+            if scalar_gate
+            else token_tensor(cutlass.Float32, key_dim)
+        ),
         dht_state,
         dh0_state,
         chunk_state,
@@ -2386,6 +2451,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run packed delta-H with fused intra-chunk dV.
 
+    ``gk`` is a per-key-dimension gate shaped like ``q`` or a scalar gate shaped ``q.shape[:3]``.
     Chunk-state slots beyond ``metadata.chunk_offsets[-1]`` and inactive token rows are undefined.
     """
     batch, tokens, heads, key_dim = q.shape
@@ -2402,8 +2468,9 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
     expected_aqk = (1, tokens, heads, chunk_size)
     if aqk.shape != expected_aqk:
         raise ValueError(f"Aqk must have shape {expected_aqk}")
-    if gk is not None and gk.shape != q.shape:
-        raise ValueError("gk must match q")
+    scalar_gate = gk is not None and gk.shape == q.shape[:3]
+    if gk is not None and not scalar_gate and gk.shape != q.shape:
+        raise ValueError("gk must match q or q.shape[:3]")
     tensor_inputs = (q, k, w, do, aqk, *((gk,) if gk is not None else ()))
     if any(tensor.device != q.device for tensor in tensor_inputs):
         raise ValueError("packed delta-H+dV inputs must share q.device")
@@ -2479,6 +2546,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         ),
         requires_dynamic_state_layout(final_state_kernel, initial_state_gradient_kernel),
         fastmath,
+        scalar_gate,
     )
     compiled(
         *kernel_tensors,
@@ -2508,7 +2576,10 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     *,
     fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    """Run the dense B=1 CuTeDSL SM100 delta-H backward leaf."""
+    """Run the dense B=1 CuTeDSL SM100 delta-H backward leaf.
+
+    ``gk`` is a per-key-dimension gate shaped like ``q`` or a scalar gate shaped ``q.shape[:3]``.
+    """
     B, T, H, K = q.shape
     V = do.shape[-1]
     BT = chunk_size
@@ -2527,6 +2598,9 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
     expected_aqk = (B, T, H, BT)
     if aqk.shape != expected_aqk:
         raise ValueError(f"the dense delta-H kernel requires Aqk with shape {expected_aqk}")
+    scalar_gate = gk is not None and gk.shape == q.shape[:3]
+    if gk is not None and not scalar_gate and gk.shape != q.shape:
+        raise ValueError("gk must match q or q.shape[:3]")
     expected_state = (B, H, V, K)
     for name, state in (("h0", h0), ("dht", dht)):
         if state is not None and state.shape != expected_state:
@@ -2576,6 +2650,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         use_int64_offsets,
         requires_dynamic_state_layout(dht_k, dh0_k),
         fastmath,
+        scalar_gate,
     )
     dummy_metadata = torch.empty(2, dtype=torch.int32, device=dev)
     fn(
