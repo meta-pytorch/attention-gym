@@ -4,8 +4,8 @@ Modes (see MAINTENANCE.md in the vendored package for the full upgrade procedure
 
     # Vendor a tag into a scratch dir (default agent_space/cudnn_fe_vendor/<rev>).
     python -m tools.cudnn_fe.vendor --rev v1.31.0 --upstream <cudnn-frontend clone>
-    # Check the machinery: regenerate v1.30.0 and compare with the verbatim drop commit, found
-    # by its subject (DROP_SUBJECT) in the current history; --verify also takes any rev.
+    # Check the machinery: regenerate v1.30.0 and compare with the verbatim drop commit
+    # (DROP_COMMIT); --verify also takes any rev.
     python -m tools.cudnn_fe.vendor --rev v1.30.0 --upstream <clone> --verify auto
     # Per-file upstream churn of the closure between two tags.
     python -m tools.cudnn_fe.vendor --upstream <clone> --diff-upstream v1.30.0 v1.31.0
@@ -41,9 +41,8 @@ NOTICE = (
     "# Modified by Attention Gym in 2026: vendored from cudnn-frontend {rev}; imports relocated into\n"
     "# {package}.\n"
 )
-# Subject of the verbatim v1.30 drop commit; ``--verify auto`` resolves the commit through it, since
-# stack rebases and squash merges rewrite the hash.
-DROP_SUBJECT = "Vendor the cudnn-frontend v1.30 GDN and KDA kernels verbatim"
+# The verbatim v1.30 drop as merged to main (#606); ``auto`` in ``--verify`` and ``audit --rev``.
+DROP_COMMIT = "d590d9dc70d48c08462bc29aef7428774e8217d1"
 # Torch-backed replacements for the cudnn.frost host utilities v1.30 kernels reach, byte-identical
 # to the verbatim drop's (its docstring names that drop's script); written into scratch output so it
 # imports. The behavior layer deletes the host code that needs it.
@@ -300,24 +299,9 @@ def diff_upstream(clone: Path, old: str, new: str) -> None:
         print(f"new closure reaches unvendorable modules: {sorted(cl_new.external)}")
 
 
-def find_drop_commit(subject: str = DROP_SUBJECT, rev: str = "HEAD") -> str | None:
-    """Newest commit reachable from ``rev`` whose subject is exactly ``subject``, or None."""
-    log = _git_repo("log", "--format=%H %s", "--fixed-strings", f"--grep={subject}", rev)
-    for line in log.decode().splitlines():
-        sha, _, line_subject = line.partition(" ")
-        if line_subject == subject:
-            return sha
-    return None
-
-
 def resolve_drop(rev: str) -> str:
-    """``rev`` itself, or for ``auto`` the drop commit found by ``DROP_SUBJECT``."""
-    if rev != "auto":
-        return rev
-    sha = find_drop_commit()
-    if sha is None:
-        raise SystemExit(f"no commit with subject {DROP_SUBJECT!r} in the current history")
-    return sha
+    """``rev`` itself, or ``DROP_COMMIT`` for ``auto``."""
+    return DROP_COMMIT if rev == "auto" else rev
 
 
 def _git_repo(*args: str) -> bytes:
@@ -343,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--verify",
         metavar="COMMIT",
-        help="compare with COMMIT's vendored tree; 'auto' finds the drop commit by DROP_SUBJECT",
+        help="compare with COMMIT's vendored tree; 'auto' is the v1.30 drop (DROP_COMMIT)",
     )
     ap.add_argument("--diff-upstream", nargs=2, metavar=("OLD", "NEW"), help="closure churn")
     a = ap.parse_args(argv)

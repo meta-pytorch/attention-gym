@@ -36,9 +36,8 @@ Commit with `git commit --only -- <paths>` when several agents share the checkou
 Run these commands from a clean, dedicated upgrade checkout with its own editable `.venv`;
 never switch branches in a checkout where another agent is working. Set `<old-drop-commit>` to
 the previous **verbatim vendor commit**, not the previous integration tip. For v1.30 it is the
-#606 commit "Vendor the cudnn-frontend v1.30 GDN and KDA kernels verbatim"; hashes change on every
-rebase and squash merge, so `--verify auto` finds it by that subject (`vendor.DROP_SUBJECT`), and
-`git log --format=%H --fixed-strings --grep='<subject>'` finds any other drop. The merge below has
+#606 commit on main, pinned as `vendor.DROP_COMMIT` (what `--verify auto` compares with).
+When a new drop lands on main, pin its merged hash there. The merge below has
 base = old drop, theirs = new drop, ours = current AG.
 
 1. **Churn and reproducibility.** Before changing branches:
@@ -47,7 +46,9 @@ base = old drop, theirs = new drop, ours = current AG.
    python -m tools.cudnn_fe.vendor --upstream <clone> --rev v1.30.0 --verify auto
    ```
    Review files added, changed and removed from the driver-import closure. The GDP d_v=64
-   prologue fork is pruned automatically; unresolved `cudnn.*` imports fail closed.
+   prologue fork is pruned automatically; unresolved `cudnn.*` imports fail closed. The
+   `--verify` replay must print `PASS` before trusting the vendor tool on the new tag; pytest
+   does not run it (it needs the upstream clone and full git history).
 2. **Three-way import (layer A into the existing AG layers).** Generate the new drop before
    switching to the old commit, where the current tooling may not exist. Replace the placeholder
    values below, and keep `drop` outside the tracked package:
