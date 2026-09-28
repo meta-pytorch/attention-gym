@@ -43,6 +43,11 @@ def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extr
     image.add_local_file.assert_any_call(
         runner.ROOT_PATH / "modal_tests.py", remote_path="/root/modal_tests.py"
     )
+    # Maintenance tests need tools data files and package Markdown, not just Python modules.
+    image.add_local_dir.assert_any_call(runner.ROOT_PATH / "tools", remote_path="/root/tools")
+    image.add_local_dir.assert_any_call(
+        runner.ROOT_PATH / "attn_gym", remote_path="/root/attn_gym"
+    )
     image.pip_install_from_pyproject.assert_called_once_with(
         str(runner.ROOT_PATH / "pyproject.toml"), optional_dependencies=extras, pre=True
     )

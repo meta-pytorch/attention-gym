@@ -85,6 +85,13 @@ conflicts = [
 [tool.hatch.version]
 source = "vcs"
 
+# Maintenance tools are importable in development, but are not part of the runtime wheel.
+[tool.hatch.build]
+dev-mode-dirs = ["."]
+
+[tool.hatch.build.targets.wheel]
+packages = ["attn_gym"]
+
 # ---------- PYTEST ------------
 [tool.pytest.ini_options]
 testpaths = ["test"]

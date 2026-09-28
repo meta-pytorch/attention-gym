@@ -62,10 +62,12 @@ def configure_local_image(
             )
         )
     else:
-        configured = configured.add_local_python_source("attn_gym")
+        # Tool tests also inspect vendored notices and the generated maintenance ledger.
+        configured = configured.add_local_dir(ROOT_PATH / "attn_gym", remote_path="/root/attn_gym")
     # test_examples_layout checks README.md and docs/ against examples/, so ship them too.
     return (
-        configured.add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
+        configured.add_local_dir(ROOT_PATH / "tools", remote_path="/root/tools")
+        .add_local_dir(ROOT_PATH / "test", remote_path="/root/test")
         .add_local_dir(ROOT_PATH / "examples", remote_path="/root/examples")
         .add_local_dir(ROOT_PATH / "benchmarks", remote_path="/root/benchmarks")
         .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
