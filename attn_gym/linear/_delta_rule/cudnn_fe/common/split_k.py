@@ -66,13 +66,21 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4
-from .host import get_dtype
+from .host import get_dtype, validate_cuda_tensors
+from .paged_state import resolve_paged_state
+from .tvm_ffi import (
+    make_counter_signature,
+    make_cu_seqlens_signature,
+    make_strided_signature_tensor,
+    make_work_items_signature,
+    validate_cu_seqlens,
+)
 
 USE_PDL = True
 
@@ -157,7 +165,7 @@ def max_work_items(
 ) -> int:
     """Provable upper bound on the emitted item count: spans are capped at
     ``ideal_chunks`` (at most ``ceil(nc / ideal) + 1`` pieces per (b, h)),
-    zero-length sequences emit one item each, and the fill-regime search
+    capacity for zero-length sequences is conservative, and the fill-regime search
     can widen any tile by up to ``P_WINDOW - 1`` extra pieces."""
     total_chunks = -(-total_tokens // b_t)
     window = P_WINDOW - 1 if batch_size * n_heads_out < 2 * num_sms else 0
@@ -958,7 +966,7 @@ def frost_split_k_scan_scalar(
                                 (
                                     mGate.iterator
                                     + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0])
-                                    + h_r
+                                    + cutlass.Int64(h_r) * cutlass.Int64(mGate.stride[1])
                                 )
                                 .load()
                                 .to(cutlass.Float32)
@@ -1100,8 +1108,8 @@ def frost_split_k_walk(
                 num_blocks = nb_w
 
     if num_blocks <= 1:
-        # ---- nothing to cut: emit the whole sequence ---------------------------------
-        if tidx == 0:
+        # Empty sequences have no chunks and must not enter the persistent work queue.
+        if (tidx == 0) and (batch_num_chunks > 0):
             emit_item(
                 mStaging,
                 mCount,
@@ -1399,6 +1407,53 @@ def gen_interval_items(
 
 
 @cute.jit
+def compact_sequences(
+    n_threads: cutlass.Constexpr[int],
+    tidx,
+    n_batch: cutlass.Int32,
+    mCuSeqlens: cute.Tensor,
+    sIdx,
+    sWarp,
+    *,
+    mStateIndices: cute.Tensor | None = None,
+    mHasInitialState: cute.Tensor | None = None,
+):
+    """Write, in sequence order, ids with tokens or a fresh paged slot to clear into
+    ``sIdx[0, M)`` and return ``M``.  A warp ballot ranks each round of ``n_threads`` sequences, so
+    the table is deterministic.  ``sWarp`` holds ``n_threads // 32`` Int32 cells."""
+    lane = cute.arch.lane_idx()
+    warp = tidx // cutlass.Int32(32)
+    base = cutlass.Int32(0)
+    start = cutlass.Int32(0)
+    while start < n_batch:
+        b = start + tidx
+        keep = cutlass.Boolean(False)
+        if b < n_batch:
+            keep = mCuSeqlens[b + 1] > mCuSeqlens[b]
+            if cutlass.const_expr(mStateIndices is not None):
+                _, _, _, clear_empty = resolve_paged_state(b, mStateIndices, mHasInitialState)
+                keep = keep or clear_empty
+        ballot = cute.arch.vote_ballot_sync(keep)
+        rank = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot) & cute.arch.lanemask_lt()))
+        if lane == 0:
+            sWarp[warp] = cutlass.Int32(cute.arch.popc(cutlass.Uint32(ballot)))
+        nvvm.barrier_cta_sync()
+        offset = base
+        total = cutlass.Int32(0)
+        for w in cutlass.range_constexpr(n_threads // 32):
+            count = sWarp[w]
+            total = total + count
+            if cutlass.Int32(w) < warp:
+                offset = offset + count
+        if keep:
+            sIdx[offset + rank] = b
+        base = base + total
+        nvvm.barrier_cta_sync()
+        start = start + cutlass.Int32(n_threads)
+    return base
+
+
+@cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
@@ -1421,6 +1476,8 @@ def order_body(
     chain: cutlass.Constexpr[bool] = False,
     mRowBase: cute.Tensor | None = None,
     mSlotRows: cute.Tensor | None = None,
+    mStateIndices: cute.Tensor | None = None,
+    mHasInitialState: cute.Tensor | None = None,
 ):
     """Bitonic-sort the staged items by ``compute_end - compute_start``,
     longest first, into ``work_items``; with ``gen`` synthesize the uncut item
@@ -1441,7 +1498,33 @@ def order_body(
                 mScheduler[si] = cutlass.Int32(0)
                 si = si + cutlass.Int32(1)
 
-    if cutlass.const_expr(gen):
+    # Attention Gym modification: the uncut ``gen`` table emits no item for sequences without
+    # tokens, so padded ``cu_seqlens`` cost neither sort slots nor main-kernel tiles. Compacted item
+    # ``i`` maps back to the original ``sequence * n_heads_out + head`` index. Callers seed the final
+    # state and the state cotangent of empty sequences. Batches of more than ``capacity``
+    # sequences keep the uncompacted table.
+    compact = False
+    if cutlass.const_expr(gen and not chain and expand_num == 1):
+        n_batch = n_tiles // n_heads_out
+        compact = n_batch <= cutlass.Int32(capacity)
+        n = n_tiles
+        if compact:
+            n = (
+                compact_sequences(
+                    n_threads,
+                    tidx,
+                    n_batch,
+                    mCuSeqlens,
+                    sIdx,
+                    sKey,
+                    mStateIndices=mStateIndices,
+                    mHasInitialState=mHasInitialState,
+                )
+                * n_heads_out
+            )
+        if tidx == 0:
+            mCount[0] = n
+    elif cutlass.const_expr(gen):
         n = n_tiles
         if tidx == 0:
             mCount[0] = n_tiles
@@ -1452,6 +1535,9 @@ def order_body(
     if (n > cutlass.Int32(capacity)) or (n <= cutlass.Int32(num_ctas)):
         i = tidx
         while i < n:
+            src = i
+            if compact:
+                src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
             write_item(
                 gen,
                 b_t,
@@ -1460,7 +1546,7 @@ def order_body(
                 mStaging,
                 mWorkItems,
                 i,
-                i,
+                src,
                 expand_num,
                 chain,
                 mRowBase,
@@ -1468,6 +1554,15 @@ def order_body(
             )
             i = i + cutlass.Int32(n_threads)
     else:
+        # Resolve compacted sources before sIdx is reused as the sort permutation.
+        sources = []
+        for e in cutlass.range_constexpr(order_elements):
+            i = tidx + cutlass.Int32(e * n_threads)
+            src = i
+            if compact:
+                if i < n:
+                    src = sIdx[i // n_heads_out] * n_heads_out + i % n_heads_out
+            sources.append(src)
         if tidx == 0:
             sSpread[0] = cutlass.Int32(2147483647)
             sSpread[1] = cutlass.Int32(-2147483648)
@@ -1489,13 +1584,13 @@ def order_body(
                     )
                 elif cutlass.const_expr(gen):
                     _batch_idx, _head_idx, _batch_start, _batch_end, batch_num_chunks = (
-                        gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i, expand_num)
+                        gen_item_bounds(b_t, n_heads_out, mCuSeqlens, sources[e], expand_num)
                     )
                     key = batch_num_chunks
                 else:
                     key = mStaging[i, 5] - mStaging[i, 4]
                 sKey[i] = key
-                sIdx[i] = i
+                sIdx[i] = sources[e]
                 kmin = kmin if kmin < key else key
                 kmax = kmax if kmax > key else key
             elif i < b_pad:
@@ -1517,7 +1612,7 @@ def order_body(
                     mStaging,
                     mWorkItems,
                     i2,
-                    i2,
+                    sIdx[i2],
                     expand_num,
                     chain,
                     mRowBase,
@@ -1699,7 +1794,104 @@ def launch(
         )
 
 
-compiled_cache = {}
+@jit_cache
+def _compile_split_table(
+    split,
+    b_t,
+    scan_rows,
+    log_gate,
+    safe_gate,
+    gate_channels,
+    overhead_chunks,
+    expand_num,
+    warmup_cap,
+    full_scan,
+    num_sms,
+    gate_dtype,
+    a_dtype,
+    bias_spec,
+    has_sched,
+    use_int64_offsets,
+    opt_level,
+):
+    sym_int = cute.sym_int
+
+    def tensor(dtype, rank, align=4):
+        return make_strided_signature_tensor(
+            dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=align,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+
+    gate = (
+        tensor(gate_dtype, 3 if gate_channels else 2, 8 if gate_dtype.width == 16 else 4)
+        if split
+        else None
+    )
+    if split and not gate_channels:
+        gate = make_fake_strided_tensor(
+            gate_dtype,
+            (sym_int(), sym_int()),
+            contiguous_dim=None,
+            assumed_align=4,
+            use_int64_strides=use_int64_offsets,
+        )
+    a_log = tensor(a_dtype, 1) if a_dtype is not None else None
+    dt_bias = tensor(*bias_spec) if bias_spec is not None else None
+    flags = (
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        num_sms,
+        has_sched,
+        use_int64_offsets,
+        opt_level,
+    )
+    suffix = "_".join(str(int(flag)) for flag in flags)
+    dtype_names = "_".join(
+        "none" if dtype is None else dtype.__name__.lower()
+        for dtype in (gate_dtype, a_dtype, None if bias_spec is None else bias_spec[0])
+    )
+    bias_rank = 0 if bias_spec is None else bias_spec[1]
+    return compile_tvm_ffi(
+        launch,
+        split,
+        b_t,
+        scan_rows,
+        log_gate,
+        safe_gate,
+        gate_channels,
+        overhead_chunks,
+        expand_num,
+        warmup_cap,
+        full_scan,
+        cutlass.Int32(0),
+        num_sms,
+        *(cutlass.Int32(0) for _ in range(3)),
+        cutlass.Float32(0),
+        cutlass.Float32(0),
+        gate,
+        a_log,
+        dt_bias,
+        make_cu_seqlens_signature(sym_int(), assumed_align=4),
+        tensor(cutlass.Float32, 2) if split else None,
+        make_work_items_signature(sym_int()) if split else None,
+        make_work_items_signature(sym_int()),
+        make_counter_signature(sym_int()),
+        make_counter_signature(sym_int()) if has_sched else None,
+        *(cutlass.Int32(0) for _ in range(3)),
+        name=f"split_table_{suffix}_{dtype_names}_biasrank{bias_rank}",
+        opt_level=opt_level,
+    )
 
 
 class SplitTableFacts(NamedTuple):
@@ -1747,6 +1939,18 @@ def split_table_facts(
     if log2_threshold is None:
         log2_threshold = DEFAULT_LOG2_THRESHOLD
     gate_channels = gate.shape[2] if len(gate.shape) == 3 else 0
+    # The channel scan reads four channels per lane with one vector load (16 B fp32, 8 B 16-bit).
+    vector_bytes = 4 * gate.element_size()
+    if (
+        split
+        and gate_channels
+        and gate_channels % 128 == 0
+        and (gate.data_ptr() % vector_bytes or gate.stride(0) % 4 or gate.stride(1) % 4)
+    ):
+        raise ValueError(
+            f"per-channel gate rows and head slices must be {vector_bytes}-byte aligned "
+            "for vectorized scan loads"
+        )
     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
@@ -1802,6 +2006,7 @@ class TableRecipe(NamedTuple):
     n_scan_blocks: int
     n_walk_ctas: int
     expand_num: int
+    has_sched: bool
 
 
 def run_table(
@@ -1837,11 +2042,10 @@ def run_table(
         item_scratch if r.split else None,
         work_items,
         work_count,
-        scheduler_counter,
+        scheduler_counter if r.has_sched else None,
         r.n_scan_ctas,
         r.n_scan_blocks,
         r.n_walk_ctas,
-        cuda.CUstream(int(stream)),
     )
 
 
@@ -1893,6 +2097,66 @@ def build_split_table(
     in ``cu * expand_num`` units without materializing that array (1 = off).
     Runs entirely on device, no host synchronization.  ``opt_level`` is the family's main-kernel level, so the
     standalone table is the one the family's warmup hosts nest."""
+    validate_cuda_tensors(
+        gate,
+        cu_seqlens=cu_seqlens,
+        work_items=work_items,
+        work_count=work_count,
+        chunk_scratch=chunk_scratch,
+        item_scratch=item_scratch,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        scheduler_counter=scheduler_counter,
+    )
+    if gate.ndim not in (2, 3) or gate.shape[1] <= 0:
+        raise ValueError("gate must have rank 2 or 3 with a positive head count")
+    validate_cu_seqlens(cu_seqlens, assumed_align=4)
+    batch_size, heads = cu_seqlens.numel() - 1, gate.shape[1]
+    if batch_size <= 0:
+        raise ValueError("cu_seqlens must describe at least one sequence")
+    if n_tiles != batch_size * heads:
+        raise ValueError("n_tiles must equal the number of sequences times output heads")
+    if b_t <= 0 or num_sms <= 0 or expand_num < 1:
+        raise ValueError("b_t, num_sms and expand_num must be positive")
+    ideal_chunks = 0 if ideal_chunks is None else int(ideal_chunks)
+    if ideal_chunks < 0:
+        raise ValueError("ideal_chunks must be nonnegative")
+    if safe_gate and gate.ndim == 3 and gate_lower_bound is None:
+        raise ValueError("safe channel gates require gate_lower_bound")
+    alignment = 8 if gate.element_size() == 2 else 4
+    if gate.data_ptr() % alignment or (gate.ndim == 3 and gate.stride(-1) != 1):
+        raise ValueError("gate does not satisfy the aligned scan layout")
+    for name, tensor in (("work_count", work_count), ("scheduler_counter", scheduler_counter)):
+        if tensor is not None and (
+            tensor.ndim != 1
+            or tensor.numel() < 1
+            or str(tensor.dtype) != "torch.int32"
+            or not tensor.is_contiguous()
+            or tensor.data_ptr() % 4
+        ):
+            raise ValueError(f"{name} must be a nonempty compact int32 vector")
+    required_items = n_tiles
+    if split and ideal_chunks:
+        required_items = max_work_items(
+            gate.shape[0] * expand_num, batch_size, heads, ideal_chunks, b_t, num_sms
+        )
+    for name, tensor in (("work_items", work_items), ("item_scratch", item_scratch)):
+        if name == "item_scratch" and not split:
+            continue
+        if tensor is None or tensor.ndim != 2 or tensor.shape[1] != WORK_ITEM_FIELDS:
+            raise ValueError(f"{name} must have shape (rows, {WORK_ITEM_FIELDS})")
+        if str(tensor.dtype) != "torch.int32" or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be a compact int32 table")
+        if tensor.shape[0] < required_items:
+            raise ValueError(f"{name} requires at least {required_items} rows")
+    if split:
+        rows = chunk_scratch_rows(gate.shape[0] * expand_num, batch_size, b_t)
+        if chunk_scratch is None or chunk_scratch.ndim != 2 or chunk_scratch.shape[0] < rows:
+            raise ValueError(f"chunk_scratch requires at least {rows} rows")
+        if chunk_scratch.shape[1] != heads or str(chunk_scratch.dtype) != "torch.float32":
+            raise ValueError("chunk_scratch must be float32 with one column per head")
+        if chunk_scratch.stride(1) != 1 or chunk_scratch.data_ptr() % 4:
+            raise ValueError("chunk_scratch must have aligned contiguous head rows")
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -1910,115 +2174,36 @@ def build_split_table(
         gate_lower_bound=gate_lower_bound,
         expand_num=expand_num,
     )
-    scan_rows, gate_channels, n_heads_out, batch_size, gate_elem_bytes = (
+    scan_rows, gate_channels, n_heads_out, batch_size = (
         f.scan_rows,
         f.gate_channels,
         f.n_heads_out,
         f.batch_size,
-        f.gate_elem_bytes,
     )
     log2_threshold, gate_scale_log2 = f.log2_threshold, f.gate_scale_log2
     n_scan_ctas, n_scan_blocks, n_walk_ctas = f.n_scan_ctas, f.n_scan_blocks, f.n_walk_ctas
     overhead_chunks, warmup_cap, full_scan = f.overhead_chunks, f.warmup_cap, f.full_scan
-    cu_stream = cuda.CUstream(int(stream))
-
-    key = (
+    compiled = _compile_split_table(
         bool(split),
         b_t,
-        scan_rows,
-        num_sms,
+        int(scan_rows),
         bool(log_gate),
         bool(safe_gate),
         gate_channels,
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
+        overhead_chunks,
         int(expand_num),
-        current_device(),
+        warmup_cap,
+        full_scan,
+        int(num_sms),
+        get_dtype(gate.dtype),
+        get_dtype(a_log.dtype) if a_log is not None else None,
+        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
+        scheduler_counter is not None,
+        True,
         int(opt_level),
     )
-    if key not in compiled_cache:
-        dt_bias_c = None
-        if dt_bias is not None:
-            dt_bias_c = from_dlpack(dt_bias, assumed_align=4)
-            dt_bias_c.mark_compact_shape_dynamic(
-                mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1
-            )
-        chunk_scratch_c = None
-        item_scratch_c = None
-        if split:
-            chunk_scratch_c = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_c.mark_layout_dynamic(leading_dim=1)
-            item_scratch_c = from_dlpack(item_scratch, assumed_align=4)
-            item_scratch_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_c = from_dlpack(work_items, assumed_align=4)
-        work_items_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_c = from_dlpack(work_count, assumed_align=4)
-        work_count_c.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        compiled_cache[key] = cute.compile(
-            launch,
-            bool(split),
-            b_t,
-            int(scan_rows),
-            bool(log_gate),
-            bool(safe_gate),
-            gate_channels,
-            overhead_chunks,
-            int(expand_num),
-            warmup_cap,
-            full_scan,
-            cutlass.Int32(n_heads_out),
-            int(num_sms),
-            cutlass.Int32(n_tiles),
-            cutlass.Int32(ideal_chunks),
-            cutlass.Int32(batch_size),
-            cutlass.Float32(log2_threshold),
-            cutlass.Float32(gate_scale_log2),
-            from_dlpack(
-                gate, assumed_align=(8 if gate_elem_bytes == 2 else 4)
-            ).mark_layout_dynamic(leading_dim=len(gate.shape) - 1)
-            if split
-            else None,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic()
-            if a_log is not None
-            else None,
-            dt_bias_c,
-            from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
-            chunk_scratch_c,
-            item_scratch_c,
-            work_items_c,
-            work_count_c,
-            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic(),
-            cutlass.Int32(n_scan_ctas),
-            cutlass.Int32(n_scan_blocks),
-            cutlass.Int32(n_walk_ctas),
-            cu_stream,
-            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
-        )
-    compiled_cache[key](
-        n_heads_out,
-        n_tiles,
-        ideal_chunks,
-        batch_size,
-        float(log2_threshold),
-        float(gate_scale_log2),
-        gate,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        chunk_scratch,
-        item_scratch,
-        work_items,
-        work_count,
-        scheduler_counter,
-        n_scan_ctas,
-        n_scan_blocks,
-        n_walk_ctas,
-        cu_stream,
-    )
-    return TableRecipe(
-        compiled_cache[key],
+    recipe = TableRecipe(
+        compiled,
         bool(split),
         bool(safe_gate),
         n_heads_out,
@@ -2032,7 +2217,22 @@ def build_split_table(
         n_scan_blocks,
         n_walk_ctas,
         int(expand_num),
+        scheduler_counter is not None,
     )
+    run_table(
+        recipe,
+        gate,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        chunk_scratch,
+        item_scratch,
+        work_items,
+        work_count,
+        scheduler_counter,
+        stream,
+    )
+    return recipe
 
 
 frost_split_k_plan.set_name_prefix("cudnn", remove_cutlass_symbol=False)

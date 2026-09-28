@@ -595,8 +595,8 @@ def test_cudnn_public_packed_unsplit_local_backward_matches_exact_gradients(monk
         )
 
 
-def test_cudnn_document_aligned_spans_are_bitwise_equal() -> None:
-    """A document's output and gradients must not depend on its enclosing span length."""
+def test_cudnn_document_aligned_spans_are_bitwise_equal(kda_plan_comparison) -> None:
+    """Spans are bit-exact within uncut; shape-dependent automatic plans allow 1% relative L2."""
     from attn_gym.linear import chunk_kda
 
     lengths = (64, 128, 4096)
@@ -631,7 +631,9 @@ def test_cudnn_document_aligned_spans_are_bitwise_equal() -> None:
                 (output, *gradients),
                 strict=True,
             ):
-                assert torch.equal(actual, expected[:, start:end]), (name, first, last, packed)
+                kda_plan_comparison(
+                    actual, expected[:, start:end], str((name, first, last, packed))
+                )
 
 
 def test_cudnn_kernel_options_are_strict() -> None:
@@ -679,31 +681,35 @@ def _split_forward_pair(
     Returns the inputs, both outputs, and the number of work items the split schedule emitted.
     """
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn import forward, schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
 
     inputs = make_kda_test_inputs(
         8192, seed=107, normalize_qk=True, sigmoid_beta=True, dtype=dtype, **gate
     )
     unsplit, _ = chunk_kda(*inputs, kernel_options={"backend": "cudnn"})
-    schedules = []
+    counts = []
+    allocate_count = driver._work_count
 
-    def recording_schedule(*args, **kwargs):
-        schedules.append(schedule.prepare_cudnn_schedule(*args, **kwargs))
-        return schedules[-1]
+    def recording_count(device):
+        counts.append(allocate_count(device))
+        return counts[-1]
 
-    monkeypatch.setattr(forward, "prepare_cudnn_schedule", recording_schedule)
+    monkeypatch.setattr(driver, "_work_count", recording_count)
     split, _ = chunk_kda(*inputs, kernel_options={"backend": "cudnn", "split_forward": True})
     torch.cuda.synchronize()
-    (recorded,) = schedules
-    return inputs, unsplit, split, int(recorded.work_count.item())
+    (recorded,) = counts
+    return inputs, unsplit, split, int(recorded.item())
 
 
-def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
+def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(
+    monkeypatch, kda_plan_comparison
+) -> None:
+    """No-cut is bit-exact within uncut; automatic prep/chain may change rounding by <1% L2."""
     _, unsplit, split, work_items = _split_forward_pair(
         monkeypatch, torch.bfloat16, gate_value=-1e-5
     )
     assert work_items == 1
-    torch.testing.assert_close(split, unsplit, atol=0, rtol=0)
+    kda_plan_comparison(split, unsplit, "no-cut forward")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -735,11 +741,11 @@ def test_cudnn_cpu_inputs_fail_before_dispatch() -> None:
 
 def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn import schedule
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
     from attn_gym.linear.kda.impl import cudnn as backend
 
     local_backward = backend.chunk_cudnn_packed_local_bwd_op
-    compute_ideal_chunks = schedule.compute_ideal_chunks
+    compute_ideal_chunks = driver.compute_ideal_chunks
     selected = []
     geometries = []
 
@@ -752,7 +758,7 @@ def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
         return compute_ideal_chunks(*args)
 
     monkeypatch.setattr(backend, "chunk_cudnn_packed_local_bwd_op", record_split)
-    monkeypatch.setattr(schedule, "compute_ideal_chunks", record_geometry)
+    monkeypatch.setattr(driver, "compute_ideal_chunks", record_geometry)
 
     exact_inputs = _make_inputs(requires_grad=True)
     exact_output = _candidate_dense(*exact_inputs)
@@ -908,6 +914,51 @@ def test_cudnn_repeated_backward_with_empty_sequences() -> None:
             (d_output, d_state),
         )
         torch.cuda.synchronize()
+
+
+def test_cudnn_backward_past_sort_capacity_runs_empty_work_items() -> None:
+    """Zero-chunk work items must leave the dstate handshake and every neighbour intact.
+
+    Batches within the sort capacity compact empty sequences out of the work table, so the
+    29-sequence stress never hands the kernels an empty item. Past ``ORDER_CAPACITY`` sequences
+    the table copies through uncompacted and every empty (sequence, head) reaches the recompute
+    and bprop kernels as a zero-chunk item, which must neither consume a dstate handshake phase
+    nor touch its neighbours: the native stateful backward equals the compacted run over the
+    nonempty sequences and empty sequences pass their state cotangent straight through.
+    """
+    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import ORDER_CAPACITY
+    from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_bwd_with_state_op
+
+    heads = 2
+    num_seqs = ORDER_CAPACITY + 3
+    lengths = tuple(0 if index % 3 else 16 for index in range(num_seqs))
+    q, k, value, gate, beta = make_kda_test_inputs(
+        sum(lengths), heads=heads, seed=433, normalize_qk=True
+    )
+    state = torch.randn(num_seqs, heads, D, D, device="cuda") / 100
+    d_output = torch.randn_like(value)
+    d_state = torch.randn(num_seqs, heads, D, D, device="cuda")
+    nonempty = torch.tensor([length > 0 for length in lengths], device="cuda")
+    assert nonempty.sum().item() < ORDER_CAPACITY < num_seqs
+
+    def run(cu_seqlens, initial_state, exit_cotangent):
+        return chunk_cudnn_packed_bwd_with_state_op(
+            q, k, value, gate, beta, d_output, cu_seqlens, initial_state, exit_cotangent, 1.0
+        )
+
+    expected = run(
+        cumulative_sequence_offsets(tuple(n for n in lengths if n)),
+        state[nonempty].contiguous(),
+        d_state[nonempty].contiguous(),
+    )
+    actual = run(cumulative_sequence_offsets(lengths), state, d_state)
+    torch.cuda.synchronize()
+    for name, got, want in zip(
+        ("dq", "dk", "dv", "dgate", "dbeta"), actual, expected, strict=False
+    ):
+        assert torch.equal(got, want), name
+    assert torch.equal(actual[5][nonempty], expected[5])
+    assert torch.equal(actual[5][~nonempty], d_state[~nonempty])
 
 
 def test_cudnn_packed_h64_exact_tail_with_trailing_empty_is_finite() -> None:
@@ -1113,10 +1164,11 @@ def test_cudnn_tma_validation_routes_oversized_singleton_stride_to_int64() -> No
 
 
 def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
-    from attn_gym.linear._delta_rule.cudnn.kernels import (
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
         kda_bprop_f16,
-        kda_prefill_f16,
+        kda_chain_forward_f16,
         kda_recompute_f16,
+        kda_warmup_forward_f16,
     )
 
     expected_inputs = _make_inputs(requires_grad=True, dtype=torch.float16)
@@ -1125,10 +1177,24 @@ def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
 
     expected = _candidate_no_state(*expected_inputs)
     expected_grads = torch.autograd.grad(expected, expected_inputs[:5], d_output)
-    for module in (kda_prefill_f16, kda_recompute_f16, kda_bprop_f16):
-        monkeypatch.setattr(module, "requires_int64_abi", lambda *_: True)
+    forced_calls = []
+    for module in (
+        kda_warmup_forward_f16,
+        kda_chain_forward_f16,
+        kda_recompute_f16,
+        kda_bprop_f16,
+    ):
+
+        def force_wide(*tensors, name=module.__name__):
+            forced_calls.append(name)
+            return True
+
+        monkeypatch.setattr(module, "requires_int64_abi", force_wide)
     actual = _candidate_no_state(*actual_inputs)
+    assert forced_calls, "forward did not invoke a forced int64 selector"
+    forced_calls.clear()
     actual_grads = torch.autograd.grad(actual, actual_inputs[:5], d_output)
+    assert forced_calls, "backward did not invoke a forced int64 selector"
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):

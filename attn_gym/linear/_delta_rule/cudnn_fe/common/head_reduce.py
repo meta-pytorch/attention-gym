@@ -25,12 +25,14 @@ GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
 import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
-from .host import get_dtype
+from .host import get_dtype, validate_cuda_tensors
+from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -121,7 +123,29 @@ def launch(
     )
 
 
-compiled_cache = {}
+@jit_cache
+def _compile_head_reduce(io_dtype, rank, dim, use_int64_offsets):
+    sym_int = cute.sym_int
+    tensors = [
+        make_strided_signature_tensor(
+            io_dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=4,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+        for _ in range(2)
+    ]
+    inner_words = dim if io_dtype == cutlass.Float32 else dim // 2
+    return compile_tvm_ffi(
+        launch,
+        *tensors,
+        *(cutlass.Int64(0) for _ in range(3)),
+        *(cutlass.Int32(0) for _ in range(3)),
+        inner_words,
+        io_dtype,
+        name=f"head_reduce_{io_dtype.__name__.lower()}_r{rank}_d{dim}_i64{int(use_int64_offsets)}",
+    )
 
 
 def head_group_reduce(src, dst, *, stream) -> None:
@@ -134,6 +158,19 @@ def head_group_reduce(src, dst, *, stream) -> None:
     must be even, word-pair stores). Same-dtype (f16/bf16, or fp32),
     DLPack-compatible CUDA tensors; the f16/bf16 inner extent ``D`` must be
     even.  Compile-cache-and-replay per ``(dtype, rank, D)``; head counts are runtime."""
+    validate_cuda_tensors(src, dst=dst)
+    if src.ndim not in (2, 3) or dst.ndim != src.ndim:
+        raise ValueError("head reduction requires matching rank-2 or rank-3 tensors")
+    if src.shape[0] != dst.shape[0] or src.shape[2:] != dst.shape[2:]:
+        raise ValueError("head reduction input and output must agree outside the head mode")
+    if dst.shape[1] <= 0 or src.shape[1] % dst.shape[1]:
+        raise ValueError("output head count must divide the input head count")
+    if src.dtype != dst.dtype:
+        raise ValueError("head reduction requires matching input and output dtypes")
+    if not src.is_contiguous() or src.data_ptr() % 4:
+        raise ValueError("head reduction source must be compact and 4-byte aligned")
+    if not tensor_supports_contiguous_dim(dst, alignment_bytes=4):
+        raise ValueError("head reduction output requires aligned, contiguous inner words")
     if len(src.shape) == 2:
         total, HO = src.shape
         D = 1
@@ -143,41 +180,22 @@ def head_group_reduce(src, dst, *, stream) -> None:
         H = dst.shape[1]
     io_dtype = get_dtype(src.dtype)
     is_fp32 = io_dtype == cutlass.Float32
+    if not is_fp32 and (src.ndim != 3 or D % 2):
+        raise ValueError("16-bit head reduction requires an even rank-3 inner dimension")
+    if src.numel() == 0:
+        return
     r = HO // H
     inner_words = D if is_fp32 else D // 2
     total_words = total * H * inner_words
     grid_x = -(-total_words // BLOCK)
-    cu_stream = cuda.CUstream(int(stream))
-
     dst_strides = tuple(dst.stride())
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
     out_head_words = (
         (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
     )
 
-    key = (str(src.dtype).split(".")[-1], len(src.shape), D, current_device())
-    if key not in compiled_cache:
-        src_c = from_dlpack(src, assumed_align=4).mark_layout_dynamic(
-            leading_dim=len(src.shape) - 1
-        )
-        compiled_cache[key] = cute.compile(
-            launch,
-            src_c,
-            from_dlpack(dst, assumed_align=4).mark_layout_dynamic(leading_dim=len(dst.shape) - 1),
-            cutlass.Int64(total_words),
-            cutlass.Int64(out_row_words),
-            cutlass.Int64(out_head_words),
-            cutlass.Int32(grid_x),
-            cutlass.Int32(H),
-            cutlass.Int32(r),
-            inner_words,
-            io_dtype,
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    compiled_cache[key](
-        src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream
-    )
+    compiled = _compile_head_reduce(io_dtype, src.ndim, D, True)
+    compiled(src, dst, total_words, out_row_words, out_head_words, grid_x, H, r)
 
 
 frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=False)

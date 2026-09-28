@@ -18,6 +18,8 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. Register arrays use cute.make_rmem_tensor, operand SMEM
 # buffers share one SharedStorage struct, and raw SMEM pointers go through smem_data_ptr.
+# Modified by Attention Gym in 2026: frozen cfg (build_cfg derives the SMEM cosizes and TMA byte
+# counts) and jit_cache fake-tensor TVM-FFI compiles for the standalone launcher.
 
 """
 Chunked Gated Delta Net (GDN) bprop state-summary kernel for SM100 / SM103 / SM107 (Cutlass primitives): the reverse
@@ -75,8 +77,8 @@ Warp assignments (16 warps = 512 threads):
   warp  15      : epilogue warp  - scheduler-only shell
 """
 
-import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -85,13 +87,22 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
-from cutlass.cute.runtime import from_dlpack
-
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import (
+    validate_named_barriers,
+    validate_seqlens,
+    validate_tensor,
+    validate_warp_roles,
+    validate_work_table,
+    validate_workspace,
+)
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from ..tile_dsl.barrier import (
@@ -113,6 +124,11 @@ from ..tile_dsl.tma import (
 from .gdn_bprop_summary_config import CFG
 
 USE_PDL = True
+STATE_DIMS = (64, 128)
+TMEM_COLUMNS = 512
+IO_DTYPES = ("bfloat16", "float16")
+SCALAR_DTYPES = ("float32", "bfloat16", "float16")
+STATE_DTYPES = ("float32", "bfloat16")
 
 
 class GdnBpropSummaryBars(NamedTuple):
@@ -212,7 +228,13 @@ def make_bars(cfg) -> GdnBpropSummaryBars:
         mb_a_done=MBarrier(alloc(cfg.smem_a_stages), try_wait=True, stages=cfg.smem_a_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            try_wait=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -1792,25 +1814,7 @@ def host(
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
     k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
 
-    # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
-    bytes_per_element = cfg.io_dtype.width // 8
-    q_tile_elements = cfg.b_t * cfg.d_k
-    k_tile_elements = cfg.b_t * cfg.d_k
-    do_tile_elements = cfg.d_v * cfg.b_t
-    tinv_tile_elements = cfg.b_t * cfg.b_t
-    a_tile_elements = cfg.b_t * cfg.b_t
-    cfg.q_cosize = q_tile_elements * cfg.smem_q_stages
-    cfg.k_cosize = k_tile_elements * cfg.smem_k_stages
-    cfg.do_cosize = do_tile_elements * cfg.smem_do_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-    cfg.a_cosize = a_tile_elements * cfg.smem_a_stages
-
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
-
-    cfg.tma_q_bytes = q_tile_elements * bytes_per_element
-    cfg.tma_k_bytes = k_tile_elements * bytes_per_element
-    cfg.tma_do_bytes = do_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
 
     num_descs = batch_size
 
@@ -2033,54 +2037,55 @@ def frost_gdn_bprop_summary(
         cumsumlog_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    for s in range(cfg.smem_q_stages):
-        bars.mb_q_ready[s].init()
-        bars.mb_q_mma_done[s].init()
-    for s in range(cfg.smem_k_stages):
-        bars.mb_k_ready[s].init()
-        bars.mb_k_mma_done[s].init()
-    for s in range(cfg.smem_do_stages):
-        bars.mb_do_ready[s].init()
-        bars.mb_do_mma_done[s].init()
-        bars.mb_do_cg0_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.tmem_dstate_acc_stages):
-        bars.mb_dstate_acc_ready[s].init()
-        bars.mb_dstate_scale_acc_done[s].init()
-    for b in (
-        bars.mb_du_scale_acc_ready,
-        bars.mb_du_scale_acc_done,
-        bars.mb_du_total_acc_ready,
-        bars.mb_du_total_acc_done,
-    ):
-        b[0].init()
-    for b in (
-        bars.mb_a_acc_ready,
-        bars.mb_dy_acc_ready,
-    ):
-        b[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.smem_a_stages):
-        bars.mb_a_ready[s].init()
-        bars.mb_a_done[s].init()
-    for s in range(cfg.tmem_dstate_input_stages):
-        bars.mb_dstate_input_ready[s].init()
-        bars.mb_dstate_input_done[s].init()
-    for b in (
-        bars.mb_do_prime_input_ready,
-        bars.mb_du_input_ready,
-        bars.mb_dyp_input_ready,
-    ):
-        b[0].init()
-    bars.mb_tmem_done[0].init()
+    # ---- mbarrier init (one thread; the fence + CTA barrier publish it) ---------------
+    if tidx == 0:
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        for s in range(cfg.smem_q_stages):
+            bars.mb_q_ready[s].init()
+            bars.mb_q_mma_done[s].init()
+        for s in range(cfg.smem_k_stages):
+            bars.mb_k_ready[s].init()
+            bars.mb_k_mma_done[s].init()
+        for s in range(cfg.smem_do_stages):
+            bars.mb_do_ready[s].init()
+            bars.mb_do_mma_done[s].init()
+            bars.mb_do_cg0_done[s].init()
+        for s in range(cfg.smem_gate_stages):
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.tmem_dstate_acc_stages):
+            bars.mb_dstate_acc_ready[s].init()
+            bars.mb_dstate_scale_acc_done[s].init()
+        for b in (
+            bars.mb_du_scale_acc_ready,
+            bars.mb_du_scale_acc_done,
+            bars.mb_du_total_acc_ready,
+            bars.mb_du_total_acc_done,
+        ):
+            b[0].init()
+        for b in (
+            bars.mb_a_acc_ready,
+            bars.mb_dy_acc_ready,
+        ):
+            b[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.smem_a_stages):
+            bars.mb_a_ready[s].init()
+            bars.mb_a_done[s].init()
+        for s in range(cfg.tmem_dstate_input_stages):
+            bars.mb_dstate_input_ready[s].init()
+            bars.mb_dstate_input_done[s].init()
+        for b in (
+            bars.mb_do_prime_input_ready,
+            bars.mb_du_input_ready,
+            bars.mb_dyp_input_ready,
+        ):
+            b[0].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -2217,10 +2222,10 @@ def frost_gdn_bprop_summary(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnBpropSummaryCfg:
-    """Per-compile bprop state-summary kernel knob (``build_cfg``): the dtype / GQA fields are the ``cute.compile`` cache
-    keys, the rest derives from ``CFG``; ``host`` stamps the shape-derived fields at trace time.
+    """Per-compile bprop state-summary kernel knob (``build_cfg``): the dtype / GQA fields are the compile cache keys;
+    the rest, including the SMEM cosizes and TMA byte counts, derives from ``CFG`` in ``build_cfg``.
     """
 
     use_dstate_in: bool
@@ -2280,7 +2285,7 @@ class GdnBpropSummaryCfg:
     tmem_y_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time (shape-derived) -------------------------------
+    # ---- SMEM cosizes and TMA byte counts, derived by build_cfg ----------------------
     q_cosize: int = 0
     k_cosize: int = 0
     do_cosize: int = 0
@@ -2304,6 +2309,10 @@ def build_cfg(
     expand_num: int = 1,
 ) -> GdnBpropSummaryCfg:
     """Build the per-compile ``GdnBpropSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
+    if io_dtype not in (cutlass.Float16, cutlass.BFloat16) or d_k not in STATE_DIMS or d_v not in STATE_DIMS:
+        raise ValueError(f"bprop summary serves Float16/BFloat16 with d_k, d_v in {STATE_DIMS}, got {io_dtype}, {d_k}, {d_v}")
+    if max_active_clusters <= 0 or expand_num < 1:
+        raise ValueError("max_active_clusters and expand_num must be positive")
     if expand_num > 1 and (CFG.SMEM_Q_STAGES != 2 or CFG.SMEM_DO_STAGES != 2):
         raise ValueError("the compact q / dO block state assumes 2-stage q and dO rings")
     cfg = GdnBpropSummaryCfg(
@@ -2320,17 +2329,51 @@ def build_cfg(
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     n_cg2 = len(cfg.compute_group_2_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1 + n_cg2)
-    cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_cg0 + n_cg1 + n_cg2)
-    cfg.init_state_store_barrier_threads = cfg.threads_per_warp * n_cg1
-    cfg.cg1_barrier_threads = cfg.threads_per_warp * n_cg1
-    cfg.cg2_barrier_threads = cfg.threads_per_warp * n_cg2
-    cfg.tmem_dstate_acc_offset = 0
-    cfg.tmem_dvdk_acc_offset = cfg.tmem_dstate_acc_offset + cfg.tmem_dstate_acc_stages * cfg.d_k
-    cfg.tmem_dstate_input_offset = cfg.tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * cfg.b_t
-    cfg.tmem_shared_acc_offset = cfg.tmem_dstate_input_offset + cfg.tmem_dstate_input_stages * max(cfg.d_k // 2, cfg.b_t)
-    cfg.tmem_shared_input_offset = cfg.tmem_shared_acc_offset + cfg.tmem_shared_acc_stages * cfg.b_t
-    cfg.tmem_y_offset = cfg.tmem_shared_input_offset + cfg.tmem_shared_input_stages * (cfg.b_t // 2)
+    warp = cfg.threads_per_warp
+    # Attention Gym modification: the warp count derives from the validated role table.
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids),
+        (cfg.tcgen05_mma_warp_id, cfg.tma_qkv_warp_id, cfg.load_gate_beta_warp_id, cfg.epilogue_warp_id),
+    )
+    tmem_dvdk_acc_offset = cfg.tmem_dstate_acc_stages * cfg.d_k
+    tmem_dstate_input_offset = tmem_dvdk_acc_offset + cfg.tmem_dvdk_acc_stages * cfg.b_t
+    tmem_shared_acc_offset = tmem_dstate_input_offset + cfg.tmem_dstate_input_stages * max(cfg.d_k // 2, cfg.b_t)
+    tmem_shared_input_offset = tmem_shared_acc_offset + cfg.tmem_shared_acc_stages * cfg.b_t
+    bytes_per_element = io_dtype.width // 8
+    qk_tile = cfg.b_t * cfg.d_k
+    do_tile = cfg.d_v * cfg.b_t
+    square_tile = cfg.b_t * cfg.b_t
+    cfg = replace(
+        cfg,
+        threads_per_cta=warp * n_warps,
+        tmem_user_threads=warp * (1 + n_cg0 + n_cg1 + n_cg2),
+        init_state_store_barrier_threads=warp * n_cg1,
+        cg1_barrier_threads=warp * n_cg1,
+        cg2_barrier_threads=warp * n_cg2,
+        tmem_dstate_acc_offset=0,
+        tmem_dvdk_acc_offset=tmem_dvdk_acc_offset,
+        tmem_dstate_input_offset=tmem_dstate_input_offset,
+        tmem_shared_acc_offset=tmem_shared_acc_offset,
+        tmem_shared_input_offset=tmem_shared_input_offset,
+        tmem_y_offset=tmem_shared_input_offset + cfg.tmem_shared_input_stages * (cfg.b_t // 2),
+        q_cosize=qk_tile * cfg.smem_q_stages,
+        k_cosize=qk_tile * cfg.smem_k_stages,
+        do_cosize=do_tile * cfg.smem_do_stages,
+        t_inv_cosize=square_tile * cfg.smem_t_inv_stages,
+        a_cosize=square_tile * cfg.smem_a_stages,
+        tma_q_bytes=qk_tile * bytes_per_element,
+        tma_k_bytes=qk_tile * bytes_per_element,
+        tma_do_bytes=do_tile * bytes_per_element,
+        tma_tinv_bytes=square_tile * bytes_per_element,
+    )
+    validate_named_barriers(
+        cfg.threads_per_cta,
+        tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads),
+        cg1=(cfg.cg1_barrier_id, cfg.cg1_barrier_threads),
+        cg2=(cfg.cg2_barrier_id, cfg.cg2_barrier_threads),
+    )
+    if cfg.tmem_y_offset + cfg.b_t // 2 > TMEM_COLUMNS:
+        raise ValueError(f"bprop summary TMEM layout needs {cfg.tmem_y_offset + cfg.b_t // 2} > {TMEM_COLUMNS} columns")
     return cfg
 
 
@@ -2340,91 +2383,172 @@ TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    cu_dtype_str: str,
-    gate_dtype_str: str,
-    a_log_dtype_str: str,
-    dt_bias_dtype_str: str,
-    dstate_in_dtype_str: str,
-    dstate0_dtype_str: str,
-    device: int,
-    num_sm: int,
-    DK: int,
-    DV: int,
-    expand_num: int,
-    use_dstate_in: bool = False,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    run_order: bool = False,
-    order_gen: bool = False,
-    q_step: int = 1,
-):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
+_INDEX_DTYPES = {"int32": cutlass.Int32, "int64": cutlass.Int64}
 
 
-def compile(
-    io_dtype,
-    use_dstate_in: bool = False,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    *,
+def _index_dtype(name: str):
+    return _INDEX_DTYPES[name]
+
+
+def _dtype_or_none(name: str):
+    return None if name == "none" else get_dtype(name)
+
+
+def _dtype_name(tensor) -> str:
+    return "none" if tensor is None else str(tensor.dtype).removeprefix("torch.")
+
+
+class GdnBpropSummaryOp:
+    """Standalone bprop state-summary launch over ``host`` for one static config."""
+
+    def __init__(self, cfg: GdnBpropSummaryCfg, use_int64_offsets: bool = False, dtypes: str = ""):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+        self.dtypes = dtypes
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        flags = "".join(str(int(flag)) for flag in (cfg.use_dstate_in, cfg.log_gate, cfg.safe_gate))
+        return (
+            f"gdn_cudnn_bprop_summary_{cfg.io_dtype.__name__.lower()}_k{cfg.d_k}_v{cfg.d_v}_e{cfg.expand_num}"
+            f"_f{flags}_{self.dtypes}_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}"
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        gate: cute.Tensor,
+        a_log: Optional[cute.Tensor],
+        dt_bias: Optional[cute.Tensor],
+        do_: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        dstate0: cute.Tensor,
+        dstate_in: Optional[cute.Tensor],
+        tinv: cute.Tensor,
+        work_items: Optional[cute.Tensor],
+        work_count: Optional[cute.Tensor],
+        scheduler_counter: cute.Tensor,
+        scale: cutlass.Float32,
+        tensormap_workspace: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        host(
+            self.cfg,
+            q,
+            k,
+            gate,
+            a_log,
+            dt_bias,
+            do_,
+            cu_seqlens,
+            dstate0,
+            dstate_in,
+            tinv,
+            work_items,
+            work_count,
+            scheduler_counter,
+            scale,
+            tensormap_workspace,
+            stream,
+        )
+
+
+@jit_cache
+def _compile_gdn_bprop_summary(
+    io_dtype: str,
+    cu_dtype: str,
+    gate_dtype: str,
+    a_log_dtype: str,
+    dt_bias_dtype: str,
+    dstate_in_dtype: str,
+    dstate0_dtype: str,
     num_sm: int,
     d_k: int,
     d_v: int,
-    expand_num: int = 1,
-    q_cute,
-    k_cute,
-    gate_cute,
-    a_log_cute=None,
-    dt_bias_cute=None,
-    do_cute,
-    cu_seqlens_cute,
-    dstate0_cute,
-    dstate_in_cute=None,
-    tinv_cute,
-    work_items_cute=None,
-    work_count_cute=None,
-    scheduler_counter_cute=None,
-    scale=None,
-    workspace_cute=None,
-    stream=None,
+    expand_num: int,
+    log_gate: bool,
+    safe_gate: bool,
+    use_int64_offsets: bool,
 ):
-    """JIT-compile the chunked GDN bprop state-summary kernel for one static
-    config."""
+    """Compile the bprop state-summary main launch over the upstream dynamic-layout tensor ABI."""
+    io = get_dtype(io_dtype)
     cfg = build_cfg(
-        io_dtype,
+        io,
         max_active_clusters=num_sm,
-        use_dstate_in=use_dstate_in,
+        use_dstate_in=dstate_in_dtype != "none",
         log_gate=log_gate,
         safe_gate=safe_gate,
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
     )
+    dtypes = "_".join((cu_dtype, gate_dtype, a_log_dtype, dt_bias_dtype, dstate_in_dtype, dstate0_dtype))
+    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
 
-    return cute.compile(
-        host,
-        cfg,
-        q_cute,
-        k_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        do_cute,
-        cu_seqlens_cute,
-        dstate0_cute,
-        dstate_in_cute,
-        tinv_cute,
-        work_items_cute,
-        work_count_cute,
-        scheduler_counter_cute,
-        scale,
-        workspace_cute,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
+    def optional(dtype_name, rank, align):
+        dtype = _dtype_or_none(dtype_name)
+        return None if dtype is None else dyn(dtype, rank, assumed_align=align)
+
+    return compile_tvm_ffi(
+        GdnBpropSummaryOp(cfg, use_int64_offsets, dtypes),
+        dyn(io, 3, assumed_align=16),
+        dyn(io, 3, assumed_align=16),
+        dyn(get_dtype(gate_dtype), 2, assumed_align=16),
+        optional(a_log_dtype, 1, 4),
+        optional(dt_bias_dtype, 1, 4),
+        dyn(io, 3, assumed_align=16),
+        dyn(_index_dtype(cu_dtype), 1, assumed_align=4),
+        dyn(get_dtype(dstate0_dtype), 4, assumed_align=16),
+        optional(dstate_in_dtype, 4, 16),
+        dyn(io, 4, assumed_align=128),
+        make_compact_signature_tensor(cutlass.Int32, (cute.sym_int(), WORK_ITEM_FIELDS), assumed_align=16),
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        cutlass.Float32(1.0),
+        dyn(cutlass.Int64, 1, assumed_align=128),
+        opt_level=2,
+    )
+
+
+@jit_cache
+def _compile_gdn_bprop_summary_prologue(
+    io_dtype: str,
+    cu_dtype: str,
+    run_order: bool,
+    order_gen: bool,
+    expand_num: int,
+    q_step: int,
+    has_tinv: bool,
+    use_int64_offsets: bool,
+):
+    """Compile the standalone bprop state-summary descriptor (and optional ordering) prologue."""
+    io = get_dtype(io_dtype)
+    dyn = partial(make_dynamic_signature_tensor, use_int64_offsets=use_int64_offsets)
+    items = partial(make_compact_signature_tensor, cutlass.Int32, assumed_align=16)
+    flags = "".join(str(int(flag)) for flag in (run_order, order_gen, has_tinv))
+    return compile_tvm_ffi(
+        prologue,
+        io,
+        CFG.B_T,
+        run_order,
+        order_gen,
+        expand_num,
+        q_step,
+        *(dyn(io, 3, assumed_align=16) for _ in range(3)),
+        dyn(_index_dtype(cu_dtype), 1, assumed_align=4),
+        items((cute.sym_int(), WORK_ITEM_FIELDS)) if run_order and not order_gen else None,
+        dyn(cutlass.Int32, 1, assumed_align=4),
+        items((cute.sym_int(), WORK_ITEM_FIELDS)),
+        dyn(cutlass.Int32, 1, assumed_align=4) if run_order else None,
+        dyn(io, 4, assumed_align=128) if has_tinv else None,
+        dyn(cutlass.Int64, 1, assumed_align=128),
+        name=(
+            f"gdn_cudnn_bprop_summary_prologue_{io_dtype}_{cu_dtype}_e{expand_num}_q{q_step}"
+            f"_f{flags}_i64{int(use_int64_offsets)}"
+        ),
+        opt_level=2,
     )
 
 
@@ -2457,8 +2581,8 @@ def chunk_gdn_bwd_summary(
     stream,
     own_prologue: bool = True,
 ) -> None:
-    """Execute the chunked GDN bprop state-summary kernel (THD / varlen entry), compiled once per static config and
-    replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``d_initial_state`` is the only output.
+    """Execute the chunked GDN bprop state-summary kernel (THD / varlen entry), compiled through the persistent ``jit_cache`` once per
+    static config and launched on the current torch stream; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``d_initial_state`` is the only output.
     gate: raw linear alpha, natural-log decay under ``log_gate``, or raw logits under ``safe_gate`` (``-exp(a_log) * softplus(gate + dt_bias)``)
     work_items / work_count: ``common/split_k.py`` table ``(max_items, 8)`` int32 and ``(1,)`` count (REQUIRED); an item
         computes chunks ``[write_start, compute_end)`` backward and only the item owning chunk 0 stores
@@ -2468,16 +2592,6 @@ def chunk_gdn_bwd_summary(
     q_step: row step of the phase rows inside ``q`` (1 = compact buffer)
     own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
     """
-    q.shape[1]
-    k.shape[1]
-    do.shape[1]
-    DK = q.shape[2]
-    DV = do.shape[2]
-    cu_seqlens.shape[0] - 1
-    io_dtype = get_dtype(q.dtype)
-
-    cu_stream = cuda.CUstream(int(stream))
-
     if scheduler_counter is None:
         raise ValueError("scheduler_counter is required")
     run_order = bool(order_in_prologue)
@@ -2487,137 +2601,86 @@ def chunk_gdn_bwd_summary(
     if not safe_gate:
         a_log = None
         dt_bias = None
-    cache = get_compiled_cache(
-        str(q.dtype),
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(d_final_state.dtype) if d_final_state is not None else "none",
-        str(d_initial_state.dtype),
-        device,
-        num_sm,
-        DK,
-        DV,
-        expand_num,
-        d_final_state is not None,
-        log_gate,
-        safe_gate,
-        run_order,
-        order_gen,
-        q_step,
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    validate_cuda_tensors(
+        q, k=k, gate=gate, do=do, d_initial_state=d_initial_state, cu_seqlens=cu_seqlens, d_final_state=d_final_state,
+        work_items=work_items, work_count=work_count, scheduler_counter=scheduler_counter, scheduler_all=scheduler_all,
+        work_item_scratch=work_item_scratch, a_log=a_log, dt_bias=dt_bias, tinv=tinv, workspace=workspace,
     )
-
-    if "compiled" not in cache:
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-        workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        tinv_cute = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
-
-        dstate0_cute = from_dlpack(d_initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        dstate_in_cute = None
-        if d_final_state is not None:
-            dstate_in_cute = from_dlpack(d_final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        work_items_cute = from_dlpack(work_items, assumed_align=16)
-        work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        scheduler_counter_cute = from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic()
-        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
-        cache["compiled"] = compile(
-            io_dtype,
-            use_dstate_in=d_final_state is not None,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            num_sm=num_sm,
-            d_k=DK,
-            d_v=DV,
-            expand_num=expand_num,
-            q_cute=from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            gate_cute=from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            do_cute=from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            cu_seqlens_cute=cu_seqlens_cute,
-            dstate0_cute=dstate0_cute,
-            dstate_in_cute=dstate_in_cute,
-            tinv_cute=tinv_cute,
-            work_items_cute=work_items_cute,
-            work_count_cute=work_count_cute,
-            scheduler_counter_cute=scheduler_counter_cute,
-            scale=scale,
-            workspace_cute=workspace_cute,
-            stream=cu_stream,
-        )
-
-    compiled = cache["compiled"]
-
-    if own_prologue and "prologue" not in cache:
-        cu_placeholder = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-        staging_placeholder = None
-        if run_order and not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        scheduler_all_placeholder = None
-        if run_order:
-            scheduler_all_placeholder = from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic()
-        workspace_placeholder = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        tinv_placeholder = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3) if tinv is not None else None
-        cache["prologue"] = cute.compile(
-            prologue,
-            io_dtype,
-            CFG.B_T,
-            run_order,
-            order_gen,
+    num_seqs = validate_seqlens(cu_seqlens)
+    if q.ndim != 3 or k.ndim != 3 or do.ndim != 3 or gate.ndim != 2 or expand_num < 1 or q_step < 1:
+        raise ValueError("q, k, do must be packed [T, H, D], gate [T, HO], and expand_num, q_step positive")
+    tokens, dim_k, dim_v, heads_out = k.shape[0], k.shape[2], do.shape[2], gate.shape[1]
+    io = (str(k.dtype).removeprefix("torch."),)
+    if io[0] not in IO_DTYPES:
+        raise ValueError(f"k must have dtype in {IO_DTYPES}, got {k.dtype}")
+    validate_tensor("q", q, (None, None, dim_k), io, tma=True)
+    validate_tensor("k", k, (tokens, None, dim_k), io, tma=True)
+    validate_tensor("do", do, (q.shape[0], heads_out, dim_v), io, tma=True)
+    for name, heads in (("q", q.shape[1]), ("k", k.shape[1])):
+        if heads <= 0 or heads_out % heads:
+            raise ValueError(f"{name} heads ({heads}) must divide the output heads ({heads_out})")
+    validate_tensor("gate", gate, (tokens, heads_out), SCALAR_DTYPES)
+    for name, tensor in (("a_log", a_log), ("dt_bias", dt_bias)):
+        if tensor is not None:
+            validate_tensor(name, tensor, (heads_out,), SCALAR_DTYPES, align=4)
+    for name, tensor in (("d_initial_state", d_initial_state), ("d_final_state", d_final_state)):
+        if tensor is not None or name == "d_initial_state":
+            validate_tensor(name, tensor, (None, heads_out, dim_v, dim_k), STATE_DTYPES, min_rows=num_seqs)
+    validate_tensor(
+        "tinv", tinv, (None, heads_out, CFG.B_T, CFG.B_T), io, align=128, tma=True,
+        min_rows=tokens * expand_num // CFG.B_T + num_seqs,
+    )
+    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
+    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
+    work_item_staging = work_item_scratch if run_order and not order_gen else None
+    scheduler_all = scheduler_all if run_order else None
+    use_int64_offsets = requires_int64_abi(
+        q, k, gate, a_log, dt_bias, do, cu_seqlens, d_initial_state, d_final_state, tinv, workspace
+    )
+    cache = {
+        "compiled": _compile_gdn_bprop_summary(
+            _dtype_name(q),
+            _dtype_name(cu_seqlens),
+            _dtype_name(gate),
+            _dtype_name(a_log),
+            _dtype_name(dt_bias),
+            _dtype_name(d_final_state),
+            _dtype_name(d_initial_state),
+            num_sm,
+            q.shape[2],
+            do.shape[2],
             expand_num,
-            q_step,
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            cu_placeholder,
-            staging_placeholder,
-            work_count_placeholder,
-            work_items_placeholder,
-            scheduler_all_placeholder,
-            tinv_placeholder,
-            workspace_placeholder,
-            cu_stream,
-            options="--enable-tvm-ffi --opt-level 2",
+            log_gate,
+            safe_gate,
+            use_int64_offsets,
         )
+    }
     if own_prologue:
-        cache["prologue"](
-            q,
-            k,
-            do,
-            cu_seqlens,
-            work_item_scratch if (run_order and not order_gen) else None,
-            work_count,
-            work_items,
-            scheduler_all if run_order else None,
-            tinv,
-            workspace,
-            cu_stream,
+        cache["prologue"] = _compile_gdn_bprop_summary_prologue(
+            _dtype_name(q), _dtype_name(cu_seqlens), run_order, order_gen, expand_num, q_step, tinv is not None, use_int64_offsets
         )
-    compiled(
+    run_bwd_summary(
+        cache,
         q,
         k,
         gate,
-        a_log,
-        dt_bias,
         do,
         cu_seqlens,
         d_initial_state,
         d_final_state,
-        tinv,
         work_items,
         work_count,
         scheduler_counter,
-        scale,
+        scheduler_all,
+        work_item_staging,
         workspace,
-        cu_stream,
+        scale,
+        stream,
+        a_log,
+        dt_bias,
+        tinv=tinv,
+        own_prologue=own_prologue,
     )
     return cache
 
@@ -2645,9 +2708,8 @@ def run_bwd_summary(
     tinv,
     own_prologue=True,
 ) -> None:
-    """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
-    nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
+    """Replay the compiled plan: the prologue launch, then the main launch, on the current torch stream (``stream`` is
+    kept for the upstream call signature).  The plan validated the contract at build, so nothing here raises."""
     if own_prologue:
         cache["prologue"](
             q,
@@ -2660,7 +2722,6 @@ def run_bwd_summary(
             scheduler_all,
             tinv,
             tensormap_workspace,
-            cu_stream,
         )
     cache["compiled"](
         q,
@@ -2678,7 +2739,6 @@ def run_bwd_summary(
         scheduler_counter,
         scale,
         tensormap_workspace,
-        cu_stream,
     )
 
 

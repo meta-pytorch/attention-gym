@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; the per-call run_chain_prologue compile wrapper is removed (the
+# chain hosts nest chain_prologue in their persisted compiles).
 
 """
 Chunked Kimi Delta Attention (KDA) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass primitives): the one launch that
@@ -30,7 +31,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
-from cutlass.cute.runtime import from_dlpack
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 
@@ -413,142 +413,6 @@ def chain_prologue(
         dv,
         dgate,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
-
-
-def run_chain_prologue(
-    cache,
-    *,
-    pieces,
-    unit_chunks,
-    b_t,
-    length_rule,
-    heads_out,
-    series_span_tokens=0,
-    checkpoint_every_n_tokens=0,
-    cu_seqlens,
-    cu_pieces,
-    main_rows,
-    summary_rows,
-    main_count,
-    summary_count,
-    work_items,
-    work_items_summary=None,
-    scheduler,
-    series_items=None,
-    series_count=None,
-    summary_words=None,
-    recompute_h_words=None,
-    recompute_m_words=None,
-    series_words=None,
-    prefill_words=None,
-    bprop_summary_words=None,
-    bprop_words=None,
-    q=None,
-    k,
-    v=None,
-    gate,
-    o=None,
-    do=None,
-    checkpoints=None,
-    dq=None,
-    dk=None,
-    dv=None,
-    dgate=None,
-    stream,
-) -> None:
-    """Launch the chain prologue (compiled into ``cache`` on the first call).  Each ``*_words`` region is the descriptor
-    workspace of one consumer kernel (None when the chain does not launch it); ``series_items`` / ``series_count`` request
-    the checkpoint-seeded series items of ``series_span_tokens`` per item."""
-    cu_stream = cuda.CUstream(int(stream))
-    series_span_chunks = int(series_span_tokens) // int(b_t)
-    if "compiled" not in cache:
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_summary_placeholder = None
-        if work_items_summary is not None:
-            work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
-            work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        series_items_placeholder = None
-        if series_items is not None:
-            series_items_placeholder = from_dlpack(series_items, assumed_align=16)
-            series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        cache["compiled"] = cute.compile(
-            chain_prologue,
-            cutlass.Int32(int(pieces)),
-            int(unit_chunks),
-            int(b_t),
-            bool(length_rule),
-            cutlass.Int32(int(heads_out)),
-            cutlass.Int32(series_span_chunks),
-            cutlass.Int32(checkpoint_every_n_tokens),
-            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
-            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
-            work_items_placeholder,
-            work_items_summary_placeholder,
-            from_dlpack(scheduler, assumed_align=4).mark_layout_dynamic(),
-            series_items_placeholder,
-            from_dlpack(series_count, assumed_align=4).mark_layout_dynamic() if series_count is not None else None,
-            from_dlpack(summary_words, assumed_align=128).mark_layout_dynamic() if summary_words is not None else None,
-            from_dlpack(recompute_h_words, assumed_align=128).mark_layout_dynamic() if recompute_h_words is not None else None,
-            from_dlpack(recompute_m_words, assumed_align=128).mark_layout_dynamic() if recompute_m_words is not None else None,
-            from_dlpack(series_words, assumed_align=128).mark_layout_dynamic() if series_words is not None else None,
-            from_dlpack(prefill_words, assumed_align=128).mark_layout_dynamic() if prefill_words is not None else None,
-            from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic() if bprop_summary_words is not None else None,
-            from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic() if bprop_words is not None else None,
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2) if q is not None else None,
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2) if v is not None else None,
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2) if o is not None else None,
-            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if do is not None else None,
-            from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
-            from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dq is not None else None,
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dk is not None else None,
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dv is not None else None,
-            from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dgate is not None else None,
-            cu_stream,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    cache["compiled"](
-        int(pieces),
-        int(heads_out),
-        series_span_chunks,
-        checkpoint_every_n_tokens,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler,
-        series_items,
-        series_count,
-        summary_words,
-        recompute_h_words,
-        recompute_m_words,
-        series_words,
-        prefill_words,
-        bprop_summary_words,
-        bprop_words,
-        q,
-        k,
-        v,
-        gate,
-        o,
-        do,
-        checkpoints,
-        dq,
-        dk,
-        dv,
-        dgate,
-        cu_stream,
-    )
 
 
 frost_kda_chain_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

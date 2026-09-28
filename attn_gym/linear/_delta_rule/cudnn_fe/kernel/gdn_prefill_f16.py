@@ -89,7 +89,7 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : epilogue warp  - O then checkpoint TMA stores
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -100,6 +100,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.paged_state import resolve_paged_state
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -275,7 +276,13 @@ def make_bars(cfg) -> GdnPrefillBars:
         ),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_THREADS, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            try_wait=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA producer
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -1849,12 +1856,17 @@ def compute1_warp_group(
     mState_out,
     mSeedIndices,
     mFinalIndices,
+    mHasInitialState,
     checkpoint_every_n_tokens,
     sScheduler,
     bars,
 ):
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
-    running the per-chunk state-update and output epilogues."""
+    running the per-chunk state-update and output epilogues.
+
+    With ``cfg.paged_state`` the state tensors alias one pool and ``mSeedIndices[batch_idx]``
+    selects the slot: non-positive routes are null (zero output, pool untouched), a zero
+    ``mHasInitialState[batch_idx]`` seeds from zero and, for an empty sequence, clears the slot."""
     nvvm.setmaxregister(cfg.num_regs_compute_group_1, nvvm.SetMaxRegisterAction.INCREASE)
 
     v_index = PipelineState.start(phase=0)
@@ -1928,8 +1940,13 @@ def compute1_warp_group(
             cfg, tile_idx, mWorkItems
         )
         head_o, v_offset = decode_head(cfg, head_idx)
+        # Attention Gym modification: paged state resolves the sequence's pool slot and its
+        # load/store predicates once per work item (null routes never touch the pool, fresh
+        # routes zero-seed, empty fresh routes clear their slot); dense calls index directly.
         seed_row = batch_idx
-        if cutlass.const_expr(mSeedIndices is not None):
+        if cutlass.const_expr(cfg.paged_state):
+            seed_row, state_active, load_initial, clear_empty = resolve_paged_state(batch_idx, mSeedIndices, mHasInitialState)
+        elif cutlass.const_expr(mSeedIndices is not None):
             seed_row = cutlass.Int32(mSeedIndices[batch_idx])
         n_local = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
@@ -1939,6 +1956,8 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.use_initial_state):
                 gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
+                if cutlass.const_expr(cfg.paged_state):
+                    seed_state = seed_state and load_initial
                 if seed_state:
                     seed_vw = 16 // (mState_init.element_type.width // 8)
                     seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
@@ -2253,6 +2272,9 @@ def compute1_warp_group(
                             )
                             o_regs.append([o_vec[k] for k in range(32)])
                         nvvm.tcgen05_wait("load")
+                        if cutlass.const_expr(cfg.paged_state):
+                            # Null-route padding may hold NaNs: select, never multiply, to emit zeros.
+                            o_regs = [[val if state_active else cutlass.Float32(0.0) for val in regs] for regs in o_regs]
                         o_idx = o_index.idx
                         bars.mb_o_tmastg_done[o_idx].wait(o_index.phase)
                         o_index = advance(o_index, cfg.smem_o_stages)
@@ -2281,11 +2303,17 @@ def compute1_warp_group(
             bars.mb_state_acc_ready[kv_last_idx].wait(kv_acc_index.phase)
             kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
             if cutlass.const_expr(cfg.store_final_state):
-                final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
-                if final_dst >= 0:
+                if cutlass.const_expr(cfg.paged_state):
+                    store_final = state_active
+                    final_row = seed_row
+                else:
+                    final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+                    store_final = final_dst >= 0
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        if store_final:
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
+                if store_final:
                     gState_out = mState_out[None, None, head_o, final_row]
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (gState_out.iterator + gState_out.layout((state_gmem_row + v_offset, 0))).raw_ptr()
@@ -2301,13 +2329,20 @@ def compute1_warp_group(
                                 )
         else:
             if cutlass.const_expr(cfg.store_final_state):
-                final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
-                if final_dst >= 0:
+                if cutlass.const_expr(cfg.paged_state):
+                    # Only a fresh route clears its slot; resumed and null routes leave the pool.
+                    write_empty = state_active and clear_empty
+                    final_row = seed_row
+                else:
+                    final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
+                    write_empty = final_dst >= 0
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        if write_empty:
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
+                if write_empty:
                     gState_out = mState_out[None, None, head_o, final_row]
-                    if cutlass.const_expr(cfg.use_initial_state):
+                    if cutlass.const_expr(cfg.use_initial_state and not cfg.paged_state):
                         gState_in = mState_init[None, None, head_o, seed_row]
                         for i in cutlass.range_constexpr(num_ldtms):
                             for k in cutlass.range_constexpr(32):
@@ -2427,6 +2462,8 @@ def frost_gdn_prefill_prologue(
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    mStateIndices: Optional[cute.Tensor],
+    mHasInitialState: Optional[cute.Tensor],
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
     scheduler rings via :func:`order_body`, block 1 builds the per-batch
@@ -2462,6 +2499,8 @@ def frost_gdn_prefill_prologue(
             sIdx,
             sSpread,
             expand_num=expand_num,
+            mStateIndices=mStateIndices,
+            mHasInitialState=mHasInitialState,
         )
     else:
         build_descs_body(
@@ -2508,10 +2547,13 @@ def prologue(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
+    state_indices: Optional[cute.Tensor] = None,
+    has_initial_state: Optional[cute.Tensor] = None,
 ):
     """One-launch prologue: LPT-order the work items and build the per-(b,h)
     TMA-descriptor arrays (Q, K, V, O, checkpoints) into
-    ``tensormap_workspace``."""
+    ``tensormap_workspace``.  Paged ``state_indices`` / ``has_initial_state`` keep the empty
+    sequences whose fresh slot the main kernel must clear in the compacted uncut table."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -2589,6 +2631,8 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         checkpoint_every_n,
+        state_indices,
+        has_initial_state,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -2608,6 +2652,7 @@ def host(
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
+    has_initial_state: Optional[cute.Tensor],
     tinv: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
@@ -2683,6 +2728,7 @@ def host(
         state_out,
         seed_indices,
         final_indices,
+        has_initial_state,
         tinv,
         work_items,
         work_count,
@@ -2723,6 +2769,7 @@ def frost_gdn_prefill(
     mState_out: Optional[cute.Tensor],
     mSeedIndices: Optional[cute.Tensor],
     mFinalIndices: Optional[cute.Tensor],
+    mHasInitialState: Optional[cute.Tensor],
     mTinv: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
@@ -2747,6 +2794,11 @@ def frost_gdn_prefill(
     num_ctas = cute.arch.grid_dim()[0]
 
     total_tiles = mCount[0]
+    if cutlass.const_expr(cfg.paged_state):
+        assert mSeedIndices is not None, "paged_state routes every sequence through mSeedIndices"
+        assert cfg.use_initial_state and cfg.store_final_state, "paged_state reads and writes the pool"
+    else:
+        assert mHasInitialState is None, "mHasInitialState requires paged_state"
 
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -2848,53 +2900,55 @@ def frost_gdn_prefill(
         beta_smem_layout_staged,
     )
 
-    # ---- mbarrier init (all threads) -------------------------------------------------
-    for s in range(cfg.smem_kq_stages):
-        bars.mb_kq_ready[s].init()
-        bars.mb_kq_done[s].init()
-    for s in range(cfg.smem_v_stages):
-        bars.mb_v_ready[s].init()
-        bars.mb_v_done[s].init()
-    for s in range(cfg.smem_gate_stages):
-        bars.mb_gate_ready[s].init()
-        bars.mb_gate_done[s].init()
-    for s in range(cfg.smem_beta_stages):
-        bars.mb_beta_ready[s].init()
-        bars.mb_beta_done[s].init()
-    if cutlass.const_expr(cfg.expand_num > 1):
+    # ---- mbarrier init (one thread; every thread fences and syncs below) ----------------
+    # Attention Gym modification: a single initializer instead of a racy all-thread init.
+    if tidx == 0:
+        for s in range(cfg.smem_kq_stages):
+            bars.mb_kq_ready[s].init()
+            bars.mb_kq_done[s].init()
+        for s in range(cfg.smem_v_stages):
+            bars.mb_v_ready[s].init()
+            bars.mb_v_done[s].init()
         for s in range(cfg.smem_gate_stages):
-            bars.mb_gate_cumsum_done[s].init()
-    for s in range(cfg.tmem_state_acc_stages):
-        bars.mb_state_acc_ready[s].init()
-    for s in range(cfg.tmem_q_state_acc_stages):
-        bars.mb_o_acc_ready[s].init()
-        bars.mb_o_final_acc_ready[s].init()
-        bars.mb_o_state_scale_acc_done[s].init()
-    for s in range(cfg.tmem_cg0_acc_stages):
-        bars.mb_cg0_acc_ready[s].init()
-        bars.mb_cg0_acc_done[s].init()
-    bars.mb_k_state_acc_ready[0].init()
-    bars.mb_u_acc_ready[0].init()
-    for s in range(cfg.smem_t_inv_stages):
-        bars.mb_t_inv_ready[s].init()
-        bars.mb_t_inv_done[s].init()
-    for s in range(cfg.smem_a_stages):
-        bars.mb_a_ready[s].init()
-        bars.mb_a_done[s].init()
-    for s in range(cfg.tmem_state_input_stages):
-        bars.mb_state_input_ready[s].init()
-    for b in (bars.mb_y_input_ready, bars.mb_u_input_ready, bars.mb_decay_u_input_ready):
-        b[0].init()
-    for s in range(cfg.smem_o_stages):
-        bars.mb_o_tmastg_ready[s].init()
-        bars.mb_o_tmastg_done[s].init()
-    for s in range(cfg.smem_checkpoint_stages):
-        bars.mb_checkpoint_tmastg_ready[s].init()
-        bars.mb_checkpoint_tmastg_done[s].init()
-    for s in range(cfg.scheduler_stages):
-        bars.mb_scheduler_ready[s].init()
-        bars.mb_scheduler_done[s].init()
-    bars.mb_tmem_done[0].init()
+            bars.mb_gate_ready[s].init()
+            bars.mb_gate_done[s].init()
+        for s in range(cfg.smem_beta_stages):
+            bars.mb_beta_ready[s].init()
+            bars.mb_beta_done[s].init()
+        if cutlass.const_expr(cfg.expand_num > 1):
+            for s in range(cfg.smem_gate_stages):
+                bars.mb_gate_cumsum_done[s].init()
+        for s in range(cfg.tmem_state_acc_stages):
+            bars.mb_state_acc_ready[s].init()
+        for s in range(cfg.tmem_q_state_acc_stages):
+            bars.mb_o_acc_ready[s].init()
+            bars.mb_o_final_acc_ready[s].init()
+            bars.mb_o_state_scale_acc_done[s].init()
+        for s in range(cfg.tmem_cg0_acc_stages):
+            bars.mb_cg0_acc_ready[s].init()
+            bars.mb_cg0_acc_done[s].init()
+        bars.mb_k_state_acc_ready[0].init()
+        bars.mb_u_acc_ready[0].init()
+        for s in range(cfg.smem_t_inv_stages):
+            bars.mb_t_inv_ready[s].init()
+            bars.mb_t_inv_done[s].init()
+        for s in range(cfg.smem_a_stages):
+            bars.mb_a_ready[s].init()
+            bars.mb_a_done[s].init()
+        for s in range(cfg.tmem_state_input_stages):
+            bars.mb_state_input_ready[s].init()
+        for b in (bars.mb_y_input_ready, bars.mb_u_input_ready, bars.mb_decay_u_input_ready):
+            b[0].init()
+        for s in range(cfg.smem_o_stages):
+            bars.mb_o_tmastg_ready[s].init()
+            bars.mb_o_tmastg_done[s].init()
+        for s in range(cfg.smem_checkpoint_stages):
+            bars.mb_checkpoint_tmastg_ready[s].init()
+            bars.mb_checkpoint_tmastg_done[s].init()
+        for s in range(cfg.scheduler_stages):
+            bars.mb_scheduler_ready[s].init()
+            bars.mb_scheduler_done[s].init()
+        bars.mb_tmem_done[0].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -2999,6 +3053,7 @@ def frost_gdn_prefill(
             mState_out=mState_out,
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
+            mHasInitialState=mHasInitialState,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             sScheduler=sScheduler,
             bars=bars,
@@ -3100,7 +3155,7 @@ def frost_gdn_prefill(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnPrefillCfg:
     """Per-compile GDN kernel knob, built by ``build_cfg``.
 
@@ -3125,6 +3180,8 @@ class GdnPrefillCfg:
     allow_neg_eigval: bool = False
     tinv_source: str = "compute"
     tiles_per_head: int = 1
+    # Attention Gym: the seed and final indices address one mutable pool (see common/paged_state.py).
+    paged_state: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -3201,6 +3258,7 @@ def build_cfg(
     d_v: int,
     expand_num: int = 1,
     tiles_per_head: int = 1,
+    paged_state: bool = False,
 ) -> GdnPrefillCfg:
     """Build the per-compile ``GdnPrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tinv_source`` "compute" builds the chunk factor in compute
@@ -3208,6 +3266,14 @@ def build_cfg(
     ``tiles_per_head`` tiles of ``d_v`` value columns each (the d_v split)."""
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")
+    if paged_state and not (use_initial_state and store_final_state):
+        raise ValueError("paged_state reads and writes one state pool: use_initial_state and store_final_state")
+    stages = {"smem_checkpoint_stages": 1}
+    if enable_checkpoints and d_v != 64:
+        stages["smem_kq_stages"] = 3
+    if expand_num > 1 and d_v != 64:
+        stages["smem_gate_stages"] = 2
+        stages["smem_beta_stages"] = 2
     cfg = GdnPrefillCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
@@ -3225,24 +3291,15 @@ def build_cfg(
         d_v=d_v,
         expand_num=expand_num,
         tiles_per_head=tiles_per_head,
+        paged_state=paged_state,
+        **stages,
     )
-    cfg.smem_checkpoint_stages = 1
-    if enable_checkpoints and d_v != 64:
-        cfg.smem_kq_stages = 3
-    if expand_num > 1 and d_v != 64:
-        cfg.smem_gate_stages = 2
-        cfg.smem_beta_stages = 2
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
-    cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_cg0 + n_cg1)
-    cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_cg0 + n_cg1)
-    cfg.inverse_barrier_threads = cfg.threads_per_warp * n_cg0
-    cfg.tmem_state_acc_offset = 0
-    cfg.tmem_q_state_acc_offset = cfg.tmem_state_acc_offset + cfg.tmem_state_acc_stages * cfg.d_k
-    cfg.tmem_state_input_offset = cfg.tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
-    cfg.tmem_cg0_acc_offset = cfg.tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
-    cfg.tmem_cg1_acc_offset = cfg.tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * cfg.b_t
-    cfg.tmem_y_decay_u_input_offset = cfg.tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t
+    tmem_q_state_acc_offset = cfg.tmem_state_acc_stages * cfg.d_k
+    tmem_state_input_offset = tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
+    tmem_cg0_acc_offset = tmem_state_input_offset + cfg.tmem_state_input_stages * (cfg.d_k // 2)
+    tmem_cg1_acc_offset = tmem_cg0_acc_offset + cfg.tmem_cg0_acc_stages * cfg.b_t
     # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
     bytes_per_element = io_dtype.width // 8
     kq_tile_elements = 2 * cfg.b_t * cfg.d_k
@@ -3250,17 +3307,28 @@ def build_cfg(
     tinv_tile_elements = cfg.b_t * cfg.b_t
     a_tile_elements = cfg.b_t * cfg.b_t
     o_tile_elements = cfg.d_v * cfg.b_t
-    cfg.kq_cosize = kq_tile_elements * cfg.smem_kq_stages
-    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-    cfg.a_cosize = a_tile_elements * cfg.smem_a_stages
-    cfg.o_cosize = o_tile_elements * cfg.smem_o_stages
-    cfg.checkpoint_cosize = cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages
-    cfg.tma_kq_bytes = kq_tile_elements * bytes_per_element
-    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
-    cfg.tma_o_bytes = o_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
-    return cfg
+    return replace(
+        cfg,
+        threads_per_cta=cfg.threads_per_warp * (4 + n_cg0 + n_cg1),
+        tmem_user_threads=cfg.threads_per_warp * (1 + n_cg0 + n_cg1),
+        inverse_barrier_threads=cfg.threads_per_warp * n_cg0,
+        tmem_state_acc_offset=0,
+        tmem_q_state_acc_offset=tmem_q_state_acc_offset,
+        tmem_state_input_offset=tmem_state_input_offset,
+        tmem_cg0_acc_offset=tmem_cg0_acc_offset,
+        tmem_cg1_acc_offset=tmem_cg1_acc_offset,
+        tmem_y_decay_u_input_offset=tmem_cg1_acc_offset + cfg.tmem_cg1_acc_stages * cfg.b_t,
+        kq_cosize=kq_tile_elements * cfg.smem_kq_stages,
+        v_cosize=v_tile_elements * cfg.smem_v_stages,
+        t_inv_cosize=tinv_tile_elements * cfg.smem_t_inv_stages,
+        a_cosize=a_tile_elements * cfg.smem_a_stages,
+        o_cosize=o_tile_elements * cfg.smem_o_stages,
+        checkpoint_cosize=cfg.d_k * cfg.d_v * cfg.smem_checkpoint_stages,
+        tma_kq_bytes=kq_tile_elements * bytes_per_element,
+        tma_v_bytes=v_tile_elements * bytes_per_element,
+        tma_o_bytes=o_tile_elements * bytes_per_element,
+        tma_tinv_bytes=tinv_tile_elements * bytes_per_element,
+    )
 
 
 TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: Q, K, V, O, checkpoints, tinv

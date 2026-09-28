@@ -152,17 +152,20 @@ def test_gdn_cudnn_forward_rejects_misaligned_and_noncontiguous_inner_modes() ->
 
 
 def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
-    """Every private kernel must preserve results under its int64 ABI specialization."""
-    from attn_gym.linear._delta_rule.cudnn.kernels import (
+    """Public forward and backward must actually exercise their forced-wide launch ABIs."""
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
         gdn_bprop_f16,
-        gdn_prefill_f16,
+        gdn_bprop_summary_f16,
+        gdn_chain_backward_f16,
+        gdn_chain_forward_f16,
         gdn_recompute_f16,
+        gdn_warmup_backward_f16,
+        gdn_warmup_forward_f16,
     )
 
-    inputs = make_gdn_test_inputs(
+    q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
         (65, 63), key_heads=2, value_heads=2, dtype=torch.float16, seed=229
     )
-    q, k, value, gate, beta, state, cu_seqlens = inputs
     torch.manual_seed(233)
     d_output = torch.randn_like(value)
     d_final_state = torch.randn_like(state)
@@ -170,39 +173,72 @@ def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> N
         q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
     )
     expected_backward = chunk_gdn_bwd_cudnn_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        d_output,
-        cu_seqlens,
-        state,
-        d_final_state,
+        q, k, value, gate, beta, d_output, cu_seqlens, state, d_final_state
     )
+    forced_calls = []
+    for module in (
+        gdn_warmup_forward_f16,
+        gdn_chain_forward_f16,
+        gdn_recompute_f16,
+        gdn_bprop_f16,
+        gdn_warmup_backward_f16,
+        gdn_chain_backward_f16,
+        gdn_bprop_summary_f16,
+    ):
 
-    for module in (gdn_prefill_f16, gdn_recompute_f16, gdn_bprop_f16):
-        monkeypatch.setattr(module, "requires_int64_abi", lambda *_: True)
+        def force_wide(*tensors, name=module.__name__):
+            forced_calls.append(name)
+            return True
+
+        monkeypatch.setattr(module, "requires_int64_abi", force_wide)
     actual_forward = run_forward(
         q, k, value, gate, beta, cu_seqlens, state, scale=None, output_final_state=True
     )
+    assert forced_calls, "forward did not invoke a forced int64 selector"
+    forced_calls.clear()
     actual_backward = chunk_gdn_bwd_cudnn_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        d_output,
-        cu_seqlens,
-        state,
-        d_final_state,
+        q, k, value, gate, beta, d_output, cu_seqlens, state, d_final_state
     )
-
+    assert forced_calls, "backward did not invoke a forced int64 selector"
     for actual, expected in zip(actual_forward, expected_forward, strict=True):
         assert actual is not None and expected is not None
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual, expected in zip(actual_backward, expected_backward, strict=True):
         assert actual is not None and expected is not None
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta() -> None:
+    """Gate/beta sliced from a shared fp32 projection may start 4 bytes past a 16-byte boundary."""
+    q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
+        (100, 300), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=241
+    )
+    d_output = torch.randn_like(value)
+
+    def offset_by_one_word(tensor: torch.Tensor) -> torch.Tensor:
+        storage = torch.empty(tensor.numel() + 4, dtype=tensor.dtype, device=tensor.device)
+        return storage[1 : 1 + tensor.numel()].view_as(tensor).copy_(tensor)
+
+    shifted_gate, shifted_beta = offset_by_one_word(gate), offset_by_one_word(beta)
+    assert shifted_gate.data_ptr() % 16 and shifted_beta.data_ptr() % 16
+    results = []
+    for gate_input, beta_input in ((gate, beta), (shifted_gate, shifted_beta)):
+        forward = run_forward(
+            q,
+            k,
+            value,
+            gate_input,
+            beta_input,
+            cu_seqlens,
+            state,
+            scale=None,
+            output_final_state=True,
+        )
+        backward = chunk_gdn_bwd_cudnn_packed(
+            q, k, value, gate_input, beta_input, d_output, cu_seqlens, state
+        )
+        results.append((*forward, *(g for g in backward if g is not None)))
+    for actual, expected in zip(results[1], results[0], strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

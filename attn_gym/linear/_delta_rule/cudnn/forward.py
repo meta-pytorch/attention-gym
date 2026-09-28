@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Shared Torch launcher for the CuTeDSL 4.7 cuDNN forward kernel."""
+"""Validated KDA launchers over the v1.30 kernels, including paged recurrent state."""
 
 from __future__ import annotations
 
@@ -10,14 +10,10 @@ from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_suppo
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.utils import ceildiv
 
-from .kernels import kda_prefill_f16 as kernel
-from .kernels.common.host import tensormap_workspace_bytes
-from .schedule import prepare_cudnn_schedule
+from ..cudnn_fe.kda import kda_forward
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-_WORKSPACE_WORD_BYTES = 8
 
 
 def validate_available(q: torch.Tensor) -> None:
@@ -101,45 +97,21 @@ def run_forward_on_current_device(
     if output_final_state and initial_state is None:
         raise ValueError("output_final_state requires an initial_state buffer")
 
-    # Empty sequences emit no token work. Cloning only when requested preserves their state.
-    final_state = initial_state.clone() if output_final_state else None
-    if paged_state is not None:
-        final_state = paged_state.cache
-    output = torch.empty_like(value)
-    stream = torch.cuda.current_stream(q.device).cuda_stream
-    schedule = prepare_cudnn_schedule(
-        gate,
-        cu_seqlens,
-        tile_tokens=kernel.CFG.B_T,
-        counter_count=2,
-        split=split,
-        stream=stream,
-    )
-    tensormap_workspace = torch.empty(
-        ceildiv(tensormap_workspace_bytes(kernel, num_sequences), _WORKSPACE_WORD_BYTES),
-        dtype=torch.int64,
-        device=q.device,
-    )
-    kernel.chunk_kda_sm100(
+    output, final_state = kda_forward(
         q[0],
         k[0],
         value[0],
         gate[0],
         beta[0],
-        output[0],
         cu_seqlens,
-        initial_state,
-        final_state,
-        scale,
-        work_items=schedule.work_items,
-        work_count=schedule.work_count,
-        sched_ctr=schedule.counters,
-        work_item_scratch=schedule.item_scratch,
-        tensormap_workspace=tensormap_workspace,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        split=split,
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
     )
-    return output, (None if paged_state is not None else final_state)
+    return output.unsqueeze(0), final_state
 
 
 def run_forward(

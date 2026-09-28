@@ -1,0 +1,22 @@
+diff --git a/python/cudnn/linear_attention/frost/common/split_k.py b/python/cudnn/linear_attention/frost/common/split_k.py
+--- a/python/cudnn/linear_attention/frost/common/split_k.py
++++ b/python/cudnn/linear_attention/frost/common/split_k.py
+@@ -72,6 +72,7 @@
+ 
+ from .host import get_dtype
+ from cudnn.frost.device import current_device
++from cudnn.frost.buffers import data_ptr
+ 
+ USE_PDL = True
+ 
+@@ -1406,6 +1407,10 @@
+     if log2_threshold is None:
+         log2_threshold = DEFAULT_LOG2_THRESHOLD
+     gate_channels = gate.shape[2] if len(gate.shape) == 3 else 0
++    # The channel scan loads four adjacent channels per lane.
++    vector_bytes = 4 * (get_dtype(gate.dtype).width // 8)
++    if split and gate_channels and gate_channels % 128 == 0 and (data_ptr(gate) % vector_bytes or gate.stride()[0] % 4 or gate.stride()[1] % 4):
++        raise ValueError(f"per-channel gate rows and head slices must be {vector_bytes}-byte aligned for vectorized scan loads")
+     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
+     n_heads_out = gate.shape[1]
+     batch_size = cu_seqlens.shape[0] - 1

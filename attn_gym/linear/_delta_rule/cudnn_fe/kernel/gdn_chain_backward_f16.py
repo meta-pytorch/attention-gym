@@ -17,6 +17,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe.
+# Modified by Attention Gym in 2026: persistent jit_cache compiles on fake-tensor TVM-FFI signatures
+# (legacy placeholder ABI) with an int64-shape variant.
 
 """Two compiled launches for the GDN chain backward.  The head (``--opt-level 2``, the option of the T pass, the summary and
 the recompute) runs the chain prologue, the T pass, the fused H and M summary and the forward state chain (M alone from the
@@ -34,15 +36,15 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import DeviceView
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import requires_int64_abi
 
-from ..common.host import get_dtype
-from ..common.piece_chain import dtype_name, launch_state_chain
-from . import gdn_bprop_summary_f16, gdn_chain_prologue_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
-
-chain_backward_cache = {}
+from ..common.host import get_dtype, validate_cuda_tensors
+from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
+from ..common.piece_chain import CHAIN_WARPS, dtype_name, launch_state_chain
+from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_signature, signature_spec
+from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_chain_prologue_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16
 
 
 @cute.jit
@@ -397,6 +399,234 @@ def chain_backward_tail_host(
         )
 
 
+def _as_dtype(spec, dtype):
+    """Retype a spec: the state chain was compiled against device views of a fixed dtype."""
+    return None if spec is None else (spec[0], dtype, *spec[2:])
+
+
+def _build_cfgs(cfg_args):
+    (io_dtype, state_h_dtype, state_m_dtype, state_x_dtype, num_sm, d_k, d_v, expand_num, fused_h_m, series, coarse,
+     log_gate, safe_gate, use_beta_sigmoid, allow_neg_eigval, use_dstate0, fused_l2norm) = cfg_args
+    io = get_dtype(io_dtype)
+    tinv_cfg = gdn_tinv_f16.build_cfg(
+        io,
+        num_sm=num_sm,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        beta_sigmoid=use_beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
+        d_k=d_k,
+        expand_num=expand_num,
+    )
+    summary_cfg = None
+    transition_cfg = None
+    if fused_h_m:
+        summary_cfg = gdn_summary_f16.build_cfg(
+            io,
+            get_dtype(state_h_dtype),
+            max_active_clusters=num_sm,
+            use_initial_state=False,
+            log_gate=log_gate,
+            safe_gate=safe_gate,
+            d_k=d_k,
+            d_v=d_v,
+            expand_num=expand_num,
+        )
+    else:
+        transition_cfg = gdn_recompute_f16.build_cfg(
+            io,
+            get_dtype(state_m_dtype),
+            max_active_clusters=num_sm,
+            use_initial_state=False,
+            store_final_state=True,
+            enable_checkpoints=False,
+            seed_checkpoints=False,
+            log_gate=log_gate,
+            safe_gate=safe_gate,
+            seed_identity=True,
+            v_is_zero=True,
+            d_k=d_k,
+            d_v=d_k,
+            expand_num=expand_num,
+        )
+    series_cfg = None
+    if series:
+        series_cfg = gdn_recompute_f16.build_cfg(
+            io,
+            get_dtype(state_x_dtype) if not coarse else cutlass.Float32,
+            max_active_clusters=num_sm,
+            use_initial_state=not coarse,
+            store_final_state=False,
+            enable_checkpoints=True,
+            seed_checkpoints=coarse,
+            log_gate=log_gate,
+            safe_gate=safe_gate,
+            d_k=d_k,
+            d_v=d_v,
+            expand_num=expand_num,
+        )
+    bwd_summary_cfg = gdn_bprop_summary_f16.build_cfg(
+        io,
+        max_active_clusters=num_sm,
+        use_dstate_in=False,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        d_k=d_k,
+        d_v=d_v,
+        expand_num=expand_num,
+    )
+    bprop_cfg = gdn_bprop_f16.build_cfg(
+        io,
+        max_active_clusters=num_sm,
+        use_initial_state=True,
+        use_dstate_in=True,
+        use_dstate0=use_dstate0,
+        log_gate=log_gate,
+        safe_gate=safe_gate,
+        beta_sigmoid=use_beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
+        fused_l2norm=fused_l2norm,
+        d_k=d_k,
+        d_v=d_v,
+        expand_num=expand_num,
+        tinv_source="gmem",
+    )
+    return tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg
+
+
+def _name(prefix, constexprs, use_int64_offsets):
+    flags = "_".join(str(int(value)) for value in constexprs)
+    return f"{prefix}_{flags}_i64{int(use_int64_offsets)}"
+
+
+@jit_cache
+def _compile_chain_backward_head(constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool):
+    """Compile the chain-backward head over the upstream dynamic-layout tensor ABI."""
+    tinv_cfg, summary_cfg, transition_cfg, series_cfg, _, _ = _build_cfgs(cfg_args)
+    unit_chunks, b_t, expand_num, length_rule, compact_qdo, summary_q_step, fused_h_m, series, dim_v, dim_k, rows, has_seed = constexprs
+    return compile_tvm_ffi(
+        chain_backward_head_host,
+        unit_chunks,
+        b_t,
+        expand_num,
+        length_rule,
+        compact_qdo,
+        summary_q_step,
+        fused_h_m,
+        series,
+        tinv_cfg,
+        summary_cfg,
+        transition_cfg,
+        series_cfg,
+        dim_v,
+        dim_k,
+        rows,
+        has_seed,
+        *(cutlass.Int32(0) for _ in range(6)),
+        *(make_signature(spec, use_int64_offsets=use_int64_offsets) for spec in specs),
+        name=_name("gdn_cudnn_chain_backward_head", constexprs, use_int64_offsets) + "_" + "_".join(cfg_args[:4]),
+        opt_level=2,
+    )
+
+
+@jit_cache
+def _compile_chain_backward_tail(constexprs: tuple, cfg_args: tuple, specs: tuple, use_int64_offsets: bool):
+    """Compile the chain-backward tail over the upstream dynamic-layout tensor ABI."""
+    *_, bwd_summary_cfg, bprop_cfg = _build_cfgs(cfg_args)
+    compact_qdo, dim_v, dim_k, rows, has_dseed = constexprs
+    return compile_tvm_ffi(
+        chain_backward_tail_host,
+        gdn_bprop_f16,
+        compact_qdo,
+        bwd_summary_cfg,
+        bprop_cfg,
+        dim_v,
+        dim_k,
+        rows,
+        has_dseed,
+        *(cutlass.Int32(0) for _ in range(3)),
+        cutlass.Float32(1.0),
+        *(make_signature(spec, use_int64_offsets=use_int64_offsets) for spec in specs),
+        name=_name("gdn_cudnn_chain_backward_tail", constexprs, use_int64_offsets) + "_" + "_".join(cfg_args[:4]),
+        opt_level=2,
+    )
+
+
+def _validate_launch(
+    *, q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, cu_pieces, main_rows, summary_rows, main_count,
+    summary_count, work_items, work_items_summary, series_items, series_count, scheduler_all, scheduler_recompute,
+    scheduler_m, scheduler_series, scheduler_summary, scheduler_bwd, tinv_words, tinv_rows, tinv_row_count,
+    summary_words, recompute_m_words, series_words, bprop_summary_words, bprop_words, checkpoints, seed_checkpoints,
+    dq, dk, dv, dgate, dbeta, summary_q, summary_do, tinv, state_h, state_m, state_x, state_g, state_dx_end, seed,
+    dseed, dstate0, inv_q, inv_k, pieces, heads_out, num_seqs, unit_chunks, b_t, expand_num, summary_q_step,
+    fused_h_m, series, coarse, chain_rows, num_sm,
+):
+    """Check the chain backward buffers of one plan: ``num_seqs * pieces`` piece series and piece tables."""
+    if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 2 or gate.shape[1] != heads_out:
+        raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
+    if min(pieces, unit_chunks, summary_q_step, num_sm) < 1:
+        raise ValueError("pieces, unit_chunks, summary_q_step and num_sm must be positive")
+    num_pieces = num_seqs * pieces
+    gdn_bprop_f16.validate_bwd_bundle(
+        q, k, v, do, dq, dk, dv, gate, beta, cu_seqlens, checkpoints, tinv, tinv_rows, tinv_row_count, bprop_words,
+        num_pieces=num_pieces, expand_num=expand_num, b_t=b_t, dgate=dgate, dbeta=dbeta, a_log=a_log,
+        dt_bias=dt_bias, inv_q=inv_q, inv_k=inv_k,
+    )
+    tables = dict(
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
+        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd,
+    )
+    states = dict(state_h=state_h, state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end)
+    words = dict(
+        tinv_words=tinv_words, summary_words=summary_words, recompute_m_words=recompute_m_words,
+        series_words=series_words, bprop_summary_words=bprop_summary_words,
+    )
+    operands = dict(summary_q=summary_q, summary_do=summary_do, seed_checkpoints=seed_checkpoints)
+    validate_cuda_tensors(q, **tables, **states, **words, **operands, seed=seed, dseed=dseed, dstate0=dstate0)
+    dim_v, dim_k = v.shape[2], q.shape[2]
+    if chain_rows < CHAIN_WARPS or dim_v % chain_rows or chain_rows % CHAIN_WARPS:
+        raise ValueError("chain_rows must divide d_v and contain whole chain warp groups")
+    for name, entries in (("cu_pieces", num_pieces + 1), ("main_rows", num_seqs + 1), ("summary_rows", num_seqs + 1)):
+        validate_tensor(name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16)
+    counters = ("main_count", "summary_count", *(name for name in tables if name.startswith("scheduler")))
+    for name in (*counters, *(("series_count",) if series and coarse else ())):
+        validate_tensor(name, tables[name], (None,), ("int32",), align=4, min_rows=1)
+    for name in ("work_items", "work_items_summary", *(("series_items",) if series and coarse else ())):
+        validate_tensor(
+            name, tables[name], (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=num_pieces * heads_out
+        )
+    for name, tensor in states.items():
+        if name == "state_h" and not fused_h_m or name == "state_x" and not (fused_h_m or series and not coarse):
+            continue
+        width = dim_k if name == "state_m" else dim_v
+        validate_tensor(name, tensor, (None, heads_out, width, dim_k), gdn_bprop_f16.STATE_DTYPES, min_rows=num_pieces)
+    for name, tensor in (("seed", seed), ("dseed", dseed), ("dstate0", dstate0)):
+        if tensor is not None:
+            validate_tensor(
+                name, tensor, (None, heads_out, dim_v, dim_k), gdn_bprop_f16.STATE_DTYPES,
+                align=16 if name == "dstate0" else 4, min_rows=num_seqs,
+            )
+    io = (str(q.dtype).removeprefix("torch."),)
+    validate_tensor("summary_q", summary_q, (None, None, dim_k), io, tma=True)
+    validate_tensor("summary_do", summary_do, (None, heads_out, dim_v), io, tma=True)
+    if coarse:
+        validate_tensor(
+            "seed_checkpoints", seed_checkpoints, (None, heads_out, dim_v, dim_k), (*gdn_bprop_f16.STATE_DTYPES, *io)
+        )
+    for name, module, needed in (
+        ("tinv_words", gdn_tinv_f16, True),
+        ("summary_words", gdn_summary_f16, fused_h_m),
+        ("recompute_m_words", gdn_recompute_f16, not fused_h_m),
+        ("series_words", gdn_recompute_f16, series),
+        ("bprop_summary_words", gdn_bprop_summary_f16, True),
+    ):
+        if needed:
+            validate_workspace(name, words[name], module.TENSORMAP_DESC_ARRAYS, num_pieces)
+
+
 def build_chain_backward(
     *,
     bprop_module,
@@ -482,33 +712,59 @@ def build_chain_backward(
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
-    HO = gate.shape[1]
     if not safe_gate:
         a_log = None
         dt_bias = None
-    io_dtype = get_dtype(q.dtype)
+    if bprop_module is not gdn_bprop_f16 or compact_qdo:
+        raise ValueError("the GDN chain backward supports only the gdn_bprop_f16 bprop without compact_qdo")
+    # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
+    _validate_launch(
+        q=q, k=k, v=v, do=do, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, cu_seqlens=cu_seqlens,
+        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
+        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
+        series_items=series_items, series_count=series_count, scheduler_all=scheduler_all,
+        scheduler_recompute=scheduler_recompute, scheduler_m=scheduler_m, scheduler_series=scheduler_series,
+        scheduler_summary=scheduler_summary, scheduler_bwd=scheduler_bwd, tinv_words=tinv_words,
+        tinv_rows=tinv_rows, tinv_row_count=tinv_row_count, summary_words=summary_words,
+        recompute_m_words=recompute_m_words, series_words=series_words, bprop_summary_words=bprop_summary_words,
+        bprop_words=bprop_words, checkpoints=checkpoints, seed_checkpoints=seed_checkpoints, dq=dq, dk=dk,
+        dv=dv, dgate=dgate, dbeta=dbeta, summary_q=summary_q, summary_do=summary_do, tinv=tinv, state_h=state_h,
+        state_m=state_m, state_x=state_x, state_g=state_g, state_dx_end=state_dx_end, seed=seed, dseed=dseed,
+        dstate0=dstate0, inv_q=inv_q, inv_k=inv_k, pieces=pieces, heads_out=heads_out, num_seqs=num_seqs,
+        unit_chunks=unit_chunks, b_t=b_t, expand_num=expand_num, summary_q_step=summary_q_step,
+        fused_h_m=fused_h_m, series=series, coarse=coarse, chain_rows=chain_rows, num_sm=num_sm
+    )
     has_seed = seed is not None
     has_dseed = dseed is not None
     seed_name = dtype_name(seed.dtype) if has_seed else "float32"
     dseed_name = dtype_name(dseed.dtype) if has_dseed else "float32"
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4
-    key = (
-        str(q.dtype),
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(beta.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(state_x.dtype) if state_x is not None else "none",
-        str(dstate0.dtype) if dstate0 is not None else "none",
-        seed_name,
-        dseed_name,
-        int(device),
+
+    def name(tensor):
+        return "none" if tensor is None else dtype_name(tensor.dtype)
+
+    cfg_args = (
+        name(q),
+        name(state_h),
+        name(state_m),
+        name(state_x),
         int(num_sm),
         DK,
         DV,
-        summary_q.shape[1],
-        summary_do.shape[1],
+        int(expand_num),
+        bool(fused_h_m),
+        bool(series),
+        bool(coarse),
+        bool(log_gate),
+        bool(safe_gate),
+        bool(use_beta_sigmoid),
+        bool(allow_neg_eigval),
+        dstate0 is not None,
+        inv_q is not None,
+    )
+    recompute_items = (series_items if coarse else work_items) if series else None
+    recompute_count = (series_count if coarse else main_count) if series else None
+    head_constexprs = (
         int(unit_chunks),
         int(b_t),
         int(expand_num),
@@ -517,246 +773,104 @@ def build_chain_backward(
         int(summary_q_step),
         bool(fused_h_m),
         bool(series),
-        bool(coarse),
-        bool(log_gate),
-        bool(safe_gate),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
-        inv_q is not None,
-        has_seed,
-        has_dseed,
+        DV,
+        DK,
         int(chain_rows),
-        bprop_module.__name__,
+        has_seed,
     )
-    if key not in chain_backward_cache:
-        tinv_cfg = gdn_tinv_f16.build_cfg(
-            io_dtype,
-            num_sm=num_sm,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            d_k=DK,
-            expand_num=expand_num,
-        )
-        summary_cfg = None
-        transition_cfg = None
-        if fused_h_m:
-            summary_cfg = gdn_summary_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_h.dtype),
-                max_active_clusters=num_sm,
-                use_initial_state=False,
-                log_gate=log_gate,
-                safe_gate=safe_gate,
-                d_k=DK,
-                d_v=DV,
-                expand_num=expand_num,
-            )
-        else:
-            transition_cfg = gdn_recompute_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_m.dtype),
-                max_active_clusters=num_sm,
-                use_initial_state=False,
-                store_final_state=True,
-                enable_checkpoints=False,
-                seed_checkpoints=False,
-                log_gate=log_gate,
-                safe_gate=safe_gate,
-                seed_identity=True,
-                v_is_zero=True,
-                d_k=DK,
-                d_v=DK,
-                expand_num=expand_num,
-            )
-        series_cfg = None
-        if series:
-            series_cfg = gdn_recompute_f16.build_cfg(
-                io_dtype,
-                get_dtype(state_x.dtype) if not coarse else cutlass.Float32,
-                max_active_clusters=num_sm,
-                use_initial_state=not coarse,
-                store_final_state=False,
-                enable_checkpoints=True,
-                seed_checkpoints=coarse,
-                log_gate=log_gate,
-                safe_gate=safe_gate,
-                d_k=DK,
-                d_v=DV,
-                expand_num=expand_num,
-            )
-        bwd_summary_cfg = gdn_bprop_summary_f16.build_cfg(
-            io_dtype,
-            max_active_clusters=num_sm,
-            use_dstate_in=False,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            d_k=DK,
-            d_v=DV,
-            expand_num=expand_num,
-        )
-        bprop_cfg = bprop_module.build_cfg(
-            io_dtype,
-            max_active_clusters=num_sm,
-            use_initial_state=True,
-            use_dstate_in=True,
-            use_dstate0=dstate0 is not None,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            fused_l2norm=inv_q is not None,
-            d_k=DK,
-            d_v=DV,
-            expand_num=expand_num,
-            **({} if compact_qdo else dict(tinv_source="gmem")),
-        )
-
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
-        work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        series_items_placeholder = None
-        if series_items is not None:
-            series_items_placeholder = from_dlpack(series_items, assumed_align=16)
-            series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        state_h_placeholder = None
-        if fused_h_m:
-            state_h_placeholder = from_dlpack(state_h, assumed_align=16)
-            state_h_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        state_m_placeholder = from_dlpack(state_m, assumed_align=16)
-        state_m_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        state_x_placeholder = None
-        if series and not coarse:
-            state_x_placeholder = from_dlpack(state_x, assumed_align=16)
-            state_x_placeholder.mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
-        head = cute.compile(
-            chain_backward_head_host,
-            int(unit_chunks),
-            int(b_t),
-            int(expand_num),
-            bool(length_rule),
-            bool(compact_qdo),
-            int(summary_q_step),
-            bool(fused_h_m),
-            bool(series),
-            tinv_cfg,
-            summary_cfg,
-            transition_cfg,
-            series_cfg,
-            DV,
-            DK,
-            int(chain_rows),
-            has_seed,
-            cutlass.Int32(int(pieces)),
-            cutlass.Int32(int(heads_out)),
-            cutlass.Int32(int(num_seqs)),
-            cutlass.Int32(int(series_span_tokens) // int(b_t)),
-            cutlass.Int32(int(b_t)),
-            cutlass.Int32(int(seed_every_n_tokens)),
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
-            from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
-            from_dlpack(cu_seqlens, assumed_align=cu_align).mark_layout_dynamic(),
-            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
-            work_items_placeholder,
-            work_items_summary_placeholder,
-            series_items_placeholder,
-            from_dlpack(series_count, assumed_align=4).mark_layout_dynamic() if series_count is not None else None,
-            (series_items_placeholder if coarse else work_items_placeholder) if series else None,
-            from_dlpack(series_count if coarse else main_count, assumed_align=4).mark_layout_dynamic() if series else None,
-            from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_recompute, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_m, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_series, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(tinv_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(tinv_rows, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(tinv_row_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_words, assumed_align=128).mark_layout_dynamic() if summary_words is not None else None,
-            from_dlpack(recompute_m_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(series_words, assumed_align=128).mark_layout_dynamic() if series_words is not None else None,
-            from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(summary_q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3),
-            state_h_placeholder,
-            state_m_placeholder,
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if fused_h_m else None,
-            from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if fused_h_m else None,
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if fused_h_m else None,
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
-            state_x_placeholder,
-            from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if coarse else None,
-            cuda.CUstream(int(stream)),
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-        tail = cute.compile(
-            chain_backward_tail_host,
-            bprop_module,
-            bool(compact_qdo),
-            bwd_summary_cfg,
-            bprop_cfg,
-            DV,
-            DK,
-            int(chain_rows),
-            has_dseed,
-            cutlass.Int32(int(pieces)),
-            cutlass.Int32(int(heads_out)),
-            cutlass.Int32(int(num_seqs)),
-            float(scale),
-            from_dlpack(summary_q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
-            from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
-            from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(state_g, assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(state_dx_end, assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, DV, DK), dseed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_dseed else None,
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
-            from_dlpack(inv_q, assumed_align=4).mark_layout_dynamic(leading_dim=1) if inv_q is not None else None,
-            from_dlpack(inv_k, assumed_align=4).mark_layout_dynamic(leading_dim=1) if inv_k is not None else None,
-            from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3),
-            work_items_summary_placeholder,
-            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_summary, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic(),
-            work_items_placeholder,
-            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(scheduler_bwd, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
-            cuda.CUstream(int(stream)),
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-        chain_backward_cache[key] = (head, tail)
-    return chain_backward_cache[key]
+    head_specs = (
+        signature_spec(q, assumed_align=16),
+        signature_spec(k, assumed_align=16),
+        signature_spec(v, assumed_align=16),
+        signature_spec(do, assumed_align=16),
+        signature_spec(gate, assumed_align=16),
+        signature_spec(beta, assumed_align=16),
+        signature_spec(a_log, assumed_align=4),
+        signature_spec(dt_bias, assumed_align=4),
+        signature_spec(cu_seqlens, assumed_align=cu_align),
+        signature_spec(cu_pieces, assumed_align=4),
+        signature_spec(main_rows, assumed_align=16),
+        signature_spec(summary_rows, assumed_align=16),
+        signature_spec(main_count, assumed_align=4),
+        signature_spec(summary_count, assumed_align=4),
+        signature_spec(work_items, assumed_align=16, compact=True),
+        signature_spec(work_items_summary, assumed_align=16, compact=True),
+        signature_spec(series_items, assumed_align=16, compact=True),
+        signature_spec(series_count, assumed_align=4),
+        signature_spec(recompute_items, assumed_align=16, compact=True),
+        signature_spec(recompute_count, assumed_align=4),
+        signature_spec(scheduler_all, assumed_align=4),
+        signature_spec(scheduler_recompute, assumed_align=4),
+        signature_spec(scheduler_m, assumed_align=4),
+        signature_spec(scheduler_series, assumed_align=4),
+        signature_spec(tinv_words, assumed_align=128),
+        signature_spec(tinv_rows, assumed_align=16),
+        signature_spec(tinv_row_count, assumed_align=4),
+        signature_spec(summary_words, assumed_align=128),
+        signature_spec(recompute_m_words, assumed_align=128),
+        signature_spec(series_words, assumed_align=128),
+        signature_spec(bprop_summary_words, assumed_align=128),
+        signature_spec(bprop_words, assumed_align=128),
+        signature_spec(checkpoints, assumed_align=16),
+        signature_spec(dq, assumed_align=16),
+        signature_spec(dk, assumed_align=16),
+        signature_spec(dv, assumed_align=16),
+        signature_spec(summary_q, assumed_align=16),
+        signature_spec(summary_do, assumed_align=16),
+        signature_spec(tinv, assumed_align=128),
+        signature_spec(state_h, assumed_align=16, mode3_divisibility=DK) if fused_h_m else None,
+        signature_spec(state_m, assumed_align=16, mode3_divisibility=DK),
+        _as_dtype(signature_spec(state_h, assumed_align=16), "float32") if fused_h_m else None,
+        _as_dtype(signature_spec(state_m, assumed_align=16), "float32") if fused_h_m else None,
+        _as_dtype(signature_spec(state_x, assumed_align=16), "float32") if fused_h_m else None,
+        _as_dtype(signature_spec(seed, assumed_align=4), seed_name),
+        signature_spec(state_x, assumed_align=16, mode3_divisibility=DK) if series and not coarse else None,
+        signature_spec(seed_checkpoints, assumed_align=16) if coarse else None,
+    )
+    tail_specs = (
+        signature_spec(summary_q, assumed_align=16),
+        signature_spec(k, assumed_align=16),
+        signature_spec(gate, assumed_align=16),
+        signature_spec(a_log, assumed_align=4),
+        signature_spec(dt_bias, assumed_align=4),
+        signature_spec(summary_do, assumed_align=16),
+        signature_spec(cu_pieces, assumed_align=4),
+        signature_spec(main_rows, assumed_align=16),
+        signature_spec(state_g, assumed_align=16),
+        _as_dtype(signature_spec(state_m, assumed_align=16), "float32"),
+        signature_spec(state_dx_end, assumed_align=16),
+        _as_dtype(signature_spec(dseed, assumed_align=4), dseed_name),
+        signature_spec(q, assumed_align=16),
+        signature_spec(v, assumed_align=16),
+        signature_spec(beta, assumed_align=16),
+        signature_spec(do, assumed_align=16),
+        signature_spec(dq, assumed_align=16),
+        signature_spec(dk, assumed_align=16),
+        signature_spec(dv, assumed_align=16),
+        signature_spec(dgate, assumed_align=16),
+        signature_spec(dbeta, assumed_align=16),
+        signature_spec(dstate0, assumed_align=16),
+        signature_spec(inv_q, assumed_align=4),
+        signature_spec(inv_k, assumed_align=4),
+        signature_spec(tinv, assumed_align=128),
+        signature_spec(work_items_summary, assumed_align=16, compact=True),
+        signature_spec(summary_count, assumed_align=4),
+        signature_spec(scheduler_summary, assumed_align=4),
+        signature_spec(bprop_summary_words, assumed_align=128),
+        signature_spec(work_items, assumed_align=16, compact=True),
+        signature_spec(main_count, assumed_align=4),
+        signature_spec(scheduler_bwd, assumed_align=4),
+        signature_spec(bprop_words, assumed_align=128),
+    )
+    use_int64_offsets = requires_int64_abi(
+        q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, checkpoints, seed_checkpoints, dq, dk, dv, dgate, dbeta,
+        summary_q, summary_do, tinv, state_h, state_m, state_x, state_g, state_dx_end, seed, dseed, dstate0, inv_q, inv_k,
+    )
+    head = _compile_chain_backward_head(head_constexprs, cfg_args, head_specs, use_int64_offsets)
+    tail = _compile_chain_backward_tail(
+        (bool(compact_qdo), DV, DK, int(chain_rows), has_dseed), cfg_args, tail_specs, use_int64_offsets
+    )
+    return head, tail
 
 
 def run_chain_backward(
@@ -830,7 +944,6 @@ def run_chain_backward(
     """Replay the chain backward: two crossings into the DSL for its eight launches.  The plan validated the contract at
     build, so nothing here raises."""
     head, tail = compiled
-    cu_stream = cuda.CUstream(int(stream))
     head(
         int(pieces),
         int(heads_out),
@@ -885,7 +998,6 @@ def run_chain_backward(
         seed,
         state_x if series and not coarse else None,
         seed_checkpoints if coarse else None,
-        cu_stream,
     )
     tail(
         int(pieces),
@@ -925,5 +1037,4 @@ def run_chain_backward(
         main_count,
         scheduler_bwd,
         bprop_words,
-        cu_stream,
     )

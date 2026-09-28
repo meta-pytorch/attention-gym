@@ -50,11 +50,6 @@ _FP16_COTANGENT_RANGE = pytest.mark.xfail(
     raises=AssertionError,
     reason="FP16 execution stages state cotangents as FP16 tapes; 2^-25 flushes to zero",
 )
-_CUDNN_KDA_CARRY = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="cuDNN KDA decays the carried state through a Q/K/V-dtype diagonal MMA, not in FP32",
-)
 # The FP32 carry may differ from the eager reference only by log2-domain gate conversions.
 _FP32_CARRY_RTOL = 1e-5
 
@@ -122,8 +117,6 @@ def test_large_state_decays_in_fp32(
     """An FP32 state element above the FP16 range must decay to its FP32 value without NaNs."""
     if dtype is torch.float16:
         request.applymarker(_FP16_STATE_RANGE)
-    elif family == "kda" and kernel_options is not None:
-        request.applymarker(_CUDNN_KDA_CARRY)
     inputs = _zero_inputs(family, dtype, tokens=1, gate_value=-4.0)
     initial_state = torch.zeros(1, 1, 128, 128, device="cuda")
     initial_state[0, 0, 0, 0] = 65536.0

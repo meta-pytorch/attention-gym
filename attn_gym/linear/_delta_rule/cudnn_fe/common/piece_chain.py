@@ -32,10 +32,12 @@ from typing import NamedTuple
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.experimental.primitives as nvvm
+import torch
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import DeviceView
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from ..tile_dsl.tma import (
@@ -52,6 +54,8 @@ from ..tile_dsl.tma import (
     st_shared_v2,
     st_shared_v4,
 )
+from .host import get_dtype, validate_cuda_tensors
+from .tvm_ffi import make_counter_signature, make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -1143,7 +1147,72 @@ def launch_state_chain(
     )
 
 
-state_chain_cache = {}
+@jit_cache
+def _compile_state_chain(
+    dim_v,
+    dim_k,
+    rows,
+    transpose,
+    has_seed,
+    has_tail,
+    emit_summary,
+    filled_only,
+    seed_dtype,
+    tail_dtype,
+    summary_dtype,
+    opt_level,
+    has_seed_indices,
+    use_int64_offsets,
+):
+    sym_int = cute.sym_int
+
+    def state(dtype, align):
+        return make_strided_signature_tensor(
+            get_dtype(dtype),
+            tuple(sym_int() for _ in range(4)),
+            assumed_align=align,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+
+    walk_state = has_seed or has_tail or not emit_summary
+    flags = (
+        dim_v,
+        dim_k,
+        rows,
+        transpose,
+        has_seed,
+        has_tail,
+        emit_summary,
+        filled_only,
+        opt_level,
+        has_seed_indices,
+        use_int64_offsets,
+    )
+    suffix = "_".join(str(int(flag)) for flag in flags)
+    return compile_tvm_ffi(
+        launch_state_chain,
+        cutlass.Int32(0),
+        dim_v,
+        dim_k,
+        rows,
+        cutlass.Int32(0),
+        transpose,
+        has_seed,
+        has_tail,
+        emit_summary,
+        cutlass.Int32(0),
+        state("float32", 16) if walk_state else None,
+        state("float32", 16),
+        state("float32", 16) if walk_state else None,
+        state(seed_dtype, 4) if has_seed else None,
+        state(tail_dtype, 4) if has_tail else None,
+        state(summary_dtype, 16) if emit_summary else None,
+        make_counter_signature(sym_int()) if filled_only else None,
+        make_counter_signature(sym_int()) if has_seed_indices else None,
+        name=f"state_chain_{suffix}_{seed_dtype}_{tail_dtype}_{summary_dtype}",
+        opt_level=opt_level,
+    )
 
 
 class CompiledStateChain(NamedTuple):
@@ -1209,11 +1278,18 @@ def build_state_chain(
     ``[num_seqs]`` table naming the row of ``seed`` each sequence reads."""
     HO, V, K, P = int(heads_out), int(dim_v), int(dim_k), int(pieces)
     rows = V // 8 if rows_per_cta is None else int(rows_per_cta)
-    walk_state = bool(has_seed or has_tail or not emit_summary)
+    if HO <= 0 or P <= 0 or K not in (64, 128) or V <= 0:
+        raise ValueError("state chain requires positive heads/pieces/rows and K in {64, 128}")
+    if rows < CHAIN_WARPS or V % rows or rows % CHAIN_WARPS:
+        raise ValueError("rows_per_cta must divide V and contain whole chain warp groups")
+    if emit_summary and (K * rows % V or (K * rows // V) % CHAIN_WARPS):
+        raise ValueError("rows_per_cta must also tile the transition product warp groups")
+    if torch.cuda.current_device() != int(device):
+        raise ValueError("the active CUDA device must match the state-chain compile device")
     seed_name = dtype_name(seed_dtype) if has_seed else "float32"
     tail_name = dtype_name(tail_dtype) if has_tail else "float32"
     summary_name = dtype_name(summary_dtype) if emit_summary else "float32"
-    key = (
+    compiled = _compile_state_chain(
         V,
         K,
         rows,
@@ -1225,68 +1301,12 @@ def build_state_chain(
         seed_name,
         tail_name,
         summary_name,
-        int(device),
         int(opt_level),
         bool(has_seed_indices),
+        True,
     )
-    if key not in state_chain_cache:
-        state_chain_cache[key] = cute.compile(
-            launch_state_chain,
-            cutlass.Int32(HO),
-            V,
-            K,
-            rows,
-            cutlass.Int32(P),
-            bool(transpose),
-            bool(has_seed),
-            bool(has_tail),
-            bool(emit_summary),
-            cutlass.Int32(1),
-            from_dlpack(
-                DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
-            if walk_state
-            else None,
-            from_dlpack(
-                DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(
-                DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
-            if walk_state
-            else None,
-            from_dlpack(
-                DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4
-            ).mark_layout_dynamic(leading_dim=3)
-            if has_seed
-            else None,
-            from_dlpack(
-                DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4
-            ).mark_layout_dynamic(leading_dim=3)
-            if has_tail
-            else None,
-            (
-                from_dlpack(
-                    DeviceView(256, (1, HO, K, K), summary_name, int(device)), assumed_align=16
-                ).mark_layout_dynamic(leading_dim=3)
-                if emit_summary
-                else None
-            ),
-            from_dlpack(
-                DeviceView(256, (1,), "int32", int(device)), assumed_align=4
-            ).mark_layout_dynamic()
-            if filled_only
-            else None,
-            from_dlpack(
-                DeviceView(256, (1,), "int32", int(device)), assumed_align=4
-            ).mark_layout_dynamic()
-            if has_seed_indices
-            else None,
-            cuda.CUstream(0),
-            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
-        )
     return CompiledStateChain(
-        state_chain_cache[key],
+        compiled,
         HO,
         V,
         K,
@@ -1324,6 +1344,49 @@ def run_state_chain(
     int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in sequence order), ``seed_indices`` int32 ``[num_seqs]`` when
     built with ``has_seed_indices``."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
+    validate_cuda_tensors(
+        M,
+        H=H,
+        X=X,
+        seed=seed,
+        tail=tail,
+        summary_m=summary_m,
+        main_rows=main_rows,
+        seed_indices=seed_indices,
+    )
+    heads, v, k = compiled.heads_out, compiled.dim_v, compiled.dim_k
+    for name, tensor, enabled, shape, dtype, alignment in (
+        ("M", M, True, (heads, k, k), "float32", 16),
+        ("H", H, walk_state, (heads, v, k), "float32", 16),
+        ("X", X, walk_state, (heads, v, k), "float32", 16),
+        ("seed", seed, compiled.has_seed, (heads, v, k), compiled.seed_dtype, 4),
+        ("tail", tail, compiled.has_tail, (heads, v, k), compiled.tail_dtype, 4),
+        ("summary_m", summary_m, compiled.emit_summary, (heads, k, k), compiled.summary_dtype, 16),
+    ):
+        if not enabled:
+            continue
+        if tensor is None or tensor.ndim != 4 or tuple(tensor.shape[1:]) != shape:
+            raise ValueError(f"{name} must have trailing state shape {shape}")
+        if get_dtype(tensor.dtype) != get_dtype(dtype):
+            raise ValueError(f"{name} must have dtype {dtype}")
+        if not tensor_supports_contiguous_dim(tensor, alignment_bytes=alignment):
+            raise ValueError(f"{name} requires aligned contiguous state rows")
+        needed = num_seqs * compiled.pieces if name in ("M", "H", "X") else num_seqs
+        if name == "seed" and compiled.has_seed_indices:
+            needed = 0  # Device routes index the caller's state pool, not sequence rows.
+        if tensor.shape[0] < needed:
+            raise ValueError(f"{name} requires at least {needed} rows")
+    for name, tensor, enabled, entries in (
+        ("main_rows", main_rows, compiled.filled_only, num_seqs + 1),
+        ("seed_indices", seed_indices, compiled.has_seed_indices, num_seqs),
+    ):
+        if enabled and (
+            tensor is None
+            or tuple(tensor.shape) != (entries,)
+            or str(tensor.dtype) != "torch.int32"
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be a compact int32 vector with {entries} entries")
     compiled.compiled(
         int(compiled.heads_out),
         int(compiled.pieces),
@@ -1336,7 +1399,6 @@ def run_state_chain(
         summary_m if compiled.emit_summary else None,
         main_rows if compiled.filled_only else None,
         seed_indices if compiled.has_seed_indices else None,
-        cuda.CUstream(int(stream)),
     )
 
 

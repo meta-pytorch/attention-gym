@@ -1,0 +1,54 @@
+diff --git a/python/cudnn/linear_attention/frost/common/split_k.py b/python/cudnn/linear_attention/frost/common/split_k.py
+--- a/python/cudnn/linear_attention/frost/common/split_k.py
++++ b/python/cudnn/linear_attention/frost/common/split_k.py
+@@ -64,7 +64,7 @@
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.experimental.primitives as nvvm
+-from cutlass.cute.runtime import from_dlpack
++from cutlass.cute.runtime import from_dlpack, make_fake_tensor
+ 
+ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+ from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
+@@ -759,7 +759,11 @@
+                                 row_r = pos_r // cutlass.Int32(expand_num)
+                                 inb = inb and (pos_r - row_r * cutlass.Int32(expand_num) == 0)
+                                 pos_r = row_r
+-                            gv = (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + h_r).load().to(cutlass.Float32)
++                            gv = (
++                                (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + cutlass.Int64(h_r) * cutlass.Int64(mGate.stride[1]))
++                                .load()
++                                .to(cutlass.Float32)
++                            )
+                             if cutlass.const_expr(safe_gate):
+                                 contrib = a * softplus(gv + bias)
+                                 acc = acc + (contrib if inb else cutlass.Float32(0.0))
+@@ -1579,6 +1583,19 @@
+     )
+     if key not in compiled_cache:
+ 
++        gate_c = None
++        if split:
++            if gate_channels:
++                gate_c = from_dlpack(gate, assumed_align=(8 if gate_elem_bytes == 2 else 4)).mark_layout_dynamic(leading_dim=2)
++            else:
++                # mark_layout_dynamic infers a unit stride from a compact first call.
++                # Both strides must instead remain dynamic for strided replay.
++                gate_c = make_fake_tensor(
++                    get_dtype(gate.dtype),
++                    (cute.sym_int(), cute.sym_int()),
++                    (cute.sym_int(), cute.sym_int()),
++                    assumed_align=(8 if gate_elem_bytes == 2 else 4),
++                )
+         dt_bias_c = None
+         if dt_bias is not None:
+             dt_bias_c = from_dlpack(dt_bias, assumed_align=4)
+@@ -1613,7 +1630,7 @@
+             cutlass.Int32(batch_size),
+             cutlass.Float32(log2_threshold),
+             cutlass.Float32(gate_scale_log2),
+-            from_dlpack(gate, assumed_align=(8 if gate_elem_bytes == 2 else 4)).mark_layout_dynamic(leading_dim=len(gate.shape) - 1) if split else None,
++            gate_c,
+             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
+             dt_bias_c,
+             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),

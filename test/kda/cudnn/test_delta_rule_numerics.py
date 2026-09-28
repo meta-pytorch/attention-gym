@@ -193,6 +193,40 @@ def test_kda_cudnn_delta_residual_keeps_fp32_precision(dtype: torch.dtype) -> No
     assert dq[0, 32, 0, 1].item() == expected_dq[0, 32, 0, 1].item() == 96
 
 
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("beta_value", (0.0, 1e-12, 1e-10, 1e-8))
+def test_kda_cudnn_backward_preserves_small_beta_gradient(
+    dtype: torch.dtype, beta_value: float
+) -> None:
+    """dBeta must stay defined at a zero or tiny write gate (no division by beta)."""
+    shape = (1, 2, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    value = torch.zeros_like(q)
+    q[..., 0] = 1
+    k[..., 0] = 1
+    value[0, 0, 0, 0] = 1
+    value[0, 1, 0, 0] = 2  # Makes both the residual and the strict-lower dBeta terms nonzero.
+    gate = torch.zeros(shape, device="cuda")
+    beta = torch.tensor([[[1.0], [beta_value]]], device="cuda")
+    d_output = torch.zeros_like(value)
+    d_output[0, 1, 0, 0] = 1
+    cu_seqlens = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+
+    gradients = chunk_cudnn_packed_local_bwd_op(
+        q, k, value, gate, beta, d_output, cu_seqlens, False, 1.0
+    )
+    leaves = clone_kda_inputs(
+        tuple(tensor.requires_grad_() for tensor in (q, k, value, gate, beta)),
+        dtype=torch.float64,
+    )
+    expected_output = kda_reference(*leaves, scale=1.0, output_final_state=False)[0]
+    expected = torch.autograd.grad(expected_output, leaves, d_output.to(torch.float64))
+    for actual, want in zip(gradients, expected, strict=True):
+        assert torch.equal(actual, want.to(actual.dtype))
+    assert gradients[4][0, 1, 0].item() == 1.0
+
+
 @pytest.mark.parametrize("seed", (888, 889, 890))
 def test_gdn_cudnn_model_range_backward(seed: int) -> None:
     """GDN output and gradients must remain within the BF16 reference error budget."""

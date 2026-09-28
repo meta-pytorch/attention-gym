@@ -17,7 +17,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; register arrays are rmem tensors, the SMEM data buffers share one
-# SharedStorage, and segment-major swizzle offsets use swizzle_box_offset_128b.
+# SharedStorage, and segment-major swizzle offsets use swizzle_box_offset_128b. The frozen cfg
+# launches through KdaPrepOp, whose name encodes every static flag.
 
 """
 KDA prep for SM100 / SM103 / SM107 (Cutlass primitives): the per-(chunk, head) prep records of the BT = 16 schedule,
@@ -50,7 +51,7 @@ prefill's CG0 operand materialization (the four warps own the whole chunk), phas
 No register redistribution: the launch's occupancy floor (min_blocks_per_mp = CTAS_PER_SM) sets the register budget.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
@@ -63,6 +64,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 from attn_gym._backends.cute.compat import SmemAllocator
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.launch import validate_kernel_domain, validate_named_barriers
 from ..tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.handles import SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import mma_step
@@ -799,84 +801,102 @@ def prep_base_maps(cfg, q, k, gate, k_decay, q_decay, t):
     return base_desc_q, base_desc_k, base_desc_gate, record_maps
 
 
-@cute.jit
-def host(
-    cfg: cutlass.Constexpr,
-    q: cute.Tensor,
-    k: cute.Tensor,
-    desc_words: cute.Tensor,
-    gate: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    beta: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    k_decay: cute.Tensor,
-    q_decay: cute.Tensor,
-    t: cute.Tensor,
-    a: cute.Tensor,
-    diag: cute.Tensor,
-    rows: cute.Tensor,
-    row_count: cute.Tensor,
-    stream: cuda.CUstream,
-):
-    # ---- grid: ctas_per_sm CTAs per SM, capped by the item count ----------------------
-    heads_out = cutlass.Int32(gate.shape[1])
-    q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
-    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
-    num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm * cfg.ctas_per_sm), cutlass.Int32(k_decay.shape[0]) * heads_out)
+def _name_float(value: float) -> str:
+    return str(float(value)).replace(".", "p").replace("-", "m").replace("+", "")
 
-    # ---- SMEM sizing -------------------------------------------------------------------
-    bytes_per_element = cfg.io_dtype.width // 8
-    gate_bytes_per_element = cfg.gate_dtype.width // 8
-    cfg.gate_stage_elems = cfg.d_k * cfg.b_t
-    cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t * gate_bytes_per_element // 4
-    cfg.tma_q_bytes = cfg.d_k * cfg.b_t * bytes_per_element
-    cfg.tma_k_bytes = cfg.d_k * cfg.b_t * bytes_per_element
-    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * gate_bytes_per_element
-    tile_elems = cfg.d_k * cfg.b_t
-    raw_elems = cfg.smem_raw_stages * tile_elems
-    record_elems = cfg.smem_record_stages * tile_elems
-    exchange_elems = 0 if cfg.gate_dtype == cutlass.Float32 else tile_elems  # fp32 gates exchange in place
-    align = cfg.buffer_align_bytes
 
-    @cute.struct
-    class SharedStorage:
-        q: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, raw_elems], align]
-        k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, raw_elems], align]
-        gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], align]
-        exchange: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, exchange_elems], align]
-        k_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, tile_elems], align]
-        k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, tile_elems], align]
-        intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.b_t * cfg.b_t], align]
-        beta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.b_t], 128]
-        k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
-        q_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
-        w: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
+class KdaPrepOp:
+    """The prep launch for one frozen ``KdaPrepCfg``; nested into the warmup forward host."""
 
-    # ---- launch ----------------------------------------------------------------------
-    frost_kda_prep(
-        cfg,
-        SharedStorage,
-        cute.FastDivmodDivisorV2(heads_out),
-        q_ratio,
-        k_ratio,
-        cute.FastDivmodDivisorV2(num_ctas),
-        desc_words,
-        a_log,
-        dt_bias,
-        beta,
-        rows,
-        row_count,
-        a,
-        diag,
-        cutlass.Int32(cu_seqlens.shape[0] - 1),
-    ).launch(
-        grid=(num_ctas, 1, 1),
-        block=(cfg.threads_per_cta, 1, 1),
-        stream=stream,
-        use_pdl=USE_PDL,
-        min_blocks_per_mp=cfg.ctas_per_sm,
-    )
+    def __init__(self, cfg: "KdaPrepCfg", use_int64_offsets: bool = False):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        flags = "".join(
+            str(int(flag))
+            for flag in (cfg.l2norm, cfg.safe_gate, cfg.log_gate, cfg.beta_sigmoid, cfg.allow_neg_eigval)
+        )
+        dtypes = "_".join(t.__name__.lower() for t in (cfg.io_dtype, cfg.gate_dtype))
+        return (
+            f"kda_cudnn_prep_{dtypes}_k{cfg.d_k}_f{flags}_g{_name_float(cfg.gate_scale_log2)}"
+            f"_sm{cfg.num_sm}_i64{int(self.use_int64_offsets)}"
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        desc_words: cute.Tensor,
+        gate: cute.Tensor,
+        a_log: Optional[cute.Tensor],
+        dt_bias: Optional[cute.Tensor],
+        beta: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        k_decay: cute.Tensor,
+        q_decay: cute.Tensor,
+        t: cute.Tensor,
+        a: cute.Tensor,
+        diag: cute.Tensor,
+        rows: cute.Tensor,
+        row_count: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        cfg = self.cfg
+        # ---- grid: ctas_per_sm CTAs per SM, capped by the item count ----------------------
+        heads_out = cutlass.Int32(gate.shape[1])
+        q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
+        k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+        num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm * cfg.ctas_per_sm), cutlass.Int32(k_decay.shape[0]) * heads_out)
+
+        # ---- SMEM sizing -------------------------------------------------------------------
+        tile_elems = cfg.d_k * cfg.b_t
+        raw_elems = cfg.smem_raw_stages * tile_elems
+        record_elems = cfg.smem_record_stages * tile_elems
+        exchange_elems = 0 if cfg.gate_dtype == cutlass.Float32 else tile_elems  # fp32 gates exchange in place
+        align = cfg.buffer_align_bytes
+
+        @cute.struct
+        class SharedStorage:
+            q: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, raw_elems], align]
+            k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, raw_elems], align]
+            gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], align]
+            exchange: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, exchange_elems], align]
+            k_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, tile_elems], align]
+            k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, tile_elems], align]
+            intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.b_t * cfg.b_t], align]
+            beta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.b_t], 128]
+            k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
+            q_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
+            w: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, record_elems], align]
+
+        frost_kda_prep.set_name_prefix(self.get_name())
+        # ---- launch ----------------------------------------------------------------------
+        frost_kda_prep(
+            cfg,
+            SharedStorage,
+            cute.FastDivmodDivisorV2(heads_out),
+            q_ratio,
+            k_ratio,
+            cute.FastDivmodDivisorV2(num_ctas),
+            desc_words,
+            a_log,
+            dt_bias,
+            beta,
+            rows,
+            row_count,
+            a,
+            diag,
+            cutlass.Int32(cu_seqlens.shape[0] - 1),
+        ).launch(
+            grid=(num_ctas, 1, 1),
+            block=(cfg.threads_per_cta, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+            min_blocks_per_mp=cfg.ctas_per_sm,
+        )
 
 
 @cute.kernel
@@ -1067,10 +1087,10 @@ def frost_kda_prep(
         launch_dependent_grids()
 
 
-@dataclass
+@dataclass(frozen=True)
 class KdaPrepCfg:
-    """Kernel cfg (fixed BT = 16 schedule constants; the derived SMEM sizes are stamped by ``host``).  Passed ``cfg``-first
-    (a ``cutlass.Constexpr``) into ``host`` / ``kernel`` and every warp body."""
+    """Kernel cfg (fixed BT = 16 schedule constants; the derived SMEM sizes are stamped by ``build_cfg``).  Passed
+    ``cfg``-first (a ``cutlass.Constexpr``) into ``KdaPrepOp`` / ``kernel`` and every warp body."""
 
     io_dtype: Type[cutlass.Numeric]
     gate_dtype: Type[cutlass.Numeric]
@@ -1086,18 +1106,18 @@ class KdaPrepCfg:
     compute_warps: int = CFG.COMPUTE_WARPS
     threads_per_warp: int = CFG.THREADS_PER_WARP
     ctas_per_sm: int = CFG.CTAS_PER_SM
-    threads_per_cta: int = 0
+    threads_per_cta: int = 0  # derived by build_cfg
     barrier_id: int = 1
     smem_raw_stages: int = CFG.SMEM_RAW_STAGES
     smem_record_stages: int = CFG.SMEM_RECORD_STAGES
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time -----------------------------------------------
-    gate_stage_elems: int = 0
-    gate_cosize: int = 0
-    tma_q_bytes: int = 0
-    tma_k_bytes: int = 0
-    tma_gate_bytes: int = 0
+    # ---- derived by build_cfg ---------------------------------------------------------
+    gate_stage_elems: int = 0  # derived by build_cfg
+    gate_cosize: int = 0  # derived by build_cfg
+    tma_q_bytes: int = 0  # derived by build_cfg
+    tma_k_bytes: int = 0  # derived by build_cfg
+    tma_gate_bytes: int = 0  # derived by build_cfg
 
 
 def build_cfg(
@@ -1114,6 +1134,9 @@ def build_cfg(
     d_k: int,
 ) -> KdaPrepCfg:
     """Build the per-compile ``KdaPrepCfg`` (io_dtype in {Float16, BFloat16}; gate fp32 or the io dtype)."""
+    validate_kernel_domain("KDA prep", io_dtype, (d_k,), num_sm=num_sm)
+    if gate_dtype not in (cutlass.Float32, io_dtype):
+        raise ValueError(f"KDA prep reads a Float32 or io-dtype gate, got {gate_dtype}")
     cfg = KdaPrepCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -1126,18 +1149,25 @@ def build_cfg(
         allow_neg_eigval=allow_neg_eigval,
         d_k=d_k,
     )
-    cfg.threads_per_cta = cfg.threads_per_warp * cfg.compute_warps
     bytes_per_element = io_dtype.width // 8
     tile = d_k * cfg.b_t
     stage_bytes = 2 * tile * bytes_per_element + tile * (gate_dtype.width // 8) + 4 * cfg.b_t
     fixed_bytes = 2 * tile * bytes_per_element + cfg.b_t * cfg.b_t * bytes_per_element + 4 * cfg.b_t + (0 if gate_dtype == cutlass.Float32 else 4 * tile)
     record_bytes = 3 * cfg.smem_record_stages * tile * bytes_per_element
     smem_bytes = cfg.smem_raw_stages * stage_bytes + fixed_bytes + record_bytes + CFG.SMEM_CTA_RESERVED_BYTES
-    assert cfg.ctas_per_sm * smem_bytes <= CFG.SMEM_PER_SM_BYTES, f"{cfg.ctas_per_sm} CTAs of {smem_bytes} B do not fit the SM ({CFG.SMEM_PER_SM_BYTES} B)"
+    if cfg.ctas_per_sm * smem_bytes > CFG.SMEM_PER_SM_BYTES:
+        raise ValueError(f"{cfg.ctas_per_sm} CTAs of {smem_bytes} B do not fit the SM ({CFG.SMEM_PER_SM_BYTES} B)")
+    cfg = replace(
+        cfg,
+        threads_per_cta=cfg.threads_per_warp * cfg.compute_warps,
+        gate_stage_elems=tile,
+        gate_cosize=cfg.smem_raw_stages * tile * (gate_dtype.width // 8) // 4,
+        tma_q_bytes=tile * bytes_per_element,
+        tma_k_bytes=tile * bytes_per_element,
+        tma_gate_bytes=tile * (gate_dtype.width // 8),
+    )
+    validate_named_barriers(cfg.threads_per_cta, compute=(cfg.barrier_id, cfg.threads_per_cta))
     return cfg
 
 
 TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: Q, K, Gate, k_decay, q_decay, t
-
-
-frost_kda_prep.set_name_prefix("cudnn", remove_cutlass_symbol=False)

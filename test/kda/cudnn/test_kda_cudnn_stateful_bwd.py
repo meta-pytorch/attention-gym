@@ -180,10 +180,11 @@ def _fragments(cu_seqlens: list[int], cut: int) -> tuple[list[int], list[int], i
     ],
 )
 def test_two_aligned_fragments_with_state_handoff_match_one_native_call(
-    lengths: list[int], cut: int, heads: int, gate_scale: float
+    lengths: list[int], cut: int, heads: int, gate_scale: float, kda_plan_comparison
 ) -> None:
-    """A document cut at a 16-token offset and continued from the actual states is bit-exact.
+    """Aligned handoff is bit-exact within uncut; automatic plans agree within 1% relative L2.
 
+    Plans depend on shape by design: prep and chain can change across the cut.
     Rank 0 owns ``[0, cut)`` and rank 1 ``[cut, T)``; the cut document's exit state travels
     forward and its entry cotangent travels backward, as the context-parallel recipe does.
     """
@@ -212,9 +213,9 @@ def test_two_aligned_fragments_with_state_handoff_match_one_native_call(
     tail_output, tail_states = chunk_cudnn_packed_fwd_with_state_op(
         *tail[:5], tail_entry, second_offsets, SCALE
     )
-    torch.testing.assert_close(torch.cat((head_output, tail_output), 1), output, atol=0, rtol=0)
-    torch.testing.assert_close(head_states[:document], final_state[:document], atol=0, rtol=0)
-    torch.testing.assert_close(tail_states, final_state[document:], atol=0, rtol=0)
+    kda_plan_comparison(torch.cat((head_output, tail_output), 1), output, "output")
+    kda_plan_comparison(head_states[:document], final_state[:document], "head final state")
+    kda_plan_comparison(tail_states, final_state[document:], "tail final state")
 
     tail_grads = chunk_cudnn_packed_bwd_with_state_op(
         *tail, second_offsets, tail_entry, d_final_state[document:], SCALE
@@ -227,7 +228,8 @@ def test_two_aligned_fragments_with_state_handoff_match_one_native_call(
         *(torch.cat(pair, 1) for pair in zip(head_grads[:5], tail_grads[:5], strict=True)),
         torch.cat((head_grads[5], tail_grads[5][1:])),
     ]
-    _assert_gradients_equal(joined, expected)
+    for name, actual, reference in zip(GRADIENT_NAMES, joined, expected, strict=True):
+        kda_plan_comparison(actual, reference, name)
 
 
 def test_staged_cudnn_backward_is_the_native_op() -> None:

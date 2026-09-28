@@ -17,12 +17,15 @@ from typing import NamedTuple
 import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 
-from .._compat import current_device
+from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
+
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from ..tile_dsl.tma import ld_global_v4, st_global, st_global_v4
+from .host import get_dtype, validate_cuda_tensors
+from .tvm_ffi import make_strided_signature_tensor
 
 USE_PDL = True
 
@@ -178,7 +181,33 @@ def l2norm_qk_launch(
     ).launch(grid=(n_blocks, 1, 1), block=(THREADS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
-compiled_cache = {}
+@jit_cache
+def _compile_l2norm_qk(dtypes, d, expand_num, expand_phase, expand_fill, use_int64_offsets):
+    sym_int = cute.sym_int
+    tensors = [
+        make_strided_signature_tensor(
+            dtype,
+            tuple(sym_int() for _ in range(rank)),
+            assumed_align=16,
+            use_int64_offsets=use_int64_offsets,
+            stride_divisibility=1,
+        )
+        for dtype, rank in zip(dtypes, (3, 3, 3, 3, 2, 2))
+    ]
+    dtype_name = "_".join(dtype.__name__.lower() for dtype in dtypes)
+    return compile_tvm_ffi(
+        l2norm_qk_launch,
+        *tensors,
+        *(cutlass.Int32(0) for _ in range(5)),
+        d,
+        expand_num,
+        expand_phase,
+        expand_fill,
+        name=(
+            f"l2norm_qk_{dtype_name}_d{d}_e{expand_num}_p{expand_phase}"
+            f"_f{int(expand_fill)}_i64{int(use_int64_offsets)}"
+        ),
+    )
 
 
 class L2NormQkRecipe(NamedTuple):
@@ -207,7 +236,6 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
         r.h_q,
         r.h_k,
         r.n_blocks,
-        cuda.CUstream(int(stream)),
     )
 
 
@@ -234,39 +262,48 @@ def build_l2norm_qk(
     out fully written on the expanded timeline.  ``skip_q`` walks the k rows
     alone (the state summaries take no q); q, q_n and inv_q are then never
     read and may alias the k buffers."""
+    validate_cuda_tensors(q, k=k, q_n=q_n, k_n=k_n, inv_q=inv_q, inv_k=inv_k)
+    if q.ndim != 3 or k.ndim != 3 or q.shape[-1] != k.shape[-1]:
+        raise ValueError("q and k must have matching rank-3 head dimensions")
+    if q.shape[-1] not in (64, 128):
+        raise ValueError("L2 normalization head dimension must be 64 or 128")
+    if expand_num < 1 or not 0 <= expand_phase < expand_num:
+        raise ValueError("expand_phase must lie within a positive expand_num")
+    for name, source, output, inverse, expansion in (
+        ("q", q, q_n, inv_q, expand_num),
+        ("k", k, k_n, inv_k, 1),
+    ):
+        if name == "q" and skip_q:
+            continue
+        if get_dtype(source.dtype) not in (cutlass.BFloat16, cutlass.Float16):
+            raise ValueError(f"{name} must have a 16-bit floating dtype")
+        if not tensor_supports_contiguous_dim(source, alignment_bytes=16):
+            raise ValueError(f"{name} requires aligned contiguous vector rows")
+        expected = (source.shape[0] * expansion, *source.shape[1:])
+        if tuple(output.shape) != expected or output.dtype != source.dtype:
+            raise ValueError(f"normalized {name} must have shape {expected} and source dtype")
+        if tuple(inverse.shape) != expected[:2] or get_dtype(inverse.dtype) != cutlass.Float32:
+            raise ValueError(f"inverse {name} norms must be float32 with shape {expected[:2]}")
+        if any(not t.is_contiguous() or t.data_ptr() % 16 for t in (output, inverse)):
+            raise ValueError(
+                "normalized outputs and inverse norms must be compact and 16-byte aligned"
+            )
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, _d_k = (int(s_) for s_ in k.shape)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
     n_q_rows = 0 if skip_q else total * h_q * (int(expand_num) if expand_fill else 1)
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
-    cu_stream = cuda.CUstream(int(stream))
-    key = (
-        "fwd",
-        str(q.dtype),
+    tensors = (q, k, q_n, k_n, inv_q, inv_k)
+    compiled = _compile_l2norm_qk(
+        tuple(get_dtype(t.dtype) for t in tensors),
+        d,
         int(expand_num),
         int(expand_phase),
         bool(expand_fill),
-        d,
-        current_device(),
+        True,
     )
-    if key not in compiled_cache:
-        tensors = (q, k, q_n, k_n, inv_q, inv_k)
-        compiled_cache[key] = cute.compile(
-            l2norm_qk_launch,
-            *(
-                from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead)
-                for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))
-            ),
-            *(cutlass.Int32(a) for a in args),
-            d,
-            int(expand_num),
-            int(expand_phase),
-            bool(expand_fill),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    r = L2NormQkRecipe(compiled_cache[key], *args)
+    r = L2NormQkRecipe(compiled, *args)
     run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream)
     return r
 

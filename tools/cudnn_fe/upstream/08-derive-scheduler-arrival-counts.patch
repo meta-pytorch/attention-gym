@@ -1,0 +1,171 @@
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py
+@@ -270,7 +270,14 @@
+         ),
+         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_THREADS, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_bprop_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_bprop_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_bprop_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_bprop_f16.py
+@@ -335,7 +335,14 @@
+         mb_sdv_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_f16.py b/python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/gdn_bprop_summary_f16.py
+@@ -206,7 +206,14 @@
+         mb_a_done=MBarrier(alloc(cfg.smem_a_stages), try_wait=True, stages=cfg.smem_a_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py
+@@ -227,7 +227,14 @@
+             alloc(cfg.smem_checkpoint_stages), spin=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
+         ),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            spin=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_prep_prefill_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_prep_prefill_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_prep_prefill_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_prep_prefill_f16.py
+@@ -170,7 +170,14 @@
+             alloc(cfg.smem_checkpoint_stages), spin=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
+         ),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            spin=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_summary_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_summary_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_summary_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_summary_f16.py
+@@ -200,7 +200,14 @@
+         mb_k_restore_done=MBarrier(alloc(cfg.smem_decay_stages), spin=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
+         mb_tmem_done=MBarrier(alloc(1), spin=True, stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            spin=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+         mb_state_k_acc_h_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=1, producer=Producer.MMA_COMMIT),
+         mb_u_acc_h_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=1, producer=Producer.MMA_COMMIT),
+         mb_state_input_h_cg1_ready=MBarrier(alloc(1), spin=True, stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_recompute_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_recompute_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_recompute_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_recompute_f16.py
+@@ -214,7 +214,14 @@
+             alloc(cfg.smem_checkpoint_stages), try_wait=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
+         ),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_bprop_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_bprop_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_bprop_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_bprop_f16.py
+@@ -298,7 +298,14 @@
+         mb_dstate0_acc_stored=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
+         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1 + CG2, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 
+diff --git a/python/cudnn/linear_attention/frost/kernel/kda_bprop_summary_f16.py b/python/cudnn/linear_attention/frost/kernel/kda_bprop_summary_f16.py
+--- a/python/cudnn/linear_attention/frost/kernel/kda_bprop_summary_f16.py
++++ b/python/cudnn/linear_attention/frost/kernel/kda_bprop_summary_f16.py
+@@ -189,7 +189,14 @@
+         mb_dstate0_acc_stored=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
+         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
+         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
+-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=11, producer=Producer.THREAD),
++        # One arrival per active warp, excluding the TMA publisher.
++        mb_scheduler_done=MBarrier(
++            alloc(cfg.scheduler_stages),
++            try_wait=True,
++            stages=cfg.scheduler_stages,
++            init_count=len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids) + 3,
++            producer=Producer.THREAD,
++        ),
+     )
+ 
+ 

@@ -30,6 +30,161 @@ vendored_tag = "v1.30.0"
 upstream_commit = "42286a6fb8792055f3db80403350e80114ea086c"
 stack_prs = [606, 607, 608, 609]
 
+# --------------------------------------------------------------------------- bug fixes
+[[fix]]
+id = "B7"
+title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps)"
+kind = "numerics"
+ag_subject = "Compute the GDN bprop dBeta without dividing by beta"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient",
+  "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference",
+]
+upstream_patch = "upstream/01-gdn-beta-free-dbeta.patch"
+upstream_repro = "upstream/repro_01_gdn_beta.py"
+upstream_runs = [["--beta", "0", "1e-12", "1e-10", "1e-8"], ["--beta", "0", "1e-12", "1e-10", "1e-8", "--checkpoints"]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B6"
+title = "KDA delta residual kept in FP32 through subtraction and beta scaling (fwd + bwd)"
+kind = "numerics"
+ag_subject = "Keep the KDA forward delta residual in FP32 before the MMA pack"
+ag_subjects_extra = [
+  "Add an FP32 KDA delta-residual staging helper",
+  "Keep the KDA backward delta residual in FP32 through subtraction and beta scaling",
+]
+guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32",
+  "test/kda/cudnn/test_delta_rule_numerics.py::test_kda_cudnn_delta_residual_keeps_fp32_precision",
+]
+upstream_patch = "upstream/02-kda-fp32-delta-residual.patch"
+upstream_repro = "upstream/repro_02_kda_residual.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B8"
+title = "Compact empty cu_seqlens intervals out of the unsplit work table"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work",
+]
+upstream_patch = "upstream/03-compact-empty-unsplit-work.patch"
+upstream_repro = "upstream/repro_03_empty_unsplit.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B10"
+title = "Split-table walk omits zero-chunk sequences"
+kind = "bugfix"
+ag_subject = "Omit zero-chunk split work items"
+guarding_tests = ["test/test_cudnn_fe_common.py::test_split_table_omits_zero_chunk_sequences"]
+upstream_patch = "upstream/04-omit-zero-chunk-split-work.patch"
+upstream_repro = "upstream/repro_04_zero_chunk_walk.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B13"
+title = "Scalar-gate split scan uses the head stride instead of assuming 1"
+kind = "bugfix"
+ag_subject = "Respect scalar-gate head strides in split scans"
+guarding_tests = ["test/test_cudnn_fe_common.py::test_scalar_split_scan_respects_head_stride"]
+upstream_patch = "upstream/05-scalar-scan-head-stride.patch"
+upstream_repro = "upstream/repro_05_scalar_head_stride.py"
+upstream_runs = [["--raw"], []]
+upstream_expect = "bug"
+upstream_bug_patterns = ["Mismatched mGate.strides"]
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B14"
+title = "Split-table replay passes sched_ctr only when compiled with it"
+kind = "bugfix"
+ag_subject = "Preserve the scheduler ABI when replaying split tables"
+guarding_tests = ["test/test_cudnn_fe_common.py::test_split_table_replay_preserves_absent_scheduler_abi"]
+upstream_repro = "upstream/repro_09_replay_abi_scope.py"
+upstream_runs = [[]]
+upstream_expect = "scope"
+upstream_status = "excluded-no-upstream-abi"
+
+[[fix]]
+id = "B15"
+title = "Driver launch caches keyed on static config, not shape"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default",
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
+]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "B16"
+title = "Copy 4-byte-aligned gate/beta to 16-byte bases"
+kind = "bugfix"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R3"
+title = "Warmup forward state_in/state_out get independent fake extents"
+kind = "bugfix"
+ag_subject = "Give the warmup forward state signatures independent extents"
+guarding_tests = []
+gate = "none (no dedicated test; covered indirectly by GDN warmup split tests)"
+upstream_status = "ag-specific"
+
+# --------------------------------------------------------------------------- features / integration
+[[fix]]
+id = "F1/F2/F4/F6/F9"
+title = "GDN/KDA drivers (uncut, d_v split, prep, chain, warmup split, staged stateful bwd, AG plan floors)"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "F7/F8"
+title = "Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+ag_subjects_extra = ["Use native cached summary compilers and retire temporary shims"]
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "F5"
+title = "Grouped q/k GDN backward through deterministic AG group_sum"
+kind = "feature"
+ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "F3"
+title = "Paged recurrent state (null/fresh/resumed/empty routes) in the v1.30 GDN/KDA prefill"
+kind = "feature"
+ag_subject = "Serve paged GDN state from the v1.30 prefill"
+ag_subjects_extra = [
+  "Preserve fresh-empty paged routes during work compaction",
+  "Route KDA paged recurrent state through the v1.30 prefill kernels",
+]
+guarding_tests = [
+  "test/test_cudnn_fe_paged_order.py::test_paged_order_keeps_only_nonempty_and_fresh_empty_routes",
+  "test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_are_null",
+  "test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_never_touch_the_pool",
+]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- performance
 [[fix]]
 id = "R2"
@@ -62,6 +217,7 @@ ag_subjects_extra = [
   "Restyle KDA summary kernel storage and swizzle offsets",
   "Restyle the v1.30 GDN recompute and bprop summary kernel storage",
   "Restyle KDA recompute, bprop and bprop summary kernel storage",
+  "Test the v1.30 shared-memory swizzle helpers",
 ]
 guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts"]
 gate = "sass (identical or offset-only noise)"
@@ -72,10 +228,115 @@ id = "S5/S13"
 title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target"
 kind = "restyle"
 ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
+ag_subjects_extra = [
+  "Share exact legacy dynamic-layout fake signatures",
+  "Share static tensor ABI specifications for bundled hosts",
+  "Compile common v1.30 hosts from persisted fake tensor signatures",
+  "Compile the v1.30 GDN forward hosts from persisted fake tensor signatures",
+  "Compile the v1.30 GDN backward kernels and hosts through jit_cache fake signatures",
+  "Compile the KDA forward kernels and hosts from persisted fake tensor signatures",
+  "Compile the v1.30 KDA backward kernels and hosts from persisted fake tensor signatures",
+  "Use native cached summary compilers and retire temporary shims",
+]
 guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
   "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",
 ]
 gate = "sass (byte-identical per family)"
+upstream_status = "ag-specific"
+
+# --------------------------------------------------------------------------- validation / hardening
+[[fix]]
+id = "S12"
+title = "Launch-contract validation before compile; scheduler arrivals derived from warp counts"
+kind = "validation"
+ag_subject = "Validate GDN backward launch contracts and derive scheduler arrivals from warp counts"
+ag_subjects_extra = [
+  "Validate common cuDNN host launch contracts before compiling",
+  "Preserve strided gate parameter layouts in host validation",
+  "Validate the KDA backward warp-role maps and derive the scheduler arrival count",
+  "Validate KDA forward launch contracts and derive scheduler arrivals from warp counts",
+]
+guarding_tests = [
+  "test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_warp_role_and_named_barrier_tables_reject_conflicts",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_backward_cfgs_reject_unsupported_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_forward_cfgs_reject_unsupported_geometry",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_warmup_forward_rejects_invalid_plan_buffers",
+  "test/test_cudnn_fe_launch_contract.py::test_kda_chain_forward_rejects_invalid_plan_buffers",
+]
+upstream_patch = "upstream/08-derive-scheduler-arrival-counts.patch"
+upstream_repro = "upstream/repro_08_scheduler_counts.py"
+upstream_runs = [[]]
+upstream_expect = "smoke"
+upstream_status = "hardening-draft"
+
+[[fix]]
+id = "R7"
+title = "Reject misaligned per-channel gate rows before the vectorized split scan"
+kind = "validation"
+ag_subject = "Reject misaligned per-channel gate rows before the vectorized split scan"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_forward.py::test_cudnn_split_table_rejects_misaligned_vector_gate_rows"]
+upstream_patch = "upstream/06-validate-channel-scan-alignment.patch"
+upstream_repro = "upstream/repro_06_channel_alignment.py"
+upstream_runs = [[]]
+upstream_expect = "bug"
+upstream_status = "draft-not-filed"
+
+[[fix]]
+id = "B2"
+title = "Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary"
+kind = "validation"
+ag_subject = "Initialize the GDN prefill mbarriers from one thread"
+ag_subjects_extra = [
+  "Initialize the GDN backward mbarriers from one thread",
+]
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary",
+]
+env = { ATTN_GYM_RUN_STRESS_TESTS = "1" }
+gate = "cutracer random_delay (hardening; tests pass without the fix)"
+upstream_patch = "upstream/07-single-thread-gdn-mbarrier-init.patch"
+upstream_repro = "upstream/repro_07_mbarrier_stress.py"
+upstream_runs = [[]]
+upstream_expect = "smoke"
+upstream_status = "hardening-draft"
+
+[[fix]]
+id = "S14"
+title = "int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests"
+kind = "validation"
+ag_subject = "Route oversized GDN forward tensors to the wide-extent compile variant"
+ag_subjects_extra = [
+  "Restore non-vacuous forced-int64 GDN forward and backward coverage",
+  "Enable non-vacuous forced-int64 KDA forward and backward coverage",
+]
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32",
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32",
+  "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path",
+]
+upstream_status = "ag-specific"
+
+# --------------------------------------------------------------------------- tests / decisions
+[[fix]]
+id = "B3"
+title = "Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream)"
+kind = "test"
+ag_subject = "Cover KDA zero-chunk backward work items and tiny write gates"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items"]
+upstream_status = "superseded-by-v1.30"
+
+[[fix]]
+id = "R8"
+title = "Sharded KDA dbeta bounded by the operand-pack budget"
+kind = "test"
+ag_subject = "Bound the sharded KDA dbeta error by the kernels' operand-pack budget"
+guarding_tests = ["test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op"]
 upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- superseded by v1.30

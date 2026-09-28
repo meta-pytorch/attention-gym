@@ -137,12 +137,8 @@ exclude = [
     "attn_gym/linear/_delta_rule/cudnn/kernels/common",
     # Vendored cudnn-frontend v1.30 kernels; restyled and linted in a follow-up.
     "attn_gym/linear/_delta_rule/cudnn_fe/kernel",
-    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_config.py",
-    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_f16.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_config.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_f16.py",
-    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_recompute_config.py",
-    "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_recompute_f16.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/kda_bprop_config.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/kda_bprop_f16.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/kda_prefill_config.py",

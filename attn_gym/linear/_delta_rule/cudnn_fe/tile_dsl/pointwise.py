@@ -4,7 +4,8 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. TMEM reduction loads, register-tile and vector helpers,
 # FP8/FP4/MX conversions, and the exp2 emulation unused by the vendored kernels were removed;
-# fadd2 uses the cute.arch packed wrapper.
+# fadd2 uses the cute.arch packed wrapper; beta_residual_f16x2 stages the KDA delta residual in
+# FP32.
 
 
 import cutlass
@@ -165,6 +166,31 @@ def mul_f16x2(
     if cutlass.const_expr(input_dtype is cutlass.BFloat16):
         return nvvm.mul_bf16x2(lhs, rhs)
     return mul_fp16x2(lhs, rhs)
+
+
+@cute.jit
+def beta_residual_f16x2(
+    v_pair: cutlass.Int32,
+    beta_lo,
+    beta_hi,
+    state_k_lo=None,
+    state_k_hi=None,
+    *,
+    dtype=cutlass.Float16,
+):
+    """Stage the delta-rule update ``beta * (v - state_k)`` for one packed pair.
+
+    ``v`` arrives as a packed b16 pair and ``state_k`` as the fp32 MMA
+    accumulator; ``state_k`` may be omitted when no state is carried in.  The
+    subtraction and beta scaling run in fp32 so the only rounding is the
+    final pack into the b16 MMA operand.  Also returns the fp32 residual for
+    consumers such as the dBeta v-term.
+    """
+    v_lo, v_hi = f16x2_to_f32(v_pair, dtype=dtype)
+    if cutlass.const_expr(state_k_lo is not None):
+        v_lo, v_hi = fadd2(v_lo, v_hi, -state_k_lo, -state_k_hi)
+    y_lo, y_hi = fmul2(beta_lo, beta_hi, v_lo, v_hi)
+    return fp32_to_fp16(y_lo, y_hi, dtype=dtype), v_lo, v_hi
 
 
 @cute.jit

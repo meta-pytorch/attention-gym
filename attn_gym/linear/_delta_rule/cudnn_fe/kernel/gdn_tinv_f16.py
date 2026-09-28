@@ -63,7 +63,6 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : gate warp      - Gate cumsum + Beta of both members into the group's stage
 """
 
-import functools
 from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional, Tuple, Type
 
@@ -73,19 +72,15 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
-from cutlass.cute.runtime import from_dlpack
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import expanded_cu_seqlen
-from ..common.host import get_dtype
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
     blockwise_diagonal_16x16_to_32x32,
     blockwise_diagonal_32x32_to_64x64,
     invert_diagonal_NxN,
 )
-from .._compat import probe
-from .._compat import multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from ..tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
@@ -1054,7 +1049,7 @@ def frost_gdn_tinv(
         launch_dependent_grids()
 
 
-@dataclass
+@dataclass(frozen=True)
 class GdnTinvCfg:
     """Per-compile chunk-factor kernel knob (``build_cfg``): the dtype / head-count / gate-flag fields are the ``cute.compile``
     cache keys, the rest derives from ``CFG``.
@@ -1130,19 +1125,24 @@ def build_cfg(
     n_group_warps = len(cfg.compute_group_warp_ids[0])
     other_threads = cfg.threads_per_warp * 4
     compute_threads = cfg.threads_per_warp * n_groups * n_group_warps
-    cfg.threads_per_cta = other_threads + compute_threads
-    cfg.num_regs_compute = min(256, (cfg.threads_per_cta * CFG.LAUNCH_REGS - other_threads * cfg.num_regs_other) // compute_threads // 8 * 8)
-    cfg.inverse_barrier_threads = cfg.threads_per_warp * n_group_warps
-    cfg.tmem_columns = cfg.tmem_acc_stages * 2 * cfg.b_t
+    threads_per_cta = other_threads + compute_threads
     # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
     bytes_per_element = io_dtype.width // 8
     k_stage_elements = 2 * cfg.b_t * cfg.d_k
     tile_elements = cfg.b_t * cfg.b_t
-    cfg.k_cosize = k_stage_elements * cfg.smem_k_stages
-    cfg.tile_cosize = tile_elements * n_groups * cfg.smem_tile_stages
-    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * bytes_per_element
-    cfg.tile_bytes = tile_elements * bytes_per_element
-    return cfg
+    return replace(
+        cfg,
+        threads_per_cta=threads_per_cta,
+        num_regs_compute=min(
+            256, (threads_per_cta * CFG.LAUNCH_REGS - other_threads * cfg.num_regs_other) // compute_threads // 8 * 8
+        ),
+        inverse_barrier_threads=cfg.threads_per_warp * n_group_warps,
+        tmem_columns=cfg.tmem_acc_stages * 2 * cfg.b_t,
+        k_cosize=k_stage_elements * cfg.smem_k_stages,
+        tile_cosize=tile_elements * n_groups * cfg.smem_tile_stages,
+        tma_k_bytes=cfg.b_t * cfg.d_k * bytes_per_element,
+        tile_bytes=tile_elements * bytes_per_element,
+    )
 
 
 def tinv_rows(total_tokens: int, num_seqs: int, expand_num: int = 1, b_t: int = CFG.B_T) -> int:
@@ -1151,207 +1151,6 @@ def tinv_rows(total_tokens: int, num_seqs: int, expand_num: int = 1, b_t: int = 
 
 
 TENSORMAP_DESC_ARRAYS = 2  # per-batch runtime TMA descriptors: K, tinv
-
-
-# ---------------------------------------------------------------------------
-
-
-@functools.cache
-def get_compiled_cache(
-    io_dtype_str: str,
-    cu_dtype_str: str,
-    gate_dtype_str: str,
-    a_log_dtype_str: str,
-    dt_bias_dtype_str: str,
-    beta_dtype_str: str,
-    device: int,
-    DK: int,
-    expand_num: int,
-    log_gate: bool,
-    safe_gate: bool,
-    beta_sigmoid: bool,
-    allow_neg_eigval: bool,
-    publish_desc: bool,
-):
-    """Return a mutable dict that lazily stores the compiled kernel."""
-    return {}
-
-
-def compile(
-    io_dtype,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
-    publish_desc: bool = True,
-    *,
-    num_sm: int,
-    d_k: int,
-    expand_num: int = 1,
-    k_cute,
-    workspace_cute,
-    gate_cute,
-    a_log_cute=None,
-    dt_bias_cute=None,
-    beta_cute,
-    cu_seqlens_cute,
-    tinv_cute,
-    rows_cute,
-    row_count_cute,
-    stream,
-):
-    """JIT-compile the chunk-factor pass for one static config."""
-    cfg = build_cfg(
-        io_dtype,
-        num_sm=num_sm,
-        log_gate=log_gate,
-        safe_gate=safe_gate,
-        beta_sigmoid=beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        d_k=d_k,
-        expand_num=expand_num,
-    )
-
-    return cute.compile(
-        host,
-        cfg,
-        bool(publish_desc),
-        k_cute,
-        workspace_cute,
-        gate_cute,
-        a_log_cute,
-        dt_bias_cute,
-        beta_cute,
-        cu_seqlens_cute,
-        tinv_cute,
-        rows_cute,
-        row_count_cute,
-        stream,
-        options="--enable-tvm-ffi --opt-level 2",
-    )
-
-
-def chunk_gdn_tinv(
-    k,
-    gate,
-    beta,
-    cu_seqlens,
-    tinv,
-    *,
-    log_gate: bool = False,
-    safe_gate: bool = False,
-    a_log=None,
-    dt_bias=None,
-    use_beta_sigmoid: bool = False,
-    allow_neg_eigval: bool = False,
-    expand_num: int = 1,
-    workspace,
-    row_table,
-    row_count,
-    device: int,
-    stream,
-    publish_desc: bool = True,
-):
-    """Execute the GDN chunk-factor pass (THD / varlen entry), compiled once per static config and replayed; tensors are
-    DLPack CUDA tensors with a stride-1 innermost dim.  Two launches per call: the one-warp prologue emits the per-batch
-    K and tinv descriptor arrays into ``workspace``, then the pass reads them.
-    k: ``(total_tokens * expand_num, HK, DK)`` normalized keys, row and head strides multiples of 8 elements
-    gate: raw linear alpha, natural-log decay under ``log_gate``, or raw logits under ``safe_gate`` (``a_log`` / ``dt_bias`` per head)
-    beta: ``(total_tokens * expand_num, HO)`` post-sigmoid, or raw logits under ``use_beta_sigmoid``
-    tinv: ``(tinv_rows(total_tokens, num_seqs, expand_num), HO, B_T, B_T)`` io dtype, contiguous; padding rows are left untouched
-    row_table / row_count: ``(rows, 4)`` / ``(1,)`` int32 row table (chunk, batch, batch_start, batch_end per valid row, and
-    the count), written by the prologue, or by the caller's prologue under ``publish_desc=False``
-    expand_num: GDP's ``num_householder`` timeline factor (1 = off)
-    publish_desc: False when the caller's prologue already emitted the descriptor arrays and the row table (no prologue launch)
-    """
-    HK = k.shape[1]
-    HO = gate.shape[1]
-    DK = k.shape[2]
-    B = cu_seqlens.shape[0] - 1
-    if workspace.shape[0] < TENSORMAP_DESC_ARRAYS * B * TENSOR_MAP_QWORDS:
-        raise ValueError(
-            f"workspace holds {workspace.shape[0]} int64 words, the K and tinv descriptor arrays need {TENSORMAP_DESC_ARRAYS * B * TENSOR_MAP_QWORDS}"
-        )
-    if tuple(tinv.shape[1:]) != (HO, CFG.B_T, CFG.B_T):
-        raise ValueError(f"tinv must be (rows, {HO}, {CFG.B_T}, {CFG.B_T}), got {tuple(tinv.shape)}")
-    if tinv.shape[0] < tinv_rows(gate.shape[0], B, expand_num):
-        raise ValueError(f"tinv has {tinv.shape[0]} rows, needs {tinv_rows(gate.shape[0], B, expand_num)}")
-    if tinv.shape[0] * HO * multiprocessor_count(device) >= 2**31:
-        raise ValueError(f"the item block arithmetic needs rows * HO * num_sm < 2^31, got {tinv.shape[0]} * {HO} * {multiprocessor_count(device)}")
-    if tuple(row_table.shape) != (tinv.shape[0], 4) or row_count.shape[0] < 1:
-        raise ValueError(f"the row table must be ({tinv.shape[0]}, 4) int32 plus a 1-entry count, got {tuple(row_table.shape)} / {tuple(row_count.shape)}")
-    _, _, k_strides, _, _ = probe(k)
-    if k_strides is None:
-        k_strides = (HK * DK, DK, 1)
-    if k_strides[2] != 1 or k_strides[1] % 8 != 0 or k_strides[0] % 8 != 0:
-        raise ValueError(f"k needs a stride-1 head dim and 16-byte aligned row / head strides, got strides {k_strides}")
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
-    io_dtype = get_dtype(k.dtype)
-
-    cu_stream = cuda.CUstream(int(stream))
-    cache = get_compiled_cache(
-        str(k.dtype),
-        str(cu_seqlens.dtype),
-        str(gate.dtype),
-        str(a_log.dtype) if a_log is not None else "none",
-        str(dt_bias.dtype) if dt_bias is not None else "none",
-        str(beta.dtype),
-        device,
-        DK,
-        expand_num,
-        log_gate,
-        safe_gate,
-        use_beta_sigmoid,
-        allow_neg_eigval,
-        publish_desc,
-    )
-
-    if "compiled" not in cache:
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        gate_cute = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        a_log_cute = from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None
-        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
-        beta_cute = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        tinv_cute = from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3)
-        rows_cute = from_dlpack(row_table, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        row_count_cute = from_dlpack(row_count, assumed_align=4).mark_layout_dynamic()
-
-        cache["compiled"] = compile(
-            io_dtype,
-            log_gate,
-            safe_gate,
-            use_beta_sigmoid,
-            allow_neg_eigval,
-            publish_desc,
-            d_k=DK,
-            expand_num=expand_num,
-            num_sm=multiprocessor_count(device),
-            k_cute=k_cute,
-            workspace_cute=workspace_cute,
-            gate_cute=gate_cute,
-            a_log_cute=a_log_cute,
-            dt_bias_cute=dt_bias_cute,
-            beta_cute=beta_cute,
-            cu_seqlens_cute=cu_seqlens_cute,
-            tinv_cute=tinv_cute,
-            rows_cute=rows_cute,
-            row_count_cute=row_count_cute,
-            stream=cu_stream,
-        )
-
-    cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
-    return cache
-
-
-def run_tinv(cache, k, gate, beta, cu_seqlens, tinv, workspace, stream, a_log=None, dt_bias=None, *, row_table, row_count) -> None:
-    """Replay the compiled plan (the prologue launch, then the pass).  The caller owns the
-    contract, which the plan validated at build, so nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
-    cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
 
 
 frost_gdn_tinv_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

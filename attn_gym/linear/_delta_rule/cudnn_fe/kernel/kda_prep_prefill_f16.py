@@ -17,6 +17,8 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; register arrays, SMEM storage, and swizzle offsets restyled.
+# The frozen cfg launches through KdaPrepPrefillOp, whose name encodes every static flag. The delta
+# residual stays FP32 until the MMA pack, and optional paged routes seed, store, clear, or skip slots.
 
 """
 Prep-fed chunked Kimi Delta Attention (KDA) prefill for SM100 / SM103 / SM107: the BT = 16 recurrence over the records of
@@ -63,7 +65,7 @@ Warp assignments (16 warps = 512 threads):
   warp  15      : epilogue warp  - O and checkpoint TMA stores
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Type
 
 import cuda.bindings.driver as cuda_driver
@@ -74,8 +76,10 @@ import cutlass.cute as cute
 
 from attn_gym._backends.cute.compat import SmemAllocator
 
+from ..common.paged_state import resolve_paged_state
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs, emit_tile_seq_descs
+from ..common.launch import validate_kernel_domain, validate_named_barriers, validate_tmem_columns, validate_warp_roles
 from . import kda_prep_f16
 from .gdn_tinv_f16 import emit_tinv_rows
 from .kda_prefill_config import CFG
@@ -92,13 +96,22 @@ from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runti
 from ..tile_dsl.mma import desc_opaque, mma_ts_step
 from ..tile_dsl.swizzle import swizzle_box_offset_128b, swizzle_xor_128b
 from ..tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
-from ..tile_dsl.pointwise import sigmoid, opaque_f32_zero, opaque_i32, fmul2, fp32_to_fp16, sub_f16x2
+from ..tile_dsl.pointwise import sigmoid, opaque_f32_zero, opaque_i32, f16x2_to_f32, fadd2, fmul2, fp32_to_fp16
 
 USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
 L2_NORM_EPS: float = 1.0e-12
+
+
+@cute.jit
+def residual_f16x2(v_pair, state_k_lo, state_k_hi, dtype: cutlass.Constexpr):
+    """Attention Gym modification (B6): ``v - state_k`` for one packed pair, formed in FP32 and
+    rounded once into the b16 MMA operand (beta is applied later, through the prep factors)."""
+    v_lo, v_hi = f16x2_to_f32(v_pair, dtype=dtype)
+    d_lo, d_hi = fadd2(v_lo, v_hi, -state_k_lo, -state_k_hi)
+    return fp32_to_fp16(d_lo, d_hi, dtype=dtype)
 
 
 class KdaPrefillBars(NamedTuple):
@@ -175,7 +188,13 @@ def make_bars(cfg) -> KdaPrefillBars:
             alloc(cfg.smem_checkpoint_stages), spin=True, stages=cfg.smem_checkpoint_stages, init_count=1, producer=Producer.THREAD
         ),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=1, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), spin=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages),
+            spin=True,
+            stages=cfg.scheduler_stages,
+            init_count=cfg.threads_per_cta // cfg.threads_per_warp - 1,  # every warp but the TMA publisher
+            producer=Producer.THREAD,
+        ),
     )
 
 
@@ -968,6 +987,8 @@ def compute1_warp_group(
     sO_raw,
     scale,
     bars,
+    mStateIndices,
+    mHasInitialState,
 ) -> None:
     """CG1 warp role (warps 4-7): the O drain, every chunk's O accumulator scaled into the b16 O staging tile."""
     nvvm.setmaxregister(
@@ -1001,6 +1022,8 @@ def compute1_warp_group(
             cfg, tile_idx, mWorkItems
         )
         num_chunks_tile = write_end - compute_start
+        if cutlass.const_expr(mStateIndices is not None):
+            _, state_active, _, _ = resolve_paged_state(batch_idx, mStateIndices, mHasInitialState)
         for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
             drain_o_stage = cg1_index.idx
             drain_o_parity = cg1_index.phase
@@ -1020,9 +1043,17 @@ def compute1_warp_group(
             o_pack_hi = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 scaled0_0, scaled0_1 = fmul2(loaded_vec_lo[2 * reg_idx], loaded_vec_lo[2 * reg_idx + 1], scale, scale)
+                if cutlass.const_expr(mStateIndices is not None):
+                    # Null routes emit zero output (predicated, so NaN inputs cannot leak).
+                    scaled0_0 = cutlass.Float32(cutlass.select_(state_active, scaled0_0, cutlass.Float32(0.0)))
+                    scaled0_1 = cutlass.Float32(cutlass.select_(state_active, scaled0_1, cutlass.Float32(0.0)))
                 o_pack_lo[reg_idx] = fp32_to_fp16(scaled0_0, scaled0_1, dtype=mO.element_type)
                 if cutlass.const_expr(cfg.d_v == 128):
                     scaled1_0, scaled1_1 = fmul2(loaded_vec_hi[2 * reg_idx], loaded_vec_hi[2 * reg_idx + 1], scale, scale)
+                    if cutlass.const_expr(mStateIndices is not None):
+                        # Null routes emit zero output (predicated, so NaN inputs cannot leak).
+                        scaled1_0 = cutlass.Float32(cutlass.select_(state_active, scaled1_0, cutlass.Float32(0.0)))
+                        scaled1_1 = cutlass.Float32(cutlass.select_(state_active, scaled1_1, cutlass.Float32(0.0)))
                     o_pack_hi[reg_idx] = fp32_to_fp16(scaled1_0, scaled1_1, dtype=mO.element_type)
             nvvm.stmatrix(
                 sO_ptr + drain_o_stage * (cfg.b_t * cfg.d_v) + ov_swizzle_off_lo,
@@ -1063,6 +1094,8 @@ def compute2_warp_group(
     mState_init,
     mSeedIndices,
     mFinalIndices,
+    mStateIndices,
+    mHasInitialState,
     mO,
     sO_raw,
     sV_raw,
@@ -1129,6 +1162,10 @@ def compute2_warp_group(
         )
         head_o, v_offset = decode_head(cfg, head_idx)
         num_chunks_tile = write_end - compute_start
+        if cutlass.const_expr(mStateIndices is not None):
+            # Attention Gym paged state: route slots and fresh/null predicates (null routes never
+            # read or write the pool; fresh routes seed zeros and overwrite their slot).
+            state_slot, state_active, load_initial, clear_empty = resolve_paged_state(batch_idx, mStateIndices, mHasInitialState)
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_phase = compute_start % checkpoint_chunks
             checkpoint_stage = checkpoint_row_count % cutlass.Int32(cfg.smem_checkpoint_stages)
@@ -1145,6 +1182,8 @@ def compute2_warp_group(
                     seed_row = batch_idx
                     if cutlass.const_expr(mSeedIndices is not None):
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+                    if cutlass.const_expr(mStateIndices is not None):
+                        seed_row = state_slot
                     seed_vw = 16 // (mState_init.element_type.width // 8)
                     seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, value_dim + v_offset, 0))).raw_ptr()
                     bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
@@ -1160,7 +1199,10 @@ def compute2_warp_group(
                             for g in cutlass.range_constexpr(16 // seed_vw):
                                 seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
                                 for t in cutlass.range_constexpr(seed_vw):
-                                    seed_block.append(seed_chunk[t].to(cutlass.Float32))
+                                    seed_value = seed_chunk[t].to(cutlass.Float32)
+                                    if cutlass.const_expr(mStateIndices is not None):
+                                        seed_value = cutlass.Float32(cutlass.select_(load_initial, seed_value, cutlass.Float32(0.0)))
+                                    seed_block.append(seed_value)
                             seed_vecs.append(seed_block)
 
                         seed_packed_blocks = []
@@ -1278,16 +1320,12 @@ def compute2_warp_group(
                     state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + state_k_col_id, cutlass.Float32), num=2)
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
-                        state_k_lo = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                        diff_lo = sub_f16x2(raw_v_frag_lo[reg_idx], state_k_lo, cfg.io_dtype)
-                        y_lo[reg_idx] = diff_lo
+                        y_lo[reg_idx] = residual_f16x2(raw_v_frag_lo[reg_idx], state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], cfg.io_dtype)
                     if cutlass.const_expr(cfg.d_v == 128):
                         state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + state_k_col_id, cutlass.Float32), num=2)
                         for reg_idx in cutlass.range_constexpr(4):
                             frag_pair = reg_idx * 2
-                            state_k_hi = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
-                            diff_hi = sub_f16x2(raw_v_frag_hi[reg_idx], state_k_hi, cfg.io_dtype)
-                            y_hi[reg_idx] = diff_hi
+                            y_hi[reg_idx] = residual_f16x2(raw_v_frag_hi[reg_idx], state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], cfg.io_dtype)
                 else:
                     for reg_idx in cutlass.range_constexpr(4):
                         y_lo[reg_idx] = raw_v_frag_lo[reg_idx]
@@ -1476,19 +1514,13 @@ def compute2_warp_group(
             y_input_pack_lo = cute.make_rmem_tensor((4,), cutlass.Int32)
             for reg_idx in cutlass.range_constexpr(4):
                 frag_pair = reg_idx * 2
-                state_k_val0, state_k_val1 = state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1]
-                state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                diff_pair = sub_f16x2(raw_v_frag_lo[reg_idx], state_k_pair, cfg.io_dtype)
-                y_input_pack_lo[reg_idx] = diff_pair
+                y_input_pack_lo[reg_idx] = residual_f16x2(raw_v_frag_lo[reg_idx], state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], cfg.io_dtype)
 
             y_input_pack_hi = cute.make_rmem_tensor((4,), cutlass.Int32)
             if cutlass.const_expr(cfg.d_v == 128):
                 for reg_idx in cutlass.range_constexpr(4):
                     frag_pair = reg_idx * 2
-                    state_k_val0, state_k_val1 = state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1]
-                    state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(raw_v_frag_hi[reg_idx], state_k_pair, cfg.io_dtype)
-                    y_input_pack_hi[reg_idx] = diff_pair
+                    y_input_pack_hi[reg_idx] = residual_f16x2(raw_v_frag_hi[reg_idx], state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], cfg.io_dtype)
 
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + y_dst_col_id, cutlass.Int8), y_input_pack_lo.load())
             if cutlass.const_expr(cfg.d_v == 128):
@@ -1507,11 +1539,16 @@ def compute2_warp_group(
 
         # ---- final state store: TMEM -> GMEM -----------------------------------------
         if cutlass.const_expr(mState_out is not None):
+            owns_final = final_dst >= 0
+            if cutlass.const_expr(mStateIndices is not None):
+                owns_final = owns_final and state_active
             if batch_seqlen > 0:
-                if final_dst >= 0:
+                if owns_final:
                     final_row = final_dst
                     if cutlass.const_expr(mFinalIndices is not None):
                         final_row = cutlass.Int32(mFinalIndices[final_dst])
+                    if cutlass.const_expr(mStateIndices is not None):
+                        final_row = state_slot
                     state_vw = 16 // (mState_out.element_type.width // 8)
                     state_dst = (mState_out.iterator + mState_out.layout((final_row, head_o, value_dim + v_offset, 0))).raw_ptr()
                     for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
@@ -1531,22 +1568,29 @@ def compute2_warp_group(
                                     alignment=16,
                                 )
             else:
-                if state_row_valid and final_dst >= 0:
-                    final_row = final_dst
-                    if cutlass.const_expr(mFinalIndices is not None):
-                        final_row = cutlass.Int32(mFinalIndices[final_dst])
-                    seed_row = batch_idx
-                    if cutlass.const_expr(mSeedIndices is not None):
-                        seed_row = cutlass.Int32(mSeedIndices[batch_idx])
-                    for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
-                        for col in cutlass.range_constexpr(32):
-                            key_dim = key_block_start + col
-                            if cutlass.const_expr(mState_init is not None):
-                                mState_out[final_row, head_o, value_dim + v_offset, key_dim] = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(
-                                    mState_out.element_type
-                                )
-                            else:
-                                mState_out[final_row, head_o, value_dim + v_offset, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
+                if cutlass.const_expr(mStateIndices is not None):
+                    # Fresh empty routes clear their slot; resumed and null empty routes leave it.
+                    if state_row_valid and owns_final and clear_empty:
+                        for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
+                            for col in cutlass.range_constexpr(32):
+                                mState_out[state_slot, head_o, value_dim + v_offset, key_block_start + col] = cutlass.Float32(0.0).to(mState_out.element_type)
+                else:
+                    if state_row_valid and final_dst >= 0:
+                        final_row = final_dst
+                        if cutlass.const_expr(mFinalIndices is not None):
+                            final_row = cutlass.Int32(mFinalIndices[final_dst])
+                        seed_row = batch_idx
+                        if cutlass.const_expr(mSeedIndices is not None):
+                            seed_row = cutlass.Int32(mSeedIndices[batch_idx])
+                        for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
+                            for col in cutlass.range_constexpr(32):
+                                key_dim = key_block_start + col
+                                if cutlass.const_expr(mState_init is not None):
+                                    mState_out[final_row, head_o, value_dim + v_offset, key_dim] = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(
+                                        mState_out.element_type
+                                    )
+                                else:
+                                    mState_out[final_row, head_o, value_dim + v_offset, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
         cum_chunk_base += num_chunks_tile
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1688,6 +1732,8 @@ def frost_kda_prep_prefill_prologue(
     prep_desc_words: cute.Tensor,
     prep_rows: cute.Tensor,
     prep_count: cute.Tensor,
+    mStateIndices: cute.Tensor | None,
+    mHasInitialState: cute.Tensor | None,
 ) -> None:
     """Three-CTA prologue (block 2 emits kda_prep's descriptor arrays and its row table, so the prep launches without a
     prologue of its own): block 0 LPT-orders the work-item table and zeroes the
@@ -1725,6 +1771,8 @@ def frost_kda_prep_prefill_prologue(
             sIdx,
             sSpread,
             num_ctas=num_ctas,
+            mStateIndices=mStateIndices,
+            mHasInitialState=mHasInitialState,
         )
     elif bidx == cutlass.Int32(1):
         build_descs_body(
@@ -1811,6 +1859,8 @@ def prologue(
     prep_desc_words: cute.Tensor | None = None,
     prep_rows: cute.Tensor | None = None,
     prep_row_count: cute.Tensor | None = None,
+    state_indices: cute.Tensor | None = None,
+    has_initial_state: cute.Tensor | None = None,
 ):
     """One-launch prologue: LPT-order the work items and build the 6
     per-(batch, head) TMA-descriptor arrays (q, k, v, gate, o,
@@ -1914,86 +1964,126 @@ def prologue(
         prep_desc_words,
         prep_rows,
         prep_row_count,
+        state_indices,
+        has_initial_state,
     ).launch(grid=(3, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
-@cute.jit
-def host(
-    cfg: cutlass.Constexpr,
-    q: cute.Tensor,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    raw_gate: cute.Tensor,
-    a_log: cute.Tensor | None,
-    dt_bias: cute.Tensor | None,
-    beta: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    initial_state: cute.Tensor | None,
-    out: cute.Tensor,
-    final_state: cute.Tensor | None,
-    seed_indices: cute.Tensor | None,
-    final_indices: cute.Tensor | None,
-    work_items: cute.Tensor | None,
-    work_count: cute.Tensor | None,
-    scheduler_counter: cute.Tensor,
-    tensormap_workspace: cute.Tensor,
-    checkpoint_every_n_tokens: cutlass.Int32,
-    scale: cutlass.Float32,
-    stream,
-) -> None:
-    heads_out = cutlass.Int32(raw_gate.shape[1])
-    if cutlass.const_expr(cfg.tiles_per_head > 1):
-        heads_out = heads_out * cutlass.Int32(cfg.tiles_per_head)
-    v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
-    num_sequences = cu_seqlens.shape[0] - 1
+def _name_float(value: float) -> str:
+    return str(float(value)).replace(".", "p").replace("-", "m").replace("+", "")
 
-    @cute.struct
-    class SharedStorage:
-        k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_decay_cosize], cfg.buffer_align_bytes]
-        q_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.q_decay_cosize], cfg.buffer_align_bytes]
-        k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_restore_cosize], cfg.buffer_align_bytes]
-        intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.intermediate_cosize], cfg.buffer_align_bytes]
-        v: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes]
-        gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], 1024]
-        output: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.o_cosize], cfg.buffer_align_bytes]
-        if cfg.enable_checkpoints:
-            checkpoint: cute.struct.Align[
-                cute.struct.MemRange[cfg.io_dtype, cfg.smem_checkpoint_stages * cfg.d_k * cfg.d_v], cfg.buffer_align_bytes
-            ]
 
-    # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
-    frost_kda_prep_prefill(
-        cfg,
-        SharedStorage,
-        v_ratio,
-        tensormap_workspace,
-        cutlass.Int32(num_sequences),
-        q,
-        k,
-        v,
-        raw_gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        out,
-        final_state,
-        seed_indices,
-        final_indices,
-        work_items,
-        work_count,
-        scheduler_counter,
-        scale,
-        checkpoint_every_n_tokens,
-    ).launch(
-        grid=grid_shape,
-        block=(cfg.threads_per_cta, 1, 1),
-        stream=stream,
-        use_pdl=USE_PDL,
-        min_blocks_per_mp=1,
-    )
+class KdaPrepPrefillOp:
+    """The prep-fed prefill launch for one frozen ``KdaPrepPrefillCfg``; nested into the warmup forward host."""
+
+    def __init__(self, cfg: "KdaPrepPrefillCfg", use_int64_offsets: bool = False):
+        self.cfg = cfg
+        self.use_int64_offsets = use_int64_offsets
+
+    def get_name(self) -> str:
+        cfg = self.cfg
+        flags = "".join(
+            str(int(flag))
+            for flag in (
+                cfg.use_initial_state,
+                cfg.store_final_state,
+                cfg.enable_checkpoints,
+                cfg.l2norm,
+                cfg.safe_gate,
+                cfg.log_gate,
+                cfg.beta_sigmoid,
+                cfg.allow_neg_eigval,
+            )
+        )
+        dtypes = "_".join(t.__name__.lower() for t in (cfg.io_dtype, cfg.state_dtype, cfg.gate_dtype))
+        return (
+            f"kda_cudnn_prep_prefill_{dtypes}_k{cfg.d_k}_v{cfg.d_v}_t{cfg.tiles_per_head}_f{flags}"
+            f"_g{_name_float(cfg.gate_scale_log2)}_sm{cfg.max_active_clusters}_i64{int(self.use_int64_offsets)}_p{cfg.paged_state}"
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        raw_gate: cute.Tensor,
+        a_log: cute.Tensor | None,
+        dt_bias: cute.Tensor | None,
+        beta: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        initial_state: cute.Tensor | None,
+        out: cute.Tensor,
+        final_state: cute.Tensor | None,
+        seed_indices: cute.Tensor | None,
+        final_indices: cute.Tensor | None,
+        state_indices: cute.Tensor | None,
+        has_initial_state: cute.Tensor | None,
+        work_items: cute.Tensor | None,
+        work_count: cute.Tensor | None,
+        scheduler_counter: cute.Tensor,
+        tensormap_workspace: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        scale: cutlass.Float32,
+        stream,
+    ) -> None:
+        cfg = self.cfg
+        heads_out = cutlass.Int32(raw_gate.shape[1])
+        if cutlass.const_expr(cfg.tiles_per_head > 1):
+            heads_out = heads_out * cutlass.Int32(cfg.tiles_per_head)
+        v_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(v.shape[1]))
+        num_sequences = cu_seqlens.shape[0] - 1
+
+        @cute.struct
+        class SharedStorage:
+            k_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_decay_cosize], cfg.buffer_align_bytes]
+            q_decay: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.q_decay_cosize], cfg.buffer_align_bytes]
+            k_restore: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_restore_cosize], cfg.buffer_align_bytes]
+            intermediate: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.intermediate_cosize], cfg.buffer_align_bytes]
+            v: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes]
+            gate: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, cfg.gate_cosize], 1024]
+            output: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.o_cosize], cfg.buffer_align_bytes]
+            if cfg.enable_checkpoints:
+                checkpoint: cute.struct.Align[
+                    cute.struct.MemRange[cfg.io_dtype, cfg.smem_checkpoint_stages * cfg.d_k * cfg.d_v], cfg.buffer_align_bytes
+                ]
+
+        frost_kda_prep_prefill.set_name_prefix(self.get_name())
+        # ---- launch ----------------------------------------------------------------------
+        grid_shape = (cfg.max_active_clusters, 1, 1)
+        frost_kda_prep_prefill(
+            cfg,
+            SharedStorage,
+            v_ratio,
+            tensormap_workspace,
+            cutlass.Int32(num_sequences),
+            q,
+            k,
+            v,
+            raw_gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_seqlens,
+            initial_state,
+            out,
+            final_state,
+            seed_indices,
+            final_indices,
+            state_indices,
+            has_initial_state,
+            work_items,
+            work_count,
+            scheduler_counter,
+            scale,
+            checkpoint_every_n_tokens,
+        ).launch(
+            grid=grid_shape,
+            block=(cfg.threads_per_cta, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+            min_blocks_per_mp=1,
+        )
 
 
 @cute.kernel
@@ -2016,6 +2106,8 @@ def frost_kda_prep_prefill(
     mState_out: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
     mFinalIndices: cute.Tensor | None,
+    mStateIndices: cute.Tensor | None,
+    mHasInitialState: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -2249,6 +2341,8 @@ def frost_kda_prep_prefill(
             mState_init,
             mSeedIndices,
             mFinalIndices,
+            mStateIndices,
+            mHasInitialState,
             mO,
             sO_raw,
             sV_raw,
@@ -2274,10 +2368,12 @@ def frost_kda_prep_prefill(
             sO_raw,
             scale,
             bars,
+            mStateIndices,
+            mHasInitialState,
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class KdaPrepPrefillCfg:
     """Kernel cfg (fixed BT=16 schedule constants; derived TMEM column offsets
     and SMEM buffer cosizes are stamped by ``build_cfg``; per-stage sizes are
@@ -2300,6 +2396,7 @@ class KdaPrepPrefillCfg:
     d_k: int
     d_v: int
     tiles_per_head: int = 1
+    paged_state: int = 0  # 0 dense, 1 paged routes, 2 routes + fresh-slot mask (profiler name only)
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = (0, 1, 2, 3)
@@ -2312,8 +2409,8 @@ class KdaPrepPrefillCfg:
     b_t: int = CFG.B_T
     threads_per_warp: int = CFG.THREADS_PER_WARP
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
-    threads_per_cta: int = 0
-    tmem_user_threads: int = 0
+    threads_per_cta: int = 0  # derived by build_cfg
+    tmem_user_threads: int = 0  # derived by build_cfg
     tmem_lifecycle_barrier_id: int = 3
     num_regs_compute_group_0: int = CFG.NUM_REGS_COMPUTE_GROUP_0
     num_regs_compute_group_1: int = CFG.NUM_REGS_COMPUTE_GROUP_0
@@ -2331,25 +2428,25 @@ class KdaPrepPrefillCfg:
 
     # ---- TMEM column offsets (state doubles as the final state acc) ------------------
     tmem_state_acc_offset: int = 0
-    tmem_state_input_offset: int = 0
-    tmem_q_state_acc_offset: int = 0
-    tmem_state_k_acc_offset: int = 0
-    tmem_u_input_offset: int = 0
+    tmem_state_input_offset: int = 0  # derived by build_cfg
+    tmem_q_state_acc_offset: int = 0  # derived by build_cfg
+    tmem_state_k_acc_offset: int = 0  # derived by build_cfg
+    tmem_u_input_offset: int = 0  # derived by build_cfg
 
     # ---- SMEM buffer cosizes ---------------------------------------------------------
-    v_cosize: int = 0
-    gate_cosize: int = 0
-    gate_stage_elems: int = 0
-    k_decay_cosize: int = 0
-    q_decay_cosize: int = 0
-    k_restore_cosize: int = 0
-    o_cosize: int = 0
+    v_cosize: int = 0  # derived by build_cfg
+    gate_cosize: int = 0  # derived by build_cfg
+    gate_stage_elems: int = 0  # derived by build_cfg
+    k_decay_cosize: int = 0  # derived by build_cfg
+    q_decay_cosize: int = 0  # derived by build_cfg
+    k_restore_cosize: int = 0  # derived by build_cfg
+    o_cosize: int = 0  # derived by build_cfg
 
     # ---- TMA transaction bytes per stage ---------------------------------------------
-    tma_k_bytes: int = 0
-    tma_v_bytes: int = 0
-    tma_gate_bytes: int = 0
-    intermediate_cosize: int = 0
+    tma_k_bytes: int = 0  # derived by build_cfg
+    tma_v_bytes: int = 0  # derived by build_cfg
+    tma_gate_bytes: int = 0  # derived by build_cfg
+    intermediate_cosize: int = 0  # derived by build_cfg
 
 
 def build_cfg(
@@ -2370,10 +2467,14 @@ def build_cfg(
     d_k: int,
     d_v: int,
     tiles_per_head: int = 1,
+    paged_state: int = 0,
 ) -> KdaPrepPrefillCfg:
     """Build the per-compile ``KdaPrepPrefillCfg`` (io_dtype in {Float16, BFloat16}); fills the derived TMEM column
     offsets and SMEM buffer cosizes.  ``tiles_per_head`` > 1 runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value
     columns each (the d_v split)."""
+    validate_kernel_domain(
+        "KDA prep prefill", io_dtype, (d_k, d_v), max_active_clusters=max_active_clusters, tiles_per_head=tiles_per_head
+    )
     cfg = KdaPrepPrefillCfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2391,43 +2492,53 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
         tiles_per_head=tiles_per_head,
+        paged_state=paged_state,
     )
-    if enable_checkpoints:
-        cfg.smem_checkpoint_stages = 2
-    cfg.smem_raw_bar_stages = cfg.smem_raw_stages + (cfg.smem_raw_stages % 2)
-    cfg.threads_per_cta = 16 * cfg.threads_per_warp
-    cfg.tmem_user_threads = (
-        1 + len(cfg.compute_group_2_warp_ids) + len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids)
-    ) * cfg.threads_per_warp
     if len(cfg.compute_group_0_warp_ids) != len(cfg.compute_group_2_warp_ids):
         raise ValueError("the state halves are packed by CG0 and by CG2: their warp counts must match")
-
-    cfg.tmem_state_input_offset = cfg.tmem_state_acc_offset + cfg.d_k
-    cfg.tmem_q_state_acc_offset = cfg.tmem_state_input_offset + (cfg.d_k // 2)
-    cfg.tmem_state_k_acc_offset = cfg.tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * cfg.b_t
-    cfg.tmem_u_input_offset = cfg.tmem_state_k_acc_offset + cfg.b_t
-    assert (cfg.tmem_u_input_offset + (cfg.b_t // 2)) <= 512
-
-    cfg.v_cosize = cfg.smem_raw_stages * cfg.d_v * cfg.b_t
-    cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8) // 4
-    cfg.gate_stage_elems = cfg.d_k * cfg.b_t
-    cfg.k_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.q_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.k_restore_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.o_cosize = cfg.smem_o_stages * cfg.b_t * cfg.d_v
-    cfg.intermediate_cosize = cfg.smem_intermediate_stages * 2 * cfg.b_t * cfg.b_t
-    cfg.tma_k_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_v_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8)
-    cfg.gate_cosize = cfg.smem_raw_stages * cfg.d_k
-    cfg.gate_stage_elems = cfg.d_k
-    cfg.tma_gate_bytes = cfg.d_k * 4
-    cfg.smem_decay_stages = 4
-    cfg.smem_intermediate_stages = 4
-    cfg.k_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.q_decay_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.k_restore_cosize = cfg.smem_decay_stages * cfg.d_k * cfg.b_t
-    cfg.intermediate_cosize = cfg.smem_intermediate_stages * 2 * cfg.b_t * cfg.b_t
+    n_warps = validate_warp_roles(
+        (cfg.compute_group_0_warp_ids, cfg.compute_group_1_warp_ids, cfg.compute_group_2_warp_ids),
+        (cfg.scheduler_warp_id, cfg.tcgen05_mma_warp_id, cfg.tma_warp_id, cfg.epilogue_warp_id),
+    )
+    raw, b_t, d_k, d_v = cfg.smem_raw_stages, cfg.b_t, cfg.d_k, cfg.d_v
+    io_bytes = cfg.io_dtype.width // 8
+    tmem_state_input_offset = cfg.tmem_state_acc_offset + d_k
+    tmem_q_state_acc_offset = tmem_state_input_offset + (d_k // 2)
+    tmem_state_k_acc_offset = tmem_q_state_acc_offset + cfg.tmem_q_state_acc_stages * b_t
+    tmem_u_input_offset = tmem_state_k_acc_offset + b_t
+    validate_tmem_columns("KDA prep prefill", tmem_u_input_offset + b_t // 2)
+    # The prep records replace the raw gate tile with its per-chunk diag row (fp32, d_k per stage), and
+    # the decay / intermediate rings run 4 deep.
+    decay_stages = 4
+    intermediate_stages = 4
+    cfg = replace(
+        cfg,
+        smem_checkpoint_stages=2 if enable_checkpoints else cfg.smem_checkpoint_stages,
+        smem_raw_bar_stages=raw + (raw % 2),
+        threads_per_cta=n_warps * cfg.threads_per_warp,
+        tmem_user_threads=(
+            1 + len(cfg.compute_group_2_warp_ids) + len(cfg.compute_group_0_warp_ids) + len(cfg.compute_group_1_warp_ids)
+        )
+        * cfg.threads_per_warp,
+        tmem_state_input_offset=tmem_state_input_offset,
+        tmem_q_state_acc_offset=tmem_q_state_acc_offset,
+        tmem_state_k_acc_offset=tmem_state_k_acc_offset,
+        tmem_u_input_offset=tmem_u_input_offset,
+        v_cosize=raw * d_v * b_t,
+        gate_cosize=raw * d_k,
+        gate_stage_elems=d_k,
+        smem_decay_stages=decay_stages,
+        smem_intermediate_stages=intermediate_stages,
+        k_decay_cosize=decay_stages * d_k * b_t,
+        q_decay_cosize=decay_stages * d_k * b_t,
+        k_restore_cosize=decay_stages * d_k * b_t,
+        o_cosize=cfg.smem_o_stages * b_t * d_v,
+        intermediate_cosize=intermediate_stages * 2 * b_t * b_t,
+        tma_k_bytes=d_k * b_t * io_bytes,
+        tma_v_bytes=d_v * b_t * io_bytes,
+        tma_gate_bytes=d_k * 4,
+    )
+    validate_named_barriers(cfg.threads_per_cta, tmem_lifecycle=(cfg.tmem_lifecycle_barrier_id, cfg.tmem_user_threads))
     return cfg
 
 
@@ -2438,4 +2549,3 @@ TENSORMAP_DESC_ARRAYS = 11  # per-batch runtime TMA descriptors: Q, K, V, Gate, 
 
 
 frost_kda_prep_prefill_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)
-frost_kda_prep_prefill.set_name_prefix("cudnn", remove_cutlass_symbol=False)

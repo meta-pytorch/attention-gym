@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the CuTeDSL 4.7 cuDNN long-context backward, with or without state."""
+"""Validated v1.30 KDA backward adapter, with optional state and exit cotangent."""
 
 from __future__ import annotations
 
@@ -8,17 +8,11 @@ import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym._backends.cute.utils import initialized_cuda_device
-from attn_gym.linear._delta_rule.cudnn.kernels.common.host import tensormap_workspace_bytes
 from attn_gym.linear._delta_rule.validation import resolve_scale
-from attn_gym.utils import ceildiv
 
-from .kernels import kda_bprop_f16, kda_recompute_f16
-from .schedule import prepare_cudnn_schedule
+from ..cudnn_fe.kda import kda_backward
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-_KERNEL_CHUNK_SIZE = 16
-_SCHEDULER_COUNTERS = 4
-_WORKSPACE_WORD_BYTES = 8
 
 
 def chunk_delta_rule_bwd_cudnn_packed(
@@ -76,7 +70,7 @@ def chunk_delta_rule_bwd_cudnn_packed(
         if gate.dtype != torch.float32 or beta.dtype != torch.float32:
             raise TypeError("gate and beta must be float32")
 
-        _, tokens, heads, dim = q.shape
+        _, _, heads, dim = q.shape
         if (
             cu_seqlens.ndim != 1
             or cu_seqlens.shape[0] < 2
@@ -97,89 +91,18 @@ def chunk_delta_rule_bwd_cudnn_packed(
                 raise ValueError(f"{name} must be on q.device")
             if not tensor_supports_tma(state):
                 raise TypeError(f"{name} requires a TMA-compatible inner mode")
-        stream = torch.cuda.current_stream(q.device).cuda_stream
-        schedule = prepare_cudnn_schedule(
-            gate,
-            cu_seqlens,
-            tile_tokens=_KERNEL_CHUNK_SIZE,
-            counter_count=_SCHEDULER_COUNTERS,
-            split=split,
-            stream=stream,
-        )
-        checkpoints = torch.empty(
-            tokens // _KERNEL_CHUNK_SIZE + num_sequences,
-            heads,
-            dim,
-            dim,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        recompute_workspace = torch.empty(
-            ceildiv(
-                tensormap_workspace_bytes(kda_recompute_f16, num_sequences),
-                _WORKSPACE_WORD_BYTES,
-            ),
-            dtype=torch.int64,
-            device=q.device,
-        )
-        backward_workspace = torch.empty(
-            ceildiv(
-                tensormap_workspace_bytes(kda_bprop_f16, num_sequences),
-                _WORKSPACE_WORD_BYTES,
-            ),
-            dtype=torch.int64,
-            device=q.device,
-        )
-        gradients = tuple(torch.empty_like(t[0]) for t in (q, k, value, gate, beta))
-        d_initial_state = None
-        if initial_state is not None:
-            # Empty sequences emit no work item; their state cotangent passes through unchanged.
-            d_initial_state = (
-                torch.zeros(state_shape, dtype=torch.float32, device=q.device)
-                if d_final_state is None
-                else d_final_state.clone(memory_format=torch.contiguous_format)
-            )
-
-        kda_recompute_f16.chunk_kda_recompute_sm100(
-            k[0],
-            value[0],
-            gate[0],
-            beta[0],
-            cu_seqlens,
-            initial_state,
-            None,
-            checkpoint_every_n_tokens=16,
-            output_state_checkpoints=checkpoints,
-            work_items=schedule.work_items,
-            work_count=schedule.work_count,
-            sched_ctr=schedule.counters[:2],
-            sched_all=schedule.counters,
-            work_item_scratch=schedule.item_scratch,
-            order_in_prologue=True,
-            tensormap_workspace=recompute_workspace,
-        )
-        bwd_scheduler = (
-            schedule.counters[2:] if num_sequences * heads <= schedule.num_sms else None
-        )
-        kda_bprop_f16.chunk_kda_bwd_sm100(
+        *gradients, d_initial_state = kda_backward(
             q[0],
             k[0],
             value[0],
             gate[0],
             beta[0],
             d_output[0],
-            checkpoints,
-            *gradients,
             cu_seqlens,
-            scale,
-            use_initial_state=initial_state is not None,
-            d_initial_state=d_initial_state,
+            scale=scale,
+            split=split,
+            initial_state=initial_state,
             d_final_state=d_final_state,
-            work_items=schedule.work_items,
-            work_count=schedule.work_count,
-            sched_ctr=bwd_scheduler,
-            order_in_prologue=False,
-            tensormap_workspace=backward_workspace,
         )
         return (*(grad.unsqueeze(0) for grad in gradients), d_initial_state)
 
