@@ -92,7 +92,7 @@ def chunk_gla_fwd_kernel_o(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if USE_INT64_OFFSETS:
@@ -239,7 +239,7 @@ def chunk_gla_fwd_kernel_o_tma(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Compose fixed KDA output tiles with TMA-backed tensor descriptors."""
     value_tile, chunk, batch_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -388,7 +388,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma(
     BK: tl.constexpr,
     BV: tl.constexpr,
     num_sequences,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Launch one CTA per capacity task; capacity-only CTAs exit immediately."""
     i_v, global_chunk, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -453,7 +453,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
     BV: tl.constexpr,
     num_sequences,
     num_workers,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Stride a bounded worker grid over active (chunk, head, value-tile) tasks."""
     worker = tl.program_id(0)
@@ -520,7 +520,7 @@ def chunk_gla_fwd_o_gk(
     metadata: RaggedChunkMetadata | None = None,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> torch.Tensor:
     """Compose fixed-length or packed KDA intra- and inter-chunk output terms.
 

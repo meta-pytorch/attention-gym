@@ -128,7 +128,7 @@ def chunk_kda_fwd_k3_triton_kernel(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
-    FASTMATH: tl.constexpr = True,
+    FASTMATH: tl.constexpr,
 ):
     """Produce six off-diagonal Aqk/Akk blocks for one chunk and head."""
     global_chunk = tl.program_id(0)
@@ -468,7 +468,7 @@ def chunk_kda_fwd_k3b_triton(
     aqk: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata | None,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> torch.Tensor:
     """Complete the caller-owned Aqk tensor and return the temporary Akk blocks."""
     batch, tokens, heads, key_dim = q.shape

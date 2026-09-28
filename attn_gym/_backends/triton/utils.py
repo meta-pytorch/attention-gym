@@ -34,7 +34,7 @@ def configure_triton_allocator() -> None:
 
 
 @triton.jit
-def exp2(x, FASTMATH: tl.constexpr = True):
+def exp2(x, FASTMATH: tl.constexpr):
     """Select approximate or libdevice exp2.
 
     Launch with ``enable_reflect_ftz=FASTMATH`` to give libdevice the same math policy.

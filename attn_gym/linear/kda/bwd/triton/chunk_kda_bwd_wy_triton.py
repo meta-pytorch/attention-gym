@@ -459,7 +459,7 @@ def chunk_kda_bwd_wy_triton(
     metadata: RaggedChunkMetadata | None,
     *,
     scale: float,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,

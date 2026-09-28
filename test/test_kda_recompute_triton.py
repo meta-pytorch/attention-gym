@@ -51,10 +51,10 @@ def test_optional_q_and_gate_arguments():
     beta = torch.rand(1, 64, 1, device="cuda")
     A = torch.randn(1, 64, 64, device="cuda", dtype=torch.bfloat16).tril().unsqueeze(2)
 
-    plain = recompute_w_u_fwd_triton(k, v, beta, A)
-    q_only = recompute_w_u_fwd_triton(k, v, beta, A, q=q)
-    gate = recompute_w_u_fwd_triton(k, v, beta, A, gk=gk)
-    both = recompute_w_u_fwd_triton(k, v, beta, A, q=q, gk=gk)
+    plain = recompute_w_u_fwd_triton(k, v, beta, A, fastmath=True)
+    q_only = recompute_w_u_fwd_triton(k, v, beta, A, q=q, fastmath=True)
+    gate = recompute_w_u_fwd_triton(k, v, beta, A, gk=gk, fastmath=True)
+    both = recompute_w_u_fwd_triton(k, v, beta, A, q=q, gk=gk, fastmath=True)
 
     assert plain[2] is plain[3] is q_only[2] is q_only[3] is gate[2] is None
     assert gate[3] is not None and both[2] is not None and both[3] is not None
@@ -85,12 +85,16 @@ def test_precision_modes_tighten_error_and_reject_half_a():
 
     errors = {}
     for precision in ("bf16", "tf32", "tf32x3"):
-        _, u, _, _ = recompute_w_u_fwd_triton(k, v, beta, A, metadata, dot_precision=precision)
+        _, u, _, _ = recompute_w_u_fwd_triton(
+            k, v, beta, A, metadata, dot_precision=precision, fastmath=True
+        )
         errors[precision] = (u.float() - ref_u).abs().max().item()
     assert errors["tf32x3"] < errors["bf16"], errors
 
     with pytest.raises(ValueError, match="tf32x3"):
-        recompute_w_u_fwd_triton(k, v, beta, A.bfloat16(), metadata, dot_precision="tf32x3")
+        recompute_w_u_fwd_triton(
+            k, v, beta, A.bfloat16(), metadata, dot_precision="tf32x3", fastmath=True
+        )
 
 
 def test_grouped_value_heads_map_onto_key_heads():
@@ -106,7 +110,7 @@ def test_grouped_value_heads_map_onto_key_heads():
     beta = torch.rand(1, total, hv, device="cuda")
     A = torch.randn(1, total, hv, 64, device="cuda", dtype=torch.bfloat16) / 8
 
-    w, u, qg, kg = recompute_w_u_fwd_triton(k, v, beta, A, metadata, q=q, gk=gk)
+    w, u, qg, kg = recompute_w_u_fwd_triton(k, v, beta, A, metadata, q=q, gk=gk, fastmath=True)
     ref_w, ref_u, ref_qg, ref_kg = _reference(k, v, beta, A, offsets, gk=gk, q=q)
     assert w.shape == kg.shape == (1, total, hv, 128)
     torch.testing.assert_close(qg.float(), ref_qg, rtol=1e-2, atol=1e-2)

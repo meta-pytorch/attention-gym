@@ -15,6 +15,8 @@ Use this workflow whenever adding a backend under `attn_gym/linear/<variant>/imp
 2. **Triton implementation:** direct Triton kernels can work under `torch.compile`. Prefer
    `torch.library.triton_op` with `torch.library.wrap_triton` when a stable operator boundary is
    useful and compiler subsystems should remain able to inspect the implementation.
+   Put required JIT parameters before optional ones: Triton 3.8's generated binder drops the
+   keyword-only separator, so a required constexpr after defaults produces invalid Python.
 3. **CuTeDSL or external implementation:** use a private registered operator
    (`torch.library.define`/`impl`, below) when the launcher cannot be traced correctly.
 

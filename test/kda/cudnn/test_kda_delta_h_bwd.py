@@ -136,6 +136,7 @@ def test_delta_h_dv_fusion_matches_reference_and_is_deterministic(bv: int, satur
         scale=D**-0.5,
         chunk_size=64,
         bv=bv,
+        fastmath=False,
     )
     torch.cuda.synchronize()
     for got, reference in zip(actual, expected, strict=True):
@@ -156,6 +157,7 @@ def test_delta_h_dv_fusion_matches_reference_and_is_deterministic(bv: int, satur
             scale=D**-0.5,
             chunk_size=64,
             bv=bv,
+            fastmath=False,
         )
         torch.cuda.synchronize()
         for got, reference in zip(rerun, actual, strict=True):
@@ -202,7 +204,7 @@ def test_delta_h_dv_fusion_runtime_flags(use_gate: bool, state_mode: str):
         d_final_state=d_final_state,
         scale=D**-0.5,
     )
-    actual = blackwell_delta_h_bwd_dhu_dv_fused(q, k, w, d_output, aqk, **kwargs)
+    actual = blackwell_delta_h_bwd_dhu_dv_fused(q, k, w, d_output, aqk, **kwargs, fastmath=False)
     for got, reference in zip(actual, expected, strict=True):
         if got is None:
             assert reference is None
@@ -275,6 +277,7 @@ def test_packed_delta_h_dv_fusion_matches_reference(
         dht=d_final_state,
         scale=D**-0.5,
         bv=bv,
+        fastmath=False,
     )
     actual_daqk = chunk_kda_bwd_daqk(
         value_new,
@@ -307,6 +310,7 @@ def test_packed_delta_h_dv_fusion_matches_reference(
                 dht=d_final_state,
                 scale=D**-0.5,
                 bv=bv,
+                fastmath=False,
             )
             for index, (result, reference) in enumerate(zip(rerun, actual, strict=True)):
                 assert result is not None and reference is not None
@@ -335,7 +339,7 @@ def test_packed_delta_h_dv_fusion_cuda_graph_replays_smaller_endpoint():
     cu_seqlens = cumulative_sequence_offsets([512, 512])
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
     _blackwell_delta_h_bwd_dhu_dv_fused_packed(
-        q, k, w, d_output, aqk, warm_metadata, gk=gate, scale=D**-0.5, bv=16
+        q, k, w, d_output, aqk, warm_metadata, gk=gate, scale=D**-0.5, bv=16, fastmath=False
     )
     torch.cuda.synchronize()
 
@@ -343,7 +347,7 @@ def test_packed_delta_h_dv_fusion_cuda_graph_replays_smaller_endpoint():
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
         actual = _blackwell_delta_h_bwd_dhu_dv_fused_packed(
-            q, k, w, d_output, aqk, metadata, gk=gate, scale=D**-0.5, bv=16
+            q, k, w, d_output, aqk, metadata, gk=gate, scale=D**-0.5, bv=16, fastmath=False
         )
 
     active_lengths = [257, 255]
@@ -403,6 +407,7 @@ def test_packed_delta_h_dv_fusion_preserves_empty_state_slots():
         h0=initial_state,
         dht=d_final_state,
         bv=16,
+        fastmath=False,
     )
 
     assert dh.shape == (1, 0, heads, D, D)
@@ -420,9 +425,12 @@ def test_delta_h_dv_fusion_rejects_invalid_dense_contracts():
         blackwell_delta_h_bwd_dhu_dv_fused(
             *(tensor[:, :65].contiguous() for tensor in inputs[:5]),
             gk=inputs[5][:, :65].contiguous(),
+            fastmath=False,
         )
     with pytest.raises(ValueError, match="chunk_size=64"):
-        blackwell_delta_h_bwd_dhu_dv_fused(*inputs[:5], gk=inputs[5], chunk_size=32)
+        blackwell_delta_h_bwd_dhu_dv_fused(
+            *inputs[:5], gk=inputs[5], chunk_size=32, fastmath=False
+        )
     bad_state = torch.empty(2, 2, D, D, device="cuda")
     for name in ("h0", "dht"):
         with pytest.raises(ValueError, match=rf"{name} must have shape"):
@@ -430,4 +438,5 @@ def test_delta_h_dv_fusion_rejects_invalid_dense_contracts():
                 *inputs[:5],
                 gk=inputs[5],
                 **{name: bad_state},
+                fastmath=False,
             )

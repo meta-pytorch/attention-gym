@@ -89,10 +89,10 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
     num_sequences,
     USE_INT64_OFFSETS: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    FASTMATH: tl.constexpr,
     CAUSAL_NORMREF: tl.constexpr = True,
     GRID_NT=0,
     MAX_NT=0,
-    FASTMATH: tl.constexpr = True,
 ):
     i_t_start, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if USE_INT64_OFFSETS:
@@ -244,7 +244,8 @@ def chunk_kda_fwd_intra_diagonal(
     scale: float,
     metadata: RaggedChunkMetadata | None,
     chunk_size: int = 64,
-    fastmath: bool = True,
+    *,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the scheduler-aware diagonal intra-chunk stage in isolation."""
     batch, tokens, heads, key_dim = k.shape

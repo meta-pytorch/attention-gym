@@ -57,6 +57,7 @@ def test_ragged_fake_tensors_reject_legacy_boolean_schedule():
                 128**-0.5,
                 metadata,
                 schedule=True,
+                fastmath=True,
             )
 
         offdiagonal = torch.empty(6, 256, device="cuda")
@@ -104,6 +105,7 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
             diagonal_inverse,
             128**-0.5,
             Akk=Akk,
+            fastmath=True,
         )
 
     run_inter_solve()

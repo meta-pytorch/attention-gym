@@ -160,7 +160,7 @@ def test_private_chunk_kda_forward_matches_reference(dtype: torch.dtype):
     q, k, v, gate, beta = _inputs(tokens=64, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     actual, aqk, akk = _chunk_kda_fwd_op(
-        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto", fastmath=False
     )
     golden, _ = naive_chunk_kda(
         q.double(),
@@ -184,7 +184,7 @@ def test_private_fp16_forward_factors_are_finite_at_gate_limit():
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
 
     output, aqk, akk = _chunk_kda_fwd_op(
-        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
+        q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto", fastmath=False
     )
 
     for tensor in (output, aqk, akk):
@@ -889,6 +889,7 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
         tensor,
         tensor,
         metadata=metadata,
+        fastmath=False,
     )
 
     assert actual is result
@@ -916,8 +917,10 @@ def test_chunk_kda_op_registration(dtype):
         True,
         "auto",
     )
-    torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
-    torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
+    torch.library.opcheck(_chunk_kda_fwd_op, args, {"fastmath": False}, rtol=2e-2, atol=2e-3)
+    torch.library.opcheck(
+        _chunk_kda_fwd_with_state_op, args, {"fastmath": False}, rtol=2e-2, atol=2e-3
+    )
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
@@ -969,6 +972,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             _DEFAULT_SCALE,
             True,
             "auto",
+            fastmath=False,
         )
     torch.library.opcheck(
         _chunk_kda_bwd_op,

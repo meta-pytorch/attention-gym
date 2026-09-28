@@ -166,6 +166,7 @@ def chunk_gdn_fwd_recurrence_packed(
         metadata.chunk_offsets,
         metadata.capacity,
         final_state,
+        fastmath=True,
     )
     return h, v_new, final_state
 

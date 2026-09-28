@@ -61,6 +61,7 @@ def _sequence_local_reference(inputs, lengths: list[int]):
                 *local_inputs,
                 scale=128**-0.5,
                 metadata=metadata,
+                fastmath=True,
             )
             outputs_aqk.append(Aqk)
             outputs_akk.append(Akk)
@@ -79,6 +80,7 @@ def test_ragged_intra_diagonal_matches_sequence_local_launches(lengths):
         *inputs,
         scale=128**-0.5,
         metadata=metadata,
+        fastmath=True,
     )
     expected_aqk, expected_akk = _sequence_local_reference(inputs, lengths)
 
@@ -96,6 +98,7 @@ def test_ragged_intra_diagonal_accepts_zero_capacity():
         *inputs,
         scale=128**-0.5,
         metadata=metadata,
+        fastmath=True,
     )
 
     assert Aqk.shape == (1, 0, 1, 64)
@@ -112,6 +115,7 @@ def test_ragged_intra_diagonal_rejects_mismatched_metadata_chunk_size():
             *inputs,
             scale=128**-0.5,
             metadata=metadata,
+            fastmath=True,
         )
 
 
@@ -128,6 +132,7 @@ def test_ragged_intra_diagonal_fullgraph():
             beta,
             scale=128**-0.5,
             metadata=metadata,
+            fastmath=True,
         )
 
     expected_aqk, expected_akk = operation(*inputs, cu_seqlens)
@@ -145,6 +150,7 @@ def test_ragged_intra_diagonal_replays_aligned_to_ragged():
         *inputs,
         scale=128**-0.5,
         metadata=warm_metadata,
+        fastmath=True,
     )
     torch.cuda.synchronize()
 
@@ -155,6 +161,7 @@ def test_ragged_intra_diagonal_replays_aligned_to_ragged():
             *inputs,
             scale=128**-0.5,
             metadata=metadata,
+            fastmath=True,
         )
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))

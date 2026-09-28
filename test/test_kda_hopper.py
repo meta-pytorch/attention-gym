@@ -196,6 +196,7 @@ def test_hopper_delta_h_masks_upper_aqk(dtype: torch.dtype):
             d_final_state=None,
             scale=128**-0.5,
             metadata=None,
+            fastmath=True,
         )
 
     expected = run(aqk)
@@ -299,11 +300,12 @@ def test_hopper_raw_operator_registration():
     torch.library.opcheck(
         _chunk_kda_fwd_with_state_op,
         forward_args,
+        {"fastmath": False},
         rtol=2e-2,
         atol=2e-3,
     )
     with torch.no_grad():
-        _output, state, aqk, akk = _chunk_kda_fwd_with_state_op(*forward_args)
+        _output, state, aqk, akk = _chunk_kda_fwd_with_state_op(*forward_args, fastmath=False)
     torch.library.opcheck(
         _chunk_kda_bwd_with_state_grad_op,
         (

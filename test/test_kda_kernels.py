@@ -652,6 +652,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         V=V,
         BT=64,
         num_sequences=0,
+        FASTMATH=True,
     )
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o T={T} H={H} K={K} V={V}")
 
@@ -686,7 +687,7 @@ def test_chunk_gla_fwd_o_gk_tma(dtype, T):
     ref = _fwd_o_ref(q, g, h.reshape(B * num_chunks, H, K, V), A, v, scale)
 
     assert can_use_tma(v), "expected TMA-eligible tensors so the launcher takes its TMA path"
-    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale)
+    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, fastmath=True)
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o_gk_tma T={T}")
 
 
@@ -762,7 +763,7 @@ def test_chunk_delta_h_fwd(dtype, T, use_h0):
     if T % 64:
         cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, T, 64)
-    h, v_new, ht = chunk_gated_delta_rule_fwd_h(k, w, v, gk, h0, metadata=metadata)
+    h, v_new, ht = chunk_gated_delta_rule_fwd_h(k, w, v, gk, h0, metadata=metadata, fastmath=True)
 
     num_chunks = triton.cdiv(T, 64)
     tag = f"T={T} h0={use_h0}"
@@ -789,7 +790,9 @@ def test_chunk_delta_h_fwd_fp32_path():
     gh, gvn, ght = _fwd_h_ref(k.double(), w.double(), v.double(), gk.double(), None)
     cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, T, 64)
-    h, v_new, ht = chunk_gated_delta_rule_fwd_h(k, w, v, gk, None, metadata=metadata)
+    h, v_new, ht = chunk_gated_delta_rule_fwd_h(
+        k, w, v, gk, None, metadata=metadata, fastmath=True
+    )
 
     num_chunks = triton.cdiv(T, 64)
     # TF32 mantissa error compounds through the sequential state updates, so
@@ -903,6 +906,7 @@ def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
         CAUSAL_NORMREF=causal_normref,
         GRID_NT=num_chunks,
         MAX_NT=num_chunks,
+        FASTMATH=True,
     )
     tag = f"T={T} H={H} K={K} causal_normref={causal_normref}"
     assert_golden(Aqk, gAqk, rAqk, dtype, f"fwd_intra Aqk {tag}")
@@ -965,6 +969,7 @@ def test_recompute_w_u_fwd_triton():
         q=q,
         gk=gk,
         chunk_size=64,
+        fastmath=True,
     )
 
     gW, gU, gQG, gKG = _recompute_wu_ref(
@@ -1047,7 +1052,18 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
 
     qb, kb, wb, dob, aqkb = (t.to(torch.bfloat16) for t in (q, k, w, do, aqk))
     dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_dv_fused(
-        qb, kb, wb, dob, aqkb, gk=gk, h0=h0, dht=dht, scale=scale, chunk_size=64, bv=bv
+        qb,
+        kb,
+        wb,
+        dob,
+        aqkb,
+        gk=gk,
+        h0=h0,
+        dht=dht,
+        scale=scale,
+        chunk_size=64,
+        bv=bv,
+        fastmath=False,
     )
     dvb = torch.empty(B, T, H, V, device="cuda", dtype=torch.bfloat16)
     for start in range(0, T, 64):
@@ -1103,7 +1119,7 @@ def test_delta_h_bwd_dhu_dispatch_selects_bv(monkeypatch, sm_count, expected_bv)
     monkeypatch.setattr(delta_h_bwd, "get_device_properties", lambda device: _Props())
     monkeypatch.setattr(delta_h_bwd, "blackwell_delta_h_bwd_dhu_dv_fused", fake_fused)
 
-    delta_h_bwd.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(q, q, q, zeros, zeros)
+    delta_h_bwd.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(q, q, q, zeros, zeros, fastmath=False)
     assert captured["bv"] == expected_bv
 
 
@@ -1171,6 +1187,7 @@ def test_chunk_kda_fwd_intra_cute():
         scale,
         None,
         chunk_size=64,
+        fastmath=False,
     )
 
     gAqk, gAkk = _inter_solve_ref(q.double(), k.double(), gk.double(), beta.double(), scale)
@@ -1263,6 +1280,7 @@ def test_chunk_kda_bwd_intra_cute():
         zb.clone(),
         zq.clone(),
         None,
+        fastmath=True,
     )
 
     gdq, gdk, gdb, gdg = _bwd_intra_ref(
@@ -1326,6 +1344,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
         None,
         scale=scale,
         chunk_size=64,
+        fastmath=False,
     )
 
     ref_args = (v_new, g, beta, A, h, do, dh, dv)

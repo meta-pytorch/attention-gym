@@ -56,7 +56,7 @@ def _prepare_chunk_kda_bwd(
     chunk_size: int,
     autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
-    fastmath: bool = False,
+    fastmath: bool,
 ) -> ChunkKDABwdPrepared:
     """Resolve intra factors and recompute local state before CP communication."""
     if Aqk is None:
@@ -241,7 +241,7 @@ def chunk_kda_bwd(
     *,
     scale: float,
     chunk_size: int = 64,
-    fastmath: bool = False,
+    fastmath: bool,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[

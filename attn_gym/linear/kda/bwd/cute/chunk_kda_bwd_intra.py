@@ -933,7 +933,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     use_int64_offsets: Constexpr,
     use_packed_f32x2: Constexpr,
     use_stmatrix: Constexpr,
-    fastmath: Constexpr = True,
+    fastmath: Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
@@ -1949,7 +1949,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         use_int64_offsets: bool,
         use_packed_f32x2: bool,
         use_stmatrix: bool,
-        fastmath: bool = True,
+        fastmath: bool,
     ):
         self.ragged = ragged
         self.use_int64_offsets = use_int64_offsets
@@ -2021,8 +2021,8 @@ def _compile_chunk_kda_bwd_intra(
     heads: int,
     ragged: bool,
     io_type: type[cutlass.Numeric],
-    use_int64_offsets: bool = False,
-    fastmath: bool = True,
+    use_int64_offsets: bool,
+    fastmath: bool,
 ):
     """Compile one persistent intra-chunk backward specialization."""
     target = get_compile_target()
@@ -2131,7 +2131,7 @@ class ChunkKdaBwdIntraTunable:
         cu_seqlens: torch.Tensor | None
         chunk_offsets: torch.Tensor | None
         capacity: int
-        fastmath: bool = True
+        fastmath: bool
 
     @staticmethod
     def default_config(args: Args, *, target: CompileTarget) -> ChunkKdaBwdIntraConfig:
@@ -2258,7 +2258,7 @@ def chunk_kda_bwd_intra(
     config: ChunkKdaBwdIntraConfig | None = None,
     autotune: bool = False,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
-    fastmath: bool = True,
+    fastmath: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run or tune the final dense or fixed-capacity ragged backward stage.
 

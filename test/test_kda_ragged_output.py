@@ -79,7 +79,9 @@ def test_ragged_output_composition_matches_reference(lengths):
     scale = 0.125
 
     expected = _reference(q, v, g, A, h, lengths, scale)
-    actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+    actual = output_module.chunk_gla_fwd_o_gk(
+        q, v, g, A, h, scale, metadata=metadata, fastmath=True
+    )
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
@@ -114,7 +116,9 @@ def test_ragged_output_routes_full_chunks_through_tma_and_masks_tails(monkeypatc
 
     expected = _reference(q, v, g, A, h, lengths, scale)
     expected_tma = output_module._can_use_tensor_descriptors(q, v, g, h, torch.empty_like(v), A)
-    actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
+    actual = output_module.chunk_gla_fwd_o_gk(
+        q, v, g, A, h, scale, metadata=metadata, fastmath=True
+    )
     assert launch_count == int(expected_tma)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
@@ -148,7 +152,7 @@ def test_ragged_output_replays_aligned_to_ragged(schedule):
 
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
     output_module.chunk_gla_fwd_o_gk(
-        q, v, g, A, h, scale, metadata=warm_metadata, schedule=schedule
+        q, v, g, A, h, scale, metadata=warm_metadata, schedule=schedule, fastmath=True
     )
     torch.cuda.synchronize()
 
@@ -156,7 +160,7 @@ def test_ragged_output_replays_aligned_to_ragged(schedule):
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
         actual = output_module.chunk_gla_fwd_o_gk(
-            q, v, g, A, h, scale, metadata=metadata, schedule=schedule
+            q, v, g, A, h, scale, metadata=metadata, schedule=schedule, fastmath=True
         )
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
@@ -198,10 +202,10 @@ def test_persistent_ragged_output_matches_static_over_capacity(lengths):
 
     expected = _reference(q, v, g, A, h, lengths, scale)
     static = output_module.chunk_gla_fwd_o_gk(
-        q, v, g, A, h, scale, metadata=metadata, schedule=ScheduleRequest.STATIC
+        q, v, g, A, h, scale, metadata=metadata, schedule=ScheduleRequest.STATIC, fastmath=True
     )
     persistent = output_module.chunk_gla_fwd_o_gk(
-        q, v, g, A, h, scale, metadata=metadata, schedule=ScheduleRequest.PERSISTENT
+        q, v, g, A, h, scale, metadata=metadata, schedule=ScheduleRequest.PERSISTENT, fastmath=True
     )
     torch.testing.assert_close(persistent[:, :tokens], expected[:, :tokens], atol=2e-2, rtol=2e-2)
     assert torch.equal(persistent[:, :tokens], static[:, :tokens])
@@ -217,9 +221,9 @@ def test_persistent_is_noop_for_dense_and_raises_off_the_packed_tma_path():
     h = torch.randn(1, 2, heads, dim, dim, device="cuda", dtype=torch.bfloat16) / 8
 
     # Dense launch grids are already exact, so the request is trivially satisfied.
-    dense = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, 0.125)
+    dense = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, 0.125, fastmath=True)
     dense_persistent = output_module.chunk_gla_fwd_o_gk(
-        q, v, g, A, h, 0.125, schedule=ScheduleRequest.PERSISTENT
+        q, v, g, A, h, 0.125, schedule=ScheduleRequest.PERSISTENT, fastmath=True
     )
     assert torch.equal(dense, dense_persistent)
 
@@ -236,6 +240,7 @@ def test_persistent_is_noop_for_dense_and_raises_off_the_packed_tma_path():
             0.125,
             metadata=metadata,
             schedule=ScheduleRequest.PERSISTENT,
+            fastmath=True,
         )
 
 
@@ -252,7 +257,7 @@ def test_ragged_output_zero_capacity_skips_launch():
         )
         assert metadata.capacity == 0
         output = output_module.chunk_gla_fwd_o_gk(
-            q, v, g, A, h, 0.125, metadata=metadata, schedule=schedule
+            q, v, g, A, h, 0.125, metadata=metadata, schedule=schedule, fastmath=True
         )
         assert output.shape == v.shape
 
@@ -278,7 +283,7 @@ def test_persistent_ragged_output_strides_multiple_tasks_per_worker(monkeypatch)
     h = torch.randn(1, metadata.capacity, heads, 128, 128, device="cuda", dtype=torch.bfloat16) / 8
 
     static = output_module.chunk_gla_fwd_o_gk(
-        q, v, g, A, h, 0.125, metadata=metadata, schedule=ScheduleRequest.STATIC
+        q, v, g, A, h, 0.125, metadata=metadata, schedule=ScheduleRequest.STATIC, fastmath=True
     )
     persistent = output_module.chunk_gla_fwd_o_gk(
         q,
@@ -289,5 +294,6 @@ def test_persistent_ragged_output_strides_multiple_tasks_per_worker(monkeypatch)
         0.125,
         metadata=metadata,
         schedule=ScheduleRequest.PERSISTENT,
+        fastmath=True,
     )
     assert torch.equal(persistent, static)

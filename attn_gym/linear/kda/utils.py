@@ -131,7 +131,7 @@ exp2 = triton_utils.exp2
 
 
 @triton.jit
-def masked_exp2(value, mask, FASTMATH: tl.constexpr = True):
+def masked_exp2(value, mask, FASTMATH: tl.constexpr):
     """Mask exponent inputs and select approximate or precise exponentiation."""
     exponent = tl.where(mask, value, 0.0)
     return tl.where(mask, exp2(exponent, FASTMATH), 0.0)

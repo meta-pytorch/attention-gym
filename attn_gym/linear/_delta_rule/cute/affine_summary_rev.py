@@ -158,7 +158,7 @@ class BlackwellDeltaAffineSummaryRev:
         io_type: type[cutlass.Numeric],
         use_int64_offsets: bool,
         whole_ranges: bool,
-        fastmath: bool = False,
+        fastmath: bool,
     ):
         self.num_heads = num_heads
         self.io_type = io_type
@@ -1474,7 +1474,7 @@ def build_state_grad_summaries(
     scale: float,
     bounds: torch.Tensor,
     *,
-    fastmath: bool | None = None,
+    fastmath: bool,
 ) -> torch.Tensor:
     """Compute one packed reverse affine summary per token range of a stream.
 
@@ -1489,7 +1489,6 @@ def build_state_grad_summaries(
         bounds: ``int32 [R, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
             same contract as ``build_state_summaries``.
         fastmath: Select fast or non-fast per-chunk decay, matching the local backward.
-            ``None`` selects fast Triton or non-fast SM100 exponentials.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as local bias then reverse
@@ -1559,8 +1558,6 @@ def build_state_grad_summaries(
     if capability < (8, 0):
         raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
     portable = not is_sm100_kda_capability(capability)
-    if fastmath is None:
-        fastmath = portable
     if portable:
         if capability[0] in (10, 12):
             from attn_gym._backends.triton.utils import configure_triton_allocator

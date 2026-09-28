@@ -158,7 +158,7 @@ class ChunkKDAPrepared:
     scale: float
     autotune: bool
     schedule: ScheduleRequest
-    fastmath: bool = True
+    fastmath: bool
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.

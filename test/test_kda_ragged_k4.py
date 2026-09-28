@@ -126,6 +126,7 @@ def test_ragged_inter_solve_accepts_all_empty_sequences(lengths, monkeypatch):
         Aqk,
         128**-0.5,
         metadata,
+        fastmath=True,
     )
 
     forced_akk = chunk_kda_fwd_k4b_ragged_cute(
@@ -201,6 +202,7 @@ def test_ragged_inter_solve_nonempty_resolves_once(monkeypatch):
         Aqk,
         128**-0.5,
         metadata,
+        fastmath=True,
     )
 
     assert actual_aqk.shape == Aqk.shape
