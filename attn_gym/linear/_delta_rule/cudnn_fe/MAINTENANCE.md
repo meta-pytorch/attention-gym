@@ -81,9 +81,13 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
    `--no-allowlist` is given. After the focused edits, run the full-package acceptance check:
    `python -m tools.cudnn_fe.audit --root "$candidate" --strict`. It must print `CLEAN`, including
    no stale entries in [`audit_allowlist.txt`](../../../../tools/cudnn_fe/audit_allowlist.txt).
-4. **SASS gate.** Before and after each B commit, snapshot every GDN/KDA cubin through the AG
-   drivers and diff SASS and resources. Accept identical instruction text and resources;
-   offset-only noise additionally needs unchanged mbarrier offsets, `DSMEM`, `REG` and `STACK`.
+4. **SASS gate.** Before and after each B commit run
+   `python -m tools.cudnn_fe.sass snapshot <dir> [--tree <ref_tree>]` (every GDN/KDA cubin through
+   the AG drivers), then `python -m tools.cudnn_fe.sass diff <ref> <new>`. Accept identical
+   instruction text and resources. Treat `same-histogram` as a review requirement, not proof of
+   equivalence; offset-only noise additionally needs unchanged mbarrier offsets, `DSMEM`, `REG`
+   and `STACK`. Use the same version of the gate on both trees; see
+   [sass/README.md](../../../../tools/cudnn_fe/sass/README.md).
 5. **Port the behavior layer (C/D).** For upstream-changed hosts/configs that AG converted to
    frozen dataclasses and `@jit_cache`, port the upstream semantic delta into the AG host; do not
    restore upstream live-tensor compilation. Check each item explicitly:
@@ -103,14 +107,22 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
    commit subject. Then run
    `python -m tools.cudnn_fe.verify_fixes --gpu-run --tree . --upstream-python <env>/bin/python`.
    Every fix must report `pass` or `no pytest guard`; `MISSING` means a guarding test was renamed,
-   so update `fixes.toml`.
+   so update `fixes.toml`. Compare with the [v1.30 baseline](WORKLOG.md#verification-baseline-v130).
 6. **Bug-reversal audit.** For every WORKLOG entry with "Fails without = YES", revert the
    production hunk in a scratch tree and confirm the guarding test fails, then passes restored.
    Update its narrative evidence.
-7. **CUTracer.** Run the CUTracer `random_delay` race stress over every pipelined kernel against a
-   bitwise oracle. Any new hang follows the cute-kernel-hang-debug skill.
-8. **Bench gate.** Compare forward, backward, summaries and paged paths with the previous stack
-   tip; fail above a 2% threshold, on output drift or on a changed launch set. Bisect regressions.
+7. **CUTracer.** `gpu-run --timeout 900 auto -- python -m tools.cudnn_fe.cutracer.stress --family all --ref-dir <reference> --out <results>`
+   records the bitwise oracle and runs the `random_delay` ladder (or `--mode deadlock`);
+   `results.md` must start with `PASS`. Alternatively, omit the outer reservation and pass
+   `--gpu-run` to reserve per attempt with no waiting (exit 75 stops the ladder). Never nest
+   reservations. Any new hang follows the cute-kernel-hang-debug skill; see
+   [cutracer/README.md](../../../../tools/cudnn_fe/cutracer/README.md).
+8. **Bench gate.** `python -m tools.cudnn_fe.bench run --suite gdn kda summary paged --new cand=. --base prev=<prev-tip-tree> --out <results>`
+   compares forward, backward, summaries and paged paths with the previous stack tip. It fails
+   above the 2% default threshold, on output drift or on a changed launch set;
+   `--threshold 0.01` selects a stricter run
+   (cells within ~1.3% have been noise on GB200). Bisect regressions; see
+   [bench/README.md](../../../../tools/cudnn_fe/bench/README.md).
 9. Update the tag everywhere (`NOTICE.md`, notices, this file), `fixes.toml`, then run
    `python -m tools.cudnn_fe.verify_fixes --write-ledger` to regenerate the index below
    (`test/test_cudnn_fe_tools_fixes.py` checks it is in sync). Update WORKLOG.md with findings

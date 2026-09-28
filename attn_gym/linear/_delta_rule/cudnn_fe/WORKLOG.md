@@ -351,6 +351,32 @@ Performance was not measured. Snapshots: `agent_space/f3/{before,after}`, report
 4. **A work-item count is not proof of non-vacuity (B9).** Counts grow from orthogonal tiling; pin
    the plan before asserting on them. Likewise, after deleting code, re-check that forced-path tests
    still reach the path (R4/S14).
+5. **Shared-worktree commits.** Several agents committed on this stack at once. Commit with
+   `git commit --only -- <paths>` (a bare commit picks up another agent's staged files), never
+   stash in a multi-worktree repo (the stash list is shared), and never amend or reset a branch
+   others are reading; key ledger rows on subjects, not hashes.
 6. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
    and one (B14) targets an ABI upstream lacks; the repros and `verify_fixes.py` classification keep
    hardening drafts from being filed as bug fixes.
+
+## Verification baseline (v1.30)
+
+`verify_fixes.py --tree <v1.30 stack> --upstream-python <env with stock nvidia-cudnn-frontend
+1.30.0>` on GB200 (2026-09-27), run with the pre-repo version of the script at "Add a cuDNN vendoring
+audit and a mechanical restyle codemod", before S15 existed. The in-repo script has not been re-run
+on the final branch yet.
+
+- **Tree:** all 53 guarding node ids collected and passed (pytest: 177 passed + 6 xfailed in the
+  main group; 4 passed in the stress group with `ATTN_GYM_RUN_STRESS_TESTS=1`). The ledger now has
+  **40 rows**, including S15. In that earlier run, 30 fixes and all 5 superseded/inherited guards
+  reported `pass`; the other 9 then-present fixes (R1, R3,
+  R11, R12, R13, R14, R16, S8/S6/S3, S10) are gated by SASS, bench or review only, as is S15 (added
+  later). The 6 xfails are R8's FP16 CP cases.
+- **Upstream (stock v1.30.0):** every reproducible bug is still present (B7, B6, B8, B10, B13, R7).
+  The hardening drafts (B2 → 07, S12 → 08) report no isolated bug (smoke passes on stock). B14's
+  scope check confirms upstream still lacks the optional-scheduler ABI.
+- **Positive control:** against the combined patched v1.30 checkout via `--upstream-pythonpath`, B8, B13
+  and R7 flip to "fixed upstream"; B10 stays "bug" by design (patch 04 is opt-in).
+
+After the next rebase, compare against this: any upstream row that flips to "fixed" is a candidate
+to drop (keep its test); any tree row that is not `pass` / `no pytest guard` blocks the upgrade.
