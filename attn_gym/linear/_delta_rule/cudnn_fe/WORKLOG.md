@@ -78,6 +78,10 @@ vendor the new tag.
   equal to main to three digits, dGate within ±13%, dBeta +4…7% (the gmem rebuild was +80…100%).
   All small-beta tests pass again (no xfail). Cost vs the gmem rebuild: fwd+bwd +2.4% at
   prefill_2048 and prefill_8x2048, +0.3% at train_10x4096, noise on the chain train_1x40960.
+  "Remove the unused gmem inverse-factor path from the GDN bprop" then deleted the dead
+  tinv_source knob, the CG0 T = I - T_b L rebuild, the T_b TMA loads, mb_t_inv_done and the
+  ninth (tinv) descriptor array: backward outputs bitwise equal on uncut, packed, split and chain
+  shapes; SASS differs only by the dropped barrier (one fewer mbarrier init, later offsets -0x10).
 
 ### B6 — KDA delta residual rounded before subtraction (C06) · numerics
 - **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large

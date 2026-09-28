@@ -228,7 +228,6 @@ def warmup_backward_host(
         work_count,
         work_items,
         scheduler_all_bprop,
-        None,
         bprop_words,
         stream,
     )

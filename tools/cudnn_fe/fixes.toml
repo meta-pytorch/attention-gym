@@ -38,7 +38,10 @@ id = "B7"
 title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps)"
 kind = "numerics"
 ag_subject = "Compute the GDN bprop dBeta without dividing by beta"
-ag_subjects_extra = ["Compute the GDN cuDNN bprop dBeta exactly with the in-kernel inverse"]
+ag_subjects_extra = [
+  "Compute the GDN cuDNN bprop dBeta exactly with the in-kernel inverse",
+  "Remove the unused gmem inverse-factor path from the GDN bprop",
+]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient",
   "test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference",

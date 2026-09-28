@@ -363,7 +363,6 @@ def chain_backward_tail_host(
         cu_pieces,
         dstate0,
         state_dx_end,
-        None,
         work_items,
         main_count,
         scheduler_bwd,
