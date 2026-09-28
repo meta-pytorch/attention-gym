@@ -237,17 +237,6 @@ def test_gdn_cudnn_backward_uniform_negative_twenty_is_finite(
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
-# The vendored v1.30 bprop folds beta into the T tile and recovers the beta-free V/M dBeta
-# terms as rowsum / (beta + 1e-10), so it returns beta / (beta + 1e-10) times the true dBeta
-# (0 at beta = 0, half at 1e-10), and beta-scaled fp16/bf16 operands underflow near zero. The
-# beta-free formulation fixed this but cost 1.5-2.6x dV/dBeta/dK precision at normal beta.
-SMALL_BETA_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="v1.30 GDN bprop divides by (beta + 1e-10): dBeta is lost as beta -> 0",
-)
-
-
-@SMALL_BETA_XFAIL
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("beta_value", (0.0, 1e-12, 1e-10, 1e-8))
 def test_gdn_cudnn_backward_preserves_small_beta_gradient(
@@ -279,7 +268,6 @@ def test_gdn_cudnn_backward_preserves_small_beta_gradient(
     assert gradients[4][0, 1, 0].item() == 1.0
 
 
-@SMALL_BETA_XFAIL
 def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
     """Direct dBeta must survive zero and small beta across persistent chunks."""
     inputs = make_gdn_test_inputs(

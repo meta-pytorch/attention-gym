@@ -37,8 +37,10 @@ Changes made for Attention Gym:
   compiled kernels persist across processes.
 - Bug fixes: mbarriers initialized by one thread (GDN prefill, summary, and backward); the KDA
   delta residual stays FP32 through subtraction and beta scaling in every kernel that forms it;
-  split tables omit empty and zero-chunk work items; scalar-gate split scans respect the head
-  stride; split-table replay preserves the scheduler-counter ABI; per-channel gates are checked for the vectorized scan's row alignment.
+  the GDN bprop computes dBeta without dividing by beta, from the beta-free inverse factor it
+  builds in-kernel; split tables omit empty and zero-chunk work items; scalar-gate split scans
+  respect the head stride; split-table replay preserves the scheduler-counter ABI; per-channel
+  gates are checked for the vectorized scan's row alignment.
 - Features: paged recurrent state (null, fresh, and empty-sequence semantics) in the GDN and KDA
   prefill kernels, and context-parallel forward and reverse state summaries over arbitrary bounds.
 - Validation: host launch contracts are checked before compiling (work-table and scratch shapes,

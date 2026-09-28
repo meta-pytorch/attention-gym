@@ -411,7 +411,6 @@ def gdn_backward(
             scheduler_counter=schedulers[2:4],
             workspace=bprop_words,
             num_sm=plan.num_sm,
-            tinv=common["tinv"],
             bundle_validated=True,  # build_warmup_backward checked the shared bundle
         )
 

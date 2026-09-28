@@ -69,6 +69,15 @@ vendor the new tag.
   1.4–2.4% faster. The small-beta tests are strict xfails documenting dBeta = beta/(beta + 1e-10) × true.
   Candidate to restore exactness: tinv_source="compute" (in-kernel beta-free inverse) measured
   main-level dK/dV with exact beta = 0 at 0–2.4% fwd+bwd over the reverted fix.
+- **Restored with the in-kernel inverse** ("Compute the GDN cuDNN bprop dBeta exactly with the
+  in-kernel inverse"): the beta-free logic is back and both backward plans (uncut/warmup and chain
+  tail) run the bprop with tinv_source="compute", so CG0 inverts bf16 M_kk in place (the same
+  blockwise inverse as gdn_tinv_f16) instead of rebuilding T from the bf16 T_b tile. The T pass
+  still runs for the checkpoint recompute; the bprop no longer loads its tile. Worst relL2 over 4
+  layers vs main (fp64 reference, steps 2500/15000/27500, packed_16k and longdoc_32k): dK and dV
+  equal to main to three digits, dGate within ±13%, dBeta +4…7% (the gmem rebuild was +80…100%).
+  All small-beta tests pass again (no xfail). Cost vs the gmem rebuild: fwd+bwd +2.4% at
+  prefill_2048 and prefill_8x2048, +0.3% at train_10x4096, noise on the chain train_1x40960.
 
 ### B6 — KDA delta residual rounded before subtraction (C06) · numerics
 - **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large

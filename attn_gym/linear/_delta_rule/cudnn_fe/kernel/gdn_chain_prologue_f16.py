@@ -342,7 +342,7 @@ def frost_gdn_chain_prologue(
                 dq,
                 dk,
                 dv,
-                tinv,
+                None,
                 n_pieces,
                 checkpoint_every_n,
                 b_t,

@@ -363,7 +363,7 @@ def chain_backward_tail_host(
         cu_pieces,
         dstate0,
         state_dx_end,
-        tinv,
+        None,
         work_items,
         main_count,
         scheduler_bwd,
@@ -458,7 +458,6 @@ def _build_cfgs(cfg_args):
         log_gate=log_gate,
         d_k=d_k,
         d_v=d_v,
-        tinv_source="gmem",
     )
     return tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg
 
