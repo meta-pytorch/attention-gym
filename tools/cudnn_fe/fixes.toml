@@ -1,0 +1,29 @@
+# Authoritative ledger of every Attention Gym change on top of the vendored cudnn-frontend.
+# Generate the MAINTENANCE.md index with python -m tools.cudnn_fe.verify_fixes --write-ledger;
+# WORKLOG.md next to it holds the narrative. Run verify_fixes after every upstream rebase;
+# test/test_cudnn_fe_tools_fixes.py checks the generated index and guarding test pointers.
+#
+# Fields per [[fix]]:
+#   id, title, kind       ledger ID, one-line summary, category
+#                         (bugfix | numerics | feature | perf | restyle | validation | pruning | test)
+#   ag_subject            primary stack commit subject (key on subjects; hashes change on rebase)
+#   ag_subjects_extra     other commits of the same ledger item
+#   guarding_tests        pytest node ids relative to the repo root ([] when only a gate applies)
+#   gate                  non-pytest acceptance gate (sass, bench, cutracer, review)
+#   env                   extra environment for the guarding tests (stress tests are opt-in)
+#   upstream_patch/repro  paths relative to tools/cudnn_fe/ (upstream/ holds DRAFT patches)
+#   upstream_runs         argument lists for the repro, one run each
+#   upstream_expect       "bug"   -> nonzero exit with a bug signature = bug still present upstream
+#                         "smoke" -> hardening; stock and patched both pass (no isolated bug)
+#                         "scope" -> exit 0 = upstream still lacks the surface our fix relies on
+#   upstream_bug_patterns extra regexes that count as a reproduced bug for this repro
+#   upstream_status       draft-not-filed          bug reproduced on stock, patch drafted, not filed
+#                         hardening-draft          no isolated failure on stock, patch drafted
+#                         superseded-by-v1.30      upstream already fixes it; test kept
+#                         excluded-no-upstream-abi AG-only ABI; no upstream equivalent
+#                         ag-specific              AG integration/style/test; nothing to upstream
+#                         nv-surface-removed       AG deleted upstream surface it does not use
+#                         candidate-no-patch       could be upstreamed, no patch drafted yet
+# [[superseded]] entries have no AG commit; their tests are kept and run too.
+
+fix = []
