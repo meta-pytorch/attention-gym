@@ -5,7 +5,7 @@ import torch
 
 pytest.importorskip("cutlass.cute")
 
-from attn_gym.linear._delta_rule.cudnn_fe.common import gate_bwd, split_k
+from attn_gym.linear._delta_rule.cudnn_fe.common import split_k
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -114,40 +114,18 @@ def test_split_table_replay_preserves_absent_scheduler_abi():
         stream=stream,
     )
     unrelated_counter = torch.full((2,), 37, dtype=torch.int32, device="cuda")
-    split_k.run_table(
-        recipe, gate, None, None, cu, chunks, staging, items, count, unrelated_counter, stream
-    )
+    split_k.run_table(recipe, gate, cu, chunks, staging, items, count, unrelated_counter, stream)
     assert count.item() == 2
     assert unrelated_counter.tolist() == [37, 37]
 
 
-def test_channel_gate_parameter_rows_may_be_strided():
-    """Parameter and gradient head strides are dynamic, not a compact-buffer contract."""
-    torch.manual_seed(42)
-    raw = torch.randn(32, 2, 64, device="cuda")
-    incoming = torch.randn_like(raw)
-    a_log = torch.zeros(2, device="cuda")
-    bias_storage = torch.randn(2, 128, device="cuda")
-    bias = bias_storage[:, :64]
-    results = []
-    for strided in (False, True):
-        gradient = incoming.clone()
-        da = torch.empty_like(a_log)
-        db = torch.empty_like(bias_storage)[:, :64] if strided else torch.empty_like(bias)
-        part_a = torch.empty(gate_bwd.GATE_BWD_BLOCKS * 2 * 64, device="cuda")
-        part_dt = torch.empty_like(part_a)
-        gate_bwd.channel_gate_bwd(
-            gradient,
-            raw,
-            a_log,
-            bias if strided else bias.contiguous(),
-            da,
-            db,
-            part_a,
-            part_dt,
-            -1.0,
-            stream=torch.cuda.current_stream().cuda_stream,
-        )
-        results.append((gradient, da, db))
-    for strided, compact in zip(results[1], results[0]):
-        torch.testing.assert_close(strided, compact, rtol=0, atol=0)
+def test_cudnn_dtype_names_are_exact():
+    """Dtype names match exactly; substrings of a supported name are rejected."""
+    import cutlass
+
+    from attn_gym.linear._delta_rule.cudnn_fe.common.host import get_dtype
+
+    assert get_dtype(torch.float16) is cutlass.Float16
+    assert get_dtype("half") is cutlass.Float16
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        get_dtype("torch.bfloat16_suffix")

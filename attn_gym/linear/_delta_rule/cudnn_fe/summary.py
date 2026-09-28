@@ -31,18 +31,13 @@ from attn_gym._backends.cute.utils import (
 )
 from attn_gym.utils import ceildiv
 
-from .common.host import get_dtype, tensormap_workspace_bytes
+from .common.host import get_dtype
 from .common.split_k import WORK_ITEM_FIELDS
 from .kernel import kda_bprop_summary_f16, kda_summary_f16
+from .plan import int32, workspace
 
-# Staged KDA tensors: natural-log FP32 channel gate, FP32 post-sigmoid beta, normalized keys.
-_GATE = {
-    "l2norm": False,
-    "safe_gate": False,
-    "log_gate": True,
-    "beta_sigmoid": False,
-    "allow_neg_eigval": False,
-}
+# Staged KDA tensors: natural-log FP32 channel gate (log_gate), FP32 post-sigmoid beta,
+# normalized keys.
 _GATE_SCALE_LOG2 = kda_summary_f16.DEFAULT_GATE_LOWER_BOUND * kda_summary_f16.LOG2_E
 
 
@@ -152,7 +147,7 @@ class _Launch:
         work_items = torch.empty(
             sequences * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
         )
-        work_count = torch.empty(1, dtype=torch.int32, device=device)
+        work_count = int32(1, device)
         _select_summary_work[(sequences, heads)](
             cu_seqlens,
             work_count if bounds is None else bounds,
@@ -162,16 +157,11 @@ class _Launch:
             0 if bounds is None else bounds.shape[0],
             WORK_ITEM_FIELDS,
         )
-        workspace = torch.empty(
-            ceildiv(tensormap_workspace_bytes(kernel, sequences), 8),
-            dtype=torch.int64,
-            device=device,
-        )
         return cls(
             work_items,
             work_count,
-            torch.empty(2, dtype=torch.int32, device=device),
-            workspace,
+            int32(2, device),
+            workspace(kernel, sequences, device),
             get_device_properties(device).multi_processor_count,
         )
 
@@ -206,31 +196,25 @@ def _forward_summary(
     )
     cu_dtype = cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32
     prologue = kda_summary_f16._compile_kda_summary_prologue(
-        get_dtype(k.dtype),
-        get_dtype(gate.dtype),
-        cu_dtype,
-        False,
-        False,
-        use_int64_offsets,
+        io_dtype=get_dtype(k.dtype),
+        gate_dtype=get_dtype(gate.dtype),
+        cu_seqlens_dtype=cu_dtype,
+        run_order=False,
+        order_gen=False,
+        use_int64_offsets=use_int64_offsets,
     )
     compiled = kda_summary_f16._compile_kda_summary(
-        get_dtype(k.dtype),
-        get_dtype(gate.dtype),
-        get_dtype(beta.dtype),
-        None,
-        None,
-        cu_dtype,
-        None,
-        k.shape[-1],
-        v.shape[-1],
-        _GATE["l2norm"],
-        _GATE["safe_gate"],
-        _GATE_SCALE_LOG2,
-        _GATE["log_gate"],
-        _GATE["beta_sigmoid"],
-        _GATE["allow_neg_eigval"],
-        launch.num_sm,
-        use_int64_offsets,
+        io_dtype=get_dtype(k.dtype),
+        gate_dtype=get_dtype(gate.dtype),
+        beta_dtype=get_dtype(beta.dtype),
+        cu_seqlens_dtype=cu_dtype,
+        state_in_dtype=None,
+        d_k=k.shape[-1],
+        d_v=v.shape[-1],
+        gate_scale_log2=_GATE_SCALE_LOG2,
+        log_gate=True,
+        num_sm=launch.num_sm,
+        use_int64_offsets=use_int64_offsets,
     )
     launch.reset()
     prologue(
@@ -248,8 +232,6 @@ def _forward_summary(
         k,
         v,
         gate,
-        None,
-        None,
         beta,
         cu_seqlens,
         None,
@@ -291,36 +273,30 @@ def _reverse_summary(
     )
     cu_dtype = cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32
     prologue = kda_bprop_summary_f16._compile_kda_bprop_summary_prologue(
-        get_dtype(q.dtype),
-        get_dtype(gate.dtype),
-        cu_dtype,
-        False,
-        False,
-        False,
-        use_int64_offsets,
+        io_dtype=get_dtype(q.dtype),
+        gate_dtype=get_dtype(gate.dtype),
+        cu_seqlens_dtype=cu_dtype,
+        run_order=False,
+        order_gen=False,
+        has_sched=False,
+        use_int64_offsets=use_int64_offsets,
     )
     compiled = kda_bprop_summary_f16._compile_kda_bprop_summary(
-        get_dtype(q.dtype),
-        get_dtype(gate.dtype),
-        None,
-        None,
-        cu_dtype,
-        get_dtype(beta.dtype),
-        get_dtype(d_initial_state.dtype),
-        None if d_final_state is None else get_dtype(d_final_state.dtype),
-        d_final_state is not None,
-        _GATE["l2norm"],
-        _GATE["safe_gate"],
-        _GATE_SCALE_LOG2,
-        _GATE["log_gate"],
-        _GATE["beta_sigmoid"],
-        _GATE["allow_neg_eigval"],
-        1,
-        1,
-        q.shape[-1],
-        d_output.shape[-1],
-        launch.num_sm,
-        use_int64_offsets,
+        io_dtype=get_dtype(q.dtype),
+        gate_dtype=get_dtype(gate.dtype),
+        cu_seqlens_dtype=cu_dtype,
+        beta_dtype=get_dtype(beta.dtype),
+        dstate0_dtype=get_dtype(d_initial_state.dtype),
+        dstate_in_dtype=None if d_final_state is None else get_dtype(d_final_state.dtype),
+        use_dstate_in=d_final_state is not None,
+        gate_scale_log2=_GATE_SCALE_LOG2,
+        log_gate=True,
+        q_ratio=1,
+        k_ratio=1,
+        d_k=q.shape[-1],
+        d_v=d_output.shape[-1],
+        num_sm=launch.num_sm,
+        use_int64_offsets=use_int64_offsets,
     )
     launch.reset()
     prologue(
@@ -338,8 +314,6 @@ def _reverse_summary(
     compiled(
         cutlass.Int32(1),
         cutlass.Int32(1),
-        None,
-        None,
         beta,
         cu_seqlens,
         d_initial_state,

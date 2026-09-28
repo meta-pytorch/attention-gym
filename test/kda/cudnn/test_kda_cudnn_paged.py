@@ -331,3 +331,43 @@ def test_cudnn_paged_runs_the_native_driver(monkeypatch) -> None:
             kda.kda_forward(
                 *packed, scale=1.0, initial_state=pool, state_indices=state_indices, **options
             )
+
+
+def test_cudnn_paged_writes_every_token_up_to_the_last_interval() -> None:
+    """Every token in ``[0, cu_seqlens[-1])`` is written: sequence tokens with their output and
+    null-route tokens with zeros. Rows past ``cu_seqlens[-1]`` are unspecified (not written)."""
+    q, k, value, gate, beta = make_kda_test_inputs(128, heads=2, seed=3)
+    cu_seqlens = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
+    pool = torch.zeros(2, 2, 128, 128, device="cuda")
+    state_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    expected, _final = chunk_kda(
+        *(t[:, 32:96] for t in (q, k, value, gate, beta)),
+        pool[1:2].clone(),
+        cu_seqlens=torch.tensor([0, 64], device="cuda", dtype=torch.int32),
+        output_final_state=True,
+        kernel_options=_CUDNN,
+    )
+
+    def paged(pool):
+        with torch.no_grad():
+            return paged_chunk_kda(
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                pool,
+                state_indices,
+                cu_seqlens=cu_seqlens,
+                kernel_options=_CUDNN,
+            )
+
+    paged(pool.clone())
+    # Leave NaN-filled output-sized blocks in the caching allocator so an unwritten token shows.
+    poison = [torch.full_like(value, torch.nan) for _ in range(4)]
+    del poison
+
+    output = paged(pool)
+
+    torch.testing.assert_close(output[:, :32], torch.zeros_like(output[:, :32]), rtol=0, atol=0)
+    torch.testing.assert_close(output[:, 32:96], expected, rtol=0, atol=0)

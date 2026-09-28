@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe.
+# attn_gym.linear._delta_rule.cudnn_fe; register arrays restyled to cute.make_rmem_tensor.
 
 """Blockwise inverse of the beta-folded chunk matrix ``I + strict_lower(M)``."""
 
@@ -55,7 +55,7 @@ def blockwise_diagonal_8x8_to_16x16(cfg, base, raw_base, d_idx, lane_idx):
     c_frag = nvvm.ldmatrix(raw_base + off_c, 1, nvvm.MMALayout.COL)
 
     # ---- T = -(D^-1 @ C) -------------------------------------------------------------
-    c_regs = cutlass.Array(cutlass.Float32, 4, alignment=16, space=cutlass.AddressSpace.rmem)
+    c_regs = cute.make_rmem_tensor((4,), cutlass.Float32)
     for i in cutlass.range_constexpr(4):
         c_regs[i] = cutlass.Float32(0.0)
     mma_step_k8(
@@ -67,7 +67,7 @@ def blockwise_diagonal_8x8_to_16x16(cfg, base, raw_base, d_idx, lane_idx):
 
     # ---- C = T @ A^-1 ----------------------------------------------------------------
     a_inv_frag = nvvm.ldmatrix(base + off_a_inv, 1, nvvm.MMALayout.COL)
-    o_regs = cutlass.Array(cutlass.Float32, 4, alignment=16, space=cutlass.AddressSpace.rmem)
+    o_regs = cute.make_rmem_tensor((4,), cutlass.Float32)
     for i in cutlass.range_constexpr(4):
         o_regs[i] = cutlass.Float32(0.0)
     mma_step_k8(o_regs, a_pack, [a_inv_frag], k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype)
@@ -92,7 +92,7 @@ def blockwise_diagonal_16x16_to_32x32(cfg, base, raw_base, d_idx, lane_idx):
     c_frags = list(nvvm.ldmatrix(raw_base + off_c, 4, nvvm.MMALayout.COL))
 
     # ---- T = -(D^-1 @ C) -------------------------------------------------------------
-    c_regs = cutlass.Array(cutlass.Float32, 8, alignment=16, space=cutlass.AddressSpace.rmem)
+    c_regs = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         c_regs[i] = cutlass.Float32(0.0)
     mma_step(c_regs, d_inv_frags, c_frags, k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
@@ -102,7 +102,7 @@ def blockwise_diagonal_16x16_to_32x32(cfg, base, raw_base, d_idx, lane_idx):
 
     # ---- C = T @ A^-1 ----------------------------------------------------------------
     a_inv_frags = list(nvvm.ldmatrix(base + off_a_inv, 4, nvvm.MMALayout.COL))
-    o_regs = cutlass.Array(cutlass.Float32, 8, alignment=16, space=cutlass.AddressSpace.rmem)
+    o_regs = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         o_regs[i] = cutlass.Float32(0.0)
     mma_step(o_regs, a_pack, a_inv_frags, k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
@@ -144,7 +144,7 @@ def blockwise_diagonal_32x32_to_64x64(
         )
 
     # ---- T = -(D^-1 @ C) -------------------------------------------------------------
-    c_regs = cutlass.Array(cutlass.Float32, 16, alignment=16, space=cutlass.AddressSpace.rmem)
+    c_regs = cute.make_rmem_tensor((16,), cutlass.Float32)
     for i in cutlass.range_constexpr(16):
         c_regs[i] = cutlass.Float32(0.0)
     for ks in cutlass.range_constexpr(2):
@@ -172,7 +172,7 @@ def blockwise_diagonal_32x32_to_64x64(
                 nvvm.MMALayout.COL,
             )
         )
-    o_regs = cutlass.Array(cutlass.Float32, 16, alignment=16, space=cutlass.AddressSpace.rmem)
+    o_regs = cute.make_rmem_tensor((16,), cutlass.Float32)
     for i in cutlass.range_constexpr(16):
         o_regs[i] = cutlass.Float32(0.0)
     for ks in cutlass.range_constexpr(2):
@@ -213,7 +213,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     zero = opaque_i32_zero()
 
     # ---- L4 = blockdiag_4(L), S = L4 @ L4 ---------------------------------------------
-    l4 = cutlass.Array(cutlass.Float32, 8, alignment=16)
+    l4 = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         if cutlass.const_expr((i % 4) // 2 == i // 4):
             l4[i] = l_regs[i] if on_diagonal_block else cutlass.Float32(0.0)
@@ -221,7 +221,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
             l4[i] = cutlass.Float32(0.0)
     l4_a0 = fp32_to_fp16(l4[0], l4[1], dtype=cfg.io_dtype)
     l4_a3 = fp32_to_fp16(l4[6], l4[7], dtype=cfg.io_dtype)
-    s = cutlass.Array(cutlass.Float32, 8, alignment=16)
+    s = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         s[i] = cutlass.Float32(0.0)
     mma_step(
@@ -235,7 +235,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     )
 
     # ---- D4 = I - L4 + S - L4 @ S -------------------------------------------------------
-    d4 = cutlass.Array(cutlass.Float32, 8, alignment=16)
+    d4 = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         if cutlass.const_expr((i % 4) // 2 == i // 4):
             eye = cutlass.Float32(1.0) if row_lo == col_lo + (i % 2) else cutlass.Float32(0.0)
@@ -263,7 +263,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     c4_b3 = movmatrix_16b(fp32_to_fp16(c4_hi0, c4_hi1, dtype=cfg.io_dtype))
     d4_a0 = fp32_to_fp16(d4[0], d4[1], dtype=cfg.io_dtype)
     d4_a3 = fp32_to_fp16(d4[6], d4[7], dtype=cfg.io_dtype)
-    m = cutlass.Array(cutlass.Float32, 8, alignment=16)
+    m = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         m[i] = cutlass.Float32(0.0)
     mma_step(
@@ -277,7 +277,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     )
 
     # ---- D8 = D4 - M @ D4 ---------------------------------------------------------------
-    d8 = cutlass.Array(cutlass.Float32, 8, alignment=16)
+    d8 = cute.make_rmem_tensor((8,), cutlass.Float32)
     for i in cutlass.range_constexpr(8):
         d8[i] = d4[i]
     neg_m_a0 = fp32_to_fp16(-m[0], -m[1], dtype=cfg.io_dtype)
@@ -296,7 +296,7 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     c8_b1 = movmatrix_16b(fp32_to_fp16(l_regs[2], l_regs[3], dtype=cfg.io_dtype))
     d8_a0 = fp32_to_fp16(d8[0], d8[1], dtype=cfg.io_dtype)
     d8_a3 = fp32_to_fp16(d8[6], d8[7], dtype=cfg.io_dtype)
-    m8 = cutlass.Array(cutlass.Float32, 4, alignment=16)
+    m8 = cute.make_rmem_tensor((4,), cutlass.Float32)
     for i in cutlass.range_constexpr(4):
         m8[i] = cutlass.Float32(0.0)
     mma_step(

@@ -143,39 +143,56 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 23 modification rows below are generated from
+The 40 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 23 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 40 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
 | B7 | GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps) | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_preserves_small_beta_gradient`; `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_mixed_small_beta_matches_reference` |
 | B6 | KDA delta residual kept in FP32 through subtraction and beta scaling (fwd + bwd) | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32`; `test/kda/cudnn/test_delta_rule_numerics.py::test_kda_cudnn_delta_residual_keeps_fp32_precision` |
-| B8 | Compact empty cu_seqlens intervals out of the unsplit work table | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work` |
+| B8 | Compact empty cu_seqlens intervals out of the unsplit work table | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work`; `test/kda/cudnn/test_kda_cudnn_v130.py::test_cudnn_compaction_keeps_empty_state_cotangents` |
 | B10 | Split-table walk omits zero-chunk sequences | `test/test_cudnn_fe_common.py::test_split_table_omits_zero_chunk_sequences` |
 | B13 | Scalar-gate split scan uses the head stride instead of assuming 1 | `test/test_cudnn_fe_common.py::test_scalar_split_scan_respects_head_stride` |
 | B14 | Split-table replay passes sched_ctr only when compiled with it | `test/test_cudnn_fe_common.py::test_split_table_replay_preserves_absent_scheduler_abi` |
+| E12 | get_dtype matches exact dtype names, not substrings | `test/test_cudnn_fe_common.py::test_cudnn_dtype_names_are_exact` |
 | B15 | Driver launch caches keyed on static config, not shape | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default`; `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration` |
 | B16 | Copy 4-byte-aligned gate/beta to 16-byte bases | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta` |
+| R15 | Composed KDA stateful bwd gets a compact 128-byte-aligned beta; traceable under Dynamo | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_stateful_backward_accepts_forward_beta_layouts`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_training_fullgraph_and_six_gradients` |
 | R3 | Warmup forward state_in/state_out get independent fake extents | none (no dedicated test; covered indirectly by GDN warmup split tests) |
+| R4 | Restore kda_recompute int64 selector; stop forcing selectors on GDN modules that no longer launch | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32` |
 | F1/F2/F4/F6/F9 | GDN/KDA drivers (uncut, d_v split, prep, chain, warmup split, staged stateful bwd, AG plan floors) | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference` |
 | F7/F8 | Native CP forward summaries [B;A] and reverse maps [C;R] for arbitrary bounds | `test/kda/cudnn/test_kda_cudnn_native_summary.py::test_native_selected_bounds` |
 | F5 | Grouped q/k GDN backward through deterministic AG group_sum | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_grouped_h4_h12_forward_backward` |
 | F3 | Paged recurrent state (null/fresh/resumed/empty routes) in the v1.30 GDN/KDA prefill | `test/test_cudnn_fe_paged_order.py::test_paged_order_keeps_only_nonempty_and_fresh_empty_routes`; `test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_are_null`; `test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_negative_and_zero_routes_never_touch_the_pool` |
+| R6 | Paged outputs past cu_seqlens[-1] documented as unspecified (zero-fill reverted for cost) | `test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval`; `test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval` |
+| R1 | Restore upstream SMEM order (tiles before barriers) in GDN prefill/tinv/summary | bench (tools/cudnn_fe/bench; gdn_prefill main kernel vs previous tip) |
 | R2 | compile_tvm_ffi takes opt_level; hosts keep O2 | `test/test_cute_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option` |
 | S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
 | S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
 | S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration`; `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
+| S15 | Remaining exact KDA prefill swizzle forms; common-helper rmem tensors; state-chain SharedStorage | sass (55/55 byte-identical SASS and resources) |
+| R5 | Driver simplification: shared plan.py, no device/stream args, shared allocators, _GATE_FLAGS | `test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference`; sass + existing suites bitwise unchanged |
+| S10 | Ruff lint/format the vendored kernels | sass (42/42 identical) |
+| R16 | Rename sdq_reduction to v_term_scratch; dedupe residual_f16x2; host docstring | sass |
 | S12 | Launch-contract validation before compile; scheduler arrivals derived from warp counts | `test/test_cudnn_fe_launch_contract.py::test_split_table_rejects_invalid_launch_geometry`; `test/test_cudnn_fe_launch_contract.py::test_warp_role_and_named_barrier_tables_reject_conflicts`; `test/test_cudnn_fe_launch_contract.py::test_gdn_backward_cfgs_reject_unsupported_geometry`; `test/test_cudnn_fe_launch_contract.py::test_gdn_bprop_host_rejects_invalid_launch_metadata`; `test/test_cudnn_fe_launch_contract.py::test_gdn_warmup_backward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_gdn_chain_backward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_kda_forward_cfgs_reject_unsupported_geometry`; `test/test_cudnn_fe_launch_contract.py::test_kda_warmup_forward_rejects_invalid_plan_buffers`; `test/test_cudnn_fe_launch_contract.py::test_kda_chain_forward_rejects_invalid_plan_buffers` |
 | R7 | Reject misaligned per-channel gate rows before the vectorized split scan | `test/kda/cudnn/test_kda_cudnn_forward.py::test_cudnn_split_table_rejects_misaligned_vector_gate_rows` |
 | B2 | Elect-one (thread 0) mbarrier init in GDN prefill/bprop/recompute/bprop_summary/summary | `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary`; `test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_backward_crosses_wave_boundary`; cutracer random_delay (hardening; tests pass without the fix) |
 | S14 | int64 ABI selectors, wide-extent GDN forward variant, non-vacuous forced-int64 tests | `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32`; `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32`; `test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path` |
+| R10 | Delete the legacy 085d50b kernel copy, schedule.py, kda_plain_gate_bwd | `test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies` |
+| R11 | Drop the GDP d_v=64 bprop fork from the GDN chain prologue | vendor.py applies the GDP fork cut automatically; import test |
+| R13 | Delete unreached/test-only upstream code (gate_bwd, head_reduce, l2norm, standalone hosts, ...) | reachability (package import + full suite) |
+| R14 | Prune upstream-only constexpr knobs AG never sets | sass (51/51 identical) |
+| R12 | Accurate NOTICE.md and per-file modification notices | review (notices list every ledger row touching the file) |
 | B3 | Test: native KDA stateful bwd past sort capacity with zero-chunk items (fix is upstream) | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backward_past_sort_capacity_runs_empty_work_items` |
+| B9 | Test: contracting-gate split test pins the uncut plan so an ignored split fails | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate` |
+| B17 | Test: GDN backward rejects HQ > HV before dispatch | `test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads` |
 | R8 | Sharded KDA dbeta bounded by the operand-pack budget | `test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op` |
+| R9 | Tighten tests: cache_info reuse, match= on raises, stress rename | `test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress` |
 <!-- END GENERATED FIX LEDGER -->
 
 Superseded by v1.30 (no AG commit; tests kept): B1 seeded-state wait, B5 KDA FP32 factors,

@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. Block-scale, multi-CTA, FP8 mma.sync, and ldmatrix
-# B-fragment helpers unused by the vendored kernels were removed.
+# attn_gym.linear._delta_rule.cudnn_fe. Block-scale and multi-CTA tcgen05 paths, the standalone
+# m16n8k16/FP8 m16n8k32 mma.sync wrappers, and the ldmatrix B-fragment loaders and mma wrapper
+# unused by the vendored kernels were removed.
 
 
 import cutlass

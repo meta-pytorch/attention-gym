@@ -3,17 +3,15 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe. TMEM reduction loads, register-tile and vector helpers,
-# FP8/FP4/MX conversions, and the exp2 emulation unused by the vendored kernels were removed;
-# fadd2 uses the cute.arch packed wrapper; beta_residual_f16x2 stages the KDA delta residual in
-# FP32.
+# FP8/FP4/MX conversions, the exp2 emulation, and the packed mul/sigmoid, lane_group_sum,
+# l2norm_inv, and sigmoid2 helpers unused by the vendored kernels were removed; fadd2 uses the
+# cute.arch packed wrapper; beta_residual_f16x2 was added to stage the KDA delta residual in
+# FP32 (optionally without beta).
 
 
 import cutlass
 from cutlass import cute
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
-from cutlass.experimental import primitives as nvvm
-
-L2_NORM_EPS = 1.0e-12
 
 
 @cute.jit
@@ -80,7 +78,7 @@ def opaque_i32_zero():
     """A packed-zero b32 word the optimizer cannot prove constant.
 
     Same libNVVM immediate-constraint hazard as :func:`opaque_f32_zero`, for
-    the packed 16x2 operands (:func:`sub_f16x2` / :func:`mul_f16x2`)."""
+    the packed 16x2 operands of :func:`sub_f16x2`."""
     return inline_ptx("mov.b32 $0, 0;", write_only_types=[cutlass.Int32])
 
 
@@ -135,16 +133,6 @@ def movmatrix_16b(value: cutlass.Int32) -> cutlass.Int32:
 
 
 @cute.jit
-def mul_fp16x2(value: cutlass.Int32, scale: cutlass.Int32) -> cutlass.Int32:
-    """Multiply two packed FP16 pairs."""
-    return inline_ptx(
-        "mul.f16x2 $0, $1, $2;",
-        write_only_types=[cutlass.Int32],
-        read_only_args=[value, scale],
-    )
-
-
-@cute.jit
 def sub_f16x2(
     lhs: cutlass.Int32, rhs: cutlass.Int32, input_dtype: cutlass.Constexpr
 ) -> cutlass.Int32:
@@ -156,16 +144,6 @@ def sub_f16x2(
     return inline_ptx(
         "sub.f16x2 $0, $1, $2;", write_only_types=[cutlass.Int32], read_only_args=[lhs, rhs]
     )
-
-
-@cute.jit
-def mul_f16x2(
-    lhs: cutlass.Int32, rhs: cutlass.Int32, input_dtype: cutlass.Constexpr
-) -> cutlass.Int32:
-    """Multiply two packed pairs using the compile-time input dtype."""
-    if cutlass.const_expr(input_dtype is cutlass.BFloat16):
-        return nvvm.mul_bf16x2(lhs, rhs)
-    return mul_fp16x2(lhs, rhs)
 
 
 @cute.jit
@@ -184,34 +162,16 @@ def beta_residual_f16x2(
     accumulator; ``state_k`` may be omitted when no state is carried in.  The
     subtraction and beta scaling run in fp32 so the only rounding is the
     final pack into the b16 MMA operand.  Also returns the fp32 residual for
-    consumers such as the dBeta v-term.
+    consumers such as the dBeta v-term.  ``beta_lo=None`` skips the scaling
+    (callers that apply beta later, e.g. through the KDA prep factors).
     """
     v_lo, v_hi = f16x2_to_f32(v_pair, dtype=dtype)
     if cutlass.const_expr(state_k_lo is not None):
         v_lo, v_hi = fadd2(v_lo, v_hi, -state_k_lo, -state_k_hi)
+    if cutlass.const_expr(beta_lo is None):
+        return fp32_to_fp16(v_lo, v_hi, dtype=dtype), v_lo, v_hi
     y_lo, y_hi = fmul2(beta_lo, beta_hi, v_lo, v_hi)
     return fp32_to_fp16(y_lo, y_hi, dtype=dtype), v_lo, v_hi
-
-
-@cute.jit
-def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cutlass.Float32:
-    """Sum ``value`` across a power-of-two group of consecutive lanes via
-    butterfly shuffles (every lane ends up holding the group total)."""
-    offset = lanes // 2
-    while offset >= 1:
-        value = value + cutlass.Float32(
-            nvvm.shfl_sync(0xFFFFFFFF, value, offset, 31, kind=nvvm.Shfl.BFLY)
-        )
-        offset = offset // 2
-    return value
-
-
-@cute.jit
-def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm with the shared epsilon floor: rows at or below the
-    floor normalize by ``1 / L2_NORM_EPS`` instead of dividing by zero."""
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-    return cute.math.rsqrt(cute.math.max(sum_sq, norm_floor_sq), fastmath=True)
 
 
 @cute.jit
@@ -219,17 +179,6 @@ def sigmoid(x: cutlass.Float32) -> cutlass.Float32:
     """sigmoid(x) via the tanh identity (single MUFU on Blackwell)."""
     half = cutlass.Float32(0.5)
     return cute.math.tanh(x * half, approx=True) * half + half
-
-
-@cute.jit
-def sigmoid2(x_lo, x_hi):
-    """``(sigmoid(x_lo), sigmoid(x_hi))`` via the tanh identity, with the
-    halving and the scale-bias folded into one FMUL2 and one FFMA2."""
-    half = opaque_f32_zero() + cutlass.Float32(0.5)
-    scaled_lo, scaled_hi = fmul2(x_lo, x_hi, half, half)
-    tanh_lo = cute.math.tanh(scaled_lo, approx=True)
-    tanh_hi = cute.math.tanh(scaled_hi, approx=True)
-    return ffma2(tanh_lo, tanh_hi, half, half, half, half)
 
 
 @cute.jit

@@ -100,8 +100,6 @@ def run_forward_on_current_device(
             raise ValueError("initial_state must be on q.device")
         if not tensor_supports_tma(initial_state):
             raise TypeError("initial_state requires a TMA-compatible inner mode")
-    # The cudnn-frontend v1.30 kernels: uncut, d_v split, exact chain, or split; a paged pool is
-    # advanced in place through the uncut / d_v-split table.
     output, final_state = gdn_forward(
         q[0],
         k[0],

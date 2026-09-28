@@ -180,6 +180,13 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   dlpack, so `None` fails at build time (`repro_09_replay_abi_scope.py`); proposing it would be a
   feature request. Reapply unconditionally while AG keeps the optional-scheduler recipe.
 
+### E12 — `get_dtype` matched substrings · bugfix
+- **Problem:** substring parsing accepted `not_float16`, `float32_extra`, `torch.bfloat16_suffix`.
+- **Found by:** E-series audit. **Fix:** exact names in `common/host.py` ("Prune and restyle the
+  vendored v1.30 tile_dsl and common helpers"; test in "Close regression-test gaps: …").
+- **Tests:** CM::test_cudnn_dtype_names_are_exact (substring mutation: 3 fail). Candidate upstream,
+  no patch drafted.
+
 ## 2. Bugs in our own port (found in review, bench or audit)
 
 ### B15 — Launch caches keyed on shape-unaware state
@@ -195,17 +202,58 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
 - **Fix:** `aligned()` copies such gate/beta into a 16-byte base (`plan.py`).
 - **Tests:** GL::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta. Fails without = YES.
 
+### R15 — Composed KDA stateful backward got a strided/misaligned beta
+- **Found by:** review round on the stack: a 4-byte-offset or token-strided forward beta failed in
+  the composed stateful backward (pre-existing adapter bug, not a kernel bug).
+- **Fix:** `_compact_beta` in `../../kda/impl/cudnn.py` before
+  `chunk_bwd_recompute_factors_with_state_grad_op`, then made Dynamo-traceable. "Compact beta before
+  the composed KDA cuDNN stateful backward", "Make the KDA beta compaction traceable under
+  torch.compile".
+- **Tests:** KT::test_cudnn_stateful_backward_accepts_forward_beta_layouts,
+  KT::test_cudnn_training_fullgraph_and_six_gradients. Fails without = YES.
+
 ### R3 — Warmup forward state fakes shared one symbolic extent
 - A shared symbol forced equal extents on the distinct `state_in`/`state_out` fakes. Found while
   writing the fake signatures; "Give the warmup forward state signatures independent extents". No
   dedicated test.
 
+### R4 / S14 — Forced-int64 coverage went vacuous
+- **Found by:** R13's dead-code deletion removed code the forced-int64 test relied on; the test kept
+  passing without exercising the wide variant.
+- **Fix:** module-level `requires_int64_abi` selectors, the wide-extent GDN forward variant, tests
+  that assert the selector ran; restore kda_recompute's selector; stop forcing selectors on GDN
+  modules that no longer launch. Subjects in `fixes.toml` (S14, R4).
+- **Tests:** GL::test_gdn_cudnn_forced_int64_forward_backward_matches_int32,
+  KT::test_cudnn_forced_int64_forward_backward_matches_int32,
+  GL::test_gdn_cudnn_oversized_singleton_stride_executes_int64_path. Fails without = YES.
+
+### R1 — The restyle moved the barrier block and cost 1–4% · perf
+- **Found by:** bench gate (GDN forward-only +1.0…+4.4% vs #604) → bisect to the restyle commit that
+  moved the mbarrier + gate/beta staging block to the first KB of dynamic SMEM → ncu: identical
+  instruction count, shared-load bank conflicts ×3.7, `stall_mio` ×1.4. The SASS gate passed.
+- **Fix:** `LeadStorage`/`TailStorage` around the barrier arrays (tiles before barriers) in
+  gdn_prefill, gdn_tinv, gdn_summary. "Restore the v1.30 SMEM order in the GDN prefill, tinv and
+  summary kernels".
+- **Evidence:** gdn_prefill 10x4096 456.3 µs (#604 456.9); 1x2048 49.5 vs 50.7 per kernel.
+- **Replay:** see [Lessons](#lessons). With 4 KQ stages the tile struct is exactly 224 KiB; the
+  2.3 KiB staging must fill the alignment gap before it or the layout overflows 227 KiB by 256 B (F11).
+
+### B9 — A non-vacuity check was vacuous (test)
+- **Found by:** mutation audit: ignoring `split` did not fail the contracting-gate test, because
+  under the automatic plan the d_v split alone made `work_items > 1`.
+- **Fix:** pin the uncut plan (`ForwardPlan(0,1,1,num_sm)`).
+  KT::test_cudnn_split_forward_matches_reference_on_a_contracting_gate.
+
 ### Other tests encoding decisions
 - **B3** — KT::test_cudnn_backward_past_sort_capacity_runs_empty_work_items: native KDA stateful
   backward over ORDER_CAPACITY+3 sequences (5,464/8,198 zero-chunk items). The fix (an empty item
   must not consume a dstate handshake phase, C03) is upstream in v1.30; reverting it historically hung.
+- **B17** — GB::test_gdn_backward_rejects_more_query_than_value_heads: HQ > HV rejected before
+  dispatch (the old dV last-write-wins store is gone in v1.30; the domain guard stays).
 - **R8** — test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op:
   sharded KDA dbeta bounded by an operand-pack budget (see Decisions).
+- **R9** — tighter assertions (`cache_info` reuse, `match=` on raises, stress renamed to
+  KT::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress).
 - **Superseded by v1.30, tests kept** (verify_fixes.py runs them as `superseded`): B1 seeded-state
   wait, B5 KDA FP32 factors, B11 terminal TMA overfetch (upstream bit-21 descriptor fix, NVIDIA
   #1013/#1015), B12 checkpoint `[V,K]` descriptors, S11 V-major state. Inherited from main: B4 dO
@@ -229,6 +277,9 @@ cuDNN license texts verbatim under pre-commit". Replay: prove the tool against t
   has seed/final indices but no has-initial-state mask; the hardest port. 6/8 KDA paged tests fail
   on the pre-commit tree; dense-prefill SASS unchanged; paged fwd vs main 0.88–0.90×. Reapply after
   B8; if upstream adds a has-initial-state mask, evaluate mapping AG routes onto it.
+- **R6 — paged tail unspecified.** Review asked for zero rows past `cu_seqlens[-1]`; the zero-fill
+  commit was measured and reverted (see Decisions), and the docstrings now say the rows are
+  unspecified.
 - **R2 — `compile_tvm_ffi(opt_level=...)`**, hosts keep O2 (see Lessons).
 
 ## 4. Restyle, pruning and infra (gated by SASS, not behavior)
@@ -243,15 +294,27 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - Run S10 (ruff) last so upstream diffs stay readable during replay.
 - Append to, never replace, per-file notices (R12).
 
+S15 follow-up, "Pass state-chain storage before runtime arguments": moved `shared_type` before
+runtime arguments and derived product/partial row counts once in the launcher. Before/after
+GB200 snapshots (`python -m tools.cudnn_fe.sass snapshot <out> --cases chain`) covered eight
+GDN/KDA forward/backward cases, including int64. The corrected strict gate reported all ten
+compile artifacts identical; all twelve state-chain instances had byte-identical raw instruction
+lines, unchanged resources and unchanged shared-memory layout. Only symbol names changed.
+Performance was not measured. Snapshots: `agent_space/f3/{before,after}`, report:
+`agent_space/f3/diff-final.log` (local, gitignored).
 
 ## Decisions
 
 | Decision | Rationale / evidence | Revisit when |
 |---|---|---|
 | Shape-dependent KDA plans + pinned-plan tests | Auto plans keep v1.30 prep (fwd) and exact chain (bwd): T8192 H48 fwd 443.7→341.4 µs, fwd+bwd 2612.7→1836.8; T32768 H48 fwd+bwd 10362→6250. Prep/chain change arithmetic order, so bitwise tests pin the uncut plan and auto-plan companions use rel-L2 < 1e-2 (GDN policy from #604). | Planner heuristics change or new GPU. |
+| KDA stateful backward via the composed op | Public `chunk_kda` with `initial_state` backprops through `chunk_bwd_recompute_factors_with_state_grad_op`; the native stateful bprop is exercised directly by B3's test. R15 hardened its beta. | Routing public stateful bwd to the native kernel (then retarget R9's stress test). |
+| Paged tail unspecified (R6) | Full-output memset cost 31–33 µs (≈200 MB) per paged call at 16k tok × 48 heads, +5.7% on kda_paged_4x4096. If needed, fill only rows ≥ `cu_seqlens[-1]` or do it in-kernel. | A consumer needs defined tail rows. |
 | Opt level 2 | Upstream and #604 compile at O2; O3 was mixed (+1.3% / −4.0%). An earlier claim that #604 used O3 was wrong. | New CuTeDSL release. |
 | Keep upstream untimed waits (S7) | `try_wait=True` / `spin=True`; `cute.arch.mbarrier_wait` changes the wait loop. | Upstream changes wait primitives. |
 | `fmul2`/`ffma2` stay inline PTX | `cute.arch` versions changed 35 cubins (STACK 24→0 kda_summary, 96→144 gdn_recompute); the `fadd2` wrapper is identical and used. | New CuTeDSL; re-check SASS. |
+| KDA bwd swizzle left inline (S4 skipped there) | `swizzle_box_offset_*` changed kda_recompute/bprop SASS by ±16/24 instructions; S1–S3 applied, and S15 converted only forms whose SASS stays byte-identical. | Helper codegen changes. |
+| Keep upstream's 4 KQ SMEM stages (F11) | Old AG reduced to 3 for budget; v1.30 fits 4 by putting the small staging in the alignment gap. | SMEM layout changes. |
 | CP dbeta pack-budget criterion (R8) | The partial-chunk KDA-cuDNN CP case exceeded the old dbeta tolerance (2.9×) with both new and legacy summaries, i.e. rounding of the unsharded realization, not a bug. New bound: magnitude-weighted BF16 operand-pack budget; fail-closed (no-dstate penultimate chunk and a 1.01× terminal chunk both fail). | CP numerics change. |
 | Drop the replay-ABI upstream draft (B14) | Upstream has no optional-scheduler ABI; it would be a feature request. | Upstream makes the scheduler optional. |
 
@@ -264,6 +327,8 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
+- **Default-backend beta alignment:** the default (non-cuDNN) WY backend requires a 128-byte-aligned
+  beta; outside cuDNN (R15 fixed only the composed cuDNN path).
 - **Shapes:** the cuDNN GDN/KDA adapters require `q.shape == [1, T, H, 128]` (V = 128); summaries
   derive V, K ∈ {64, 128}.
 - Single-token KDA dgate leaves a 6e-10 residual vs an exact-zero reference.
@@ -271,6 +336,11 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 
 ## Lessons
 
+1. **Barrier-block relocation is a perf change the SASS gate cannot see (R1).** Moving the mbarrier
+   and gate/beta staging arrays to the start of dynamic SMEM kept every instruction identical and
+   cost gdn_prefill ~2.8% through shared-load bank conflicts. Keep upstream's order (tiles first);
+   any `SharedStorage` change needs the bench gate, and a bench regression with identical SASS
+   should go straight to a bisect plus ncu memory-workload comparison.
 2. **Fake signatures are an ABI (S5/S13, B13).** Upstream compiled from live tensors marked
    `mark_layout_dynamic(leading_dim=rank-1)`: int32 shapes, int64 outer strides, divisibility 1.
    int64 shapes changed register allocation (REG 52→46); promising aligned strides grew a
@@ -278,6 +348,9 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
    symbolic stride; `leading_dim=None` still infers 1 from a compact first call.
 3. **Match upstream's opt level (R2).** The compiler default is not upstream's `--opt-level 2`;
    without an explicit level SASS differs and perf comparisons are meaningless.
+4. **A work-item count is not proof of non-vacuity (B9).** Counts grow from orthogonal tiling; pin
+   the plan before asserting on them. Likewise, after deleting code, re-check that forced-path tests
+   still reach the path (R4/S14).
 6. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
    and one (B14) targets an ABI upstream lacks; the repros and `verify_fixes.py` classification keep
    hardening drafts from being filed as bug fixes.

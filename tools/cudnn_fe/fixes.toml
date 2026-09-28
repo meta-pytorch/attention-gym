@@ -54,6 +54,7 @@ ag_subject = "Keep the KDA forward delta residual in FP32 before the MMA pack"
 ag_subjects_extra = [
   "Add an FP32 KDA delta-residual staging helper",
   "Keep the KDA backward delta residual in FP32 through subtraction and beta scaling",
+  "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names",
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_forward_plans_keep_delta_residual_in_fp32",
@@ -70,8 +71,10 @@ id = "B8"
 title = "Compact empty cu_seqlens intervals out of the unsplit work table"
 kind = "bugfix"
 ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+ag_subjects_extra = ["Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work",
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_cudnn_compaction_keeps_empty_state_cotangents",
 ]
 upstream_patch = "upstream/03-compact-empty-unsplit-work.patch"
 upstream_repro = "upstream/repro_03_empty_unsplit.py"
@@ -116,6 +119,15 @@ upstream_expect = "scope"
 upstream_status = "excluded-no-upstream-abi"
 
 [[fix]]
+id = "E12"
+title = "get_dtype matches exact dtype names, not substrings"
+kind = "bugfix"
+ag_subject = "Prune and restyle the vendored v1.30 tile_dsl and common helpers"
+ag_subjects_extra = ["Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"]
+guarding_tests = ["test/test_cudnn_fe_common.py::test_cudnn_dtype_names_are_exact"]
+upstream_status = "candidate-no-patch"
+
+[[fix]]
 id = "B15"
 title = "Driver launch caches keyed on static config, not shape"
 kind = "bugfix"
@@ -131,7 +143,20 @@ id = "B16"
 title = "Copy 4-byte-aligned gate/beta to 16-byte bases"
 kind = "bugfix"
 ag_subject = "Route unpaged GDN and KDA and native CP summaries to the v1.30 kernels"
+ag_subjects_extra = ["Simplify the GDN and KDA drivers: share plans and scratch buffers in cudnn_fe/plan.py"]
 guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_accepts_four_byte_aligned_gate_and_beta"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R15"
+title = "Composed KDA stateful bwd gets a compact 128-byte-aligned beta; traceable under Dynamo"
+kind = "bugfix"
+ag_subject = "Compact beta before the composed KDA cuDNN stateful backward"
+ag_subjects_extra = ["Make the KDA beta compaction traceable under torch.compile"]
+guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_stateful_backward_accepts_forward_beta_layouts",
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_training_fullgraph_and_six_gradients",
+]
 upstream_status = "ag-specific"
 
 [[fix]]
@@ -141,6 +166,19 @@ kind = "bugfix"
 ag_subject = "Give the warmup forward state signatures independent extents"
 guarding_tests = []
 gate = "none (no dedicated test; covered indirectly by GDN warmup split tests)"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R4"
+title = "Restore kda_recompute int64 selector; stop forcing selectors on GDN modules that no longer launch"
+kind = "bugfix"
+ag_subject = "Restore kda_recompute_f16's module-level int64 ABI selector"
+ag_subjects_extra = ["Stop forcing int64 selectors on GDN modules that no longer launch"]
+guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference",
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_forced_int64_forward_backward_matches_int32",
+  "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_forced_int64_forward_backward_matches_int32",
+]
 upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- features / integration
@@ -185,7 +223,28 @@ guarding_tests = [
 ]
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "R6"
+title = "Paged outputs past cu_seqlens[-1] documented as unspecified (zero-fill reverted for cost)"
+kind = "feature"
+ag_subject = "Document that paged cuDNN output rows past cu_seqlens[-1] are unspecified"
+ag_subjects_extra = ["Zero-fill paged cuDNN outputs past cu_seqlens[-1]"]
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval",
+  "test/kda/cudnn/test_kda_cudnn_paged.py::test_cudnn_paged_writes_every_token_up_to_the_last_interval",
+]
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- performance
+[[fix]]
+id = "R1"
+title = "Restore upstream SMEM order (tiles before barriers) in GDN prefill/tinv/summary"
+kind = "perf"
+ag_subject = "Restore the v1.30 SMEM order in the GDN prefill, tinv and summary kernels"
+guarding_tests = []
+gate = "bench (tools/cudnn_fe/bench; gdn_prefill main kernel vs previous tip)"
+upstream_status = "ag-specific"
+
 [[fix]]
 id = "R2"
 title = "compile_tvm_ffi takes opt_level; hosts keep O2"
@@ -245,6 +304,49 @@ guarding_tests = [
 gate = "sass (byte-identical per family)"
 upstream_status = "ag-specific"
 
+[[fix]]
+id = "S15"
+title = "Remaining exact KDA prefill swizzle forms; common-helper rmem tensors; state-chain SharedStorage"
+kind = "restyle"
+ag_subject = "Restyle the remaining cuDNN swizzle forms and common-helper arrays"
+ag_subjects_extra = ["Pass state-chain storage before runtime arguments"]
+guarding_tests = []
+gate = "sass (55/55 byte-identical SASS and resources)"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R5"
+title = "Driver simplification: shared plan.py, no device/stream args, shared allocators, _GATE_FLAGS"
+kind = "restyle"
+ag_subject = "Simplify the GDN and KDA drivers: share plans and scratch buffers in cudnn_fe/plan.py"
+ag_subjects_extra = [
+  "Simplify the v1.30 bundle hosts: drop unused device and stream arguments",
+  "Simplify the native summary launch: reuse the shared workspace and counter allocators",
+  "Spell the KDA chain-backward gate flags through _GATE_FLAGS",
+  "Simplify the cuDNN launch-contract tests and drop a narrating adapter comment",
+]
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_plans_match_reference"]
+gate = "sass + existing suites bitwise unchanged"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "S10"
+title = "Ruff lint/format the vendored kernels"
+kind = "restyle"
+ag_subject = "Lint and format the vendored v1.30 GDN and KDA kernels"
+guarding_tests = []
+gate = "sass (42/42 identical)"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R16"
+title = "Rename sdq_reduction to v_term_scratch; dedupe residual_f16x2; host docstring"
+kind = "restyle"
+ag_subject = "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names"
+guarding_tests = []
+gate = "sass"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- validation / hardening
 [[fix]]
 id = "S12"
@@ -293,6 +395,7 @@ kind = "validation"
 ag_subject = "Initialize the GDN prefill mbarriers from one thread"
 ag_subjects_extra = [
   "Initialize the GDN backward mbarriers from one thread",
+  "Initialize GDN summary mbarriers from one thread and tidy vendored kernel names",
 ]
 guarding_tests = [
   "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",
@@ -322,6 +425,56 @@ guarding_tests = [
 ]
 upstream_status = "ag-specific"
 
+# --------------------------------------------------------------------------- pruning / docs
+[[fix]]
+id = "R10"
+title = "Delete the legacy 085d50b kernel copy, schedule.py, kda_plain_gate_bwd"
+kind = "pruning"
+ag_subject = "Delete the legacy cuDNN kernel copy and its unused schedule helper"
+guarding_tests = ["test/test_cudnn_optional_import.py::test_linear_import_does_not_load_cudnn_kernel_dependencies"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R11"
+title = "Drop the GDP d_v=64 bprop fork from the GDN chain prologue"
+kind = "pruning"
+ag_subject = "Drop the unused GDP d_v=64 bprop fork from the GDN chain prologue"
+guarding_tests = []
+gate = "vendor.py applies the GDP fork cut automatically; import test"
+upstream_status = "nv-surface-removed"
+
+[[fix]]
+id = "R13"
+title = "Delete unreached/test-only upstream code (gate_bwd, head_reduce, l2norm, standalone hosts, ...)"
+kind = "pruning"
+ag_subject = "Delete unreached and test-only upstream code from the vendored cuDNN v1.30 kernels"
+guarding_tests = []
+gate = "reachability (package import + full suite)"
+upstream_status = "nv-surface-removed"
+
+[[fix]]
+id = "R14"
+title = "Prune upstream-only constexpr knobs AG never sets"
+kind = "pruning"
+ag_subject = "Prune upstream-only constexpr knobs from the vendored cuDNN v1.30 kernels"
+ag_subjects_extra = ["Simplify the GDN backward hosts: drop the always-default bprop_module and compact_qdo knobs"]
+guarding_tests = []
+gate = "sass (51/51 identical)"
+upstream_status = "nv-surface-removed"
+
+[[fix]]
+id = "R12"
+title = "Accurate NOTICE.md and per-file modification notices"
+kind = "pruning"
+ag_subject = "Make the vendored cuDNN v1.30 notices describe the final modification set"
+ag_subjects_extra = [
+  "Describe the final Attention Gym changes in the v1.30 cuDNN notice",
+  "Wrap the v1.30 cuDNN notice at 99 columns",
+]
+guarding_tests = []
+gate = "review (notices list every ledger row touching the file)"
+upstream_status = "ag-specific"
+
 # --------------------------------------------------------------------------- tests / decisions
 [[fix]]
 id = "B3"
@@ -332,11 +485,36 @@ guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_backwar
 upstream_status = "superseded-by-v1.30"
 
 [[fix]]
+id = "B9"
+title = "Test: contracting-gate split test pins the uncut plan so an ignored split fails"
+kind = "test"
+ag_subject = "Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_split_forward_matches_reference_on_a_contracting_gate"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "B17"
+title = "Test: GDN backward rejects HQ > HV before dispatch"
+kind = "test"
+ag_subject = "Close regression-test gaps: KDA empty-state compaction, pinned split cuts, exact dtype names, grouped value heads"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_backward_rejects_more_query_than_value_heads"]
+upstream_status = "ag-specific"
+
+[[fix]]
 id = "R8"
 title = "Sharded KDA dbeta bounded by the operand-pack budget"
 kind = "test"
 ag_subject = "Bound the sharded KDA dbeta error by the kernels' operand-pack budget"
 guarding_tests = ["test/test_delta_rule_stages.py::test_simulated_context_parallel_matches_unsharded_op"]
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "R9"
+title = "Tighten tests: cache_info reuse, match= on raises, stress rename"
+kind = "test"
+ag_subject = "Tighten the KDA cuDNN and delta-rule test assertions"
+guarding_tests = ["test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_repeated_stateful_backward_with_empty_sequences_stress"]
+env = { ATTN_GYM_RUN_STRESS_TESTS = "1" }
 upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- superseded by v1.30

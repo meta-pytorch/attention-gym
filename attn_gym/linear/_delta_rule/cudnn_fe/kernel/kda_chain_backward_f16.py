@@ -16,24 +16,28 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host compiles through a persisted ``jit_cache`` function
-# over fake TVM-FFI signatures and launches on the current Torch stream.
+# attn_gym.linear._delta_rule.cudnn_fe; the host nests the chain prologue, KdaSummaryOp, and the
+# recompute/bprop/bprop_summary hosts and compiles through a @jit_cache function over fake TVM-FFI
+# signatures (int64 ABI from the kernel modules' selectors), launching on the current Torch stream
+# (unused device/stream arguments dropped); upstream-only constexpr knobs pruned (safe_gate,
+# A_log/dt_bias, beta sigmoid, allow_neg_eigval, Q/K L2 norm); Ruff formatting.
 
-"""One compiled launch for the KDA chain backward: chain prologue, fused H and M summary and forward state chain (M alone
-from the recompute when the forward's series is passed back), G summary, reverse state chain, seeded series recompute and
-bprop issued from a single host.  Every KDA module compiles at ``--opt-level 2``, the chain prologue and the state chain
-included (``opt_level``), so the host does too and every nested kernel is the standalone one.  Every kernel, its host and the tensor placeholder each host was compiled with are the
-standalone modules' own; a buffer two hosts read through different placeholder types is passed twice, once per type: H, M,
-X, G and dX (the summary, recompute and bprop hosts' torch views against the state chain's ``(1, HO, V, K)`` device views),
-``cu_pieces`` (the prologue marks it at its element alignment, every other kernel at 8 bytes) and the gate when the bprop
-reads it as a linear alpha (a 4-byte view)."""
+"""One compiled launch for the KDA chain backward: chain prologue, fused H and M summary and
+forward state chain (M alone from the recompute when the forward's series is passed back), G
+summary, reverse state chain, seeded series recompute and bprop issued from a single host.  Every
+KDA module compiles at ``--opt-level 2``, the chain prologue and the state chain included
+(``opt_level``), so the host does too and every nested kernel is the standalone one.  Every kernel,
+its host and the tensor placeholder each host was compiled with are the standalone modules' own; a
+buffer two hosts read through different placeholder types is passed twice, once per type: H, M, X,
+G and dX (the summary, recompute and bprop hosts' torch views against the state chain's ``(1, HO,
+V, K)`` device views), ``cu_pieces`` (the prologue marks it at its element alignment, every other
+kernel at 8 bytes) and the gate when the bprop reads it as a linear alpha (a 4-byte view)."""
 
 from functools import partial
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 
@@ -44,7 +48,13 @@ from ..common.tvm_ffi import (
     make_compact_signature_tensor,
     make_dynamic_signature_tensor,
 )
-from . import kda_bprop_f16, kda_bprop_summary_f16, kda_chain_prologue_f16, kda_recompute_f16, kda_summary_f16
+from . import (
+    kda_bprop_f16,
+    kda_bprop_summary_f16,
+    kda_chain_prologue_f16,
+    kda_recompute_f16,
+    kda_summary_f16,
+)
 
 
 @cute.jit
@@ -76,10 +86,8 @@ def chain_backward_host(
     v: cute.Tensor,
     do: cute.Tensor,
     gate: cute.Tensor,
-    gate_main: Optional[cute.Tensor],
+    gate_main: cute.Tensor | None,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
     cu_pieces_main: cute.Tensor,
@@ -89,41 +97,41 @@ def chain_backward_host(
     summary_count: cute.Tensor,
     work_items: cute.Tensor,
     work_items_summary: cute.Tensor,
-    series_items: Optional[cute.Tensor],
-    series_count: Optional[cute.Tensor],
-    recompute_items: Optional[cute.Tensor],
-    recompute_count: Optional[cute.Tensor],
+    series_items: cute.Tensor | None,
+    series_count: cute.Tensor | None,
+    recompute_items: cute.Tensor | None,
+    recompute_count: cute.Tensor | None,
     scheduler_all: cute.Tensor,
     scheduler_recompute: cute.Tensor,
     scheduler_m: cute.Tensor,
     scheduler_series: cute.Tensor,
     scheduler_summary: cute.Tensor,
     scheduler_bwd: cute.Tensor,
-    summary_words: Optional[cute.Tensor],
+    summary_words: cute.Tensor | None,
     recompute_m_words: cute.Tensor,
-    series_words: Optional[cute.Tensor],
+    series_words: cute.Tensor | None,
     bprop_summary_words: cute.Tensor,
     bprop_words: cute.Tensor,
     checkpoints: cute.Tensor,
-    seed_checkpoints: Optional[cute.Tensor],
+    seed_checkpoints: cute.Tensor | None,
     dq: cute.Tensor,
     dk: cute.Tensor,
     dv: cute.Tensor,
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
-    state_h_summary: Optional[cute.Tensor],
+    state_h_summary: cute.Tensor | None,
     state_m_main: cute.Tensor,
-    state_h_chain: Optional[cute.Tensor],
+    state_h_chain: cute.Tensor | None,
     state_m_chain: cute.Tensor,
-    state_x_chain: Optional[cute.Tensor],
-    seed: Optional[cute.Tensor],
-    state_x_series: Optional[cute.Tensor],
+    state_x_chain: cute.Tensor | None,
+    seed: cute.Tensor | None,
+    state_x_series: cute.Tensor | None,
     state_g: cute.Tensor,
     state_g_chain: cute.Tensor,
     state_dx_end_chain: cute.Tensor,
     state_dx_end: cute.Tensor,
-    dseed: Optional[cute.Tensor],
-    dstate0: Optional[cute.Tensor],
+    dseed: cute.Tensor | None,
+    dstate0: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     heads_out = cutlass.Int32(gate.shape[1])
@@ -174,8 +182,6 @@ def chain_backward_host(
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             beta,
             cu_pieces_main,
             None,
@@ -214,8 +220,6 @@ def chain_backward_host(
             k,
             k,
             gate,
-            a_log,
-            dt_bias,
             beta,
             cu_pieces_main,
             None,
@@ -233,8 +237,6 @@ def chain_backward_host(
         bwd_summary_cfg,
         q_ratio,
         k_ratio,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces_main,
         state_g,
@@ -273,8 +275,6 @@ def chain_backward_host(
             k,
             v,
             gate,
-            a_log,
-            dt_bias,
             beta,
             cu_pieces_main,
             state_x_series,
@@ -293,8 +293,6 @@ def chain_backward_host(
         q_ratio,
         k_ratio,
         v_ratio,
-        a_log,
-        dt_bias,
         beta,
         gate_main,
         checkpoints,
@@ -317,8 +315,6 @@ def _compile_chain_backward(
     io_dtype,
     gate_dtype,
     beta_dtype,
-    a_log_dtype,
-    dt_bias_spec,
     cu_seqlens_dtype,
     state_m_dtype,
     state_x_dtype,
@@ -336,11 +332,7 @@ def _compile_chain_backward(
     has_series_items: bool,
     coarse: bool,
     log_gate: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
-    use_qk_l2norm: bool,
-    use_beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     has_seed: bool,
     has_dseed: bool,
     chain_rows: int,
@@ -361,17 +353,13 @@ def _compile_chain_backward(
             cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16
         )
 
-    gate_main = not log_gate and not safe_gate
-    flags = dict(
-        l2norm=use_qk_l2norm,
-        safe_gate=safe_gate,
-        gate_scale_log2=gate_scale_log2,
-        log_gate=log_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        max_active_clusters=num_sm,
-        d_k=d_k,
-    )
+    gate_main = not log_gate
+    flags = {
+        "gate_scale_log2": gate_scale_log2,
+        "log_gate": log_gate,
+        "max_active_clusters": num_sm,
+        "d_k": d_k,
+    }
     summary_cfg = None
     transition_cfg = None
     if fused_h_m:
@@ -430,10 +418,6 @@ def _compile_chain_backward(
         has_series_items,
         coarse,
         log_gate,
-        safe_gate,
-        use_qk_l2norm,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         has_seed,
         has_dseed,
         chain_rows,
@@ -442,14 +426,21 @@ def _compile_chain_backward(
     )
     dtype_names = "_".join(
         "none" if dtype is None else dtype.__name__.lower()
-        for dtype in (io_dtype, gate_dtype, beta_dtype, a_log_dtype, cu_seqlens_dtype, state_m_dtype, state_x_dtype)
+        for dtype in (
+            io_dtype,
+            gate_dtype,
+            beta_dtype,
+            cu_seqlens_dtype,
+            state_m_dtype,
+            state_x_dtype,
+        )
     )
     name = (
-        "kda_chain_backward_" + "_".join(str(int(flag)) for flag in static)
+        "kda_chain_backward_"
+        + "_".join(str(int(flag)) for flag in static)
         + f"_{dtype_names}_{seed_name}_{dseed_name}"
         f"_g{str(gate_scale_log2).replace('.', 'p').replace('-', 'm')}"
     )
-    dt_bias_rank = 1 if dt_bias_spec is None else 1 + len(dt_bias_spec[1])
     state = partial(strided, cutlass.Float32, 4)
     return compile_tvm_ffi(
         chain_backward_host,
@@ -477,8 +468,6 @@ def _compile_chain_backward(
         strided(gate_dtype, 3, 16),  # gate
         strided(gate_dtype, 3, 4) if gate_main else None,  # gate_main
         strided(beta_dtype, 2, 4),  # beta
-        strided(a_log_dtype, 1, 4) if a_log_dtype is not None else None,  # a_log
-        strided(dt_bias_spec[0], dt_bias_rank, 16) if dt_bias_spec is not None else None,  # dt_bias
         strided(cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4),  # cu_seqlens
         strided(cutlass.Int32, 1, 4),  # cu_pieces
         strided(cutlass.Int32, 1, 8),  # cu_pieces_main
@@ -531,8 +520,6 @@ def build_chain_backward(
     do,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     cu_pieces,
     main_rows,
@@ -581,34 +568,62 @@ def build_chain_backward(
     series_span_tokens,
     seed_every_n_tokens,
     log_gate,
-    safe_gate,
     gate_lower_bound,
-    use_qk_l2norm,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
-    """Compile (persisted per static config) the chain backward launch over the buffers of one plan; ``pieces``,
-    ``heads_out`` and ``num_seqs`` are launch arguments.  The fake signatures repeat the marks of the standalone modules'
-    builds so every kernel compiles as it does there."""
+    """Compile (persisted per static config) the chain backward launch over the buffers of one
+    plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The fake signatures
+    repeat the marks of the standalone modules' builds so every kernel compiles as it does there.
+    """
     DK = q.shape[2]
     DV = v.shape[2]
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
     has_seed = seed is not None
     has_dseed = dseed is not None
     tensors = (
-        q, k, v, do, gate, beta, a_log, dt_bias, cu_seqlens, cu_pieces, main_rows, summary_rows,
-        main_count, summary_count, work_items, work_items_summary, series_items, series_count,
-        scheduler_all, scheduler_recompute, scheduler_m, scheduler_series, scheduler_summary,
-        scheduler_bwd, summary_words, recompute_m_words, series_words, bprop_summary_words,
-        bprop_words, checkpoints, seed_checkpoints, dq, dk, dv, dgate, dbeta, state_h, state_m,
-        state_x, state_g, state_dx_end, seed, dseed, dstate0,
+        q,
+        k,
+        v,
+        do,
+        gate,
+        beta,
+        cu_seqlens,
+        cu_pieces,
+        main_rows,
+        summary_rows,
+        main_count,
+        summary_count,
+        work_items,
+        work_items_summary,
+        series_items,
+        series_count,
+        scheduler_all,
+        scheduler_recompute,
+        scheduler_m,
+        scheduler_series,
+        scheduler_summary,
+        scheduler_bwd,
+        summary_words,
+        recompute_m_words,
+        series_words,
+        bprop_summary_words,
+        bprop_words,
+        checkpoints,
+        seed_checkpoints,
+        dq,
+        dk,
+        dv,
+        dgate,
+        dbeta,
+        state_h,
+        state_m,
+        state_x,
+        state_g,
+        state_dx_end,
+        seed,
+        dseed,
+        dstate0,
     )
     # The bprop module owns the ABI selector for the bundled host (tests monkeypatch it).
     use_int64_offsets = kda_bprop_f16.requires_int64_abi(*(t for t in tensors if t is not None))
@@ -616,10 +631,6 @@ def build_chain_backward(
         get_dtype(q.dtype),
         get_dtype(gate.dtype),
         get_dtype(beta.dtype),
-        get_dtype(a_log.dtype) if a_log is not None else None,
-        (get_dtype(dt_bias.dtype), tuple(int(n) for n in dt_bias.shape[1:]))
-        if dt_bias is not None
-        else None,
         cutlass.Int64 if str(cu_seqlens.dtype).endswith("int64") else cutlass.Int32,
         get_dtype(state_m.dtype),
         get_dtype(state_x.dtype) if state_x is not None else cutlass.Float32,
@@ -637,11 +648,7 @@ def build_chain_backward(
         series_items is not None,
         bool(coarse),
         bool(log_gate),
-        bool(safe_gate),
         float(gate_lower_bound) * kda_bprop_f16.LOG2_E,
-        bool(use_qk_l2norm),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         has_seed,
         has_dseed,
         int(chain_rows),
@@ -659,8 +666,6 @@ def run_chain_backward(
     do,
     gate,
     beta,
-    a_log,
-    dt_bias,
     cu_seqlens,
     cu_pieces,
     main_rows,
@@ -707,12 +712,10 @@ def run_chain_backward(
     series_span_tokens,
     seed_every_n_tokens,
     log_gate,
-    safe_gate,
     scale,
-    stream,
 ) -> None:
-    """Replay the chain backward: one crossing into the DSL for its seven launches.  The plan validated the contract at
-    build, so nothing here raises."""
+    """Replay the chain backward: one crossing into the DSL for its seven launches.  The plan
+    validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
@@ -726,10 +729,8 @@ def run_chain_backward(
         v,
         do,
         gate,
-        gate if not log_gate and not safe_gate else None,
+        gate if not log_gate else None,
         beta,
-        a_log if safe_gate else None,
-        dt_bias if safe_gate else None,
         cu_seqlens,
         cu_pieces,
         cu_pieces,

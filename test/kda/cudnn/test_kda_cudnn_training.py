@@ -715,6 +715,12 @@ def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cudnn_split_forward_matches_reference_on_a_contracting_gate(monkeypatch, dtype) -> None:
     """Cuts land only where the gate has saturated, so the result stays within the budget."""
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+
+    # Pin the uncut plan: the automatic d_v split also emits two work items per tile, which would
+    # satisfy the count below even if the split option were ignored.
+    sms = torch.cuda.get_device_properties().multi_processor_count
+    monkeypatch.setattr(driver.ForwardPlan, "build", lambda *_: driver.ForwardPlan(0, 1, 1, sms))
     inputs, _, split, work_items = _split_forward_pair(
         monkeypatch, dtype, gate_scale=math.log(2.0)
     )
@@ -741,11 +747,11 @@ def test_cudnn_cpu_inputs_fail_before_dispatch() -> None:
 
 def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.cudnn_fe import plan
     from attn_gym.linear.kda.impl import cudnn as backend
 
     local_backward = backend.chunk_cudnn_packed_local_bwd_op
-    compute_ideal_chunks = driver.compute_ideal_chunks
+    compute_ideal_chunks = plan.compute_ideal_chunks
     selected = []
     geometries = []
 
@@ -758,7 +764,7 @@ def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
         return compute_ideal_chunks(*args)
 
     monkeypatch.setattr(backend, "chunk_cudnn_packed_local_bwd_op", record_split)
-    monkeypatch.setattr(driver, "compute_ideal_chunks", record_geometry)
+    monkeypatch.setattr(plan, "compute_ideal_chunks", record_geometry)
 
     exact_inputs = _make_inputs(requires_grad=True)
     exact_output = _candidate_dense(*exact_inputs)
@@ -875,13 +881,64 @@ def test_cudnn_rejects_mismatched_value_and_beta_shapes() -> None:
         )
 
 
+def _strided_beta(beta: torch.Tensor, layout: str) -> torch.Tensor:
+    """A beta view the public contract accepts but the composed stateful backward ABI rejects."""
+    if layout == "misaligned":
+        storage = torch.empty(beta.numel() + 1, device=beta.device)
+        view = storage[1:].view_as(beta)  # 4-byte base offset
+    else:
+        heads = beta.shape[-1]
+        view = torch.empty(*beta.shape[:-1], 3 * heads, device=beta.device)[..., :heads]
+    view.copy_(beta)
+    return view
+
+
+@pytest.mark.parametrize("layout", ["misaligned", "token_strided"])
+@pytest.mark.parametrize("state", ["initial", "final_only"])
+def test_cudnn_stateful_backward_accepts_forward_beta_layouts(layout: str, state: str) -> None:
+    """Beta layouts the cuDNN forward accepts must also train through the composed backward.
+
+    The fused stateful backward requires a contiguous, 128-byte-aligned beta; the adapter has
+    to compact the saved beta instead of forwarding the caller's view.
+    """
+    from attn_gym.linear import chunk_kda
+
+    q, k, value, gate, beta, initial_state, cu_seqlens = _make_inputs(requires_grad=False)
+    if state == "final_only":
+        initial_state = None
+    results = []
+    for candidate in (beta, _strided_beta(beta, layout)):
+        inputs = tuple(
+            tensor.detach().clone().requires_grad_() if index != 4 else candidate.requires_grad_()
+            for index, tensor in enumerate((q, k, value, gate, beta))
+        )
+        leaves = inputs if initial_state is None else (*inputs, initial_state.requires_grad_())
+        output, final_state = chunk_kda(
+            *inputs,
+            None if initial_state is None else initial_state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options={"backend": "cudnn"},
+        )
+        results.append(torch.autograd.grad((output, final_state), leaves, (output, final_state)))
+    for expected, actual in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
     reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
 )
-def test_cudnn_repeated_backward_with_empty_sequences() -> None:
-    """Empty work items must not advance the dstate handshake phase."""
+@pytest.mark.parametrize("path", ["composed", "native"])
+def test_cudnn_repeated_stateful_backward_with_empty_sequences_stress(path: str) -> None:
+    """500 stateful backward launches over alternating empty sequences must all complete.
+
+    ``composed`` is what public ``chunk_kda`` with an entry state runs (the fused stateful
+    backward); ``native`` drives the cuDNN BT16 stateful backward op directly, where empty work
+    items must not advance the dstate handshake phase.
+    """
     from attn_gym.linear import chunk_kda
+    from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_bwd_with_state_op
 
     lengths = tuple(0 if index % 2 == 0 else 128 for index in range(29))
     q, k, value, gate, beta = make_kda_test_inputs(
@@ -889,31 +946,37 @@ def test_cudnn_repeated_backward_with_empty_sequences() -> None:
         heads=16,
         seed=421,
         normalize_qk=True,
-        requires_grad=True,
+        requires_grad=path == "composed",
     )
-    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_()
+    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_(path == "composed")
     cu_seqlens = cumulative_sequence_offsets(lengths)
     d_output = torch.randn_like(value)
     d_state = torch.randn_like(state)
     for _ in range(500):
-        output, final_state = chunk_kda(
-            q,
-            k,
-            value,
-            gate,
-            beta,
-            state,
-            cu_seqlens=cu_seqlens,
-            output_final_state=True,
-            kernel_options={"backend": "cudnn"},
-        )
-        assert final_state is not None
-        torch.autograd.grad(
-            (output, final_state),
-            (q, k, value, gate, beta, state),
-            (d_output, d_state),
-        )
+        if path == "native":
+            grads = chunk_cudnn_packed_bwd_with_state_op(
+                q, k, value, gate, beta, d_output, cu_seqlens, state, d_state, D**-0.5
+            )
+        else:
+            output, final_state = chunk_kda(
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                state,
+                cu_seqlens=cu_seqlens,
+                output_final_state=True,
+                kernel_options={"backend": "cudnn"},
+            )
+            assert final_state is not None
+            grads = torch.autograd.grad(
+                (output, final_state),
+                (q, k, value, gate, beta, state),
+                (d_output, d_state),
+            )
         torch.cuda.synchronize()
+    assert all(torch.isfinite(grad).all() for grad in grads)
 
 
 def test_cudnn_backward_past_sort_capacity_runs_empty_work_items() -> None:
@@ -1199,16 +1262,6 @@ def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-
-
-def test_cudnn_plain_gate_backward_forced_int64_matches_int32(monkeypatch) -> None:
-    from attn_gym.linear._delta_rule.cudnn.kernels import kda_plain_gate_bwd
-
-    d_cumulative = torch.randn(1, 64, 1, D, device="cuda")
-    expected = kda_plain_gate_bwd.plain_gate_cumsum_dense_bwd_cute(d_cumulative)
-    monkeypatch.setattr(kda_plain_gate_bwd, "requires_int64_abi", lambda *_: True)
-    actual = kda_plain_gate_bwd.plain_gate_cumsum_dense_bwd_cute(d_cumulative)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_cudnn_fullgraph_cuda_graph_replay() -> None:

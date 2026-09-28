@@ -325,19 +325,8 @@ def test_native_reverse_selection_skips_unrequested_work(monkeypatch) -> None:
     assert not tables
 
 
-def test_native_summary_uses_no_legacy_kernels(monkeypatch) -> None:
+def test_native_summary_launches_no_driver_plans(monkeypatch) -> None:
     """Every validated entry point launches only the v1.30 summary kernels."""
-    legacy = pytest.importorskip("attn_gym.linear._delta_rule.cudnn.kernels")
-    for module_name, entry in (
-        ("kda_prefill_f16", "chunk_kda_sm100"),
-        ("kda_recompute_f16", "chunk_kda_recompute_sm100"),
-        ("kda_bprop_f16", "chunk_kda_bwd_sm100"),
-    ):
-        module = getattr(legacy, module_name, None)
-        if module is not None and hasattr(module, entry):
-            monkeypatch.setattr(
-                module, entry, lambda *a, **k: pytest.fail("legacy summary kernel launched")
-            )
     _forbid_driver_plans(monkeypatch)
     tables = _record_work_tables(monkeypatch)
     inputs, cu = _packed_inputs(LENGTHS)

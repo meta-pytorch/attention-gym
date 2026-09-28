@@ -16,25 +16,28 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host nests the prep / prefill Ops, compiles through a
-# persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor needs it),
-# and launches with live tensors on the current Torch stream. Optional paged routes reach the
-# prologue's compaction and the prefill.
+# attn_gym.linear._delta_rule.cudnn_fe; the host nests the prep, prefill, and prep-prefill Ops and
+# compiles through a @jit_cache function over fake TVM-FFI signatures (+int64 variants), launching
+# live tensors on the current Torch stream (unused device/stream arguments dropped);
+# launch-contract validation of the plan buffers; optional paged-state routes through the prologue
+# compaction and the prefill; upstream-only constexpr knobs pruned (safe_gate, A_log/dt_bias, beta
+# sigmoid, allow_neg_eigval, Q/K L2 norm, expand_num, the log2_threshold override); Ruff
+# formatting.
 
-"""One compiled launch for the KDA warmup and uncut forwards: the split-K table (plan, scan and walk, warmup only), the
-prefill prologue and the prefill issued from a single host.  Every kernel, its host and the tensor placeholder each host
-was compiled with are the standalone modules' own; this host only sequences the launches, so the kernels' SASS is
-unchanged and the Python side crosses into the DSL once per call instead of two or three times.  A buffer that two hosts
-read through different signature types is passed twice, once per type: the table marks the gate at its element
-alignment along its last mode, a_log fully dynamic, dt_bias, work_items, work_count and item_scratch as 4-byte compact
-views, cu_seqlens at 4 bytes; the prologue and prefill mark the same buffers as the standalone prefill wrapper does."""
-
-from typing import Optional
+"""One compiled launch for the KDA warmup and uncut forwards: the split-K table (plan, scan and
+walk, warmup only), the prefill prologue and the prefill issued from a single host.  Every kernel,
+its host and the tensor placeholder each host was compiled with are the standalone modules' own;
+this host only sequences the launches, so the kernels' SASS is unchanged and the Python side
+crosses into the DSL once per call instead of two or three times.  A buffer that two hosts read
+through different signature types is passed twice, once per type: the table marks the gate at its
+element alignment along its last mode, work_items, work_count and item_scratch as 4-byte compact
+views, cu_seqlens at 4 bytes; the prologue and prefill mark the same
+buffers as the standalone prefill wrapper does."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import torch
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -57,10 +60,8 @@ def warmup_forward_host(
     b_t: cutlass.Constexpr[int],
     scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
-    safe_gate: cutlass.Constexpr[bool],
     gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
     full_scan: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Int32,
@@ -83,41 +84,37 @@ def warmup_forward_host(
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
-    gate_table: Optional[cute.Tensor],
-    a_log: Optional[cute.Tensor],
-    a_log_table: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
-    dt_bias_table: Optional[cute.Tensor],
+    gate_table: cute.Tensor | None,
     beta: cute.Tensor,
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
-    state_in: Optional[cute.Tensor],
-    state_out: Optional[cute.Tensor],
-    seed_indices: Optional[cute.Tensor],
-    final_indices: Optional[cute.Tensor],
-    state_indices: Optional[cute.Tensor],
-    has_initial_state: Optional[cute.Tensor],
-    checkpoints: Optional[cute.Tensor],
+    state_in: cute.Tensor | None,
+    state_out: cute.Tensor | None,
+    seed_indices: cute.Tensor | None,
+    final_indices: cute.Tensor | None,
+    state_indices: cute.Tensor | None,
+    has_initial_state: cute.Tensor | None,
+    checkpoints: cute.Tensor | None,
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
     work_count: cute.Tensor,
     work_count_table: cute.Tensor,
-    staging: Optional[cute.Tensor],
-    item_scratch: Optional[cute.Tensor],
-    chunk_scratch: Optional[cute.Tensor],
+    staging: cute.Tensor | None,
+    item_scratch: cute.Tensor | None,
+    chunk_scratch: cute.Tensor | None,
     scheduler: cute.Tensor,
     workspace: cute.Tensor,
     prep: cutlass.Constexpr[bool],
     prep_op: cutlass.Constexpr,
-    prep_k_decay: Optional[cute.Tensor],
-    prep_q_decay: Optional[cute.Tensor],
-    prep_t: Optional[cute.Tensor],
-    prep_a: Optional[cute.Tensor],
-    prep_diag: Optional[cute.Tensor],
-    prep_words: Optional[cute.Tensor],
-    prep_rows: Optional[cute.Tensor],
-    prep_row_count: Optional[cute.Tensor],
+    prep_k_decay: cute.Tensor | None,
+    prep_q_decay: cute.Tensor | None,
+    prep_t: cute.Tensor | None,
+    prep_a: cute.Tensor | None,
+    prep_diag: cute.Tensor | None,
+    prep_words: cute.Tensor | None,
+    prep_rows: cute.Tensor | None,
+    prep_row_count: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     if cutlass.const_expr(split):
@@ -126,10 +123,8 @@ def warmup_forward_host(
             b_t,
             scan_rows,
             log_gate,
-            safe_gate,
             gate_channels,
             overhead_chunks,
-            expand_num,
             warmup_cap,
             full_scan,
             n_heads_out,
@@ -140,8 +135,6 @@ def warmup_forward_host(
             log2_thresh,
             gate_scale_log2,
             gate_table,
-            a_log_table,
-            dt_bias_table,
             cu_seqlens_table,
             chunk_scratch,
             item_scratch,
@@ -191,8 +184,6 @@ def warmup_forward_host(
             k,
             prep_words,
             gate,
-            a_log,
-            dt_bias,
             beta,
             cu_seqlens,
             prep_k_decay,
@@ -233,8 +224,6 @@ def warmup_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_seqlens,
         state_in,
@@ -255,12 +244,16 @@ def warmup_forward_host(
 
 
 def _dynamic(dtype, rank: int, align: int, use_int64_offsets: bool):
-    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last mode contiguous)."""
-    return make_dynamic_signature_tensor(dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets)
+    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last
+    mode contiguous)."""
+    return make_dynamic_signature_tensor(
+        dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets
+    )
 
 
 def _compact(dtype, tail: tuple, align: int, use_int64_offsets: bool):
-    """The legacy ``mark_compact_shape_dynamic(mode=0, ...)`` placeholder: row-major, only the leading mode dynamic."""
+    """The legacy ``mark_compact_shape_dynamic(mode=0, ...)`` placeholder: row-major, only the
+    leading mode dynamic."""
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     return make_compact_signature_tensor(dtype, (sym_int(), *tail), assumed_align=align)
 
@@ -271,8 +264,6 @@ def _compile_warmup_forward(
     io_dtype,
     gate_dtype,
     beta_dtype,
-    a_log_dtype,
-    dt_bias_spec,
     cu_seqlens_dtype,
     state_in_dtype,
     state_out_dtype,
@@ -283,27 +274,22 @@ def _compile_warmup_forward(
     has_seed_indices: bool,
     has_final_indices: bool,
     gate_scale_log2: float,
-    use_qk_l2norm: bool,
-    use_beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     prep: bool,
     use_int64_offsets: bool,
     paged_state: int = 0,
 ):
-    """Compile the warmup / uncut forward host for one static config over fake tensors that repeat the standalone
-    builds' placeholders.  ``facts_static`` is the split table's constexpr facts (split, b_t, scan_rows, log_gate,
-    safe_gate, gate_channels, overhead_chunks, expand_num, warmup_cap, full_scan, num_sms); absent tensors have a None
-    dtype; ``dt_bias_spec`` is ``(dtype, trailing shape)`` or None.  ``paged_state`` is 0 without paged routing, 1 with
+    """Compile the warmup / uncut forward host for one static config over fake tensors that repeat
+    the standalone builds' placeholders.  ``facts_static`` is the split table's constexpr facts
+    (split, b_t, scan_rows, log_gate, gate_channels, overhead_chunks, warmup_cap, full_scan,
+    num_sms); absent tensors have a None dtype.  ``paged_state`` is 0 without paged routing, 1 with
     per-sequence routes and 2 with routes plus the fresh-slot byte mask."""
     (
         split,
         b_t,
         scan_rows,
         log_gate,
-        safe_gate,
         gate_channels,
         overhead_chunks,
-        expand_num,
         warmup_cap,
         full_scan,
         num_sms,
@@ -314,15 +300,7 @@ def _compile_warmup_forward(
         state_dtype = state_out_dtype
     if state_in_dtype is not None:
         state_dtype = state_in_dtype
-    flags = dict(
-        l2norm=use_qk_l2norm,
-        safe_gate=safe_gate,
-        gate_scale_log2=gate_scale_log2,
-        log_gate=log_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        d_k=d_k,
-    )
+    flags = {"gate_scale_log2": gate_scale_log2, "log_gate": log_gate, "d_k": d_k}
     prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
     prefill_cfg = prefill_module.build_cfg(
         io_dtype,
@@ -337,12 +315,16 @@ def _compile_warmup_forward(
         paged_state=paged_state,
         **flags,
     )
-    prefill_op_type = kda_prep_prefill_f16.KdaPrepPrefillOp if prep else kda_prefill_f16.KdaPrefillOp
+    prefill_op_type = (
+        kda_prep_prefill_f16.KdaPrepPrefillOp if prep else kda_prefill_f16.KdaPrefillOp
+    )
     prefill_op = prefill_op_type(prefill_cfg, i64)
     prep_op = None
     prep_signatures = [None] * 8
     if prep:
-        prep_op = kda_prep_f16.KdaPrepOp(kda_prep_f16.build_cfg(io_dtype, gate_dtype, num_sm=num_sms, **flags), i64)
+        prep_op = kda_prep_f16.KdaPrepOp(
+            kda_prep_f16.build_cfg(io_dtype, gate_dtype, num_sm=num_sms, **flags), i64
+        )
         prep_signatures = [
             _dynamic(io_dtype, 4, 128, i64),  # prep_k_decay
             _dynamic(io_dtype, 4, 128, i64),  # prep_q_decay
@@ -353,13 +335,6 @@ def _compile_warmup_forward(
             _dynamic(cutlass.Int32, 2, 16, i64),  # prep_rows
             _dynamic(cutlass.Int32, 1, 4, i64),  # prep_row_count
         ]
-    a_log = _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None
-    a_log_table = _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None
-    dt_bias = dt_bias_table = None
-    if dt_bias_spec is not None:
-        dt_bias_dtype, dt_bias_tail = dt_bias_spec
-        dt_bias = _dynamic(dt_bias_dtype, 1 + len(dt_bias_tail), 16, i64)
-        dt_bias_table = _compact(dt_bias_dtype, dt_bias_tail, 4, i64)
     static = (
         *facts_static,
         d_k,
@@ -370,9 +345,6 @@ def _compile_warmup_forward(
         checkpoint_dtype is not None,
         has_seed_indices,
         has_final_indices,
-        use_qk_l2norm,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         prep,
         i64,
         paged_state,
@@ -383,19 +355,17 @@ def _compile_warmup_forward(
             io_dtype,
             gate_dtype,
             beta_dtype,
-            a_log_dtype,
-            None if dt_bias_spec is None else dt_bias_spec[0],
             cu_seqlens_dtype,
             state_in_dtype,
             state_out_dtype,
             checkpoint_dtype,
         )
     )
-    dt_bias_shape = "none" if dt_bias_spec is None else "x".join(str(n) for n in dt_bias_spec[1]) or "r1"
     gate_tag = str(float(gate_scale_log2)).replace(".", "p").replace("-", "m").replace("+", "")
     name = (
-        "kda_warmup_forward_" + "_".join(str(int(flag)) for flag in static)
-        + f"_{dtype_names}_bias{dt_bias_shape}_g{gate_tag}"
+        "kda_warmup_forward_"
+        + "_".join(str(int(flag)) for flag in static)
+        + f"_{dtype_names}_g{gate_tag}"
     )
     return compile_tvm_ffi(
         warmup_forward_host,
@@ -403,10 +373,8 @@ def _compile_warmup_forward(
         b_t,
         scan_rows,
         log_gate,
-        safe_gate,
         gate_channels,
         overhead_chunks,
-        expand_num,
         warmup_cap,
         full_scan,
         cutlass.Int32(0),  # n_heads_out
@@ -418,20 +386,22 @@ def _compile_warmup_forward(
         *(cutlass.Int32(0) for _ in range(3)),  # n_tiles, ideal_chunks, batch_size
         cutlass.Float32(0),  # log2_thresh
         cutlass.Float32(0),  # gate_scale_log2
-        *(cutlass.Int32(0) for _ in range(4)),  # n_scan_ctas, n_scan_blocks, n_walk_ctas, checkpoint_every_n
+        *(
+            cutlass.Int32(0) for _ in range(4)
+        ),  # n_scan_ctas, n_scan_blocks, n_walk_ctas, checkpoint_every_n
         cutlass.Float32(0),  # scale
         _dynamic(io_dtype, 3, 16, i64),  # q
         _dynamic(io_dtype, 3, 16, i64),  # k
         _dynamic(io_dtype, 3, 16, i64),  # v
         _dynamic(gate_dtype, 3, 16, i64),  # gate
-        _dynamic(gate_dtype, 3, 8 if gate_dtype.width == 16 else 4, i64) if split else None,  # gate_table
-        a_log,
-        a_log_table,
-        dt_bias,
-        dt_bias_table,
+        _dynamic(gate_dtype, 3, 8 if gate_dtype.width == 16 else 4, i64)
+        if split
+        else None,  # gate_table
         _dynamic(beta_dtype, 2, 4, i64),  # beta
         _dynamic(io_dtype, 3, 16, i64),  # o
-        _dynamic(cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64),  # cu_seqlens
+        _dynamic(
+            cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64
+        ),  # cu_seqlens
         _dynamic(cu_seqlens_dtype, 1, 4, i64),  # cu_seqlens_table
         _dynamic(state_in_dtype, 4, 16, i64) if state_in_dtype is not None else None,
         _dynamic(state_out_dtype, 4, 16, i64) if state_out_dtype is not None else None,
@@ -465,60 +435,160 @@ def _dtype_or_none(tensor):
 
 
 def _validate_launch(
-    *, q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, state_in, state_out, seed_indices, final_indices, checkpoints,
-    work_items, work_count, item_scratch, chunk_scratch, scheduler, workspace, split, n_tiles, ideal_chunks, num_sm, b_t,
-    checkpoint_every_n_tokens, tiles_per_head, prep, prep_k_decay, prep_q_decay, prep_t, prep_a, prep_diag, prep_words,
-    prep_rows, prep_row_count, state_indices,
+    *,
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    o,
+    cu_seqlens,
+    state_in,
+    state_out,
+    seed_indices,
+    final_indices,
+    checkpoints,
+    work_items,
+    work_count,
+    item_scratch,
+    chunk_scratch,
+    scheduler,
+    workspace,
+    split,
+    n_tiles,
+    ideal_chunks,
+    num_sm,
+    b_t,
+    checkpoint_every_n_tokens,
+    tiles_per_head,
+    prep,
+    prep_k_decay,
+    prep_q_decay,
+    prep_t,
+    prep_a,
+    prep_diag,
+    prep_words,
+    prep_rows,
+    prep_row_count,
+    state_indices,
 ):
-    """Check the warmup / uncut forward buffers of one plan (``n_tiles`` = sequences x heads x value tiles)."""
+    """Check the warmup / uncut forward buffers of one plan (``n_tiles`` = sequences x heads x
+    value tiles)."""
     tokens, heads_out, num_seqs = kda_prefill_f16.validate_forward_operands(
-        q, k, v, gate, beta, o, cu_seqlens, a_log=a_log, dt_bias=dt_bias, b_t=b_t
+        q, k, v, gate, beta, o, cu_seqlens, b_t=b_t
     )
     kda_prefill_f16.validate_forward_states(
-        q, v, heads_out, num_seqs,
+        q,
+        v,
+        heads_out,
+        num_seqs,
         state_in=(state_in, state_indices is not None or seed_indices is not None),
         state_out=(state_out, state_indices is not None or final_indices is not None),
     )
-    kda_prefill_f16.validate_checkpoints(checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v)
+    kda_prefill_f16.validate_checkpoints(
+        checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v
+    )
     validate_cuda_tensors(
-        q, work_items=work_items, work_count=work_count, item_scratch=item_scratch, chunk_scratch=chunk_scratch,
-        scheduler=scheduler, workspace=workspace, seed_indices=seed_indices, final_indices=final_indices,
+        q,
+        work_items=work_items,
+        work_count=work_count,
+        item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch,
+        scheduler=scheduler,
+        workspace=workspace,
+        seed_indices=seed_indices,
+        final_indices=final_indices,
         state_indices=state_indices,
     )
     dim_v = v.shape[2]
-    if num_sm < 1 or tiles_per_head < 1 or dim_v % tiles_per_head or (split and tiles_per_head != 1):
-        raise ValueError("num_sm must be positive and tiles_per_head must divide d_v (1 under the split table)")
+    if (
+        num_sm < 1
+        or tiles_per_head < 1
+        or dim_v % tiles_per_head
+        or (split and tiles_per_head != 1)
+    ):
+        raise ValueError(
+            "num_sm must be positive and tiles_per_head must divide d_v (1 under the split table)"
+        )
     if n_tiles != num_seqs * heads_out * tiles_per_head:
         raise ValueError("n_tiles must equal sequences x output heads x tiles_per_head")
-    for name, table in (("seed_indices", seed_indices), ("final_indices", final_indices), ("state_indices", state_indices)):
+    for name, table in (
+        ("seed_indices", seed_indices),
+        ("final_indices", final_indices),
+        ("state_indices", state_indices),
+    ):
         if table is not None:
             validate_tensor(name, table, (num_seqs,), ("int32",), align=4, compact=True)
     table_rows = n_tiles
     if split:
         if ideal_chunks:
-            table_rows = split_k.max_work_items(tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm)
+            table_rows = split_k.max_work_items(
+                tokens, num_seqs, heads_out, ideal_chunks, b_t, num_sm
+            )
         validate_tensor(
-            "item_scratch", item_scratch, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows
+            "item_scratch",
+            item_scratch,
+            (None, WORK_ITEM_FIELDS),
+            ("int32",),
+            compact=True,
+            min_rows=table_rows,
         )
         validate_tensor(
-            "chunk_scratch", chunk_scratch, (None, heads_out), ("float32",), align=4,
+            "chunk_scratch",
+            chunk_scratch,
+            (None, heads_out),
+            ("float32",),
+            align=4,
             min_rows=split_k.chunk_scratch_rows(tokens, num_seqs, b_t),
         )
-    validate_tensor("work_items", work_items, (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=table_rows)
+    validate_tensor(
+        "work_items",
+        work_items,
+        (None, WORK_ITEM_FIELDS),
+        ("int32",),
+        compact=True,
+        min_rows=table_rows,
+    )
     validate_tensor("work_count", work_count, (None,), ("int32",), align=4, min_rows=1)
     validate_tensor("scheduler", scheduler, (None,), ("int32",), align=4, min_rows=1)
     prefill = kda_prep_prefill_f16 if prep else kda_prefill_f16
     validate_workspace("workspace", workspace, prefill.TENSORMAP_DESC_ARRAYS, num_seqs)
     if prep:
         validate_cuda_tensors(
-            q, prep_k_decay=prep_k_decay, prep_q_decay=prep_q_decay, prep_t=prep_t, prep_a=prep_a, prep_diag=prep_diag,
-            prep_words=prep_words, prep_rows=prep_rows, prep_row_count=prep_row_count,
+            q,
+            prep_k_decay=prep_k_decay,
+            prep_q_decay=prep_q_decay,
+            prep_t=prep_t,
+            prep_a=prep_a,
+            prep_diag=prep_diag,
+            prep_words=prep_words,
+            prep_rows=prep_rows,
+            prep_row_count=prep_row_count,
         )
-        rows, dim_k, io = tokens // b_t + num_seqs, q.shape[2], (str(q.dtype).removeprefix("torch."),)
-        for name, tensor in (("prep_k_decay", prep_k_decay), ("prep_q_decay", prep_q_decay), ("prep_t", prep_t)):
-            validate_tensor(name, tensor, (None, heads_out, b_t, dim_k), io, tma=True, min_rows=rows)
-        validate_tensor("prep_a", prep_a, (None, heads_out, b_t * b_t // 2), ("int32",), tma=True, min_rows=rows)
-        validate_tensor("prep_diag", prep_diag, (None, heads_out, dim_k), ("float32",), tma=True, min_rows=rows)
+        rows, dim_k, io = (
+            tokens // b_t + num_seqs,
+            q.shape[2],
+            (str(q.dtype).removeprefix("torch."),),
+        )
+        for name, tensor in (
+            ("prep_k_decay", prep_k_decay),
+            ("prep_q_decay", prep_q_decay),
+            ("prep_t", prep_t),
+        ):
+            validate_tensor(
+                name, tensor, (None, heads_out, b_t, dim_k), io, tma=True, min_rows=rows
+            )
+        validate_tensor(
+            "prep_a",
+            prep_a,
+            (None, heads_out, b_t * b_t // 2),
+            ("int32",),
+            tma=True,
+            min_rows=rows,
+        )
+        validate_tensor(
+            "prep_diag", prep_diag, (None, heads_out, dim_k), ("float32",), tma=True, min_rows=rows
+        )
         validate_tensor("prep_rows", prep_rows, (None, 4), ("int32",), compact=True, min_rows=rows)
         validate_tensor("prep_row_count", prep_row_count, (None,), ("int32",), align=4, min_rows=1)
         validate_workspace("prep_words", prep_words, kda_prep_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
@@ -531,8 +601,6 @@ def build_warmup_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     state_in,
@@ -552,15 +620,9 @@ def build_warmup_forward(
     num_sm,
     b_t,
     log_gate,
-    safe_gate,
     gate_lower_bound,
-    use_qk_l2norm,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     checkpoint_every_n_tokens,
     scale,
-    device,
-    stream,
     tiles_per_head=1,
     prep=False,
     prep_k_decay=None,
@@ -574,25 +636,49 @@ def build_warmup_forward(
     state_indices=None,
     has_initial_state=None,
 ):
-    """Compile (persisted per static config: dtypes, dims, gate flags and bound, the split-K geometry, the d_v split,
-    state and checkpoint presence, the int64 ABI) the warmup or uncut forward launch over the buffers of one plan.  The
-    fake signatures repeat the marks of the standalone split-table and prefill builds so every kernel compiles as it
-    does there.  ``device`` and ``stream`` are unused: the compile is keyed on ``num_sm`` and launches on the current
-    Torch stream.  ``state_indices`` (int32 per sequence) and the optional uint8 ``has_initial_state`` select paged
-    state: ``state_in`` and ``state_out`` are then one pool routed per sequence (null, fresh and resumed slots)."""
-    del device, stream
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
+    """Compile (persisted per static config: dtypes, dims, gate flags and bound, the split-K
+    geometry, the d_v split, state and checkpoint presence, the int64 ABI) the warmup or uncut
+    forward launch over the buffers of one plan.  The fake signatures repeat the marks of the
+    standalone split-table and prefill builds so every kernel compiles as it does there.
+    It launches on the current Torch stream.  ``state_indices`` (int32 per sequence) and the
+    optional uint8 ``has_initial_state`` select paged state: ``state_in`` and ``state_out`` are
+    then one pool routed per sequence (null, fresh and resumed slots)."""
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
-        q=q, k=k, v=v, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, o=o, cu_seqlens=cu_seqlens,
-        state_in=state_in, state_out=state_out, seed_indices=seed_indices, final_indices=final_indices,
-        checkpoints=checkpoints, work_items=work_items, work_count=work_count, item_scratch=item_scratch,
-        chunk_scratch=chunk_scratch, scheduler=scheduler, workspace=workspace, split=split, n_tiles=n_tiles,
-        ideal_chunks=ideal_chunks, num_sm=num_sm, b_t=b_t, checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        tiles_per_head=tiles_per_head, prep=prep, prep_k_decay=prep_k_decay, prep_q_decay=prep_q_decay, prep_t=prep_t,
-        prep_a=prep_a, prep_diag=prep_diag, prep_words=prep_words, prep_rows=prep_rows, prep_row_count=prep_row_count,
+        q=q,
+        k=k,
+        v=v,
+        gate=gate,
+        beta=beta,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        state_in=state_in,
+        state_out=state_out,
+        seed_indices=seed_indices,
+        final_indices=final_indices,
+        checkpoints=checkpoints,
+        work_items=work_items,
+        work_count=work_count,
+        item_scratch=item_scratch,
+        chunk_scratch=chunk_scratch,
+        scheduler=scheduler,
+        workspace=workspace,
+        split=split,
+        n_tiles=n_tiles,
+        ideal_chunks=ideal_chunks,
+        num_sm=num_sm,
+        b_t=b_t,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        tiles_per_head=tiles_per_head,
+        prep=prep,
+        prep_k_decay=prep_k_decay,
+        prep_q_decay=prep_q_decay,
+        prep_t=prep_t,
+        prep_a=prep_a,
+        prep_diag=prep_diag,
+        prep_words=prep_words,
+        prep_rows=prep_rows,
+        prep_row_count=prep_row_count,
         state_indices=state_indices,
     )
     facts = split_k.split_table_facts(
@@ -603,32 +689,63 @@ def build_warmup_forward(
         ideal_chunks=ideal_chunks,
         num_sms=num_sm,
         b_t=b_t,
-        log2_threshold=None,
         log_gate=log_gate,
-        safe_gate=safe_gate,
-        gate_lower_bound=gate_lower_bound if safe_gate else None,
-        expand_num=1,
     )
     for name, tensor in (("seed_indices", seed_indices), ("final_indices", final_indices)):
         if tensor is not None and tensor.dtype != torch.int32:
             raise ValueError(f"{name} must be int32, got {tensor.dtype}")
-    if work_items.shape[1:] != (WORK_ITEM_FIELDS,) or (split and item_scratch.shape[1:] != (WORK_ITEM_FIELDS,)):
+    if work_items.shape[1:] != (WORK_ITEM_FIELDS,) or (
+        split and item_scratch.shape[1:] != (WORK_ITEM_FIELDS,)
+    ):
         raise ValueError(f"work-item tables must be [rows, {WORK_ITEM_FIELDS}]")
     enable_checkpoints = int(checkpoint_every_n_tokens) > 0
     if not enable_checkpoints:
         checkpoints = None
     tensors = (
-        q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, state_in, state_out, seed_indices,
-        final_indices, checkpoints, work_items, work_count, item_scratch, chunk_scratch, scheduler,
-        workspace, prep_k_decay, prep_q_decay, prep_t, prep_a, prep_diag, prep_words, prep_rows,
-        prep_row_count, state_indices, has_initial_state,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        o,
+        cu_seqlens,
+        state_in,
+        state_out,
+        seed_indices,
+        final_indices,
+        checkpoints,
+        work_items,
+        work_count,
+        item_scratch,
+        chunk_scratch,
+        scheduler,
+        workspace,
+        prep_k_decay,
+        prep_q_decay,
+        prep_t,
+        prep_a,
+        prep_diag,
+        prep_words,
+        prep_rows,
+        prep_row_count,
+        state_indices,
+        has_initial_state,
     )
     if state_indices is not None:
-        if state_in is None or state_in is not state_out or seed_indices is not None or final_indices is not None:
-            raise ValueError("paged state routes one aliased state pool without seed/final indices")
+        if (
+            state_in is None
+            or state_in is not state_out
+            or seed_indices is not None
+            or final_indices is not None
+        ):
+            raise ValueError(
+                "paged state routes one aliased state pool without seed/final indices"
+            )
         if state_indices.dtype != torch.int32 or not state_indices.is_contiguous():
             raise ValueError("state_indices must be contiguous int32")
-        if has_initial_state is not None and (has_initial_state.dtype != torch.uint8 or not has_initial_state.is_contiguous()):
+        if has_initial_state is not None and (
+            has_initial_state.dtype != torch.uint8 or not has_initial_state.is_contiguous()
+        ):
             raise ValueError("has_initial_state must be a contiguous uint8 mask")
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
@@ -640,10 +757,8 @@ def build_warmup_forward(
             int(facts.b_t),
             int(facts.scan_rows),
             bool(facts.log_gate),
-            bool(facts.safe_gate),
             int(facts.gate_channels),
             int(facts.overhead_chunks),
-            int(facts.expand_num),
             int(facts.warmup_cap),
             bool(facts.full_scan),
             int(facts.num_sms),
@@ -651,8 +766,6 @@ def build_warmup_forward(
         get_dtype(q.dtype),
         get_dtype(gate.dtype),
         get_dtype(beta.dtype),
-        _dtype_or_none(a_log),
-        (get_dtype(dt_bias.dtype), tuple(int(n) for n in dt_bias.shape[1:])) if dt_bias is not None else None,
         cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32,
         _dtype_or_none(state_in),
         _dtype_or_none(state_out),
@@ -663,9 +776,6 @@ def build_warmup_forward(
         seed_indices is not None,
         final_indices is not None,
         float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
-        bool(use_qk_l2norm),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         bool(prep),
         use_int64_offsets,
         paged_state,
@@ -682,8 +792,6 @@ def run_warmup_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     state_in,
@@ -699,7 +807,6 @@ def run_warmup_forward(
     workspace,
     checkpoint_every_n_tokens,
     scale,
-    stream,
     prep_k_decay=None,
     prep_q_decay=None,
     prep_t=None,
@@ -711,9 +818,9 @@ def run_warmup_forward(
     state_indices=None,
     has_initial_state=None,
 ) -> None:
-    """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches, on the
-    current Torch stream (``stream`` is unused).  The plan validated the contract at build, so nothing here raises."""
-    del stream
+    """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and
+    prefill launches, on the current Torch stream.  The plan validated the contract at build, so
+    nothing here raises."""
     compiled(
         facts.n_heads_out,
         facts.n_tiles,
@@ -731,10 +838,6 @@ def run_warmup_forward(
         v,
         gate,
         gate if facts.split else None,
-        a_log if facts.safe_gate else None,
-        a_log if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
         beta,
         o,
         cu_seqlens,

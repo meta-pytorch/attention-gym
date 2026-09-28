@@ -81,11 +81,22 @@ def test_v130_plans_match_reference(monkeypatch, scheme):
 
 
 def test_v130_changing_shapes_reuses_only_static_configuration():
-    """A prior launch must not freeze the next call's sequence/head geometry or scratch size."""
+    """A prior launch must not freeze the next call's sequence/head geometry or scratch size,
+    and repeating a shape must relaunch the compiled hosts instead of compiling again."""
     from attn_gym.linear import chunk_kda
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
+        kda_warmup_backward_f16,
+        kda_warmup_forward_f16,
+    )
 
+    compile_fns = (
+        kda_warmup_forward_f16._compile_warmup_forward,
+        kda_warmup_backward_f16._compile_warmup_backward,
+    )
+    sizes = []
     # A head count/sequence-count change shares some kernel configs but changes work-table sizes.
     for lengths, heads in (([65, 0, 63], 2), ([17, 31, 48, 0], 3), ([65, 0, 63], 2)):
+        before = [fn.cache_info() for fn in compile_fns]
         inputs = make_kda_test_inputs(
             sum(lengths),
             heads=heads,
@@ -108,6 +119,11 @@ def test_v130_changing_shapes_reuses_only_static_configuration():
         )
         grads = torch.autograd.grad(actual, inputs, torch.randn_like(actual))
         assert all(torch.isfinite(g).all() for g in grads)
+        after = [fn.cache_info() for fn in compile_fns]
+        assert [b.hits + b.misses + 1 for b in before] == [a.hits + a.misses for a in after]
+        sizes.append([info.currsize for info in after])
+    # The third shape repeats the first, so it adds no forward or backward specialization.
+    assert sizes[2] == sizes[1]
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
@@ -149,3 +165,51 @@ def test_v130_forward_plans_keep_delta_residual_in_fp32(monkeypatch, scheme, wit
     )
 
     assert (out[16, 0, 0].item(), out[32, 0, 0].item()) == (1.5, 1.5)
+
+
+@pytest.mark.parametrize("with_exit", [False, True], ids=["no-exit", "exit"])
+def test_cudnn_compaction_keeps_empty_state_cotangents(monkeypatch, with_exit):
+    """Compaction drops empty intervals from the work table (the count stays at 4 items) while
+    their states pass through the forward and their exit cotangents through the backward."""
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+
+    inputs = tuple(t[0] for t in make_kda_test_inputs(32, heads=2, seed=433, normalize_qk=True))
+    state = torch.randn(4, 2, 128, 128, device="cuda") / 100
+    dstate = torch.randn_like(state) if with_exit else None
+    do = torch.randn_like(inputs[2])
+    keep = torch.tensor([True, False, True, False], device="cuda")
+    counts = []
+    sms = torch.cuda.get_device_properties().multi_processor_count
+    monkeypatch.setattr(
+        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(0, 1, 1, sms)
+    )
+    monkeypatch.setattr(driver.BackwardPlan, "build", lambda *args: driver.BackwardPlan(0, 1, sms))
+
+    def work_count(device):
+        count = torch.empty(1, device=device, dtype=torch.int32)
+        counts.append(count)
+        return count
+
+    monkeypatch.setattr(driver, "_work_count", work_count)
+    results = []
+    for padded in (False, True):
+        cu = cumulative_sequence_offsets([16, 0, 16, 0] if padded else [16, 16])
+        seed = state if padded else state[keep].contiguous()
+        exit_grad = dstate if padded or dstate is None else dstate[keep].contiguous()
+        out, final = driver.kda_forward(
+            *inputs, cu, scale=1.0, initial_state=seed, output_final_state=True
+        )
+        grads = driver.kda_backward(
+            *inputs, do, cu, scale=1.0, initial_state=seed, d_final_state=exit_grad
+        )
+        results.append((out, final, grads))
+    compact, padded = results
+    torch.testing.assert_close(padded[0], compact[0], rtol=0, atol=0)
+    torch.testing.assert_close(padded[1][keep], compact[1], rtol=0, atol=0)
+    torch.testing.assert_close(padded[1][~keep], state[~keep], rtol=0, atol=0)
+    for got, want in zip(padded[2][:5], compact[2][:5], strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.testing.assert_close(padded[2][5][keep], compact[2][5], rtol=0, atol=0)
+    expected = dstate[~keep] if with_exit else torch.zeros_like(state[~keep])
+    torch.testing.assert_close(padded[2][5][~keep], expected, rtol=0, atol=0)
+    assert [count.item() for count in counts] == [4, 4, 4, 4]

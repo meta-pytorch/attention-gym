@@ -16,25 +16,27 @@
 # limitations under the License.
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
-# attn_gym.linear._delta_rule.cudnn_fe. The host nests the summary / prefill Ops, compiles through a
-# persisted jit_cache function over fake TVM-FFI signatures (int64 ABI variant when a tensor needs it),
-# and launches with live tensors on the current Torch stream.
+# attn_gym.linear._delta_rule.cudnn_fe; the host nests the chain prologue and the summary/prefill
+# Ops and compiles through a @jit_cache function over fake TVM-FFI signatures (+int64 variants),
+# launching live tensors on the current Torch stream (unused device/stream arguments dropped);
+# launch-contract validation of the plan buffers; upstream-only constexpr knobs pruned (safe_gate,
+# A_log/dt_bias, beta sigmoid, allow_neg_eigval, Q/K L2 norm); Ruff formatting.
 
-"""One compiled launch for the KDA chain forward: chain prologue, fused summary, fp32 state chain and prefill issued from a
-single host, the way ``split_k.run_table`` launches plan, scan and walk.  Every kernel, its host and the tensor signature
-each host was compiled with are the standalone modules' own; this host only sequences the four launches, so the kernels'
-SASS is unchanged and the Python side crosses into the DSL once per call instead of four times.  A buffer that two hosts read
-through different signature types is passed twice, once per type: H, M and X (the summary's and prefill's torch views, the
-state chain's ``(1, HO, V, K)`` device views) and ``cu_pieces`` (the prologue marks it at its element alignment, the summary
-and prefill at 8 bytes).  Compiled at ``--opt-level 2``, the level of every KDA module (the chain prologue and the state chain
-take it standalone too, through ``opt_level``), so every nested kernel is the standalone one."""
-
-from typing import Optional
+"""One compiled launch for the KDA chain forward: chain prologue, fused summary, fp32 state chain
+and prefill issued from a single host, the way ``split_k.run_table`` launches plan, scan and walk.
+Every kernel, its host and the tensor signature each host was compiled with are the standalone
+modules' own; this host only sequences the four launches, so the kernels' SASS is unchanged and the
+Python side crosses into the DSL once per call instead of four times.  A buffer that two hosts read
+through different signature types is passed twice, once per type: H, M and X (the summary's and
+prefill's torch views, the state chain's ``(1, HO, V, K)`` device views) and ``cu_pieces`` (the
+prologue marks it at its element alignment, the summary and prefill at 8 bytes).  Compiled at
+``--opt-level 2``, the level of every KDA module (the chain prologue and the state chain take it
+standalone too, through ``opt_level``), so every nested kernel is the standalone one."""
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import torch
+from cutlass import cute
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
@@ -42,7 +44,11 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from ..common.host import get_dtype, validate_cuda_tensors
 from ..common.launch import validate_seqlens, validate_tensor, validate_workspace
 from ..common.piece_chain import CHAIN_WARPS, launch_state_chain
-from ..common.tvm_ffi import WORK_ITEM_FIELDS, make_compact_signature_tensor, make_dynamic_signature_tensor
+from ..common.tvm_ffi import (
+    WORK_ITEM_FIELDS,
+    make_compact_signature_tensor,
+    make_dynamic_signature_tensor,
+)
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
 
 
@@ -67,8 +73,6 @@ def chain_forward_host(
     v: cute.Tensor,
     gate: cute.Tensor,
     beta: cute.Tensor,
-    a_log: Optional[cute.Tensor],
-    dt_bias: Optional[cute.Tensor],
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
@@ -89,12 +93,12 @@ def chain_forward_host(
     state_h_chain: cute.Tensor,
     state_m_chain: cute.Tensor,
     state_x_chain: cute.Tensor,
-    seed: Optional[cute.Tensor],
-    seed_indices: Optional[cute.Tensor],
+    seed: cute.Tensor | None,
+    seed_indices: cute.Tensor | None,
     state_x_prefill: cute.Tensor,
-    final_state: Optional[cute.Tensor],
-    final_indices: Optional[cute.Tensor],
-    checkpoints: Optional[cute.Tensor],
+    final_state: cute.Tensor | None,
+    final_indices: cute.Tensor | None,
+    checkpoints: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     kda_chain_prologue_f16.chain_prologue(
@@ -140,8 +144,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces_main,
         None,
@@ -179,8 +181,6 @@ def chain_forward_host(
         k,
         v,
         gate,
-        a_log,
-        dt_bias,
         beta,
         cu_pieces_main,
         state_x_prefill,
@@ -201,14 +201,20 @@ def chain_forward_host(
 
 
 def _dynamic(dtype, rank: int, align: int, use_int64_offsets: bool):
-    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last mode contiguous)."""
-    return make_dynamic_signature_tensor(dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets)
+    """The legacy ``from_dlpack(t, assumed_align=align).mark_layout_dynamic()`` placeholder (last
+    mode contiguous)."""
+    return make_dynamic_signature_tensor(
+        dtype, rank, assumed_align=align, use_int64_offsets=use_int64_offsets
+    )
 
 
 def _work_table(use_int64_offsets: bool):
-    """The legacy work-item placeholder: compact ``[rows, WORK_ITEM_FIELDS]`` int32, only the row count dynamic."""
+    """The legacy work-item placeholder: compact ``[rows, WORK_ITEM_FIELDS]`` int32, only the row
+    count dynamic."""
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
-    return make_compact_signature_tensor(cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16)
+    return make_compact_signature_tensor(
+        cutlass.Int32, (sym_int(), WORK_ITEM_FIELDS), assumed_align=16
+    )
 
 
 @jit_cache
@@ -219,8 +225,6 @@ def _compile_chain_forward(
     io_dtype,
     gate_dtype,
     beta_dtype,
-    a_log_dtype,
-    dt_bias_spec,
     cu_seqlens_dtype,
     state_dtype,
     final_state_dtype,
@@ -232,28 +236,20 @@ def _compile_chain_forward(
     d_v: int,
     chain_rows: int,
     log_gate: bool,
-    safe_gate: bool,
     gate_scale_log2: float,
-    use_qk_l2norm: bool,
-    use_beta_sigmoid: bool,
-    allow_neg_eigval: bool,
     num_sm: int,
     use_int64_offsets: bool,
 ):
-    """Compile the chain forward host for one static config over fake tensors that repeat the standalone builds'
-    placeholders.  Absent tensors have a None dtype; ``dt_bias_spec`` is ``(dtype, rank)`` or None."""
+    """Compile the chain forward host for one static config over fake tensors that repeat the
+    standalone builds' placeholders.  Absent tensors have a None dtype."""
     i64 = use_int64_offsets
-    flags = dict(
-        l2norm=use_qk_l2norm,
-        safe_gate=safe_gate,
-        gate_scale_log2=gate_scale_log2,
-        log_gate=log_gate,
-        beta_sigmoid=use_beta_sigmoid,
-        allow_neg_eigval=allow_neg_eigval,
-        max_active_clusters=num_sm,
-        d_k=d_k,
-        d_v=d_v,
-    )
+    flags = {
+        "gate_scale_log2": gate_scale_log2,
+        "log_gate": log_gate,
+        "max_active_clusters": num_sm,
+        "d_k": d_k,
+        "d_v": d_v,
+    }
     summary_cfg = kda_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, **flags)
     prefill_cfg = kda_prefill_f16.build_cfg(
         io_dtype,
@@ -277,10 +273,6 @@ def _compile_chain_forward(
         d_v,
         chain_rows,
         log_gate,
-        safe_gate,
-        use_qk_l2norm,
-        use_beta_sigmoid,
-        allow_neg_eigval,
         num_sm,
         i64,
     )
@@ -290,8 +282,6 @@ def _compile_chain_forward(
             io_dtype,
             gate_dtype,
             beta_dtype,
-            a_log_dtype,
-            None if dt_bias_spec is None else dt_bias_spec[0],
             cu_seqlens_dtype,
             state_dtype,
             final_state_dtype,
@@ -299,14 +289,14 @@ def _compile_chain_forward(
             seed_dtype,
         )
     )
-    dt_bias_rank = 0 if dt_bias_spec is None else dt_bias_spec[1]
     gate_tag = str(float(gate_scale_log2)).replace(".", "p").replace("-", "m").replace("+", "")
     name = (
-        "kda_chain_forward_" + "_".join(str(int(flag)) for flag in static)
-        + f"_{dtype_names}_biasrank{dt_bias_rank}_g{gate_tag}"
+        "kda_chain_forward_"
+        + "_".join(str(int(flag)) for flag in static)
+        + f"_{dtype_names}_g{gate_tag}"
     )
-    f32_state = lambda: _dynamic(cutlass.Float32, 4, 16, i64)  # noqa: E731
-    counter = lambda: _dynamic(cutlass.Int32, 1, 4, i64)  # noqa: E731
+    f32_state = lambda: _dynamic(cutlass.Float32, 4, 16, i64)
+    counter = lambda: _dynamic(cutlass.Int32, 1, 4, i64)
     return compile_tvm_ffi(
         chain_forward_host,
         unit_chunks,
@@ -325,10 +315,10 @@ def _compile_chain_forward(
         _dynamic(io_dtype, 3, 16, i64),  # v
         _dynamic(gate_dtype, 3, 16, i64),  # gate
         _dynamic(beta_dtype, 2, 4, i64),  # beta
-        _dynamic(a_log_dtype, 1, 4, i64) if a_log_dtype is not None else None,
-        _dynamic(dt_bias_spec[0], dt_bias_spec[1], 16, i64) if dt_bias_spec is not None else None,
         _dynamic(io_dtype, 3, 16, i64),  # o
-        _dynamic(cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64),  # cu_seqlens
+        _dynamic(
+            cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64
+        ),  # cu_seqlens
         _dynamic(cutlass.Int32, 1, 4, i64),  # cu_pieces (chain prologue)
         _dynamic(cutlass.Int32, 1, 8, i64),  # cu_pieces_main (summary, prefill)
         _dynamic(cutlass.Int32, 1, 16, i64),  # main_rows
@@ -363,50 +353,123 @@ def _dtype_or_none(tensor):
 
 
 def _validate_launch(
-    *, q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, cu_pieces, main_rows, summary_rows, main_count, summary_count,
-    work_items, work_items_summary, scheduler_all, scheduler_summary, scheduler_prefill, summary_words, prefill_words,
-    state_h, state_m, state_x, seed, seed_indices, final_state, final_indices, checkpoints, pieces, heads_out, num_seqs,
-    unit_chunks, b_t, checkpoint_every_n_tokens, chain_rows, num_sm,
+    *,
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    o,
+    cu_seqlens,
+    cu_pieces,
+    main_rows,
+    summary_rows,
+    main_count,
+    summary_count,
+    work_items,
+    work_items_summary,
+    scheduler_all,
+    scheduler_summary,
+    scheduler_prefill,
+    summary_words,
+    prefill_words,
+    state_h,
+    state_m,
+    state_x,
+    seed,
+    seed_indices,
+    final_state,
+    final_indices,
+    checkpoints,
+    pieces,
+    heads_out,
+    num_seqs,
+    unit_chunks,
+    b_t,
+    checkpoint_every_n_tokens,
+    chain_rows,
+    num_sm,
 ):
-    """Check the chain forward buffers of one plan: ``num_seqs * pieces`` piece states and the piece tables."""
+    """Check the chain forward buffers of one plan: ``num_seqs * pieces`` piece states and the
+    piece tables."""
     if validate_seqlens(cu_seqlens) != num_seqs or gate.ndim != 3 or gate.shape[1] != heads_out:
         raise ValueError("num_seqs and heads_out must match cu_seqlens and gate")
     if min(pieces, unit_chunks, num_sm) < 1:
         raise ValueError("pieces, unit_chunks and num_sm must be positive")
     tokens, _, _ = kda_prefill_f16.validate_forward_operands(
-        q, k, v, gate, beta, o, cu_seqlens, a_log=a_log, dt_bias=dt_bias, b_t=b_t
+        q, k, v, gate, beta, o, cu_seqlens, b_t=b_t
     )
     kda_prefill_f16.validate_forward_states(
-        q, v, heads_out, num_seqs, seed=(seed, seed_indices is not None), final_state=(final_state, final_indices is not None)
+        q,
+        v,
+        heads_out,
+        num_seqs,
+        seed=(seed, seed_indices is not None),
+        final_state=(final_state, final_indices is not None),
     )
-    kda_prefill_f16.validate_checkpoints(checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v)
+    kda_prefill_f16.validate_checkpoints(
+        checkpoints, checkpoint_every_n_tokens, tokens, heads_out, num_seqs, q, v
+    )
     num_pieces, dim_v, dim_k = num_seqs * pieces, v.shape[2], q.shape[2]
-    tables = dict(
-        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
-        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
-        scheduler_all=scheduler_all, scheduler_summary=scheduler_summary, scheduler_prefill=scheduler_prefill,
-        seed_indices=seed_indices, final_indices=final_indices,
+    tables = {
+        "cu_pieces": cu_pieces,
+        "main_rows": main_rows,
+        "summary_rows": summary_rows,
+        "main_count": main_count,
+        "summary_count": summary_count,
+        "work_items": work_items,
+        "work_items_summary": work_items_summary,
+        "scheduler_all": scheduler_all,
+        "scheduler_summary": scheduler_summary,
+        "scheduler_prefill": scheduler_prefill,
+        "seed_indices": seed_indices,
+        "final_indices": final_indices,
+    }
+    states = {"state_h": state_h, "state_m": state_m, "state_x": state_x}
+    validate_cuda_tensors(
+        q, **tables, **states, summary_words=summary_words, prefill_words=prefill_words
     )
-    states = dict(state_h=state_h, state_m=state_m, state_x=state_x)
-    validate_cuda_tensors(q, **tables, **states, summary_words=summary_words, prefill_words=prefill_words)
     if chain_rows < CHAIN_WARPS or dim_v % chain_rows or chain_rows % CHAIN_WARPS:
         raise ValueError("chain_rows must divide d_v and contain whole chain warp groups")
-    for name, entries in (("cu_pieces", num_pieces + 1), ("main_rows", num_seqs + 1), ("summary_rows", num_seqs + 1)):
-        validate_tensor(name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16)
-    for name in ("main_count", "summary_count", "scheduler_all", "scheduler_summary", "scheduler_prefill"):
+    for name, entries in (
+        ("cu_pieces", num_pieces + 1),
+        ("main_rows", num_seqs + 1),
+        ("summary_rows", num_seqs + 1),
+    ):
+        validate_tensor(
+            name, tables[name], (entries,), ("int32",), align=4 if name == "cu_pieces" else 16
+        )
+    for name in (
+        "main_count",
+        "summary_count",
+        "scheduler_all",
+        "scheduler_summary",
+        "scheduler_prefill",
+    ):
         validate_tensor(name, tables[name], (None,), ("int32",), align=4, min_rows=1)
     for name in ("seed_indices", "final_indices"):
         if tables[name] is not None:
             validate_tensor(name, tables[name], (num_seqs,), ("int32",), align=4, compact=True)
     for name in ("work_items", "work_items_summary"):
         validate_tensor(
-            name, tables[name], (None, WORK_ITEM_FIELDS), ("int32",), compact=True, min_rows=num_pieces * heads_out
+            name,
+            tables[name],
+            (None, WORK_ITEM_FIELDS),
+            ("int32",),
+            compact=True,
+            min_rows=num_pieces * heads_out,
         )
     for name, tensor in states.items():
         width = dim_k if name == "state_m" else dim_v
-        validate_tensor(name, tensor, (None, heads_out, width, dim_k), ("float32",), min_rows=num_pieces)
-    validate_workspace("summary_words", summary_words, kda_summary_f16.TENSORMAP_DESC_ARRAYS, num_pieces)
-    validate_workspace("prefill_words", prefill_words, kda_prefill_f16.TENSORMAP_DESC_ARRAYS, num_pieces)
+        validate_tensor(
+            name, tensor, (None, heads_out, width, dim_k), ("float32",), min_rows=num_pieces
+        )
+    validate_workspace(
+        "summary_words", summary_words, kda_summary_f16.TENSORMAP_DESC_ARRAYS, num_pieces
+    )
+    validate_workspace(
+        "prefill_words", prefill_words, kda_prefill_f16.TENSORMAP_DESC_ARRAYS, num_pieces
+    )
 
 
 def build_chain_forward(
@@ -416,8 +479,6 @@ def build_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -447,38 +508,56 @@ def build_chain_forward(
     b_t,
     length_rule,
     log_gate,
-    safe_gate,
     gate_lower_bound,
-    use_qk_l2norm,
-    use_beta_sigmoid,
-    allow_neg_eigval,
     checkpoint_every_n_tokens,
     scale,
     chain_rows,
-    device,
     num_sm,
-    stream,
 ):
-    """Compile (persisted per static config: dtypes, dims, gate flags and bound, checkpoint and final-state presence,
-    seed dtype, chain rows, SM count, the int64 ABI) the chain forward launch over the buffers of one plan; ``pieces``,
-    ``heads_out`` and ``num_seqs`` are launch arguments.  The fake signatures repeat the marks of the standalone modules'
-    builds so every kernel compiles as it does there.  ``device`` and ``stream`` are unused: the launch runs on the
-    current Torch stream."""
-    if not safe_gate:
-        a_log = None
-        dt_bias = None
+    """Compile (persisted per static config: dtypes, dims, gate flags and bound, checkpoint and
+    final-state presence, seed dtype, chain rows, SM count, the int64 ABI) the chain forward launch
+    over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.
+    The fake signatures repeat the marks of the standalone modules' builds so every kernel compiles
+    as it does there; the launch runs on the current Torch stream."""
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
-        q=q, k=k, v=v, gate=gate, beta=beta, a_log=a_log, dt_bias=dt_bias, o=o, cu_seqlens=cu_seqlens,
-        cu_pieces=cu_pieces, main_rows=main_rows, summary_rows=summary_rows, main_count=main_count,
-        summary_count=summary_count, work_items=work_items, work_items_summary=work_items_summary,
-        scheduler_all=scheduler_all, scheduler_summary=scheduler_summary, scheduler_prefill=scheduler_prefill,
-        summary_words=summary_words, prefill_words=prefill_words, state_h=state_h, state_m=state_m, state_x=state_x,
-        seed=seed, seed_indices=seed_indices, final_state=final_state, final_indices=final_indices,
-        checkpoints=checkpoints, pieces=pieces, heads_out=heads_out, num_seqs=num_seqs, unit_chunks=unit_chunks, b_t=b_t,
-        checkpoint_every_n_tokens=checkpoint_every_n_tokens, chain_rows=chain_rows, num_sm=num_sm,
+        q=q,
+        k=k,
+        v=v,
+        gate=gate,
+        beta=beta,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        cu_pieces=cu_pieces,
+        main_rows=main_rows,
+        summary_rows=summary_rows,
+        main_count=main_count,
+        summary_count=summary_count,
+        work_items=work_items,
+        work_items_summary=work_items_summary,
+        scheduler_all=scheduler_all,
+        scheduler_summary=scheduler_summary,
+        scheduler_prefill=scheduler_prefill,
+        summary_words=summary_words,
+        prefill_words=prefill_words,
+        state_h=state_h,
+        state_m=state_m,
+        state_x=state_x,
+        seed=seed,
+        seed_indices=seed_indices,
+        final_state=final_state,
+        final_indices=final_indices,
+        checkpoints=checkpoints,
+        pieces=pieces,
+        heads_out=heads_out,
+        num_seqs=num_seqs,
+        unit_chunks=unit_chunks,
+        b_t=b_t,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        chain_rows=chain_rows,
+        num_sm=num_sm,
     )
-    del pieces, heads_out, num_seqs, scale, device, stream
+    del pieces, heads_out, num_seqs, scale
     if int(checkpoint_every_n_tokens) <= 0:
         checkpoints = None
     for name, tensor in (("state_h", state_h), ("state_m", state_m), ("state_x", state_x)):
@@ -488,10 +567,33 @@ def build_chain_forward(
         if tensor is not None and tensor.dtype != torch.int32:
             raise ValueError(f"{name} must be int32, got {tensor.dtype}")
     tensors = (
-        q, k, v, gate, beta, a_log, dt_bias, o, cu_seqlens, cu_pieces, main_rows, summary_rows,
-        main_count, summary_count, work_items, work_items_summary, scheduler_all, scheduler_summary,
-        scheduler_prefill, summary_words, prefill_words, state_h, state_m, state_x, seed,
-        seed_indices, final_state, final_indices, checkpoints,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        o,
+        cu_seqlens,
+        cu_pieces,
+        main_rows,
+        summary_rows,
+        main_count,
+        summary_count,
+        work_items,
+        work_items_summary,
+        scheduler_all,
+        scheduler_summary,
+        scheduler_prefill,
+        summary_words,
+        prefill_words,
+        state_h,
+        state_m,
+        state_x,
+        seed,
+        seed_indices,
+        final_state,
+        final_indices,
+        checkpoints,
     )
     return _compile_chain_forward(
         int(unit_chunks),
@@ -500,8 +602,6 @@ def build_chain_forward(
         get_dtype(q.dtype),
         get_dtype(gate.dtype),
         get_dtype(beta.dtype),
-        _dtype_or_none(a_log),
-        (get_dtype(dt_bias.dtype), dt_bias.ndim) if dt_bias is not None else None,
         cutlass.Int64 if cu_seqlens.dtype == torch.int64 else cutlass.Int32,
         get_dtype(state_x.dtype),
         _dtype_or_none(final_state),
@@ -513,11 +613,7 @@ def build_chain_forward(
         int(v.shape[2]),
         int(chain_rows),
         bool(log_gate),
-        bool(safe_gate),
         float(gate_lower_bound) * kda_summary_f16.LOG2_E,
-        bool(use_qk_l2norm),
-        bool(use_beta_sigmoid),
-        bool(allow_neg_eigval),
         int(num_sm),
         requires_int64_abi(*tensors),
     )
@@ -531,8 +627,6 @@ def run_chain_forward(
     v,
     gate,
     beta,
-    a_log,
-    dt_bias,
     o,
     cu_seqlens,
     cu_pieces,
@@ -560,11 +654,9 @@ def run_chain_forward(
     num_seqs,
     checkpoint_every_n_tokens,
     scale,
-    stream,
 ) -> None:
-    """Replay the chain forward: one crossing into the DSL for the four launches, on the current Torch stream
-    (``stream`` is unused).  The plan validated the contract at build, so nothing here raises."""
-    del stream
+    """Replay the chain forward: one crossing into the DSL for the four launches, on the current
+    Torch stream.  The plan validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),
         int(heads_out),
@@ -576,8 +668,6 @@ def run_chain_forward(
         v,
         gate,
         beta,
-        a_log,
-        dt_bias,
         o,
         cu_seqlens,
         cu_pieces,

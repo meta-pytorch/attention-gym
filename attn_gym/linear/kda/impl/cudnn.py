@@ -30,6 +30,18 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
     return torch.zeros_like(value) if d_output is None else d_output.contiguous()
 
 
+def _compact_beta(beta: torch.Tensor) -> torch.Tensor:
+    """Copy beta into a contiguous, 128-byte-aligned buffer for the composed stateful backward.
+
+    The cuDNN forward only asks for an element-aligned contiguous inner mode, but the fused
+    stateful backward's TVM-FFI ABI rejects token-strided or misaligned beta.
+    """
+    # Dynamo cannot trace the alignment check, so compiled backward always copies.
+    if not torch.compiler.is_compiling() and beta.is_contiguous() and beta.data_ptr() % 128 == 0:
+        return beta
+    return beta.clone(memory_format=torch.contiguous_format)
+
+
 class ChunkKdaCudnn(torch.autograd.Function):
     """Attach a backward to cuDNN's forward: cuDNN's own without an entry state, fused with one.
 
@@ -86,6 +98,7 @@ class ChunkKdaCudnn(torch.autograd.Function):
             )
             d_initial_state = None
         else:
+            beta = _compact_beta(beta)
             cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
             dq, dk, dv, d_cumulative, d_beta, d_initial_state = (
                 chunk_bwd_recompute_factors_with_state_grad_op(

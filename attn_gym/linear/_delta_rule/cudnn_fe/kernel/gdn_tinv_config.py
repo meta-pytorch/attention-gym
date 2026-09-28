@@ -18,12 +18,11 @@
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe.
 
-"""Fixed compile-time constants of the GDN chunk-factor (T_inv) pass (SM100 / SM103 / SM107); the per-compile attributes live on
-``GdnTinvCfg`` in the kernel file.
+"""Fixed compile-time constants of the GDN chunk-factor (T_inv) pass (SM100 / SM103 / SM107); the
+per-compile attributes live on ``GdnTinvCfg`` in the kernel file.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,7 @@ class Cfg:
     B_T: int = 64
 
     # --- warp assignments (12 warps total) ---
-    COMPUTE_GROUP_WARP_IDS: Tuple[Tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))
+    COMPUTE_GROUP_WARP_IDS: tuple[tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))
     TMA_K_WARP_ID: int = 8
     TCGEN05_MMA_WARP_ID: int = 9
     EPILOGUE_WARP_ID: int = 10
