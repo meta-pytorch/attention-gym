@@ -60,7 +60,7 @@ vendor the new tag.
 - **Tests:** GB::test_gdn_cudnn_backward_preserves_small_beta_gradient,
   GB::test_gdn_cudnn_backward_mixed_small_beta_matches_reference.
 - **Upstream:** draft `01-gdn-beta-free-dbeta.patch`; stock v1.30 returns dBeta = 0 instead of 1.
-- **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the two new barriers
+- **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the new barriers
   must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`
   rejects fused l2norm at d_v = 128 after this change; AG never passes `inv_q`.
 - **Reverted** ("Restore the v1.30 divide-by-beta dBeta in the GDN cuDNN backward"). Kernel-isolated
@@ -84,6 +84,11 @@ vendor the new tag.
   tinv_source knob, the CG0 T = I - T_b L rebuild, the T_b TMA loads, mb_t_inv_done and the
   ninth (tinv) descriptor array: backward outputs bitwise equal on uncut, packed, split and chain
   shapes; SASS differs only by the dropped barrier (one fewer mbarrier init, later offsets -0x10).
+  "Tidy the exact-dBeta GDN bprop synchronization, naming and validation" removed
+  mb_t_free_ready: the same 128 CG0 threads arrive on mb_t_inv_ready later in program order, and
+  the MMA warp waits on it (U GEMM) before the Z GEMM. Outputs bitwise equal (uncut, packed,
+  16-piece chain); SASS gdn_bprop -1 mbarrier init/arrive, -2 try-waits, -1 fence, STACK 24->16,
+  7424->7408 instructions; bprop kernel time -0.1...-2.3% (noise band).
 
 ### B6 — KDA delta residual rounded before subtraction (C06) · numerics
 - **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large
