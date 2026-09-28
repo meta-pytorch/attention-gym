@@ -100,7 +100,8 @@ argument handling. No already-landed replacement was found.
 Translated from these AG commits (by subject; see `../fixes.toml`), **without AG restyling or
 dependencies**:
 
-- 01 (B7): "Compute the GDN bprop dBeta without dividing by beta".
+- 01 (B7): "Compute the GDN bprop dBeta without dividing by beta". The patch keeps upstream's
+  gmem inverse-factor route; AG later inverts in-kernel only and removed that route.
 - 02 (B6): "Add an FP32 KDA delta-residual staging helper", "Keep the KDA forward delta residual
   in FP32 before the MMA pack", "Keep the KDA backward delta residual in FP32 through subtraction
   and beta scaling".

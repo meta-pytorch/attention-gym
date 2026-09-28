@@ -286,6 +286,23 @@ def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
     assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
 
 
+def test_gdn_cudnn_chain_backward_mixed_small_beta_matches_reference(monkeypatch) -> None:
+    """The piece-chain backward runs its own bprop launch; dBeta must stay exact there too."""
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+
+    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    inputs = make_gdn_test_inputs(
+        (2048,), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=163
+    )
+    assert fe_gdn.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
+    beta = inputs[4]
+    beta[:, ::4] = 0.0
+    beta[:, 1::4] = 1e-12
+    d_output, d_final_state = make_cotangents(inputs[2], inputs[5], seed=167, state_cotangent=True)
+
+    assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
+
+
 def test_gdn_cudnn_backward_rejects_mismatched_output_gradient_dtype() -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64,), key_heads=1, value_heads=1, dtype=torch.bfloat16, seed=143

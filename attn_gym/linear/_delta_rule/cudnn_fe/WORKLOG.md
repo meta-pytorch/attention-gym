@@ -49,9 +49,10 @@ vendor the new tag.
   accepts any post-activation beta.
 - **Found by:** originally #475; on v1.30 it resurfaced as 9 small-beta test failures when the
   existing AG suite first ran against the new kernels.
-- **Fix:** keep beta-free inverse factors (T = I − T_b L) and stage Z separately from beta·Z, so
+- **Fix:** keep the inverse factor T beta-free and stage Z = Tᵀ dU separately from beta·Z, so
   dBeta is computed directly; includes the coupled GEMM issue order and scratch lifetimes.
-  `kernel/gdn_bprop_f16.py`; "Compute the GDN bprop dBeta without dividing by beta".
+  `kernel/gdn_bprop_f16.py`; "Compute the GDN bprop dBeta without dividing by beta" first rebuilt
+  T = I − T_b L from the T-pass tile (reverted, below); the landed version inverts in-kernel.
 - **Evidence:** fails without = YES (mutation back to the divide: all 8 exact cases fail, dBeta
   0 / 0.0099 / 0.5 / 0.9901 instead of 1). SASS: gdn_bprop +296 instructions, STACK 16→24, REG 128.
   Fwd+bwd +0.4…+3.6% over four workloads (the cost #604 accepted). KDA bprop has no beta divide
@@ -76,8 +77,9 @@ vendor the new tag.
   still runs for the checkpoint recompute; the bprop no longer loads its tile. Worst relL2 over 4
   layers vs main (fp64 reference, steps 2500/15000/27500, packed_16k and longdoc_32k): dK and dV
   equal to main to three digits, dGate within ±13%, dBeta +4…7% (the gmem rebuild was +80…100%).
-  All small-beta tests pass again (no xfail). Cost vs the gmem rebuild: fwd+bwd +2.4% at
-  prefill_2048 and prefill_8x2048, +0.3% at train_10x4096, noise on the chain train_1x40960.
+  All small-beta tests pass again (no xfail). Cost vs the reverted gmem rebuild: fwd+bwd +2.4% at
+  prefill_2048 and prefill_8x2048, +0.3% at train_10x4096, noise on the chain train_1x40960; vs
+  main (divide-by-beta): fwd+bwd +1.8…+5.4%, bwd +1.9…+6.5% over seven 27B-shape workloads.
   "Remove the unused gmem inverse-factor path from the GDN bprop" then deleted the dead
   tinv_source knob, the CG0 T = I - T_b L rebuild, the T_b TMA loads, mb_t_inv_done and the
   ninth (tinv) descriptor array: backward outputs bitwise equal on uncut, packed, split and chain

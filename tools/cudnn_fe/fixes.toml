@@ -39,6 +39,7 @@ title = "GDN bprop dBeta computed beta-free instead of rowsum/(beta+eps)"
 kind = "numerics"
 ag_subject = "Compute the GDN bprop dBeta without dividing by beta"
 ag_subjects_extra = [
+  "Restore the v1.30 divide-by-beta dBeta in the GDN cuDNN backward",
   "Compute the GDN cuDNN bprop dBeta exactly with the in-kernel inverse",
   "Remove the unused gmem inverse-factor path from the GDN bprop",
 ]

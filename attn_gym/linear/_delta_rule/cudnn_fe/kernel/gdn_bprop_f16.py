@@ -33,14 +33,15 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
            the forward state ENTERING chunk c), Gate[BT], Beta[BT]
   State  : dstate[DK,DV]  (state gradient, held in TMEM, accumulated backward)
 
-  MMA order.  A = the staged attention matrix
-  (CG0's A epilogue, sA); dO' = dO * cumprod_vals * scale (CG1 restage):
   Beta handling (exact at Beta == 0): T is the beta-free (I + Beta*L)^-1 with L = strict(W_kk
   2^{g_i-g_j}); T_b = T * Beta[col] is the U GEMM operand. Z = T^T dU is the gradient w.r.t.
   Beta*Y, so dV = Beta*Z, dY' = -Beta*cumprod*Z and dBeta = rowsum(Z*Y) - rowsum(dM*L) with no
   division by Beta. CG0 builds T in sDm by the in-place blockwise inverse, then scales it into
   sTinv for the U GEMM. (Rebuilding T = I - T_b @ L from the bf16 gdn_tinv_f16 tile instead costs
   1.5-2.6x dV/dBeta/dK precision: the cancelling bf16 sum amplifies the operand roundings.)
+
+  MMA order.  A = the staged attention matrix
+  (CG0's A epilogue, sA); dO' = dO * cumprod_vals * scale (CG1 restage):
 
   KK          : W_kk[BT,BT]  = K  @ K^T        -> shared acc   (for T and the dGate/dBeta M-terms)
   QK          : W_qk[BT,BT]  = Q  @ K^T        -> shared acc   (for the A tile)
@@ -85,7 +86,7 @@ gdn_bprop_config.py):
   dO                               16384     1
   state (checkpoint entry c-1)     32768     1      <-- io-dtype [DK,DV], TMA-loaded
   T_b = T * Beta[col]              8192      1      <-- U GEMM operand: CG0's scaled inverse
-  L (beta-free strict-masked W_kk) 8192      1      <-- KK epi store; T build and dGate/dBeta M-terms
+  L (beta-free strict-masked W_kk) 8192      1      <-- KK epi store; dGate/dBeta M-terms
   A staging / sDa                  8192      1      <-- ALIAS: A then the masked dA
   T / dM staging (sDm)             8192      1      <-- beta-free T (Z GEMM operand), then the
                                                         dK dM-terms operand
@@ -105,8 +106,8 @@ TMEM layout (512 cols):
                                                     / dM core
   cols 384-448 : shared inputs x2 (f16 packed) <-- dO' / dU / dY'; the dK
                  state-path acc overwrites them after their last GEMM reads
-                 (CG1's state-path readout precedes its next-chunk restages)
-  cols 448-512 : Y (448) + g_k_state (480) f16 slots until the dV pass, then
+                 (CG2's state-path readout precedes CG1's next-chunk restages)
+  cols 448-512 : Y (448) + g_k_state (480) f16 slots until the dBeta pass, then
                  Q^T (448) until CG1's dQ dot reads it
 
 Warp assignments (16 warps = 512 threads):
@@ -200,6 +201,8 @@ from ..tile_dsl.tma import (
 from .gdn_bprop_config import CFG
 
 USE_PDL = True
+# Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0].
+assert CFG.SMEM_DQ_STAGES == 1 and CFG.SMEM_DK_STAGES == 1
 STATE_DIMS = (64, 128)
 TMEM_COLUMNS = 512
 
@@ -1116,7 +1119,6 @@ def tcgen05_mma_warp(
     sState_trans,
     sState,
     sTinv,
-    sTinv_trans,
     sA,
     sA_trans,
     sDa,
@@ -1488,7 +1490,6 @@ def tcgen05_mma_warp(
     d_state_trans0 = sState_trans[0].desc()
     d_state0 = sState[0].desc()
     d_tinv0 = sTinv[0].desc()
-    d_t_free_trans0 = sDm_trans[0].desc()
     d_z0 = sdQ[0].desc()
     d_a_trans0 = sA_trans[0].desc()
     d_v0 = sV[0].desc()
@@ -1696,7 +1697,6 @@ def tcgen05_mma_warp(
             bars.mb_t_free_ready[0].wait(t_free_index.phase)
             t_free_index = advance(t_free_index, 1)
 
-            desc_tinv_trans = d_t_free_trans0
             for i in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.num_subtiles_B):
                 for k in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.sps_B):
                     mma_ts_step(
@@ -1706,7 +1706,7 @@ def tcgen05_mma_warp(
                             * bmm_du_t_inv_trans_desc.sps_B
                             * bmm_du_t_inv_trans_desc.tmem_advance_A
                         ),
-                        desc_tinv_trans + i * (bmm_du_t_inv_trans_desc.smem_subtile_B >> 4),
+                        d_dm_trans0 + i * (bmm_du_t_inv_trans_desc.smem_subtile_B >> 4),
                         dy_acc_ptr,
                         k,
                         cutlass.Boolean(i + k > 0),
@@ -1751,12 +1751,10 @@ def tcgen05_mma_warp(
             bars.mb_z_ready[0].wait(z_ready_index.phase)
             z_ready_index = advance(z_ready_index, 1)
 
-            desc_dy_dm = d_z0
-            desc_u_dm = d_v0
             mma_ss(
                 bmm_dy_u_desc,
-                desc_dy_dm,
-                desc_u_dm,
+                d_z0,
+                d_v0,
                 dm_core_acc_ptr,
                 accumulate=False,
             )
@@ -2543,7 +2541,7 @@ def compute0_warp_group(
                 num=8,
             )
 
-            # dm_vec = Z @ U^T carries no Beta: sDm = -Beta[i] * strict * dm_vec. The dY GEMM,
+            # dm_vec = Z @ U^T carries no Beta: sDm = -Beta[i] * strict * dm_vec. The Z GEMM,
             # T_free's last reader in sDm, completes before mb_dm_acc_ready.
             dm_pack = []
             for k in cutlass.range_constexpr(num_vals // 2):
@@ -4070,11 +4068,9 @@ def build_descs_body(
     dv: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
-    b_t: cutlass.Constexpr[int],
 ) -> None:
-    """Per-batch descriptor-array build, one warp per array. Runs
-    inside the prologue kernel after its order pass; warps past the array count fall through the
-    widx guards."""
+    """Per-batch descriptor-array build, one warp per array. Runs inside the prologue kernel
+    after its order pass; warps past the array count fall through the widx guards."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
     sub0 = cute.make_tensor(desc_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
     sub1 = cute.make_tensor(
@@ -4242,7 +4238,6 @@ def frost_gdn_bprop_prologue(
             dv,
             n_batch,
             checkpoint_every_n,
-            b_t,
         )
 
 
@@ -4690,14 +4685,6 @@ def frost_gdn_bprop(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sTinv_trans = SmemTile(
-        base=smem_data_ptr(sTinv_raw),
-        elems_per_stage=(cfg.t_inv_cosize // cfg.smem_t_inv_stages),
-        stages=cfg.smem_t_inv_stages,
-        leading_byte_offset=(cfg.b_t // 2) * 128,
-        stride_byte_offset=STRIDE,
-        layout=SWZ,
-    )
     sKK_raw = storage.kk.get_tensor(cute.make_layout((cfg.t_inv_cosize,)))
     sKK = SmemTile(
         base=smem_data_ptr(sKK_raw),
@@ -5060,7 +5047,6 @@ def frost_gdn_bprop(
             sState_trans=sState_trans,
             sState=sState,
             sTinv=sTinv,
-            sTinv_trans=sTinv_trans,
             sA=sA,
             sA_trans=sA_trans,
             sDa=sDa,
@@ -5253,11 +5239,6 @@ def build_cfg(
     if d_k != d_v:
         raise ValueError(
             "the bprop stages Z (d_v wide) in the dQ tile, whose fragment strides need d_k == d_v"
-        )
-    if CFG.SMEM_DQ_STAGES != 1 or CFG.SMEM_DK_STAGES != 1:
-        raise ValueError(
-            "Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0]; both need one "
-            "stage"
         )
     cfg = GdnBpropCfg(
         use_initial_state=use_initial_state,
@@ -5599,9 +5580,10 @@ def validate_bwd_bundle(
     dgate=None,
     dbeta=None,
 ):
-    """Check the operands every bundled backward host (warmup/uncut and chain) hands the bprop:
+    """Check the operands every bundled backward host (warmup/uncut and chain) shares: the bprop's
     ``num_pieces`` checkpoint series (one per sequence, or per chain piece) and, with
-    ``tinv_pass``, the T-pass tiles and row table; return ``(tokens, heads_out, num_seqs)``."""
+    ``tinv_pass``, the T-pass tiles and row table the recompute and bprop summary read; return
+    ``(tokens, heads_out, num_seqs)``."""
     if b_t != CFG.B_T or num_pieces < 1:
         raise ValueError(f"bundled backward hosts need b_t={CFG.B_T} and a positive piece count")
     tokens, heads_out, num_seqs = validate_bwd_operands(
