@@ -135,10 +135,8 @@ exclude = [
     "*.ipynb",
     # Vendored NVIDIA Apache-2.0/MIT source; lint the maintained cuDNN adapters instead.
     "attn_gym/linear/_delta_rule/cudnn/kernels/common",
-    # Verbatim cudnn-frontend v1.30 drop; restyled and linted in a follow-up.
-    "attn_gym/linear/_delta_rule/cudnn_fe/common",
+    # Vendored cudnn-frontend v1.30 kernels; restyled and linted in a follow-up.
     "attn_gym/linear/_delta_rule/cudnn_fe/kernel",
-    "attn_gym/linear/_delta_rule/cudnn_fe/tile_dsl",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_config.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_f16.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_config.py",
@@ -160,3 +158,6 @@ ignore = ['E231', 'E731']
 "__init__.py" = ["F401", "F403"]
 "attn_gym/linear/kda/utils.py" = ["BLE001"]
 "test/test_kda_kernels.py" = ["E402"]
+# CuTeDSL traces if-expressions and nested ifs as device selects/branches; min/max builtins and
+# `and` do not trace the same way on dynamic values, so keep the vendored control flow.
+"attn_gym/linear/_delta_rule/cudnn_fe/{common,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]

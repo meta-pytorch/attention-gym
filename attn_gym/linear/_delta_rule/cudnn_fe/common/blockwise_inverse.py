@@ -7,8 +7,8 @@
 """Blockwise inverse of the beta-folded chunk matrix ``I + strict_lower(M)``."""
 
 import cutlass
-import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+from cutlass import cute
 
 from ..tile_dsl.mma import mma_step, mma_step_k8
 from ..tile_dsl.pointwise import fp32_to_fp16, movmatrix_16b, opaque_i32_zero
@@ -32,7 +32,9 @@ def invert_diagonal_NxN(cfg, in_base, out_base, d_idx, tidx, N: int = 8):
     for src_row in cutlass.range_constexpr(N - 1):
         row_scale = -row[src_row]
         for i in cutlass.range_constexpr(src_row):
-            shfl_val = nvvm.shfl_sync(0xFFFFFFFF, row[i], src_row, 0b1100000011111, kind=nvvm.Shfl.IDX)
+            shfl_val = nvvm.shfl_sync(
+                0xFFFFFFFF, row[i], src_row, 0b1100000011111, kind=nvvm.Shfl.IDX
+            )
             row[i] = row[i] + row_scale * shfl_val if tidx_in_group > src_row else row[i]
         row[src_row] = row_scale if tidx_in_group > src_row else row[src_row]
 
@@ -56,7 +58,9 @@ def blockwise_diagonal_8x8_to_16x16(cfg, base, raw_base, d_idx, lane_idx):
     c_regs = cutlass.Array(cutlass.Float32, 4, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(4):
         c_regs[i] = cutlass.Float32(0.0)
-    mma_step_k8(c_regs, [d_inv_frag, d_inv_frag], [c_frag], k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype)
+    mma_step_k8(
+        c_regs, [d_inv_frag, d_inv_frag], [c_frag], k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype
+    )
     for i in cutlass.range_constexpr(4):
         c_regs[i] = -c_regs[i]
     a_pack = [fp32_to_fp16(c_regs[2 * j], c_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(2)]
@@ -109,7 +113,9 @@ def blockwise_diagonal_16x16_to_32x32(cfg, base, raw_base, d_idx, lane_idx):
 
 
 @cute.jit
-def blockwise_diagonal_32x32_to_64x64(cfg, base, raw_base, warp_id, lane_idx, barrier_id, barrier_threads):
+def blockwise_diagonal_32x32_to_64x64(
+    cfg, base, raw_base, warp_id, lane_idx, barrier_id, barrier_threads
+):
     """Off-diagonal correction 32x32 -> 64x64 (2 warps, one 16-row M-band each; raw C from ``raw_base``);
     the two bands meet on named barrier ``barrier_id`` (``barrier_threads`` arrivals) before the store."""
     band = warp_id % 2
@@ -119,18 +125,38 @@ def blockwise_diagonal_32x32_to_64x64(cfg, base, raw_base, warp_id, lane_idx, ba
     row_d_inv = 32 + band * 16 + lane_row
     d_inv_frags = []
     for vs in cutlass.range_constexpr(2):
-        d_inv_frags += list(nvvm.ldmatrix(base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, 32 + vs * 16 + lane_col), 4, nvvm.MMALayout.ROW))
+        d_inv_frags += list(
+            nvvm.ldmatrix(
+                base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, 32 + vs * 16 + lane_col),
+                4,
+                nvvm.MMALayout.ROW,
+            )
+        )
     c_frags = []
     for vs in cutlass.range_constexpr(4):
         row_c = 32 + (vs // 2) * 16 + lane_row
-        c_frags += list(nvvm.ldmatrix(raw_base + row_c * BT + swizzle_xor_128b(row_c, (vs % 2) * 16 + lane_col), 4, nvvm.MMALayout.COL))
+        c_frags += list(
+            nvvm.ldmatrix(
+                raw_base + row_c * BT + swizzle_xor_128b(row_c, (vs % 2) * 16 + lane_col),
+                4,
+                nvvm.MMALayout.COL,
+            )
+        )
 
     # ---- T = -(D^-1 @ C) -------------------------------------------------------------
     c_regs = cutlass.Array(cutlass.Float32, 16, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(16):
         c_regs[i] = cutlass.Float32(0.0)
     for ks in cutlass.range_constexpr(2):
-        mma_step(c_regs, d_inv_frags, c_frags[ks * 8 : ks * 8 + 8], k_step=ks, M=16, N=32, ab_dtype=cfg.io_dtype)
+        mma_step(
+            c_regs,
+            d_inv_frags,
+            c_frags[ks * 8 : ks * 8 + 8],
+            k_step=ks,
+            M=16,
+            N=32,
+            ab_dtype=cfg.io_dtype,
+        )
     for i in cutlass.range_constexpr(16):
         c_regs[i] = -c_regs[i]
     a_pack = [fp32_to_fp16(c_regs[2 * j], c_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(8)]
@@ -139,18 +165,40 @@ def blockwise_diagonal_32x32_to_64x64(cfg, base, raw_base, warp_id, lane_idx, ba
     a_inv_frags = []
     for vs in cutlass.range_constexpr(4):
         row_a_inv = (vs // 2) * 16 + lane_row
-        a_inv_frags += list(nvvm.ldmatrix(base + row_a_inv * BT + swizzle_xor_128b(row_a_inv, (vs % 2) * 16 + lane_col), 4, nvvm.MMALayout.COL))
+        a_inv_frags += list(
+            nvvm.ldmatrix(
+                base + row_a_inv * BT + swizzle_xor_128b(row_a_inv, (vs % 2) * 16 + lane_col),
+                4,
+                nvvm.MMALayout.COL,
+            )
+        )
     o_regs = cutlass.Array(cutlass.Float32, 16, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(16):
         o_regs[i] = cutlass.Float32(0.0)
     for ks in cutlass.range_constexpr(2):
-        mma_step(o_regs, a_pack, a_inv_frags[ks * 8 : ks * 8 + 8], k_step=ks, M=16, N=32, ab_dtype=cfg.io_dtype)
+        mma_step(
+            o_regs,
+            a_pack,
+            a_inv_frags[ks * 8 : ks * 8 + 8],
+            k_step=ks,
+            M=16,
+            N=32,
+            ab_dtype=cfg.io_dtype,
+        )
     o_pack = [fp32_to_fp16(o_regs[2 * j], o_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(8)]
 
     # ---- store corrected C -----------------------------------------------------------
     nvvm.barrier_cta_sync_aligned(barrier_id, thread_count=barrier_threads)
-    nvvm.stmatrix(base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, lane_col), o_pack[0:4], nvvm.MMALayout.ROW)
-    nvvm.stmatrix(base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, 16 + lane_col), o_pack[4:8], nvvm.MMALayout.ROW)
+    nvvm.stmatrix(
+        base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, lane_col),
+        o_pack[0:4],
+        nvvm.MMALayout.ROW,
+    )
+    nvvm.stmatrix(
+        base + row_d_inv * BT + swizzle_xor_128b(row_d_inv, 16 + lane_col),
+        o_pack[4:8],
+        nvvm.MMALayout.ROW,
+    )
 
 
 @cute.jit
@@ -176,7 +224,15 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     s = cutlass.Array(cutlass.Float32, 8, alignment=16)
     for i in cutlass.range_constexpr(8):
         s[i] = cutlass.Float32(0.0)
-    mma_step(s, (l4_a0, zero, zero, l4_a3), (movmatrix_16b(l4_a0), zero, zero, movmatrix_16b(l4_a3)), k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
+    mma_step(
+        s,
+        (l4_a0, zero, zero, l4_a3),
+        (movmatrix_16b(l4_a0), zero, zero, movmatrix_16b(l4_a3)),
+        k_step=0,
+        M=16,
+        N=16,
+        ab_dtype=cfg.io_dtype,
+    )
 
     # ---- D4 = I - L4 + S - L4 @ S -------------------------------------------------------
     d4 = cutlass.Array(cutlass.Float32, 8, alignment=16)
@@ -188,7 +244,15 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
             d4[i] = cutlass.Float32(0.0)
     neg_s_b0 = movmatrix_16b(fp32_to_fp16(-s[0], -s[1], dtype=cfg.io_dtype))
     neg_s_b3 = movmatrix_16b(fp32_to_fp16(-s[6], -s[7], dtype=cfg.io_dtype))
-    mma_step(d4, (l4_a0, zero, zero, l4_a3), (neg_s_b0, zero, zero, neg_s_b3), k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
+    mma_step(
+        d4,
+        (l4_a0, zero, zero, l4_a3),
+        (neg_s_b0, zero, zero, neg_s_b3),
+        k_step=0,
+        M=16,
+        N=16,
+        ab_dtype=cfg.io_dtype,
+    )
 
     # ---- C4 = subdiag_4(L), M = D4 @ C4 -------------------------------------------------
     c4_lo0 = l_regs[0] if below_diagonal_block else cutlass.Float32(0.0)
@@ -202,7 +266,15 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     m = cutlass.Array(cutlass.Float32, 8, alignment=16)
     for i in cutlass.range_constexpr(8):
         m[i] = cutlass.Float32(0.0)
-    mma_step(m, (d4_a0, zero, zero, d4_a3), (c4_b0, zero, zero, c4_b3), k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
+    mma_step(
+        m,
+        (d4_a0, zero, zero, d4_a3),
+        (c4_b0, zero, zero, c4_b3),
+        k_step=0,
+        M=16,
+        N=16,
+        ab_dtype=cfg.io_dtype,
+    )
 
     # ---- D8 = D4 - M @ D4 ---------------------------------------------------------------
     d8 = cutlass.Array(cutlass.Float32, 8, alignment=16)
@@ -210,7 +282,15 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
         d8[i] = d4[i]
     neg_m_a0 = fp32_to_fp16(-m[0], -m[1], dtype=cfg.io_dtype)
     neg_m_a3 = fp32_to_fp16(-m[6], -m[7], dtype=cfg.io_dtype)
-    mma_step(d8, (neg_m_a0, zero, zero, neg_m_a3), (movmatrix_16b(d4_a0), zero, zero, movmatrix_16b(d4_a3)), k_step=0, M=16, N=16, ab_dtype=cfg.io_dtype)
+    mma_step(
+        d8,
+        (neg_m_a0, zero, zero, neg_m_a3),
+        (movmatrix_16b(d4_a0), zero, zero, movmatrix_16b(d4_a3)),
+        k_step=0,
+        M=16,
+        N=16,
+        ab_dtype=cfg.io_dtype,
+    )
 
     # ---- C8 = L[8:16, 0:8], M = D8 @ C8 -------------------------------------------------
     c8_b1 = movmatrix_16b(fp32_to_fp16(l_regs[2], l_regs[3], dtype=cfg.io_dtype))
@@ -219,10 +299,20 @@ def invert_unit_lower_16x16_fragments(cfg, l_regs, tinv_acc, lane_idx):
     m8 = cutlass.Array(cutlass.Float32, 4, alignment=16)
     for i in cutlass.range_constexpr(4):
         m8[i] = cutlass.Float32(0.0)
-    mma_step(m8, (d8_a0, zero, zero, d8_a3), (zero, c8_b1), k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype)
+    mma_step(
+        m8, (d8_a0, zero, zero, d8_a3), (zero, c8_b1), k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype
+    )
 
     # ---- T_inv = D8 - M @ D8 ------------------------------------------------------------
     for i in cutlass.range_constexpr(8):
         tinv_acc[i] = d8[i]
     neg_m8_a1 = fp32_to_fp16(-m8[2], -m8[3], dtype=cfg.io_dtype)
-    mma_step(tinv_acc, (zero, neg_m8_a1, zero, zero), (movmatrix_16b(d8_a0), zero), k_step=0, M=16, N=8, ab_dtype=cfg.io_dtype)
+    mma_step(
+        tinv_acc,
+        (zero, neg_m8_a1, zero, zero),
+        (movmatrix_16b(d8_a0), zero),
+        k_step=0,
+        M=16,
+        N=8,
+        ab_dtype=cfg.io_dtype,
+    )

@@ -95,7 +95,9 @@ from ..tile_dsl.barrier import (
     launch_dependent_grids,
     wait_on_dependent_grids,
 )
-from ..tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
+from attn_gym._backends.cute.compat import SmemAllocator
+
+from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
 from ..tile_dsl.mma import mma_ts
 from ..tile_dsl.pointwise import fadd2, fmul2, fp32_to_fp16, opaque_f32_zero, opaque_i32_zero, softplus2, sub_f16x2
 from ..tile_dsl.swizzle import swizzle_xor_128b
@@ -640,7 +642,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
             # ---- chunk-factor tile load ----------------------------------------------
             tinv_idx = tinv_index.idx
@@ -649,7 +651,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_tinv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
             tinv_slice = tma_slice_runtime_desc(desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_o, chunk_idx)
-            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_tinv_ready[tinv_idx].smem_ptr, acquire=False)
+            tma_load_tile(sTinv_tma[tinv_idx], tinv_slice, bars.mb_tinv_ready[tinv_idx].smem_ptr)
 
             # ---- V load --------------------------------------------------------------
             v_idx = v_index.idx
@@ -658,7 +660,7 @@ def tmaldg_warp(
             if elect_one:
                 bars.mb_v_ready[v_idx].arrive(n_bytes=cfg.tma_v_bytes)
             v_slice = tma_slice_runtime_desc(desc_v_slot, v_offset, head_v, tok_coord)
-            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr, acquire=False)
+            tma_load_tile(sV_tma[v_idx], v_slice, bars.mb_v_ready[v_idx].smem_ptr)
 
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
 
@@ -733,7 +735,7 @@ def chain_warp_group(
         state_gmem_row = (group_tidx // 32) * 16 + (group_tidx % 32) % 16
         state_row_valid = (group_tidx % 32) < 16
     v_stage_elements = cfg.v_cosize // cfg.smem_v_stages
-    sV_base = sV_raw.data_ptr()
+    sV_base = smem_data_ptr(sV_raw)
     num_vals = 32
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
@@ -1219,20 +1221,13 @@ def host(
         ),
     )
 
-    # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
-    bytes_per_element = cfg.io_dtype.width // 8
-    k_tile_elements = cfg.b_t * cfg.d_k
-    v_tile_elements = cfg.d_v * cfg.b_t
-    tinv_tile_elements = cfg.b_t * cfg.b_t
-    cfg.k_cosize = k_tile_elements * cfg.smem_k_stages
-    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
-    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
-
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
 
-    cfg.tma_k_bytes = k_tile_elements * bytes_per_element
-    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
-    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
+    @cute.struct
+    class SharedStorage:
+        k: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.k_cosize], cfg.buffer_align_bytes]
+        v: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.v_cosize], cfg.buffer_align_bytes]
+        t_inv: cute.struct.Align[cute.struct.MemRange[cfg.io_dtype, cfg.t_inv_cosize], cfg.buffer_align_bytes]
 
     num_descs = batch_size
 
@@ -1241,6 +1236,7 @@ def host(
 
     frost_gdn_summary(
         cfg,
+        SharedStorage,
         k_ratio,
         v_ratio,
         gate,
@@ -1272,6 +1268,7 @@ def host(
 @cute.kernel
 def frost_gdn_summary(
     cfg: cutlass.Constexpr,
+    shared_type: cutlass.Constexpr,
     k_ratio: cute.FastDivmodDivisorV2,
     v_ratio: cute.FastDivmodDivisorV2,
     mGate: cute.Tensor,
@@ -1315,9 +1312,17 @@ def frost_gdn_summary(
     LEAD = 16
     STRIDE = 8 * 128
     KT_LEAD = cfg.b_t * 128
-    sK_raw = cutlass.Array(cfg.io_dtype, cfg.k_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
+    # Barrier, scheduler and gate staging arrays keep stable raw pointers; the 1024-aligned tile
+    # buffers share one SharedStorage allocation placed after them.
+    bars = make_bars(cfg)
+    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
+    sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
+    cumsumlog_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
+    cumprod_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
+    storage = SmemAllocator().allocate(shared_type)
+    sK_raw = storage.k.get_tensor(cute.make_layout((cfg.k_cosize,)))
     sK = SmemTile(
-        base=sK_raw.data_ptr(),
+        base=sK_raw,
         elems_per_stage=(cfg.k_cosize // cfg.smem_k_stages),
         stages=cfg.smem_k_stages,
         leading_byte_offset=LEAD,
@@ -1325,34 +1330,29 @@ def frost_gdn_summary(
         layout=SWZ,
     )
     sK_trans = SmemTile(
-        base=sK_raw.data_ptr(),
+        base=sK_raw,
         elems_per_stage=(cfg.k_cosize // cfg.smem_k_stages),
         stages=cfg.smem_k_stages,
         leading_byte_offset=KT_LEAD,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    sV_raw = cutlass.Array(cfg.io_dtype, cfg.v_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
-    sTinv_raw = cutlass.Array(cfg.io_dtype, cfg.t_inv_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
+    sV_raw = storage.v.get_tensor(cute.make_layout((cfg.v_cosize,)))
+    sTinv_raw = storage.t_inv.get_tensor(cute.make_layout((cfg.t_inv_cosize,)))
     sTinv = SmemTile(
-        base=sTinv_raw.data_ptr(),
+        base=sTinv_raw,
         elems_per_stage=(cfg.t_inv_cosize // cfg.smem_t_inv_stages),
         stages=cfg.smem_t_inv_stages,
         leading_byte_offset=LEAD,
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    bars = make_bars(cfg)
-    tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
-    sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
-    cumsumlog_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
-    cumprod_raw = cutlass.Array(cutlass.Float32, cute.cosize(cumsumlog_smem_layout_staged), space=SMEM, alignment=128)
     sCumsumlog = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, cumsumlog_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(cumsumlog_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
     sCumprod = cute.make_tensor(
-        cute.make_ptr(cutlass.Float32, cumprod_raw.data_ptr().toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
+        cute.make_ptr(cutlass.Float32, smem_data_ptr(cumprod_raw).toint(), mem_space=cute.AddressSpace.smem, assumed_align=128),
         cumsumlog_smem_layout_staged,
     )
 
@@ -1508,7 +1508,7 @@ def frost_gdn_summary(
 @dataclass
 class GdnSummaryCfg:
     """Per-compile fused-summary kernel knob (``build_cfg``): the dtype / GQA / state-flag fields are the ``cute.compile``
-    cache keys, the rest derives from ``CFG``; ``host`` stamps the shape-derived fields at trace time.
+    cache keys, the rest derives from ``CFG``.
     """
 
     io_dtype: Type[cutlass.Numeric]
@@ -1557,7 +1557,7 @@ class GdnSummaryCfg:
     tmem_acc_m_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time (shape-derived) -------------------------------
+    # ---- derived by build_cfg (SMEM cosizes, TMA transaction bytes) --------------------
     k_cosize: int = 0
     v_cosize: int = 0
     t_inv_cosize: int = 0
@@ -1607,6 +1607,17 @@ def build_cfg(
     cfg.tmem_acc_m_offset = cfg.tmem_acc_h_offset + cfg.b_t
     if cfg.tmem_acc_m_offset + cfg.b_t > 512:
         raise ValueError(f"TMEM layout exceeds 512 columns: {cfg.tmem_acc_m_offset + cfg.b_t}")
+    # ---- SMEM sizing: per-buffer element cosizes and TMA transaction bytes -----------------
+    bytes_per_element = io_dtype.width // 8
+    k_tile_elements = cfg.b_t * cfg.d_k
+    v_tile_elements = cfg.d_v * cfg.b_t
+    tinv_tile_elements = cfg.b_t * cfg.b_t
+    cfg.k_cosize = k_tile_elements * cfg.smem_k_stages
+    cfg.v_cosize = v_tile_elements * cfg.smem_v_stages
+    cfg.t_inv_cosize = tinv_tile_elements * cfg.smem_t_inv_stages
+    cfg.tma_k_bytes = k_tile_elements * bytes_per_element
+    cfg.tma_v_bytes = v_tile_elements * bytes_per_element
+    cfg.tma_tinv_bytes = tinv_tile_elements * bytes_per_element
     return cfg
 
 

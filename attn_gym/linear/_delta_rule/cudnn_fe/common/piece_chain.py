@@ -31,8 +31,8 @@ from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
 from .._compat import DeviceView
@@ -71,7 +71,13 @@ CHAIN_THREADS = CHAIN_WARPS * CHAIN_LANES
 CHAIN_K_TILE = 8
 CHAIN_M_BUFFERS = 2
 
-DTYPE_NAMES = {cutlass.Float32: "float32", cutlass.BFloat16: "bfloat16", cutlass.Float16: "float16", cutlass.Int32: "int32", cutlass.Int64: "int64"}
+DTYPE_NAMES = {
+    cutlass.Float32: "float32",
+    cutlass.BFloat16: "bfloat16",
+    cutlass.Float16: "float16",
+    cutlass.Int32: "int32",
+    cutlass.Int64: "int64",
+}
 STATE_DTYPES = ("float32", "bfloat16")
 
 
@@ -91,10 +97,26 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
     num_seqs = max(1, int(num_seqs))
     tiles = num_seqs * max(1, int(heads_out))
     total_chunks = -(-(int(total_tokens) * max(1, int(expand_num))) // int(b_t))
-    return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
+    return min(
+        int(num_sm) // tiles,
+        CHAIN_MAX_PIECES,
+        total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)),
+    )
 
 
-def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
+def choose_pieces(
+    *,
+    num_seqs,
+    heads_out,
+    num_sm,
+    total_tokens,
+    b_t,
+    cadence_tokens,
+    batch_invariant,
+    expand_num,
+    reverse=False,
+    compose_tail=False,
+):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
     Boundaries are multiples of ``unit_chunks = lcm(expand_num, cadence_chunks)`` chunks.  Without ``batch_invariant`` the
@@ -116,7 +138,13 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
             return 0, unit_chunks
         return pieces, unit_chunks
     pieces = piece_budget(
-        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+        num_seqs=num_seqs,
+        heads_out=heads_out,
+        num_sm=num_sm,
+        total_tokens=total_tokens,
+        b_t=b_t,
+        expand_num=expand_num,
+        unit_chunks=unit_chunks,
     )
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
@@ -128,7 +156,13 @@ def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand
     ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
     is exactly ``DV_SPLIT_TILES`` and ``dim_v`` is 128."""
     budget = piece_budget(
-        num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
+        num_seqs=num_seqs,
+        heads_out=heads_out,
+        num_sm=num_sm,
+        total_tokens=total_tokens,
+        b_t=b_t,
+        expand_num=expand_num,
+        unit_chunks=unit_chunks,
     )
     return budget == DV_SPLIT_TILES and int(dim_v) == 128
 
@@ -157,7 +191,15 @@ def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTable
     cu_pieces = 2 * rows_bytes
     cu_bytes = -(-4 * (num_seqs * int(pieces) + 1) // 16) * 16
     nbytes = -(-(cu_pieces + cu_bytes) // PIECE_TABLE_ALIGN) * PIECE_TABLE_ALIGN
-    return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, num_seqs * int(pieces) * int(heads_out), nbytes)
+    return PieceTableLayout(
+        0,
+        rows_bytes,
+        cu_pieces,
+        4 * num_seqs,
+        rows_bytes + 4 * num_seqs,
+        num_seqs * int(pieces) * int(heads_out),
+        nbytes,
+    )
 
 
 @cute.jit
@@ -182,10 +224,14 @@ def piece_count(
     """Slots a sequence of ``length`` real tokens takes: ``ceil(chunks / span_chunks)`` (the length rule:
     ``clamp(ceil(length / LENGTH_RULE_PIECE_TOKENS), 1, pieces)``), at least one."""
     if cutlass.const_expr(length_rule):
-        count = (length + cutlass.Int32(LENGTH_RULE_PIECE_TOKENS - 1)) // cutlass.Int32(LENGTH_RULE_PIECE_TOKENS)
+        count = (length + cutlass.Int32(LENGTH_RULE_PIECE_TOKENS - 1)) // cutlass.Int32(
+            LENGTH_RULE_PIECE_TOKENS
+        )
         count = count if count < cutlass.Int32(pieces) else cutlass.Int32(pieces)
     else:
-        chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
+        chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(
+            b_t
+        )
         count = (chunks + span_chunks - cutlass.Int32(1)) // span_chunks
     return count if count > cutlass.Int32(1) else cutlass.Int32(1)
 
@@ -242,8 +288,12 @@ def piece_table_body(
     batch end to ``cu_pieces[num_seqs * pieces]`` all hold the batch end, so the table stays monotone over the whole wave
     for the consumers that size the slots from its shape.  Deterministic, no host sync."""
     num_warps = cutlass.const_expr(n_threads // 32)
-    sWarpMain = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
-    sWarpSummary = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
+    sWarpMain = cutlass.Array(
+        cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16
+    )
+    sWarpSummary = cutlass.Array(
+        cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16
+    )
     lane = tidx % cutlass.Int32(32)
     warp = tidx // cutlass.Int32(32)
 
@@ -254,7 +304,9 @@ def piece_table_body(
     total_tokens = cutlass.Int32(mCu[num_seqs]) - cutlass.Int32(mCu[0])
 
     # ---- the slot span: one wave shared by the whole batch, guarded against the per-sequence ceilings ----------------
-    total_chunks = (total_tokens * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
+    total_chunks = (
+        total_tokens * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)
+    ) // cutlass.Int32(b_t)
     wave = num_seqs * cutlass.Int32(pieces)
     span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave)
     if cutlass.const_expr(not length_rule):
@@ -272,8 +324,12 @@ def piece_table_body(
                 # ---- CTA sum of the counts: warp scan, lane 31 parks the warp total, every thread adds the words ----
                 inclusive = count if valid else cutlass.Int32(0)
                 for offset in [1, 2, 4, 8, 16]:
-                    other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, inclusive, offset, 0, kind=nvvm.Shfl.UP))
-                    inclusive = inclusive + (other if lane >= cutlass.Int32(offset) else cutlass.Int32(0))
+                    other = cutlass.Int32(
+                        nvvm.shfl_sync(0xFFFFFFFF, inclusive, offset, 0, kind=nvvm.Shfl.UP)
+                    )
+                    inclusive = inclusive + (
+                        other if lane >= cutlass.Int32(offset) else cutlass.Int32(0)
+                    )
                 if lane == cutlass.Int32(31):
                     sWarpMain[warp] = inclusive
                 nvvm.barrier_cta_sync()
@@ -284,7 +340,9 @@ def piece_table_body(
                 taken = taken + total
                 probe_start = probe_start + cutlass.Int32(n_threads)
             if taken > wave:
-                span_chunks = chunks_per_slot(unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1))
+                span_chunks = chunks_per_slot(
+                    unit_chunks, total_chunks, wave - num_seqs + cutlass.Int32(1)
+                )
 
     running_main = cutlass.Int32(0)
     running_summary = cutlass.Int32(0)
@@ -299,7 +357,9 @@ def piece_table_body(
             start = cutlass.Int32(mCu[b_read])
             end = cutlass.Int32(mCu[b_read + 1])
         length = end - start
-        span_tokens, last = piece_span(pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks)
+        span_tokens, last = piece_span(
+            pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks
+        )
         rows = (last + cutlass.Int32(1)) * cutlass.Int32(heads_out)
         rows_main = rows if valid else cutlass.Int32(0)
         rows_summary = rows if (valid and last > cutlass.Int32(0)) else cutlass.Int32(0)
@@ -308,10 +368,18 @@ def piece_table_body(
         incl_main = rows_main
         incl_summary = rows_summary
         for off in [1, 2, 4, 8, 16]:
-            other_main = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, incl_main, off, 0, kind=nvvm.Shfl.UP))
-            other_summary = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, incl_summary, off, 0, kind=nvvm.Shfl.UP))
-            incl_main = incl_main + (other_main if lane >= cutlass.Int32(off) else cutlass.Int32(0))
-            incl_summary = incl_summary + (other_summary if lane >= cutlass.Int32(off) else cutlass.Int32(0))
+            other_main = cutlass.Int32(
+                nvvm.shfl_sync(0xFFFFFFFF, incl_main, off, 0, kind=nvvm.Shfl.UP)
+            )
+            other_summary = cutlass.Int32(
+                nvvm.shfl_sync(0xFFFFFFFF, incl_summary, off, 0, kind=nvvm.Shfl.UP)
+            )
+            incl_main = incl_main + (
+                other_main if lane >= cutlass.Int32(off) else cutlass.Int32(0)
+            )
+            incl_summary = incl_summary + (
+                other_summary if lane >= cutlass.Int32(off) else cutlass.Int32(0)
+            )
         if lane == cutlass.Int32(31):
             sWarpMain[warp] = incl_main
             sWarpSummary[warp] = incl_summary
@@ -325,8 +393,12 @@ def piece_table_body(
             count_summary = sWarpSummary[w]
             total_main = total_main + count_main
             total_summary = total_summary + count_summary
-            warp_base_main = warp_base_main + (count_main if cutlass.Int32(w) < warp else cutlass.Int32(0))
-            warp_base_summary = warp_base_summary + (count_summary if cutlass.Int32(w) < warp else cutlass.Int32(0))
+            warp_base_main = warp_base_main + (
+                count_main if cutlass.Int32(w) < warp else cutlass.Int32(0)
+            )
+            warp_base_summary = warp_base_summary + (
+                count_summary if cutlass.Int32(w) < warp else cutlass.Int32(0)
+            )
 
         # ---- per-sequence: the flat slots and the row bases ---------------------------------
         if valid:
@@ -433,9 +505,18 @@ def frost_state_chain(
 
     sWalk = cutlass.Array(cutlass.Float32, rows * K, space=cutlass.AddressSpace.smem, alignment=16)
     if cutlass.const_expr(emit_summary):
-        sProduct = cutlass.Array(cutlass.Float32, product_rows * K, space=cutlass.AddressSpace.smem, alignment=16)
-    sPart = cutlass.Array(cutlass.Float32, CHAIN_K_WARPS * part_rows * K, space=cutlass.AddressSpace.smem, alignment=16)
-    sM = cutlass.Array(cutlass.Float32, CHAIN_M_BUFFERS * m_words, space=cutlass.AddressSpace.smem, alignment=128)
+        sProduct = cutlass.Array(
+            cutlass.Float32, product_rows * K, space=cutlass.AddressSpace.smem, alignment=16
+        )
+    sPart = cutlass.Array(
+        cutlass.Float32,
+        CHAIN_K_WARPS * part_rows * K,
+        space=cutlass.AddressSpace.smem,
+        alignment=16,
+    )
+    sM = cutlass.Array(
+        cutlass.Float32, CHAIN_M_BUFFERS * m_words, space=cutlass.AddressSpace.smem, alignment=128
+    )
     acc = cutlass.Array(cutlass.Float32, walk_group_rows * cols_per_lane)
     acc_product = cutlass.Array(cutlass.Float32, max(1, product_group_rows) * cols_per_lane)
     m_tile = cutlass.Array(cutlass.Float32, CHAIN_K_TILE * cols_per_lane)
@@ -449,7 +530,11 @@ def frost_state_chain(
     if one_piece:
         if cutlass.const_expr(walk_state):
             for rr in cutlass.range_constexpr(walk_own_rows):
-                seed_row = row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+                seed_row = (
+                    row_group * cutlass.Int32(walk_group_rows)
+                    + k_warp * cutlass.Int32(walk_own_rows)
+                    + cutlass.Int32(rr)
+                )
                 if cutlass.const_expr(has_seed):
                     seed_state_row = row0 + seed_row
                     seed_offset = (
@@ -459,20 +544,38 @@ def frost_state_chain(
                         + cutlass.Int64(col0)
                     )
                     seed_iter = mSeed.iterator
-                    seed_addr = seed_iter.toint() + seed_offset * cutlass.Int64(mSeed.element_type.width // 8)
+                    seed_addr = seed_iter.toint() + seed_offset * cutlass.Int64(
+                        mSeed.element_type.width // 8
+                    )
                     if cutlass.const_expr(mSeed.element_type == cutlass.Float32):
                         if cutlass.const_expr(cols_per_lane == 2):
                             seed_vals = list(ld_global_v2(seed_addr, cutlass.Float32))
                         else:
-                            seed_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(seed_addr + cutlass.Int64(16 * q), cutlass.Float32)]
+                            seed_vals = [
+                                x
+                                for q in range(cols_per_lane // 4)
+                                for x in ld_global_v4(
+                                    seed_addr + cutlass.Int64(16 * q), cutlass.Float32
+                                )
+                            ]
                     else:
                         if cutlass.const_expr(cols_per_lane == 2):
                             seed_words = [ld_global(seed_addr, cutlass.Int32)]
                         elif cutlass.const_expr(cols_per_lane == 4):
                             seed_words = list(ld_global_v2(seed_addr, cutlass.Int32))
                         else:
-                            seed_words = [w for q in range(cols_per_lane // 8) for w in ld_global_v4(seed_addr + cutlass.Int64(16 * q), cutlass.Int32)]
-                        seed_vals = [x for word in seed_words for x in f16x2_to_f32(word, dtype=mSeed.element_type)]
+                            seed_words = [
+                                w
+                                for q in range(cols_per_lane // 8)
+                                for w in ld_global_v4(
+                                    seed_addr + cutlass.Int64(16 * q), cutlass.Int32
+                                )
+                            ]
+                        seed_vals = [
+                            x
+                            for word in seed_words
+                            for x in f16x2_to_f32(word, dtype=mSeed.element_type)
+                        ]
                 else:
                     seed_vals = [cutlass.Float32(0.0)] * cols_per_lane
                 for c in cutlass.range_constexpr(cols_per_lane):
@@ -485,17 +588,27 @@ def frost_state_chain(
                     + cutlass.Int64(col0)
                 )
                 seed_x_iter = mX.iterator
-                seed_x_addr = seed_x_iter.toint() + seed_x_offset * cutlass.Int64(mX.element_type.width // 8)
+                seed_x_addr = seed_x_iter.toint() + seed_x_offset * cutlass.Int64(
+                    mX.element_type.width // 8
+                )
                 seed_x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                 if cutlass.const_expr(cols_per_lane == 2):
                     st_global_v2(seed_x_addr, seed_x_vals, cutlass.Float32)
                 else:
                     for q in cutlass.range_constexpr(cols_per_lane // 4):
-                        st_global_v4(seed_x_addr + cutlass.Int64(16 * q), seed_x_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                        st_global_v4(
+                            seed_x_addr + cutlass.Int64(16 * q),
+                            seed_x_vals[4 * q : 4 * q + 4],
+                            cutlass.Float32,
+                        )
     else:
         # ---- seeds --------------------------------------------------------------------------------
         for rr in cutlass.range_constexpr(walk_own_rows):
-            seed_row = row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+            seed_row = (
+                row_group * cutlass.Int32(walk_group_rows)
+                + k_warp * cutlass.Int32(walk_own_rows)
+                + cutlass.Int32(rr)
+            )
             if cutlass.const_expr(has_seed):
                 seed_state_row = row0 + seed_row
                 seed_offset = (
@@ -505,20 +618,36 @@ def frost_state_chain(
                     + cutlass.Int64(col0)
                 )
                 seed_iter = mSeed.iterator
-                seed_addr = seed_iter.toint() + seed_offset * cutlass.Int64(mSeed.element_type.width // 8)
+                seed_addr = seed_iter.toint() + seed_offset * cutlass.Int64(
+                    mSeed.element_type.width // 8
+                )
                 if cutlass.const_expr(mSeed.element_type == cutlass.Float32):
                     if cutlass.const_expr(cols_per_lane == 2):
                         seed_vals = list(ld_global_v2(seed_addr, cutlass.Float32))
                     else:
-                        seed_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(seed_addr + cutlass.Int64(16 * q), cutlass.Float32)]
+                        seed_vals = [
+                            x
+                            for q in range(cols_per_lane // 4)
+                            for x in ld_global_v4(
+                                seed_addr + cutlass.Int64(16 * q), cutlass.Float32
+                            )
+                        ]
                 else:
                     if cutlass.const_expr(cols_per_lane == 2):
                         seed_words = [ld_global(seed_addr, cutlass.Int32)]
                     elif cutlass.const_expr(cols_per_lane == 4):
                         seed_words = list(ld_global_v2(seed_addr, cutlass.Int32))
                     else:
-                        seed_words = [w for q in range(cols_per_lane // 8) for w in ld_global_v4(seed_addr + cutlass.Int64(16 * q), cutlass.Int32)]
-                    seed_vals = [x for word in seed_words for x in f16x2_to_f32(word, dtype=mSeed.element_type)]
+                        seed_words = [
+                            w
+                            for q in range(cols_per_lane // 8)
+                            for w in ld_global_v4(seed_addr + cutlass.Int64(16 * q), cutlass.Int32)
+                        ]
+                    seed_vals = [
+                        x
+                        for word in seed_words
+                        for x in f16x2_to_f32(word, dtype=mSeed.element_type)
+                    ]
             else:
                 seed_vals = [cutlass.Float32(0.0)] * cols_per_lane
             for c in cutlass.range_constexpr(cols_per_lane):
@@ -529,20 +658,38 @@ def frost_state_chain(
                 st_shared_v2(seed_walk_ptr, seed_walk_vals, cutlass.Float32)
             else:
                 for q in cutlass.range_constexpr(cols_per_lane // 4):
-                    st_shared_v4(seed_walk_ptr + 4 * q, seed_walk_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                    st_shared_v4(
+                        seed_walk_ptr + 4 * q, seed_walk_vals[4 * q : 4 * q + 4], cutlass.Float32
+                    )
         if cutlass.const_expr(emit_summary):
             for rr in cutlass.range_constexpr(product_own_rows):
-                seed_row = row_group * cutlass.Int32(product_group_rows) + k_warp * cutlass.Int32(product_own_rows) + cutlass.Int32(rr)
+                seed_row = (
+                    row_group * cutlass.Int32(product_group_rows)
+                    + k_warp * cutlass.Int32(product_own_rows)
+                    + cutlass.Int32(rr)
+                )
                 for c in cutlass.range_constexpr(cols_per_lane):
-                    cur_product[rr * cols_per_lane + c] = cutlass.Float32(1.0) if product_row0 + seed_row == col0 + cutlass.Int32(c) else cutlass.Float32(0.0)
+                    cur_product[rr * cols_per_lane + c] = (
+                        cutlass.Float32(1.0)
+                        if product_row0 + seed_row == col0 + cutlass.Int32(c)
+                        else cutlass.Float32(0.0)
+                    )
                 seed_product_ptr = sProduct.data_ptr(seed_row * K + col0)
-                seed_product_vals = [cur_product[rr * cols_per_lane + c] for c in range(cols_per_lane)]
+                seed_product_vals = [
+                    cur_product[rr * cols_per_lane + c] for c in range(cols_per_lane)
+                ]
                 if cutlass.const_expr(cols_per_lane == 2):
                     st_shared_v2(seed_product_ptr, seed_product_vals, cutlass.Float32)
                 else:
                     for q in cutlass.range_constexpr(cols_per_lane // 4):
-                        st_shared_v4(seed_product_ptr + 4 * q, seed_product_vals[4 * q : 4 * q + 4], cutlass.Float32)
-        first_step = cutlass.Int32(0) if cutlass.const_expr(not transpose) else count - cutlass.Int32(1)
+                        st_shared_v4(
+                            seed_product_ptr + 4 * q,
+                            seed_product_vals[4 * q : 4 * q + 4],
+                            cutlass.Float32,
+                        )
+        first_step = (
+            cutlass.Int32(0) if cutlass.const_expr(not transpose) else count - cutlass.Int32(1)
+        )
         first_buf_words = cutlass.Int32(0)
         first_slot = seq_base + first_step
         for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
@@ -550,9 +697,21 @@ def frost_state_chain(
             first_m_row = first_chunk_id // cutlass.Int32(K // 4)
             first_m_chunk = first_chunk_id % cutlass.Int32(K // 4)
             nvvm.cp_async_shared_global(
-                sM.data_ptr(first_buf_words + (first_m_row * K + (first_m_chunk ^ ((first_m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))),
+                sM.data_ptr(
+                    first_buf_words
+                    + (
+                        first_m_row * K
+                        + (first_m_chunk ^ ((first_m_row // cutlass.Int32(4)) % cutlass.Int32(8)))
+                        * cutlass.Int32(4)
+                    )
+                ),
                 mM.iterator
-                + ((cutlass.Int64(first_slot) * cutlass.Int64(HO) + cutlass.Int64(h)) * cutlass.Int64(K) + cutlass.Int64(first_m_row)) * cutlass.Int64(K)
+                + (
+                    (cutlass.Int64(first_slot) * cutlass.Int64(HO) + cutlass.Int64(h))
+                    * cutlass.Int64(K)
+                    + cutlass.Int64(first_m_row)
+                )
+                * cutlass.Int64(K)
                 + cutlass.Int64(first_m_chunk) * cutlass.Int64(4),
                 16,
                 nvvm.LoadCacheModifier.CG,
@@ -566,7 +725,12 @@ def frost_state_chain(
             slot = seq_base + step
             if cutlass.const_expr(walk_state):
                 for rr in cutlass.range_constexpr(walk_own_rows):
-                    row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+                    row = (
+                        row0
+                        + row_group * cutlass.Int32(walk_group_rows)
+                        + k_warp * cutlass.Int32(walk_own_rows)
+                        + cutlass.Int32(rr)
+                    )
                     x_offset = (
                         cutlass.Int64(slot) * cutlass.Int64(mX.stride[0])
                         + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
@@ -580,7 +744,11 @@ def frost_state_chain(
                         st_global_v2(x_addr, x_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_global_v4(
+                                x_addr + cutlass.Int64(16 * q),
+                                x_vals[4 * q : 4 * q + 4],
+                                cutlass.Float32,
+                            )
                     h_offset = (
                         cutlass.Int64(slot) * cutlass.Int64(mH.stride[0])
                         + cutlass.Int64(h) * cutlass.Int64(mH.stride[1])
@@ -592,12 +760,22 @@ def frost_state_chain(
                     if cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
                     else:
-                        h_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)]
+                        h_vals = [
+                            x
+                            for q in range(cols_per_lane // 4)
+                            for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)
+                        ]
                     for c in cutlass.range_constexpr(cols_per_lane):
                         piece_h[rr * cols_per_lane + c] = h_vals[c]
             if i + cutlass.Int32(1) < count:
-                next_step = step + cutlass.Int32(1) if cutlass.const_expr(not transpose) else step - cutlass.Int32(1)
-                next_buf_words = ((i + cutlass.Int32(1)) % cutlass.Int32(CHAIN_M_BUFFERS)) * cutlass.Int32(m_words)
+                next_step = (
+                    step + cutlass.Int32(1)
+                    if cutlass.const_expr(not transpose)
+                    else step - cutlass.Int32(1)
+                )
+                next_buf_words = (
+                    (i + cutlass.Int32(1)) % cutlass.Int32(CHAIN_M_BUFFERS)
+                ) * cutlass.Int32(m_words)
                 next_slot = seq_base + next_step
                 for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
                     next_chunk_id = tidx + cutlass.Int32(q * CHAIN_THREADS)
@@ -605,10 +783,23 @@ def frost_state_chain(
                     next_m_chunk = next_chunk_id % cutlass.Int32(K // 4)
                     nvvm.cp_async_shared_global(
                         sM.data_ptr(
-                            next_buf_words + (next_m_row * K + (next_m_chunk ^ ((next_m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
+                            next_buf_words
+                            + (
+                                next_m_row * K
+                                + (
+                                    next_m_chunk
+                                    ^ ((next_m_row // cutlass.Int32(4)) % cutlass.Int32(8))
+                                )
+                                * cutlass.Int32(4)
+                            )
                         ),
                         mM.iterator
-                        + ((cutlass.Int64(next_slot) * cutlass.Int64(HO) + cutlass.Int64(h)) * cutlass.Int64(K) + cutlass.Int64(next_m_row)) * cutlass.Int64(K)
+                        + (
+                            (cutlass.Int64(next_slot) * cutlass.Int64(HO) + cutlass.Int64(h))
+                            * cutlass.Int64(K)
+                            + cutlass.Int64(next_m_row)
+                        )
+                        * cutlass.Int64(K)
                         + cutlass.Int64(next_m_chunk) * cutlass.Int64(4),
                         16,
                         nvvm.LoadCacheModifier.CG,
@@ -638,7 +829,11 @@ def frost_state_chain(
                             m_chunk = m_col // cutlass.Int32(4)
                             m_ptr = sM.data_ptr(
                                 buf_words
-                                + (m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
+                                + (
+                                    m_row * K
+                                    + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8)))
+                                    * cutlass.Int32(4)
+                                )
                                 + m_col % cutlass.Int32(4)
                             )
                             m_vals += list(ld_shared_v4(m_ptr, cutlass.Float32))
@@ -653,7 +848,11 @@ def frost_state_chain(
                             m_chunk = m_col // cutlass.Int32(4)
                             m_ptr = sM.data_ptr(
                                 buf_words
-                                + (m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
+                                + (
+                                    m_row * K
+                                    + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8)))
+                                    * cutlass.Int32(4)
+                                )
                                 + m_col % cutlass.Int32(4)
                             )
                             if cutlass.const_expr(cols_per_lane >= 4):
@@ -666,55 +865,86 @@ def frost_state_chain(
                     for r in cutlass.range_constexpr(walk_group_rows):
                         op_row = row_group * cutlass.Int32(walk_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
-                            x4 = ld_shared_v4(sWalk.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)), cutlass.Float32)
+                            x4 = ld_shared_v4(
+                                sWalk.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)),
+                                cutlass.Float32,
+                            )
                             for e in cutlass.range_constexpr(4):
                                 for c in cutlass.range_constexpr(cols_per_lane):
-                                    acc[r * cols_per_lane + c] = cute.math.fma(x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc[r * cols_per_lane + c])
+                                    acc[r * cols_per_lane + c] = cute.math.fma(
+                                        x4[e],
+                                        m_tile[(4 * kq + e) * cols_per_lane + c],
+                                        acc[r * cols_per_lane + c],
+                                    )
                 if cutlass.const_expr(emit_summary):
                     for r in cutlass.range_constexpr(product_group_rows):
                         op_row = row_group * cutlass.Int32(product_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
-                            x4 = ld_shared_v4(sProduct.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)), cutlass.Float32)
+                            x4 = ld_shared_v4(
+                                sProduct.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)),
+                                cutlass.Float32,
+                            )
                             for e in cutlass.range_constexpr(4):
                                 for c in cutlass.range_constexpr(cols_per_lane):
                                     acc_product[r * cols_per_lane + c] = cute.math.fma(
-                                        x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc_product[r * cols_per_lane + c]
+                                        x4[e],
+                                        m_tile[(4 * kq + e) * cols_per_lane + c],
+                                        acc_product[r * cols_per_lane + c],
                                     )
 
             # ---- slice partials ------------------------------------------------------------------
             if cutlass.const_expr(walk_state):
                 for r in cutlass.range_constexpr(walk_group_rows):
                     op_row = row_group * cutlass.Int32(walk_group_rows) + cutlass.Int32(r)
-                    part_ptr = sPart.data_ptr((k_warp * cutlass.Int32(part_rows) + op_row) * K + col0)
+                    part_ptr = sPart.data_ptr(
+                        (k_warp * cutlass.Int32(part_rows) + op_row) * K + col0
+                    )
                     part_vals = [acc[r * cols_per_lane + c] for c in range(cols_per_lane)]
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_shared_v2(part_ptr, part_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_shared_v4(part_ptr + 4 * q, part_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_shared_v4(
+                                part_ptr + 4 * q, part_vals[4 * q : 4 * q + 4], cutlass.Float32
+                            )
             if cutlass.const_expr(emit_summary):
                 for r in cutlass.range_constexpr(product_group_rows):
                     op_row = row_group * cutlass.Int32(product_group_rows) + cutlass.Int32(r)
-                    part_ptr = sPart.data_ptr((k_warp * cutlass.Int32(part_rows) + cutlass.Int32(rows) + op_row) * K + col0)
+                    part_ptr = sPart.data_ptr(
+                        (k_warp * cutlass.Int32(part_rows) + cutlass.Int32(rows) + op_row) * K
+                        + col0
+                    )
                     part_vals = [acc_product[r * cols_per_lane + c] for c in range(cols_per_lane)]
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_shared_v2(part_ptr, part_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_shared_v4(part_ptr + 4 * q, part_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_shared_v4(
+                                part_ptr + 4 * q, part_vals[4 * q : 4 * q + 4], cutlass.Float32
+                            )
             nvvm.barrier_cta_sync()
 
             # ---- owned rows: H_j plus the four slice partials in slice order ---------------------
             if cutlass.const_expr(walk_state):
                 for rr in cutlass.range_constexpr(walk_own_rows):
-                    op_row = row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+                    op_row = (
+                        row_group * cutlass.Int32(walk_group_rows)
+                        + k_warp * cutlass.Int32(walk_own_rows)
+                        + cutlass.Int32(rr)
+                    )
                     total = [piece_h[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                     for w2 in cutlass.range_constexpr(CHAIN_K_WARPS):
-                        part_ptr = sPart.data_ptr((cutlass.Int32(w2 * part_rows) + op_row) * K + col0)
+                        part_ptr = sPart.data_ptr(
+                            (cutlass.Int32(w2 * part_rows) + op_row) * K + col0
+                        )
                         if cutlass.const_expr(cols_per_lane == 2):
                             part = list(ld_shared_v2(part_ptr, cutlass.Float32))
                         else:
-                            part = [x for q in range(cols_per_lane // 4) for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)]
+                            part = [
+                                x
+                                for q in range(cols_per_lane // 4)
+                                for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)
+                            ]
                         for c in cutlass.range_constexpr(cols_per_lane):
                             total[c] = total[c] + part[c]
                     for c in cutlass.range_constexpr(cols_per_lane):
@@ -724,17 +954,30 @@ def frost_state_chain(
                         st_shared_v2(walk_ptr, total, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_shared_v4(walk_ptr + 4 * q, total[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_shared_v4(
+                                walk_ptr + 4 * q, total[4 * q : 4 * q + 4], cutlass.Float32
+                            )
             if cutlass.const_expr(emit_summary):
                 for rr in cutlass.range_constexpr(product_own_rows):
-                    op_row = row_group * cutlass.Int32(product_group_rows) + k_warp * cutlass.Int32(product_own_rows) + cutlass.Int32(rr)
+                    op_row = (
+                        row_group * cutlass.Int32(product_group_rows)
+                        + k_warp * cutlass.Int32(product_own_rows)
+                        + cutlass.Int32(rr)
+                    )
                     total = [cutlass.Float32(0.0) for c in range(cols_per_lane)]
                     for w2 in cutlass.range_constexpr(CHAIN_K_WARPS):
-                        part_ptr = sPart.data_ptr((cutlass.Int32(w2 * part_rows) + cutlass.Int32(rows) + op_row) * K + col0)
+                        part_ptr = sPart.data_ptr(
+                            (cutlass.Int32(w2 * part_rows) + cutlass.Int32(rows) + op_row) * K
+                            + col0
+                        )
                         if cutlass.const_expr(cols_per_lane == 2):
                             part = list(ld_shared_v2(part_ptr, cutlass.Float32))
                         else:
-                            part = [x for q in range(cols_per_lane // 4) for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)]
+                            part = [
+                                x
+                                for q in range(cols_per_lane // 4)
+                                for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)
+                            ]
                         for c in cutlass.range_constexpr(cols_per_lane):
                             total[c] = total[c] + part[c]
                     for c in cutlass.range_constexpr(cols_per_lane):
@@ -744,14 +987,21 @@ def frost_state_chain(
                         st_shared_v2(product_ptr, total, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_shared_v4(product_ptr + 4 * q, total[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_shared_v4(
+                                product_ptr + 4 * q, total[4 * q : 4 * q + 4], cutlass.Float32
+                            )
             nvvm.barrier_cta_sync()
             i = i + cutlass.Int32(1)
 
         # ---- epilogue -----------------------------------------------------------------------------
         if cutlass.const_expr(has_tail):
             for rr in cutlass.range_constexpr(walk_own_rows):
-                out_row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+                out_row = (
+                    row0
+                    + row_group * cutlass.Int32(walk_group_rows)
+                    + k_warp * cutlass.Int32(walk_own_rows)
+                    + cutlass.Int32(rr)
+                )
                 tail_offset = (
                     cutlass.Int64(seq) * cutlass.Int64(mTail.stride[0])
                     + cutlass.Int64(h) * cutlass.Int64(mTail.stride[1])
@@ -759,28 +1009,53 @@ def frost_state_chain(
                     + cutlass.Int64(col0)
                 )
                 tail_iter = mTail.iterator
-                tail_addr = tail_iter.toint() + tail_offset * cutlass.Int64(mTail.element_type.width // 8)
+                tail_addr = tail_iter.toint() + tail_offset * cutlass.Int64(
+                    mTail.element_type.width // 8
+                )
                 tail_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                 if cutlass.const_expr(mTail.element_type == cutlass.Float32):
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_global_v2(tail_addr, tail_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_global_v4(tail_addr + cutlass.Int64(16 * q), tail_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_global_v4(
+                                tail_addr + cutlass.Int64(16 * q),
+                                tail_vals[4 * q : 4 * q + 4],
+                                cutlass.Float32,
+                            )
                 else:
-                    tail_words = [fp32_to_fp16(tail_vals[2 * p], tail_vals[2 * p + 1], dtype=mTail.element_type) for p in range(cols_per_lane // 2)]
+                    tail_words = [
+                        fp32_to_fp16(
+                            tail_vals[2 * p], tail_vals[2 * p + 1], dtype=mTail.element_type
+                        )
+                        for p in range(cols_per_lane // 2)
+                    ]
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_global(tail_addr, tail_words[0], cutlass.Int32)
                     elif cutlass.const_expr(cols_per_lane == 4):
                         st_global_v2(tail_addr, tail_words, cutlass.Int32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 8):
-                            st_global_v4(tail_addr + cutlass.Int64(16 * q), tail_words[4 * q : 4 * q + 4], cutlass.Int32)
+                            st_global_v4(
+                                tail_addr + cutlass.Int64(16 * q),
+                                tail_words[4 * q : 4 * q + 4],
+                                cutlass.Int32,
+                            )
         if cutlass.const_expr(emit_summary):
             for rr in cutlass.range_constexpr(product_own_rows):
-                out_row = product_row0 + row_group * cutlass.Int32(product_group_rows) + k_warp * cutlass.Int32(product_own_rows) + cutlass.Int32(rr)
+                out_row = (
+                    product_row0
+                    + row_group * cutlass.Int32(product_group_rows)
+                    + k_warp * cutlass.Int32(product_own_rows)
+                    + cutlass.Int32(rr)
+                )
                 summary_m_addr = mSummaryM.iterator.toint() + (
-                    ((cutlass.Int64(seq) * cutlass.Int64(HO) + cutlass.Int64(h)) * cutlass.Int64(K) + cutlass.Int64(out_row)) * cutlass.Int64(K)
+                    (
+                        (cutlass.Int64(seq) * cutlass.Int64(HO) + cutlass.Int64(h))
+                        * cutlass.Int64(K)
+                        + cutlass.Int64(out_row)
+                    )
+                    * cutlass.Int64(K)
                     + cutlass.Int64(col0)
                 ) * cutlass.Int64(mSummaryM.element_type.width // 8)
                 summary_vals = [cur_product[rr * cols_per_lane + c] for c in range(cols_per_lane)]
@@ -789,10 +1064,19 @@ def frost_state_chain(
                         st_global_v2(summary_m_addr, summary_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
-                            st_global_v4(summary_m_addr + cutlass.Int64(16 * q), summary_vals[4 * q : 4 * q + 4], cutlass.Float32)
+                            st_global_v4(
+                                summary_m_addr + cutlass.Int64(16 * q),
+                                summary_vals[4 * q : 4 * q + 4],
+                                cutlass.Float32,
+                            )
                 else:
                     summary_words = [
-                        fp32_to_fp16(summary_vals[2 * p], summary_vals[2 * p + 1], dtype=mSummaryM.element_type) for p in range(cols_per_lane // 2)
+                        fp32_to_fp16(
+                            summary_vals[2 * p],
+                            summary_vals[2 * p + 1],
+                            dtype=mSummaryM.element_type,
+                        )
+                        for p in range(cols_per_lane // 2)
                     ]
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_global(summary_m_addr, summary_words[0], cutlass.Int32)
@@ -800,7 +1084,11 @@ def frost_state_chain(
                         st_global_v2(summary_m_addr, summary_words, cutlass.Int32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 8):
-                            st_global_v4(summary_m_addr + cutlass.Int64(16 * q), summary_words[4 * q : 4 * q + 4], cutlass.Int32)
+                            st_global_v4(
+                                summary_m_addr + cutlass.Int64(16 * q),
+                                summary_words[4 * q : 4 * q + 4],
+                                cutlass.Int32,
+                            )
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
 
@@ -847,7 +1135,12 @@ def launch_state_chain(
         mSummaryM,
         mMainRows,
         mSeedIndices,
-    ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+    ).launch(
+        grid=(num_seqs, heads_out, slices),
+        block=(CHAIN_THREADS, 1, 1),
+        stream=stream,
+        use_pdl=USE_PDL,
+    )
 
 
 state_chain_cache = {}
@@ -878,7 +1171,11 @@ def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
     """Rows of the state per chain CTA: ``dim_v // 16`` (16 CTAs per (sequence, head)) when that grid still fits
     the SMs and every warp keeps a whole row of the state and of the M product, else ``dim_v // 8``."""
     rows = dim_v // 16
-    if num_seqs * heads_out * 16 <= num_sm and rows >= CHAIN_WARPS and dim_k * rows // dim_v >= CHAIN_WARPS:
+    if (
+        num_seqs * heads_out * 16 <= num_sm
+        and rows >= CHAIN_WARPS
+        and dim_k * rows // dim_v >= CHAIN_WARPS
+    ):
         return rows
     return dim_v // 8
 
@@ -945,18 +1242,46 @@ def build_state_chain(
             bool(has_tail),
             bool(emit_summary),
             cutlass.Int32(1),
-            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
-            from_dlpack(DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) if walk_state else None,
-            from_dlpack(DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
-            from_dlpack(DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_tail else None,
+            from_dlpack(
+                DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            if walk_state
+            else None,
+            from_dlpack(
+                DeviceView(256, (1, HO, K, K), "float32", int(device)), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(
+                DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            if walk_state
+            else None,
+            from_dlpack(
+                DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4
+            ).mark_layout_dynamic(leading_dim=3)
+            if has_seed
+            else None,
+            from_dlpack(
+                DeviceView(256, (1, HO, V, K), tail_name, int(device)), assumed_align=4
+            ).mark_layout_dynamic(leading_dim=3)
+            if has_tail
+            else None,
             (
-                from_dlpack(DeviceView(256, (1, HO, K, K), summary_name, int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                from_dlpack(
+                    DeviceView(256, (1, HO, K, K), summary_name, int(device)), assumed_align=16
+                ).mark_layout_dynamic(leading_dim=3)
                 if emit_summary
                 else None
             ),
-            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if filled_only else None,
-            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
+            from_dlpack(
+                DeviceView(256, (1,), "int32", int(device)), assumed_align=4
+            ).mark_layout_dynamic()
+            if filled_only
+            else None,
+            from_dlpack(
+                DeviceView(256, (1,), "int32", int(device)), assumed_align=4
+            ).mark_layout_dynamic()
+            if has_seed_indices
+            else None,
             cuda.CUstream(0),
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
@@ -980,7 +1305,19 @@ def build_state_chain(
     )
 
 
-def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None) -> None:
+def run_state_chain(
+    compiled: CompiledStateChain,
+    num_seqs,
+    H,
+    M,
+    X,
+    seed,
+    tail,
+    summary_m,
+    stream,
+    main_rows=None,
+    seed_indices=None,
+) -> None:
     """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
     (None for a product-only chain), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``, ``seed`` / ``tail`` ``[num_seqs, HO, V, K]``
     and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when not built), the piece table's ``main_rows``

@@ -30,7 +30,53 @@ vendored_tag = "v1.30.0"
 upstream_commit = "42286a6fb8792055f3db80403350e80114ea086c"
 stack_prs = [606, 607, 608, 609]
 
-fix = []
+# --------------------------------------------------------------------------- performance
+[[fix]]
+id = "R2"
+title = "compile_tvm_ffi takes opt_level; hosts keep O2"
+kind = "perf"
+ag_subject = "Let compile_tvm_ffi set the CuTeDSL optimization level"
+guarding_tests = ["test/test_cute_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option"]
+upstream_status = "ag-specific"
+
+# --------------------------------------------------------------------------- restyle / infra
+[[fix]]
+id = "S8/S6/S3"
+title = "Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases"
+kind = "restyle"
+ag_subject = "Prune and restyle the vendored v1.30 tile_dsl and common helpers"
+guarding_tests = []
+gate = "sass (74/74 identical)"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "S1-S4"
+title = "Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes"
+kind = "restyle"
+ag_subject = "Restyle the v1.30 GDN prefill, tinv and summary kernel storage"
+ag_subjects_extra = [
+  "Restyle the v1.30 GDN bprop kernel storage and swizzle offsets",
+  "Restyle KDA prep prefill kernel storage and swizzle offsets",
+  "Restyle KDA prep kernel storage and swizzle offsets",
+  "Restyle KDA prefill kernel storage and swizzle offsets",
+  "Restyle KDA summary kernel storage and swizzle offsets",
+  "Restyle the v1.30 GDN recompute and bprop summary kernel storage",
+  "Restyle KDA recompute, bprop and bprop summary kernel storage",
+]
+guarding_tests = ["test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts"]
+gate = "sass (identical or offset-only noise)"
+upstream_status = "ag-specific"
+
+[[fix]]
+id = "S5/S13"
+title = "Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target"
+kind = "restyle"
+ag_subject = "Add v1.30 fake tensor TVM-FFI signatures"
+guarding_tests = [
+  "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",
+]
+gate = "sass (byte-identical per family)"
+upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- superseded by v1.30
 # No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.

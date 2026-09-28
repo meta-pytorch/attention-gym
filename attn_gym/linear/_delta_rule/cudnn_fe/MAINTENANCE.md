@@ -143,16 +143,20 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 
 ## Ledger: Attention Gym modifications on top of v1.30.0
 
-The 0 modification rows below are generated from
+The 4 modification rows below are generated from
 [`fixes.toml`](../../../../tools/cudnn_fe/fixes.toml), the single source for titles, commit
 subjects, guarding node IDs, gates and upstream status. Regenerate with
 `python -m tools.cudnn_fe.verify_fixes --write-ledger`; do not edit this table by hand.
 [WORKLOG.md](WORKLOG.md) records the replay notes and fails-without evidence.
 
 <!-- BEGIN GENERATED FIX LEDGER -->
-<!-- Generated from tools/cudnn_fe/fixes.toml: 0 rows. -->
+<!-- Generated from tools/cudnn_fe/fixes.toml: 4 rows. -->
 | ID | Title | Guarding test / gate |
 |---|---|---|
+| R2 | compile_tvm_ffi takes opt_level; hosts keep O2 | `test/test_cute_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option` |
+| S8/S6/S3 | Prune unreached tile_dsl/common helpers; cute.arch wrappers; SmemTile tensor bases | sass (74/74 identical) |
+| S1-S4 | Kernel storage restyle: rmem tensors, SharedStorage, smem_data_ptr, swizzle helpers, derived cosizes | `test/kda/cudnn/test_smem_swizzle.py::test_swizzle_box_offsets_match_original_layouts`; sass (identical or offset-only noise) |
+| S5/S13 | Frozen cfgs; @jit_cache compiles over fake TVM-FFI signatures; compile key includes target | `test/test_cute_cache.py::test_runtime_cache_includes_compile_target`; sass (byte-identical per family) |
 <!-- END GENERATED FIX LEDGER -->
 
 Superseded by v1.30 (no AG commit; tests kept): B1 seeded-state wait, B5 KDA FP32 factors,
