@@ -32,6 +32,13 @@ def house():
     return restyle.tile_helpers(audit.default_root())
 
 
+def test_current_tree_is_clean_with_allowlist():
+    entries = audit.load_allowlist(audit.DEFAULT_ALLOWLIST)
+    remaining, _ = audit.apply_allowlist(audit.audit_tree(audit.default_root()), entries)
+    assert [f.format() for f in remaining] == []
+    assert [e.lineno for e in entries if e.hits == 0] == [], "stale allowlist entries"
+
+
 @pytest.mark.parametrize(
     ("rule", "body"),
     [
@@ -189,6 +196,14 @@ def test_allowlist_matches_rule_path_and_key(tmp_path):
     allow.write_text("rmem-array kernel/x\\.py .* -- every key\n")
     with pytest.raises(ValueError, match="evidenced keys"):
         audit.load_allowlist(allow)
+
+
+def test_shipped_allowlist_does_not_cover_new_keys():
+    """A new swizzle site in an allowlisted kernel still reports until it has its own evidence."""
+    text = "new_tile = (c // 64) * (rows * 64) + r * 64 + swizzle_xor_128b(r, c % 64)\n"
+    findings = audit.audit_source(HEADER + text, "kernel/kda_bprop_f16.py")
+    remaining, _ = audit.apply_allowlist(findings, audit.load_allowlist(audit.DEFAULT_ALLOWLIST))
+    assert [f.key for f in remaining] == ["new_tile"]
 
 
 CODEMOD_CASES = {
@@ -513,3 +528,13 @@ def test_codemod_skips_allowlisted_findings(tmp_path):
     result = restyle.restyle_source(text, "kernel/x.py", audit.load_allowlist(allow))
     assert "acc = cutlass.Array(cutlass.Float32, 8)" in result.text
     assert "other = cute.make_rmem_tensor((8,), cutlass.Float32)" in result.text
+
+
+def test_codemod_leaves_current_tree_unchanged():
+    entries = audit.load_allowlist(audit.DEFAULT_ALLOWLIST)
+    changed = [
+        r.relpath
+        for r in restyle.restyle_tree(audit.default_root(), entries)
+        if r.text != r.original
+    ]
+    assert changed == []

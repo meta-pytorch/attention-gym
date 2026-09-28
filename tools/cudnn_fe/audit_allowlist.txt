@@ -3,3 +3,17 @@
 # Keys are assigned names or enclosing functions, so entries survive line drift. List each
 # evidenced key explicitly (no `.*`), so a new occurrence is reported until it has its own evidence.
 # Remove an entry when its finding is gone; `audit --strict` fails on entries that match nothing.
+
+# --- SASS-driven: the house-style form changes codegen ----------------------------------------
+inline-ptx-packed-f32 tile_dsl/pointwise\.py (fmul2|ffma2) -- cute.arch.{mul,fma}_packed_f32x2 let LLVM reschedule around the op and changed SASS on 35 cubins (spill/stack deltas in gdn_recompute and kda_summary); fadd2 alone uses the wrapper (3bbb2d54).
+inline-swizzle-box kernel/kda_recompute_f16\.py (raw_f16_idx|k_inv_swizzled_idx|k_restore_idx|row_addr|v_swizzle_off_lo|v_swizzle_off_hi|seed_row_addr|init_row_addr|checkpoint_addr) -- KDA backward swizzle: swizzle_box_offset_128b changes the v1.30 kda_recompute SASS by 16-24 instructions, so S4 was skipped (69a8f6ed).
+inline-swizzle-box kernel/kda_bprop_f16\.py (prefix_idx0|prefix_idx1|ridx0|raw_f16_idx|op_idx|h_addr|raw_v_frag_lo|raw_v_frag_hi|compute1_warp_group|dy_addr_lo|dy_addr_hi|out_idx|dgate_idx) -- KDA backward swizzle: swizzle_box_offset_128b changes the v1.30 kda_bprop SASS, so S4 was skipped (69a8f6ed).
+inline-swizzle-box kernel/kda_bprop_summary_f16\.py (prefix_idx0|prefix_idx1|raw_f16_idx|op_idx) -- KDA backward swizzle: swizzle_box_offset_128b changes the v1.30 kda_bprop_summary SASS, so S4 was skipped (69a8f6ed).
+
+# --- SMEM placement: arrays that must keep the v1.30 declaration order -------------------------
+smem-data-array kernel/gdn_recompute_f16\.py (sCheckpoint_raw|sKQ_raw) -- recompute checkpoint/K arrays: v1.30 allocates checkpoint and K before the barriers; keeping them as declaration-ordered arrays preserves the v1.30 SMEM layout (f0be7d4b).
+smem-data-array kernel/gdn_(prefill|tinv|summary|recompute|bprop|bprop_summary)_f16\.py (cumsumlog_raw|cumprod_raw|beta_raw) -- small FP32 gate/beta staging rings stay cutlass.Array with the barriers: in the struct they overflow 227 KiB with 4 KQ stages (F11) and moving them ahead of the tiles caused 3.7x bank conflicts in gdn_prefill (21e1dc08).
+smem-data-array kernel/kda_bprop_f16\.py (sBeta_raw|sNorm_raw|sReduction_raw|sRed1_raw|sProj_raw|sBetaM_raw|sDaDiag_raw) -- per-token FP32 scalar rings and reduction scratch stay cutlass.Array as on main (A2 rule 3); only operand tiles moved into SharedStorage, SASS identical (69a8f6ed).
+smem-data-array kernel/kda_(recompute|bprop_summary)_f16\.py sBeta_raw -- per-token FP32 beta ring stays cutlass.Array as on main (A2 rule 3); the 69a8f6ed SASS gate covers this split.
+smem-data-array common/piece_chain\.py (sWarpMain|sWarpSummary) -- per-warp Int32 scan totals of the shared piece_table_body helper stay cutlass.Array (A2 rule 3: reduction scratch); the helper runs inside both chain prologue kernels, which own no SharedStorage.
+smem-data-array common/split_k\.py (sPartial|sWarmup|sPre) -- split-scan per-warp partials, warmup picks and prefix-sum windows stay cutlass.Array (A2 rule 3: reduction scratch indexed element-wise, not operand tiles).
