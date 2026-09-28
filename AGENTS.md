@@ -113,6 +113,13 @@ When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct
 `currsize`, launches in `hits + misses`) instead of disabling the disk cache with
 `CUTE_DSL_NO_CACHE`, which forces cold compiles.
 
+## cuDNN Vendor Maintenance
+
+`tools/cudnn_fe/` contains the cudnn-frontend GDN/KDA vendor/import tools, the mechanical restyle
+and audit, and the machine-readable fix ledger (`tools/cudnn_fe/fixes.toml`). Their CPU tests
+(`test/test_cudnn_fe_tools_*.py`) run through this checkout's editable install, including from
+outside the repository root; see `tools/cudnn_fe/README.md`.
+
 ## Project-local Agent Skills
 
 Repository-specific workflows live under `.agents/skills/`. Load the matching `SKILL.md`
