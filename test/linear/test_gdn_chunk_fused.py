@@ -161,6 +161,9 @@ def force_portable_backward(monkeypatch) -> None:
         (1, 64, 2, 2, 128, torch.bfloat16, "mild", None, False),
         (1, 65, 1, 4, 128, torch.bfloat16, "spikes", None, False),
         (2, 65, 1, 4, 128, torch.bfloat16, "mild", None, False),
+        (1, 128, 2, 6, 128, torch.bfloat16, "spikes", None, False),
+        (1, 64, 1, 16, 128, torch.bfloat16, "mild", None, False),
+        (1, 192, 2, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], False),
         (1, 64, 1, 1, 128, torch.bfloat16, "unbounded", None, True),
         (1, 64, 1, 64, 128, torch.bfloat16, "mild", None, True),
         (1, 192, 1, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], True),
@@ -772,7 +775,7 @@ def test_scalar_intra_masks_poisoned_akk_diagonal_and_upper():
     strict = row[:, None] > row[None, :]
     clean_d_akk = torch.where(strict[None, :, None, :], d_akk, 0.0)
     poisoned_d_akk = torch.where(strict[None, :, None, :], d_akk, torch.nan)
-    d_gate_raw = torch.zeros_like(q, dtype=torch.float32)
+    d_gate_raw = torch.zeros_like(cumulative_gate, dtype=torch.float32)
     expected = chunk_gdn_bwd_intra_dense(
         q, k, cumulative_gate, beta, d_aqk, clean_d_akk, d_gate_raw
     )

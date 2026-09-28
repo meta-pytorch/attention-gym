@@ -247,3 +247,62 @@ def test_ragged_wy_cuda_graph_replay():
     replay_expected = operation(*inputs, cu_seqlens)
     for captured, eager in zip(replayed, replay_expected, strict=True):
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("key_heads", "value_heads", "lengths"),
+    [(1, 2, None), (2, 6, None), (2, 4, [65, 100, 0, 1])],
+)
+def test_wy_grouped_scalar_gate_matches_expanded_vector_gate(
+    key_heads: int, value_heads: int, lengths: list[int] | None
+):
+    """Grouped q/k with a scalar gate must match expanded q/k with the gate broadcast over K."""
+    torch.manual_seed(41)
+    tokens = 192 if lengths is None else sum(lengths)
+    metadata = (
+        None
+        if lengths is None
+        else prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    )
+    capacity = tokens // 64 if metadata is None else metadata.capacity
+
+    def rand16(*shape: int) -> torch.Tensor:
+        return torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+
+    q, k = rand16(1, tokens, key_heads, 128), rand16(1, tokens, key_heads, 128)
+    v, v_new, do, dv = (rand16(1, tokens, value_heads, 128) for _ in range(4))
+    gate = -4 * torch.rand(1, tokens, value_heads, device="cuda")
+    beta = torch.rand(1, tokens, value_heads, device="cuda")
+    A = rand16(1, tokens, value_heads, 64)
+    h, dh = rand16(1, capacity, value_heads, 128, 128), rand16(1, capacity, value_heads, 128, 128)
+    groups = value_heads // key_heads
+    expected = list(
+        chunk_kda_bwd_wy_dqkg(
+            q.repeat_interleave(groups, dim=2),
+            k.repeat_interleave(groups, dim=2),
+            v,
+            v_new,
+            gate.unsqueeze(-1).expand(*gate.shape, 128).contiguous(),
+            beta,
+            A,
+            h,
+            do,
+            dh,
+            dv,
+            metadata,
+            scale=128**-0.5,
+        )
+    )
+    actual = chunk_kda_bwd_wy_dqkg(
+        q, k, v, v_new, gate, beta, A, h, do, dh, dv, metadata, scale=128**-0.5
+    )
+    expected[3] = expected[3].sum(-1)
+    names = ("dq", "dk", "dv", "dg", "db", "dA")
+    for name, result, reference in zip(names, actual, expected, strict=True):
+        assert result.shape == reference.shape, name
+        result, reference = result[:, :tokens], reference[:, :tokens]
+        if name == "dg":
+            # The scalar dg is the same K-sum in a different reduction order.
+            torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5, msg=name)
+        else:
+            torch.testing.assert_close(result, reference, rtol=0, atol=0, msg=name)

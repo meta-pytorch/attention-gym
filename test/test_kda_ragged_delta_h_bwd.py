@@ -371,3 +371,36 @@ def test_ragged_delta_h_replay_bounds_sequence_extent_without_initial_state(
     torch.testing.assert_close(
         actual_dv[:, :active_tokens], expected_dv[:, :active_tokens], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("lengths", [None, [65, 0, 127, 1]])
+def test_delta_h_scalar_gate_matches_broadcast_vector_gate(lengths: list[int] | None):
+    """A [B, T, H] scalar gate must reproduce the same gate broadcast over K bit for bit."""
+    tokens = 256 if lengths is None else sum(lengths)
+    inputs = _inputs(tokens, 1 if lengths is None else len(lengths), heads=3, lengths=lengths)
+    q, k, w, do, aqk, _gk, h0, dht = inputs
+    scalar_gate = -3 * torch.rand(q.shape[:3], device="cuda")
+    vector_gate = scalar_gate.unsqueeze(-1).expand_as(q).contiguous()
+    metadata = (
+        None
+        if lengths is None
+        else prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    )
+
+    def run(gate):
+        return blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
+            q, k, w, do, aqk, gk=gate, h0=h0, dht=dht, scale=128**-0.5, metadata=metadata
+        )
+
+    expected_dh, expected_dh0, expected_dv = run(vector_gate)
+    actual_dh, actual_dh0, actual_dv = run(scalar_gate)
+    active_chunks = (
+        expected_dh.shape[1]
+        if metadata is None
+        else sum((length + 63) // 64 for length in lengths)
+    )
+    torch.testing.assert_close(
+        actual_dh[:, :active_chunks], expected_dh[:, :active_chunks], rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual_dh0, expected_dh0, rtol=0, atol=0)
+    torch.testing.assert_close(actual_dv[:, :tokens], expected_dv[:, :tokens], rtol=0, atol=0)

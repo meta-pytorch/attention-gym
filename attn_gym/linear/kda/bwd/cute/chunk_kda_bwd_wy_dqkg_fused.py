@@ -483,6 +483,7 @@ class ChunkKdaBwdWyDqkgFused:
         grid_waves: int = 1,
         use_fast_math: bool = True,
         use_int64_offsets: bool = False,
+        scalar_gate: bool = False,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
         assert head_dim_k == 128 and head_dim_v == 128, (
@@ -492,6 +493,8 @@ class ChunkKdaBwdWyDqkgFused:
 
         self.use_fast_math = use_fast_math
         self.use_int64_offsets = use_int64_offsets
+        # Scalar gate: g is one decay per (token, value head) and dg is summed over K.
+        self.scalar_gate = scalar_gate
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v
@@ -544,6 +547,8 @@ class ChunkKdaBwdWyDqkgFused:
         # V-loop TMA: 2-stage double buffer
         self.vloop_stage = 2
         self.kloop_stage = 1
+        # The G/K/Q loads and the dG store index SMEM stage 0 directly.
+        assert self.kloop_stage == 1, "K-loop TMA copies hardcode SMEM stage 0"
         self.a_stage = 2
         self.mma_stage = 1
 
@@ -613,7 +618,7 @@ class ChunkKdaBwdWyDqkgFused:
         k_in: cute.Tensor,  # [B, T, H, K] io_dtype
         v_in: cute.Tensor,  # [B, T, HV, V] io_dtype
         v_new_in: cute.Tensor,  # [B, T, HV, V] io_dtype
-        g_in: cute.Tensor,  # [B, T, HV, K] fp32
+        g_in: cute.Tensor,  # [B, T, HV, K] fp32, or [B, T, HV] with scalar_gate
         beta_in: cute.Tensor,  # [B, T, HV]   fp32
         A_in: cute.Tensor,  # [B, T, HV, BT] io_dtype
         h_in: cute.Tensor,  # [B, NT, HV, K, V] io_dtype
@@ -624,7 +629,7 @@ class ChunkKdaBwdWyDqkgFused:
         dq_in: cute.Tensor,  # [B, T, HV, K] fp32
         dk_in: cute.Tensor,  # [B, T, HV, K] fp32
         dv2_in: cute.Tensor,  # [B, T, HV, V] io_dtype
-        dg_in: cute.Tensor,  # [B, T, HV, K] fp32
+        dg_in: cute.Tensor,  # [B, T, HV, K] fp32, or [B, T, HV] with scalar_gate
         db_in: cute.Tensor,  # [B, T, HV]    fp32
         dA_in: cute.Tensor,  # [B, T, HV, BT] fp32
         # ── Metadata ──
@@ -687,19 +692,22 @@ class ChunkKdaBwdWyDqkgFused:
         dv = cute.make_tensor(dv_ptr, tv_layout)
         dv2 = cute.make_tensor(dv2_ptr, tv_layout)
 
-        # g: (T, K, (HV, data_B)) fp32
-        g_layout = cute.make_layout(
-            (T, K, (HV, data_B)),
-            stride=(self.upcast(HV * K), 1, (K, self.upcast(T) * HV * K)),
-        )
-        g = cute.make_tensor(g_ptr, g_layout)
-
         # beta: (T, (HV, data_B)) fp32
         beta_layout = cute.make_layout(
             (T, (HV, data_B)),
             stride=(self.upcast(HV), (1, self.upcast(T) * HV)),
         )
         beta = cute.make_tensor(beta_ptr, beta_layout)
+
+        # g: (T, K, (HV, data_B)) fp32, or (T, (HV, data_B)) for a scalar gate
+        if cutlass.const_expr(self.scalar_gate):
+            g = cute.make_tensor(g_ptr, beta_layout)
+        else:
+            g_layout = cute.make_layout(
+                (T, K, (HV, data_B)),
+                stride=(self.upcast(HV * K), 1, (K, self.upcast(T) * HV * K)),
+            )
+            g = cute.make_tensor(g_ptr, g_layout)
 
         # A: (T, BT, (HV, data_B)) io_dtype
         # NOTE: for A as operand A, A is loaded as transposed view to do MMA
@@ -717,8 +725,10 @@ class ChunkKdaBwdWyDqkgFused:
         dq = cute.make_tensor(dq_ptr, dqk_layout)
         dk = cute.make_tensor(dk_ptr, dqk_layout)
 
-        # dg: (T, K, (HV, data_B)) fp32
-        dg = cute.make_tensor(dg_ptr, dqk_layout)
+        # dg: (T, K, (HV, data_B)) fp32, or (T, (HV, data_B)) for a scalar gate
+        dg = cute.make_tensor(
+            dg_ptr, beta_layout if cutlass.const_expr(self.scalar_gate) else dqk_layout
+        )
 
         # db: (T, (HV, data_B)) fp32
         db = cute.make_tensor(db_ptr, beta_layout)
@@ -1026,13 +1036,17 @@ class ChunkKdaBwdWyDqkgFused:
             cluster_layout.shape,
         )
 
+        # A scalar gate is loaded by the aux warps and dg is reduced before its store, so
+        # neither needs a TMA descriptor; the G tile stays allocated as epilogue scratch.
         g_epi_smem_no_stage = cute.select(g_epi_smem_layout, mode=[0, 1])
-        tma_atom_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            g,
-            g_epi_smem_no_stage,
-            (self.BT, self.BK),
-        )
+        tma_atom_g = tma_tensor_g = tma_atom_dg = tma_tensor_dg = None
+        if cutlass.const_expr(not self.scalar_gate):
+            tma_atom_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                g,
+                g_epi_smem_no_stage,
+                (self.BT, self.BK),
+            )
 
         k_epi_smem_no_stage = cute.select(k_epi_smem_layout, mode=[0, 1])
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
@@ -1051,12 +1065,13 @@ class ChunkKdaBwdWyDqkgFused:
         )
 
         dg_epi_smem_no_stage = cute.select(dg_epi_smem_layout, mode=[0, 1])
-        tma_atom_dg, tma_tensor_dg = cpasync.make_tiled_tma_atom(
-            tma_store_op,
-            dg,
-            dg_epi_smem_no_stage,
-            (self.BT, self.BK),
-        )
+        if cutlass.const_expr(not self.scalar_gate):
+            tma_atom_dg, tma_tensor_dg = cpasync.make_tiled_tma_atom(
+                tma_store_op,
+                dg,
+                dg_epi_smem_no_stage,
+                (self.BT, self.BK),
+            )
 
         # ===================== TMA byte counts =====================
         self.tma_bytes_A = cute.size_in_bytes(self.io_dtype, A_mn_opA_smem_no_stage)
@@ -1065,7 +1080,10 @@ class ChunkKdaBwdWyDqkgFused:
         self.tma_bytes_dh = cute.size_in_bytes(self.io_dtype, vloop_opB_smem_no_stage)
         self.tma_bytes_do = cute.size_in_bytes(self.io_dtype, vloop_opA_smem_no_stage)
         self.tma_bytes_vnew = cute.size_in_bytes(self.io_dtype, vloop_opA_smem_no_stage)
-        self.tma_bytes_g = cute.size_in_bytes(self.g_dtype, g_epi_smem_no_stage)
+        # With a scalar gate the G pipeline carries no bytes and only orders G-tile scratch reuse.
+        self.tma_bytes_g = (
+            0 if self.scalar_gate else cute.size_in_bytes(self.g_dtype, g_epi_smem_no_stage)
+        )
         self.tma_bytes_v = cute.size_in_bytes(self.io_dtype, v_opB_smem_no_stage)
         self.tma_bytes_k = cute.size_in_bytes(self.io_dtype, k_epi_smem_no_stage)
         self.tma_bytes_q = cute.size_in_bytes(self.io_dtype, q_epi_smem_no_stage)
@@ -1172,6 +1190,11 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.struct.MemRange[cutlass.Float32, self.BK],
                 128,
             ]
+            # Per-row scalar gate, published with beta when scalar_gate is set.
+            s_g: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.BT],
+                128,
+            ]
             s_dgk: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.BK],
                 128,
@@ -1274,8 +1297,8 @@ class ChunkKdaBwdWyDqkgFused:
         tma_tensor_dh: cute.Tensor,
         tma_atom_do: cute.CopyAtom,
         tma_tensor_do: cute.Tensor,
-        tma_atom_g: cute.CopyAtom,
-        tma_tensor_g: cute.Tensor,
+        tma_atom_g: cute.CopyAtom | None,
+        tma_tensor_g: cute.Tensor | None,
         tma_atom_v: cute.CopyAtom,
         tma_tensor_v: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
@@ -1284,8 +1307,8 @@ class ChunkKdaBwdWyDqkgFused:
         tma_tensor_vnew: cute.Tensor,
         tma_atom_q: cute.CopyAtom,
         tma_tensor_q: cute.Tensor,
-        tma_atom_dg: cute.CopyAtom,
-        tma_tensor_dg: cute.Tensor,
+        tma_atom_dg: cute.CopyAtom | None,
+        tma_tensor_dg: cute.Tensor | None,
         # SMEM layouts
         vloop_opA_smem: cute.ComposedLayout,
         vloop_opB_smem: cute.ComposedLayout,
@@ -1346,12 +1369,13 @@ class ChunkKdaBwdWyDqkgFused:
             cpasync.prefetch_descriptor(tma_atom_h)
             cpasync.prefetch_descriptor(tma_atom_dh)
             cpasync.prefetch_descriptor(tma_atom_do)
-            cpasync.prefetch_descriptor(tma_atom_g)
             cpasync.prefetch_descriptor(tma_atom_v)
             cpasync.prefetch_descriptor(tma_atom_vnew)
             cpasync.prefetch_descriptor(tma_atom_k)
             cpasync.prefetch_descriptor(tma_atom_q)
-            cpasync.prefetch_descriptor(tma_atom_dg)
+            if cutlass.const_expr(not self.scalar_gate):
+                cpasync.prefetch_descriptor(tma_atom_g)
+                cpasync.prefetch_descriptor(tma_atom_dg)
 
         # ===================== SMEM allocation =====================
         smem = SmemAllocator()
@@ -1810,6 +1834,10 @@ class ChunkKdaBwdWyDqkgFused:
             cute.make_ptr(Float32, storage.s_gn.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BK,), stride=(1,)),
         )
+        sGs = cute.make_tensor(
+            cute.make_ptr(Float32, storage.s_g.data_ptr().toint(), cute.AddressSpace.smem),
+            cute.make_layout((self.BT,), stride=(1,)),
+        )
 
         #
         # Cluster wait before tensor memory alloc
@@ -2042,11 +2070,17 @@ class ChunkKdaBwdWyDqkgFused:
                 # gk_exp = exp2(g)
                 pipeline_load_g.consumer_wait(load_g_consumer_state)
                 # write to gn
-                sGn[local_tidx] = sG_raw[(sub_seq_len - 1, local_tidx, 0)]
+                if cutlass.const_expr(self.scalar_gate):
+                    sGn[local_tidx] = sGs[(sub_seq_len - 1,)]
+                else:
+                    sGn[local_tidx] = sG_raw[(sub_seq_len - 1, local_tidx, 0)]
 
                 # row-major load, match TMEM layout
                 rG = cute.make_rmem_tensor((self.BK // 4,), self.g_dtype)
-                if row < sub_seq_len:
+                if cutlass.const_expr(self.scalar_gate):
+                    # sGs is zero past sub_seq_len, matching the vector-gate fill below.
+                    rG.fill(sGs[(row,)])
+                elif row < sub_seq_len:
                     for i in cutlass.range_constexpr(self.BK // 4 // 4):
                         col_base = bk_col_base + i * 4
                         vals = smem_load_f32x4_sw128(sG_raw_ptr, row, col_base)
@@ -2653,21 +2687,23 @@ class ChunkKdaBwdWyDqkgFused:
                     vloop_stage_idx = (vloop_stage_idx + 1) % self.vloop_stage
                 vloop_phase ^= 1
 
-                # Load g
-                tma_g_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_g)
-                tGsG, tGgG = self._epilog_partition_varlen(
-                    tma_atom_g,
-                    tma_g_v[None, None, (i_hv, Int32(0))],
-                    (self.BT, self.BK),
-                    sG_raw,
-                )
+                # Load g. A scalar gate arrives with beta, so this stage only hands the
+                # G tile to the consumers once both have released the previous chunk.
                 pipeline_load_g.producer_acquire(load_g_producer_state)
-                cute.copy(
-                    tma_atom_g,
-                    tGgG[(None, tile_idx, 0)],
-                    tGsG[(None, 0)],  # hardcode stage to 0 because kloop_stage is 1
-                    tma_bar_ptr=pipeline_load_g.producer_get_barrier(load_g_producer_state),
-                )
+                if cutlass.const_expr(not self.scalar_gate):
+                    tma_g_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_g)
+                    tGsG, tGgG = self._epilog_partition_varlen(
+                        tma_atom_g,
+                        tma_g_v[None, None, (i_hv, Int32(0))],
+                        (self.BT, self.BK),
+                        sG_raw,
+                    )
+                    cute.copy(
+                        tma_atom_g,
+                        tGgG[(None, tile_idx, 0)],
+                        tGsG[(None, 0)],  # hardcode stage to 0 because kloop_stage is 1
+                        tma_bar_ptr=pipeline_load_g.producer_get_barrier(load_g_producer_state),
+                    )
                 load_g_producer_state.advance()
 
                 # Load k
@@ -3198,6 +3234,13 @@ class ChunkKdaBwdWyDqkgFused:
                         beta_gmem[(tok_offset + tile_idx * self.BT + tidx, (i_hv, Int32(0)))]
                     )
                 sBeta[(tidx,)] = beta_f32
+                if cutlass.const_expr(self.scalar_gate):
+                    g_f32 = Float32(0.0)
+                    if tidx < sub_seq_len:
+                        g_f32 = Float32(
+                            g_gmem[(tok_offset + tile_idx * self.BT + tidx, (i_hv, Int32(0)))]
+                        )
+                    sGs[(tidx,)] = g_f32
 
                 cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_load_beta.producer_commit(load_beta_producer_state)
@@ -3206,54 +3249,63 @@ class ChunkKdaBwdWyDqkgFused:
                 pipeline_load_g.consumer_wait(load_g_store_consumer_state)
                 pipeline_store_dg.consumer_wait(store_dg_consumer_state)
 
-                tma_dg_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_dg)
-                tDGsDG, tDGgDG = self._epilog_partition_varlen(
-                    tma_atom_dg,
-                    tma_dg_v[None, None, (i_hv, Int32(0))],
-                    (self.BT, self.BK),
-                    sG_raw,
-                )
-                if sub_seq_len < self.BT:
-                    # Tail chunk, direct store
-                    store_lane_row = tidx >> Int32(4)  # 0..3
-                    store_col_base = (tidx & Int32(15)) * Int32(8)  # 0,8,...,120
-                    for row_quad in cutlass.range_constexpr(self.BT // 4):
-                        store_row = row_quad * 4 + store_lane_row
-                        if store_row < sub_seq_len:
-                            vals0 = smem_load_f32x4_sw128(sG_raw_ptr, store_row, store_col_base)
-                            vals1 = smem_load_f32x4_sw128(
-                                sG_raw_ptr, store_row, store_col_base + Int32(4)
-                            )
-                            dg_store_rmem = cute.make_rmem_tensor((8,), Float32)
-                            dg_store_rmem[0] = vals0[0]
-                            dg_store_rmem[1] = vals0[1]
-                            dg_store_rmem[2] = vals0[2]
-                            dg_store_rmem[3] = vals0[3]
-                            dg_store_rmem[4] = vals1[0]
-                            dg_store_rmem[5] = vals1[1]
-                            dg_store_rmem[6] = vals1[2]
-                            dg_store_rmem[7] = vals1[3]
-                            dg_store_i32_vec = reinterpret_cast(
-                                dg_store_rmem.load(), Float32, 8, Int32
-                            )
-                            dg_base_addr = (
-                                dg_gmem.iterator
-                                + self.upcast(tok_offset + tile_idx * self.BT + store_row) * HV * K
-                                + i_hv * K
-                                + store_col_base
-                            ).toint()
-                            store_256b(dg_base_addr, dg_store_i32_vec)
+                if cutlass.const_expr(self.scalar_gate):
+                    # Scalar dg is the K-sum of the staged vector dg, one row per thread.
+                    if tidx < sub_seq_len:
+                        dg_row = Float32(0.0)
+                        for i in cutlass.range_constexpr(self.BK // 4):
+                            vals = smem_load_f32x4_sw128(sG_raw_ptr, tidx, Int32(i * 4))
+                            dg_row += vals[0] + vals[1] + vals[2] + vals[3]
+                        dg_gmem[(tok_offset + tile_idx * self.BT + tidx, (i_hv, Int32(0)))] = (
+                            dg_row
+                        )
                 else:
-                    # Non-tail chunk, TMA store
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.copy(
+                    tma_dg_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_dg)
+                    tDGsDG, tDGgDG = self._epilog_partition_varlen(
                         tma_atom_dg,
-                        tDGsDG[(None, 0)],  # hardcode stage to 0 because kloop_stage is 1
-                        tDGgDG[(None, tile_idx, 0)],
+                        tma_dg_v[None, None, (i_hv, Int32(0))],
+                        (self.BT, self.BK),
+                        sG_raw,
                     )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-
+                    if sub_seq_len < self.BT:
+                        # Tail chunk, direct store
+                        store_lane_row = tidx >> Int32(4)  # 0..3
+                        store_col_base = (tidx & Int32(15)) * Int32(8)  # 0,8,...,120
+                        for row_quad in cutlass.range_constexpr(self.BT // 4):
+                            store_row = row_quad * 4 + store_lane_row
+                            if store_row < sub_seq_len:
+                                vals0 = smem_load_f32x4_sw128(
+                                    sG_raw_ptr, store_row, store_col_base
+                                )
+                                vals1 = smem_load_f32x4_sw128(
+                                    sG_raw_ptr, store_row, store_col_base + Int32(4)
+                                )
+                                dg_store_rmem = cute.make_rmem_tensor((8,), Float32)
+                                for j in cutlass.range_constexpr(4):
+                                    dg_store_rmem[j] = vals0[j]
+                                    dg_store_rmem[j + 4] = vals1[j]
+                                dg_store_i32_vec = reinterpret_cast(
+                                    dg_store_rmem.load(), Float32, 8, Int32
+                                )
+                                dg_base_addr = (
+                                    dg_gmem.iterator
+                                    + self.upcast(tok_offset + tile_idx * self.BT + store_row)
+                                    * HV
+                                    * K
+                                    + i_hv * K
+                                    + store_col_base
+                                ).toint()
+                                store_256b(dg_base_addr, dg_store_i32_vec)
+                    else:
+                        # Non-tail chunk, TMA store
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.copy(
+                            tma_atom_dg,
+                            tDGsDG[(None, 0)],  # hardcode stage to 0 because kloop_stage is 1
+                            tDGgDG[(None, tile_idx, 0)],
+                        )
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                 pipeline_store_dg.consumer_release(store_dg_consumer_state)
                 store_dg_consumer_state.advance()
                 pipeline_load_g.consumer_release(load_g_store_consumer_state)
@@ -3368,11 +3420,14 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     ragged: bool,
     use_int64_offsets: bool = False,
     key_heads: int | None = None,
+    scalar_gate: bool = False,
 ):
     """Compile one persistent dense or ragged WY/dQKG specialization.
 
     ``key_heads`` defaults to ``heads``; fewer q/k heads share each q/k head across
     ``heads // key_heads`` consecutive value heads, and dQ/dK stay per value head.
+    ``scalar_gate`` takes g and returns dg as ``[B, T, heads]`` instead of
+    ``[B, T, heads, head_dim]``.
     """
     key_heads = heads if key_heads is None else key_heads
     cutlass_io_dtype = _torch_to_cutlass_dtype[io_dtype]
@@ -3385,6 +3440,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         grid_waves=grid_waves,
         use_fast_math=fastmath,
         use_int64_offsets=use_int64_offsets,
+        scalar_gate=scalar_gate,
     )
     tokens, chunks, sequences = (cute.sym_int() for _ in range(3))
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
@@ -3405,11 +3461,12 @@ def _compile_chunk_kda_bwd_wy_dqkg(
             assumed_align=_MIN_ALIGN_BYTES,
         )
 
+    gate_shape = (1, tokens, heads) if scalar_gate else (1, tokens, heads, head_dim)
     q = strided_io_tensor((1, tokens, key_heads, head_dim))
     k = strided_io_tensor((1, tokens, key_heads, head_dim))
     v = strided_io_tensor((1, tokens, heads, head_dim))
     v_new = tensor(cutlass_io_dtype, (1, tokens, heads, head_dim))
-    g = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    g = tensor(cutlass.Float32, gate_shape)
     beta = tensor(cutlass.Float32, (1, tokens, heads))
     A = tensor(cutlass_io_dtype, (1, tokens, heads, chunk_size))
     h = tensor(cutlass_io_dtype, (1, chunks, heads, head_dim, head_dim))
@@ -3419,7 +3476,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     dq = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
     dk = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
     dv2 = tensor(cutlass_io_dtype, (1, tokens, heads, head_dim))
-    dg = tensor(cutlass.Float32, (1, tokens, heads, head_dim))
+    dg = tensor(cutlass.Float32, gate_shape)
     db = tensor(cutlass.Float32, (1, tokens, heads))
     dA = tensor(cutlass.Float32, (1, tokens, heads, chunk_size))
     cu_seqlens = tensor(cutlass.Int32, (sequences,)) if ragged else None
@@ -3450,7 +3507,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
         name=(
             f"kda_bwd_wy_dqkg_hk{key_heads}_h{heads}_d{head_dim}_c{chunk_size}_"
             f"{str(io_dtype).removeprefix('torch.')}_fm{int(fastmath)}_"
-            f"gw{grid_waves}_rg{int(ragged)}_i64{int(use_int64_offsets)}"
+            f"gw{grid_waves}_rg{int(ragged)}_i64{int(use_int64_offsets)}_sg{int(scalar_gate)}"
         ),
     )
 
@@ -3509,7 +3566,7 @@ class ChunkKdaBwdWyDqkgTunable:
     def compile_call(
         config: ChunkKdaBwdWyDqkgConfig,
         args: Args,
-    ) -> tuple[int, int, int, torch.dtype, float, bool, int, bool, bool, int]:
+    ) -> tuple[int, int, int, torch.dtype, float, bool, int, bool, bool, int, bool]:
         return (
             args.v.shape[2],
             args.q.shape[3],
@@ -3539,6 +3596,7 @@ class ChunkKdaBwdWyDqkgTunable:
                 args.dA,
             ),
             args.q.shape[2],
+            args.g.ndim == 3,
         )
 
     compile = staticmethod(_compile_chunk_kda_bwd_wy_dqkg)
@@ -3625,6 +3683,8 @@ def chunk_kda_bwd_wy_dqkg(
 
     ``q`` and ``k`` may have fewer heads than ``v``; each q/k head is shared by
     ``H // HK`` consecutive value heads and the returned dQ/dK are per value head.
+    ``g`` is either a per-key-dimension gate ``[B, T, H, K]`` or a scalar gate ``[B, T, H]``;
+    ``dg`` has the same shape as ``g``, a scalar dg being the sum over K of the vector one.
     """
     batch, tokens, key_heads, head_dim = q.shape
     heads = v.shape[2]
@@ -3632,6 +3692,10 @@ def chunk_kda_bwd_wy_dqkg(
         raise ValueError("the fused WY backward requires B=1 and K=V=128")
     if k.shape != q.shape or heads % key_heads:
         raise ValueError("k must match q and value heads must be a multiple of q/k heads")
+    if g.shape not in ((batch, tokens, heads), (batch, tokens, heads, head_dim)):
+        raise ValueError(
+            f"g must have shape {(batch, tokens, heads)} or {(*v.shape[:3], head_dim)}"
+        )
     if chunk_size != 64:
         raise ValueError(f"the fused WY backward requires chunk_size=64, got {chunk_size}")
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -3655,10 +3719,11 @@ def chunk_kda_bwd_wy_dqkg(
     expected_h = (batch, chunks, heads, head_dim, head_dim)
     if h.shape != expected_h or dh.shape != expected_h:
         raise ValueError(f"h and dh must have shape {expected_h}")
+    dqk_shape = (batch, tokens, heads, head_dim)
     if tokens == 0:
         return (
-            torch.empty_like(g, memory_format=torch.contiguous_format),
-            torch.empty_like(g, memory_format=torch.contiguous_format),
+            q.new_empty(dqk_shape, dtype=torch.float32),
+            q.new_empty(dqk_shape, dtype=torch.float32),
             torch.empty_like(v, memory_format=torch.contiguous_format),
             torch.empty_like(g, memory_format=torch.contiguous_format),
             torch.empty_like(beta, memory_format=torch.contiguous_format),
@@ -3678,8 +3743,8 @@ def chunk_kda_bwd_wy_dqkg(
         dh=dh,
         dv=dv,
         # Every generated output is compact even when v is a strided QKV view.
-        dq=torch.empty_like(g, memory_format=torch.contiguous_format),
-        dk=torch.empty_like(g, memory_format=torch.contiguous_format),
+        dq=q.new_empty(dqk_shape, dtype=torch.float32),
+        dk=q.new_empty(dqk_shape, dtype=torch.float32),
         dv2=torch.empty_like(v, memory_format=torch.contiguous_format),
         # Every active dg row is written (tail chunks store row-predicated); the inactive capacity
         # is never loaded (intra stages predicate rows) and the reverse gate scan zeroes it.
