@@ -26,4 +26,42 @@
 #                         candidate-no-patch       could be upstreamed, no patch drafted yet
 # [[superseded]] entries have no AG commit; their tests are kept and run too.
 
+vendored_tag = "v1.30.0"
+upstream_commit = "42286a6fb8792055f3db80403350e80114ea086c"
+stack_prs = [606, 607, 608, 609]
+
 fix = []
+
+# --------------------------------------------------------------------------- superseded by v1.30
+# No AG commit; tests kept. verify_fixes.py runs these too so a regression upstream shows up.
+[[superseded]]
+id = "B1"
+title = "GDN seeded state waited on a nonexistent MMA producer"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_public_gdn_cudnn_repeated_stateful_launches_cross_wave_boundary",
+]
+env = { ATTN_GYM_RUN_STRESS_TESTS = "1" }
+
+[[superseded]]
+id = "B5"
+title = "KDA FP32 factors + Gamma-free dA diagonal"
+guarding_tests = ["test/kda/cudnn/test_delta_rule_numerics.py::test_kda_cudnn_raw_backward_precision"]
+
+[[superseded]]
+id = "B11"
+title = "Terminal-sequence TMA overfetch / fault"
+guarding_tests = [
+  "test/gdn/cudnn/test_gdn_cudnn_layouts.py::test_gdn_cudnn_terminal_capacity_slack_is_not_read",
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_packed_h64_exact_tail_with_trailing_empty_is_finite",
+  "test/kda/cudnn/test_kda_cudnn_training.py::test_cudnn_packed_tail_isolated_from_next_sequence",
+]
+
+[[superseded]]
+id = "B12"
+title = "GDN bwd checkpoint descriptors interpret public state as [V,K]"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_checkpoint_uses_v_by_k_state_at_token_64"]
+
+[[superseded]]
+id = "B4"
+title = "GDN mismatched dO dtype rejected before dispatch (inherited from main)"
+guarding_tests = ["test/gdn/cudnn/test_gdn_cudnn_backward.py::test_gdn_cudnn_backward_rejects_mismatched_output_gradient_dtype"]

@@ -135,6 +135,10 @@ exclude = [
     "*.ipynb",
     # Vendored NVIDIA Apache-2.0/MIT source; lint the maintained cuDNN adapters instead.
     "attn_gym/linear/_delta_rule/cudnn/kernels/common",
+    # Verbatim cudnn-frontend v1.30 drop; restyled and linted in a follow-up.
+    "attn_gym/linear/_delta_rule/cudnn_fe/common",
+    "attn_gym/linear/_delta_rule/cudnn_fe/kernel",
+    "attn_gym/linear/_delta_rule/cudnn_fe/tile_dsl",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_config.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_bprop_f16.py",
     "attn_gym/linear/_delta_rule/cudnn/kernels/gdn_prefill_config.py",

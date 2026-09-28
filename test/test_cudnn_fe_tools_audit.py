@@ -1,10 +1,14 @@
 """CPU-only tests for the cuDNN vendoring audit (tools/cudnn_fe/audit.py) and codemod (restyle.py)."""
 
+import ast
+import subprocess
 import textwrap
 
 import pytest
 
-from tools.cudnn_fe import audit, restyle
+from tools.cudnn_fe import audit, closure, restyle
+
+PR_A = "88eb5ce"  # the verbatim v1.30 drop
 
 HEADER = """\
 import cutlass
@@ -343,6 +347,50 @@ def test_codemod_leaves_other_fadd2_bodies_manual(old, new):
     before = V130_POINTWISE.replace(old, new)
     assert before != V130_POINTWISE
     assert restyle.restyle_source(before, "tile_dsl/pointwise.py").text == before
+
+
+def _defined_names(tree: ast.Module) -> set[str]:
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names |= {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+    return names
+
+
+def test_codemod_on_the_verbatim_drop_only_calls_existing_helpers(tmp_path):
+    """Every ``from ..tile_dsl.X import name`` in the restyled 88eb5ce drop resolves."""
+    has = subprocess.run(
+        ["git", "-C", str(closure.repo_root()), "cat-file", "-e", f"{PR_A}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    if has.returncode:
+        pytest.skip(f"{PR_A} is not in this clone")
+    root = audit.extract_rev(PR_A, tmp_path)
+    results = restyle.restyle_tree(root, [], write=True)
+    assert any(r.applied for r in results)
+    missing = []
+    for path in audit.iter_sources(root):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.ImportFrom) and node.level and node.module):
+                continue
+            target = path.parent.joinpath(*[".."] * (node.level - 1), *node.module.split("."))
+            module = target.with_suffix(".py").resolve()
+            if not module.is_file():
+                continue
+            defined = _defined_names(ast.parse(module.read_text()))
+            missing += [
+                f"{path.relative_to(root)}: {node.module}.{a.name}"
+                for a in node.names
+                if a.name not in defined
+            ]
+    assert missing == []
 
 
 def test_codemod_skips_allowlisted_findings(tmp_path):

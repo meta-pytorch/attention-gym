@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from tools.cudnn_fe import closure, vendor
 
+PR_A = "88eb5ce"
 KERNEL = "cudnn.linear_attention.frost.kernel."
 LICENSE_HEADER = (
     "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.\n"
@@ -179,3 +182,53 @@ def test_explicit_destination_refuses_symlinks(fake_checkout: Path, tmp_path: Pa
     (real / "kernel/gdn_prefill_f16.py").symlink_to(package / "kernel/gdn_prefill_f16.py")
     with pytest.raises(SystemExit, match="symlink"):
         vendor.check_dest(real)
+
+
+def _upstream_clone() -> Path | None:
+    candidates = [
+        os.environ.get("CUDNN_FE_UPSTREAM"),
+        closure.repo_root() / "agent_space/upstream/cudnn-frontend",
+        closure.repo_root().parent / "attention-gym/agent_space/upstream/cudnn-frontend",
+    ]
+    for candidate in candidates:
+        if candidate and (Path(candidate) / ".git").exists():
+            return Path(candidate)
+    return None
+
+
+@pytest.fixture
+def clone() -> Path:
+    clone = _upstream_clone()
+    if clone is None:
+        pytest.skip("set CUDNN_FE_UPSTREAM to a cudnn-frontend clone")
+    has_commit = subprocess.run(
+        ["git", "-C", str(closure.repo_root()), "cat-file", "-e", f"{PR_A}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    if has_commit.returncode:
+        pytest.skip(f"{PR_A} is not in this clone")
+    return clone
+
+
+def test_verify_reproduces_the_verbatim_v130_drop(
+    clone: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = vendor.main(["--rev", "v1.30.0", "--upstream", str(clone), "--verify", PR_A])
+    assert rc == 0, capsys.readouterr().out
+
+
+@pytest.mark.parametrize("rel", ["_compat.py", "LICENSE.txt", "kernel/gdn_prefill_f16.py"])
+def test_verify_fails_on_any_corrupted_generated_file(
+    rel: str, clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    package = repo / closure.PACKAGE_RELPATH
+    vendor.vendor(closure.Upstream(clone, "v1.30.0"), package, "engines")
+    (package / rel).write_bytes((package / rel).read_bytes() + b"# corrupted\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "drop"], check=True)
+    monkeypatch.setattr(closure, "repo_root", lambda: repo)
+    assert vendor.verify(closure.Upstream(clone, "v1.30.0"), "HEAD") == 1
