@@ -6,15 +6,15 @@
 
 """CuTeDSL causal depthwise convolution with a first-order backward.
 
-The implementation accepts contiguous FP16, BF16, or FP32 ``[B, T, C]`` tensors and
-treats every batch row as an independent sequence. Dense inputs may supply their
-preceding ``W - 1`` input positions as functional state. An optional CUDA
-``cu_seqlens`` tensor instead delimits independent sequences packed into ``[1, T, C]``.
-Its final offset is the dynamic active endpoint and may be smaller than the physical
-capacity ``T``. Inference prefill and decode can instead address a mutable paged history
-pool directly. Each thread owns a compile-time number of adjacent channels. Forward stages
-its input window in registers, while backward computes input gradients and FP32
-weight-gradient partials followed by a Torch reduction.
+The implementation accepts FP16, BF16, or FP32 ``[B, T, C]`` input with contiguous channels
+and reads it in place through its batch and token strides, treating every batch row as an
+independent sequence. Dense inputs may supply their preceding ``W - 1`` input positions as
+functional state. An optional CUDA ``cu_seqlens`` tensor instead delimits independent
+sequences packed into ``[1, T, C]``. Its final offset is the dynamic active endpoint and may
+be smaller than the physical capacity ``T``. Inference prefill and decode can instead address
+a mutable paged history pool directly. Each thread owns a compile-time number of adjacent
+channels. Forward stages its input window in registers, while backward computes input
+gradients and FP32 weight-gradient partials followed by a Torch reduction.
 """
 
 from __future__ import annotations
@@ -37,7 +37,12 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import (
+    TMA_ALIGNMENT_BYTES,
+    make_fake_strided_tensor,
+    requires_int64_abi,
+    tensor_supports_contiguous_dim,
+)
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.utils import ceildiv
@@ -384,6 +389,14 @@ class ShortConvKernel:
         """Return ``batch * tokens + time`` without overflowing before widening."""
         return self.upcast_offset(batch) * tokens + self.upcast_offset(time)
 
+    @cute.jit
+    def input_group(self, x: cute.Tensor, batch, time, channel_group):
+        """Select one channel group of ``[B, T, C]`` input through its batch and token strides."""
+        x_groups = cute.zipped_divide(x, (1, 1, self.channels_per_thread))
+        return x_groups[
+            ((0, 0, None), (self.upcast_offset(batch), self.upcast_offset(time), channel_group))
+        ]
+
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
         name = f"short_conv_{self.kernel_kind}_{self.dtype.name}"
@@ -473,7 +486,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 for tap in cutlass.range_constexpr(self.width):
                     weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
 
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
             initial_groups = initial_state
             if cutlass.const_expr(initial_state is not None and state_indices is None):
@@ -489,12 +501,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     cutlass.const_expr(full_tile) or input_time < active_endpoint
                 ):
                     inputs[(None, input_offset)].store(
-                        x_groups[
-                            (
-                                (0, None),
-                                (self.flattened_row(batch, input_time, tokens), channel_group),
-                            )
-                        ].load()
+                        self.input_group(x, batch, input_time, channel_group).load()
                     )
 
             tile_sequence, tile_sequence_start, tile_sequence_end = tile_sequence_bounds(
@@ -668,7 +675,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
             grid=(
                 cute.ceil_div(tokens, self.times_per_block),
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -861,13 +868,14 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
             slot = state_indices[sequence]
             if slot > 0:
                 if cutlass.const_expr(cu_seqlens is None):
-                    sequence_start = self.upcast_offset(sequence) * tokens
-                    sequence_end = sequence_start + tokens
+                    batch = Int32(sequence)
+                    sequence_start = Int32(0)
+                    sequence_end = tokens
                 else:
-                    sequence_start = self.upcast_offset(Int32(cu_seqlens[sequence]))
-                    sequence_end = self.upcast_offset(Int32(cu_seqlens[sequence + 1]))
+                    batch = Int32(0)
+                    sequence_start = Int32(cu_seqlens[sequence])
+                    sequence_end = Int32(cu_seqlens[sequence + 1])
                 sequence_length = sequence_end - sequence_start
-                x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
                 state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
 
                 for row in cutlass.range_constexpr(self.width - 1):
@@ -877,7 +885,7 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
                     values.fill(self.dtype.cute_type(0.0))
                     input_time = sequence_end - (self.width - 1) + row
                     if input_time >= sequence_start:
-                        values.store(x_groups[((0, None), (input_time, channel_group))].load())
+                        values.store(self.input_group(x, batch, input_time, channel_group).load())
                     # For short sequences the source row is ``row + sequence_length``,
                     # so ascending stores cannot overwrite a value before it is read.
                     elif cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
@@ -962,7 +970,6 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
         time_start = time_block * self.times_per_block
 
         if channel < self.channels:
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
             dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
             if cutlass.const_expr(initial_state is not None):
@@ -983,12 +990,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                 input_time = time_start + input_offset - (self.width - 1)
                 if input_time >= 0 and input_time < tokens:
                     inputs[(None, input_offset)].store(
-                        x_groups[
-                            (
-                                (0, None),
-                                (self.flattened_row(batch, input_time, tokens), channel_group),
-                            )
-                        ].load()
+                        self.input_group(x, batch, input_time, channel_group).load()
                     )
 
             grad_z = cute.make_rmem_tensor(
@@ -1137,7 +1139,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             grid=(
                 cute.ceil_div(tokens, self.times_per_block),
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -1188,7 +1190,6 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
         time_start = time_block * self.times_per_block
 
         if channel < self.channels:
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
             if cutlass.const_expr(initial_state is not None):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
@@ -1227,15 +1228,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                             input_time = time + tap - (self.width - 1)
                             if input_time >= sequence_start:
                                 input_taps[(None, tap)].store(
-                                    x_groups[
-                                        (
-                                            (0, None),
-                                            (
-                                                self.flattened_row(batch, input_time, tokens),
-                                                channel_group,
-                                            ),
-                                        )
-                                    ]
+                                    self.input_group(x, batch, input_time, channel_group)
                                     .load()
                                     .to(Float32)
                                 )
@@ -1305,7 +1298,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             grid=(
                 cute.ceil_div(tokens, self.times_per_block),
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -1397,7 +1390,6 @@ class ShortConvTmaKernel:
     ):
         """Initialize a convolution window from physical input, state, or zeros."""
         history.fill(self.dtype.cute_type(0.0))
-        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
         initial_groups = initial_state
         if cutlass.const_expr(initial_state is not None):
             initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
@@ -1405,12 +1397,7 @@ class ShortConvTmaKernel:
             history_time = output_time + history_offset - (self.width - 1)
             if history_time >= sequence_start:
                 history[(None, history_offset)].store(
-                    x_groups[
-                        (
-                            (0, None),
-                            (self.flattened_row(batch, history_time, tokens), channel_group),
-                        )
-                    ].load()
+                    self.input_group(x, batch, history_time, channel_group).load()
                 )
             elif cutlass.const_expr(initial_state is not None):
                 history[(None, history_offset)].store(
@@ -1513,20 +1500,21 @@ class ShortConvTmaKernel:
         )
         # Keep the batch mode separate so a partial trailing time box clamps
         # (zero-fills) inside its own batch instead of straddling batch rows.
-        batched = cute.make_layout(
-            (tokens, self.channels, 1 if cutlass.const_expr(packed) else x.shape[0] // tokens),
+        # The input keeps its caller's batch and token strides; grad_output is compact rows.
+        compact = cute.make_layout(
+            (tokens, self.channels, 1 if cutlass.const_expr(packed) else x.shape[0]),
             stride=(self.channels, 1, self.upcast_offset(tokens) * self.channels),
         )
         load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
             load_op,
-            cute.make_tensor(x.iterator, batched),
+            cute.make_tensor(x.iterator, cute.select(x.layout, mode=[1, 2, 0])),
             staged,
             cta_tiler,
         )
         tma_atom_dy, tma_tensor_dy = cpasync.make_tiled_tma_atom(
             load_op,
-            cute.make_tensor(grad_output.iterator, batched),
+            cute.make_tensor(grad_output.iterator, compact),
             staged,
             cta_tiler,
         )
@@ -1747,7 +1735,6 @@ class CausalConv1dSiluInputGradientTma(
         subtiles = self.times_per_block // stage_tokens
         first_time_tile = Int32(time_start // stage_tokens)
 
-        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
         dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
         dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
         sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
@@ -1780,12 +1767,7 @@ class CausalConv1dSiluInputGradientTma(
                 history_time = time_start + history_offset - (self.width - 1)
                 if history_time >= sequence_start:
                     history[(None, history_offset)].store(
-                        x_groups[
-                            (
-                                (0, None),
-                                (self.flattened_row(batch, history_time, tokens), channel_group),
-                            )
-                        ].load()
+                        self.input_group(x, batch, history_time, channel_group).load()
                     )
         else:
             self.initialize_history(
@@ -1913,14 +1895,7 @@ class CausalConv1dSiluInputGradientTma(
             if cutlass.const_expr(cu_seqlens is not None):
                 has_input = has_input and output_time < sequence_end
             if has_input:
-                current.store(
-                    x_groups[
-                        (
-                            (0, None),
-                            (self.flattened_row(batch, output_time, tokens), channel_group),
-                        )
-                    ].load()
-                )
+                current.store(self.input_group(x, batch, output_time, channel_group).load())
                 incoming.store(
                     dy_groups[
                         (
@@ -2205,7 +2180,7 @@ class CausalConv1dSiluInputGradientTma(
                         Int32(self.time_workers), cute.ceil_div(tokens, self.times_per_block)
                     ),
                     self.channels // (self.threads * self.channels_per_thread),
-                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
                 ),
                 block=(self.threads, 1, 1),
                 stream=stream,
@@ -2228,7 +2203,7 @@ class CausalConv1dSiluInputGradientTma(
                 grid=(
                     cute.ceil_div(tokens, self.times_per_block),
                     self.channels // (self.threads * self.channels_per_thread),
-                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
                 ),
                 block=(self.threads, 1, 1),
                 stream=stream,
@@ -2306,7 +2281,6 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                 )
                 producer_state.advance()
 
-        x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
         sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
         sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
         weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
@@ -2336,20 +2310,13 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                     if cutlass.const_expr(self.dtype.name == "fp32"):
                         for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
                             history[channel_offset, history_offset] = x[
-                                self.flattened_row(batch, history_time, tokens),
+                                self.upcast_offset(batch),
+                                self.upcast_offset(history_time),
                                 channel + channel_offset,
                             ]
                     else:
                         history[(None, history_offset)].store(
-                            x_groups[
-                                (
-                                    (0, None),
-                                    (
-                                        self.flattened_row(batch, history_time, tokens),
-                                        channel_group,
-                                    ),
-                                )
-                            ].load()
+                            self.input_group(x, batch, history_time, channel_group).load()
                         )
         else:
             self.initialize_history(
@@ -2503,7 +2470,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             grid=(
                 cute.ceil_div(tokens, self.times_per_block),
                 self.channels // (self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0] // tokens,
+                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -2557,15 +2524,16 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
         channel = channel_group * self.channels_per_thread
 
         if cutlass.const_expr(cu_seqlens is None):
-            sequence_start = self.upcast_offset(sequence) * tokens
-            sequence_end = sequence_start + tokens
+            batch = Int32(sequence)
+            sequence_start = Int32(0)
+            sequence_end = tokens
         else:
+            batch = Int32(0)
             sequence_start = Int32(cu_seqlens[sequence])
             sequence_end = Int32(cu_seqlens[sequence + 1])
         sequence_length = sequence_end - sequence_start
 
         if channel < self.channels:
-            x_groups = cute.zipped_divide(x, (1, self.channels_per_thread))
             state_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
             dstate_groups = cute.zipped_divide(grad_initial_state, (1, self.channels_per_thread))
@@ -2586,15 +2554,9 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                         input_value = cute.make_rmem_tensor((self.channels_per_thread,), Float32)
                         if input_offset >= 0:
                             input_value.store(
-                                x_groups[
-                                    (
-                                        (0, None),
-                                        (
-                                            self.upcast_offset(sequence_start + input_offset),
-                                            channel_group,
-                                        ),
-                                    )
-                                ]
+                                self.input_group(
+                                    x, batch, sequence_start + input_offset, channel_group
+                                )
                                 .load()
                                 .to(Float32)
                             )
@@ -2622,7 +2584,9 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                             (
                                 (0, None),
                                 (
-                                    self.upcast_offset(sequence_start + output_offset),
+                                    self.flattened_row(
+                                        batch, sequence_start + output_offset, tokens
+                                    ),
                                     channel_group,
                                 ),
                             )
@@ -2697,13 +2661,14 @@ def _compile_forward(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     packed: bool,
     has_initial_state: bool,
     activation: Activation,
     use_int64_offsets: bool = False,
     full_time_tiles: bool = False,
 ):
-    """Compile forward with runtime batch, token, and sequence extents."""
+    """Compile forward with runtime batch, token, and sequence extents and input strides."""
     activation_fn = activation.forward
     operation = CausalConv1dSiluForward(
         channels,
@@ -2716,7 +2681,7 @@ def _compile_forward(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_indices(packed),
@@ -2787,6 +2752,7 @@ def _compile_input_gradient(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     packed: bool,
     has_initial_state: bool,
     activation: Activation,
@@ -2794,9 +2760,12 @@ def _compile_input_gradient(
     time_workers: int = 0,
     use_int64_offsets: bool = False,
 ):
-    """Compile one static or explicitly persistent TMA input-gradient specialization."""
+    """Compile one static or explicitly persistent TMA input-gradient specialization.
+
+    TMA requires a 16-byte input alignment; other inputs use the vector or general kernel.
+    """
     derivative = activation.derivative
-    use_tma = _input_gradient_uses_tma(
+    use_tma = input_alignment == TMA_ALIGNMENT_BYTES and _input_gradient_uses_tma(
         dtype,
         config,
         packed,
@@ -2830,7 +2799,7 @@ def _compile_input_gradient(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
@@ -2846,13 +2815,17 @@ def _compile_weight_gradient(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     packed: bool,
     has_initial_state: bool,
     activation: Activation,
     capability: tuple[int, int],
     use_int64_offsets: bool = False,
 ):
-    """Compile weight gradients with runtime batch, token, and partial extents."""
+    """Compile weight gradients with runtime batch, token, and partial extents.
+
+    TMA requires a 16-byte input alignment; other inputs use the vector or general kernel.
+    """
     derivative = activation.derivative
     sym_offset = cute.sym_int64 if use_int64_offsets else cute.sym_int32
     partials = cute.runtime.make_fake_compact_tensor(
@@ -2861,7 +2834,7 @@ def _compile_weight_gradient(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    use_tma = supports_tma(
+    use_tma = input_alignment == TMA_ALIGNMENT_BYTES and supports_tma(
         CausalConv1dSiluWeightGradientPartialsTma,
         config,
         tuned_config(dtype, packed=packed).weight_gradient,
@@ -2884,7 +2857,7 @@ def _compile_weight_gradient(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         partials,
@@ -2901,6 +2874,7 @@ def _compile_initial_state_gradient(
     dtype: ShortConvDType,
     threads: int,
     channels_per_thread: int,
+    input_alignment: int,
     packed: bool,
     activation: Activation,
     use_int64_offsets: bool = False,
@@ -2918,7 +2892,7 @@ def _compile_initial_state_gradient(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
@@ -2928,19 +2902,24 @@ def _compile_initial_state_gradient(
     )
 
 
+def _validate_channel_contiguous_input(x: torch.Tensor) -> None:
+    """Validate the read-only input without constraining outer strides."""
+    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or x.stride(-1) != 1:
+        raise ValueError("x must be a CUDA FP16, BF16, or FP32 tensor with contiguous channels")
+
+
 def _validate_inputs(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
 ) -> None:
-    """Validate the public compile-time-width CuTeDSL tensor contract."""
+    """Validate the shared training, tuning, and paged-prefill tensor contract."""
     if x.ndim != 3:
         raise ValueError(f"x must have shape [B, T, C], got {tuple(x.shape)}")
     if x.shape[0] < 1 or x.shape[1] < 1 or x.shape[2] < 1:
         raise ValueError(f"x must have positive B, T, and C dimensions, got {tuple(x.shape)}")
-    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or not x.is_contiguous():
-        raise ValueError("x must be a contiguous CUDA FP16, BF16, or FP32 tensor")
+    _validate_channel_contiguous_input(x)
     if weight.ndim != 2 or weight.shape[0] != x.shape[2] or weight.shape[1] < 1:
         raise ValueError(
             f"weight must have shape [C, W] with W positive, got {tuple(weight.shape)}"
@@ -2987,8 +2966,7 @@ def _validate_decode_inputs(
         raise ValueError(
             f"x must have positive sequence and channel dimensions, got {tuple(x.shape)}"
         )
-    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or not x.is_contiguous():
-        raise ValueError("x must be a contiguous CUDA FP16, BF16, or FP32 tensor")
+    _validate_channel_contiguous_input(x)
     if weight.ndim != 2 or weight.shape[0] != x.shape[1] or weight.shape[1] < 2:
         raise ValueError(
             f"weight must have shape [{x.shape[1]}, W] with W >= 2, got {tuple(weight.shape)}"
@@ -3080,6 +3058,19 @@ def _aligned(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
+def _input_alignment(x: torch.Tensor, config: ShortConvConfig, *, tma: bool = False) -> int:
+    """Select the widest input signature ``x`` satisfies in place, in bytes.
+
+    Candidates are TMA's 16 bytes when ``tma`` is set, then one channel group's vector
+    width, then the element size, which every channel-contiguous view satisfies.
+    """
+    vector = min(TMA_ALIGNMENT_BYTES, config.channels_per_thread * x.element_size())
+    for alignment in (TMA_ALIGNMENT_BYTES, vector) if tma else (vector,):
+        if tensor_supports_contiguous_dim(x, alignment_bytes=alignment):
+            return alignment
+    return x.element_size()
+
+
 def _launch_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3089,20 +3080,21 @@ def _launch_forward(
     *,
     activation: str | None,
 ) -> torch.Tensor:
-    """Allocate and launch the compiled forward specialization."""
+    """Allocate a contiguous output and launch the compiled forward on ``x`` in place."""
     resolved_activation = resolve_activation(activation)
-    x, weight = _aligned(x), _aligned(weight)
+    weight = _aligned(weight)
     if initial_state is not None:
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
     width = weight.shape[1]
     dtype = SHORT_CONV_DTYPES[x.dtype]
-    output = torch.empty_like(x)
+    output = x.new_empty(x.shape)
     compiled = _compile_forward(
         channels,
         width,
         dtype,
         config,
+        _input_alignment(x, config),
         cu_seqlens is not None,
         initial_state is not None,
         resolved_activation,
@@ -3110,7 +3102,7 @@ def _launch_forward(
         tokens % config.times_per_block == 0,
     )
     compiled(
-        x.view(batches * tokens, channels),
+        x,
         weight,
         output.view(batches * tokens, channels),
         cu_seqlens,
@@ -3133,38 +3125,44 @@ def _launch_backward(
     persistent_tma_input_gradient: bool = False,
     activation: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Launch configured gradient kernels and reduce FP32 partials."""
+    """Launch configured gradient kernels on ``x`` in place and reduce FP32 partials.
+
+    ``grad_x`` is a fresh contiguous tensor whatever the input strides; autograd routes it
+    back through any view that produced ``x``.
+    """
     resolved_activation = resolve_activation(activation)
-    x, weight = _aligned(x), _aligned(weight)
+    weight = _aligned(weight)
     if initial_state is not None:
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
     width = weight.shape[1]
+    packed = cu_seqlens is not None
     dtype = SHORT_CONV_DTYPES[x.dtype]
     properties = get_device_properties(x.device)
     capability = (properties.major, properties.minor)
+    input_uses_tma = _input_gradient_uses_tma(
+        dtype, input_config, packed, channels, width, capability
+    )
+    if persistent_tma_input_gradient and not (packed and input_uses_tma):
+        raise ValueError("persistent TMA input gradients require a packed staged specialization")
+    input_alignment = _input_alignment(x, input_config, tma=input_uses_tma)
     input_time_workers = 0
     if persistent_tma_input_gradient:
-        if cu_seqlens is None or not _input_gradient_uses_tma(
-            dtype,
-            input_config,
-            cu_seqlens is not None,
-            channels,
-            width,
-            capability,
-        ):
+        if input_alignment != TMA_ALIGNMENT_BYTES:
             raise ValueError(
-                "persistent TMA input gradients require a packed staged specialization"
+                "persistent TMA input gradients require x's base and outer strides to be "
+                f"{TMA_ALIGNMENT_BYTES}-byte aligned"
             )
         input_time_workers = _persistent_tma_dx_workers(channels, input_config, x.device)
     grad_output = _aligned(grad_output.contiguous())
-    grad_x = torch.empty_like(x)
+    grad_x = x.new_empty(x.shape)
     _compile_input_gradient(
         channels,
         width,
         dtype,
         input_config,
-        cu_seqlens is not None,
+        input_alignment,
+        packed,
         initial_state is not None,
         resolved_activation,
         capability,
@@ -3172,7 +3170,7 @@ def _launch_backward(
         batches * tokens > 2**31 - 1
         or requires_int64_abi(x, weight, grad_output, grad_x, initial_state),
     )(
-        x.view(batches * tokens, channels),
+        x,
         weight,
         grad_output.view(batches * tokens, channels),
         grad_x.view(batches * tokens, channels),
@@ -3198,14 +3196,15 @@ def _launch_backward(
         width,
         dtype,
         weight_config,
-        cu_seqlens is not None,
+        _input_alignment(x, weight_config, tma=True),
+        packed,
         initial_state is not None,
         resolved_activation,
         capability,
         batches * tokens > 2**31 - 1
         or requires_int64_abi(x, weight, grad_output, partials, initial_state),
     )(
-        x.view(batches * tokens, channels),
+        x,
         weight,
         grad_output.view(batches * tokens, channels),
         partials,
@@ -3220,12 +3219,13 @@ def _launch_backward(
             dtype,
             input_config.threads,
             input_config.channels_per_thread,
-            cu_seqlens is not None,
+            _input_alignment(x, input_config),
+            packed,
             resolved_activation,
             batches * tokens > 2**31 - 1
             or requires_int64_abi(x, weight, grad_output, initial_state, grad_initial_state),
         )(
-            x.view(batches * tokens, channels),
+            x,
             weight,
             initial_state.flatten(0, 1),
             grad_output.view(batches * tokens, channels),
@@ -3350,7 +3350,7 @@ def tune_causal_conv1d(
     if grad_output.device != x.device or not grad_output.is_contiguous():
         raise ValueError("grad_output must be contiguous on x.device")
 
-    x, weight, grad_output = _aligned(x), _aligned(weight), _aligned(grad_output)
+    weight, grad_output = _aligned(weight), _aligned(grad_output)
     if initial_state is not None:
         initial_state = _aligned(initial_state)
     batches, tokens, channels = x.shape
@@ -3359,7 +3359,6 @@ def tune_causal_conv1d(
     properties = get_device_properties(x.device)
     capability = (properties.major, properties.minor)
     packed = cu_seqlens is not None
-    x_matrix = x.view(batches * tokens, channels)
     grad_matrix = grad_output.view(batches * tokens, channels)
     kernel_initial_state = None if width == 1 else initial_state
     state_matrix = None if kernel_initial_state is None else kernel_initial_state.flatten(0, 1)
@@ -3374,12 +3373,12 @@ def tune_causal_conv1d(
     )
     for config in forward_candidates:
         _validate_config(config, channels, "forward_configs")
-    forward_output = torch.empty_like(x).view(batches * tokens, channels)
+    forward_output = x.new_empty(batches * tokens, channels)
     forward = tune(
         forward_candidates,
         _compile_forward,
         lambda compiled, _config: compiled(
-            x_matrix,
+            x,
             weight,
             forward_output,
             cu_seqlens,
@@ -3391,7 +3390,8 @@ def tune_causal_conv1d(
             width,
             dtype,
             config,
-            cu_seqlens is not None,
+            _input_alignment(x, config),
+            packed,
             kernel_initial_state is not None,
             resolved_activation,
             use_int64_offsets,
@@ -3407,19 +3407,24 @@ def tune_causal_conv1d(
     )
     for config in input_candidates:
         _validate_config(config, channels, "input_grad_configs")
-    grad_x = torch.empty_like(x).view(batches * tokens, channels)
+    grad_x = x.new_empty(batches * tokens, channels)
     input_gradient = tune(
         input_candidates,
         _compile_input_gradient,
         lambda compiled, _config: compiled(
-            x_matrix, weight, grad_matrix, grad_x, cu_seqlens, state_matrix, tokens
+            x, weight, grad_matrix, grad_x, cu_seqlens, state_matrix, tokens
         ),
         compile_call=lambda config: (
             channels,
             width,
             dtype,
             config,
-            cu_seqlens is not None,
+            _input_alignment(
+                x,
+                config,
+                tma=_input_gradient_uses_tma(dtype, config, packed, channels, width, capability),
+            ),
+            packed,
             kernel_initial_state is not None,
             resolved_activation,
             capability,
@@ -3451,7 +3456,7 @@ def tune_causal_conv1d(
         weight_candidates,
         _compile_weight_gradient,
         lambda compiled, config: compiled(
-            x_matrix,
+            x,
             weight,
             grad_matrix,
             partials[config],
@@ -3464,7 +3469,8 @@ def tune_causal_conv1d(
             width,
             dtype,
             config,
-            cu_seqlens is not None,
+            _input_alignment(x, config, tma=True),
+            packed,
             kernel_initial_state is not None,
             resolved_activation,
             capability,
@@ -3487,6 +3493,29 @@ def _fake_dynamic_rows(dtype: ShortConvDType, columns: int, use_int64_offsets: b
         (cute.sym_int64() if use_int64_offsets else cute.sym_int32(), columns),
         stride_order=(1, 0),
         assumed_align=16,
+    )
+
+
+def _fake_input(
+    dtype: ShortConvDType,
+    channels: int,
+    alignment: int,
+    use_int64_offsets: bool = False,
+    *,
+    outer_modes: int = 2,
+):
+    """Create read-only input with contiguous channels and runtime outer extents and strides.
+
+    ``alignment`` bytes bound the base and every outer stride: the TMA or vector width for
+    fast paths, or the element size for the general path, whose loads stay scalar.
+    """
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int32
+    return make_fake_strided_tensor(
+        dtype.cute_type,
+        (*(sym_int() for _ in range(outer_modes)), channels),
+        stride_divisibility=alignment * 8 // dtype.cute_type.width,
+        assumed_align=alignment,
+        use_int64_strides=use_int64_offsets,
     )
 
 
@@ -3534,12 +3563,13 @@ def _compile_paged_forward(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     packed: bool,
     use_has_initial_state: bool,
     activation: Activation,
     use_int64_offsets: bool = False,
 ):
-    """Compile paged forward with runtime batch, token, and sequence counts."""
+    """Compile paged forward with runtime batch, token, and sequence counts and input strides."""
     operation = CausalConv1dPagedForward(
         channels,
         width,
@@ -3550,7 +3580,7 @@ def _compile_paged_forward(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels, use_int64_offsets),
         _fake_indices(packed),
@@ -3567,11 +3597,12 @@ def _compile_paged_state_update(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     packed: bool,
     use_has_initial_state: bool,
     use_int64_offsets: bool = False,
 ):
-    """Compile paged state updates with runtime token and sequence counts."""
+    """Compile paged state updates with runtime token and sequence counts and input strides."""
     operation = CausalConv1dPagedStateUpdate(
         channels,
         width,
@@ -3581,7 +3612,7 @@ def _compile_paged_state_update(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels, use_int64_offsets),
+        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
         _fake_decode_state(dtype, width, channels),
         _fake_indices(True),
         _fake_has_initial_state(use_has_initial_state),
@@ -3596,6 +3627,7 @@ def _compile_decode(
     width: int,
     dtype: ShortConvDType,
     config: ShortConvConfig,
+    input_alignment: int,
     paged: bool,
     activation: Activation,
     use_has_initial_state: bool = False,
@@ -3606,7 +3638,7 @@ def _compile_decode(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels),
+        _fake_input(dtype, channels, input_alignment, outer_modes=1),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels),
         _fake_decode_state(dtype, width, channels),
@@ -3625,21 +3657,22 @@ def _launch_decode(
     activation: str | None,
     has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Allocate the output and launch the compiled decode specialization."""
+    """Allocate a contiguous output and launch the compiled decode on ``x`` in place."""
     resolved_activation = resolve_activation(activation)
-    x, weight = _aligned(x), _aligned(weight)
+    weight = _aligned(weight)
     if state.data_ptr() % 16 != 0:
         raise ValueError("state storage must be 16-byte aligned for the in-place advance")
     channels = x.shape[1]
     width = weight.shape[1]
     _validate_config(config, channels, "forward_config")
     dtype = SHORT_CONV_DTYPES[x.dtype]
-    output = torch.empty_like(x)
+    output = x.new_empty(x.shape)
     compiled = _compile_decode(
         channels,
         width,
         dtype,
         config,
+        _input_alignment(x, config),
         state_indices is not None,
         resolved_activation,
         has_initial_state is not None,
@@ -3666,7 +3699,7 @@ def _launch_paged_forward(
 ) -> torch.Tensor:
     """Run paged prefill and advance selected history slots in place."""
     resolved_activation = resolve_activation(activation)
-    x, weight = _aligned(x), _aligned(weight)
+    weight = _aligned(weight)
     if state.data_ptr() % 16 != 0:
         raise ValueError("state storage must be 16-byte aligned for the in-place advance")
     batches, tokens, channels = x.shape
@@ -3674,19 +3707,22 @@ def _launch_paged_forward(
     packed = cu_seqlens is not None
     _validate_config(config, channels, "forward_config")
     dtype = SHORT_CONV_DTYPES[x.dtype]
-    output = torch.empty_like(x)
+    output = x.new_empty(x.shape)
     use_int64_offsets = _paged_forward_uses_int64_offsets(x, output)
+    # Both kernels share channel ownership, so they read x through one signature.
+    input_alignment = _input_alignment(x, config)
     _compile_paged_forward(
         channels,
         width,
         dtype,
         config,
+        input_alignment,
         packed,
         has_initial_state is not None,
         resolved_activation,
         use_int64_offsets,
     )(
-        x.view(batches * tokens, channels),
+        x,
         weight,
         output.view(batches * tokens, channels),
         cu_seqlens,
@@ -3700,11 +3736,12 @@ def _launch_paged_forward(
         width,
         dtype,
         ShortConvConfig(config.threads, config.channels_per_thread, 1),
+        input_alignment,
         packed,
         has_initial_state is not None,
         use_int64_offsets,
     )(
-        x.view(batches * tokens, channels),
+        x,
         state,
         state_indices,
         has_initial_state,
@@ -3746,7 +3783,7 @@ def _default_forward_fake(
     activation: str | None = None,
 ) -> torch.Tensor:
     del weight, cu_seqlens, initial_state, activation
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_paged_fwd_cuda(
@@ -3790,7 +3827,7 @@ def _paged_forward_fake(
     activation: str | None = None,
 ) -> torch.Tensor:
     del weight, state, state_indices, has_initial_state, cu_seqlens, activation
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_decode_cuda(
@@ -3830,7 +3867,7 @@ def _decode_fake(
     has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del weight, state, state_indices, activation, has_initial_state
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_configured_decode_cuda(
@@ -3888,7 +3925,7 @@ def _configured_decode_fake(
         activation,
         has_initial_state,
     )
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_bwd_cuda(
@@ -3926,7 +3963,7 @@ def _default_backward_fake(
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del grad_output, cu_seqlens, activation
-    return torch.empty_like(x), torch.empty_like(weight)
+    return x.new_empty(x.shape), torch.empty_like(weight)
 
 
 def _cute_short_conv_configured_fwd_cuda(
@@ -3997,7 +4034,7 @@ def _forward_fake(
         weight_times,
         activation,
     )
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_configured_bwd_cuda(
@@ -4109,7 +4146,7 @@ def _backward_fake(
         persistent_tma_input_gradient,
         activation,
     )
-    return torch.empty_like(x), torch.empty_like(weight)
+    return x.new_empty(x.shape), torch.empty_like(weight)
 
 
 @torch.library.register_fake("attn_gym::_cute_short_conv_configured_bwd_with_state_grad")
@@ -4142,7 +4179,11 @@ def _backward_with_state_grad_fake(
         persistent_tma_input_gradient,
         activation,
     )
-    return torch.empty_like(x), torch.empty_like(weight), torch.empty_like(initial_state)
+    return (
+        x.new_empty(x.shape),
+        torch.empty_like(weight),
+        torch.empty_like(initial_state),
+    )
 
 
 class _ShortConv(torch.autograd.Function):
@@ -4401,8 +4442,10 @@ def causal_conv1d(
     and block mapping, so changing one compiles and caches a distinct kernel.
 
     Args:
-        x: Contiguous CUDA FP16, BF16, or FP32 input with shape ``[B, T, C]``.
-            Each batch row is convolved as an independent sequence.
+        x: CUDA FP16, BF16, or FP32 input with shape ``[B, T, C]`` and contiguous
+            channels. Batch and token strides are arbitrary, so slices, permutations, and
+            expanded views are read in place. Each batch row is convolved as an
+            independent sequence.
         weight: Contiguous depthwise weights with shape ``[C, W]`` matching
             ``x`` dtype and device.
         activation: Optional activation fused into the convolution epilogue and
@@ -4424,12 +4467,14 @@ def causal_conv1d(
         weight_grad_config: Optional weight-gradient schedule specialization.
         persistent_tma_input_gradient: Use an explicit machine-bounded persistent
             worker grid for packed TMA input gradients. Disabled by default because it
-            favors overcaptured replays and can regress full-capacity backward.
+            favors overcaptured replays and can regress full-capacity backward. Requires
+            ``x``'s base and outer strides to be 16-byte aligned; backward raises otherwise.
 
     Returns:
-        A contiguous tensor with the same shape, dtype, and device as ``x``. For packed
-        input, only output and input-gradient positions in ``[0, L)`` are defined;
-        parameter, state, and final-state values exclude the inactive suffix. When
+        A contiguous tensor with the same shape, dtype, and device as ``x``. The input
+        gradient is also computed contiguous and flows back through any view that produced
+        ``x``. For packed input, only output and input-gradient positions in ``[0, L)`` are
+        defined; parameter, state, and final-state values exclude the inactive suffix. When
         ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
     """
     resolve_activation(activation)
@@ -4525,8 +4570,10 @@ def paged_causal_conv1d(
     """Apply multi-token convolution while advancing a paged history in place.
 
     Args:
-        x: Contiguous ``[B, T, C]`` input. With ``cu_seqlens``, ``B`` must be one
-            and the physical token axis contains packed logical sequences.
+        x: ``[B, T, C]`` input with contiguous channels. Batch and token strides are
+            arbitrary, as in a column slice of a fused projection, and are read in place.
+            With ``cu_seqlens``, ``B`` must be one and the physical token axis contains
+            packed logical sequences.
         weight: Contiguous depthwise weights ``[C, W]`` with ``W >= 2``.
         state_cache: Mutable history pool ``[num_slots, W - 1, C]``. Each slot
             must be compact, while padding between slots is supported. The storage
@@ -4540,8 +4587,8 @@ def paged_causal_conv1d(
             sequence. False entries read zero history before overwriting the slot.
 
     Returns:
-        The activated output with the same shape and dtype as ``x``. For packed input,
-        only rows before ``cu_seqlens[-1]`` are defined. ``state_cache`` is advanced in place.
+        The activated contiguous output with the same shape and dtype as ``x``. For packed
+        input, only rows before ``cu_seqlens[-1]`` are defined. ``state_cache`` is advanced in place.
         Empty fresh sequences clear their selected history; empty resumed sequences
         preserve it.
 
@@ -4596,7 +4643,8 @@ def causal_conv1d_decode(
 
     Args:
         x: ``[num_sequences, C]`` input, one token per sequence, matching ``weight`` and
-            ``state`` in dtype.
+            ``state`` in dtype. Channels must be contiguous; the row stride is arbitrary,
+            as in a column slice of a fused projection, and rows are read in place.
         weight: Contiguous depthwise weights ``[C, W]``. ``W >= 2``; a width-1
             convolution carries no history and needs no update.
         state: Causal history ``[num_slots, W - 1, C]`` holding each slot's trailing
@@ -4618,7 +4666,7 @@ def causal_conv1d_decode(
         forward_config: Optional schedule specialization.
 
     Returns:
-        The activated output ``[num_sequences, C]``, same dtype as ``x``.
+        The activated contiguous output ``[num_sequences, C]``, same dtype as ``x``.
 
     Inference-only: the single-token step has no backward, so gradient-tracking inputs
     are rejected when autograd is enabled.

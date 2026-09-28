@@ -1,5 +1,7 @@
 """Correctness and integration tests for the CuTeDSL short convolution."""
 
+import functools
+import math
 import sys
 from inspect import signature
 from itertools import pairwise
@@ -166,6 +168,80 @@ def _misaligned_inputs(tokens: int = 17, channels: int = 12, width: int = 4):
     assert x.is_contiguous() and x.data_ptr() % 16 != 0
     assert weight.is_contiguous() and weight.data_ptr() % 16 != 0
     return x, weight
+
+
+def _strided_input(
+    layout: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a channel-contiguous view of ``shape`` and the leaf tensor owning its storage.
+
+    ``row_pitch`` pads each row to the next 16-byte multiple, like a column slice of a fused
+    projection, and keeps every fast signature. ``odd_row_pitch`` pads rows by one element and
+    ``misaligned`` starts compact storage one element in, so neither meets a vector alignment.
+    ``batch_gap`` pads between batches, ``permuted`` stores tokens outermost, and
+    ``expanded_batch``/``expanded_tokens`` repeat read-only rows with stride zero.
+    """
+    *outer, channels = shape
+    randn = functools.partial(torch.randn, device="cuda", dtype=dtype)
+    match layout:
+        case "row_pitch":
+            padding = 16 // (torch.finfo(dtype).bits // 8)
+            base, view = randn(*outer, channels + padding), lambda t: t[..., :channels]
+        case "odd_row_pitch":
+            base, view = randn(*outer, channels + 1), lambda t: t[..., :channels]
+        case "misaligned":
+            base, view = randn(math.prod(shape) + 1), lambda t: t[1:].view(shape)
+        case "batch_gap":
+            batch, tokens = outer
+            base, view = randn(batch, tokens + 1, channels), lambda t: t[:, :tokens]
+        case "permuted":
+            batch, tokens = outer
+            base, view = randn(tokens, batch, channels), lambda t: t.transpose(0, 1)
+        case "expanded_batch":
+            base, view = randn(1, *shape[1:]), lambda t: t.expand(shape)
+        case "expanded_tokens":
+            base, view = randn(*outer[:-1], 1, channels), lambda t: t.expand(shape)
+        case _:
+            raise AssertionError(f"unknown layout {layout!r}")
+    x = view(base.requires_grad_(requires_grad))
+    assert x.shape == shape and x.stride(-1) == 1
+    assert not x.is_contiguous() or x.data_ptr() % 16 != 0
+    return base, x
+
+
+def _record_input_launches(monkeypatch, *compile_fns):
+    """Record, by compile function name, each launch's alignment key and input storage."""
+    launches = {compile_fn.__name__: [] for compile_fn in compile_fns}
+    for compile_fn in compile_fns:
+
+        @functools.wraps(compile_fn)
+        def compile_and_record(*args, _compile_fn=compile_fn, **kwargs):
+            compiled = _compile_fn(*args, **kwargs)
+            arguments = signature(_compile_fn.__wrapped__).bind(*args, **kwargs).arguments
+
+            def launch(x, *launch_args):
+                launches[_compile_fn.__name__].append(
+                    (arguments["input_alignment"], x.data_ptr(), x.stride())
+                )
+                return compiled(x, *launch_args)
+
+            return launch
+
+        monkeypatch.setattr(cute_backend, compile_fn.__name__, compile_and_record)
+    return launches
+
+
+def _assert_input_launches(launches, x: torch.Tensor, *, general: bool) -> None:
+    """Every kernel read ``x`` in place, through the general signature exactly when unaligned."""
+    assert any(launches.values())
+    for name, records in launches.items():
+        for alignment, data_ptr, stride in records:
+            assert (data_ptr, stride) == (x.data_ptr(), x.stride()), name
+            assert (alignment == x.element_size()) == general, name
 
 
 def _paged_prefill_reference(
@@ -427,6 +503,7 @@ def test_short_conv_ampere_compiles_portable_gradients(monkeypatch):
         4,
         descriptor,
         defaults.input_gradient,
+        16,
         True,
         False,
         activation,
@@ -437,6 +514,7 @@ def test_short_conv_ampere_compiles_portable_gradients(monkeypatch):
         4,
         descriptor,
         defaults.weight_gradient,
+        16,
         True,
         False,
         activation,
@@ -1024,10 +1102,109 @@ def test_short_conv_packed_state_forward_and_backward(width: int):
 
 
 def test_short_conv_accepts_misaligned_contiguous_storage():
-    """Materialize alignment inside the opaque launcher when a view starts off-boundary."""
+    """Read a view that starts off a 16-byte boundary through the general signature."""
     x, weight = _misaligned_inputs()
 
     _assert_conv_matches(causal_conv1d, x, weight)
+
+
+@pytest.mark.parametrize("route", ["portable", "tma"])
+@pytest.mark.parametrize(
+    ("layout", "dtype", "packed"),
+    [
+        ("row_pitch", torch.bfloat16, False),
+        ("row_pitch", torch.bfloat16, True),
+        ("batch_gap", torch.bfloat16, False),
+        ("permuted", torch.bfloat16, False),
+        ("expanded_batch", torch.bfloat16, False),
+        ("expanded_tokens", torch.bfloat16, True),
+        ("odd_row_pitch", torch.float16, False),
+        ("odd_row_pitch", torch.bfloat16, True),
+        ("odd_row_pitch", torch.float32, False),
+        ("misaligned", torch.float16, True),
+        ("misaligned", torch.bfloat16, False),
+        ("misaligned", torch.float32, True),
+    ],
+)
+def test_short_conv_training_reads_strided_input_in_place(
+    monkeypatch, route: str, layout: str, dtype: torch.dtype, packed: bool
+):
+    """Train through channel-contiguous views without copying the input.
+
+    Every forward and gradient kernel receives the view's own storage and strides. Aligned
+    layouts keep the vector and TMA signatures, while odd row pitches and misaligned storage
+    take the element-aligned general one. The fresh contiguous input gradient flows back
+    through the view into the storage owner.
+    """
+    if route == "tma" and torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("TMA training routes require SM90+")
+    torch.manual_seed(131)
+    channels, width = (12 if route == "portable" else 512), 4
+    batch, tokens = (1, 65) if packed else (3, 65)
+    boundaries = [0, 0, 7, 40, 65] if packed else None
+    base, x = _strided_input(layout, (batch, tokens, channels), dtype, requires_grad=True)
+    weight = torch.randn(channels, width, device="cuda", dtype=dtype, requires_grad=True)
+    initial = torch.randn(
+        batch if boundaries is None else len(boundaries) - 1,
+        width - 1,
+        channels,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    offsets = (
+        None if boundaries is None else torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+    )
+    incoming = torch.randn(x.shape, device="cuda", dtype=dtype)
+    launches = _record_input_launches(
+        monkeypatch,
+        cute_backend._compile_forward,
+        cute_backend._compile_input_gradient,
+        cute_backend._compile_weight_gradient,
+        cute_backend._compile_initial_state_gradient,
+    )
+
+    actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=offsets, initial_state=initial)
+    gradients = torch.autograd.grad(
+        actual, (x, weight, initial, base), incoming, retain_graph=True
+    )
+
+    assert actual.is_contiguous() and gradients[0].is_contiguous()
+    _assert_training_reference(actual, gradients[:3], x, weight, initial, incoming, boundaries)
+    (base_gradient,) = torch.autograd.grad(x, base, gradients[0])
+    torch.testing.assert_close(gradients[3], base_gradient, rtol=0, atol=0)
+    general = layout in ("odd_row_pitch", "misaligned")
+    _assert_input_launches(launches, x, general=general)
+    if route == "tma" and not general:
+        weight_launches = launches["_compile_weight_gradient"]
+        assert all(alignment == 16 for alignment, *_ in weight_launches)
+
+
+def test_short_conv_tuning_reads_strided_input_in_place(monkeypatch):
+    """Tune on a permuted input without copying it, keying each candidate on its alignment."""
+    torch.manual_seed(133)
+    _, x = _strided_input("permuted", (2, 33, 12), torch.bfloat16)
+    weight = torch.randn(12, 3, device="cuda", dtype=x.dtype)
+    launches = _record_input_launches(
+        monkeypatch,
+        cute_backend._compile_forward,
+        cute_backend._compile_input_gradient,
+        cute_backend._compile_weight_gradient,
+    )
+    config = ShortConvConfig(128, 2, 8)
+    tuned = tune_causal_conv1d(
+        x,
+        weight,
+        torch.randn(x.shape, device="cuda", dtype=x.dtype),
+        activation="silu",
+        forward_configs=(config,),
+        input_grad_configs=(config,),
+        weight_grad_configs=(config,),
+        parallel_compile=False,
+    )
+
+    assert tuned == ShortConvTunedConfig(config, config, config)
+    _assert_input_launches(launches, x, general=False)
 
 
 def test_short_conv_tuning_projects_device_capability(monkeypatch):
@@ -1148,6 +1325,16 @@ def test_short_conv_custom_op_registration(packed: bool):
         (x, weight, grad_output, cu_seqlens),
         test_utils=("test_schema", "test_faketensor"),
     )
+    # Fake outputs and input gradients stay contiguous whatever the input strides.
+    _, strided_x = _strided_input(
+        "odd_row_pitch" if packed else "permuted", tuple(x.shape), x.dtype
+    )
+    torch.library.opcheck(_forward_op, (strided_x, weight, cu_seqlens))
+    torch.library.opcheck(
+        _backward_op,
+        (strided_x, weight, grad_output, cu_seqlens),
+        test_utils=("test_schema", "test_faketensor"),
+    )
     if packed:
         configs = (128, 4, 8, 128, 4, 10, 128, 4, 128)
         torch.library.opcheck(
@@ -1220,6 +1407,31 @@ def test_short_conv_fullgraph_forward_and_backward():
     actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
     torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize("layout", ["permuted", "odd_row_pitch"])
+def test_short_conv_strided_input_fullgraph_forward_and_backward(
+    monkeypatch, layout: str, fresh_compile_cache
+):
+    """Compile strided-input training while every kernel still reads the input in place."""
+    torch.manual_seed(137)
+    _, x = _strided_input(layout, (2, 33, 512), torch.bfloat16, requires_grad=True)
+    weight = torch.randn(512, 4, device="cuda", dtype=x.dtype, requires_grad=True)
+    incoming = torch.randn(x.shape, device="cuda", dtype=x.dtype)
+    launches = _record_input_launches(
+        monkeypatch,
+        cute_backend._compile_forward,
+        cute_backend._compile_input_gradient,
+        cute_backend._compile_weight_gradient,
+    )
+
+    compiled = torch.compile(causal_conv1d, fullgraph=True)
+    actual = compiled(x, weight, activation="silu")
+    gradients = torch.autograd.grad(actual, (x, weight), incoming)
+
+    assert actual.is_contiguous()
+    _assert_training_reference(actual, gradients, x, weight, None, incoming, None)
+    _assert_input_launches(launches, x, general=layout == "odd_row_pitch")
 
 
 def test_short_conv_packed_stateful_fullgraph_forward_and_backward():
@@ -1543,6 +1755,19 @@ def test_short_conv_persistent_tma_input_gradient_validates_route():
             cu_seqlens=cu_seqlens,
             persistent_tma_input_gradient=True,
         )
+
+    if torch.cuda.get_device_capability() >= (9, 0):
+        # The staged route exists, but an odd row pitch cannot feed TMA in place.
+        _, x = _strided_input("odd_row_pitch", (1, 32, 512), torch.bfloat16, requires_grad=True)
+        weight = torch.randn(512, 4, device="cuda", dtype=x.dtype, requires_grad=True)
+        output = causal_conv1d(
+            x,
+            weight,
+            cu_seqlens=cu_seqlens,
+            persistent_tma_input_gradient=True,
+        )
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            output.sum().backward()
 
 
 def test_short_conv_packed_stateful_cuda_graph_replays_boundaries_and_history():
@@ -2021,9 +2246,37 @@ def test_short_conv_decode_supports_any_positive_channel_count(channels: int):
 
 
 def test_short_conv_decode_accepts_misaligned_contiguous_storage():
-    """Materialize alignment inside the opaque launcher for off-boundary views."""
+    """Read off-boundary views through the general signature."""
     x, weight = _misaligned_inputs()
     _assert_conv_matches(_decode_conv, x, weight)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["row_pitch", "odd_row_pitch", "misaligned", "expanded_tokens"])
+def test_short_conv_decode_reads_strided_input_in_place(
+    monkeypatch, paged_short_conv_inputs, dtype: torch.dtype, layout: str
+):
+    """Decode channel-contiguous rows in place, bitwise equal to their contiguous copy.
+
+    Row-pitched and expanded rows keep the vector signature; odd pitches and misaligned
+    storage take the general one.
+    """
+    _, weight, state, slots = paged_short_conv_inputs(channels=64, dtype=dtype)
+    _, x = _strided_input(layout, (slots.shape[0], 64), dtype)
+    expected_state = state.clone()
+    expected = causal_conv1d_decode(
+        x.clone(memory_format=torch.contiguous_format),
+        weight,
+        expected_state,
+        state_indices=slots,
+    )
+    launches = _record_input_launches(monkeypatch, cute_backend._compile_decode)
+    actual = causal_conv1d_decode(x, weight, state, state_indices=slots)
+
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    _assert_input_launches(launches, x, general=layout in ("odd_row_pitch", "misaligned"))
 
 
 def test_short_conv_decode_registered_custom_activation():
@@ -2195,6 +2448,70 @@ def test_paged_short_conv_prefill_forced_int64_matches_default(monkeypatch, pack
     torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("force_int64", [False, True])
+@pytest.mark.parametrize(
+    ("layout", "packed"),
+    [
+        ("row_pitch", True),
+        ("odd_row_pitch", True),
+        ("misaligned", True),
+        ("expanded_tokens", True),
+        ("row_pitch", False),
+        ("odd_row_pitch", False),
+        ("batch_gap", False),
+        ("permuted", False),
+        ("expanded_batch", False),
+        ("expanded_tokens", False),
+    ],
+)
+def test_paged_short_conv_prefill_reads_strided_input_in_place(
+    monkeypatch, layout: str, packed: bool, force_int64: bool
+):
+    """Prefill channel-contiguous views in place, bitwise equal to their contiguous copy.
+
+    Both the forward and state-update kernels receive the view's storage and batch/token
+    strides; odd row pitches and misaligned storage take the general signature.
+    """
+    torch.manual_seed(108)
+    channels, width = 12, 4
+    offsets = torch.tensor((0, 5, 21, 40), device="cuda", dtype=torch.int32) if packed else None
+    batches, tokens = (1, 40) if packed else (3, 5)
+    _, x = _strided_input(layout, (batches, tokens, channels), torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state_indices = torch.tensor((4, 2, 5), device="cuda", dtype=torch.int32)
+    has_initial_state = torch.tensor((False, True, False), device="cuda")
+    initial_state = torch.randn(7, width - 1, channels, device="cuda", dtype=x.dtype)
+    if force_int64:
+        monkeypatch.setattr(cute_backend, "requires_int64_abi", lambda *tensors: True)
+
+    def run(x, state):
+        return paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    expected_state = initial_state.clone()
+    actual_state = initial_state.clone()
+    with torch.no_grad():
+        expected = run(x.clone(memory_format=torch.contiguous_format), expected_state)
+        launches = _record_input_launches(
+            monkeypatch,
+            cute_backend._compile_paged_forward,
+            cute_backend._compile_paged_state_update,
+        )
+        actual = run(x, actual_state)
+
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+    _assert_input_launches(launches, x, general=layout in ("odd_row_pitch", "misaligned"))
+
+
 def test_paged_short_conv_prefill_handles_null_routes_and_strided_slots():
     """Leave null routes and page padding untouched while advancing live slots."""
     torch.manual_seed(102)
@@ -2328,6 +2645,11 @@ def test_paged_short_conv_prefill_fullgraph_and_registration():
     torch.library.opcheck(
         _paged_forward_op,
         (dense_x, weight, initial_state.clone(), state_indices, None, None),
+    )
+    strided_x = torch.randn(2, 5, channels + 2, device="cuda", dtype=x.dtype)[..., :channels]
+    torch.library.opcheck(
+        _paged_forward_op,
+        (strided_x, weight, initial_state.clone(), state_indices, None, None),
     )
 
     def run(state):
@@ -2511,6 +2833,13 @@ def test_paged_short_conv_prefill_rejects_autograd_and_malformed_state():
     state_indices = torch.tensor((2,), device="cuda", dtype=torch.int32)
     with pytest.raises(RuntimeError, match="inference-only"):
         paged_causal_conv1d(x, weight, state, state_indices)
+    with pytest.raises(ValueError, match="contiguous channels"):
+        paged_causal_conv1d(
+            x.detach().transpose(1, 2).contiguous().transpose(1, 2),
+            weight.detach(),
+            state,
+            state_indices,
+        )
     with pytest.raises(ValueError, match="W >= 2"):
         paged_causal_conv1d(
             x.detach(),
@@ -2723,6 +3052,8 @@ def test_short_conv_decode_custom_op_registration(paged_short_conv_inputs, dtype
         else {}
     )
     torch.library.opcheck(_decode_op, (x, weight, state.clone(), slots), kwargs)
+    strided_x = torch.randn(x.shape[0], x.shape[1] + 2, device="cuda", dtype=dtype)[:, :6]
+    torch.library.opcheck(_decode_op, (strided_x, weight, state.clone(), slots), kwargs)
     torch.library.opcheck(
         _configured_decode_op,
         (x, weight, state.clone(), slots, 64, 2, 8),
@@ -2737,8 +3068,12 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
         causal_conv1d_decode(x[:0], weight, state, state_indices=slots[:0])
     with pytest.raises(ValueError, match="weight must have shape"):
         causal_conv1d_decode(x, weight[:-1], state, state_indices=slots)
-    with pytest.raises(ValueError, match="contiguous CUDA FP16, BF16, or FP32"):
+    with pytest.raises(
+        ValueError, match="CUDA FP16, BF16, or FP32 tensor with contiguous channels"
+    ):
         causal_conv1d_decode(x.double(), weight, state, state_indices=slots)
+    with pytest.raises(ValueError, match="contiguous channels"):
+        causal_conv1d_decode(x.t().contiguous().t(), weight, state, state_indices=slots)
     with pytest.raises(ValueError, match="weight must match x dtype"):
         causal_conv1d_decode(x, weight.cpu(), state, state_indices=slots)
     with pytest.raises(ValueError, match="state must match x dtype"):
@@ -2782,7 +3117,7 @@ def test_short_conv_decode_cuda_graph_replays_fresh_routing(config, tmp_path):
     causal_conv1d_decode(x, weight, state, has_initial_state=mask, **kwargs)
     torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     graph.enable_debug_mode()
     with torch.cuda.graph(graph):
         output = causal_conv1d_decode(x, weight, state, has_initial_state=mask, **kwargs)
