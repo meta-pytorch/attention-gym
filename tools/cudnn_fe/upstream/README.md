@@ -13,6 +13,14 @@ patch maps to a row of the modification ledger in
 [`../verify_fixes.py`](../verify_fixes.py) `--upstream-python` runs all repros and classifies each
 bug as still present or fixed upstream.
 
+Eight independent patches: six bug/validation fixes and two lower-priority hardening proposals.
+The AG absent-scheduler replay fix (B14) is **excluded**: its optional-scheduler ABI does not exist
+upstream.
+
+**Scope limits.** 01 deliberately rejects three upstream specialization classes that need extra
+storage/lifetime work. 03 and 04 omit empty work only when no state output must be written; they do
+not claim universal stateful compaction.
+
 ## Ranked results
 
 Rank is suggested upstream value, not application order. "Fixed" means the repro passed, not that
@@ -29,7 +37,42 @@ every optional specialization was tested.
 | 7 | `07-single-thread-gdn-mbarrier-init.patch` | B2 | **No isolated failure:** all-thread init pattern exists | Stock and patched 32-iteration multi-wave GDN fwd/bwd stress both pass |
 | 8 | `08-derive-scheduler-arrival-counts.patch` | S12 | **No current wrong count:** default literals are correct | Stock and patched 32-iteration multi-wave KDA fwd/bwd smoke both pass |
 
+The combined tree also passed all eight repros at preparation time; the redundant combined
+patch is no longer stored. The eight numbered patches are the draft sources.
+
+## Applying
+
+Each numbered patch applies independently to v1.30.0 paths under
+`python/cudnn/linear_attention/frost/` or `python/cudnn/frost/tile_dsl/`. Apply and validate each
+patch independently. To combine 01 and 07, resolve their overlapping init block by initializing
+**all** GDN bprop barriers, including 01's two new barriers, under the single-thread guard;
+keep the init fence and CTA synchronization outside it.
+
+From a scratch v1.30.0 checkout (never a shared clone):
+
+```bash
+git -C <scratch> apply --check --whitespace=error <attention-gym>/tools/cudnn_fe/upstream/01-gdn-beta-free-dbeta.patch
+git -C <scratch> apply <attention-gym>/tools/cudnn_fe/upstream/01-gdn-beta-free-dbeta.patch
+```
+
+At preparation time every independent patch and the combined tree passed application checks
+against v1.30.0 and parsed (AST); the combined 16 changed files passed
+upstream Black 26.3.1 at line length 160. No AG storage or naming restyle was transplanted. This is
+not the upstream test suite.
+
 ## Running the repros
+
+The repros import only the upstream `cudnn` package (no Attention Gym code) and print their import
+provenance. They need an SM100 GPU and an env with `nvidia-cudnn-frontend`, `nvidia-cutlass-dsl`,
+`apache-tvm-ffi` and a CUDA torch; see the env recipe in
+[`../README.md`](../README.md#checking-fixes-after-an-upgrade). Repro scripts follow the repository's
+ruff rules; the patch payloads retain upstream style.
+
+```bash
+gpu-run --timeout 900 auto -- timeout -k 10 600 <env>/bin/python tools/cudnn_fe/upstream/repro_01_gdn_beta.py --beta 0 1e-12 1e-10 1e-8
+# positive control against a patched package tree:
+gpu-run --timeout 900 auto -- timeout -k 10 600 env PYTHONPATH=<scratch>/python <env>/bin/python tools/cudnn_fe/upstream/repro_01_gdn_beta.py
+```
 
 | Script | Arguments | Stock v1.30 | Patched |
 |---|---|---|---|
@@ -43,7 +86,16 @@ every optional specialization was tested.
 | `repro_08_scheduler_counts.py` | `--iterations 32` | pass | pass |
 | `repro_09_replay_abi_scope.py` | none; scope check for excluded B14 | pass (`None` fails at build) | n/a |
 
+Preparation environment: GB200 (SM100), frontend 1.30.0, torch 2.15.0.dev20260902+cu132, CuTeDSL
+4.8.0, TVM-FFI 0.1.14.post1. **No performance, CUTracer, sanitizer, or SASS measurements were taken
+on these exported patches**; historical numbers below come from the AG port and are labeled so.
+
 ## Source/history audit
+
+At preparation time, upstream `develop` was at `5962236d` ("Prepare SM120 FP8 forward and remove
+legacy THD binding"). The tree diff `v1.30.0..develop` left the affected GDN/KDA kernels and
+`common/split_k.py` / `common/thd.py` unchanged; newer KDA chain/warmup host edits concern JAX/native
+argument handling. No already-landed replacement was found.
 
 Translated from these AG commits (by subject; see `../fixes.toml`), **without AG restyling or
 dependencies**:
@@ -199,3 +251,10 @@ split tables"). Upstream `build_split_table` converts `scheduler_counter` throug
 unconditionally and every caller passes a tensor. `repro_09_replay_abi_scope.py` shows `None` failing
 at build time (`AttributeError: 'NoneType' object has no attribute '__dlpack__'`) while tensor
 build+replay succeeds. Supporting it upstream would be a feature request, so nothing is proposed.
+
+## Open items
+
+- 01 needs generalization before it can replace all upstream-supported specializations.
+- 03/04 preserve state-writing empty work; universal stateful compaction is future work.
+- No latency/SASS/CUTracer/sanitizer evidence on the exported patches; long soak and
+  summary-specific stress not done.

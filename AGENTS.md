@@ -115,10 +115,14 @@ When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct
 
 ## cuDNN Vendor Maintenance
 
-`tools/cudnn_fe/` contains the cudnn-frontend GDN/KDA vendor/import tools, the mechanical restyle
-and audit, and the machine-readable fix ledger (`tools/cudnn_fe/fixes.toml`). Their CPU tests
-(`test/test_cudnn_fe_tools_*.py`) run through this checkout's editable install, including from
-outside the repository root; see `tools/cudnn_fe/README.md`.
+`tools/cudnn_fe/` contains the GDN/KDA vendor/import tools, mechanical restyle and audit,
+SASS comparison, CUTracer stress, benchmark gates, and the machine-readable fix ledger.
+The CPU audit tests (`test/test_cudnn_fe_tools_*.py`) guard edits to the vendored kernels;
+run them through this checkout's editable install, including from outside the repository root.
+Read `attn_gym/linear/_delta_rule/cudnn_fe/MAINTENANCE.md` for the upgrade procedure and
+`WORKLOG.md` beside it for evidence and replay notes. `tools/cudnn_fe/fixes.toml` is the ledger
+source; regenerate its documentation index with
+`python -m tools.cudnn_fe.verify_fixes --write-ledger`.
 
 ## Project-local Agent Skills
 

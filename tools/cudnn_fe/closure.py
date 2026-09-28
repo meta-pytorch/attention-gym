@@ -38,7 +38,7 @@ COMPAT_MODULES = ("cudnn.frost.buffers", "cudnn.frost.device")
 # The documented prune cut: the GDN chain prologue's compact_qdo (GDP d_v=64) backward fork.
 PRUNE_MODULES = ("kernel/gdp_bprop_v64_f16.py", "kernel/gdp_bprop_v64_config.py")
 PRUNE_ENTRY = "kernel/gdn_chain_prologue_f16.py"
-# The upstream engines are the closure PR A (88eb5ce) vendored. They also reach common/expand.py,
+# The upstream engines are the closure the verbatim v1.30 drop (PR A) vendored. They also reach common/expand.py,
 # but only on the GDP path of gdn_engine, so it was never vendored.
 ENGINE_ROOTS = (
     "cudnn.linear_attention.frost.gdn_engine",

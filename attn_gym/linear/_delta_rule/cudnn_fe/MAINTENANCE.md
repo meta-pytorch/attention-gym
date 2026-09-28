@@ -12,15 +12,18 @@ known limitations, lessons and the v1.30 verification baseline.
 
 ## Stack layering
 
-An upgrade lands as a stack; each layer is reviewable on its own terms.
+An upgrade lands as a stack; each layer is reviewable on its own terms. v1.30 landed as the
+tooling base PR → #606 vendor (A) → #607 restyle (B) → #608 integration (C) → #609 cleanup (D) →
+#611 gates (E).
 
 | Layer | Content | Acceptance |
 |---|---|---|
+| 0 tooling base | `tools/cudnn_fe/` the upgrade needs first: vendor, audit, codemod, fix ledger | tool tests |
 | A verbatim | `vendor.py` output for the new tag: closure, license files, per-file notice | `vendor.py --verify <A>` passes; nothing routes to it |
 | B restyle | mechanical storage/style changes (restyle rules below), one commit per kernel family | SASS gate: identical, or reviewed offset-only noise (see SASS lessons) |
 | C behavior | drivers, fake-signature compiles, every ledger row that changes behavior, tests | guarding tests pass; bug-reversal audit; bench gate |
 | D cleanup | prune unreached code and upstream-only knobs, ruff, notices | SASS gate for prunes; notices describe the final modification set |
-| E tooling | changes to `tools/cudnn_fe/` and this file | tool tests |
+| E gates | SASS, CUTracer and bench gate tooling, strict audit, this file | tool tests; `audit --strict` prints `CLEAN` |
 
 Commit rules: one ledger item (or one kernel family for restyle) per commit; subject says what
 changed, body says why and how it was validated (SASS result, fails-without evidence). Never mix
@@ -32,13 +35,16 @@ Commit with `git commit --only -- <paths>` when several agents share the checkou
 
 Run these commands from a clean, dedicated upgrade checkout with its own editable `.venv`;
 never switch branches in a checkout where another agent is working. Set `<old-drop-commit>` to
-the previous **verbatim vendor commit**, not the previous integration tip. For v1.30 it is
-`88eb5ce` (PR #606). The merge below has base = old drop, theirs = new drop, ours = current AG.
+the previous **verbatim vendor commit**, not the previous integration tip. For v1.30 it is the
+#606 commit "Vendor the cudnn-frontend v1.30 GDN and KDA kernels verbatim"; hashes change on every
+rebase and squash merge, so `--verify auto` finds it by that subject (`vendor.DROP_SUBJECT`), and
+`git log --format=%H --fixed-strings --grep='<subject>'` finds any other drop. The merge below has
+base = old drop, theirs = new drop, ours = current AG.
 
 1. **Churn and reproducibility.** Before changing branches:
    ```bash
    python -m tools.cudnn_fe.vendor --upstream <clone> --diff-upstream v1.30.0 <new-tag>
-   python -m tools.cudnn_fe.vendor --upstream <clone> --rev v1.30.0 --verify 88eb5ce
+   python -m tools.cudnn_fe.vendor --upstream <clone> --rev v1.30.0 --verify auto
    ```
    Review files added, changed and removed from the driver-import closure. The GDP d_v=64
    prologue fork is pruned automatically; unresolved `cudnn.*` imports fail closed.
@@ -81,9 +87,13 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
    `--no-allowlist` is given. After the focused edits, run the full-package acceptance check:
    `python -m tools.cudnn_fe.audit --root "$candidate" --strict`. It must print `CLEAN`, including
    no stale entries in [`audit_allowlist.txt`](../../../../tools/cudnn_fe/audit_allowlist.txt).
-4. **SASS gate.** Before and after each B commit, snapshot every GDN/KDA cubin through the AG
-   drivers and diff SASS and resources. Accept identical instruction text and resources;
-   offset-only noise additionally needs unchanged mbarrier offsets, `DSMEM`, `REG` and `STACK`.
+4. **SASS gate.** Before and after each B commit run
+   `python -m tools.cudnn_fe.sass snapshot <dir> [--tree <ref_tree>]` (every GDN/KDA cubin through
+   the AG drivers), then `python -m tools.cudnn_fe.sass diff <ref> <new>`. Accept identical
+   instruction text and resources. Treat `same-histogram` as a review requirement, not proof of
+   equivalence; offset-only noise additionally needs unchanged mbarrier offsets, `DSMEM`, `REG`
+   and `STACK`. Use the same version of the gate on both trees; see
+   [sass/README.md](../../../../tools/cudnn_fe/sass/README.md).
 5. **Port the behavior layer (C/D).** For upstream-changed hosts/configs that AG converted to
    frozen dataclasses and `@jit_cache`, port the upstream semantic delta into the AG host; do not
    restore upstream live-tensor compilation. Check each item explicitly:
@@ -103,14 +113,22 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
    commit subject. Then run
    `python -m tools.cudnn_fe.verify_fixes --gpu-run --tree . --upstream-python <env>/bin/python`.
    Every fix must report `pass` or `no pytest guard`; `MISSING` means a guarding test was renamed,
-   so update `fixes.toml`.
+   so update `fixes.toml`. Compare with the [v1.30 baseline](WORKLOG.md#verification-baseline-v130).
 6. **Bug-reversal audit.** For every WORKLOG entry with "Fails without = YES", revert the
    production hunk in a scratch tree and confirm the guarding test fails, then passes restored.
    Update its narrative evidence.
-7. **CUTracer.** Run the CUTracer `random_delay` race stress over every pipelined kernel against a
-   bitwise oracle. Any new hang follows the cute-kernel-hang-debug skill.
-8. **Bench gate.** Compare forward, backward, summaries and paged paths with the previous stack
-   tip; fail above a 2% threshold, on output drift or on a changed launch set. Bisect regressions.
+7. **CUTracer.** `gpu-run --timeout 900 auto -- python -m tools.cudnn_fe.cutracer.stress --family all --ref-dir <reference> --out <results>`
+   records the bitwise oracle and runs the `random_delay` ladder (or `--mode deadlock`);
+   `results.md` must start with `PASS`. Alternatively, omit the outer reservation and pass
+   `--gpu-run` to reserve per attempt with no waiting (exit 75 stops the ladder). Never nest
+   reservations. Any new hang follows the cute-kernel-hang-debug skill; see
+   [cutracer/README.md](../../../../tools/cudnn_fe/cutracer/README.md).
+8. **Bench gate.** `python -m tools.cudnn_fe.bench run --suite gdn kda summary paged --new cand=. --base prev=<prev-tip-tree> --out <results>`
+   compares forward, backward, summaries and paged paths with the previous stack tip. It fails
+   above the 2% default threshold, on output drift or on a changed launch set;
+   `--threshold 0.01` selects a stricter run
+   (cells within ~1.3% have been noise on GB200). Bisect regressions; see
+   [bench/README.md](../../../../tools/cudnn_fe/bench/README.md).
 9. Update the tag everywhere (`NOTICE.md`, notices, this file), `fixes.toml`, then run
    `python -m tools.cudnn_fe.verify_fixes --write-ledger` to regenerate the index below
    (`test/test_cudnn_fe_tools_fixes.py` checks it is in sync). Update WORKLOG.md with findings
@@ -131,7 +149,8 @@ the previous **verbatim vendor commit**, not the previous integration tip. For v
 - **SASS lesson 1, barrier-block placement.** Keep upstream's SMEM order: tiles first, then the
   mbarrier/scheduler/gate-staging arrays. Moving the arrays to the start of dynamic SMEM kept the
   instruction stream identical but cost gdn_prefill ~2.8% (3.7x shared-load bank conflicts);
-  `21e1dc08` restored the order with `LeadStorage`/`TailStorage` around the arrays. The SASS gate
+  "Restore the v1.30 SMEM order in the GDN prefill, tinv and summary kernels" restored the order
+  with `LeadStorage`/`TailStorage` around the arrays. The SASS gate
   alone does not catch this, so the bench gate is mandatory for storage changes.
 - **SASS lesson 2, fake signatures must match the `mark_layout_dynamic` ABI.** Upstream compiled
   from live tensors marked `mark_layout_dynamic(leading_dim=rank-1)`: int32 shapes and int64
@@ -200,5 +219,6 @@ B11 terminal TMA overfetch, B12 checkpoint descriptor layout, S11 V-major state.
 main: B4 dO dtype check. Their full test pointers are in `fixes.toml`. Decisions: S7 keep upstream
 waits; F11 keep upstream's 4 KQ SMEM stages.
 
-Fails-without evidence was collected on the pre-reorder branch (audit HEAD `90d43a7`) and has not
-been re-run on the final stack; re-run it in step 6 of the next upgrade.
+Fails-without evidence was collected on the pre-reorder branch (audit HEAD "[C] Validate the KDA
+backward warp-role maps and derive the scheduler arrival count") and has not been re-run on the
+final stack; re-run it in step 6 of the next upgrade.

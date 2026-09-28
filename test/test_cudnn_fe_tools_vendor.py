@@ -10,7 +10,6 @@ import pytest
 
 from tools.cudnn_fe import closure, vendor
 
-PR_A = "88eb5ce"
 KERNEL = "cudnn.linear_attention.frost.kernel."
 LICENSE_HEADER = (
     "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.\n"
@@ -201,20 +200,15 @@ def clone() -> Path:
     clone = _upstream_clone()
     if clone is None:
         pytest.skip("set CUDNN_FE_UPSTREAM to a cudnn-frontend clone")
-    has_commit = subprocess.run(
-        ["git", "-C", str(closure.repo_root()), "cat-file", "-e", f"{PR_A}^{{commit}}"],
-        capture_output=True,
-        check=False,
-    )
-    if has_commit.returncode:
-        pytest.skip(f"{PR_A} is not in this clone")
+    if vendor.find_drop_commit() is None:
+        pytest.skip(f"no {vendor.DROP_SUBJECT!r} commit in this history")
     return clone
 
 
 def test_verify_reproduces_the_verbatim_v130_drop(
     clone: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = vendor.main(["--rev", "v1.30.0", "--upstream", str(clone), "--verify", PR_A])
+    rc = vendor.main(["--rev", "v1.30.0", "--upstream", str(clone), "--verify", "auto"])
     assert rc == 0, capsys.readouterr().out
 
 

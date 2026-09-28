@@ -17,7 +17,7 @@ documented, SASS-driven exceptions can be listed in ``audit_allowlist.txt`` with
 
 Usage:
     python -m tools.cudnn_fe.audit                      # installed package + allowlist
-    python -m tools.cudnn_fe.audit --rev 88eb5ce --no-allowlist --counts   # verbatim drop
+    python -m tools.cudnn_fe.audit --rev auto --no-allowlist --counts   # verbatim drop
     python -m tools.cudnn_fe.audit --files kernel/gdn_prefill_f16.py      # subset of --root
 """
 
@@ -36,7 +36,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tools.cudnn_fe import closure
+from tools.cudnn_fe import closure, vendor
 
 DEFAULT_ALLOWLIST = Path(__file__).resolve().with_name("audit_allowlist.txt")
 
@@ -744,7 +744,10 @@ def format_counts(counts: Counter[str]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, help="cudnn_fe package dir (default: installed)")
-    parser.add_argument("--rev", help="audit the package at this git revision instead of --root")
+    parser.add_argument(
+        "--rev",
+        help="audit the package at this git revision instead of --root ('auto': the v1.30 drop)",
+    )
     parser.add_argument(
         "--files", nargs="+", metavar="REL", help="audit only these paths relative to the root"
     )
@@ -757,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
         help="also fail on allowlist entries that match nothing (whole-tree runs only)",
     )
     args = parser.parse_args(argv)
+    if args.rev:
+        args.rev = vendor.resolve_drop(args.rev)
 
     with tempfile.TemporaryDirectory() as tmp:
         root = extract_rev(args.rev, Path(tmp)) if args.rev else args.root or default_root()
