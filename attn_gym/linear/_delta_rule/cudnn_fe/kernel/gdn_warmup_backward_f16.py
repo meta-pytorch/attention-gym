@@ -228,7 +228,6 @@ def warmup_backward_host(
         work_count,
         work_items,
         scheduler_all_bprop,
-        tinv,
         bprop_words,
         stream,
     )
@@ -347,7 +346,7 @@ def _validate_launch(
 ):
     """Check the warmup / uncut backward buffers of one plan (one checkpoint series per
     sequence)."""
-    _tokens, heads_out, num_seqs = gdn_bprop_f16.validate_bwd_bundle(
+    tokens, heads_out, num_seqs = gdn_bprop_f16.validate_bwd_bundle(
         q,
         k,
         v,
@@ -359,16 +358,15 @@ def _validate_launch(
         beta,
         cu_seqlens,
         checkpoints,
-        tinv,
-        tinv_rows,
-        tinv_row_count,
         bprop_words,
         num_pieces=validate_seqlens(cu_seqlens),
         b_t=b_t,
-        tinv_pass=tinv_pass,
     )
     validate_cuda_tensors(
         q,
+        tinv=tinv,
+        tinv_rows=tinv_rows,
+        tinv_row_count=tinv_row_count,
         tinv_words=tinv_words,
         seed_checkpoints=seed_checkpoints,
         state_in=state_in,
@@ -439,6 +437,15 @@ def _validate_launch(
             "recompute_words", recompute_words, gdn_recompute_f16.TENSORMAP_DESC_ARRAYS, num_seqs
         )
     if tinv_pass:
+        gdn_tinv_f16.validate_tinv(
+            tinv,
+            tinv_rows,
+            tinv_row_count,
+            tokens,
+            num_seqs,
+            heads_out,
+            str(q.dtype).removeprefix("torch."),
+        )
         validate_workspace("tinv_words", tinv_words, gdn_tinv_f16.TENSORMAP_DESC_ARRAYS, num_seqs)
 
 

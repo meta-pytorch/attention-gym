@@ -100,6 +100,13 @@ def test_gdn_backward_cfgs_reject_unsupported_geometry(module, invalid):
         module.build_cfg(*args, **kwargs)
 
 
+def test_gdn_bprop_cfg_rejects_unequal_head_dims():
+    import cutlass
+
+    with pytest.raises(ValueError, match="d_k == d_v"):
+        gdn_bprop_f16.build_cfg(cutlass.BFloat16, max_active_clusters=148, d_k=64, d_v=128)
+
+
 def workspace(module):
     return plan.workspace(module, 1, "cuda")
 

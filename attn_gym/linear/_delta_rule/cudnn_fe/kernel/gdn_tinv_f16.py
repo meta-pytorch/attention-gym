@@ -20,7 +20,8 @@
 # smem_data_ptr; a frozen cfg whose build_cfg derives the SMEM cosizes and TMA byte counts; the
 # standalone compile/chunk_gdn_tinv/run_tinv host removed (the kernel compiles only inside the
 # warmup/chain bundles); the upstream-only expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, and
-# allow_neg_eigval knobs removed; Ruff formatting.
+# allow_neg_eigval knobs removed; the bundle hosts' tile and row-table checks (validate_tinv);
+# Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) chunk-factor pass (the T pass) for SM100 / SM103 / SM107 (Cutlass
@@ -84,6 +85,7 @@ from ..common.blockwise_inverse import (
     blockwise_diagonal_32x32_to_64x64,
     invert_diagonal_NxN,
 )
+from ..common.launch import validate_tensor
 from ..common.split_k import expanded_cu_seqlen
 from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs, emit_tile_seq_descs
 
@@ -1385,6 +1387,23 @@ def tinv_rows(total_tokens: int, num_seqs: int, b_t: int = CFG.B_T) -> int:
 
 
 TENSORMAP_DESC_ARRAYS = 2  # per-batch runtime TMA descriptors: K, tinv
+
+
+def validate_tinv(tinv, row_table, row_count, tokens, num_seqs, heads_out, io_dtype):
+    """Check the chunk-factor tiles (one row per chunk plus one per sequence) and the row table
+    the recompute and bprop summary read."""
+    rows = tinv_rows(tokens, num_seqs)
+    validate_tensor(
+        "tinv",
+        tinv,
+        (None, heads_out, CFG.B_T, CFG.B_T),
+        (io_dtype,),
+        align=128,
+        tma=True,
+        min_rows=rows,
+    )
+    validate_tensor("tinv_rows", row_table, (None, 4), ("int32",), compact=True, min_rows=rows)
+    validate_tensor("tinv_row_count", row_count, (None,), ("int32",), align=4, min_rows=1)
 
 
 frost_gdn_tinv_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

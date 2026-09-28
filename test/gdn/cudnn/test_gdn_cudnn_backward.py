@@ -237,17 +237,6 @@ def test_gdn_cudnn_backward_uniform_negative_twenty_is_finite(
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
-# The vendored v1.30 bprop folds beta into the T tile and recovers the beta-free V/M dBeta
-# terms as rowsum / (beta + 1e-10), so it returns beta / (beta + 1e-10) times the true dBeta
-# (0 at beta = 0, half at 1e-10), and beta-scaled fp16/bf16 operands underflow near zero. The
-# beta-free formulation fixed this but cost 1.5-2.6x dV/dBeta/dK precision at normal beta.
-SMALL_BETA_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="v1.30 GDN bprop divides by (beta + 1e-10): dBeta is lost as beta -> 0",
-)
-
-
-@SMALL_BETA_XFAIL
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("beta_value", (0.0, 1e-12, 1e-10, 1e-8))
 def test_gdn_cudnn_backward_preserves_small_beta_gradient(
@@ -279,7 +268,34 @@ def test_gdn_cudnn_backward_preserves_small_beta_gradient(
     assert gradients[4][0, 1, 0].item() == 1.0
 
 
-@SMALL_BETA_XFAIL
+def test_gdn_cudnn_backward_fp16_beta_free_z_stays_in_range() -> None:
+    """The beta-free Z = -130560 here exceeds FP16 range; staging it must not overflow."""
+    shape = (1, 2, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=torch.float16)
+    k = torch.zeros_like(q)
+    value = torch.zeros_like(q)
+    q[..., 0] = 1
+    k[..., 0] = 16
+    value[..., 0] = 1
+    gate = torch.zeros(shape[:-1], device="cuda")
+    beta = torch.tensor([[[2.0**-12], [1.0]]], device="cuda")
+    d_output = torch.zeros_like(value)
+    d_output[0, 1, 0, 0] = 32
+    cu_seqlens = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    inputs = (q, k, value, gate, beta, None, cu_seqlens)
+
+    gradients = chunk_gdn_bwd_cudnn_packed(*inputs[:5], d_output, cu_seqlens, scale=1.0)
+    expected_gradients = reference_gradients(
+        inputs, d_output, torch.float64, None, None, scale=1.0
+    )
+
+    names = ("dq", "dk", "dv", "dgate", "dbeta")
+    for name, actual, expected in zip(names, gradients[:5], expected_gradients, strict=True):
+        assert_matches_low_precision_reference(
+            actual, expected, expected, name, source_dtype=torch.float16
+        )
+
+
 def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
     """Direct dBeta must survive zero and small beta across persistent chunks."""
     inputs = make_gdn_test_inputs(
@@ -294,6 +310,23 @@ def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
     beta[:, 1::4] = 1e-12
     beta[:, 2::4] = 1e-8
     d_output, d_final_state = make_cotangents(inputs[2], inputs[5], seed=157, state_cotangent=True)
+
+    assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
+
+
+def test_gdn_cudnn_chain_backward_mixed_small_beta_matches_reference(monkeypatch) -> None:
+    """The piece-chain backward runs its own bprop launch; dBeta must stay exact there too."""
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+
+    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    inputs = make_gdn_test_inputs(
+        (2048,), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=163
+    )
+    assert fe_gdn.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
+    beta = inputs[4]
+    beta[:, ::4] = 0.0
+    beta[:, 1::4] = 1e-12
+    d_output, d_final_state = make_cotangents(inputs[2], inputs[5], seed=167, state_cotangent=True)
 
     assert_gradients_match_references(inputs, d_output, inputs[5], d_final_state)
 

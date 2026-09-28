@@ -49,17 +49,21 @@ vendor the new tag.
   accepts any post-activation beta.
 - **Found by:** originally #475; on v1.30 it resurfaced as 9 small-beta test failures when the
   existing AG suite first ran against the new kernels.
-- **Fix:** keep beta-free inverse factors (T = I − T_b L) and stage Z separately from beta·Z, so
+- **Fix:** keep the inverse factor T beta-free and stage Z = Tᵀ dU separately from beta·Z, so
   dBeta is computed directly; includes the coupled GEMM issue order and scratch lifetimes.
-  `kernel/gdn_bprop_f16.py`; "Compute the GDN bprop dBeta without dividing by beta".
+  `kernel/gdn_bprop_f16.py`; "Compute the GDN bprop dBeta without dividing by beta" first rebuilt
+  T = I − T_b L from the T-pass tile (reverted, below); the landed version inverts in-kernel.
 - **Evidence:** fails without = YES (mutation back to the divide: all 8 exact cases fail, dBeta
   0 / 0.0099 / 0.5 / 0.9901 instead of 1). SASS: gdn_bprop +296 instructions, STACK 16→24, REG 128.
   Fwd+bwd +0.4…+3.6% over four workloads (the cost #604 accepted). KDA bprop has no beta divide
   (KN::test_kda_cudnn_backward_preserves_small_beta_gradient passes).
 - **Tests:** GB::test_gdn_cudnn_backward_preserves_small_beta_gradient,
   GB::test_gdn_cudnn_backward_mixed_small_beta_matches_reference.
+- **FP16 range:** beta-free Z overflowed FP16 in sdQ (Z = −130560 → NaN dK/dGate/dBeta); FP16
+  stages max(beta, 2⁻¹⁰)·Z and CG0 undoes it per dM row (GB::…fp16_beta_free_z_stays_in_range;
+  bf16 SASS unchanged, fp16 gdn_bprop +56 instrs, ≈+1% fp16 bprop at 2×16384 / 1×40960).
 - **Upstream:** draft `01-gdn-beta-free-dbeta.patch`; stock v1.30 returns dBeta = 0 instead of 1.
-- **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the two new barriers
+- **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the new barriers
   must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`
   rejects fused l2norm at d_v = 128 after this change; AG never passes `inv_q`.
 - **Reverted** ("Restore the v1.30 divide-by-beta dBeta in the GDN cuDNN backward"). Kernel-isolated
@@ -69,6 +73,25 @@ vendor the new tag.
   1.4–2.4% faster. The small-beta tests are strict xfails documenting dBeta = beta/(beta + 1e-10) × true.
   Candidate to restore exactness: tinv_source="compute" (in-kernel beta-free inverse) measured
   main-level dK/dV with exact beta = 0 at 0–2.4% fwd+bwd over the reverted fix.
+- **Restored with the in-kernel inverse** ("Compute the GDN cuDNN bprop dBeta exactly with the
+  in-kernel inverse"): the beta-free logic is back and both backward plans (uncut/warmup and chain
+  tail) run the bprop with tinv_source="compute", so CG0 inverts bf16 M_kk in place (the same
+  blockwise inverse as gdn_tinv_f16) instead of rebuilding T from the bf16 T_b tile. The T pass
+  still runs for the checkpoint recompute; the bprop no longer loads its tile. Worst relL2 over 4
+  layers vs main (fp64 reference, steps 2500/15000/27500, packed_16k and longdoc_32k): dK and dV
+  equal to main to three digits, dGate within ±13%, dBeta +4…7% (the gmem rebuild was +80…100%).
+  All small-beta tests pass again (no xfail). Cost vs the reverted gmem rebuild: fwd+bwd +2.4% at
+  prefill_2048 and prefill_8x2048, +0.3% at train_10x4096, noise on the chain train_1x40960; vs
+  main (divide-by-beta): fwd+bwd +1.8…+5.4%, bwd +1.9…+6.5% over seven 27B-shape workloads.
+  "Remove the unused gmem inverse-factor path from the GDN bprop" then deleted the dead
+  tinv_source knob, the CG0 T = I - T_b L rebuild, the T_b TMA loads, mb_t_inv_done and the
+  ninth (tinv) descriptor array: backward outputs bitwise equal on uncut, packed, split and chain
+  shapes; SASS differs only by the dropped barrier (one fewer mbarrier init, later offsets -0x10).
+  "Tidy the exact-dBeta GDN bprop synchronization, naming and validation" removed
+  mb_t_free_ready: the same 128 CG0 threads arrive on mb_t_inv_ready later in program order, and
+  the MMA warp waits on it (U GEMM) before the Z GEMM. Outputs bitwise equal (uncut, packed,
+  16-piece chain); SASS gdn_bprop -1 mbarrier init/arrive, -2 try-waits, -1 fence, STACK 24->16,
+  7424->7408 instructions; bprop kernel time -0.1...-2.3% (noise band).
 
 ### B6 — KDA delta residual rounded before subtraction (C06) · numerics
 - **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large

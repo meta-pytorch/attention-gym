@@ -363,7 +363,6 @@ def chain_backward_tail_host(
         cu_pieces,
         dstate0,
         state_dx_end,
-        tinv,
         work_items,
         main_count,
         scheduler_bwd,
@@ -458,7 +457,6 @@ def _build_cfgs(cfg_args):
         log_gate=log_gate,
         d_k=d_k,
         d_v=d_v,
-        tinv_source="gmem",
     )
     return tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg
 
@@ -604,7 +602,7 @@ def _validate_launch(
     if min(pieces, unit_chunks, num_sm) < 1:
         raise ValueError("pieces, unit_chunks and num_sm must be positive")
     num_pieces = num_seqs * pieces
-    gdn_bprop_f16.validate_bwd_bundle(
+    tokens, _heads_out, _num_seqs = gdn_bprop_f16.validate_bwd_bundle(
         q,
         k,
         v,
@@ -616,9 +614,6 @@ def _validate_launch(
         beta,
         cu_seqlens,
         checkpoints,
-        tinv,
-        tinv_rows,
-        tinv_row_count,
         bprop_words,
         num_pieces=num_pieces,
         b_t=b_t,
@@ -657,6 +652,9 @@ def _validate_launch(
         "bprop_summary_words": bprop_summary_words,
     }
     operands = {
+        "tinv": tinv,
+        "tinv_rows": tinv_rows,
+        "tinv_row_count": tinv_row_count,
         "summary_q": summary_q,
         "summary_do": summary_do,
         "seed_checkpoints": seed_checkpoints,
@@ -731,6 +729,9 @@ def _validate_launch(
             (None, heads_out, dim_v, dim_k),
             (*gdn_bprop_f16.STATE_DTYPES, *io),
         )
+    gdn_tinv_f16.validate_tinv(
+        tinv, tinv_rows, tinv_row_count, tokens, num_pieces, heads_out, io[0]
+    )
     for name, module, needed in (
         ("tinv_words", gdn_tinv_f16, True),
         ("summary_words", gdn_summary_f16, fused_h_m),
