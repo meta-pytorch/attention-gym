@@ -32,6 +32,11 @@ def reached_compiler(*args, **kwargs):
     raise RuntimeError("reached the compiler")
 
 
+# The builders select warm launches through these jit_cache lookups before compiling.
+reached_compiler.by_args = reached_compiler
+reached_compiler.by_static_key = reached_compiler
+
+
 @pytest.mark.parametrize("invalid", ["tiles", "chunks"])
 def test_split_table_rejects_invalid_launch_geometry(monkeypatch, invalid):
     monkeypatch.setattr(split_k, "_compile_split_table", reached_compiler)

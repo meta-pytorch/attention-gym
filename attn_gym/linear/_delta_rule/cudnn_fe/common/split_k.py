@@ -64,6 +64,7 @@ no-cuts table serves batch-invariant mode and checkpoint cadences a cut may
 not cross.
 """
 
+import functools
 import math
 from typing import NamedTuple
 
@@ -1812,9 +1813,27 @@ def split_table_facts(
             f"per-channel gate rows and head slices must be {vector_bytes}-byte aligned "
             "for vectorized scan loads"
         )
-    n_heads_out = gate.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
-    need_rows = chunk_scratch_rows(gate.shape[0], batch_size, b_t)
+    return _split_table_facts(
+        tuple(gate.shape),
+        gate.dtype,
+        cu_seqlens.shape[0] - 1,
+        split,
+        n_tiles,
+        ideal_chunks,
+        num_sms,
+        b_t,
+        log_gate,
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _split_table_facts(
+    gate_shape, gate_dtype, batch_size, split, n_tiles, ideal_chunks, num_sms, b_t, log_gate
+) -> SplitTableFacts:
+    """The facts of one full launch shape; every input is part of the memo key."""
+    gate_channels = gate_shape[2] if len(gate_shape) == 3 else 0
+    n_heads_out = gate_shape[1]
+    need_rows = chunk_scratch_rows(gate_shape[0], batch_size, b_t)
     grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
     scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
     n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
@@ -1841,7 +1860,7 @@ def split_table_facts(
         int(n_scan_ctas),
         int(n_scan_blocks),
         int(batch_size * n_heads_out),
-        get_dtype(gate.dtype).width // 8,
+        get_dtype(gate_dtype).width // 8,
     )
 
 

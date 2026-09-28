@@ -381,7 +381,7 @@ def build_warmup_forward(
     use_int64_offsets = requires_int64_abi(
         q, k, v, gate, beta, o, state_in, state_out, checkpoints, chunk_scratch
     )
-    compiled = _compile_warmup_forward(
+    compiled = _compile_warmup_forward.by_args(
         get_dtype(q.dtype),
         state_dtype,
         get_dtype(gate.dtype),

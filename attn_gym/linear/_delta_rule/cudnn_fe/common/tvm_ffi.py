@@ -116,6 +116,17 @@ def signature_spec(
     return ("dynamic", dtype, len(tensor.shape), assumed_align)
 
 
+def signature_key(dynamic: tuple = (), compact: tuple = ()) -> tuple:
+    """Hashable projection of every tensor fact ``signature_spec`` reads: dtype and rank of
+    ``dynamic`` placeholders, dtype and static trailing extents of ``compact`` tables. With a
+    builder's static flags it keys the specs without building them; passing a tensor the specs
+    omit only makes the key more specific."""
+    return (
+        tuple(None if t is None else (t.dtype, t.dim()) for t in dynamic),
+        tuple(None if t is None else (t.dtype, t.shape[1:]) for t in compact),
+    )
+
+
 def make_signature(spec: SignatureSpec | None, *, use_int64_offsets: bool = False):
     """Materialize a legacy fake signature inside a module-level cached compiler."""
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int

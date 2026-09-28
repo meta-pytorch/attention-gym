@@ -450,7 +450,7 @@ def build_chain_forward(
         final_state,
         checkpoints,
     )
-    return _compile_chain_forward(
+    return _compile_chain_forward.by_args(
         get_dtype(q.dtype),
         get_dtype(state_x.dtype),
         get_dtype(final_state.dtype) if final_state is not None else None,

@@ -627,7 +627,7 @@ def build_chain_backward(
     )
     # The bprop module owns the ABI selector for the bundled host (tests monkeypatch it).
     use_int64_offsets = kda_bprop_f16.requires_int64_abi(*(t for t in tensors if t is not None))
-    return _compile_chain_backward(
+    return _compile_chain_backward.by_args(
         get_dtype(q.dtype),
         get_dtype(gate.dtype),
         get_dtype(beta.dtype),

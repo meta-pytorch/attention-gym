@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import operator
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -50,16 +51,15 @@ def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
     Unlike cosize, TVM-FFI must represent a size-1 mode's unreachable stride.
     Bounded int32 routing arrays may be omitted by callers.
     """
+    # Builtin reductions instead of generator expressions: this runs on every launch.
     for tensor in tensors:
-        if tensor is None:
+        if tensor is None or not tensor.ndim:
             continue
         strides = tensor.stride()
-        if any(abs(stride) > 2**31 - 1 for stride in strides):
+        if max(strides) > 2**31 - 1 or min(strides) < 1 - 2**31:
             return True
-        if (
-            tensor.numel()
-            and 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, strides)) > 2**31
-        ):
+        cosize = 1 + sum(map(operator.mul, tensor.shape, strides)) - sum(strides)
+        if tensor.numel() and cosize > 2**31:
             return True
     return False
 

@@ -2,16 +2,20 @@
 
 """Plans and scratch buffers shared by the GDN and KDA drivers.
 
-Everything here is a pure function of one call's shapes and device; nothing is cached across
-calls. The compiled launches are cached by the kernel builders on their static configuration.
+Everything here is a pure function of one call's shapes and device. The plan schemes are
+memoized on the full shape (and SM count); scratch buffers are allocated per call. The compiled
+launches are cached by the kernel builders on their static configuration.
 """
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from types import ModuleType
 
 import torch
+
+from attn_gym._backends.cute.utils import get_device_properties
 
 from .common.host import tensormap_workspace_bytes
 from .common.piece_chain import DV_SPLIT_TILES, choose_pieces, piece_table_layout
@@ -39,6 +43,11 @@ def aligned(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
+def _num_sm(device) -> int:
+    return get_device_properties(device).multi_processor_count
+
+
+@functools.lru_cache(maxsize=256)
 def _chain_pieces(
     tokens: int,
     num_seqs: int,
@@ -92,7 +101,7 @@ class ForwardPlan:
         b_t: int,
         min_chain_tokens_per_piece: int,
     ):
-        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        num_sm = _num_sm(device)
         pieces, unit = _chain_pieces(
             tokens, num_seqs, heads_out, num_sm, b_t, min_chain_tokens_per_piece
         )
@@ -125,7 +134,7 @@ class BackwardPlan:
         b_t: int,
         min_chain_tokens_per_piece: int,
     ):
-        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        num_sm = _num_sm(device)
         pieces, unit = _chain_pieces(
             tokens, num_seqs, heads_out, num_sm, b_t, min_chain_tokens_per_piece, reverse=True
         )

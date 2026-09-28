@@ -62,6 +62,13 @@ vendor the new tag.
 - **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the two new barriers
   must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`
   rejects fused l2norm at d_v = 128 after this change; AG never passes `inv_q`.
+- **Reverted** ("Restore the v1.30 divide-by-beta dBeta in the GDN cuDNN backward"). Kernel-isolated
+  checks on a 30k-step byte-LM (real per-layer inputs, fp64 reference) showed the bf16 rebuild of
+  T = I − T_b L makes dV/dBeta/dK 1.5–2.6× less accurate than main and Triton at normal beta (32k doc,
+  step 15000: dV 1.43e-2 vs 5.58e-3), flat over training; after the revert dV is 6.15e-3 and bwd is
+  1.4–2.4% faster. The small-beta tests are strict xfails documenting dBeta = beta/(beta + 1e-10) × true.
+  Candidate to restore exactness: tinv_source="compute" (in-kernel beta-free inverse) measured
+  main-level dK/dV with exact beta = 0 at 0–2.4% fwd+bwd over the reverted fix.
 
 ### B6 — KDA delta residual rounded before subtraction (C06) · numerics
 - **Problem:** `pack(beta) * (V − pack(state@K))` loses small residuals next to large

@@ -17,12 +17,12 @@
 #
 # Modified by Attention Gym in 2026: vendored from cudnn-frontend v1.30.0; imports relocated into
 # attn_gym.linear._delta_rule.cudnn_fe; register arrays as rmem tensors, operand SMEM in a
-# SharedStorage struct read through smem_data_ptr, and named swizzle-box offsets; beta-free dBeta
-# (T = I - T_b L staged in sDm, Z in sdQ, dV = beta Z); mbarriers initialized by one thread;
-# build_cfg and chunk_gdn_bwd validate the launch contract, and scheduler arrivals derive from warp
-# counts; frozen cfg, GdnBpropOp, and persistent jit_cache compiles on fake-tensor TVM-FFI
-# signatures with an int64-shape variant; the upstream-only expand_num, safe_gate/A_log/dt_bias,
-# beta-sigmoid, negative-eigenvalue, fused-l2norm, and own-prologue paths removed; Ruff formatting.
+# SharedStorage struct read through smem_data_ptr, and named swizzle-box offsets; mbarriers
+# initialized by one thread; build_cfg and chunk_gdn_bwd validate the launch contract, and
+# scheduler arrivals derive from warp counts; frozen cfg, GdnBpropOp, and persistent jit_cache
+# compiles on fake-tensor TVM-FFI signatures with an int64-shape variant; the upstream-only
+# expand_num, safe_gate/A_log/dt_bias, beta-sigmoid, negative-eigenvalue, fused-l2norm, and
+# own-prologue paths removed; Ruff formatting.
 
 """
 Chunked Gated Delta Net (GDN) BPROP kernel for SM100 / SM103 / SM107 (Cutlass primitives).
@@ -34,12 +34,6 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
 
   MMA order.  A = the staged attention matrix
   (CG0's A epilogue, sA); dO' = dO * cumprod_vals * scale (CG1 restage):
-  Beta handling (exact at Beta == 0): T is the beta-free (I + Beta*L)^-1 with L = strict(W_kk
-  2^{g_i-g_j}); T_b = T * Beta[col] is the U GEMM operand. Z = T^T dU is the gradient w.r.t.
-  Beta*Y, so dV = Beta*Z, dY' = -Beta*cumprod*Z and dBeta = rowsum(Z*Y) - rowsum(dM*L) with no
-  division by Beta. CG0 builds T in sDm: "gmem" as I - T_b @ L from the TMA-loaded gdn_tinv_f16
-  tile, "compute" by the in-place blockwise inverse (then scales it into sTinv for the U GEMM).
-
   KK          : W_kk[BT,BT]  = K  @ K^T        -> shared acc   (for T and the dGate/dBeta M-terms)
   QK          : W_qk[BT,BT]  = Q  @ K^T        -> shared acc   (for the A tile)
   dV inter    : dV[DV,BT]    = dstate^T(TMEM) @ K^T -> the dV/dK slot
@@ -50,29 +44,30 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   dstate Q-term : dstate    += dO'^T(TMEM) @ Q  (acc=False on the
                 first backward chunk = dstate init;
                 dstate = dstate * exp2(g_last) + (Q * scale * exp2(g))^T @ dO)
-  U           : U^T[DV,BT]   = Y^T(TMEM f16) @ T_b^T(sTinv) -> shared acc
-  Z           : Z[DV,BT]     = dU^T(TMEM f16) @ T(sDm) -> shared acc
-                (Z = T^T dU, the gradient w.r.t. Beta*Y; T read transposed)
+  dY          : dY[DV,BT]    = dU^T(TMEM f16) @ T(SMEM) -> shared acc
+                (dY == dV == d(Y); T read transposed)
   dA          : dA_eff[BT,BT]= dO(SMEM) @ U^T(SMEM) -> shared acc
                 (sV holds U; CG0 masks it -> sDa for dQ/dK)
-  dM core     : dM[BT,BT]    = Z(sdQ) @ U^T(SMEM), the WY
-                inverse backward collapsed; CG0 applies
-                -Beta[i]*strict(2^{g_i-g_j}) -> sDm (the other beta cancels
+  dM core     : dM[BT,BT]    = dY(SMEM) @ U^T(SMEM), the WY
+                inverse backward T^T dT T^T collapsed via
+                T^T dU = dY and T Y = U (Beta folds through
+                sTinv's column scale into both factors); CG0
+                applies -strict(2^{g_i-g_j}) -> sDm (both betas cancel
                 against the K rows in the dM-terms)
-  dstate update-term : dstate += dY'^T(TMEM f16) @ K  (dY' = -Beta*cumprod_vals
-                * Z, the -(W^T @ dY) term; ready commits HERE)
+  dstate update-term : dstate += dY'^T(TMEM f16) @ K  (dY' = -cumprod_vals
+                * dY, the -(W^T @ dY) term; ready commits HERE)
   dK dM-terms : dV/dK slot  += K^T @ dM^T + K^T @ dM  (the beta row scale
                 cancels with K_beta = beta * K)
-  dK state-path : SY[BT,DV]    = S^T(SMEM) @ dV^T(sdV) -> the shared f16
-                input columns (dO'/dU/dY' dead by then); CG2 reads it as
-                -cumprod_vals[t] * (dV @ S^T)[t,:] and adds it to the banked
+  dK state-path : SY[BT,DV]    = S^T(SMEM) @ dY^T(SMEM) -> the shared f16
+                input columns (dO'/dU/dY' dead by then); CG1 reads it as
+                -cumprod_vals[t] * (dY @ S^T)[t,:] and adds it to the banked
                 inter+attn dK terms
 
   Per chunk CG1: restages dO' and dU and dY' -> the f16 input columns
   (dY' overwrites dU), computes Y = V - cumprod_vals*(K @ state) in registers and stages
   Y and g_k_state to their dedicated f16 TMEM slots (the U GEMM and
-  the dBeta pass read them), reads Z, publishes Z -> sdQ, dY' -> TMEM and
-  dV = Beta*Z -> sdV, reduces the dBeta/dGate V-terms, then stages Q^T over the Y slot.
+  the dV-pass read them), stages Q^T over the Y slot after the dV pass,
+  loads dY and stages it plain to sdV (the dV output).
 
 SMEM layout (~226 KB of the 227 KB SM100 / SM103 / SM107 cap; stage counts live in
 gdn_bprop_config.py):
@@ -82,15 +77,14 @@ gdn_bprop_config.py):
   V                                16384     1      <-- overwritten in place by U
   dO                               16384     1
   state (checkpoint entry c-1)     32768     1      <-- io-dtype [DK,DV], TMA-loaded
-  T_b = T * Beta[col]              8192      1      <-- U GEMM operand: TMA-loaded gdn_tinv_f16 tile ("gmem")
-                                                        or CG0's scaled inverse ("compute")
-  L (beta-free strict-masked W_kk) 8192      1      <-- KK epi store; T build and dGate/dBeta M-terms
+  T_inv                            8192      1      <-- the inverse output (tinv_source "compute") or the
+                                                        TMA-loaded gdn_tinv_f16 tile ("gmem")
+  KK (strict-masked M_kk)          8192      1      <-- KK epi's only store; inverse input, dGate/dBeta M-terms
   A staging / sDa                  8192      1      <-- ALIAS: A then the masked dA
-  T / dM staging (sDm)             8192      1      <-- beta-free T (Z GEMM operand), then the
-                                                        dK dM-terms operand
+  dM staging (sDm)                 8192      1      <-- dK dM-terms operand
   dstate_entry (sDstate)           32768     1      <-- f16 restage, dK-inter's A
-  dQ store staging                 16384     1      <-- Z (dM core operand) until the dQ final write
-  dK store staging                 16384     1      <-- dGate/dBeta reduction scratch before the dK fold
+  dQ store staging                 16384     1
+  dK store staging                 16384     1
   dV store staging                 16384     1
   cumsumlog / cumprod / Beta       3 x 512   2      <-- in-place dGate/dBeta staging
 
@@ -100,7 +94,7 @@ TMEM layout (512 cols):
                  per-chunk productions (dV inter -> dU intra -> dK inter
                  -> dK attn -> dK dM-terms), each with its own mbar pair
   cols 192-256 : dstate input (f16 packed)
-  cols 256-384 : shared accumulators x2        <-- KK / A / k_state / U / Z / dA
+  cols 256-384 : shared accumulators x2        <-- KK / A / k_state / U / dY / dA
                                                     / dM core
   cols 384-448 : shared inputs x2 (f16 packed) <-- dO' / dU / dY'; the dK
                  state-path acc overwrites them after their last GEMM reads
@@ -179,7 +173,7 @@ from ..tile_dsl.barrier import (
     wait_on_dependent_grids,
 )
 from ..tile_dsl.handles import MmaDesc, SmemTile, smem_data_ptr, tma_slice_runtime_desc
-from ..tile_dsl.mma import mma_ss, mma_step, mma_ts_step
+from ..tile_dsl.mma import mma_ss, mma_ts_step
 from ..tile_dsl.pointwise import (
     f16x2_to_f32,
     fadd2,
@@ -262,8 +256,6 @@ class GdnBpropBars(NamedTuple):
 
     mb_t_inv_ready: MBarrier
     mb_t_inv_done: MBarrier
-    mb_t_free_ready: MBarrier
-    mb_z_ready: MBarrier
     mb_a_ready: MBarrier
     mb_a_done: MBarrier
     mb_u_ready: MBarrier
@@ -602,12 +594,6 @@ def make_bars(cfg) -> GdnBpropBars:
             stages=cfg.smem_t_inv_stages,
             init_count=MMA_ARRIVERS,
             producer=Producer.MMA_COMMIT,
-        ),
-        mb_t_free_ready=MBarrier(
-            alloc(1), try_wait=True, stages=1, init_count=CG0_THREADS, producer=Producer.THREAD
-        ),
-        mb_z_ready=MBarrier(
-            alloc(1), try_wait=True, stages=1, init_count=CG1_THREADS, producer=Producer.THREAD
         ),
         mb_a_ready=MBarrier(
             alloc(cfg.smem_a_stages),
@@ -1134,7 +1120,6 @@ def tcgen05_mma_warp(
     sDm,
     sDm_trans,
     sdV,
-    sdQ,
     sScheduler,
     bars,
 ):
@@ -1167,8 +1152,6 @@ def tcgen05_mma_warp(
     du_input_ready = PipelineState.start(phase=0)
     dyp_input_ready = PipelineState.start(phase=0)
     dstate_input_index = PipelineState.start(phase=0)
-    t_free_index = PipelineState.start(phase=0)
-    z_ready_index = PipelineState.start(phase=0)
 
     elect_one = nvvm.elect_sync()
 
@@ -1497,8 +1480,7 @@ def tcgen05_mma_warp(
     d_state_trans0 = sState_trans[0].desc()
     d_state0 = sState[0].desc()
     d_tinv0 = sTinv[0].desc()
-    d_t_free_trans0 = sDm_trans[0].desc()
-    d_z0 = sdQ[0].desc()
+    d_tinv_trans0 = sTinv_trans[0].desc()
     d_a_trans0 = sA_trans[0].desc()
     d_v0 = sV[0].desc()
     d_dv0 = sdV[0].desc()
@@ -1674,7 +1656,7 @@ def tcgen05_mma_warp(
                         cutlass.Boolean(True) if cutlass.const_expr(i + k > 0) else have_dstate,
                     )
 
-            # ---- U^T recompute = Y^T(T) @ (T * Beta[col])^T ---------------------------
+            # ---- U^T recompute = Y^T(T) @ T^T ----------------------------------------
             tinv_idx = tinv_index.idx
             bars.mb_t_inv_ready[tinv_idx].wait(tinv_index.phase)
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
@@ -1699,13 +1681,11 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_u_acc_ready[0].arrive(cta_group=1)
 
-            # ---- Z = dU^T(T) @ T_free (beta-free T, in sDm) ---------------------------
+            # ---- dY = dU^T(T) @ T ----------------------------------------------------
             bars.mb_du_input_ready[0].wait(du_input_ready.phase)
             du_input_ready = advance(du_input_ready, 1)
-            bars.mb_t_free_ready[0].wait(t_free_index.phase)
-            t_free_index = advance(t_free_index, 1)
 
-            desc_tinv_trans = d_t_free_trans0
+            desc_tinv_trans = d_tinv_trans0
             for i in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.num_subtiles_B):
                 for k in cutlass.range_constexpr(bmm_du_t_inv_trans_desc.sps_B):
                     mma_ts_step(
@@ -1723,7 +1703,6 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_dy_acc_ready[0].arrive(cta_group=1)
                 if cutlass.const_expr(cfg.tinv_source == "gmem"):
-                    # CG0 reads this tile for T_free until mb_t_free_ready, which this GEMM waited.
                     bars.mb_t_inv_done[tinv_idx].arrive(cta_group=1)
 
             # ---- dK inter = dstate entry(S) @ U^T ------------------------------------
@@ -1759,11 +1738,12 @@ def tcgen05_mma_warp(
                 bars.mb_da_acc_ready[0].arrive(cta_group=1)
                 bars.mb_do_mma_done[do_idx].arrive(cta_group=1)
 
-            # ---- dM core = Z(S) @ U^T ------------------------------------------------
-            bars.mb_z_ready[0].wait(z_ready_index.phase)
-            z_ready_index = advance(z_ready_index, 1)
+            # ---- dM core = dY(S) @ U^T -----------------------------------------------
+            dv_ready_idx = dv_ready_index.idx
+            bars.mb_dv_tmastg_ready[dv_ready_idx].wait(dv_ready_index.phase)
+            dv_ready_index = advance(dv_ready_index, cfg.smem_dv_stages)
 
-            desc_dy_dm = d_z0
+            desc_dy_dm = d_dv0
             desc_u_dm = d_v0
             mma_ss(
                 bmm_dy_u_desc,
@@ -1845,10 +1825,7 @@ def tcgen05_mma_warp(
                 bars.mb_dq_acc_total_ready[0].arrive(cta_group=1)
                 bars.mb_a_done[du_a_idx].arrive(cta_group=1)
 
-            # ---- dK state-path = state(S) @ dV^T (dV = Beta*Z) ------------------------
-            dv_ready_idx = dv_ready_index.idx
-            bars.mb_dv_tmastg_ready[dv_ready_idx].wait(dv_ready_index.phase)
-            dv_ready_index = advance(dv_ready_index, cfg.smem_dv_stages)
+            # ---- dK state-path = state(S) @ dY^T -------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
                 desc_state_spath = d_state_trans0
                 desc_dy_spath = d_dv0
@@ -2073,22 +2050,6 @@ def tmaldg_warp(
             k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
             tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr)
 
-            # ---- chunk-factor tile load ----------------------------------------------
-            # Issued before Q/V/dO: CG0 builds T from it right after the A epilogue.
-            if cutlass.const_expr(cfg.tinv_source == "gmem"):
-                tinv_idx = tinv_index.idx
-                bars.mb_t_inv_done[tinv_idx].wait(tinv_index.phase)
-                tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
-                if elect_one:
-                    bars.mb_t_inv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
-                tinv_row = chunk_idx
-                tinv_slice = tma_slice_runtime_desc(
-                    desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_idx, tinv_row
-                )
-                tma_load_tile(
-                    sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr
-                )
-
             # ---- Q load --------------------------------------------------------------
             q_idx = q_index.idx
             bars.mb_q_mma_done[q_idx].wait(q_index.phase)
@@ -2116,6 +2077,21 @@ def tmaldg_warp(
                 bars.mb_do_ready[do_idx].arrive(n_bytes=cfg.tma_do_bytes)
             do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, tok_coord)
             tma_load_tile(sdO_tma[do_idx], do_slice, bars.mb_do_ready[do_idx].smem_ptr)
+
+            # ---- chunk-factor tile load ----------------------------------------------
+            if cutlass.const_expr(cfg.tinv_source == "gmem"):
+                tinv_idx = tinv_index.idx
+                bars.mb_t_inv_done[tinv_idx].wait(tinv_index.phase)
+                tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
+                if elect_one:
+                    bars.mb_t_inv_ready[tinv_idx].arrive(n_bytes=cfg.tma_tinv_bytes)
+                tinv_row = chunk_idx
+                tinv_slice = tma_slice_runtime_desc(
+                    desc_tinv_slot, cutlass.Int32(0), cutlass.Int32(0), head_idx, tinv_row
+                )
+                tma_load_tile(
+                    sTinv_tma[tinv_idx], tinv_slice, bars.mb_t_inv_ready[tinv_idx].smem_ptr
+                )
 
             # ---- entering state ------------------------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -2212,7 +2188,6 @@ def compute0_warp_group(
     cg0_a_ready = PipelineState.start(phase=0)
     cg0_dstate_smem_ready = PipelineState.start(phase=0)
     cg0_state_ready_index = PipelineState.start(phase=0)
-    cg0_tinv_ready = PipelineState.start(phase=0)
 
     num_threads_cg0 = cfg.threads_per_warp * len(cfg.compute_group_0_warp_ids)
     cg0_tidx = tidx % num_threads_cg0
@@ -2256,6 +2231,17 @@ def compute0_warp_group(
         mem_space=cute.AddressSpace.smem,
         assumed_align=cfg.buffer_align_bytes,
     )
+    if cutlass.const_expr(cfg.tinv_source == "compute"):
+        tinv_zero_ptr = cute.make_ptr(
+            cutlass.Int32,
+            sTinv[0].base.toint(),
+            mem_space=cute.AddressSpace.smem,
+            assumed_align=cfg.buffer_align_bytes,
+        )
+        for z in cutlass.range_constexpr(
+            cfg.t_inv_cosize * bytes_per_element // 4 // num_threads_cg0
+        ):
+            (tinv_zero_ptr + cg0_tidx + z * num_threads_cg0).store(cutlass.Int32(0))
 
     scheduler_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
@@ -2313,10 +2299,7 @@ def compute0_warp_group(
                 chunk_row = warp_id * 16 + lane_idx // 4 + ((k // 2) % 2) * 8
                 gBeta.append(sBeta[chunk_row, 0, beta_idx])
 
-            # ---- KK epilogue: L[i,j] = W kk[i,j] * T strict[i,j] -> sKK (M-terms) and ---
-            # ---- M kk[i,j] = Beta[i] * L[i,j] -> sDm (the in-place inverse's input) -----
-            # sDm is free here: its last async reader, the previous chunk's dK dM-terms GEMM,
-            # completes before this chunk's mb_kk_acc_ready commit.
+            # ---- KK epilogue: M kk[i,j] = W kk[i,j] * T strict[i,j] * Beta[i] --------
             tinv_idx = tinv_index.idx
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
             bars.mb_kk_acc_ready[0].wait(cg0_kk_ready.phase)
@@ -2324,11 +2307,9 @@ def compute0_warp_group(
 
             tinv_base = sTinv[tinv_idx].base
             kk_base = sKK[tinv_idx].base
-            t_free_base = sDm[0].base
             kk_vec = nvvm.tcgen05_ld(
                 "16x256b", nvvm.make_tmem_ptr(row_lo_addr + tmem_kk_col, cutlass.Float32), num=8
             )
-            l_pack = []
             kk_pack = []
             for k in cutlass.range_constexpr(num_vals // 2):
                 p0, p1 = fmul2(
@@ -2337,30 +2318,21 @@ def compute0_warp_group(
                     decay_t_strict[2 * k],
                     decay_t_strict[2 * k + 1],
                 )
-                l_pack.append(fp32_to_fp16(p0, p1, dtype=cfg.io_dtype))
-                if cutlass.const_expr(cfg.tinv_source == "compute"):
-                    v0, v1 = fmul2(p0, p1, gBeta[2 * k], gBeta[2 * k + 1])
-                    kk_pack.append(fp32_to_fp16(v0, v1, dtype=cfg.io_dtype))
+                v0, v1 = fmul2(p0, p1, gBeta[2 * k], gBeta[2 * k + 1])
+                kk_pack.append(fp32_to_fp16(v0, v1, dtype=cfg.io_dtype))
             for c in cutlass.range_constexpr(ACC_N_FRAGS):
-                frag_off = store_row * cfg.b_t + swizzle_xor_128b(
-                    store_row, store_col + c * FRAG_COLS
-                )
                 nvvm.stmatrix(
-                    kk_base + frag_off,
-                    [l_pack[c * 4 + 0], l_pack[c * 4 + 1], l_pack[c * 4 + 2], l_pack[c * 4 + 3]],
+                    kk_base
+                    + store_row * cfg.b_t
+                    + swizzle_xor_128b(store_row, store_col + c * FRAG_COLS),
+                    [
+                        kk_pack[c * 4 + 0],
+                        kk_pack[c * 4 + 1],
+                        kk_pack[c * 4 + 2],
+                        kk_pack[c * 4 + 3],
+                    ],
                     nvvm.MMALayout.ROW,
                 )
-                if cutlass.const_expr(cfg.tinv_source == "compute"):
-                    nvvm.stmatrix(
-                        t_free_base + frag_off,
-                        [
-                            kk_pack[c * 4 + 0],
-                            kk_pack[c * 4 + 1],
-                            kk_pack[c * 4 + 2],
-                            kk_pack[c * 4 + 3],
-                        ],
-                        nvvm.MMALayout.ROW,
-                    )
             if chunk_idx < compute_end - FIRST_STATE_CHUNK:
                 bars.mb_kk_acc_done[0].arrive()
 
@@ -2392,99 +2364,20 @@ def compute0_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_a_ready[a_idx].arrive()
 
-            if cutlass.const_expr(cfg.tinv_source == "gmem"):
-                # ---- T = I - T_b @ L -> sDm, from the TMA-loaded T_b = T * Beta[col] -------
-                # (I + Beta L) T = I gives T = I - T (Beta L) = I - T_b L with no division by
-                # Beta. Each warp builds its 16 rows over the full 64 x 64 x 64 product.
-                nvvm.barrier_cta_sync_aligned(
-                    cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads
-                )
-                bars.mb_t_inv_ready[tinv_idx].wait(cg0_tinv_ready.phase)
-                cg0_tinv_ready = advance(cg0_tinv_ready, cfg.smem_t_inv_stages)
-                mma_row = warp_id * 16 + lane_idx % 16
-                mma_col = (lane_idx // 16) * 8
-                t_b_frags = []
-                for ks in cutlass.range_constexpr(cfg.b_t // 16):
-                    t_b_frags += list(
-                        nvvm.ldmatrix(
-                            tinv_base
-                            + mma_row * cfg.b_t
-                            + swizzle_xor_128b(mma_row, ks * 16 + mma_col),
-                            4,
-                            nvvm.MMALayout.ROW,
-                        )
-                    )
-                t_acc = cute.make_rmem_tensor((32,), cutlass.Float32)
-                for i in cutlass.range_constexpr(32):
-                    t_acc[i] = cutlass.Float32(0.0)
-                for ks in cutlass.range_constexpr(cfg.b_t // 16):
-                    l_row = ks * 16 + lane_idx % 16
-                    l_frags = []
-                    for ns in cutlass.range_constexpr(cfg.b_t // 16):
-                        l_frags += list(
-                            nvvm.ldmatrix(
-                                kk_base
-                                + l_row * cfg.b_t
-                                + swizzle_xor_128b(l_row, ns * 16 + mma_col),
-                                4,
-                                nvvm.MMALayout.COL,
-                            )
-                        )
-                    mma_step(
-                        t_acc,
-                        t_b_frags,
-                        l_frags,
-                        k_step=ks,
-                        M=16,
-                        N=cfg.b_t,
-                        ab_dtype=cfg.io_dtype,
-                    )
-                t_row = warp_id * 16 + lane_idx // 4
-                t_pack = []
-                for n_frag in cutlass.range_constexpr(cfg.b_t // 8):
-                    for h in cutlass.range_constexpr(2):
-                        c0 = n_frag * 8 + 2 * (lane_idx % 4)
-                        e0 = cutlass.Float32(1.0) if t_row + h * 8 == c0 else cutlass.Float32(0.0)
-                        e1 = (
-                            cutlass.Float32(1.0)
-                            if t_row + h * 8 == c0 + 1
-                            else cutlass.Float32(0.0)
-                        )
-                        t_pack.append(
-                            fp32_to_fp16(
-                                e0 - t_acc[n_frag * 4 + 2 * h],
-                                e1 - t_acc[n_frag * 4 + 2 * h + 1],
-                                dtype=cfg.io_dtype,
-                            )
-                        )
-                for ns in cutlass.range_constexpr(cfg.b_t // 16):
-                    nvvm.stmatrix(
-                        t_free_base
-                        + mma_row * cfg.b_t
-                        + swizzle_xor_128b(mma_row, ns * 16 + mma_col),
-                        t_pack[ns * 4 : ns * 4 + 4],
-                        nvvm.MMALayout.ROW,
-                    )
-                nvvm.fence_proxy("async.shared", space="cta")
-                bars.mb_t_free_ready[0].arrive()
-            else:
-                # ---- blockwise inverse, in place in sDm: T = (I + M kk)^-1 (beta-free T) -------
-                # Every step reads the raw block it overwrites before storing it (the 32 -> 64
-                # bands meet on a barrier first); the upper triangle keeps the KK epilogue's zeros.
+            if cutlass.const_expr(cfg.tinv_source == "compute"):
+                # ---- blockwise inverse -----------------------------------------------
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
                 if warp_id < 2:
-                    invert_diagonal_NxN(cfg, t_free_base, t_free_base, cg0_tidx // 8, cg0_tidx, 8)
+                    invert_diagonal_NxN(cfg, kk_base, tinv_base, cg0_tidx // 8, cg0_tidx, 8)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
 
-                blockwise_diagonal_8x8_to_16x16(
-                    cfg, t_free_base, t_free_base, warp_id * 16, lane_idx
-                )
+                blockwise_diagonal_8x8_to_16x16(cfg, tinv_base, kk_base, warp_id * 16, lane_idx)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
@@ -2492,7 +2385,7 @@ def compute0_warp_group(
 
                 if warp_id < 2:
                     blockwise_diagonal_16x16_to_32x32(
-                        cfg, t_free_base, t_free_base, warp_id * 32, lane_idx
+                        cfg, tinv_base, kk_base, warp_id * 32, lane_idx
                     )
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg0_barrier_id,
@@ -2502,23 +2395,19 @@ def compute0_warp_group(
                 if warp_id < 2:
                     blockwise_diagonal_32x32_to_64x64(
                         cfg,
-                        t_free_base,
-                        t_free_base,
+                        tinv_base,
+                        kk_base,
                         warp_id,
                         lane_idx,
                         cfg.inverse_inner_barrier_id,
                         cfg.inverse_inner_barrier_threads,
                     )
-                nvvm.fence_proxy("async.shared", space="cta")
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg0_barrier_id,
                     thread_count=cfg.cg0_barrier_threads,
                 )
-                bars.mb_t_free_ready[0].arrive()
 
-            if cutlass.const_expr(cfg.tinv_source == "compute"):
-                # ---- U GEMM operand: T[i,j] * Beta[j] -> sTinv ------------------------------
-                # ("gmem" TMA-loads the same beta-scaled tile from gdn_tinv_f16.)
+                # ---- Beta column scaling in place: T^-1[i,j] *= Beta[j] --------------
                 beta_col = []
                 for k in cutlass.range_constexpr(num_vals):
                     beta_col.append(
@@ -2528,7 +2417,7 @@ def compute0_warp_group(
                 for c in cutlass.range_constexpr(ACC_N_FRAGS):
                     tinv_frags += list(
                         nvvm.ldmatrix(
-                            t_free_base
+                            tinv_base
                             + store_row * cfg.b_t
                             + swizzle_xor_128b(store_row, store_col + c * FRAG_COLS),
                             4,
@@ -2556,6 +2445,12 @@ def compute0_warp_group(
 
                 nvvm.fence_proxy("async.shared", space="cta")
                 bars.mb_t_inv_ready[tinv_idx].arrive()
+            else:
+                # ---- KK write -> M-terms read handoff --------------------------------
+                nvvm.barrier_cta_sync_aligned(
+                    cfg.cg0_barrier_id,
+                    thread_count=cfg.cg0_barrier_threads,
+                )
 
             # ---- dGate last state dot dstate term ------------------------------------
             if chunk_idx + DSTATE_IN0 >= 1:
@@ -2679,8 +2574,6 @@ def compute0_warp_group(
                 num=8,
             )
 
-            # dm_vec = Z @ U^T carries no Beta: sDm = -Beta[i] * strict * dm_vec. The dY GEMM,
-            # T_free's last reader in sDm, completes before mb_dm_acc_ready.
             dm_pack = []
             for k in cutlass.range_constexpr(num_vals // 2):
                 p0, p1 = fmul2(
@@ -2689,7 +2582,6 @@ def compute0_warp_group(
                     decay_t_strict[2 * k],
                     decay_t_strict[2 * k + 1],
                 )
-                p0, p1 = fmul2(p0, p1, gBeta[2 * k], gBeta[2 * k + 1])
                 v0 = cutlass.Float32(0.0) - p0
                 v1 = cutlass.Float32(0.0) - p1
                 dm_pack.append(fp32_to_fp16(v0, v1, dtype=cfg.io_dtype))
@@ -2709,8 +2601,7 @@ def compute0_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dm_acc_done[0].arrive()
 
-            # ---- dBeta/dGate M-terms: E = dM core * L(sKK, strict-masked, beta-free) ---
-            # rowsum(E) is dBeta's M-term directly; Beta[i] * E feeds the dGate row/col terms.
+            # ---- dBeta/dGate M-terms: E = dM core * M kk(sKK, strict-masked) ---------
             kk_frag = []
             for c in cutlass.range_constexpr(ACC_N_FRAGS):
                 kk_frag += list(
@@ -2722,17 +2613,22 @@ def compute0_warp_group(
                         nvvm.MMALayout.ROW,
                     )
                 )
+            binv_row = [
+                cute.math.rcp(gBeta[0] + cutlass.Float32(1e-10), approx=True, ftz=True),
+                cute.math.rcp(gBeta[2] + cutlass.Float32(1e-10), approx=True, ftz=True),
+            ]
             row_acc = [None] * 8
             col_part = [None] * 16
             for j in cutlass.range_constexpr(num_vals // 2):
                 k_lo, k_hi = f16x2_to_f32(kk_frag[j], dtype=cfg.io_dtype)
+                binv_j = binv_row[j % 2]
                 lo, hi = fmul2(dm_vec[2 * j], dm_vec[2 * j + 1], k_lo, k_hi)
+                lo, hi = fmul2(lo, hi, binv_j, binv_j)
                 r = cutlass.const_expr((j % 2) * 4 + (j // 2) % 4)
                 if cutlass.const_expr(j < 8):
                     row_acc[r] = lo + hi
                 else:
                     row_acc[r] += lo + hi
-                lo, hi = fmul2(lo, hi, gBeta[2 * j], gBeta[2 * j + 1])
                 c0 = cutlass.const_expr((j // 2) * 2)
                 if cutlass.const_expr(j % 2 == 0):
                     col_part[c0], col_part[c0 + 1] = lo, hi
@@ -2760,7 +2656,7 @@ def compute0_warp_group(
             if lane_idx % 4 == 0:
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
-                    sCumsumlog[crow_r, 0, gate_idx] = acc_zero - row_part[rp] * gBeta[2 * rp]
+                    sCumsumlog[crow_r, 0, gate_idx] = acc_zero - row_part[rp]
             nvvm.barrier_cta_sync_aligned(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
             if cg0_tidx < 64:
                 col_sum = (
@@ -2779,7 +2675,7 @@ def compute0_warp_group(
             if lane_idx % 4 == 0:
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
-                    db = sBeta[crow_r, 0, beta_idx] - row_part[rp]
+                    db = sBeta[crow_r, 0, beta_idx] - row_part[rp] * binv_row[rp]
                     sBeta[crow_r, 0, beta_idx] = db
 
             bars.mb_beta_done[beta_idx].arrive()
@@ -2904,6 +2800,12 @@ def compute1_warp_group(
     tmem_dy_col = tmem_acc_a
     tmem_u_col = tmem_acc_b
 
+    sdq_reduction_base = cute.make_ptr(
+        cutlass.Float32,
+        sdQ[0].base.toint(),
+        mem_space=cute.AddressSpace.smem,
+        assumed_align=cfg.buffer_align_bytes,
+    )
     sdk_reduction = cute.make_ptr(
         cutlass.Float32,
         sdK[0].base.toint(),
@@ -2911,9 +2813,6 @@ def compute1_warp_group(
         assumed_align=cfg.buffer_align_bytes,
     )
     PART_Q_SCRATCH_OFF = 4 * 64
-    # dBeta/dGate V-term scratch in sdK (sdQ holds Z until the dQ final write), after CG2's part_k
-    # and CG1's part_q slots; sdK is idle from its TMA store until CG2's dK fold.
-    V_TERM_SCRATCH_OFF = 8 * 64
     tmem_dstate_acc_col = tmem_col + cfg.tmem_dstate_acc_offset
     ldtm_width = 32
     num_ldtms = cutlass.const_expr(cfg.d_k // ldtm_width)
@@ -3285,54 +3184,22 @@ def compute1_warp_group(
                 )
                 dy_regs.append([dy_vec[k] for k in range(32)])
 
-            # ---- Z -> sdQ (the dM core operand) ----------------------------------------
-            # dy_regs hold Z = T^T dU with T beta-free: the gradient w.r.t. Beta*Y. The Beta loads
-            # precede the CG1 barrier below, after which sBeta holds dBeta's V-term.
-            beta_fp32 = []
-            for g in cutlass.range_constexpr(8):
-                for b in cutlass.range_constexpr(2):
-                    beta_fp32.append(sBeta[(lane_idx % 4) * 2 + g * 8 + b, 0, beta_idx])
-            beta_vals = [beta_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
-            dq_stg_idx = dq_index.idx
-            bars.mb_dq_tmastg_done[dq_stg_idx].wait(dq_index.phase)
-            dq_index = advance(dq_index, cfg.smem_dq_stages)
+            # ---- dY' = -cumprod * dY -> f16 shared input -----------------------------
+            neg_one = cutlass.Float32(-1.0)
+            cumprod_neg_vals = [cumprod_vals[k] * neg_one for k in range(32)]
             for half in cutlass.range_constexpr(dv_halves):
-                for block in cutlass.range_constexpr(4):
-                    frag_addr = (
-                        dv_frag_segment
-                        + (frag_row + block * 16) * 64
-                        + swizzle_xor_128b(frag_row + block * 16, dv_frag_col + half * 16)
-                    )
-                    z_pack = [
-                        fp32_to_fp16(
-                            dy_regs[half][8 * block + 2 * j],
-                            dy_regs[half][8 * block + 2 * j + 1],
-                            dtype=cfg.io_dtype,
-                        )
-                        for j in range(4)
-                    ]
-                    nvvm.stmatrix(
-                        sdQ_base + dq_stg_idx * dq_stage_elements + frag_addr,
-                        z_pack,
-                        nvvm.MMALayout.COL,
-                    )
-            nvvm.fence_proxy("async.shared", space="cta")
-            bars.mb_z_ready[0].arrive()
-
-            # ---- dY' = -Beta * cumprod * Z -> f16 shared input ------------------------
-            neg_beta_cumprod_vals = [
-                cutlass.Float32(0.0) - cumprod_vals[k] * beta_vals[k] for k in range(num_vals)
-            ]
-            for half in cutlass.range_constexpr(dv_halves):
-                dyp_pack = []
+                dyp = []
                 for j in cutlass.range_constexpr(16):
                     n0, n1 = fmul2(
                         dy_regs[half][2 * j],
                         dy_regs[half][2 * j + 1],
-                        neg_beta_cumprod_vals[2 * j],
-                        neg_beta_cumprod_vals[2 * j + 1],
+                        cumprod_neg_vals[2 * j],
+                        cumprod_neg_vals[2 * j + 1],
                     )
-                    dyp_pack.append(fp32_to_fp16(n0, n1, dtype=cfg.io_dtype))
+                    dyp += [n0, n1]
+                dyp_pack = [
+                    fp32_to_fp16(dyp[2 * j], dyp[2 * j + 1], dtype=cfg.io_dtype) for j in range(16)
+                ]
                 nvvm.tcgen05_st(
                     "16x128b",
                     nvvm.make_tmem_ptr(
@@ -3343,7 +3210,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_dyp_input_ready[0].arrive()
 
-            # ---- dV = Beta * Z -> sdV (the dV output and the dK state-path operand) ---
+            # ---- dV stage: dV = dY ---------------------------------------------------
             dv_stg_idx = dv_index.idx
             bars.mb_dv_tmastg_done[dv_stg_idx].wait(dv_index.phase)
             dv_index = advance(dv_index, cfg.smem_dv_stages)
@@ -3351,31 +3218,33 @@ def compute1_warp_group(
             sdv_done_index = advance(sdv_done_index, 1)
             for half in cutlass.range_constexpr(dv_halves):
                 for block in cutlass.range_constexpr(4):
-                    frag_addr = (
-                        dv_frag_segment
-                        + (frag_row + block * 16) * 64
-                        + swizzle_xor_128b(frag_row + block * 16, dv_frag_col + half * 16)
-                    )
-                    dv_pack = []
-                    for j in cutlass.range_constexpr(4):
-                        e = cutlass.const_expr(8 * block + 2 * j)
-                        b0, b1 = fmul2(
-                            dy_regs[half][e], dy_regs[half][e + 1], beta_vals[e], beta_vals[e + 1]
+                    dv_pack = [
+                        fp32_to_fp16(
+                            dy_regs[half][8 * block + 2 * j],
+                            dy_regs[half][8 * block + 2 * j + 1],
+                            dtype=cfg.io_dtype,
                         )
-                        dv_pack.append(fp32_to_fp16(b0, b1, dtype=cfg.io_dtype))
+                        for j in range(4)
+                    ]
                     nvvm.stmatrix(
-                        sdV_base + dv_stg_idx * dv_stage_elements + frag_addr,
+                        (
+                            sdV_base
+                            + dv_stg_idx * dv_stage_elements
+                            + dv_frag_segment
+                            + (frag_row + block * 16) * 64
+                            + swizzle_xor_128b(frag_row + block * 16, dv_frag_col + half * 16)
+                        ),
                         dv_pack,
                         nvvm.MMALayout.COL,
                     )
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dv_tmastg_ready[dv_stg_idx].arrive()
+            dq_stg_idx = dq_index.idx
+            bars.mb_dq_tmastg_done[dq_stg_idx].wait(dq_index.phase)
+            dq_index = advance(dq_index, cfg.smem_dq_stages)
+            sdq_reduction = sdq_reduction_base + dq_stg_idx * (dq_stage_elements // 2)
 
-            bars.mb_dk_tmastg_done[cg1_dk_index.idx].wait(cg1_dk_index.phase)
-            cg1_dk_index = advance(cg1_dk_index, cfg.smem_dk_stages)
-            v_term_scratch = sdk_reduction + V_TERM_SCRATCH_OFF
-
-            # ---- dBeta V-term rowsum(Z * Y); dGate state term Beta * rowsum(Z * g k state)
+            # ---- dBeta/dGate V-terms: dBeta += rowsum(dV * Y) / Beta -----------------
             gsum = cutlass.Float32(0.0)
             part_y = [None] * 16
             for half in cutlass.range_constexpr(dv_halves):
@@ -3431,41 +3300,51 @@ def compute1_warp_group(
                                 part_g[part_e0 + 1],
                             )
                 pg_lo, pg_hi = warp_reduce_scatter_sum_16_elements(part_g, lane_idx)
-                (v_term_scratch + cg1_warp_id * 64 + vt_tok0).store(py_lo)
-                (v_term_scratch + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
-                (v_term_scratch + 256 + cg1_warp_id * 64 + vt_tok0).store(pg_lo)
-                (v_term_scratch + 256 + cg1_warp_id * 64 + vt_tok0 + 1).store(pg_hi)
+                (sdq_reduction + cg1_warp_id * 64 + vt_tok0).store(py_lo)
+                (sdq_reduction + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
+                (sdq_reduction + 256 + cg1_warp_id * 64 + vt_tok0).store(pg_lo)
+                (sdq_reduction + 256 + cg1_warp_id * 64 + vt_tok0 + 1).store(pg_hi)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads
                 )
                 if cg1_tidx < 64:
+                    binv_t = cute.math.rcp(
+                        sBeta[cg1_tidx, 0, beta_idx] + cutlass.Float32(1e-10),
+                        approx=True,
+                        ftz=True,
+                    )
                     ysum = (
-                        (v_term_scratch + cg1_tidx).load()
-                        + (v_term_scratch + 64 + cg1_tidx).load()
-                        + (v_term_scratch + 128 + cg1_tidx).load()
-                        + (v_term_scratch + 192 + cg1_tidx).load()
+                        (sdq_reduction + cg1_tidx).load()
+                        + (sdq_reduction + 64 + cg1_tidx).load()
+                        + (sdq_reduction + 128 + cg1_tidx).load()
+                        + (sdq_reduction + 192 + cg1_tidx).load()
                     )
-                    gsum = sBeta[cg1_tidx, 0, beta_idx] * (
-                        (v_term_scratch + 256 + cg1_tidx).load()
-                        + (v_term_scratch + 320 + cg1_tidx).load()
-                        + (v_term_scratch + 384 + cg1_tidx).load()
-                        + (v_term_scratch + 448 + cg1_tidx).load()
+                    gsum = (
+                        (sdq_reduction + 256 + cg1_tidx).load()
+                        + (sdq_reduction + 320 + cg1_tidx).load()
+                        + (sdq_reduction + 384 + cg1_tidx).load()
+                        + (sdq_reduction + 448 + cg1_tidx).load()
                     )
-                    sBeta[cg1_tidx, 0, beta_idx] = ysum
+                    sBeta[cg1_tidx, 0, beta_idx] = ysum * binv_t
             if chunk_idx < FIRST_STATE_CHUNK:
-                (v_term_scratch + cg1_warp_id * 64 + vt_tok0).store(py_lo)
-                (v_term_scratch + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
+                (sdq_reduction + cg1_warp_id * 64 + vt_tok0).store(py_lo)
+                (sdq_reduction + cg1_warp_id * 64 + vt_tok0 + 1).store(py_hi)
                 nvvm.barrier_cta_sync_aligned(
                     cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads
                 )
                 if cg1_tidx < 64:
-                    ysum = (
-                        (v_term_scratch + cg1_tidx).load()
-                        + (v_term_scratch + 64 + cg1_tidx).load()
-                        + (v_term_scratch + 128 + cg1_tidx).load()
-                        + (v_term_scratch + 192 + cg1_tidx).load()
+                    binv_t = cute.math.rcp(
+                        sBeta[cg1_tidx, 0, beta_idx] + cutlass.Float32(1e-10),
+                        approx=True,
+                        ftz=True,
                     )
-                    sBeta[cg1_tidx, 0, beta_idx] = ysum
+                    ysum = (
+                        (sdq_reduction + cg1_tidx).load()
+                        + (sdq_reduction + 64 + cg1_tidx).load()
+                        + (sdq_reduction + 128 + cg1_tidx).load()
+                        + (sdq_reduction + 192 + cg1_tidx).load()
+                    )
+                    sBeta[cg1_tidx, 0, beta_idx] = ysum * binv_t
             bars.mb_beta_done[beta_idx].arrive()
             bars.mb_dbeta_cg1_ready[0].arrive()
             nvvm.barrier_cta_sync_aligned(cfg.cg1_barrier_id, thread_count=cfg.cg1_barrier_threads)
@@ -3553,6 +3432,8 @@ def compute1_warp_group(
                                 part_q[part_e0],
                                 part_q[part_e0 + 1],
                             )
+            bars.mb_dk_tmastg_done[cg1_dk_index.idx].wait(cg1_dk_index.phase)
+            cg1_dk_index = advance(cg1_dk_index, cfg.smem_dk_stages)
             part_q_lo, part_q_hi = warp_reduce_scatter_sum_16_elements(part_q, lane_idx)
             tok0 = (lane_idx // 4) * 8 + (lane_idx % 4) * 2
             (sdk_reduction + PART_Q_SCRATCH_OFF + (cg1_tidx // 32) * 64 + tok0).store(part_q_lo)
@@ -5077,8 +4958,6 @@ def frost_gdn_bprop(
         for s in range(cfg.smem_t_inv_stages):
             bars.mb_t_inv_ready[s].init()
             bars.mb_t_inv_done[s].init()
-        bars.mb_t_free_ready[0].init()
-        bars.mb_z_ready[0].init()
         for s in range(cfg.smem_a_stages):
             bars.mb_a_ready[s].init()
             bars.mb_a_done[s].init()
@@ -5236,7 +5115,6 @@ def frost_gdn_bprop(
             sDm=sDm,
             sDm_trans=sDm_trans,
             sdV=sdV,
-            sdQ=sdQ,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -5425,15 +5303,6 @@ def build_cfg(
         )
     if max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive")
-    if d_k != d_v:
-        raise ValueError(
-            "the bprop stages Z (d_v wide) in the dQ tile, whose fragment strides need d_k == d_v"
-        )
-    if CFG.SMEM_DQ_STAGES != 1 or CFG.SMEM_DK_STAGES != 1:
-        raise ValueError(
-            "Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0]; both need one "
-            "stage"
-        )
     cfg = GdnBpropCfg(
         use_initial_state=use_initial_state,
         use_dstate_in=use_dstate_in,
@@ -5853,8 +5722,13 @@ def chunk_gdn_bwd(
     tinv=None,
     workspace,
     num_sm: int,
+    bundle_validated: bool = False,
 ) -> None:
     """Execute the chunked GDN bprop kernel (THD / varlen entry).
+
+    ``bundle_validated`` means the caller already ran ``validate_bwd_bundle`` over these
+    operands, checkpoints, tinv and workspace (one series per sequence) and checked the work
+    table; only the gradient, state-cotangent and ticket-counter checks run again.
 
     Produces dQ/dK/dV/dGate/dBeta at ``HO = max(HQ, HV)`` heads (the caller
     reduces over the head group; dGate = dL/d(ln alpha)).  With
@@ -5907,48 +5781,70 @@ def chunk_gdn_bwd(
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     if d_initial_state is not None and not use_initial_state:
         raise ValueError("d_initial_state needs use_initial_state")
-    tokens, heads_out, num_seqs = validate_bwd_operands(
-        q,
-        k,
-        v,
-        do,
-        gate,
-        beta,
-        cu_seqlens,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dgate=dgate,
-        dbeta=dbeta,
-    )
-    validate_cuda_tensors(
-        q,
-        state_checkpoints=state_checkpoints,
-        d_initial_state=d_initial_state,
-        d_final_state=d_final_state,
-        work_items=work_items,
-        work_count=work_count,
-        scheduler_counter=scheduler_counter,
-        tinv=tinv,
-        workspace=workspace,
-    )
     dim_v, dim_k, io = v.shape[2], q.shape[2], str(q.dtype).removeprefix("torch.")
-    validate_state_series(
-        "state_checkpoints",
-        state_checkpoints,
-        checkpoint_capacity_bound(tokens, num_seqs, CFG.B_T),
-        heads_out,
-        dim_v,
-        dim_k,
-        (io,),
-    )
+    if bundle_validated:
+        tokens, heads_out, num_seqs = q.shape[0], gate.shape[1], cu_seqlens.shape[0] - 1
+        validate_cuda_tensors(
+            q,
+            dgate=dgate,
+            dbeta=dbeta,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
+            scheduler_counter=scheduler_counter,
+        )
+        if dgate is not None:
+            validate_tensor("dgate", dgate, (tokens, heads_out), ("float32",))
+        if dbeta is not None:
+            validate_tensor(
+                "dbeta", dbeta, (tokens, heads_out), (str(beta.dtype).removeprefix("torch."),)
+            )
+        validate_tensor(
+            "scheduler_counter", scheduler_counter, (None,), ("int32",), align=4, min_rows=1
+        )
+    else:
+        tokens, heads_out, num_seqs = validate_bwd_operands(
+            q,
+            k,
+            v,
+            do,
+            gate,
+            beta,
+            cu_seqlens,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            dgate=dgate,
+            dbeta=dbeta,
+        )
+        validate_cuda_tensors(
+            q,
+            state_checkpoints=state_checkpoints,
+            d_initial_state=d_initial_state,
+            d_final_state=d_final_state,
+            work_items=work_items,
+            work_count=work_count,
+            scheduler_counter=scheduler_counter,
+            tinv=tinv,
+            workspace=workspace,
+        )
+        validate_state_series(
+            "state_checkpoints",
+            state_checkpoints,
+            checkpoint_capacity_bound(tokens, num_seqs, CFG.B_T),
+            heads_out,
+            dim_v,
+            dim_k,
+            (io,),
+        )
+        if tinv is not None:
+            validate_tinv(tinv, tokens, num_seqs, heads_out, io)
+        validate_work_table(
+            work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out
+        )
+        validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     for name, tensor in (("d_initial_state", d_initial_state), ("d_final_state", d_final_state)):
         if tensor is not None:
             validate_state_series(name, tensor, num_seqs, heads_out, dim_v, dim_k, STATE_DTYPES)
-    if tinv is not None:
-        validate_tinv(tinv, tokens, num_seqs, heads_out, io)
-    validate_work_table(work_items, work_count, scheduler_counter, min_rows=num_seqs * heads_out)
-    validate_workspace("workspace", workspace, TENSORMAP_DESC_ARRAYS, num_seqs)
     tinv_source = "gmem" if tinv is not None else "compute"
     use_int64_offsets = requires_int64_abi(
         q,
@@ -5969,7 +5865,7 @@ def chunk_gdn_bwd(
         tinv,
         workspace,
     )
-    compiled = _compile_gdn_bprop(
+    compiled = _compile_gdn_bprop.by_args(
         _dtype_name(q),
         _dtype_name(cu_seqlens),
         _dtype_name(gate),

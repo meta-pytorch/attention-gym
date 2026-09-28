@@ -511,7 +511,7 @@ def build_warmup_backward(
             *(t for t in shared + recompute_tensors if t is not None)
         )
     )
-    compiled = _compile_warmup_backward(
+    compiled = _compile_warmup_backward.by_args(
         (
             bool(facts.split),
             int(facts.b_t),

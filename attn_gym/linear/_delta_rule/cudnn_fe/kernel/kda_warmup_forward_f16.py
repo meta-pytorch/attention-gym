@@ -44,7 +44,7 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 from ..common import split_k
 from ..common.host import get_dtype, validate_cuda_tensors
-from ..common.launch import validate_tensor, validate_workspace
+from ..common.launch import memoize_launch_check, validate_tensor, validate_workspace
 from ..common.tvm_ffi import (
     WORK_ITEM_FIELDS,
     make_compact_signature_tensor,
@@ -434,6 +434,7 @@ def _dtype_or_none(tensor):
     return None if tensor is None else get_dtype(tensor.dtype)
 
 
+@memoize_launch_check
 def _validate_launch(
     *,
     q,
@@ -751,7 +752,7 @@ def build_warmup_forward(
         raise ValueError("has_initial_state requires state_indices")
     paged_state = 0 if state_indices is None else 1 + (has_initial_state is not None)
     use_int64_offsets = requires_int64_abi(*tensors)
-    compiled = _compile_warmup_forward(
+    compiled = _compile_warmup_forward.by_args(
         (
             bool(facts.split),
             int(facts.b_t),
