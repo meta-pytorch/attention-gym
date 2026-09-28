@@ -36,8 +36,9 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   Beta handling (exact at Beta == 0): T is the beta-free (I + Beta*L)^-1 with L = strict(W_kk
   2^{g_i-g_j}); T_b = T * Beta[col] is the U GEMM operand. Z = T^T dU is the gradient w.r.t.
   Beta*Y, so dV = Beta*Z, dY' = -Beta*cumprod*Z and dBeta = rowsum(Z*Y) - rowsum(dM*L) with no
-  division by Beta. CG0 builds T in sDm by the in-place blockwise inverse, then scales it into
-  sTinv for the U GEMM. (Rebuilding T = I - T_b @ L from the bf16 gdn_tinv_f16 tile instead costs
+  division by Beta. FP16 stages max(Beta, 2^-10)*Z (beta-free Z can overflow FP16) and CG0
+  divides the dM core row by that factor. CG0 builds T in sDm by the in-place blockwise
+  inverse, then scales it into sTinv for the U GEMM. (Rebuilding T = I - T_b @ L from the bf16 gdn_tinv_f16 tile instead costs
   1.5-2.6x dV/dBeta/dK precision: the cancelling bf16 sum amplifies the operand roundings.)
 
   MMA order.  A = the staged attention matrix
@@ -201,6 +202,8 @@ from ..tile_dsl.tma import (
 from .gdn_bprop_config import CFG
 
 USE_PDL = True
+# FP16 Z staging floor (a power of two, so Beta = 0 stays exact); see the CG1 Z publish.
+Z_FP16_BETA_FLOOR = 2.0**-10
 # Z staging reads sdQ[0] and the dBeta V-term scratch lives in sdK[0].
 assert CFG.SMEM_DQ_STAGES == 1 and CFG.SMEM_DK_STAGES == 1
 STATE_DIMS = (64, 128)
@@ -2531,6 +2534,21 @@ def compute0_warp_group(
 
             # dm_vec = Z @ U^T carries no Beta: sDm = -Beta[i] * strict * dm_vec. The Z GEMM,
             # T_free's last reader in sDm, completes before mb_dm_acc_ready.
+            # FP16 stages s[i] * Z (s = max(Beta, 2^-10)), so row i is undone here in FP32.
+            dm_beta = gBeta
+            dm_inv_s = [None, None]
+            if cutlass.const_expr(cfg.io_dtype == cutlass.Float16):
+                dm_row_beta = [None, None]
+                for rp in cutlass.range_constexpr(2):
+                    # Beta / s is exactly min(Beta * 2^10, 1): the floor is a power of two.
+                    dm_row_beta[rp] = cute.arch.fmin(
+                        gBeta[2 * rp] * cutlass.Float32(1.0 / Z_FP16_BETA_FLOOR),
+                        cutlass.Float32(1.0),
+                    )
+                    dm_inv_s[rp] = cute.arch.rcp_approx(
+                        cute.arch.fmax(gBeta[2 * rp], cutlass.Float32(Z_FP16_BETA_FLOOR))
+                    )
+                dm_beta = [dm_row_beta[(k // 2) % 2] for k in range(num_vals)]
             dm_pack = []
             for k in cutlass.range_constexpr(num_vals // 2):
                 p0, p1 = fmul2(
@@ -2539,7 +2557,7 @@ def compute0_warp_group(
                     decay_t_strict[2 * k],
                     decay_t_strict[2 * k + 1],
                 )
-                p0, p1 = fmul2(p0, p1, gBeta[2 * k], gBeta[2 * k + 1])
+                p0, p1 = fmul2(p0, p1, dm_beta[2 * k], dm_beta[2 * k + 1])
                 v0 = cutlass.Float32(0.0) - p0
                 v1 = cutlass.Float32(0.0) - p1
                 dm_pack.append(fp32_to_fp16(v0, v1, dtype=cfg.io_dtype))
@@ -2582,7 +2600,7 @@ def compute0_warp_group(
                     row_acc[r] = lo + hi
                 else:
                     row_acc[r] += lo + hi
-                lo, hi = fmul2(lo, hi, gBeta[2 * j], gBeta[2 * j + 1])
+                lo, hi = fmul2(lo, hi, dm_beta[2 * j], dm_beta[2 * j + 1])
                 c0 = cutlass.const_expr((j // 2) * 2)
                 if cutlass.const_expr(j % 2 == 0):
                     col_part[c0], col_part[c0 + 1] = lo, hi
@@ -2597,6 +2615,9 @@ def compute0_warp_group(
                     row_part[rp] += nvvm.shfl_sync(
                         0xFFFFFFFF, row_part[rp], off, 31, kind=nvvm.Shfl.BFLY
                     )
+            row_beta = [gBeta[0], gBeta[2]]
+            if cutlass.const_expr(cfg.io_dtype == cutlass.Float16):
+                row_beta = dm_row_beta
 
             # ---- dGate column fold ---------------------------------------------------
             nvvm.barrier_cta_sync_aligned(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
@@ -2610,7 +2631,7 @@ def compute0_warp_group(
             if lane_idx % 4 == 0:
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
-                    sCumsumlog[crow_r, 0, gate_idx] = acc_zero - row_part[rp] * gBeta[2 * rp]
+                    sCumsumlog[crow_r, 0, gate_idx] = acc_zero - row_part[rp] * row_beta[rp]
             nvvm.barrier_cta_sync_aligned(cfg.cg0_barrier_id, thread_count=cfg.cg0_barrier_threads)
             if cg0_tidx < 64:
                 col_sum = (
@@ -2629,7 +2650,10 @@ def compute0_warp_group(
             if lane_idx % 4 == 0:
                 for rp in cutlass.range_constexpr(2):
                     crow_r = warp_id * 16 + lane_idx // 4 + rp * 8
-                    db = sBeta[crow_r, 0, beta_idx] - row_part[rp]
+                    if cutlass.const_expr(cfg.io_dtype == cutlass.Float16):
+                        db = sBeta[crow_r, 0, beta_idx] - row_part[rp] * dm_inv_s[rp]
+                    else:
+                        db = sBeta[crow_r, 0, beta_idx] - row_part[rp]
                     sBeta[crow_r, 0, beta_idx] = db
 
             bars.mb_beta_done[beta_idx].arrive()
@@ -3153,19 +3177,26 @@ def compute1_warp_group(
                 ]
                 for half in range(dv_halves)
             ]
+            # FP16 range floor: beta-free Z can exceed 65504 where Beta*Z cannot, so FP16 stages
+            # s[i] * Z with s = max(Beta, 2^-10) and CG0 divides dM core row i by s[i].
+            z_s = beta_vals
+            if cutlass.const_expr(cfg.io_dtype == cutlass.Float16):
+                z_s = [
+                    cute.arch.fmax(beta_vals[k], cutlass.Float32(Z_FP16_BETA_FLOOR))
+                    for k in range(num_vals)
+                ]
             dq_stg_idx = dq_index.idx
             bars.mb_dq_tmastg_done[dq_stg_idx].wait(dq_index.phase)
             dq_index = advance(dq_index, cfg.smem_dq_stages)
             for half in cutlass.range_constexpr(dv_halves):
                 for block in cutlass.range_constexpr(4):
-                    z_pack = [
-                        fp32_to_fp16(
-                            z_regs[half][8 * block + 2 * j],
-                            z_regs[half][8 * block + 2 * j + 1],
-                            dtype=cfg.io_dtype,
-                        )
-                        for j in range(4)
-                    ]
+                    z_pack = []
+                    for j in cutlass.range_constexpr(4):
+                        e = cutlass.const_expr(8 * block + 2 * j)
+                        z0, z1 = z_regs[half][e], z_regs[half][e + 1]
+                        if cutlass.const_expr(cfg.io_dtype == cutlass.Float16):
+                            z0, z1 = fmul2(z0, z1, z_s[e], z_s[e + 1])
+                        z_pack.append(fp32_to_fp16(z0, z1, dtype=cfg.io_dtype))
                     nvvm.stmatrix(
                         sdQ_base + dq_stg_idx * dq_stage_elements + dv_frag_addrs[half][block],
                         z_pack,

@@ -59,6 +59,9 @@ vendor the new tag.
   (KN::test_kda_cudnn_backward_preserves_small_beta_gradient passes).
 - **Tests:** GB::test_gdn_cudnn_backward_preserves_small_beta_gradient,
   GB::test_gdn_cudnn_backward_mixed_small_beta_matches_reference.
+- **FP16 range:** beta-free Z overflowed FP16 in sdQ (Z = −130560 → NaN dK/dGate/dBeta); FP16
+  stages max(beta, 2⁻¹⁰)·Z and CG0 undoes it per dM row (GB::…fp16_beta_free_z_stays_in_range;
+  bf16 SASS unchanged, fp16 gdn_bprop +56 instrs, ≈+1% fp16 bprop at 2×16384 / 1×40960).
 - **Upstream:** draft `01-gdn-beta-free-dbeta.patch`; stock v1.30 returns dBeta = 0 instead of 1.
 - **Replay:** the largest hunk. Overlaps B2 in the bprop barrier-init block: the new barriers
   must sit inside the thread-0 guard; keep the init fence and CTA sync outside it. Upstream `build_cfg`

@@ -268,6 +268,34 @@ def test_gdn_cudnn_backward_preserves_small_beta_gradient(
     assert gradients[4][0, 1, 0].item() == 1.0
 
 
+def test_gdn_cudnn_backward_fp16_beta_free_z_stays_in_range() -> None:
+    """The beta-free Z = -130560 here exceeds FP16 range; staging it must not overflow."""
+    shape = (1, 2, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=torch.float16)
+    k = torch.zeros_like(q)
+    value = torch.zeros_like(q)
+    q[..., 0] = 1
+    k[..., 0] = 16
+    value[..., 0] = 1
+    gate = torch.zeros(shape[:-1], device="cuda")
+    beta = torch.tensor([[[2.0**-12], [1.0]]], device="cuda")
+    d_output = torch.zeros_like(value)
+    d_output[0, 1, 0, 0] = 32
+    cu_seqlens = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    inputs = (q, k, value, gate, beta, None, cu_seqlens)
+
+    gradients = chunk_gdn_bwd_cudnn_packed(*inputs[:5], d_output, cu_seqlens, scale=1.0)
+    expected_gradients = reference_gradients(
+        inputs, d_output, torch.float64, None, None, scale=1.0
+    )
+
+    names = ("dq", "dk", "dv", "dgate", "dbeta")
+    for name, actual, expected in zip(names, gradients[:5], expected_gradients, strict=True):
+        assert_matches_low_precision_reference(
+            actual, expected, expected, name, source_dtype=torch.float16
+        )
+
+
 def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
     """Direct dBeta must survive zero and small beta across persistent chunks."""
     inputs = make_gdn_test_inputs(
