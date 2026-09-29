@@ -392,10 +392,8 @@ class ShortConvKernel:
     @cute.jit
     def input_group(self, x: cute.Tensor, batch, time, channel_group):
         """Select one channel group of ``[B, T, C]`` input through its batch and token strides."""
-        x_groups = cute.zipped_divide(x, (1, 1, self.channels_per_thread))
-        return x_groups[
-            ((0, 0, None), (self.upcast_offset(batch), self.upcast_offset(time), channel_group))
-        ]
+        row = x[self.upcast_offset(batch), self.upcast_offset(time), None]
+        return cute.local_tile(row, (self.channels_per_thread,), (channel_group,))
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
