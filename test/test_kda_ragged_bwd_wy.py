@@ -301,8 +301,9 @@ def test_wy_grouped_scalar_gate_matches_expanded_vector_gate(
     for name, result, reference in zip(names, actual, expected, strict=True):
         assert result.shape == reference.shape, name
         result, reference = result[:, :tokens], reference[:, :tokens]
-        if name == "dg":
-            # The scalar dg is the same K-sum in a different reduction order.
+        if name in ("dk", "dg"):
+            # The scalar-gate path rounds the gate products differently (dk differs by an ulp
+            # even without grouping), and the scalar dg is the same K-sum in a different order.
             torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5, msg=name)
         else:
             torch.testing.assert_close(result, reference, rtol=0, atol=0, msg=name)
