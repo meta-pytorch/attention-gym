@@ -38,7 +38,7 @@ Evidence environment: GB200 (SM100), torch 2.15.0.dev20260926+cu132, CuTeDSL 4.8
 plus the mandatory prune cut of the chain prologue's `gdp_bprop_v64` import under `compact_qdo`
 (R11). Subjects: "Vendor the cudnn-frontend v1.30 GDN and KDA kernels verbatim", "Keep the vendored
 cuDNN license texts verbatim under pre-commit". Replay: prove the tool against this drop first
-(`vendor.py --rev v1.30.0 --verify auto`, which finds the drop commit by the first subject), then
+(`vendor.py --rev v1.30.0 --verify auto`, which compares with `vendor.DROP_COMMIT`), then
 vendor the new tag.
 
 ## 1. Bugs in upstream v1.30 (upstream draft exists or is possible)
