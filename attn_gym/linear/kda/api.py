@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 
+from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
     resolve_scale,
@@ -31,7 +32,6 @@ from attn_gym.linear.kda.impl.cudnn import chunk_forward as _cudnn_chunk_forward
 from attn_gym.linear.kda.impl.cudnn import paged_chunk_forward as _cudnn_paged_chunk_forward
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
-from attn_gym.linear.kda.impl.reference import reference_kda
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
@@ -171,17 +171,18 @@ def chunk_kda(
             autotune=autotune,
             schedule=options.schedule,
         )
-    return reference_kda(
+    return reference_delta_rule(
         partial(naive_chunk_kda, chunk_size=_CHUNK_SIZE),
         q,
         k,
         v,
         gate.float() * LOG2_E,
         beta,
-        initial_state,
-        cu_seqlens,
-        scale,
-        output_final_state,
+        compute_dtype=torch.float32,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state,
     )
 
 
@@ -470,17 +471,18 @@ def recurrent_kda(
             has_initial_state=has_initial_state,
             autotune=autotune,
         )
-    return reference_kda(
+    return reference_delta_rule(
         naive_recurrent_kda,
         q,
         k,
         v,
         gate.float() * LOG2_E,
         beta,
-        initial_state,
-        cu_seqlens,
-        scale,
-        output_final_state,
+        compute_dtype=torch.float32,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state,
     )
 
 

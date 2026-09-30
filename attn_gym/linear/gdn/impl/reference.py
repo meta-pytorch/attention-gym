@@ -5,61 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear._delta_rule.reference import packed_delta_rule_reference
-
 _CHUNK_SIZE = 64
-
-
-def reference_gdn(
-    dense_op,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    log_decay: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    scale: float,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-    output_final_state: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run a GDN reference operation after promoting inputs and state to the compute dtype."""
-    output_dtype = q.dtype
-    compute_dtype = torch.promote_types(q.dtype, torch.float32)
-    q, k, v, log_decay, beta = (tensor.to(compute_dtype) for tensor in (q, k, v, log_decay, beta))
-    if initial_state is not None:
-        initial_state = initial_state.to(compute_dtype)
-    if q.shape[2] != v.shape[2]:
-        # Grouped heads: expand each shared query/key head across its value-head group.
-        groups = v.shape[2] // q.shape[2]
-        q, k = (tensor.repeat_interleave(groups, dim=2) for tensor in (q, k))
-    # Explicit casts do not stop autocast from selecting low-precision contractions.
-    with torch.autocast(device_type=q.device.type, enabled=False):
-        if cu_seqlens is None:
-            output, state = dense_op(
-                q,
-                k,
-                v,
-                log_decay,
-                beta,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-            )
-        else:
-            output, state = packed_delta_rule_reference(
-                dense_op,
-                q,
-                k,
-                v,
-                log_decay,
-                beta,
-                initial_state,
-                cu_seqlens,
-                output_final_state,
-                scale=scale,
-            )
-    return output.to(output_dtype), state
 
 
 def recurrent_forward(
@@ -180,4 +126,4 @@ def chunk_forward(
     return output[:, :sequence], final_state
 
 
-__all__ = ["chunk_forward", "recurrent_forward", "reference_gdn"]
+__all__ = ["chunk_forward", "recurrent_forward"]
