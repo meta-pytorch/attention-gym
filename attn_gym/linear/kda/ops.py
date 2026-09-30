@@ -12,6 +12,7 @@ import importlib
 import torch
 
 from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._lazy import register_lazy_cuda_impls
 
 _CHUNK_SIZE = 64
 
@@ -194,163 +195,49 @@ def _replay_backend():
         raise ImportError("paged_chunk_kda replay requires CUDA with Triton support") from error
 
 
-def _chunk_fwd_cuda(*args):
-    return _chunk_backend()._chunk_kda_fwd_cuda(*args)
-
-
-def _chunk_fwd_with_state_cuda(*args):
-    return _chunk_backend()._chunk_kda_fwd_with_state_cuda(*args)
-
-
-def _chunk_fwd_ragged_cuda(*args):
-    return _chunk_backend()._chunk_kda_fwd_ragged_cuda(*args)
-
-
-def _chunk_fwd_ragged_with_state_cuda(*args):
-    return _chunk_backend()._chunk_kda_fwd_ragged_with_state_cuda(*args)
-
-
-def _chunk_fwd_ragged_paged_cuda(*args):
-    return _chunk_backend()._chunk_kda_fwd_ragged_paged_cuda(*args)
-
-
-def _chunk_replay_prepare_cuda(*args):
-    return _replay_backend().prepare_paged_chunk_replay(*args)
-
-
-def _chunk_replay_commit_cuda(*args):
-    return _replay_backend().commit_paged_chunk_replay(*args)
-
-
-def _chunk_replay_prefill_prepare_cuda(*args):
-    return _replay_backend().prepare_paged_chunk_prefill(*args)
-
-
-def _chunk_replay_state_gather_cuda(*args):
-    return _replay_backend().gather_paged_chunk_state(*args)
-
-
-def _chunk_replay_prefill_commit_cuda(*args):
-    return _replay_backend().commit_paged_chunk_prefill(*args)
-
-
-def _chunk_bwd_cuda(*args):
-    return _chunk_backend()._chunk_kda_bwd_cuda(*args)
-
-
-def _chunk_bwd_with_state_grad_cuda(*args):
-    return _chunk_backend()._chunk_kda_bwd_with_state_grad_cuda(*args)
-
-
-def _chunk_bwd_recompute_factors_cuda(*args):
-    return _chunk_backend()._chunk_kda_bwd_recompute_factors_cuda(*args)
-
-
-def _chunk_bwd_recompute_factors_with_state_grad_cuda(*args):
-    return _chunk_backend()._chunk_kda_bwd_recompute_factors_with_state_grad_cuda(*args)
-
-
-def _recurrent_fwd_cuda(*args):
-    return _recurrent_backend()._kda_recurrent_fwd_cuda(*args)
-
-
-def _recurrent_fwd_no_state_cuda(*args):
-    return _recurrent_backend()._kda_recurrent_fwd_no_state_cuda(*args)
-
-
-def _recurrent_fwd_paged_cuda(*args):
-    return _recurrent_backend()._kda_recurrent_fwd_paged_cuda(*args)
-
-
-def _delta_h_cuda(*args):
-    return _delta_h_backend()._delta_h_cuda(*args)
-
-
-def _delta_h_with_state_cuda(*args):
-    return _delta_h_backend()._delta_h_with_state_cuda(*args)
-
-
-def _recurrent_decode_cuda(*args):
-    return _recurrent_backend()._kda_recurrent_decode_cuda(*args)
-
-
-def _delta_h_paged_cuda(*args):
-    return _delta_h_backend()._delta_h_paged_cuda(*args)
-
-
-torch.library.impl("attn_gym::kda_chunk_fwd", "CUDA", _chunk_fwd_cuda)
-torch.library.impl("attn_gym::kda_chunk_fwd_with_state", "CUDA", _chunk_fwd_with_state_cuda)
-torch.library.impl("attn_gym::kda_chunk_fwd_ragged", "CUDA", _chunk_fwd_ragged_cuda)
-torch.library.impl(
-    "attn_gym::kda_chunk_fwd_ragged_with_state",
-    "CUDA",
-    _chunk_fwd_ragged_with_state_cuda,
+register_lazy_cuda_impls(
+    _chunk_backend,
+    {
+        "kda_chunk_fwd": "_chunk_kda_fwd_cuda",
+        "kda_chunk_fwd_with_state": "_chunk_kda_fwd_with_state_cuda",
+        "kda_chunk_fwd_ragged": "_chunk_kda_fwd_ragged_cuda",
+        "kda_chunk_fwd_ragged_with_state": "_chunk_kda_fwd_ragged_with_state_cuda",
+        "kda_chunk_fwd_ragged_paged": "_chunk_kda_fwd_ragged_paged_cuda",
+        "kda_chunk_bwd": "_chunk_kda_bwd_cuda",
+        "kda_chunk_bwd_with_state_grad": "_chunk_kda_bwd_with_state_grad_cuda",
+        "kda_chunk_bwd_recompute_factors": "_chunk_kda_bwd_recompute_factors_cuda",
+        "kda_chunk_bwd_recompute_factors_with_state_grad": (
+            "_chunk_kda_bwd_recompute_factors_with_state_grad_cuda"
+        ),
+    },
 )
-torch.library.impl(
-    "attn_gym::kda_chunk_fwd_ragged_paged",
-    "CUDA",
-    _chunk_fwd_ragged_paged_cuda,
+register_lazy_cuda_impls(
+    _replay_backend,
+    {
+        "kda_chunk_replay_prepare": "prepare_paged_chunk_replay",
+        "kda_chunk_replay_commit": "commit_paged_chunk_replay",
+        "kda_chunk_replay_prefill_prepare": "prepare_paged_chunk_prefill",
+        "kda_chunk_replay_state_gather": "gather_paged_chunk_state",
+        "kda_chunk_replay_prefill_commit": "commit_paged_chunk_prefill",
+    },
 )
-torch.library.impl(
-    "attn_gym::kda_chunk_replay_prepare",
-    "CUDA",
-    _chunk_replay_prepare_cuda,
+register_lazy_cuda_impls(
+    _recurrent_backend,
+    {
+        "kda_recurrent_fwd": "_kda_recurrent_fwd_cuda",
+        "kda_recurrent_fwd_no_state": "_kda_recurrent_fwd_no_state_cuda",
+        "kda_recurrent_fwd_paged": "_kda_recurrent_fwd_paged_cuda",
+        "kda_recurrent_decode": "_kda_recurrent_decode_cuda",
+    },
 )
-torch.library.impl(
-    "attn_gym::kda_chunk_replay_commit",
-    "CUDA",
-    _chunk_replay_commit_cuda,
+register_lazy_cuda_impls(
+    _delta_h_backend,
+    {
+        "kda_delta_h": "_delta_h_cuda",
+        "kda_delta_h_with_state": "_delta_h_with_state_cuda",
+        "kda_delta_h_paged": "_delta_h_paged_cuda",
+    },
 )
-torch.library.impl(
-    "attn_gym::kda_chunk_replay_prefill_prepare",
-    "CUDA",
-    _chunk_replay_prefill_prepare_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_chunk_replay_state_gather",
-    "CUDA",
-    _chunk_replay_state_gather_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_chunk_replay_prefill_commit",
-    "CUDA",
-    _chunk_replay_prefill_commit_cuda,
-)
-torch.library.impl("attn_gym::kda_chunk_bwd", "CUDA", _chunk_bwd_cuda)
-torch.library.impl(
-    "attn_gym::kda_chunk_bwd_with_state_grad",
-    "CUDA",
-    _chunk_bwd_with_state_grad_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_chunk_bwd_recompute_factors",
-    "CUDA",
-    _chunk_bwd_recompute_factors_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad",
-    "CUDA",
-    _chunk_bwd_recompute_factors_with_state_grad_cuda,
-)
-torch.library.impl("attn_gym::kda_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
-torch.library.impl(
-    "attn_gym::kda_recurrent_fwd_no_state",
-    "CUDA",
-    _recurrent_fwd_no_state_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_recurrent_fwd_paged",
-    "CUDA",
-    _recurrent_fwd_paged_cuda,
-)
-torch.library.impl(
-    "attn_gym::kda_recurrent_decode",
-    "CUDA",
-    _recurrent_decode_cuda,
-)
-torch.library.impl("attn_gym::kda_delta_h", "CUDA", _delta_h_cuda)
-torch.library.impl("attn_gym::kda_delta_h_with_state", "CUDA", _delta_h_with_state_cuda)
-torch.library.impl("attn_gym::kda_delta_h_paged", "CUDA", _delta_h_paged_cuda)
 
 
 def _chunk_fwd_fake_common(q: torch.Tensor, v: torch.Tensor):
