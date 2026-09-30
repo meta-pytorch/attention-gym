@@ -2409,7 +2409,7 @@ def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activatio
 def test_paged_short_conv_flattened_row_extent_abi(batches, tokens, channels, expected):
     """The dynamic row count must fit even when its last valid offset still fits int32."""
     x = torch.empty(batches, tokens, channels, device="meta", dtype=torch.bfloat16)
-    assert cute_backend._paged_forward_uses_int64_offsets(x, torch.empty_like(x)) is expected
+    assert cute_backend._needs_int64(x, torch.empty_like(x)) is expected
 
 
 @pytest.mark.parametrize("packed", [False, True])

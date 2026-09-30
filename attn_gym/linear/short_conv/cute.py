@@ -2821,6 +2821,37 @@ def _validate_inputs(
             raise ValueError("initial_state must match x dtype and be contiguous on x.device")
 
 
+def _validate_state_pool(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor) -> None:
+    """Validate a mutable history pool of compact, non-overlapping ``[W - 1, C]`` slots."""
+    channels = x.shape[-1]
+    if state.dtype != x.dtype or state.device != x.device:
+        raise ValueError("state must match x dtype and be on x.device")
+    if state.stride()[1:] != (channels, 1):
+        raise ValueError("state must be contiguous within each [W - 1, C] slot")
+    if state.stride(0) < (weight.shape[1] - 1) * channels:
+        raise ValueError("state slots must not overlap")
+
+
+def _validate_sequence_vector(
+    x: torch.Tensor,
+    tensor: torch.Tensor | None,
+    sequences: int,
+    dtype: torch.dtype,
+    name: str,
+) -> None:
+    """Validate an optional contiguous per-sequence vector on ``x.device``."""
+    if tensor is not None and (
+        tensor.shape != (sequences,)
+        or tensor.dtype != dtype
+        or tensor.device != x.device
+        or not tensor.is_contiguous()
+    ):
+        dtype_name = str(dtype).removeprefix("torch.")
+        raise ValueError(
+            f"{name} must be contiguous {dtype_name} with shape ({sequences},) on x.device"
+        )
+
+
 def _validate_decode_inputs(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2848,31 +2879,9 @@ def _validate_decode_inputs(
     expected_state = (slots, weight.shape[1] - 1, channels)
     if slots < 1 or state.ndim != 3 or state.shape != expected_state:
         raise ValueError(f"state must have shape {expected_state}, got {tuple(state.shape)}")
-    if state.dtype != x.dtype or state.device != x.device:
-        raise ValueError("state must match x dtype and be on x.device")
-    if state.stride()[1:] != (channels, 1):
-        raise ValueError("state must be contiguous within each [W - 1, C] slot")
-    if state.stride(0) < (weight.shape[1] - 1) * channels:
-        raise ValueError("state slots must not overlap")
-
-    if state_indices is not None and (
-        tuple(state_indices.shape) != (sequences,)
-        or state_indices.dtype != torch.int32
-        or state_indices.device != x.device
-        or not state_indices.is_contiguous()
-    ):
-        raise ValueError(
-            f"state_indices must be contiguous int32 with shape ({sequences},) on x.device"
-        )
-    if has_initial_state is not None and (
-        has_initial_state.shape != (sequences,)
-        or has_initial_state.dtype != torch.bool
-        or has_initial_state.device != x.device
-        or not has_initial_state.is_contiguous()
-    ):
-        raise ValueError(
-            f"has_initial_state must be contiguous bool with shape ({sequences},) on x.device"
-        )
+    _validate_state_pool(x, weight, state)
+    _validate_sequence_vector(x, state_indices, sequences, torch.int32, "state_indices")
+    _validate_sequence_vector(x, has_initial_state, sequences, torch.bool, "has_initial_state")
 
 
 def _validate_paged_inputs(
@@ -2896,30 +2905,15 @@ def _validate_paged_inputs(
             f"state must have shape [num_slots, {expected_tail[0]}, {channels}], "
             f"got {tuple(state.shape)}"
         )
-    if state.dtype != x.dtype or state.device != x.device:
-        raise ValueError("state must match x dtype and be on x.device")
-    if state.stride()[1:] != (channels, 1):
-        raise ValueError("state must be contiguous within each [W - 1, C] slot")
-    if state.stride(0) < (weight.shape[1] - 1) * channels:
-        raise ValueError("state slots must not overlap")
-    if (
-        state_indices.shape != (sequences,)
-        or state_indices.dtype != torch.int32
-        or state_indices.device != x.device
-        or not state_indices.is_contiguous()
-    ):
-        raise ValueError(
-            f"state_indices must be contiguous int32 with shape ({sequences},) on x.device"
-        )
-    if has_initial_state is not None and (
-        has_initial_state.shape != (sequences,)
-        or has_initial_state.dtype != torch.bool
-        or has_initial_state.device != x.device
-        or not has_initial_state.is_contiguous()
-    ):
-        raise ValueError(
-            f"has_initial_state must be contiguous bool with shape ({sequences},) on x.device"
-        )
+    _validate_state_pool(x, weight, state)
+    _validate_sequence_vector(x, state_indices, sequences, torch.int32, "state_indices")
+    _validate_sequence_vector(x, has_initial_state, sequences, torch.bool, "has_initial_state")
+
+
+def _needs_int64(x: torch.Tensor, *tensors: torch.Tensor | None) -> bool:
+    """Return whether a ``[B, T, C]`` launch needs 64-bit offsets and ABI fields."""
+    # The flattened row count is itself an ABI field, not just an address bound.
+    return x.shape[0] * x.shape[1] > 2**31 - 1 or requires_int64_abi(x, *tensors)
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -2967,7 +2961,7 @@ def _launch_forward(
         cu_seqlens is not None,
         initial_state is not None,
         resolved_activation,
-        batches * tokens > 2**31 - 1 or requires_int64_abi(x, weight, output, initial_state),
+        _needs_int64(x, weight, output, initial_state),
         tokens % config.times_per_block == 0,
     )
     compiled(
@@ -3036,8 +3030,7 @@ def _launch_backward(
         resolved_activation,
         capability,
         input_time_workers,
-        batches * tokens > 2**31 - 1
-        or requires_int64_abi(x, weight, grad_output, grad_x, initial_state),
+        _needs_int64(x, weight, grad_output, grad_x, initial_state),
     )(
         x,
         weight,
@@ -3070,8 +3063,7 @@ def _launch_backward(
         initial_state is not None,
         resolved_activation,
         capability,
-        batches * tokens > 2**31 - 1
-        or requires_int64_abi(x, weight, grad_output, partials, initial_state),
+        _needs_int64(x, weight, grad_output, partials, initial_state),
     )(
         x,
         weight,
@@ -3091,8 +3083,7 @@ def _launch_backward(
             _input_alignment(x, input_config),
             packed,
             resolved_activation,
-            batches * tokens > 2**31 - 1
-            or requires_int64_abi(x, weight, grad_output, initial_state, grad_initial_state),
+            _needs_int64(x, weight, grad_output, initial_state, grad_initial_state),
         )(
             x,
             weight,
@@ -3231,9 +3222,7 @@ def tune_causal_conv1d(
     grad_matrix = grad_output.view(batches * tokens, channels)
     kernel_initial_state = None if width == 1 else initial_state
     state_matrix = None if kernel_initial_state is None else kernel_initial_state.flatten(0, 1)
-    use_int64_offsets = batches * tokens > 2**31 - 1 or requires_int64_abi(
-        x, weight, grad_output, state_matrix
-    )
+    use_int64_offsets = _needs_int64(x, weight, grad_output, state_matrix)
 
     forward_candidates = tuple(
         _candidate_configs("forward", channels, x.dtype, packed=packed)
@@ -3348,11 +3337,6 @@ def tune_causal_conv1d(
         parallel_compile=parallel_compile,
     )
     return ShortConvTunedConfig(forward, input_gradient, weight_gradient)
-
-
-def _config(threads: int, channels_per_thread: int, times_per_block: int) -> ShortConvConfig:
-    """Reconstruct a compile-time config from registered-operator scalar arguments."""
-    return ShortConvConfig(threads, channels_per_thread, times_per_block)
 
 
 def _fake_dynamic_rows(dtype: ShortConvDType, columns: int, use_int64_offsets: bool = False):
@@ -3550,11 +3534,6 @@ def _launch_decode(
     return output
 
 
-def _paged_forward_uses_int64_offsets(x: torch.Tensor, output: torch.Tensor) -> bool:
-    # The flattened row count is itself an ABI field, not just an address bound.
-    return x.shape[0] * x.shape[1] > 2**31 - 1 or requires_int64_abi(x, output)
-
-
 def _launch_paged_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3577,7 +3556,7 @@ def _launch_paged_forward(
     _validate_config(config, channels, "forward_config")
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = x.new_empty(x.shape)
-    use_int64_offsets = _paged_forward_uses_int64_offsets(x, output)
+    use_int64_offsets = _needs_int64(x, output)
     # Both kernels share channel ownership, so they read x through one signature.
     input_alignment = _input_alignment(x, config)
     _compile_paged_forward(
@@ -3757,7 +3736,7 @@ def _cute_short_conv_configured_decode_cuda(
         x,
         weight,
         state,
-        _config(forward_threads, forward_channels, forward_times),
+        ShortConvConfig(forward_threads, forward_channels, forward_times),
         state_indices,
         activation=activation,
         has_initial_state=has_initial_state,
@@ -3857,7 +3836,7 @@ def _cute_short_conv_configured_fwd_cuda(
     return _launch_forward(
         x,
         weight,
-        _config(forward_threads, forward_channels, forward_times),
+        ShortConvConfig(forward_threads, forward_channels, forward_times),
         cu_seqlens,
         initial_state,
         activation=activation,
@@ -3931,8 +3910,8 @@ def _cute_short_conv_configured_bwd_cuda(
         x,
         weight,
         grad_output,
-        _config(input_threads, input_channels, input_times),
-        _config(weight_threads, weight_channels, weight_times),
+        ShortConvConfig(input_threads, input_channels, input_times),
+        ShortConvConfig(weight_threads, weight_channels, weight_times),
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=False,
@@ -3963,8 +3942,8 @@ def _cute_short_conv_configured_bwd_with_state_grad_cuda(
         x,
         weight,
         grad_output,
-        _config(input_threads, input_channels, input_times),
-        _config(weight_threads, weight_channels, weight_times),
+        ShortConvConfig(input_threads, input_channels, input_times),
+        ShortConvConfig(weight_threads, weight_channels, weight_times),
         cu_seqlens,
         initial_state,
         compute_initial_state_grad=True,
