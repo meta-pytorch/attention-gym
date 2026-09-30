@@ -18,7 +18,10 @@ from typing import Literal, NamedTuple
 import torch
 
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
-from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
+from attn_gym.linear._delta_rule.validation import (
+    resolve_backend_options,
+    validate_delta_rule_inputs,
+)
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -38,29 +41,15 @@ def resolve_kernel_options(
     """Validate chunk backend options and resolve their defaults."""
     if kernel_options is None:
         return ResolvedKernelOptions("fused", False, False)
-    unknown = kernel_options.keys() - ResolvedKernelOptions._fields
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unsupported chunk_kda kernel options: {names}")
-    backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "cudnn"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
-    splits = {}
-    for name in ("split_backward", "split_forward"):
-        value = kernel_options.get(name, False)
-        if not isinstance(value, bool):
-            raise TypeError(f"kernel_options['{name}'] must be a bool")
-        if value and backend != "cudnn":
-            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
-        splits[name] = value
+    backend, split_backward, split_forward = resolve_backend_options(
+        kernel_options, op_name="chunk_kda", fields=ResolvedKernelOptions._fields
+    )
     schedule = kernel_options.get("schedule", "auto")
     if schedule not in ("auto", "static", "persistent"):
         raise ValueError("kernel_options['schedule'] must be 'auto', 'static', or 'persistent'")
     if schedule != "auto" and backend != "fused":
         raise ValueError("schedule requires kernel_options['backend']='fused'")
-    return ResolvedKernelOptions(
-        backend, splits["split_backward"], splits["split_forward"], ScheduleRequest(schedule)
-    )
+    return ResolvedKernelOptions(backend, split_backward, split_forward, ScheduleRequest(schedule))
 
 
 def validate_cudnn_fastmath(fastmath: bool) -> None:

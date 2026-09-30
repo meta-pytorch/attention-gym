@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Collection, Mapping
 from numbers import Real
 
 import torch
@@ -74,6 +75,35 @@ def validate_delta_rule_inputs(
     tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")
+
+
+def resolve_backend_options(
+    kernel_options: Mapping[str, object],
+    *,
+    op_name: str,
+    fields: Collection[str],
+) -> tuple[str, bool, bool]:
+    """Validate the shared chunk ``backend``/``split_*`` options.
+
+    Returns ``(backend, split_backward, split_forward)``; ``fields`` lists every key the
+    caller accepts, so family-specific keys are validated by the caller.
+    """
+    unknown = kernel_options.keys() - fields
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported {op_name} kernel options: {names}")
+    backend = kernel_options.get("backend", "fused")
+    if backend not in ("fused", "cudnn"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
+    splits = []
+    for name in ("split_backward", "split_forward"):
+        value = kernel_options.get(name, False)
+        if not isinstance(value, bool):
+            raise TypeError(f"kernel_options['{name}'] must be a bool")
+        if value and backend != "cudnn":
+            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
+        splits.append(value)
+    return backend, *splits
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -194,6 +224,7 @@ def validate_paged_state(
 
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
+    "resolve_backend_options",
     "resolve_decode_out",
     "resolve_scale",
     "validate_decode_inputs",
