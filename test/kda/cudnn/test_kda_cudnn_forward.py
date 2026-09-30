@@ -8,11 +8,7 @@ pytest.importorskip(
     reason="the CuTeDSL 4.7 KDA path requires nvidia-cutlass-dsl>=4.7",
 )
 
-from attn_gym.linear._delta_rule.cudnn import forward as adapter
-from attn_gym.linear._delta_rule.cudnn.forward import (
-    chunk_delta_rule_fwd_cudnn,
-    chunk_delta_rule_fwd_cudnn_unsplit_with_state,
-)
+from attn_gym.linear._delta_rule.cudnn.forward import run_forward
 from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
     WORK_ITEM_FIELDS,
     build_split_table,
@@ -88,13 +84,17 @@ def test_cudnn_forward_packed_tail_empty_and_deterministic(dtype: torch.dtype) -
     high_precision, _ = _reference_forward(
         q, k, value, gate, beta, zero_state, cu_seqlens, torch.float64
     )
-    actual = chunk_delta_rule_fwd_cudnn(q, k, value, gate, beta, cu_seqlens)
+    actual, _ = run_forward(
+        q, k, value, gate, beta, cu_seqlens, None, scale=None, output_final_state=False
+    )
     assert_matches_low_precision_reference(
         actual, high_precision, low_precision, "output", source_dtype=dtype
     )
     for _ in range(20):
         torch.testing.assert_close(
-            chunk_delta_rule_fwd_cudnn(q, k, value, gate, beta, cu_seqlens),
+            run_forward(
+                q, k, value, gate, beta, cu_seqlens, None, scale=None, output_final_state=False
+            )[0],
             actual,
             rtol=0,
             atol=0,
@@ -106,14 +106,16 @@ def test_cudnn_forward_packed_tail_empty_and_deterministic(dtype: torch.dtype) -
     high_output, high_state = _reference_forward(
         q, k, value, gate, beta, initial_state, cu_seqlens, torch.float64
     )
-    actual_output, actual_state = chunk_delta_rule_fwd_cudnn_unsplit_with_state(
+    actual_output, actual_state = run_forward(
         q,
         k,
         value,
         gate,
         beta,
-        initial_state,
         cu_seqlens,
+        initial_state,
+        scale=None,
+        output_final_state=True,
     )
     assert_matches_low_precision_reference(
         actual_output, high_output, low_output, "stateful output", source_dtype=dtype
@@ -210,7 +212,17 @@ def test_cudnn_forward_rejects_misaligned_tma() -> None:
     storage = torch.empty(q.numel() + 1, dtype=q.dtype, device="cuda")
     misaligned_q = storage[1:].view_as(q)
     with pytest.raises(TypeError, match="TMA-compatible inner mode"):
-        adapter.chunk_delta_rule_fwd_cudnn(misaligned_q, k, value, gate, beta, cu_seqlens)
+        run_forward(
+            misaligned_q,
+            k,
+            value,
+            gate,
+            beta,
+            cu_seqlens,
+            None,
+            scale=None,
+            output_final_state=False,
+        )
 
 
 def test_cudnn_public_forward_preserves_large_finite_state() -> None:
@@ -246,14 +258,16 @@ def test_cudnn_public_forward_preserves_large_finite_state() -> None:
         cu_seqlens,
         torch.float64,
     )
-    actual, _ = adapter.chunk_delta_rule_fwd_cudnn_unsplit_with_state(
+    actual, _ = run_forward(
         q,
         k,
         value,
         gate,
         beta,
-        initial_state,
         cu_seqlens,
+        initial_state,
+        scale=None,
+        output_final_state=True,
     )
     assert_matches_low_precision_reference(
         actual,
