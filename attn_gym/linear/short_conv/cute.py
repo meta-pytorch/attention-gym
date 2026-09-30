@@ -4501,7 +4501,7 @@ def causal_conv1d(
         if not _input_gradient_uses_tma(
             descriptor,
             input_grad,
-            cu_seqlens.shape[0] - 1,
+            True,
             channels,
             weight.shape[1],
             capability,
