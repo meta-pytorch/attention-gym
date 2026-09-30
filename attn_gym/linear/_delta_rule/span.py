@@ -22,6 +22,20 @@ from attn_gym.linear._delta_rule.validation import resolve_scale
 CHUNK_SIZE = 64
 
 
+def pack_dense_batch(
+    *tensors: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Flatten dense ``[B, T, ...]`` tensors into one packed row.
+
+    Returns ``(cu_seqlens, *packed)`` with one logical sequence per batch row.
+    """
+    batch, tokens = tensors[0].shape[:2]
+    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=tensors[0].device) * tokens
+    return cu_seqlens, *(
+        tensor.reshape(1, batch * tokens, *tensor.shape[2:]) for tensor in tensors
+    )
+
+
 class PreparedSpan(NamedTuple):
     """Normalized operands and chunk schedule of one ``B=1`` span."""
 

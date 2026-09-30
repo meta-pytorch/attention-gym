@@ -9,6 +9,7 @@ import torch
 from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.span import pack_dense_batch
 
 _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
@@ -551,12 +552,7 @@ def chunk_forward(
     # The dense kernels specialize for complete BT64 chunks. Flatten other dense inputs and
     # synthesize one packed segment per batch row so tails stay masked and never cross batches.
     if cu_seqlens is None and (batch != 1 or tokens % 64):
-        q = q.reshape(1, batch * tokens, q.shape[2], q.shape[3])
-        k = k.reshape(1, batch * tokens, k.shape[2], k.shape[3])
-        v = v.reshape(1, batch * tokens, v.shape[2], v.shape[3])
-        gate = gate.reshape(1, batch * tokens, gate.shape[2])
-        beta = beta.reshape(1, batch * tokens, beta.shape[2])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
 
     metadata = (
         prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
@@ -611,14 +607,8 @@ def paged_chunk_forward(
         )
 
     output_shape = v.shape
-    batch, tokens = q.shape[:2]
     if cu_seqlens is None:
-        q = q.reshape(1, batch * tokens, q.shape[2], q.shape[3])
-        k = k.reshape(1, batch * tokens, k.shape[2], k.shape[3])
-        v = v.reshape(1, batch * tokens, v.shape[2], v.shape[3])
-        gate = gate.reshape(1, batch * tokens, gate.shape[2])
-        beta = beta.reshape(1, batch * tokens, beta.shape[2])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
 
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
     gate = gate.float()

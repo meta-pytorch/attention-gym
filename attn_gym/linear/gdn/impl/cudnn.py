@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear.gdn.impl.cudnn_ops import (
     chunk_gdn_cudnn_packed_bwd_op,
     chunk_gdn_cudnn_packed_bwd_with_state_op,
@@ -19,11 +20,6 @@ from attn_gym.linear.gdn.impl.cudnn_ops import (
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 _CUDNN_DIM = 128
-
-
-def _pack_dense(tensor: Tensor) -> Tensor:
-    """Lower dense [B, T, ...] tensors to cuDNN's packed batch-one layout."""
-    return tensor.reshape(1, -1, *tensor.shape[2:])
 
 
 def _validate_cudnn_constraints(
@@ -174,14 +170,11 @@ def chunk_forward(
     batch = q.shape[0]
     output_shape = value.shape
     if cu_seqlens is None:
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+        cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
     elif batch != 1:
         raise ValueError("packed cu_seqlens require q to have batch size one")
     else:
         cu_seqlens = cu_seqlens.contiguous()
-
-    if batch > 1:
-        q, k, value, gate, beta = (_pack_dense(tensor) for tensor in (q, k, value, gate, beta))
 
     if output_final_state and initial_state is None:
         initial_state = torch.zeros(
@@ -243,14 +236,11 @@ def paged_chunk_forward(
     batch = q.shape[0]
     output_shape = value.shape
     if cu_seqlens is None:
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+        cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
     elif batch != 1:
         raise ValueError("packed cu_seqlens require q to have batch size one")
     else:
         cu_seqlens = cu_seqlens.contiguous()
-
-    if batch > 1:
-        q, k, value, gate, beta = (_pack_dense(tensor) for tensor in (q, k, value, gate, beta))
 
     _validate_cudnn_constraints(q, k, value, gate, beta, state_cache)
 

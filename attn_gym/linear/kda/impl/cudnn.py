@@ -9,6 +9,7 @@ import torch
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.linear.kda.impl.cudnn_ops import (
     chunk_cudnn_packed_fwd_op,
@@ -242,15 +243,11 @@ def paged_chunk_forward(
     batch = q.shape[0]
     output_shape = value.shape
     if cu_seqlens is None:
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+        cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
     elif batch != 1:
         raise ValueError("packed cu_seqlens require q to have batch size one")
     else:
         cu_seqlens = cu_seqlens.contiguous()
-    if batch > 1:
-        q, k, value, gate, beta = (
-            tensor.reshape(1, -1, *tensor.shape[2:]) for tensor in (q, k, value, gate, beta)
-        )
 
     validate_cudnn_constraints(q, k, value, gate, beta, state_cache, cu_seqlens)
     output = chunk_cudnn_packed_fwd_paged_op(
