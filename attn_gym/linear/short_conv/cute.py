@@ -269,48 +269,7 @@ def load_paged_history(
 def history_dot(
     inputs: cute.Tensor,
     weights: cute.Tensor,
-    initial_state: cute.Tensor,
-    sequence: Int32,
-    output_time: Int32,
-    sequence_start: Int32,
-    input_offset: cutlass.Constexpr,
-    channel_group: Int32,
-    channels_per_thread: cutlass.Constexpr,
-    width: cutlass.Constexpr,
-):
-    """Evaluate an early convolution dot product from staged input and compact history."""
-    products = cute.make_rmem_tensor((channels_per_thread, width), Float32)
-    for tap in cutlass.range_constexpr(width):
-        input_time = output_time + tap - (width - 1)
-        input_value = cute.make_rmem_tensor((channels_per_thread,), Float32)
-        if input_time >= sequence_start:
-            input_value.store(inputs[(None, input_offset + tap)].load().to(Float32))
-        else:
-            input_value.store(
-                load_history(
-                    initial_state,
-                    sequence,
-                    input_time,
-                    sequence_start,
-                    channel_group,
-                    width,
-                )
-            )
-        products[(None, tap)].store(input_value.load() * weights[(None, tap)].load())
-    return products.load().reduce(
-        cute.ReductionOp.ADD,
-        Float32(0.0),
-        reduction_profile=(None, 1),
-    )
-
-
-@cute.jit
-def paged_history_dot(
-    inputs: cute.Tensor,
-    weights: cute.Tensor,
     state: cute.Tensor,
-    state_indices: cute.Tensor,
-    has_initial_state: cute.Tensor | None,
     sequence: Int32,
     output_time: Int32,
     sequence_start: Int32,
@@ -318,14 +277,24 @@ def paged_history_dot(
     channel_group: Int32,
     channels_per_thread: cutlass.Constexpr,
     width: cutlass.Constexpr,
+    state_indices: cute.Tensor | None = None,
+    has_initial_state: cute.Tensor | None = None,
 ):
-    """Evaluate an early convolution dot product from staged input and paged history."""
+    """Evaluate an early convolution dot product from staged input and history.
+
+    ``state`` is compact channel-grouped history, or a paged pool when ``state_indices``
+    is given.
+    """
     products = cute.make_rmem_tensor((channels_per_thread, width), Float32)
     for tap in cutlass.range_constexpr(width):
         input_time = output_time + tap - (width - 1)
         input_value = cute.make_rmem_tensor((channels_per_thread,), Float32)
         if input_time >= sequence_start:
             input_value.store(inputs[(None, input_offset + tap)].load().to(Float32))
+        elif cutlass.const_expr(state_indices is None):
+            input_value.store(
+                load_history(state, sequence, input_time, sequence_start, channel_group, width)
+            )
         else:
             input_value.store(
                 load_paged_history(
@@ -388,6 +357,28 @@ class ShortConvKernel:
         return x_groups[
             ((0, 0, None), (self.upcast_offset(batch), self.upcast_offset(time), channel_group))
         ]
+
+    @cute.jit
+    def row_group(self, groups: cute.Tensor, batch, time, tokens, channel_group):
+        """Select one channel group of a channel-grouped compact ``[B * T, C]`` matrix."""
+        return groups[((0, None), (self.flattened_row(batch, time, tokens), channel_group))]
+
+    @cute.jit
+    def load_weights(self, weight: cute.Tensor, channel):
+        """Load this thread's ``[channels_per_thread, W]`` weights as FP32 registers."""
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+            for tap in cutlass.range_constexpr(self.width):
+                weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+        return weights
+
+    def launch_grid(self, time_blocks, batches, cu_seqlens: cute.Tensor | None):
+        """Return the time-tiled grid; see NOTE [Long-sequence launch grids]."""
+        return (
+            time_blocks,
+            cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+            1 if cutlass.const_expr(cu_seqlens is not None) else batches,
+        )
 
     def get_name(self) -> str:
         """Return the stable compiled-artifact name."""
@@ -473,11 +464,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         # The caller proves this tile starts before the active endpoint.
         # See NOTE [Packed forward active endpoint].
         if channel < self.channels:
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
-
+            weights = self.load_weights(weight, channel)
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
             initial_groups = initial_state
             if cutlass.const_expr(initial_state is not None and state_indices is None):
@@ -522,34 +509,20 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     if cutlass.const_expr(initial_state is not None):
                         value = unrolled_dot(inputs, weights, time_offset, self.width)
                         if time - (self.width - 1) < sequence_start:
-                            if cutlass.const_expr(state_indices is None):
-                                value = history_dot(
-                                    inputs,
-                                    weights,
-                                    initial_groups,
-                                    sequence,
-                                    Int32(time),
-                                    sequence_start,
-                                    time_offset,
-                                    channel_group,
-                                    self.channels_per_thread,
-                                    self.width,
-                                )
-                            else:
-                                value = paged_history_dot(
-                                    inputs,
-                                    weights,
-                                    initial_state,
-                                    state_indices,
-                                    has_initial_state,
-                                    sequence,
-                                    Int32(time),
-                                    sequence_start,
-                                    time_offset,
-                                    channel_group,
-                                    self.channels_per_thread,
-                                    self.width,
-                                )
+                            value = history_dot(
+                                inputs,
+                                weights,
+                                initial_groups,
+                                sequence,
+                                Int32(time),
+                                sequence_start,
+                                time_offset,
+                                channel_group,
+                                self.channels_per_thread,
+                                self.width,
+                                state_indices,
+                                has_initial_state,
+                            )
                     elif cutlass.const_expr(cu_seqlens is None):
                         value = unrolled_dot(inputs, weights, time_offset, self.width)
                     else:
@@ -577,9 +550,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
                             )
                             padding.fill(self.dtype.cute_type(0.0))
                             value = padding.load()
-                    output_groups[
-                        ((0, None), (self.flattened_row(batch, time, tokens), channel_group))
-                    ].store(value)
+                    self.row_group(output_groups, batch, time, tokens, channel_group).store(value)
 
     @cute.kernel
     def kernel(
@@ -664,10 +635,8 @@ class CausalConv1dSiluForward(ShortConvKernel):
             None,
             tokens,
         ).launch(
-            grid=(
-                cute.ceil_div(tokens, self.times_per_block),
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
+            grid=self.launch_grid(
+                cute.ceil_div(tokens, self.times_per_block), x.shape[0], cu_seqlens
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -704,10 +673,8 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
             has_initial_state,
             tokens,
         ).launch(
-            grid=(
-                cute.ceil_div(tokens, self.times_per_block),
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else cute.size(state_indices),
+            grid=self.launch_grid(
+                cute.ceil_div(tokens, self.times_per_block), cute.size(state_indices), cu_seqlens
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -769,12 +736,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
             state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
 
             if active:
-                weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-                for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                    for tap in cutlass.range_constexpr(self.width):
-                        weights[channel_offset, tap] = Float32(
-                            weight[channel + channel_offset, tap]
-                        )
+                weights = self.load_weights(weight, channel)
 
                 taps = cute.make_rmem_tensor(
                     (self.channels_per_thread, self.width), self.dtype.cute_type
@@ -918,10 +880,8 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
         )
 
 
-class CausalConv1dSiluInputGradient(ShortConvKernel):
-    """Recompute the preactivation and apply a compile-time activation derivative."""
-
-    kernel_kind = "dx"
+class ShortConvGradientKernel(ShortConvKernel):
+    """Own the compile-time activation derivative shared by the gradient kernels."""
 
     def __init__(
         self,
@@ -940,6 +900,12 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             use_int64_offsets,
         )
         self.d_activation = d_activation
+
+
+class CausalConv1dSiluInputGradient(ShortConvGradientKernel):
+    """Recompute the preactivation and apply a compile-time activation derivative."""
+
+    kernel_kind = "dx"
 
     @cute.kernel
     def kernel(
@@ -966,10 +932,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             dx_groups = cute.zipped_divide(grad_x, (1, self.channels_per_thread))
             if cutlass.const_expr(initial_state is not None):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+            weights = self.load_weights(weight, channel)
 
             inputs = cute.make_rmem_tensor(
                 (self.channels_per_thread, self.times_per_block + 2 * (self.width - 1)),
@@ -1048,12 +1011,7 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                         )
                     derivative = self.d_activation(value)
                     incoming = (
-                        dy_groups[
-                            (
-                                (0, None),
-                                (self.flattened_row(batch, output_time, tokens), channel_group),
-                            )
-                        ]
+                        self.row_group(dy_groups, batch, output_time, tokens, channel_group)
                         .load()
                         .to(Float32)
                     )
@@ -1101,9 +1059,9 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
                         Float32(0.0),
                         reduction_profile=(None, 1),
                     )
-                    dx_groups[
-                        ((0, None), (self.flattened_row(batch, time, tokens), channel_group))
-                    ].store(value.to(self.dtype.cute_type))
+                    self.row_group(dx_groups, batch, time, tokens, channel_group).store(
+                        value.to(self.dtype.cute_type)
+                    )
 
     @cute.jit
     def __call__(
@@ -1128,38 +1086,18 @@ class CausalConv1dSiluInputGradient(ShortConvKernel):
             initial_state,
             tokens,
         ).launch(
-            grid=(
-                cute.ceil_div(tokens, self.times_per_block),
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
+            grid=self.launch_grid(
+                cute.ceil_div(tokens, self.times_per_block), x.shape[0], cu_seqlens
             ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
 
 
-class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
+class CausalConv1dSiluWeightGradientPartials(ShortConvGradientKernel):
     """Compute FP32 batch/time-tile partial sums for the weight gradient."""
 
     kernel_kind = "dw"
-
-    def __init__(
-        self,
-        channels: int,
-        width: int,
-        config: ShortConvConfig,
-        dtype: ShortConvDType,
-        d_activation,
-        use_int64_offsets: bool = False,
-    ):
-        super().__init__(
-            channels,
-            width,
-            config,
-            dtype,
-            use_int64_offsets,
-        )
-        self.d_activation = d_activation
 
     @cute.kernel
     def kernel(
@@ -1185,12 +1123,9 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
             if cutlass.const_expr(initial_state is not None):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             accumulators = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
             accumulators.fill(Float32(0.0))
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+            weights = self.load_weights(weight, channel)
 
             sequence, sequence_start, sequence_end = tile_sequence_bounds(
                 cu_seqlens,
@@ -1242,12 +1177,7 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
                         )
                         derivative = self.d_activation(value)
                         incoming = (
-                            dy_groups[
-                                (
-                                    (0, None),
-                                    (self.flattened_row(batch, time, tokens), channel_group),
-                                )
-                            ]
+                            self.row_group(dy_groups, batch, time, tokens, channel_group)
                             .load()
                             .to(Float32)
                         )
@@ -1287,10 +1217,8 @@ class CausalConv1dSiluWeightGradientPartials(ShortConvKernel):
             initial_state,
             tokens,
         ).launch(
-            grid=(
-                cute.ceil_div(tokens, self.times_per_block),
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
+            grid=self.launch_grid(
+                cute.ceil_div(tokens, self.times_per_block), x.shape[0], cu_seqlens
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -1526,6 +1454,7 @@ class ShortConvTmaKernel:
         time_tile: Int32,
         channel_tile: Int32,
     ):
+        """Issue one two-input stage and return the advanced producer state."""
         tile_pipeline.producer_acquire(producer_state)
         barrier = tile_pipeline.producer_get_barrier(producer_state)
         cute.copy(
@@ -1540,6 +1469,38 @@ class ShortConvTmaKernel:
             tDsD[(None, producer_state.index)],
             tma_bar_ptr=barrier,
         )
+        producer_state.advance()
+        return producer_state
+
+    @cute.jit
+    def issue_prologue(
+        self,
+        tile_pipeline: pipeline.PipelineTmaAsync,
+        producer_state: pipeline.PipelineState,
+        tma_atom_x: cute.CopyAtom,
+        tXgX: cute.Tensor,
+        tXsX: cute.Tensor,
+        tma_atom_dy: cute.CopyAtom,
+        tDgD: cute.Tensor,
+        tDsD: cute.Tensor,
+        first_time_tile: Int32,
+        channel_tile: Int32,
+    ):
+        """Fill every pipeline stage starting at ``first_time_tile``."""
+        for issued in cutlass.range_constexpr(self.stages):
+            producer_state = self.issue_stage(
+                tile_pipeline,
+                producer_state,
+                tma_atom_x,
+                tXgX,
+                tXsX,
+                tma_atom_dy,
+                tDgD,
+                tDsD,
+                first_time_tile + Int32(issued),
+                channel_tile,
+            )
+        return producer_state
 
 
 class CausalConv1dSiluInputGradientTma(
@@ -1611,9 +1572,9 @@ class CausalConv1dSiluInputGradientTma(
         if cutlass.const_expr(packed):
             owns_input = owns_input and input_time >= sequence_start
         if owns_input:
-            grad_x_groups[
-                ((0, None), (self.flattened_row(batch, input_time, tokens), channel_group))
-            ].store(dx_value.to(self.dtype.cute_type))
+            self.row_group(grad_x_groups, batch, input_time, tokens, channel_group).store(
+                dx_value.to(self.dtype.cute_type)
+            )
 
     @cute.jit
     def flush_mainloop_sequence(
@@ -1740,7 +1701,6 @@ class CausalConv1dSiluInputGradientTma(
             (self.channels_per_thread, self.width),
             Float32,
         )
-        history.fill(self.dtype.cute_type(0.0))
         grad_z.fill(Float32(0.0))
         sequence, sequence_start, sequence_end = tile_sequence_bounds(
             cu_seqlens,
@@ -1754,25 +1714,17 @@ class CausalConv1dSiluInputGradientTma(
             (channel_group, 0),
         )
         weights.store(weight_tile.load().to(Float32))
-        if cutlass.const_expr(initial_state is None):
-            for history_offset in cutlass.range_constexpr(self.width - 1):
-                history_time = time_start + history_offset - (self.width - 1)
-                if history_time >= sequence_start:
-                    history[(None, history_offset)].store(
-                        self.input_group(x, batch, history_time, channel_group).load()
-                    )
-        else:
-            self.initialize_history(
-                history,
-                x,
-                initial_state,
-                sequence,
-                sequence_start,
-                Int32(time_start),
-                Int32(batch),
-                Int32(channel_group),
-                tokens,
-            )
+        self.initialize_history(
+            history,
+            x,
+            initial_state,
+            sequence,
+            sequence_start,
+            Int32(time_start),
+            Int32(batch),
+            Int32(channel_group),
+            tokens,
+        )
 
         for subtile in cutlass.range_constexpr(subtiles):
             tile_pipeline.consumer_wait(consumer_state)
@@ -1855,7 +1807,7 @@ class CausalConv1dSiluInputGradientTma(
             tile_pipeline.consumer_release(consumer_state)
             consumer_state.advance()
             if cutlass.const_expr(subtile + self.stages < subtiles) and warp_idx == 0:
-                self.issue_stage(
+                producer_state = self.issue_stage(
                     tile_pipeline,
                     producer_state,
                     tma_atom_x,
@@ -1867,7 +1819,6 @@ class CausalConv1dSiluInputGradientTma(
                     first_time_tile + Int32(subtile + self.stages),
                     Int32(channel_block),
                 )
-                producer_state.advance()
 
         # A boundary in the lookahead belongs to the next CTA; zero-fill this CTA's tail.
         for tail in cutlass.range_constexpr(self.width - 1):
@@ -1889,12 +1840,7 @@ class CausalConv1dSiluInputGradientTma(
             if has_input:
                 current.store(self.input_group(x, batch, output_time, channel_group).load())
                 incoming.store(
-                    dy_groups[
-                        (
-                            (0, None),
-                            (self.flattened_row(batch, output_time, tokens), channel_group),
-                        )
-                    ]
+                    self.row_group(dy_groups, batch, output_time, tokens, channel_group)
                     .load()
                     .to(Float32)
                 )
@@ -1962,20 +1908,18 @@ class CausalConv1dSiluInputGradientTma(
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_x)
             cpasync.prefetch_descriptor(tma_atom_dy)
-            for issued in cutlass.range_constexpr(self.stages):
-                self.issue_stage(
-                    tile_pipeline,
-                    producer_state,
-                    tma_atom_x,
-                    tXgX,
-                    tXsX,
-                    tma_atom_dy,
-                    tDgD,
-                    tDsD,
-                    first_time_tile + Int32(issued),
-                    Int32(channel_block),
-                )
-                producer_state.advance()
+            producer_state = self.issue_prologue(
+                tile_pipeline,
+                producer_state,
+                tma_atom_x,
+                tXgX,
+                tXsX,
+                tma_atom_dy,
+                tDgD,
+                tDsD,
+                first_time_tile,
+                Int32(channel_block),
+            )
 
         if cutlass.const_expr(cu_seqlens is None):
             producer_state, consumer_state = self.run_mainloop(
@@ -2064,9 +2008,8 @@ class CausalConv1dSiluInputGradientTma(
     ):
         """Stride a fixed TMA worker grid over runtime-active input-gradient tiles."""
         tidx, _, _ = cute.arch.thread_idx()
-        worker, channel_block, batch = cute.arch.block_idx()
-        if cutlass.const_expr(cu_seqlens is not None):
-            batch = Int32(0)
+        worker, channel_block, _ = cute.arch.block_idx()
+        batch = Int32(0)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         (
             tile_pipeline,
@@ -2096,20 +2039,18 @@ class CausalConv1dSiluInputGradientTma(
         for time_block in cutlass.range(worker, active_time_blocks, cute.arch.grid_dim()[0]):
             first_time_tile = time_block * stages_per_tile
             if warp_idx == 0:
-                for issued in cutlass.range_constexpr(self.stages):
-                    self.issue_stage(
-                        tile_pipeline,
-                        producer_state,
-                        tma_atom_x,
-                        tXgX,
-                        tXsX,
-                        tma_atom_dy,
-                        tDgD,
-                        tDsD,
-                        Int32(first_time_tile + issued),
-                        Int32(channel_block),
-                    )
-                    producer_state.advance()
+                producer_state = self.issue_prologue(
+                    tile_pipeline,
+                    producer_state,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_dy,
+                    tDgD,
+                    tDsD,
+                    Int32(first_time_tile),
+                    Int32(channel_block),
+                )
             producer_state, consumer_state = self.run_mainloop(
                 tile_pipeline,
                 producer_state,
@@ -2152,54 +2093,29 @@ class CausalConv1dSiluInputGradientTma(
             tokens,
             cu_seqlens is not None,
         )
+        kernel = self.tma_kernel
+        time_blocks = cute.ceil_div(tokens, self.times_per_block)
         if cutlass.const_expr(self.time_workers > 0):
-            self.persistent_tma_kernel.set_name_prefix(self.get_name())
-            self.persistent_tma_kernel(
-                x,
-                weight,
-                grad_output,
-                grad_x,
-                cu_seqlens,
-                initial_state,
-                tma_atom_x,
-                tma_tensor_x,
-                tma_atom_dy,
-                tma_tensor_dy,
-                tokens,
-            ).launch(
-                grid=(
-                    cutlass.min(
-                        Int32(self.time_workers), cute.ceil_div(tokens, self.times_per_block)
-                    ),
-                    self.channels // (self.threads * self.channels_per_thread),
-                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
-                ),
-                block=(self.threads, 1, 1),
-                stream=stream,
-            )
-        else:
-            self.tma_kernel.set_name_prefix(self.get_name())
-            self.tma_kernel(
-                x,
-                weight,
-                grad_output,
-                grad_x,
-                cu_seqlens,
-                initial_state,
-                tma_atom_x,
-                tma_tensor_x,
-                tma_atom_dy,
-                tma_tensor_dy,
-                tokens,
-            ).launch(
-                grid=(
-                    cute.ceil_div(tokens, self.times_per_block),
-                    self.channels // (self.threads * self.channels_per_thread),
-                    1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
-                ),
-                block=(self.threads, 1, 1),
-                stream=stream,
-            )
+            kernel = self.persistent_tma_kernel
+            time_blocks = cutlass.min(Int32(self.time_workers), time_blocks)
+        kernel.set_name_prefix(self.get_name())
+        kernel(
+            x,
+            weight,
+            grad_output,
+            grad_x,
+            cu_seqlens,
+            initial_state,
+            tma_atom_x,
+            tma_tensor_x,
+            tma_atom_dy,
+            tma_tensor_dy,
+            tokens,
+        ).launch(
+            grid=self.launch_grid(time_blocks, x.shape[0], cu_seqlens),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
 
 
 class CausalConv1dSiluWeightGradientPartialsTma(
@@ -2258,20 +2174,18 @@ class CausalConv1dSiluWeightGradientPartialsTma(
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_x)
             cpasync.prefetch_descriptor(tma_atom_dy)
-            for issued in cutlass.range_constexpr(self.stages):
-                self.issue_stage(
-                    tile_pipeline,
-                    producer_state,
-                    tma_atom_x,
-                    tXgX,
-                    tXsX,
-                    tma_atom_dy,
-                    tDgD,
-                    tDsD,
-                    first_time_tile + Int32(issued),
-                    Int32(channel_block),
-                )
-                producer_state.advance()
+            producer_state = self.issue_prologue(
+                tile_pipeline,
+                producer_state,
+                tma_atom_x,
+                tXgX,
+                tXsX,
+                tma_atom_dy,
+                tDgD,
+                tDsD,
+                first_time_tile,
+                Int32(channel_block),
+            )
 
         sX_groups = cute.zipped_divide(sX, (1, self.channels_per_thread, 1))
         sD_groups = cute.zipped_divide(sD, (1, self.channels_per_thread, 1))
@@ -2295,21 +2209,16 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             (channel_group, 0),
         )
         weights.store(weight_tile.load().to(Float32))
-        if cutlass.const_expr(initial_state is None):
+        if cutlass.const_expr(initial_state is None and self.dtype.name == "fp32"):
             for history_offset in cutlass.range_constexpr(self.width - 1):
                 history_time = time_start + history_offset - (self.width - 1)
                 if history_time >= sequence_start:
-                    if cutlass.const_expr(self.dtype.name == "fp32"):
-                        for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                            history[channel_offset, history_offset] = x[
-                                self.upcast_offset(batch),
-                                self.upcast_offset(history_time),
-                                channel + channel_offset,
-                            ]
-                    else:
-                        history[(None, history_offset)].store(
-                            self.input_group(x, batch, history_time, channel_group).load()
-                        )
+                    for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
+                        history[channel_offset, history_offset] = x[
+                            self.upcast_offset(batch),
+                            self.upcast_offset(history_time),
+                            channel + channel_offset,
+                        ]
         else:
             self.initialize_history(
                 history,
@@ -2406,7 +2315,7 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             consumer_state.advance()
 
             if cutlass.const_expr(subtile + self.stages < subtiles) and warp_idx == 0:
-                self.issue_stage(
+                producer_state = self.issue_stage(
                     tile_pipeline,
                     producer_state,
                     tma_atom_x,
@@ -2418,7 +2327,6 @@ class CausalConv1dSiluWeightGradientPartialsTma(
                     first_time_tile + Int32(subtile + self.stages),
                     Int32(channel_block),
                 )
-                producer_state.advance()
 
         for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
             for tap in cutlass.range_constexpr(self.width):
@@ -2459,17 +2367,15 @@ class CausalConv1dSiluWeightGradientPartialsTma(
             tma_tensor_dy,
             tokens,
         ).launch(
-            grid=(
-                cute.ceil_div(tokens, self.times_per_block),
-                self.channels // (self.threads * self.channels_per_thread),
-                1 if cutlass.const_expr(cu_seqlens is not None) else x.shape[0],
+            grid=self.launch_grid(
+                cute.ceil_div(tokens, self.times_per_block), x.shape[0], cu_seqlens
             ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
 
 
-class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
+class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
     """Differentiate causal history using its triangular output dependency.
 
     History position ``s`` contributes to output positions ``o <= s`` through
@@ -2479,24 +2385,6 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
 
     kernel_kind = "dstate"
     time_tiled = False
-
-    def __init__(
-        self,
-        channels: int,
-        width: int,
-        config: ShortConvConfig,
-        dtype: ShortConvDType,
-        d_activation,
-        use_int64_offsets: bool = False,
-    ):
-        super().__init__(
-            channels,
-            width,
-            config,
-            dtype,
-            use_int64_offsets,
-        )
-        self.d_activation = d_activation
 
     @cute.kernel
     def kernel(
@@ -2529,10 +2417,7 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
             state_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             dy_groups = cute.zipped_divide(grad_output, (1, self.channels_per_thread))
             dstate_groups = cute.zipped_divide(grad_initial_state, (1, self.channels_per_thread))
-            weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
-            for channel_offset in cutlass.range_constexpr(self.channels_per_thread):
-                for tap in cutlass.range_constexpr(self.width):
-                    weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
+            weights = self.load_weights(weight, channel)
 
             gradient = cute.make_rmem_tensor((self.channels_per_thread,), Float32)
             gradient.fill(Float32(0.0))
@@ -2572,17 +2457,9 @@ class CausalConv1dSiluInitialStateGradient(ShortConvKernel):
                         reduction_profile=(None, 1),
                     )
                     output_gradient = (
-                        dy_groups[
-                            (
-                                (0, None),
-                                (
-                                    self.flattened_row(
-                                        batch, sequence_start + output_offset, tokens
-                                    ),
-                                    channel_group,
-                                ),
-                            )
-                        ]
+                        self.row_group(
+                            dy_groups, batch, sequence_start + output_offset, tokens, channel_group
+                        )
                         .load()
                         .to(Float32)
                     )
