@@ -139,6 +139,11 @@ def can_use_tma(tensor: torch.Tensor) -> bool:
     )
 
 
+def can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
+    """Return whether every tensor satisfies the host TMA requirements."""
+    return all(can_use_tma(tensor) for tensor in tensors)
+
+
 class PinnedConfigKernel:
     """An autotuned kernel pinned to its first config, the list's heuristic default.
 

@@ -113,7 +113,7 @@ def test_ragged_output_routes_full_chunks_through_tma_and_masks_tails(monkeypatc
     scale = 0.125
 
     expected = _reference(q, v, g, A, h, lengths, scale)
-    expected_tma = output_module._can_use_tensor_descriptors(q, v, g, h, torch.empty_like(v), A)
+    expected_tma = output_module.can_use_tensor_descriptors(q, v, g, h, torch.empty_like(v), A)
     actual = output_module.chunk_gla_fwd_o_gk(q, v, g, A, h, scale, metadata=metadata)
     assert launch_count == int(expected_tma)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)

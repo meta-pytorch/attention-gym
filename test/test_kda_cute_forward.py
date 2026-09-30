@@ -768,7 +768,7 @@ def test_kda_tensor_descriptor_and_pointer_paths_match(monkeypatch):
     descriptor_gradients = torch.autograd.grad(descriptor_output, descriptor_inputs, d_output)
 
     for module_name, attribute in (
-        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "_can_use_tensor_descriptors"),
+        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "can_use_tensor_descriptors"),
         ("attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk", "can_use_tensor_descriptors"),
     ):
         module = importlib.import_module(module_name)
@@ -795,7 +795,7 @@ def test_kda_offset_width_specializations_match(monkeypatch):
     d_output = torch.randn_like(inputs[0])
 
     for module_name, attribute in (
-        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "_can_use_tensor_descriptors"),
+        ("attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o", "can_use_tensor_descriptors"),
         ("attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk", "can_use_tensor_descriptors"),
     ):
         module = importlib.import_module(module_name)

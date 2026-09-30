@@ -170,6 +170,17 @@ def tensor_supports_tma_rows(tensor: torch.Tensor) -> bool:
     )
 
 
+def normalize_tma_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy unless the tensor satisfies the aligned TMA contract.
+
+    The copy is a ``clone``: ``.contiguous()`` returns a contiguous view unchanged even when its
+    storage offset breaks the alignment.
+    """
+    if tensor_supports_tma(tensor):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
 def normalize_tma_rows(tensor: torch.Tensor) -> torch.Tensor:
     """Copy unless the tensor satisfies the aligned, compact-row TMA contract."""
     if tensor_supports_tma_rows(tensor):

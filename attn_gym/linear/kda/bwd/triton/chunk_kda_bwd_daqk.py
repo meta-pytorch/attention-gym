@@ -13,7 +13,11 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    can_use_tensor_descriptors,
+    ptr_offset,
+    requires_int64_offsets,
+)
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -193,11 +197,6 @@ def chunk_kda_bwd_kernel_dAqk(
             num_sequences,
             USE_INT64_OFFSETS,
         )
-
-
-def can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
-    """Return whether all tensors satisfy host TMA requirements."""
-    return all(can_use_tma(tensor) for tensor in tensors)
 
 
 @triton.jit
