@@ -11,6 +11,8 @@ import importlib
 
 import torch
 
+from attn_gym.linear._delta_rule.validation import require_inference_only
+
 _CHUNK_SIZE = 64
 
 
@@ -921,14 +923,11 @@ def recurrent_forward(
         raise ValueError(f"recurrent_kda requires K in [1, 256], got {q.shape[-1]}")
     if not q.is_cuda:
         raise ValueError("the fused recurrent scan requires CUDA tensors")
-    data_tensors = (q, k, v, gate, beta)
-    if initial_state is not None:
-        data_tensors += (initial_state,)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
-        raise RuntimeError(
-            "recurrent_kda is inference-only and has no backward; use chunk_kda for "
-            "training or call under torch.no_grad() / torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, v, gate, beta, initial_state),
+        "recurrent_kda is inference-only and has no backward; use chunk_kda for "
+        "training or call under torch.no_grad() / torch.inference_mode()",
+    )
 
     q, k, v, beta = (tensor.contiguous() for tensor in (q, k, v, beta))
     # FP32 gate loads measured faster than bf16 in the latency-bound scan loop.
@@ -973,12 +972,11 @@ def recurrent_decode_forward(
     """Invoke the lazily loaded fused decode implementation."""
     if not packed_qkv.is_cuda:
         raise ValueError("recurrent_kda_decode requires CUDA tensors")
-    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
-        raise RuntimeError(
-            "recurrent_kda_decode is inference-only and has no backward; "
-            "call under torch.no_grad() / torch.inference_mode()"
-        )
+    require_inference_only(
+        (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out),
+        "recurrent_kda_decode is inference-only and has no backward; "
+        "call under torch.no_grad() / torch.inference_mode()",
+    )
     recurrent_decode_op(
         packed_qkv,
         raw_gate,

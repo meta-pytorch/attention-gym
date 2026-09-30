@@ -10,7 +10,7 @@ from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_suppo
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import resolve_scale
+from attn_gym.linear._delta_rule.validation import require_inference_only, resolve_scale
 from attn_gym.linear.kda.impl.cudnn_ops import (
     chunk_cudnn_packed_fwd_op,
     chunk_cudnn_packed_fwd_paged_op,
@@ -231,12 +231,10 @@ def paged_chunk_forward(
     scale: float,
 ) -> torch.Tensor:
     """Advance selected state-cache slots with the cuDNN KDA kernel."""
-    tensors = (q, k, value, gate, beta, state_cache)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
-        raise RuntimeError(
-            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
-            "torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, value, gate, beta, state_cache),
+        "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
     if not torch.compiler.is_compiling():
         validate_cudnn_available(q)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from numbers import Real
 
 import torch
@@ -75,6 +75,14 @@ def validate_delta_rule_inputs(
     tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")
+
+
+def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str) -> None:
+    """Raise ``RuntimeError(message)`` if autograd would track any given tensor."""
+    if torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    ):
+        raise RuntimeError(message)
 
 
 def resolve_backend_options(
@@ -224,6 +232,7 @@ def validate_paged_state(
 
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
+    "require_inference_only",
     "resolve_backend_options",
     "resolve_decode_out",
     "resolve_scale",

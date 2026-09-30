@@ -11,6 +11,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
     prepare_ragged_chunk_metadata,
 )
 from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -288,14 +289,10 @@ def paged_chunk_forward(
 ) -> torch.Tensor:
     """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
-    if torch.is_grad_enabled() and any(
-        tensor.requires_grad
-        for tensor in (q, k, v, gate, beta, state_cache, *(replay_state or ()))
-    ):
-        raise RuntimeError(
-            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
-            "torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, v, gate, beta, state_cache, *(replay_state or ())),
+        "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
 
     if replay_state is None:
         return _paged_chunk_state_forward(

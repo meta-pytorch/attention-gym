@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.gdn.impl.cudnn_ops import (
     chunk_gdn_cudnn_packed_bwd_op,
     chunk_gdn_cudnn_packed_bwd_with_state_op,
@@ -225,12 +226,10 @@ def paged_chunk_forward(
         raise ValueError("the cuDNN GDN backend requires CUDA tensors")
     if not torch.compiler.is_compiling():
         validate_cudnn_available(q)
-    tensors = (q, k, value, gate, beta, state_cache)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
-        raise RuntimeError(
-            "paged_chunk_gdn is inference-only; call under torch.no_grad() or "
-            "torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, value, gate, beta, state_cache),
+        "paged_chunk_gdn is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
 
     gate, beta = (tensor.to(dtype=torch.float32) for tensor in (gate, beta))
     batch = q.shape[0]
