@@ -25,8 +25,10 @@ from attn_gym._backends.cute.compat import (
     get_num_tmem_alloc_cols,
 )
 
+from .cute_kernel_base import IndexerScoreKernelBase
 
-class IndexerGenericScoreKernel:
+
+class IndexerGenericScoreKernel(IndexerScoreKernelBase):
     """Generate scores for positive even H and positive D divisible by 16.
 
     For each candidate tile M128 and head tile N64, UMMA accumulates
@@ -44,6 +46,7 @@ class IndexerGenericScoreKernel:
     for wide offsets.
     """
 
+    name_prefix = "indexer_score_generic"
     tile_candidates = 128
     tile_heads = 64
     tile_dim = 64
@@ -85,55 +88,6 @@ class IndexerGenericScoreKernel:
             tmem_holding: Int32
 
         self.SharedStorage = SharedStorage
-
-    def get_name(self) -> str:
-        """Return a stable name for the shape, mask, weight layout, and offset width."""
-        return (
-            f"indexer_score_generic_h{self.heads}_d{self.head_dim}_c{int(self.causal)}_"
-            f"r{self.compress_ratio}_i64{int(self.use_int64_offsets)}_"
-            f"wh{int(self.contiguous_weight_heads)}"
-        )
-
-    @cute.jit
-    def upcast_offset(self, value):
-        """Widen origins before address arithmetic in the wide specialization."""
-        return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else Int32(value)
-
-    @cute.jit
-    def visible_candidates(self, query):
-        """Causal candidate count for query; the static ratio keeps r=1 division-free."""
-        if cutlass.const_expr(self.compress_ratio == 1):
-            return query + 1
-        return (query + 1) // self.compress_ratio
-
-    @cute.jit
-    def __call__(
-        self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        pair_start,
-        score_scale: Float32,
-        stream: cuda.CUstream,
-    ):
-        """Dense entrypoint: score each query's full or causal candidate prefix."""
-        self.launch(q, k, weights, scores, pair_start, score_scale, None, stream)
-
-    @cute.jit
-    def with_candidate_bounds(
-        self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        pair_start,
-        score_scale: Float32,
-        candidate_bounds: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        """Packed entrypoint: score only each query's ``candidate_bounds`` interval."""
-        self.launch(q, k, weights, scores, pair_start, score_scale, candidate_bounds, stream)
 
     @cute.jit
     def launch(

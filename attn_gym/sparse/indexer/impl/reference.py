@@ -13,7 +13,8 @@ def launch(
     topk: int,
     causal: bool,
     compress_ratio: int,
-    candidate_bounds: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
@@ -30,7 +31,8 @@ def launch(
         causal: keep only the ``(t + 1) // compress_ratio`` leading candidates of query t
         compress_ratio: tokens summarized per candidate; ``S == T // compress_ratio``
             for nonpacked calls.
-        candidate_bounds: Packed [T, 2] start/end positions after document/causal masking.
+        cu_seqlens: Packed query offsets, [N + 1]; supplied together with cu_seqlens_k.
+        cu_seqlens_k: Packed candidate offsets, [N + 1].
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -56,9 +58,17 @@ def launch(
     scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
 
     starts = torch.zeros((queries, 1), dtype=torch.int32, device=q.device)
-    if candidate_bounds is not None:
-        starts = candidate_bounds[:, :1]
-        ends = candidate_bounds[:, 1:]
+    if cu_seqlens is not None:
+        positions = torch.arange(queries, device=q.device, dtype=torch.int32)
+        # Empty documents are skipped; capacity tails receive an empty interval.
+        documents = torch.searchsorted(cu_seqlens[1:], positions, right=True, out_int32=True)
+        starts = cu_seqlens_k.index_select(0, documents)
+        ends = cu_seqlens_k.index_select(0, (documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1))
+        if causal:
+            local_positions = positions - cu_seqlens.index_select(0, documents)
+            ends = torch.minimum(ends, starts + (local_positions + 1) // compress_ratio)
+        starts = starts[:, None]
+        ends = ends[:, None]
     elif causal:
         ends = (torch.arange(1, queries + 1, device=q.device) // compress_ratio)[:, None]
     else:
