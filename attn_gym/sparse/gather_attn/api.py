@@ -170,6 +170,16 @@ def _validate_inputs(
             )
 
 
+def _validate_kernel_options(kernel_options: dict[str, str | bool] | None) -> None:
+    options = kernel_options or {}
+    if (
+        options.keys() - {"backend", "bwd_recompute_p"}
+        or options.get("backend", "cute") not in ("cute", "triton")
+        or type(options.get("bwd_recompute_p", False)) is not bool
+    ):
+        raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
+
+
 def _select_backend(
     query: Tensor,
     attention_sink: Tensor | None,
@@ -204,7 +214,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str] | None = None,
+    kernel_options: dict[str, str | bool] | None = None,
     scale: float | None = None,
     return_aux: None = ...,
 ) -> Tensor: ...
@@ -222,7 +232,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str] | None = None,
+    kernel_options: dict[str, str | bool] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, GatherAttnAux]: ...
@@ -239,7 +249,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str] | None = None,
+    kernel_options: dict[str, str | bool] | None = None,
     scale: float | None = None,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, GatherAttnAux]:
@@ -292,8 +302,12 @@ def gather_attn(
         impl: Impl.FUSED (default, or "fused") uses optimized CUDA kernels;
             Impl.REFERENCE (or "reference") uses eager PyTorch on CPU or CUDA.
 
-        kernel_options: Fused backend override: {"backend": "cute"} or {"backend": "triton"}.
-            Omit the backend to prefer supported CuTe calls, otherwise Triton.
+        kernel_options: Fused backend options. "backend": "cute" or "triton" overrides the
+            backend; omit it to prefer supported CuTe calls, otherwise Triton.
+            "bwd_recompute_p" (default True): the CuTe backward recomputes the attention
+            probabilities; False saves them in forward instead (bf16, tokens x heads x keys),
+            trading that memory for a few percent of backward time. Triton always
+            recomputes and ignores this option.
             Compiled calls, deterministic mode, and empty attention sets use Triton
             automatically. Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with Impl.REFERENCE.
@@ -319,8 +333,7 @@ def gather_attn(
     selected_impl = resolve_impl(impl)
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
-    if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
-        raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
+    _validate_kernel_options(kernel_options)
 
     share_kv = isinstance(sparse_kv, Tensor) and sparse_kv.ndim == 4 and sparse_kv.shape[1] == 1
     _validate_inputs(
@@ -338,7 +351,8 @@ def gather_attn(
         raise ValueError("scale must be greater than 0.")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
 
-    backend = (kernel_options or {}).get("backend")
+    options = kernel_options or {}
+    backend = options.get("backend")
     if selected_impl is Impl.REFERENCE:
         from .impl import reference as implementation
     else:
@@ -371,6 +385,7 @@ def gather_attn(
         sliding_window_size,
         share_kv,
         scale=scale,
+        **({"bwd_recompute_p": options.get("bwd_recompute_p", True)} if backend == "cute" else {}),
     )
 
     if return_aux is None:

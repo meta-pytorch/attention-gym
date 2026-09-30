@@ -13,7 +13,8 @@ Constraints
   zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
 - dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
 - Requires FA4 4.0.0b32+ for sparse MLA attention sinks and, with fewer than 128
-  heads, sparse-MLA head padding
+  heads, sparse-MLA head padding; 4.0.0b33+ to recompute probabilities in backward
+  for any head count
 """
 
 from __future__ import annotations
@@ -116,11 +117,14 @@ def gather_attn(
     share_kv: bool = True,
     *,
     scale: float,
+    bwd_recompute_p: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL (SM100/SM103) forward+backward for gather attention.
 
     Eager-only — torch.compile is not supported for this backend.
     Optional per-head attention sinks are forwarded to FA4, which owns their gradients.
+    ``bwd_recompute_p`` recomputes the attention probabilities in backward instead of
+    saving them in forward.
 
     Returns:
         Tuple of (output, lse) where output has shape (batch, heads, seq, head_dim)
@@ -145,6 +149,7 @@ def gather_attn(
         "causal": False,
         "pack_gqa": True,
         "return_lse": True,
+        "gather_bwd_recompute_p": bwd_recompute_p,
     }
     # Passing k=v (the same object) with hdim=512 selects FA4's sparse MLA path.
     if cu_seqlens is None:
