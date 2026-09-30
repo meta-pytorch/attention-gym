@@ -32,6 +32,7 @@ from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     assert_relative_rms_within,
     make_kda_test_inputs,
+    relative_rms_error,
 )
 
 HEAD_DIM = 128
@@ -111,11 +112,6 @@ def cudnn_native_gradients(
     return cudnn_ops.chunk_cudnn_packed_bwd_with_state_op(
         *operands, cu_seqlens, initial_state.contiguous(), d_final_state, scale
     )
-
-
-def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
-    """Relative RMS error against an FP32 oracle."""
-    return ((actual.float() - reference).square().mean() / reference.square().mean()).sqrt().item()
 
 
 def assert_sharded_matches(
