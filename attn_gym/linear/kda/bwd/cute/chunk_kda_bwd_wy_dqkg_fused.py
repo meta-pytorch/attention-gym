@@ -467,11 +467,8 @@ class ChunkKdaBwdWyDqkgFused:
     def __init__(
         self,
         chunk_size: int = 64,
-        head_dim_k: int = 128,
-        head_dim_v: int = 128,
-        acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        head_dim: int = 128,
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
-        g_dtype: type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
         grid_waves: int = 1,
         use_fast_math: bool = True,
@@ -479,21 +476,16 @@ class ChunkKdaBwdWyDqkgFused:
         scalar_gate: bool = False,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
-        assert head_dim_k == 128 and head_dim_v == 128, (
-            f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
-        )
+        assert head_dim == 128, f"head_dim must be 128, got {head_dim}"
         require_blackwell_target()
 
         self.use_fast_math = use_fast_math
         self.use_int64_offsets = use_int64_offsets
         # Scalar gate: g is one decay per (token, value head) and dg is summed over K.
         self.scalar_gate = scalar_gate
-        self.chunk_size = chunk_size
-        self.head_dim_k = head_dim_k
-        self.head_dim_v = head_dim_v
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = cutlass.Float32
         self.io_dtype = io_dtype
-        self.g_dtype = g_dtype
+        self.g_dtype = cutlass.Float32
         self.scale = scale
         self.idesc_m64n128_k_k = instruction_descriptor_for_io_dtype(
             IDESC_F16_M64_N128_K_K, io_dtype
@@ -532,9 +524,8 @@ class ChunkKdaBwdWyDqkgFused:
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
 
-        # Number of K/V tiles
-        self.num_k_tiles = (head_dim_k + self.BK - 1) // self.BK  # 128/128 = 1
-        self.num_v_tiles = (head_dim_v + self.BV - 1) // self.BV  # 128/64 = 2
+        # Number of V tiles
+        self.num_v_tiles = (head_dim + self.BV - 1) // self.BV  # 128/64 = 2
 
         # ── Pipeline stages ──
         # V-loop TMA: 2-stage double buffer
@@ -582,7 +573,6 @@ class ChunkKdaBwdWyDqkgFused:
         self.buffer_align_bytes = 1024
 
         # Persistent scheduling
-        self.persistent = True
         sm_count = get_compile_target().sm_count
         if sm_count is None:
             raise RuntimeError("KDA compilation requires a CUDA target with an SM count")
@@ -2904,9 +2894,6 @@ class ChunkKdaBwdWyDqkgFused:
                                     )
                         cute.arch.fence_proxy("async.shared", space="cta")
 
-                    # if lane_idx == 0:
-                    #     cute.printf("V_iter", v_iter)
-                    #     cute.print_tensor(sDv[None, None, None, vloop_stage_idx])
                     pipeline_mma_dvb.producer_acquire(mma_dvb_producer_state)
                     sDv_mn_cur = sDv_mn[(None, None, None, vloop_stage_idx)]
                     sA_mn_cur = sA_mn[(None, None, None, a_stage_idx)]
@@ -3426,8 +3413,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     cutlass_io_dtype = cute_dtype(io_dtype).cute_type
     op = ChunkKdaBwdWyDqkgFused(
         chunk_size=chunk_size,
-        head_dim_k=head_dim,
-        head_dim_v=head_dim,
+        head_dim=head_dim,
         io_dtype=cutlass_io_dtype,
         scale=scale,
         grid_waves=grid_waves,

@@ -139,7 +139,6 @@ def _prepare_chunk_kda_fwd(
                 scale,
                 metadata,
                 chunk_size=_CHUNK_SIZE,
-                profile_ranges=torch.autograd.profiler._is_profiler_enabled,
                 autotune=autotune,
                 schedule=schedule,
                 fastmath=fastmath,

@@ -787,18 +787,7 @@ def _hmma_load_b_group_staged(sB, tidx):
 
 
 @cute.jit
-def _hmma_load_da(mdA, row_start, head_idx, row, col, valid):
-    return _ld_global_f32_b32_pred(
-        mdA.iterator
-        + (row_start + row) * mdA.layout.stride[1]
-        + head_idx * mdA.layout.stride[2]
-        + col,
-        Boolean((row < valid) & (col < valid)),
-    )
-
-
-@cute.jit
-def _hmma_load_da_pred(mdA, row_start, head_idx, row, col, valid, pred):
+def _hmma_load_da(mdA, row_start, head_idx, row, col, valid, pred=True):
     return _ld_global_f32_b32_pred(
         mdA.iterator
         + (row_start + row) * mdA.layout.stride[1]
@@ -809,17 +798,7 @@ def _hmma_load_da_pred(mdA, row_start, head_idx, row, col, valid, pred):
 
 
 @cute.jit
-def _hmma_load_da_pair(mdA, row_start, head_idx, row, col, valid, row_stride, head_stride):
-    v0, v1 = _ld_global_f32x4_lo2_pred(
-        mdA.iterator + (row_start + row) * row_stride + head_idx * head_stride + col,
-        Boolean((row < valid) & (col < valid)),
-    )
-    v1 = v1 if (col + 1) < valid else Float32(0.0)
-    return v0, v1
-
-
-@cute.jit
-def _hmma_load_da_pair_pred(
+def _hmma_load_da_pair(
     mdA,
     row_start,
     head_idx,
@@ -828,8 +807,8 @@ def _hmma_load_da_pair_pred(
     valid,
     row_stride,
     head_stride,
-    pred0,
-    pred1,
+    pred0=True,
+    pred1=True,
 ):
     v0, v1 = _ld_global_f32x4_lo2_pred(
         mdA.iterator + (row_start + row) * row_stride + head_idx * head_stride + col,
@@ -1277,7 +1256,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             keep01 = (k_outer * 8 + 2 * tid + 1) < gid
             keep10 = (k_outer * 8 + 2 * tid) < (gid + 8)
             keep11 = (k_outer * 8 + 2 * tid + 1) < (gid + 8)
-            aq0, aq2 = _hmma_load_da_pair_pred(
+            aq0, aq2 = _hmma_load_da_pair(
                 mdAqk,
                 row_start,
                 head_idx,
@@ -1289,7 +1268,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 keep00,
                 keep01,
             )
-            ak0, ak2 = _hmma_load_da_pair_pred(
+            ak0, ak2 = _hmma_load_da_pair(
                 mdAkk,
                 row_start,
                 head_idx,
@@ -1301,7 +1280,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 keep00,
                 keep01,
             )
-            aq1, aq3 = _hmma_load_da_pair_pred(
+            aq1, aq3 = _hmma_load_da_pair(
                 mdAqk,
                 row_start,
                 head_idx,
@@ -1313,7 +1292,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 keep10,
                 keep11,
             )
-            ak1, ak3 = _hmma_load_da_pair_pred(
+            ak1, ak3 = _hmma_load_da_pair(
                 mdAkk,
                 row_start,
                 head_idx,
@@ -1487,14 +1466,14 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             keep01 = gid < (k_outer * 8 + 2 * tid + 1)
             keep10 = (gid + 8) < (k_outer * 8 + 2 * tid)
             keep11 = (gid + 8) < (k_outer * 8 + 2 * tid + 1)
-            aq0 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row0, valid, keep00)
-            aq1 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query0, row1, valid, keep10)
-            aq2 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query1, row0, valid, keep01)
-            aq3 = _hmma_load_da_pred(mdAqk, row_start, head_idx, query1, row1, valid, keep11)
-            ak0 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query0, row0, valid, keep00)
-            ak1 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query0, row1, valid, keep10)
-            ak2 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query1, row0, valid, keep01)
-            ak3 = _hmma_load_da_pred(mdAkk, row_start, head_idx, query1, row1, valid, keep11)
+            aq0 = _hmma_load_da(mdAqk, row_start, head_idx, query0, row0, valid, keep00)
+            aq1 = _hmma_load_da(mdAqk, row_start, head_idx, query0, row1, valid, keep10)
+            aq2 = _hmma_load_da(mdAqk, row_start, head_idx, query1, row0, valid, keep01)
+            aq3 = _hmma_load_da(mdAqk, row_start, head_idx, query1, row1, valid, keep11)
+            ak0 = _hmma_load_da(mdAkk, row_start, head_idx, query0, row0, valid, keep00)
+            ak1 = _hmma_load_da(mdAkk, row_start, head_idx, query0, row1, valid, keep10)
+            ak2 = _hmma_load_da(mdAkk, row_start, head_idx, query1, row0, valid, keep01)
+            ak3 = _hmma_load_da(mdAkk, row_start, head_idx, query1, row1, valid, keep11)
             bq0 = sBeta_tile[query0]
             bq1 = sBeta_tile[query1]
             qq00, qq01, qq10, qq11, qq20, qq21, qq30, qq31 = _hmma_load_b_groups_smem_ldmatrix(

@@ -9,11 +9,10 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
@@ -45,7 +44,6 @@ def chunk_kda_fwd_factors(
     metadata: RaggedChunkMetadata | None,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    profile_ranges: bool = False,
     fastmath: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce the BT64 Aqk/Akk factors used by forward and backward recompute."""
@@ -82,7 +80,6 @@ def chunk_kda_fwd_factors(
                 scale,
                 chunk_size,
                 Aqk=Aqk,
-                profile_ranges=profile_ranges,
                 fastmath=fastmath,
             )
         return chunk_kda_fwd_inter_solve_ragged_cute(
@@ -97,11 +94,7 @@ def chunk_kda_fwd_factors(
             fastmath=fastmath,
         )
 
-    with (
-        torch.profiler.record_function("kda/cute/intra_engine")
-        if profile_ranges
-        else nullcontext()
-    ):
+    with profiler_range("kda/cute/intra_engine"):
         Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata, fastmath=fastmath)
         Akk = (
             chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size, output_dtype=q.dtype)
@@ -120,7 +113,6 @@ def chunk_kda_fwd_intra(
     scale: float,
     metadata: RaggedChunkMetadata | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    profile_ranges: bool = False,
     autotune: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = False,
@@ -142,14 +134,9 @@ def chunk_kda_fwd_intra(
         scale,
         metadata,
         chunk_size=chunk_size,
-        profile_ranges=profile_ranges,
         fastmath=fastmath,
     )
-    with (
-        torch.profiler.record_function("kda/triton/recompute_w_u")
-        if profile_ranges
-        else nullcontext()
-    ):
+    with profiler_range("kda/triton/recompute_w_u"):
         w, u, _qg, kg = recompute_w_u_fwd_triton(
             autotune=autotune,
             schedule=schedule,
