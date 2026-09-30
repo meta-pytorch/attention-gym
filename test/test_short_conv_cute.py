@@ -335,6 +335,33 @@ def _assert_conv_matches(run, x, weight, activation="silu", rtol=2e-2, atol=2e-2
     return actual, expected
 
 
+def _assert_grad_match(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    inputs: tuple[torch.Tensor, ...],
+    grad_output: torch.Tensor,
+    *,
+    expected_inputs: tuple[torch.Tensor, ...] | None = None,
+    atol: float = 3e-2,
+    weight_atol: float = 3e-1,
+) -> tuple[torch.Tensor, ...]:
+    """Compare gradients of ``actual`` and ``expected``; index 1 (the weight) uses its own atol."""
+    actual_gradients = torch.autograd.grad(actual, inputs, grad_output)
+    expected_gradients = torch.autograd.grad(
+        expected, inputs if expected_inputs is None else expected_inputs, grad_output
+    )
+    for index, (actual_gradient, expected_gradient) in enumerate(
+        zip(actual_gradients, expected_gradients, strict=True)
+    ):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=3e-2,
+            atol=weight_atol if index == 1 else atol,
+        )
+    return actual_gradients
+
+
 def test_short_conv_supports_more_than_65535_time_tiles():
     """Place the unbounded time grid on CUDA's large x dimension."""
     torch.manual_seed(0)
@@ -354,27 +381,37 @@ def test_short_conv_supports_more_than_65535_time_tiles():
         weight_grad_config=config,
     )
     expected = _reference(x, weight)
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+    _assert_grad_match(actual, expected, (x, weight), grad_output, weight_atol=2e-1)
 
 
-@pytest.mark.parametrize("width", [1, 4, 5])
-def test_short_conv_forward_and_backward_match_pytorch(width: int):
-    """Check generic widths and partial first and last time tiles."""
+@pytest.mark.parametrize(
+    ("width", "batch", "tokens", "activation", "weight_grad_config"),
+    [
+        (1, 1, 17, "silu", None),
+        (4, 1, 17, "silu", None),
+        (5, 1, 17, "silu", None),
+        (4, 3, 19, "silu", ShortConvConfig(128, 4, 8)),
+        (4, 1, 17, None, None),
+    ],
+)
+def test_short_conv_forward_and_backward_match_pytorch(
+    width: int,
+    batch: int,
+    tokens: int,
+    activation: str | None,
+    weight_grad_config: ShortConvConfig | None,
+):
+    """Check generic widths, independent batches, partial time tiles, and no activation."""
     torch.manual_seed(0)
-    x, weight = _inputs(width=width)
+    x, weight = _inputs(tokens=tokens, width=width, batch=batch)
     grad_output = torch.randn_like(x)
+    run = functools.partial(causal_conv1d, weight_grad_config=weight_grad_config)
 
-    actual, expected = _assert_conv_matches(causal_conv1d, x, weight)
+    actual, expected = _assert_conv_matches(run, x, weight, activation)
 
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
+    _assert_grad_match(actual, expected, (x, weight), grad_output, weight_atol=2e-1)
 
 
 @pytest.mark.parametrize(
@@ -623,10 +660,7 @@ def test_short_conv_defaults_support_any_positive_channel_count(channels: int):
 
     actual, expected = _assert_conv_matches(causal_conv1d, x, weight)
 
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+    _assert_grad_match(actual, expected, (x, weight), grad_output)
 
     compiled = torch.compile(causal_conv1d, fullgraph=True)
     torch.testing.assert_close(
@@ -737,8 +771,10 @@ def test_short_conv_packed_tma_backward_matches_fallback(tokens: int):
 
     actual = causal_conv1d(x, weight, activation="silu", cu_seqlens=cu_seqlens)
     expected = _packed_reference(x, weight, cu_seqlens)
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    actual_gradients = _assert_grad_match(
+        actual, expected, (x, weight), grad_output, weight_atol=2e-1
+    )
     fallback_gradients = cute_backend._launch_backward(
         x,
         weight,
@@ -748,10 +784,6 @@ def test_short_conv_packed_tma_backward_matches_fallback(tokens: int):
         cu_seqlens,
         activation="silu",
     )
-
-    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=2e-1)
 
     # One BF16 ULP of headroom: partial trailing time blocks change dw's
     # FP32 partial-reduction boundaries between the TMA and fallback trees.
@@ -772,19 +804,15 @@ def test_short_conv_dense_stateful_tma_backward_matches_reference():
     expected = F.silu(
         F.conv1d(expected_input.transpose(1, 2), weight[:, None], groups=256)
     ).transpose(1, 2)
-    actual_gradients = torch.autograd.grad(actual, (x, weight, initial_state), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight, reference_state), grad_output)
-
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
-    for index, (actual_gradient, expected_gradient) in enumerate(
-        zip(actual_gradients, expected_gradients, strict=True)
-    ):
-        torch.testing.assert_close(
-            actual_gradient,
-            expected_gradient,
-            rtol=3e-2,
-            atol=2e-1 if index == 1 else 3e-2,
-        )
+    _assert_grad_match(
+        actual,
+        expected,
+        (x, weight, initial_state),
+        grad_output,
+        expected_inputs=(x, weight, reference_state),
+        weight_atol=2e-1,
+    )
 
 
 def test_short_conv_packed_stateful_tma_backward_matches_reference_and_fallback():
@@ -991,24 +1019,6 @@ def test_short_conv_dynamic_active_endpoint_ignores_nan_suffix(
         )
 
 
-def test_short_conv_batched_forward_and_backward_match_pytorch():
-    """Keep batches independent across the optimized convolution width."""
-    width = 4
-    torch.manual_seed(1)
-    x, weight = _inputs(tokens=19, channels=12, width=width, batch=3)
-    grad_output = torch.randn_like(x)
-    weight_config = ShortConvConfig(128, 4, 8)
-
-    actual = causal_conv1d(x, weight, activation="silu", weight_grad_config=weight_config)
-    expected = _reference(x, weight)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
-
-
 @pytest.mark.parametrize("width", [1, 5])
 def test_short_conv_packed_forward_and_backward_match_independent_sequences(width: int):
     """Reset convolution and gradient dependencies at every packed boundary."""
@@ -1025,10 +1035,7 @@ def test_short_conv_packed_forward_and_backward_match_independent_sequences(widt
     expected = _packed_reference(x, weight, cu_seqlens)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+    _assert_grad_match(actual, expected, (x, weight), grad_output)
 
 
 def test_short_conv_packed_final_state_uses_implicit_zero_history():
@@ -1401,12 +1408,9 @@ def test_short_conv_fullgraph_forward_and_backward():
     grad_output = torch.randn_like(x)
 
     expected_output = causal_conv1d(x, weight, activation="silu")
-    expected = torch.autograd.grad(expected_output, (x, weight), grad_output)
     compiled = torch.compile(causal_conv1d, fullgraph=True)
     actual_output = compiled(x, weight, activation="silu")
-    actual = torch.autograd.grad(actual_output, (x, weight), grad_output)
-    torch.testing.assert_close(actual[0], expected[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual[1], expected[1], rtol=3e-2, atol=2e-1)
+    _assert_grad_match(actual_output, expected_output, (x, weight), grad_output, weight_atol=2e-1)
 
 
 @pytest.mark.parametrize("layout", ["permuted", "odd_row_pitch"])
@@ -1902,20 +1906,6 @@ def test_short_conv_packed_stateful_tma_cuda_graph_replays_boundaries_and_histor
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
 
 
-def test_short_conv_identity_activation_matches_plain_conv():
-    """Run the None-activation kernels against an activation-free reference."""
-    torch.manual_seed(5)
-    x, weight = _inputs()
-    grad_output = torch.randn_like(x)
-
-    actual, expected = _assert_conv_matches(causal_conv1d, x, weight, None)
-
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
-
-
 def test_short_conv_identity_activation_packed_stateful():
     """Check the identity derivative through the packed stateful gradient kernels."""
     torch.manual_seed(6)
@@ -1936,13 +1926,7 @@ def test_short_conv_identity_activation_packed_stateful():
     expected = torch.cat(outputs, dim=1)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
-    leaves = (x, weight, initial_state)
-    actual_gradients = torch.autograd.grad(actual, leaves, grad_output)
-    expected_gradients = torch.autograd.grad(expected, leaves, grad_output)
-    for actual_gradient, expected_gradient in zip(
-        actual_gradients, expected_gradients, strict=True
-    ):
-        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=3e-1)
+    _assert_grad_match(actual, expected, (x, weight, initial_state), grad_output, atol=3e-1)
 
 
 _ACTIVATION_GLOBAL_SCALE = 2.0
@@ -1980,10 +1964,7 @@ def test_short_conv_registered_custom_activation():
     expected = torch.tanh(_plain_conv_reference(x, weight))
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
-    actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
-    torch.testing.assert_close(actual_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(actual_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+    _assert_grad_match(actual, expected, (x, weight), grad_output)
 
 
 def _make_scaled(scale: float):
@@ -2045,10 +2026,7 @@ def test_short_conv_closure_activations_key_on_captured_values():
     torch.testing.assert_close(doubled, expected * 2.0, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(tripled, expected * 3.0, rtol=2e-2, atol=2e-2)
 
-    doubled_gradients = torch.autograd.grad(doubled, (x, weight), grad_output)
-    expected_gradients = torch.autograd.grad(expected * 2.0, (x, weight), grad_output)
-    torch.testing.assert_close(doubled_gradients[0], expected_gradients[0], rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(doubled_gradients[1], expected_gradients[1], rtol=3e-2, atol=3e-1)
+    _assert_grad_match(doubled, expected * 2.0, (x, weight), grad_output)
 
 
 def test_short_conv_global_mutation_recompiles():
