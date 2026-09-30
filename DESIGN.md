@@ -370,7 +370,7 @@ Public functions are re-exported from the namespace root:
 
 ```python
 from attn_gym.linear import chunk_gdn, recurrent_gdn
-from attn_gym.sparse import compressed_sparse_attention
+from attn_gym.sparse import gather_attn, lightning_indexer
 ```
 
 Backend entry points are private and use a consistent internal name such as `forward`. A backend
@@ -385,43 +385,11 @@ would remove meaningful duplication. Explicit implementation requests never fall
 
 ### Applying the structure to compressed sparse attention
 
-The current compressed sparse attention code should move to:
-
-```text
-attn_gym/sparse/compressed_sparse_attention/
-  __init__.py
-  api.py
-  impl/
-    __init__.py
-    common.py
-    reference.py
-    triton.py
-```
-
-The refactor should be mechanical and behavior-preserving:
-
-1. Move shared padding, interleaved block compression, and the shared RoPE formulation into
-   `impl/common.py`. Give these helpers explicit names, type annotations, shape documentation, and
-   tests. Preserve separate backend implementations when sharing would compromise readability,
-   compilation, or backend requirements.
-2. Move the eager implementation into `impl/reference.py`, rename `CSA` to the private backend
-   entry point `forward`, and retain dense-only helpers such as mask materialization and sink
-   softmax there.
-3. Move the Triton implementation into `impl/triton.py`, rename its public-looking entry point to
-   `forward`, and retain Triton kernels, launchers, custom autograd, backend constraints, and
-   Triton-specific preparation there.
-4. Update `api.py` to lazily load `impl.reference.forward` or `impl.triton.forward`. Keep all public
-   argument and shape validation in `api.py`; keep device, dtype, contiguity, architecture, and
-   backend capability validation in the selected implementation.
-5. Keep `compressed_sparse_attention/__init__.py` and `attn_gym/sparse/__init__.py` as thin public
-   re-export layers.
-6. Update tests to import only the public API except for focused unit tests of private mathematical
-   primitives. Run the existing eager-versus-Triton forward and backward matrix before and after
-   the move to demonstrate that the refactor did not change behavior.
-
-The initial refactor should not introduce a global backend registry, redesign the public signature,
-or fuse additional work into kernels. Those are separate changes and should follow only after the
-module boundaries are established.
+Compressed sparse attention is composed from the sparse primitives rather than shipped as one
+package: `lightning_indexer` (`attn_gym/sparse/indexer/`) selects candidates and `gather_attn`
+(`attn_gym/sparse/gather_attn/`) attends over them. Both follow the `api.py` plus `impl/` layout
+above. The end-to-end model recipe, including compression and RoPE, lives in
+`examples/sparse/compressed_sparse_attention.py`.
 
 ## Relationship to existing FlexAttention APIs
 

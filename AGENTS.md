@@ -4,27 +4,16 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 
 ## What This Repo Provides
 
-**Mask functions** (`attn_gym/masks/`) — ready-to-use `mask_mod` functions that return `BlockMask` objects:
-- `causal` — standard causal (triangular) mask
-- `sliding_window` — local sliding window attention
-- `dilated_sliding_window` — dilated sliding window patterns
-- `prefix_lm` — prefix LM mask (bidirectional prefix + causal suffix)
-- `document_mask` — document-level masking for packed sequences
-- `natten` — neighborhood attention (multi-dimensional)
-- `flamingo` — cross-attention mask for Flamingo-style models
-- `batchify` — group tokens into batches with intra-group attention only
-- `sta` — STA (sparse temporal attention) mask
-- `svg` — Sparse VideoGen spatial/temporal attention masks
-
-**Score mods** (`attn_gym/mods/`) — `score_mod` functions that transform attention scores:
-- `alibi` — ALiBi positional bias
-- `softcapping` — Gemma-2 style soft-capping
-- `graphormer` — Graphormer spatial + edge encodings (learnable shortest-path biases)
-- `latent_attention` — latent/compressed attention
-
-**Paged attention example** (`examples/flex_attention/paged_attention.py`) — `PagedAttention` example for efficient inference with variable-length KV caches using fixed-size page blocks.
-
-**Utilities** (`attn_gym/utils.py`) — helpers for visualizing and debugging `score_mod`/`mask_mod` functions.
+- **Masks** (`attn_gym/masks/`) — `mask_mod` functions and `BlockMask` builders; see
+  [`docs/masks.md`](docs/masks.md) for the full list.
+- **Score mods** (`attn_gym/mods/`) — `score_mod` functions; see [`docs/mods.md`](docs/mods.md).
+- **Linear attention** (`attn_gym/linear/`) — KDA and GDN chunked/recurrent operators and short
+  convolution, with reference, Triton, CuTeDSL, and vendored cuDNN backends; see
+  [`docs/linear.md`](docs/linear.md).
+- **Sparse attention** (`attn_gym/sparse/`) — `lightning_indexer` Top-K selection and
+  `gather_attn`; see [`docs/sparse.md`](docs/sparse.md).
+- **Utilities** (`attn_gym/utils.py`) — helpers for visualizing and debugging
+  `score_mod`/`mask_mod` functions.
 
 **Examples** (`examples/`) — end-to-end usage and benchmarks, at most one directory level deep:
 - `flex_attention/` — masks/score mods, notebooks, MLA, paged/ring attention, and runtime integration

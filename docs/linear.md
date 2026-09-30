@@ -398,6 +398,12 @@ gate activation, beta sigmoid, recurrence, output, and state-cache update run in
 Triton kernel. Callers may provide a stable output buffer for allocation-free CUDA
 Graph replay.
 
+Token-at-a-time decode groups floating-point additions differently than 64-row `chunk_kda`
+training, so decode drifts from training numerics.
+[`examples/linear/kda_zero_drift_decode.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_zero_drift_decode.py)
+replays the current partial chunk with `chunk_kda` from the last FP32 boundary state, which
+makes decode output bitwise-identical to training.
+
 `chunk_kda(..., kernel_options={"backend": "cudnn"})` selects an opt-in SM100/SM103
 FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
