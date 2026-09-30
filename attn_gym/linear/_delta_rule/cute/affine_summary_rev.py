@@ -52,6 +52,7 @@ from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_
 from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     MAX_RANGES,
     decode_work_row,
@@ -59,7 +60,6 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     zero_tail_tokens,
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.utils import cdiv
 
 BT = 64
