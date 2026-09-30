@@ -80,6 +80,9 @@ def test_fused_requires_cuda(inputs, impl):
         {"backend": None},
         {"other": "triton"},
         {"backend": "triton", "other": "x"},
+        {"bwd_recompute_p": None},
+        {"bwd_recompute_p": 1},
+        {"bwd_recompute_p": "false"},
     ],
 )
 def test_invalid_kernel_options(inputs, options):
@@ -87,6 +90,15 @@ def test_invalid_kernel_options(inputs, options):
         gather_attn(**inputs, kernel_options=options)
     with pytest.raises(ValueError, match="kernel_options are not supported"):
         gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options=options)
+
+
+@pytest.mark.parametrize(
+    "options", [{"bwd_recompute_p": False}, {"backend": "cute", "bwd_recompute_p": True}]
+)
+def test_recompute_p_option_is_valid(inputs, options):
+    # Valid options reach device dispatch instead of failing option validation.
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        gather_attn(**inputs, kernel_options=options)
 
 
 @pytest.mark.parametrize("backend", ["cute", "triton"])

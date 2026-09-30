@@ -86,7 +86,7 @@ def check_cute_precision(
     sliding_window_size: int,
     sink_dtype: torch.dtype | None,
     scale: float | None,
-    kernel_options: dict[str, str] | None,
+    kernel_options: dict[str, str | bool] | None,
     heads: int = 128,
 ) -> None:
     """CuTe bf16 error bounded by low-precision eager error vs FP64.
@@ -385,6 +385,78 @@ def test_cute_precision_vs_fp64(
         sink_dtype=sink_dtype,
         scale=scale,
         kernel_options={"backend": "cute"},
+    )
+
+
+def _recompute_p_inputs(heads):
+    torch.manual_seed(5)
+    query = torch.randn(1, heads, 256, 512, device="cuda", dtype=torch.bfloat16)
+    local_kv = torch.randn(1, 1, 256, 512, device="cuda", dtype=torch.bfloat16)
+    sparse_kv = torch.randn(1, 1, 128, 512, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(0, 128, (1, 256, 128), device="cuda", dtype=torch.int32)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    return [t.requires_grad_() for t in (query, local_kv, sparse_kv)] + [indices, sink]
+
+
+def _bytes_saved_for_backward(heads, kernel_options):
+    query, local_kv, sparse_kv, indices, sink = _recompute_p_inputs(heads)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor.untyped_storage().nbytes())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        gather_attn(
+            query,
+            local_kv,
+            sparse_kv,
+            indices,
+            sink.requires_grad_(),
+            sliding_window_size=128,
+            kernel_options=kernel_options,
+        )
+    return sum(saved)
+
+
+@pytest.mark.parametrize("heads", [24, 64, 128])
+def test_cute_recompute_p_default_saves_no_probabilities(heads):
+    """By default the backward recomputes the probabilities instead of saving them."""
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
+
+    _skip_no_sm100()
+    if not _fa4_available(with_sink=True, padded_heads=heads != 128):
+        pytest.skip("installed FA4 does not support the requested sparse-MLA features")
+    saved_p = _bytes_saved_for_backward(heads, {"backend": "cute", "bwd_recompute_p": False})
+    default = _bytes_saved_for_backward(heads, {"backend": "cute"})
+    # bf16 probabilities: heads x tokens x (window + top-k) padded to a multiple of 128.
+    probabilities = heads * 256 * 256 * 2
+    assert saved_p - default >= probabilities
+
+
+@pytest.mark.parametrize("bwd_recompute_p", [None, False], ids=["default", "saved-p"])
+@pytest.mark.parametrize("heads", [24, 64, 128])
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_cute_recompute_p_precision_vs_fp64(heads, bwd_recompute_p, packed):
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
+
+    _skip_no_sm100()
+    if not _fa4_available(with_sink=True, padded_heads=heads != 128):
+        pytest.skip("installed FA4 does not support the requested sparse-MLA features")
+    options = {"backend": "cute"}
+    if bwd_recompute_p is not None:
+        options["bwd_recompute_p"] = bwd_recompute_p
+    check_cute_precision(
+        batch=1,
+        num_topk=128,
+        packed=packed,
+        seq_len=256,
+        sparse_seq_len=256,
+        sliding_window_size=128,
+        sink_dtype=torch.float32,
+        scale=None,
+        kernel_options=options,
+        heads=heads,
     )
 
 
