@@ -17,27 +17,6 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetada
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
-from attn_gym.linear.kda.ops import (
-    chunk_bwd_op as _chunk_kda_bwd_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_bwd_with_state_grad_op as _chunk_kda_bwd_with_state_grad_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_fwd_op as _chunk_kda_fwd_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_fwd_ragged_op as _chunk_kda_fwd_ragged_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_fwd_ragged_paged_op as _chunk_kda_fwd_ragged_paged_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_fwd_ragged_with_state_op as _chunk_kda_fwd_ragged_with_state_op,
-)
-from attn_gym.linear.kda.ops import (
-    chunk_fwd_with_state_op as _chunk_kda_fwd_with_state_op,
-)
 from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
@@ -653,13 +632,6 @@ def _chunk_kda_bwd_recompute_factors_with_state_grad_cuda(
 
 
 __all__ = [
-    "_chunk_kda_bwd_op",
     "_chunk_kda_bwd_recompute_factors_cuda",
     "_chunk_kda_bwd_recompute_factors_with_state_grad_cuda",
-    "_chunk_kda_bwd_with_state_grad_op",
-    "_chunk_kda_fwd_op",
-    "_chunk_kda_fwd_ragged_op",
-    "_chunk_kda_fwd_ragged_paged_op",
-    "_chunk_kda_fwd_ragged_with_state_op",
-    "_chunk_kda_fwd_with_state_op",
 ]

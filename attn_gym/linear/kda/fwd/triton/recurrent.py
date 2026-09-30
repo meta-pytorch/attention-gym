@@ -16,16 +16,6 @@ import torch
 
 from attn_gym.linear._delta_rule.decode import GateTransform, launch_recurrent_delta_rule_decode
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
-from attn_gym.linear.kda.ops import recurrent_decode_forward as decode_forward
-from attn_gym.linear.kda.ops import recurrent_decode_op as _recurrent_decode_op
-from attn_gym.linear.kda.ops import recurrent_forward as forward
-from attn_gym.linear.kda.ops import (
-    recurrent_fwd_no_state_op as _recurrent_fwd_no_state_op,
-)
-from attn_gym.linear.kda.ops import recurrent_fwd_op as _recurrent_fwd_op
-from attn_gym.linear.kda.ops import (
-    recurrent_fwd_paged_op as _recurrent_fwd_paged_op,
-)
 
 
 def _launch_kda_recurrent_fwd(
@@ -173,13 +163,3 @@ def _kda_recurrent_decode_cuda(
         has_initial_state=has_initial_state,
         op_name="recurrent_kda_decode",
     )
-
-
-__all__ = [
-    "_recurrent_decode_op",
-    "_recurrent_fwd_no_state_op",
-    "_recurrent_fwd_op",
-    "_recurrent_fwd_paged_op",
-    "decode_forward",
-    "forward",
-]

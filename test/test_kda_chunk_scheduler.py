@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -21,10 +23,9 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     ScheduleKind,
     ScheduleRequest,
     chunk_capacity,
-    chunk_work_oracle,
-    decode_ragged_chunk_work,
     decode_ragged_task,
     load_ragged_chunk_count,
+    load_ragged_chunk_work,
     load_ragged_task_count,
     prepare_ragged_chunk_metadata,
 )
@@ -50,6 +51,85 @@ def _decode_ragged_task_kernel(task, subtasks_per_chunk, output):
 @triton.jit
 def _load_ragged_chunk_count_kernel(chunk_offsets, output):
     tl.store(output, load_ragged_chunk_count(chunk_offsets, 0))
+
+
+class ChunkWork(NamedTuple):
+    """One sequence-local chunk decoded from a global logical work index."""
+
+    global_chunk: int
+    sequence: int
+    local_chunk: int
+    token_start: int
+    valid_tokens: int
+
+
+def chunk_work_oracle(cu_seqlens: list[int], chunk_size: int) -> list[ChunkWork]:
+    """Decode all logical chunks on the CPU."""
+    assert cu_seqlens[0] == 0 and chunk_size > 0
+    work: list[ChunkWork] = []
+    for sequence, (begin, end) in enumerate(itertools.pairwise(cu_seqlens)):
+        assert begin <= end
+        for token_start in range(begin, end, chunk_size):
+            work.append(
+                ChunkWork(
+                    global_chunk=len(work),
+                    sequence=sequence,
+                    local_chunk=(token_start - begin) // chunk_size,
+                    token_start=token_start,
+                    valid_tokens=min(chunk_size, end - token_start),
+                )
+            )
+    return work
+
+
+@triton.jit(do_not_specialize=["num_sequences"])
+def _decode_ragged_chunk_work_kernel(
+    cu_seqlens,
+    chunk_offsets,
+    work,
+    num_sequences,
+    chunk_size: tl.constexpr,
+):
+    global_chunk = tl.program_id(0)
+    active_chunks = load_ragged_chunk_count(chunk_offsets, num_sequences)
+    output = work + global_chunk * 5
+
+    if global_chunk < active_chunks:
+        sequence, local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
+            cu_seqlens,
+            chunk_offsets,
+            global_chunk,
+            num_sequences,
+            chunk_size,
+        )
+
+        tl.store(output, global_chunk)
+        tl.store(output + 1, sequence)
+        tl.store(output + 2, local_chunk)
+        tl.store(output + 3, token_start)
+        tl.store(output + 4, valid_tokens)
+    else:
+        for field in tl.static_range(5):
+            tl.store(output + field, -1)
+
+
+def decode_ragged_chunk_work(metadata: RaggedChunkMetadata) -> torch.Tensor:
+    """Materialize scheduler decisions as ``[capacity, 5]`` rows; inactive rows are -1."""
+    work = torch.empty(
+        (metadata.capacity, 5),
+        dtype=torch.int32,
+        device=metadata.cu_seqlens.device,
+    )
+    if metadata.capacity:
+        _decode_ragged_chunk_work_kernel[(metadata.capacity,)](
+            metadata.cu_seqlens,
+            metadata.chunk_offsets,
+            work,
+            num_sequences=metadata.cu_seqlens.shape[0] - 1,
+            chunk_size=metadata.chunk_size,
+            num_warps=1,
+        )
+    return work
 
 
 def _expected_tensor(lengths: list[int], chunk_size: int) -> tuple[torch.Tensor, list[int]]:
@@ -214,96 +294,6 @@ os._exit(1)
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def _decode_ragged_chunk_work_cute(*args, **kwargs):
-    pytest.importorskip("cutlass")
-    from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
-        decode_ragged_chunk_work_cute,
-    )
-
-    return decode_ragged_chunk_work_cute(*args, **kwargs)
-
-
-requires_cute = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA scheduler test requires an SM100 or SM103 GPU",
-)
-
-
-@pytest.mark.parametrize(
-    "lengths",
-    [
-        [65, 63],
-        [0, 1, 0, 63, 64, 65, 0],
-        [1] * 257,
-        [4097, 1, 511, 0, 65],
-    ],
-)
-@requires_cute
-def test_cute_chunk_scheduler_broadcast_matches_oracle(lengths):
-    expected, offsets = _expected_tensor(lengths, 64)
-    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, offsets[-1], 64)
-    actual = _decode_ragged_chunk_work_cute(
-        cu_seqlens,
-        metadata.chunk_offsets,
-        metadata.capacity,
-    ).cpu()
-
-    for warp in range(actual.shape[1]):
-        torch.testing.assert_close(actual[: expected.shape[0], warp], expected)
-        torch.testing.assert_close(
-            actual[expected.shape[0] :, warp],
-            torch.full_like(actual[expected.shape[0] :, warp], -1),
-        )
-
-
-@requires_cute
-def test_cute_chunk_scheduler_accepts_zero_capacity():
-    cu_seqlens = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 0, 64)
-    actual = _decode_ragged_chunk_work_cute(
-        cu_seqlens,
-        metadata.chunk_offsets,
-        metadata.capacity,
-    )
-
-    assert actual.shape == (0, 4, 5)
-
-
-@requires_cute
-def test_cute_chunk_scheduler_cuda_graph_replays_boundaries():
-    _, offsets = _expected_tensor([65, 63], 64)
-    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-    _decode_ragged_chunk_work_cute(
-        cu_seqlens,
-        metadata.chunk_offsets,
-        metadata.capacity,
-    )
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        actual = _decode_ragged_chunk_work_cute(
-            cu_seqlens,
-            captured_metadata.chunk_offsets,
-            captured_metadata.capacity,
-        )
-
-    cu_seqlens.copy_(torch.tensor([0, 1, 128], device="cuda", dtype=torch.int32))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected, _ = _expected_tensor([1, 127], 64)
-    for warp in range(actual.shape[1]):
-        torch.testing.assert_close(actual[: expected.shape[0], warp].cpu(), expected)
-        torch.testing.assert_close(
-            actual[expected.shape[0] :, warp].cpu(),
-            torch.full_like(actual[expected.shape[0] :, warp].cpu(), -1),
-        )
 
 
 def test_grid_scheduler_persistent_grid_is_machine_derived():

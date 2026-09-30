@@ -27,14 +27,12 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     ChunkKdaBwdWyDqkgConfig,
     chunk_kda_bwd_wy_dqkg,
 )
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    _chunk_kda_bwd_op,
-    _chunk_kda_bwd_with_state_grad_op,
-    _chunk_kda_fwd_op,
-    _chunk_kda_fwd_ragged_paged_op,
-    _chunk_kda_fwd_with_state_op,
-)
 from attn_gym.linear.kda.ops import (
+    chunk_bwd_op,
+    chunk_bwd_with_state_grad_op,
+    chunk_fwd_op,
+    chunk_fwd_ragged_paged_op,
+    chunk_fwd_with_state_op,
     chunk_replay_commit_op,
     chunk_replay_prefill_commit_op,
     chunk_replay_prefill_prepare_op,
@@ -159,7 +157,7 @@ def test_private_chunk_kda_forward_matches_reference(dtype: torch.dtype):
     torch.manual_seed(2)
     q, k, v, gate, beta = _inputs(tokens=64, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
-    actual, aqk, akk = _chunk_kda_fwd_op(
+    actual, aqk, akk = chunk_fwd_op(
         q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
     )
     golden, _ = naive_chunk_kda(
@@ -183,7 +181,7 @@ def test_private_fp16_forward_factors_are_finite_at_gate_limit():
     gate = torch.full_like(q, -MAX_GATE_LOWER_BOUND_MAGNITUDE, dtype=torch.float32)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
 
-    output, aqk, akk = _chunk_kda_fwd_op(
+    output, aqk, akk = chunk_fwd_op(
         q, k, v, cumulative_gate, beta, None, _DEFAULT_SCALE, False, "auto"
     )
 
@@ -916,8 +914,8 @@ def test_chunk_kda_op_registration(dtype):
         True,
         "auto",
     )
-    torch.library.opcheck(_chunk_kda_fwd_op, args, rtol=2e-2, atol=2e-3)
-    torch.library.opcheck(_chunk_kda_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
+    torch.library.opcheck(chunk_fwd_op, args, rtol=2e-2, atol=2e-3)
+    torch.library.opcheck(chunk_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
@@ -932,7 +930,7 @@ def test_chunk_kda_paged_op_registration(state_dtype: torch.dtype):
     has_initial_state = torch.tensor([True, False], device="cuda")
 
     torch.library.opcheck(
-        _chunk_kda_fwd_ragged_paged_op,
+        chunk_fwd_ragged_paged_op,
         (
             q,
             k,
@@ -959,7 +957,7 @@ def test_chunk_kda_backward_op_registration(dtype):
     q, k, v, gate, beta, initial_state = _inputs(initial_state=True, dtype=dtype)
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
     with torch.no_grad():
-        _output, state, Aqk, Akk = _chunk_kda_fwd_with_state_op(
+        _output, state, Aqk, Akk = chunk_fwd_with_state_op(
             q,
             k,
             v,
@@ -971,7 +969,7 @@ def test_chunk_kda_backward_op_registration(dtype):
             "auto",
         )
     torch.library.opcheck(
-        _chunk_kda_bwd_op,
+        chunk_bwd_op,
         (
             q.detach(),
             k.detach(),
@@ -995,7 +993,7 @@ def test_chunk_kda_backward_op_registration(dtype):
         atol=2e-3,
     )
     torch.library.opcheck(
-        _chunk_kda_bwd_with_state_grad_op,
+        chunk_bwd_with_state_grad_op,
         (
             q.detach(),
             k.detach(),

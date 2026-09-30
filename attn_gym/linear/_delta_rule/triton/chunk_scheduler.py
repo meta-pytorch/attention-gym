@@ -84,9 +84,7 @@ bounds the flat, chunk, or sequence axis and strides only over runtime active wo
 from __future__ import annotations
 
 import functools
-import itertools
 from dataclasses import dataclass
-from typing import NamedTuple
 
 import torch
 import triton
@@ -264,42 +262,6 @@ class GridScheduler:
         return self._resolve(request, True, self.metadata.capacity, workers, "a ragged kernel")
 
 
-class ChunkWork(NamedTuple):
-    """One sequence-local chunk decoded from a global logical work index."""
-
-    global_chunk: int
-    sequence: int
-    local_chunk: int
-    token_start: int
-    valid_tokens: int
-
-
-def chunk_work_oracle(cu_seqlens: list[int], chunk_size: int) -> list[ChunkWork]:
-    """Decode all logical chunks on the CPU for tests and scheduler validation."""
-    if len(cu_seqlens) < 2:
-        raise ValueError("cu_seqlens must contain at least one sequence")
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    if cu_seqlens[0] != 0:
-        raise ValueError("cu_seqlens must start at zero")
-    if any(begin > end for begin, end in itertools.pairwise(cu_seqlens)):
-        raise ValueError("cu_seqlens must be monotonic")
-
-    work: list[ChunkWork] = []
-    for sequence, (begin, end) in enumerate(itertools.pairwise(cu_seqlens)):
-        for token_start in range(begin, end, chunk_size):
-            work.append(
-                ChunkWork(
-                    global_chunk=len(work),
-                    sequence=sequence,
-                    local_chunk=(token_start - begin) // chunk_size,
-                    token_start=token_start,
-                    valid_tokens=min(chunk_size, end - token_start),
-                )
-            )
-    return work
-
-
 @triton.jit(debug=True, do_not_specialize=["num_sequences", "tokens"])
 def _prepare_ragged_chunk_offsets_kernel(
     cu_seqlens,
@@ -405,37 +367,6 @@ def load_ragged_chunk_work(
     return sequence, local_chunk, token_start, valid_tokens
 
 
-@triton.jit(do_not_specialize=["num_sequences"])
-def _decode_ragged_chunk_work_kernel(
-    cu_seqlens,
-    chunk_offsets,
-    work,
-    num_sequences,
-    chunk_size: tl.constexpr,
-):
-    global_chunk = tl.program_id(0)
-    active_chunks = load_ragged_chunk_count(chunk_offsets, num_sequences)
-    output = work + global_chunk * 5
-
-    if global_chunk < active_chunks:
-        sequence, local_chunk, token_start, valid_tokens = load_ragged_chunk_work(
-            cu_seqlens,
-            chunk_offsets,
-            global_chunk,
-            num_sequences,
-            chunk_size,
-        )
-
-        tl.store(output, global_chunk)
-        tl.store(output + 1, sequence)
-        tl.store(output + 2, local_chunk)
-        tl.store(output + 3, token_start)
-        tl.store(output + 4, valid_tokens)
-    else:
-        for field in tl.static_range(5):
-            tl.store(output + field, -1)
-
-
 def _prepare_ragged_chunk_offsets(
     cu_seqlens: torch.Tensor,
     tokens: int,
@@ -457,32 +388,10 @@ def _prepare_ragged_chunk_offsets(
     return chunk_offsets
 
 
-def decode_ragged_chunk_work(metadata: RaggedChunkMetadata) -> torch.Tensor:
-    """Materialize scheduler decisions for diagnostics and mapping tests."""
-    work = torch.empty(
-        (metadata.capacity, 5),
-        dtype=torch.int32,
-        device=metadata.cu_seqlens.device,
-    )
-    if metadata.capacity:
-        _decode_ragged_chunk_work_kernel[(metadata.capacity,)](
-            metadata.cu_seqlens,
-            metadata.chunk_offsets,
-            work,
-            num_sequences=metadata.cu_seqlens.shape[0] - 1,
-            chunk_size=metadata.chunk_size,
-            num_warps=1,
-        )
-    return work
-
-
 __all__ = [
-    "ChunkWork",
     "GridScheduler",
     "RaggedChunkMetadata",
     "chunk_capacity",
-    "chunk_work_oracle",
-    "decode_ragged_chunk_work",
     "decode_ragged_task",
     "load_ragged_chunk_count",
     "load_ragged_chunk_work",

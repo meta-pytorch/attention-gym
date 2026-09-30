@@ -9,13 +9,13 @@ pytest.importorskip("cutlass")
 
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.constants import LOG2_E
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    _chunk_kda_bwd_op,
-    _chunk_kda_bwd_with_state_grad_op,
-    _chunk_kda_fwd_ragged_op,
-    _chunk_kda_fwd_ragged_with_state_op,
-)
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
+from attn_gym.linear.kda.ops import (
+    chunk_bwd_op,
+    chunk_bwd_with_state_grad_op,
+    chunk_fwd_ragged_op,
+    chunk_fwd_ragged_with_state_op,
+)
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
@@ -44,7 +44,7 @@ def test_ragged_custom_op_registrations():
         "auto",
     )
     torch.library.opcheck(
-        _chunk_kda_fwd_ragged_with_state_op,
+        chunk_fwd_ragged_with_state_op,
         forward_args,
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -52,7 +52,7 @@ def test_ragged_custom_op_registrations():
     )
 
     torch.library.opcheck(
-        _chunk_kda_fwd_ragged_op,
+        chunk_fwd_ragged_op,
         forward_args,
         test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
         rtol=2e-2,
@@ -60,9 +60,9 @@ def test_ragged_custom_op_registrations():
     )
 
     with torch.no_grad():
-        output, state, Aqk, Akk = _chunk_kda_fwd_ragged_with_state_op(*forward_args)
+        output, state, Aqk, Akk = chunk_fwd_ragged_with_state_op(*forward_args)
     torch.library.opcheck(
-        _chunk_kda_bwd_with_state_grad_op,
+        chunk_bwd_with_state_grad_op,
         (
             *(value.detach() for value in inputs),
             Aqk,
@@ -92,9 +92,9 @@ def test_ragged_custom_op_registrations():
         "auto",
     )
     with torch.no_grad():
-        output, Aqk, Akk = _chunk_kda_fwd_ragged_op(*no_state_args)
+        output, Aqk, Akk = chunk_fwd_ragged_op(*no_state_args)
     torch.library.opcheck(
-        _chunk_kda_bwd_op,
+        chunk_bwd_op,
         (
             *(value.detach() for value in inputs),
             Aqk,
