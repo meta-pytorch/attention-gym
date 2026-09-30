@@ -117,12 +117,6 @@ class ExperimentConfig:
 
 
 @dataclass(frozen=True)
-class Times:
-    eager_time: float
-    compiled_time: float
-
-
-@dataclass(frozen=True)
 class ExperimentResults:
     fwd_time: float
     bwd_time: float | None
@@ -344,69 +338,6 @@ def run_single_backend_FA(
         sparsity=0.5
         if config.attn_type in ("causal", "document_mask", "alibi", "softcap")
         else 0.0,
-    )
-    return add_metrics_to_result(config, result)
-
-
-@safe_backend("flex_attention")
-def run_flex_attention(
-    config: ExperimentConfig,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    score_mod: Callable | None,
-    block_mask: BlockMask | None,
-    kernel_options: dict | None = None,
-    dynamic: bool = False,
-    max_autotune: bool = False,
-) -> ExperimentResults:
-    if max_autotune:
-        compiled_sdpa = torch.compile(
-            flex_attention, dynamic=dynamic, mode="max-autotune-no-cudagraphs"
-        )
-    else:
-        compiled_sdpa = torch.compile(flex_attention, dynamic=dynamic)
-
-    out_compile = compiled_sdpa(
-        query=query,
-        key=key,
-        value=value,
-        score_mod=score_mod,
-        block_mask=block_mask,
-        enable_gqa=True,
-        kernel_options=kernel_options,
-    )
-
-    forward_compiled_time = benchmark_torch_function_in_microseconds(
-        compiled_sdpa,
-        query,
-        key,
-        value,
-        score_mod=score_mod,
-        block_mask=block_mask,
-        enable_gqa=True,
-        kernel_options=kernel_options,
-    )
-
-    backward_compile_time = None
-    if config.calculate_bwd_time:
-        try:
-            d_out = torch.randn_like(out_compile)
-            backward_compile_time = benchmark_torch_function_in_microseconds(
-                out_compile.backward, d_out, retain_graph=True
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[SKIP] Backward pass failed for flex_attention with shape {config.shape}: {e}")
-            cleanup_memory()
-            backward_compile_time = float("nan")
-
-    sparsity = block_mask.sparsity() / 100.0 if block_mask is not None else 0.0
-    sparsity = sparsity if config.attn_type != "document_mask" else 0.5
-
-    result = ExperimentResults(
-        fwd_time=forward_compiled_time,
-        bwd_time=backward_compile_time,
-        sparsity=sparsity,
     )
     return add_metrics_to_result(config, result)
 

@@ -366,11 +366,6 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def round_up(x: int, y: int) -> int:
-    """Round up x to the nearest multiple of y"""
-    return cdiv(x, y) * y
-
-
 # =============================================================================
 # Flash Backend Utilities
 # =============================================================================

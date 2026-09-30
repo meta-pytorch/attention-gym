@@ -245,11 +245,11 @@ def paged_chunk_kda(
 
             Persistent storage consists of the five per-slot token caches plus their counts.
             Replay prefill additionally allocates five prefix buffers with token capacity
-            ``round_up(total_input_capacity + 63 * num_requests, 64)`` and five tail buffers
-            shaped ``[num_requests, 64, ...]``, plus routing and compute intermediates. CUDA graph
-            users such as vLLM must budget this workspace for every captured bucket. Graph replay
-            may change packed offsets, slot routing, initialization flags, and replay counts while
-            tensor shapes remain fixed to that bucket.
+            ``total_input_capacity + 63 * num_requests`` rounded up to a multiple of 64 and five
+            tail buffers shaped ``[num_requests, 64, ...]``, plus routing and compute
+            intermediates. CUDA graph users such as vLLM must budget this workspace for every
+            captured bucket. Graph replay may change packed offsets, slot routing, initialization
+            flags, and replay counts while tensor shapes remain fixed to that bucket.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.

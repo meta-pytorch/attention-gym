@@ -687,46 +687,6 @@ def generate_vsa_mask_mod(
     return vsa_mask_mod
 
 
-def generate_vsa_block_map_mask_mod(
-    block_map: Tensor,
-    tile_numel: int,
-    variable_block_sizes: Tensor | None = None,
-) -> _mask_mod_signature:
-    """Create a pointwise mask_mod from a dense tile-level block map.
-
-    Args:
-        block_map: Boolean tensor with shape ``(B, H, Q_TILES, KV_TILES)``.
-        tile_numel: Number of fine tokens in one VSA tile.
-        variable_block_sizes: Optional real-token counts for each padded KV tile.
-
-    Returns:
-        A ``mask_mod`` with O(1) tile membership lookup.
-
-    Raises:
-        ValueError: If ``block_map`` has the wrong rank or ``tile_numel`` is invalid.
-    """
-    if block_map.dim() != 4:
-        raise ValueError(
-            f"block_map must have shape (B, H, Q_TILES, KV_TILES), got {block_map.shape}"
-        )
-    if tile_numel <= 0:
-        raise ValueError(f"tile_numel must be positive, got {tile_numel}")
-    block_map = block_map.to(dtype=torch.bool)
-    if variable_block_sizes is not None:
-        variable_block_sizes = variable_block_sizes.to(device=block_map.device)
-
-    def vsa_block_map_mask_mod(b, h, q_idx, kv_idx):
-        q_tile = q_idx // tile_numel
-        kv_tile = kv_idx // tile_numel
-        selected = block_map[b, h, q_tile, kv_tile]
-        if variable_block_sizes is None:
-            return selected
-        return selected & (kv_idx % tile_numel < variable_block_sizes[kv_tile])
-
-    vsa_block_map_mask_mod.__name__ = f"vsa_block_map_t{tile_numel}"
-    return vsa_block_map_mask_mod
-
-
 def generate_vsa_padding_mask_mod(
     variable_block_sizes: Tensor, tile_numel: int
 ) -> _mask_mod_signature:
