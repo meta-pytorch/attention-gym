@@ -8,6 +8,7 @@ from numbers import Real
 
 import torch
 
+from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -54,16 +55,7 @@ def validate_delta_rule_inputs(
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
 
     if cu_seqlens is not None:
-        if batch != 1:
-            raise ValueError("packed cu_seqlens require q to have batch size one")
-        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
-            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
-        if (
-            cu_seqlens.dtype != torch.int32
-            or not cu_seqlens.is_contiguous()
-            or cu_seqlens.device != q.device
-        ):
-            raise ValueError("cu_seqlens must be contiguous int32 on q.device")
+        validate_cu_seqlens(batch, q.device, cu_seqlens=cu_seqlens)
 
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state = (state_batch, heads, v.shape[-1], key_dim)
