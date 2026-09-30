@@ -42,8 +42,7 @@ tests = [
     "pytest",
     "pytest-xdist",
     "typer",
-    "jsonargparse",
-    "docstring-parser",
+    "jsonargparse[signatures]",
     "flash-attn-4[cu13]~=4.0.0b33; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -53,16 +52,13 @@ dev = [
     "pytest-xdist",  # pytest addopts pass --dist, so xdist must be present even for -n 0
     "ruff",
     "typer",
-    "jsonargparse",
-    "docstring-parser",
+    "jsonargparse[signatures]",
 ]
 
 viz = [
     "matplotlib",
-    "jsonargparse",
-    "docstring-parser",
+    "jsonargparse[signatures]",
     "tabulate",
-    "pyyaml",
     "marimo",
 ]
 
