@@ -462,9 +462,7 @@ from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda import bound_gate
 
 gate = bound_gate(raw_gate, A_log, dt_bias, fastmath=False)
-output, final_state = chunk_kda(
-    q, k, v, gate, beta, fastmath=False, output_final_state=True
-)
+output, final_state = chunk_kda(q, k, v, gate, beta, fastmath=False, output_final_state=True)
 ```
 
 The training and CP examples use `--fastmath` by default; `--no-fastmath` selects `False`.
