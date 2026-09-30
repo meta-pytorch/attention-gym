@@ -61,7 +61,7 @@ from attn_gym.linear.kda.fwd.cute.gate_fwd import (
     softplus_terms,
 )
 from attn_gym.linear.types import GateTransform
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 _TILE_TOKENS = 32
 
@@ -494,7 +494,7 @@ def _gate_transform_bwd_cuda(
     d_raw_gate = torch.empty_like(raw_gate, memory_format=torch.contiguous_format)
     partial_shape = (
         raw_gate.shape[0],
-        ceildiv(raw_gate.shape[1], _TILE_TOKENS),
+        cdiv(raw_gate.shape[1], _TILE_TOKENS),
         raw_gate.shape[2],
     )
     dA_log_partial = torch.empty(partial_shape, device=raw_gate.device, dtype=torch.float32)

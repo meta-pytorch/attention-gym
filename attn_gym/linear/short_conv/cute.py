@@ -45,7 +45,7 @@ from attn_gym._backends.cute.utils import (
 )
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 
 @dataclass(frozen=True)
@@ -73,11 +73,11 @@ def _persistent_tma_dx_workers(
     device: torch.device,
 ) -> int:
     """Return the hardware-bound worker cap; the launcher clamps it to runtime T."""
-    channel_blocks = ceildiv(channels, config.threads * config.channels_per_thread)
+    channel_blocks = cdiv(channels, config.threads * config.channels_per_thread)
     device_workers = (
         get_device_properties(device).multi_processor_count * _PERSISTENT_TMA_DX_CTAS_PER_SM
     )
-    return ceildiv(device_workers, channel_blocks)
+    return cdiv(device_workers, channel_blocks)
 
 
 @dataclass(frozen=True)
@@ -3179,7 +3179,7 @@ def _launch_backward(
         tokens,
     )
 
-    num_time_blocks = ceildiv(tokens, weight_config.times_per_block)
+    num_time_blocks = cdiv(tokens, weight_config.times_per_block)
     if initial_state is None or not compute_initial_state_grad:
         grad_initial_state = None
     elif width == 1:
@@ -3444,7 +3444,7 @@ def tune_causal_conv1d(
     partials = {
         config: torch.empty(
             batches,
-            ceildiv(tokens, config.times_per_block),
+            cdiv(tokens, config.times_per_block),
             channels,
             width,
             dtype=torch.float32,

@@ -7,9 +7,7 @@ from torch.nn.attention.flex_attention import (
     noop_mask,
 )
 
-
-def _cdiv(x: float | torch.Tensor, multiple: float | torch.Tensor):
-    return (x + multiple - 1) // multiple
+from attn_gym.utils import cdiv
 
 
 class PagedAttention:
@@ -63,7 +61,7 @@ class PagedAttention:
         if seq_len <= self.capacity[batch_idx]:
             return
 
-        num_pages_to_allocate = _cdiv(seq_len - self.capacity[batch_idx], self.page_size)
+        num_pages_to_allocate = cdiv(seq_len - self.capacity[batch_idx], self.page_size)
 
         assert len(self.empty_pages) >= num_pages_to_allocate, (
             f"requested {num_pages_to_allocate.item()} pages "

@@ -47,7 +47,7 @@ from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.types import GateTransform
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 _HEAD_DIM = 128
 _HEADS_PER_BLOCK = 8
@@ -122,7 +122,7 @@ class _GateTransformForward:
     ) -> None:
         self.dtype = dtype
         self.heads = heads
-        self.head_groups = ceildiv(heads, _HEADS_PER_BLOCK)
+        self.head_groups = cdiv(heads, _HEADS_PER_BLOCK)
         self.lower_bound = lower_bound
         self.transform = transform
         self.fastmath = fastmath

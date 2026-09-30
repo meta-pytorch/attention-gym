@@ -20,11 +20,6 @@ CurrentOutputT = TypeVar("CurrentOutputT")
 SideOutputT = TypeVar("SideOutputT")
 
 
-def ceildiv(number: int, divisor: int) -> int:
-    """Return ``ceil(number / divisor)`` using integer or symbolic arithmetic."""
-    return -(number // -divisor)
-
-
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench_using_profiling"""
     # Imported lazily: torch._inductor/torch._dynamo add ~1s to ``import attn_gym``.
@@ -362,8 +357,8 @@ def plot_attention_scores(
 
 
 def cdiv(a: int, b: int) -> int:
-    """Ceiling integer division"""
-    return (a + b - 1) // b
+    """Return ``ceil(a / b)`` using integer or symbolic arithmetic."""
+    return -(a // -b)
 
 
 # =============================================================================

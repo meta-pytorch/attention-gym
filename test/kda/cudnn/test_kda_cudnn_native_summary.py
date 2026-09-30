@@ -25,7 +25,7 @@ from attn_gym.testing.kda import (
     kda_reference,
     make_kda_test_inputs,
 )
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -430,7 +430,7 @@ def test_native_reverse_matches_fp64(dtype: torch.dtype, gate_value: float) -> N
                 # Native R rounds the recurrent state/decay every BT16, not just at the
                 # output. A uniform gate can bias those roundings in the same direction;
                 # allow one source epsilon per chunk, rather than the single-round budget.
-                allowance = ceildiv(inputs[0].shape[1], 16) * torch.finfo(dtype).eps
+                allowance = cdiv(inputs[0].shape[1], 16) * torch.finfo(dtype).eps
                 error = (low[:, :, rows].double() - high[:, :, rows]).abs().max()
                 budget = error + allowance * high[:, :, rows].abs().max()
                 assert torch.isfinite(actual[:, :, rows]).all()

@@ -55,7 +55,7 @@ from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_sequence_extent
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 _MIN_SEQUENCE_EXTENT_SEQUENCES = 32
 _MIN_SEQUENCE_EXTENT_HEADS = 8
@@ -76,7 +76,7 @@ def select_delta_h_bv(
     device: torch.device,
 ) -> int:
     """Select the delta-H value tile width for the logical workload."""
-    value_tiles = ceildiv(value_dim, 16) * heads * logical_batch
+    value_tiles = cdiv(value_dim, 16) * heads * logical_batch
     return 32 if value_tiles > get_device_properties(device).multi_processor_count else 16
 
 

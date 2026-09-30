@@ -19,7 +19,7 @@ from attn_gym._backends.cute import compile as cute_compile
 from attn_gym._backends.cute import target as cute_target
 from attn_gym._backends.cute.tune import benchmark_gpu, run_tunable, tune
 from attn_gym._backends.cute.utils import compile_tvm_ffi
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 _DRIVER_LOG_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_LOG"
 _DRIVER_READY_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_READY"
@@ -132,10 +132,10 @@ def test_cache_directory_can_be_overridden(tmp_path, monkeypatch):
     assert cute_cache.get_cache_path() == configured_path
 
 
-def test_ceildiv():
-    assert ceildiv(0, 3) == 0
-    assert ceildiv(1, 3) == 1
-    assert ceildiv(7, 3) == 3
+def test_cdiv():
+    assert cdiv(0, 3) == 0
+    assert cdiv(1, 3) == 1
+    assert cdiv(7, 3) == 3
 
 
 def test_compile_tvm_ffi_enforces_the_compile_contract():
