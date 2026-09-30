@@ -25,7 +25,7 @@ from typing import ClassVar
 
 import cutlass
 import torch
-from cutlass import BFloat16, Float16, Float32, Int32, Int64, cute, pipeline
+from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
 from attn_gym._backends.cute import (
@@ -39,6 +39,8 @@ from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
 from attn_gym._backends.cute.utils import (
     TMA_ALIGNMENT_BYTES,
+    CuteDType,
+    cute_dtype,
     make_fake_strided_tensor,
     requires_int64_abi,
     tensor_supports_contiguous_dim,
@@ -47,19 +49,9 @@ from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.utils import cdiv
 
-
-@dataclass(frozen=True)
-class ShortConvDType:
-    """Map a Torch storage dtype to its compile-time CuTeDSL type and artifact tag."""
-
-    cute_type: type[cutlass.Numeric]
-    name: str
-
-
+ShortConvDType = CuteDType
 SHORT_CONV_DTYPES = {
-    torch.float16: ShortConvDType(Float16, "fp16"),
-    torch.bfloat16: ShortConvDType(BFloat16, "bf16"),
-    torch.float32: ShortConvDType(Float32, "fp32"),
+    dtype: cute_dtype(dtype) for dtype in (torch.float16, torch.bfloat16, torch.float32)
 }
 
 

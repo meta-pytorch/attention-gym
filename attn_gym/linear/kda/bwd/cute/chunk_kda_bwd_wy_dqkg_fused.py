@@ -43,7 +43,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
@@ -235,13 +235,6 @@ def umma_arrive(mbar_ptr: cute.Pointer):
     """Signal completion of one warp-group MMA sequence."""
     with elect_one():
         tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-
-
-# Mapping from torch dtypes to CuTeDSL scalar types.
-_torch_to_cutlass_dtype = {
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float16: cutlass.Float16,
-}
 
 
 def require_blackwell_target() -> None:
@@ -3430,7 +3423,7 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     ``[B, T, heads, head_dim]``.
     """
     key_heads = heads if key_heads is None else key_heads
-    cutlass_io_dtype = _torch_to_cutlass_dtype[io_dtype]
+    cutlass_io_dtype = cute_dtype(io_dtype).cute_type
     op = ChunkKdaBwdWyDqkgFused(
         chunk_size=chunk_size,
         head_dim_k=head_dim,

@@ -54,12 +54,8 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import cta_reduce_sum
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear.kda.fwd.cute.gate_fwd import (
-    _BOUND_GATE_DTYPES,
-    _BoundGateDType,
-    softplus_terms,
-)
+from attn_gym._backends.cute.utils import CuteDType, cute_dtype, requires_int64_abi
+from attn_gym.linear.kda.fwd.cute.gate_fwd import softplus_terms
 from attn_gym.linear.types import GateTransform
 from attn_gym.utils import cdiv
 
@@ -77,7 +73,7 @@ class _GateTransformBwdTmaOp:
 
     def __init__(
         self,
-        dtype: _BoundGateDType,
+        dtype: CuteDType,
         heads: int,
         head_dim: int,
         lower_bound: float,
@@ -388,7 +384,7 @@ class _GateTransformBwdTmaOp:
 
 @jit_cache
 def _compile_gate_transform_bwd(
-    dtype: _BoundGateDType,
+    dtype: CuteDType,
     heads: int,
     head_dim: int,
     lower_bound: float,
@@ -501,9 +497,9 @@ def _gate_transform_bwd_cuda(
     d_dt_bias_partial = torch.empty(
         (*partial_shape, raw_gate.shape[3]), device=raw_gate.device, dtype=torch.float32
     )
-    dtype = _BOUND_GATE_DTYPES.get(raw_gate.dtype)
-    if dtype is None:
+    if raw_gate.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported raw_gate dtype: {raw_gate.dtype}")
+    dtype = cute_dtype(raw_gate.dtype)
     compiled = _compile_gate_transform_bwd(
         dtype,
         raw_gate.shape[2],

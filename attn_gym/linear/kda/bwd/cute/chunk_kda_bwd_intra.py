@@ -26,7 +26,7 @@ from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
 from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import LN2, is_sm100_kda_capability
@@ -49,14 +49,7 @@ KC_TOTAL = K_PHASES * SUBCHUNKS  # work items per (chunk, head): 16
 # base pointer to be 16-byte (8 bf16 element) aligned.
 _MIN_ALIGN_BYTES = 16
 _MIN_ALIGN_ELEMENTS_16BIT = _MIN_ALIGN_BYTES // 2
-_IO_TYPES = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-}
-_IO_TYPE_NAMES = {
-    cutlass.Float16: "fp16",
-    cutlass.BFloat16: "bf16",
-}
+_IO_TYPES = (torch.float16, torch.bfloat16)
 
 
 @triton.jit(do_not_specialize=["elements"])
@@ -2102,7 +2095,7 @@ def _compile_chunk_kda_bwd_intra(
         chunk_offsets,
         Int32(1),
         name=(
-            f"kda_bwd_intra_h{heads}_{_IO_TYPE_NAMES[io_type]}_rg{int(ragged)}"
+            f"kda_bwd_intra_h{heads}_{cute_dtype(io_type).name}_rg{int(ragged)}"
             f"_i64{int(use_int64_offsets)}_fm{int(fastmath)}"
         ),
     )
@@ -2178,7 +2171,7 @@ class ChunkKdaBwdIntraTunable:
             raise ValueError(
                 f"grid_chunks must be in [1, {args.capacity}], got {config.grid_chunks}"
             )
-        io_type = _IO_TYPES[args.q.dtype]
+        io_type = cute_dtype(args.q.dtype).cute_type
         return (
             args.q.shape[2],
             args.chunk_offsets is not None,

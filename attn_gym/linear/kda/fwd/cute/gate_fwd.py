@@ -30,7 +30,6 @@ Only an input whose last mode is noncontiguous is materialized into a supported 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import cutlass
 import torch
@@ -44,7 +43,7 @@ from attn_gym._backends.cute import (
     tensor_supports_contiguous_dim,
 )
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import CuteDType, cute_dtype, requires_int64_abi
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.types import GateTransform
 from attn_gym.utils import cdiv
@@ -58,21 +57,6 @@ _LN_2 = math.log(2.0)
 # Below this ``exp(-|z|)`` the fastmath ``log2(1 + e)`` has lost the tail; see NOTE [Fastmath
 # Softplus] in attn_gym/linear/_delta_rule/triton/softplus_gate.py.
 _SMALL_TAIL = 2.0**-8
-
-
-@dataclass(frozen=True)
-class _BoundGateDType:
-    """Map Torch storage to its CuTeDSL type and profiler tag."""
-
-    cute_type: type[cutlass.Numeric]
-    name: str
-
-
-_BOUND_GATE_DTYPES = {
-    torch.float16: _BoundGateDType(cutlass.Float16, "fp16"),
-    torch.bfloat16: _BoundGateDType(cutlass.BFloat16, "bf16"),
-    torch.float32: _BoundGateDType(cutlass.Float32, "fp32"),
-}
 
 
 @cute.jit
@@ -111,7 +95,7 @@ class _GateTransformForward:
 
     def __init__(
         self,
-        dtype: _BoundGateDType,
+        dtype: CuteDType,
         heads: int,
         lower_bound: float,
         fastmath: bool,
@@ -222,7 +206,7 @@ def _fake_compact(dtype: type[cutlass.Numeric], shape: tuple[object, ...]):
 
 @jit_cache
 def _compile_gate_transform_fwd(
-    dtype: _BoundGateDType,
+    dtype: CuteDType,
     heads: int,
     lower_bound: float,
     fastmath: bool,
@@ -287,9 +271,9 @@ def _gate_transform_fwd_cuda(
     transform: GateTransform,
 ) -> torch.Tensor:
     """Normalize vector alignment and launch the CuTeDSL forward."""
-    dtype = _BOUND_GATE_DTYPES.get(raw_gate.dtype)
-    if dtype is None:
+    if raw_gate.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported raw_gate dtype: {raw_gate.dtype}")
+    dtype = cute_dtype(raw_gate.dtype)
     inputs = (raw_gate, A_log, dt_bias)
     inputs = tuple(
         tensor

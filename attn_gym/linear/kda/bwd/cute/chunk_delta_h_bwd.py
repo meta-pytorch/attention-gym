@@ -51,7 +51,7 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.cute.utils import compile_tvm_ffi, requires_int64_abi
+from attn_gym._backends.cute.utils import compile_tvm_ffi, cute_dtype, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_sequence_extent
@@ -59,14 +59,7 @@ from attn_gym.utils import cdiv
 
 _MIN_SEQUENCE_EXTENT_SEQUENCES = 32
 _MIN_SEQUENCE_EXTENT_HEADS = 8
-_IO_TYPES = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-}
-_IO_TYPE_NAMES = {
-    cutlass.Float16: "fp16",
-    cutlass.BFloat16: "bf16",
-}
+_IO_TYPES = (torch.float16, torch.bfloat16)
 
 
 def select_delta_h_bv(
@@ -272,7 +265,7 @@ class BlackwellDeltaHBwd:
         """Return a stable artifact and profiler name for this specialization."""
         return (
             f"kda_bwd_dhu_dv_fused_vl{int(self.varlen)}_h{self.num_heads}"
-            f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{_IO_TYPE_NAMES[self.io_type]}"
+            f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{cute_dtype(self.io_type).name}"
             f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
             f"_ds{int(self.dynamic_state_layout)}_fm{int(self.fastmath)}"
         )
@@ -2478,7 +2471,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         raise ValueError("packed delta-H+dV inputs must be contiguous")
     if q.dtype not in _IO_TYPES or any(tensor.dtype != q.dtype for tensor in (k, w, do, aqk)):
         raise TypeError("q, k, w, do, and Aqk must share dtype float16 or bfloat16")
-    io_type = _IO_TYPES[q.dtype]
+    io_type = cute_dtype(q.dtype).cute_type
     if gk is not None and gk.dtype != torch.float32:
         raise TypeError("gk must be float32")
     sequences = metadata.cu_seqlens.shape[0] - 1
@@ -2630,7 +2623,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
 
     if q.dtype not in _IO_TYPES or any(tensor.dtype != q.dtype for tensor in (k, w, do, aqk)):
         raise TypeError("q, k, w, do, and Aqk must share dtype float16 or bfloat16")
-    io_type = _IO_TYPES[q.dtype]
+    io_type = cute_dtype(q.dtype).cute_type
     use_int64_offsets = requires_int64_abi(
         q,
         k,

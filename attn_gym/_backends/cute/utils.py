@@ -6,13 +6,39 @@ import operator
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import lru_cache
-from typing import Any
+from functools import cache, lru_cache
+from typing import Any, NamedTuple
 
 import torch
 
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 TMA_ALIGNMENT_BYTES = 16
+_CUTE_DTYPES = {
+    torch.float16: ("Float16", "fp16"),
+    torch.bfloat16: ("BFloat16", "bf16"),
+    torch.float32: ("Float32", "fp32"),
+}
+
+
+class CuteDType(NamedTuple):
+    """A Torch storage dtype's CuTeDSL scalar type and kernel-name tag."""
+
+    cute_type: type
+    name: str
+
+
+@cache
+def cute_dtype(dtype: torch.dtype | type) -> CuteDType:
+    """Describe an fp16, bf16, or fp32 Torch or CuTeDSL dtype for kernel compilation."""
+    import cutlass
+    import cutlass.torch
+
+    if not isinstance(dtype, torch.dtype):
+        dtype = cutlass.torch.dtype(dtype)
+    if dtype not in _CUTE_DTYPES:
+        raise TypeError(f"no CuTeDSL storage type for {dtype}")
+    type_name, name = _CUTE_DTYPES[dtype]
+    return CuteDType(getattr(cutlass, type_name), name)
 
 
 def _contains_torch_tensor(value: Any) -> bool:
