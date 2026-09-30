@@ -136,29 +136,6 @@ def exact_tile_metadata(grid: tuple[int, int, int], tile: tuple[int, int, int], 
     return metadata
 
 
-def import_upstream_vsa():
-    """Import the installed `vsa` package, dodging the examples/sparse/vsa.py shadow.
-
-    Running ``python examples/sparse/fastwan_vsa.py`` puts ``examples/sparse/`` at
-    ``sys.path[0]``, where ``vsa.py`` (the FlexAttention example) shadows the
-    upstream FastVideo ``vsa`` package.
-    """
-    import importlib
-    import sys
-
-    module = sys.modules.get("vsa")
-    if module is not None and hasattr(module, "video_sparse_attn"):
-        return module
-    examples_dir = str(Path(__file__).parent.resolve())
-    saved_path = sys.path.copy()
-    sys.modules.pop("vsa", None)
-    sys.path = [p for p in sys.path if str(Path(p or ".").resolve()) != examples_dir]
-    try:
-        return importlib.import_module("vsa")
-    finally:
-        sys.path = saved_path
-
-
 class SparseVSAAttention:
     """Tile-major VSA self-attention over BHSD tensors for one fixed latent grid.
 
@@ -199,7 +176,9 @@ class SparseVSAAttention:
         q, k, v, gate = (t[:, :, self.perm] for t in (q, k, v, gate))
         match self.mode:
             case "upstream":
-                out = import_upstream_vsa().video_sparse_attn(
+                from vsa import video_sparse_attn
+
+                out = video_sparse_attn(
                     q.contiguous(),
                     k.contiguous(),
                     v.contiguous(),

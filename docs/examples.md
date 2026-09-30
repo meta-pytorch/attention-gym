@@ -5,7 +5,8 @@ at most one directory below `examples/`:
 
 - **`examples/flex_attention/`** — FlexAttention masks and score mods, model recipes, and runtime integration.
 - **`examples/linear/`** — KDA/GDN training, context parallelism, and decoding.
-- **`examples/sparse/`** — compressed sparse attention, VSA, and FastWan integration.
+- **`examples/sparse/`** — compressed sparse attention, VSA with FlexAttention
+  (`examples/sparse/vsa_flex.py`), and FastWan integration (`examples/sparse/fastwan_vsa.py`).
 
 Run the commands below from the repository root.
 
