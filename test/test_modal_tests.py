@@ -88,7 +88,7 @@ def test_pytest_failure_budget_and_missing_report(
     assert "--maxfail=5" in command
     assert "--instafail" in command
     assert "-vra" in command
-    assert command[command.index("-n") + 1] == "4"
+    assert command[command.index("-n") + 1] == str(runner.PYTEST_WORKERS)
 
 
 @pytest.mark.parametrize("preflight_code", [0, 1, 5])
